@@ -82,6 +82,7 @@
 //! costs one side rather than two sides and the answer, which is the memory half of #211 and is what
 //! stood between the cross product rewrite and coming back.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::{
@@ -1658,6 +1659,217 @@ impl Sink for Marking<'_> {
     }
 }
 
+/// An outer join that gathered the side it keeps.
+///
+/// A join that keeps one side's rows whatever they match cannot gather that side and stay a
+/// stream, because a gathered row nothing has matched yet may still be matched, so nothing can be
+/// said about it until the last driving row has been through. That is why [`streamed`] leaves
+/// `RIGHT` and `FULL` off its list, and why `rudb_opt`'s `sides` pass used to refuse to gather an
+/// outer join's kept side at all: gathering it handed the join to [`Join`], which pairs rows one
+/// at a time and runs on one thread.
+///
+/// Refusing it costs the parallelism of the whole pipeline. TPC-H q13 is `customer LEFT JOIN
+/// orders`, the kept side is the 150,000 row `customer` and the other side is the 1.5 million row
+/// `orders`, so keeping the kept side streaming means the pipeline's driving scan is the small one
+/// and its degree is what 150,000 rows are worth, which on this machine is two of ten threads. The
+/// 1.5 million probes then run on those two threads. DuckDB answers the same query the other way
+/// round, gathers `customer` and probes with `orders`, and gets the whole machine.
+///
+/// So this one turns the join around, and the observation that makes it possible is that the part
+/// of the answer which has to wait is small. A driving row that matches produces its pairs the
+/// moment it arrives, exactly as [`Probe`] would; what waits is the padded row owed to a gathered
+/// row nothing matched, and there are at most as many of those as the gathered side has rows. On
+/// q13 that is 1.5 million pairs that stream and about fifty thousand padded rows that do not.
+/// [`Stream::drain`] is where the second half goes, so this is a stream with a tail rather than a
+/// sink, and the answer is never materialised.
+///
+/// It holds a [`Probe`] and calls into it for the pairs, which is why the table, the lookup, the
+/// equalities and the residual are written once. The kind that probe is given is not this join's:
+/// what a `RIGHT` join should do with a driving row that matches nothing is drop it, which is
+/// `INNER`, and what a `FULL` join should do with one is pad it, which is `LEFT`. Those are the
+/// two kinds this operator is built for and they are the two substitutions.
+///
+/// # The bits
+///
+/// One per gathered row, shared by every instance and set with a relaxed `fetch_or` rather than
+/// kept per instance and merged. [`Marking`] does it the other way because it is a sink and
+/// [`Sink::combine`] is a merge point that already exists. There is no such point here: a drain
+/// runs after the last instance has finished and there is no hook between the two, so the bits
+/// have to be right the moment the instances stop. A word covers sixty four gathered rows, the
+/// write is on the match path only, and the ordering can be relaxed because joining the threads is
+/// what makes them visible to the drain.
+#[derive(Debug)]
+pub(crate) struct Padding<'a> {
+    /// The pairs, and everything it takes to find them.
+    probe: Probe<'a>,
+    /// One bit per gathered row, set where some driving row matched it.
+    ///
+    /// Filled in [`Stream::prepare`], because how many bits there are is how many rows the
+    /// gathered side has and that is not known until the table is built.
+    marked: OnceLock<Vec<AtomicU64>>,
+}
+
+/// One instance's share of a padding join.
+#[derive(Debug)]
+pub(crate) struct Padded {
+    /// The probe's own state, since the pairs are its work.
+    probing: Probing,
+}
+
+impl<'a> Padding<'a> {
+    /// The operator for this join, or nothing when this is not one it answers.
+    ///
+    /// `kind` is the join as this operator sees it, which is with the gathered side on the right,
+    /// so `RIGHT` here means the gathered side is the kept one. That is the case worth turning
+    /// around and the only one this is for.
+    pub(crate) fn new(
+        plan: &'a Plan,
+        left: &Schema,
+        right: &Gathered<'_>,
+        kind: JoinKind,
+        conditions: Slice,
+        cancel: &Cancel,
+        memory: &Memory,
+    ) -> Option<Self> {
+        // What the probe should do with a driving row that matches nothing, which is the whole of
+        // what this operator delegates. A right join drops it and a full join pads it.
+        let pairing = match kind {
+            JoinKind::Right => JoinKind::Inner,
+            JoinKind::Full => JoinKind::Left,
+            _ => return None,
+        };
+        let probe = Probe::new(plan, left, right, pairing, conditions, cancel, memory)?;
+        Some(Self { probe, marked: OnceLock::new() })
+    }
+
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.probe = self.probe.in_session(session);
+        self
+    }
+
+    pub(crate) fn schema(&self) -> &Schema {
+        self.probe.schema()
+    }
+
+    /// The key this join can hand to the scan under its driving side.
+    ///
+    /// Nothing at all, and this is the one place where turning a join around costs something. A
+    /// runtime filter over the driving side drops rows the gathered side has no key for, and a
+    /// driving row this operator drops is one that marked no bit, so for the pairs it would be
+    /// sound. It is not sound for the padding: the filter would be built from the gathered side
+    /// and the rows it removes are exactly the ones that were going to match nothing, which is the
+    /// half of a full join's answer that comes out of the drain. A right join could have it and
+    /// does not, because the two kinds share this operator and a filter that is right for one of
+    /// them and wrong for the other is worse than none.
+    pub(crate) fn sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
+        None
+    }
+
+    /// Note that every one of these gathered rows has now been matched.
+    fn mark(&self, at: &[u32]) {
+        let Some(marked) = self.marked.get() else {
+            return;
+        };
+        for &row in at {
+            if row == PAD {
+                continue;
+            }
+            let row = row as usize;
+            if let Some(word) = marked.get(row / u64::BITS as usize) {
+                word.fetch_or(1 << (row % u64::BITS as usize), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The chunk those gathered rows make, with nulls where the driving side would have been.
+    fn padded(&self, built: &Built, at: &[u32]) -> Result<Chunk> {
+        let mut columns: Vec<Vector> = self
+            .probe
+            .left_types
+            .iter()
+            .map(|ty| Vector::constant(ty.clone(), Value::Null, at.len()))
+            .collect();
+        columns.extend(built.rows.gather(at)?);
+        if self.probe.swapped {
+            // The same rotation [`Probe::push`] ends with and for the same reason, since these
+            // rows go to whatever that operator's rows go to and have to be laid out alike.
+            columns.rotate_left(self.probe.left_width);
+        }
+        Chunk::with_rows(columns, at.len())
+    }
+}
+
+impl Stream for Padding<'_> {
+    type Local = Padded;
+
+    fn local(&self) -> Padded {
+        Padded { probing: Stream::local(&self.probe) }
+    }
+
+    /// Builds the table on the whole lease, and makes the bits now that their number is known.
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        let built = self.probe.built_with(threads)?;
+        let words = built.rows.rows().div_ceil(u64::BITS as usize);
+        let _ = self.marked.set((0..words).map(|_| AtomicU64::new(0)).collect());
+        Ok(())
+    }
+
+    fn drains(&self) -> bool {
+        true
+    }
+
+    /// The gathered rows nothing matched, padded, in the order the gathered side holds them.
+    fn drain(&self, out: &mut dyn FnMut(&mut Chunk) -> Result<Progress>) -> Result<()> {
+        let built = self.probe.built()?;
+        let rows = built.rows.rows();
+        let empty = Vec::new();
+        let marked = self.marked.get().unwrap_or(&empty);
+        let mut at: Vec<u32> = Vec::with_capacity(VECTOR_SIZE);
+        for (word, bits) in marked.iter().enumerate() {
+            let bits = bits.load(Ordering::Relaxed);
+            // A word that is all ones is sixty four gathered rows every one of which matched, and
+            // on a join that mostly matches it is most of the words. The check is one comparison
+            // for the sixty four rows it skips.
+            if bits == u64::MAX {
+                continue;
+            }
+            let first = word * u64::BITS as usize;
+            for bit in 0..u64::BITS as usize {
+                let row = first + bit;
+                if row >= rows {
+                    break;
+                }
+                if bits >> bit & 1 == 1 {
+                    continue;
+                }
+                at.push(u32::try_from(row).map_err(|_| unaddressable())?);
+                if at.len() == VECTOR_SIZE {
+                    let mut chunk = self.padded(&built, &at)?;
+                    at.clear();
+                    if out(&mut chunk)? == Progress::Done {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if !at.is_empty() {
+            let mut chunk = self.padded(&built, &at)?;
+            out(&mut chunk)?;
+        }
+        Ok(())
+    }
+
+    fn push(&self, chunk: &mut Chunk, local: &mut Padded) -> Result<Progress> {
+        let progress = self.probe.push(chunk, &mut local.probing)?;
+        // After the probe rather than inside it, because what it wrote is exactly the answer to
+        // the question this operator is asking: one entry per output row saying which gathered row
+        // it read from, with [`PAD`] where it read from none.
+        self.mark(&local.probing.right_at);
+        Ok(progress)
+    }
+}
+
 /// What a join says when its gathered side holds more rows than a position can name.
 fn unaddressable() -> Error {
     Error::internal("a join gathered more rows than it can address")
@@ -2218,8 +2430,8 @@ mod tests {
     use rudb_vector::{Data, Validity, Vector};
 
     use super::{
-        Buffered, Chunk, CrossProduct, Gathered, Join, Marking, Probe, Progress, Schema, Side,
-        Sink, Stream, equalities, side_of,
+        Buffered, Chunk, CrossProduct, Gathered, Join, Marking, Padding, Probe, Progress, Schema,
+        Side, Sink, Stream, VECTOR_SIZE, equalities, side_of,
     };
     use crate::gather::Keep;
 
@@ -3366,6 +3578,298 @@ mod tests {
                 &memory,
             );
             assert!(made.is_none(), "a {} join is not a marking join", kind.keyword());
+        }
+    }
+
+    /// What a padding join produced, split into the half that streamed and the half that waited.
+    ///
+    /// The split is the point of the operator, so a test that put the two back together again
+    /// would be checking the answer and not the thing worth checking.
+    #[derive(Debug)]
+    struct Answered {
+        /// The pairs, in the order the driving rows arrived.
+        pairs: Vec<Vec<Value>>,
+        /// The gathered rows nothing matched, padded, in the order the gathered side holds them.
+        padded: Vec<Vec<Value>>,
+        /// How many rows were in each chunk the drain produced.
+        chunks: Vec<usize>,
+    }
+
+    /// Every row of one chunk, `width` columns wide.
+    fn rows_of(chunk: &Chunk, width: usize) -> Vec<Vec<Value>> {
+        (0..chunk.len())
+            .map(|row| (0..width).map(|column| chunk.value_at(row, column)).collect())
+            .collect()
+    }
+
+    /// Run a padding join over one gathered side and a driving chunk per instance.
+    ///
+    /// `driving` is a chunk per instance rather than a chunk per call, so a test that hands over
+    /// two of them is a test of two instances setting bits in the one shared bitmap. `kind` is
+    /// this operator's own, which is the join with the gathered side on the right, and the
+    /// gathered side is the plan's left, which is the way round `sides` produces.
+    fn padding(kind: JoinKind, gathered: &[Option<i32>], driving: &[&[Option<i32>]]) -> Answered {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("b", 1), schema("a", 0));
+        let conditions = {
+            let one = column(&mut plan, 1, LogicalType::Integer);
+            let other = column(&mut plan, 0, LogicalType::Integer);
+            let key = equal(&mut plan, one, other);
+            plan.add_expr_list(&[key])
+        };
+        let memory = Memory::unlimited();
+        let kept = gathered_side(gathered, &memory);
+        let pad = Padding::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+            kind,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("one equality is enough to pair on");
+        answered(&pad, &driving.iter().map(|rows| some_chunk(rows)).collect::<Vec<Chunk>>(), 2)
+    }
+
+    /// The gathered side, kept the way the pipeline before it would, a vector at a time.
+    ///
+    /// Not [`subject`], which takes the lot in one chunk, because a gathered side long enough to
+    /// make the drain produce more than one chunk is longer than a chunk can be.
+    fn gathered_side(rows: &[Option<i32>], memory: &Memory) -> Buffered {
+        let (keep, kept) = Keep::new(memory);
+        let mut local = keep.local();
+        for piece in rows.chunks(VECTOR_SIZE) {
+            keep.sink(&some_chunk(piece), &mut local).expect("the gathered rows");
+        }
+        keep.combine(local).expect("the one instance");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+        kept
+    }
+
+    /// Push a chunk per instance through a padding join and then take what it owes.
+    fn answered(pad: &Padding<'_>, driving: &[Chunk], width: usize) -> Answered {
+        pad.prepare(&rudb_pipeline::Lease::alone()).expect("the table");
+        let mut pairs = Vec::new();
+        for chunk in driving {
+            let mut local = pad.local();
+            let mut chunk = chunk.clone();
+            loop {
+                let progress = pad.push(&mut chunk, &mut local).expect("a chunk");
+                pairs.extend(rows_of(&chunk, width));
+                if progress != Progress::Again {
+                    break;
+                }
+                chunk = Chunk::empty(&[]);
+            }
+        }
+        let mut padded = Vec::new();
+        let mut chunks = Vec::new();
+        pad.drain(&mut |chunk| {
+            chunks.push(chunk.len());
+            padded.extend(rows_of(chunk, width));
+            Ok(Progress::More)
+        })
+        .expect("the gathered rows nothing matched");
+        Answered { pairs, padded, chunks }
+    }
+
+    /// The point of the operator. The pairs come out as the driving rows arrive and the gathered
+    /// row nothing matched comes out at the end, which is what lets the driving side run on every
+    /// thread the machine has rather than on however many the gathered side is worth.
+    #[test]
+    fn a_padding_right_join_streams_the_pairs_and_pads_what_nothing_matched() {
+        let answer = padding(JoinKind::Right, &[Some(1), Some(2), Some(3)], &[&[Some(3), Some(1)]]);
+        assert_eq!(
+            answer.pairs,
+            [
+                vec![Value::Integer(3), Value::Integer(3)],
+                vec![Value::Integer(1), Value::Integer(1)]
+            ]
+        );
+        assert_eq!(answer.padded, [vec![Value::Integer(2), Value::Null]]);
+    }
+
+    /// A full join is the same drain with the other half of the pairing. The driving row nothing
+    /// matched is padded by the probe as it arrives, because that much is known then, and only
+    /// the gathered row nothing matched has to wait.
+    #[test]
+    fn a_padding_full_join_pads_the_driving_side_as_it_goes_and_the_gathered_side_at_the_end() {
+        let answer = padding(JoinKind::Full, &[Some(1), Some(2)], &[&[Some(2), Some(9)]]);
+        assert_eq!(
+            answer.pairs,
+            [vec![Value::Integer(2), Value::Integer(2)], vec![Value::Null, Value::Integer(9)]]
+        );
+        assert_eq!(answer.padded, [vec![Value::Integer(1), Value::Null]]);
+    }
+
+    /// A gathered row matched many times is paired many times and padded none, which is what one
+    /// bit per gathered row gives without anything having to count.
+    #[test]
+    fn a_padding_join_pads_a_gathered_row_no_times_however_often_it_matched() {
+        let answer = padding(JoinKind::Right, &[Some(1), Some(2)], &[&[Some(2), Some(2), Some(2)]]);
+        assert_eq!(answer.pairs.len(), 3);
+        assert_eq!(answer.padded, [vec![Value::Integer(1), Value::Null]]);
+    }
+
+    /// Two instances setting bits in the one bitmap. A gathered row is padded only when neither
+    /// of them matched it, which is what makes the driving side safe to run in parallel.
+    #[test]
+    fn a_padding_join_puts_the_bits_of_two_instances_together() {
+        let answer =
+            padding(JoinKind::Right, &[Some(1), Some(2), Some(3)], &[&[Some(1)], &[Some(3)]]);
+        assert_eq!(answer.padded, [vec![Value::Integer(2), Value::Null]]);
+    }
+
+    /// Nothing drives it at all, so nothing matched anything and the whole gathered side is owed.
+    #[test]
+    fn a_padding_join_over_a_driving_side_with_no_rows_pads_every_gathered_row() {
+        let answer = padding(JoinKind::Right, &[Some(1), Some(2)], &[]);
+        assert_eq!(answer.pairs, Vec::<Vec<Value>>::new());
+        assert_eq!(
+            answer.padded,
+            [vec![Value::Integer(1), Value::Null], vec![Value::Integer(2), Value::Null]]
+        );
+    }
+
+    /// A gathered side with no rows in it owes nothing, and the table it built is the empty one
+    /// every driving row misses in. A right join drops those rows and a full join keeps them.
+    #[test]
+    fn a_padding_join_over_an_empty_gathered_side_owes_nothing() {
+        let right = padding(JoinKind::Right, &[], &[&[Some(1)]]);
+        assert_eq!(right.pairs, Vec::<Vec<Value>>::new());
+        assert_eq!(right.padded, Vec::<Vec<Value>>::new());
+        let full = padding(JoinKind::Full, &[], &[&[Some(1)]]);
+        assert_eq!(full.pairs, [vec![Value::Null, Value::Integer(1)]]);
+        assert_eq!(full.padded, Vec::<Vec<Value>>::new());
+    }
+
+    /// The null rule, from both ends. Under `=` a null key matches nothing, so a gathered row
+    /// whose key is null is never marked and is always padded, and a driving row whose key is
+    /// null matches nothing either.
+    #[test]
+    fn a_padding_join_never_matches_a_key_that_is_null() {
+        let answer = padding(JoinKind::Right, &[Some(1), None], &[&[Some(1), None]]);
+        assert_eq!(answer.pairs, [vec![Value::Integer(1), Value::Integer(1)]]);
+        assert_eq!(answer.padded, [vec![Value::Null, Value::Null]]);
+    }
+
+    /// The condition the lookup did not answer, applied to the candidates the equality found. A
+    /// gathered row the residual threw away has not been matched, so it is owed a padded row, and
+    /// getting that wrong is the difference between a right join and an inner one.
+    #[test]
+    fn a_padding_join_pads_a_gathered_row_the_residual_threw_away() {
+        let mut plan = Plan::new();
+        let (left, right) = (pair_schema(1), pair_schema(0));
+        let conditions = {
+            let one = column_at(&mut plan, 1, 0, LogicalType::Integer);
+            let other = column_at(&mut plan, 0, 0, LogicalType::Integer);
+            let key = equal(&mut plan, one, other);
+            let driving_g = column_at(&mut plan, 1, 1, LogicalType::Integer);
+            let gathered_g = column_at(&mut plan, 0, 1, LogicalType::Integer);
+            let over = greater(&mut plan, driving_g, gathered_g);
+            plan.add_expr_list(&[key, over])
+        };
+        let memory = Memory::unlimited();
+        let (keep, kept) = Keep::new(&memory);
+        let mut local = keep.local();
+        // Two gathered rows on the same key, told apart only by the column the residual reads.
+        keep.sink(&pair_chunk(&[(7, 1), (7, 9), (8, 1)]), &mut local).expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+        let pad = Padding::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+            JoinKind::Right,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("an equality beside a residual is still a lookup");
+
+        // Key 7 finds both gathered rows and the residual keeps the one whose `g` is under 5. Key
+        // 8 finds the third and the residual throws it away, so two of the three are owed.
+        let answer = answered(&pad, &[pair_chunk(&[(7, 5), (8, 0)])], 4);
+        assert_eq!(
+            answer.pairs,
+            [vec![Value::Integer(7), Value::Integer(1), Value::Integer(7), Value::Integer(5)]]
+        );
+        assert_eq!(
+            answer.padded,
+            [
+                vec![Value::Integer(7), Value::Integer(9), Value::Null, Value::Null],
+                vec![Value::Integer(8), Value::Integer(1), Value::Null, Value::Null]
+            ]
+        );
+    }
+
+    /// The drain hands over a chunk at a time rather than one row or the lot, so a gathered side
+    /// nothing matched does not turn into an allocation the size of the side.
+    #[test]
+    fn a_padding_joins_drain_hands_over_a_vector_at_a_time() {
+        let rows: Vec<Option<i32>> = (0..VECTOR_SIZE as i32 + 5).map(Some).collect();
+        let answer = padding(JoinKind::Right, &rows, &[]);
+        assert_eq!(answer.chunks, [VECTOR_SIZE, 5]);
+        assert_eq!(answer.padded.len(), VECTOR_SIZE + 5);
+    }
+
+    /// No key for the scan under the driving side, and this is the one thing turning an outer
+    /// join around costs. The rows such a filter removes are the ones that were going to match
+    /// nothing, which is exactly the half of the answer the drain produces.
+    #[test]
+    fn a_padding_join_offers_no_key_to_the_scan() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("b", 1), schema("a", 0));
+        let conditions = {
+            let one = column(&mut plan, 1, LogicalType::Integer);
+            let other = column(&mut plan, 0, LogicalType::Integer);
+            let key = equal(&mut plan, one, other);
+            plan.add_expr_list(&[key])
+        };
+        let memory = Memory::unlimited();
+        let kept = subject(&[Some(1)], &memory);
+        let pad = Padding::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+            JoinKind::Right,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("one equality is enough to pair on");
+        assert!(pad.sideways().is_none(), "a padding join has no key it can offer");
+    }
+
+    /// The operator refuses the join it was not written for rather than answering it wrongly.
+    /// Only `sides` puts a gathered side on the kept end and it only does it for these two, but
+    /// the refusal is what makes that a fact about one pass rather than an agreement between two.
+    #[test]
+    fn a_padding_join_refuses_a_kind_it_does_not_answer() {
+        let mut plan = Plan::new();
+        let (left, right) = (schema("b", 1), schema("a", 0));
+        let conditions = {
+            let one = column(&mut plan, 1, LogicalType::Integer);
+            let other = column(&mut plan, 0, LogicalType::Integer);
+            let key = equal(&mut plan, one, other);
+            plan.add_expr_list(&[key])
+        };
+        let memory = Memory::unlimited();
+        for kind in
+            [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti, JoinKind::Mark]
+        {
+            let kept = subject(&[Some(1)], &memory);
+            let made = Padding::new(
+                &plan,
+                &left,
+                &Gathered { schema: &right, chunks: kept, marker: None, swapped: true },
+                kind,
+                conditions,
+                &Cancel::new(),
+                &memory,
+            );
+            assert!(made.is_none(), "a {} join is not a padding join", kind.keyword());
         }
     }
 }

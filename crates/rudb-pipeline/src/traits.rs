@@ -116,6 +116,39 @@ pub trait Stream: Send + Sync + fmt::Debug {
         Ok(())
     }
 
+    /// Whether this operator owes chunks once every instance has finished reading.
+    ///
+    /// Almost nothing does, and the cost of asking is one virtual call per operator per pipeline,
+    /// which is why it is a question rather than a drain that turns out to be empty. A driver that
+    /// is told no by every operator skips building the state a drain would need.
+    fn drains(&self) -> bool {
+        false
+    }
+
+    /// The chunks this operator owes, once every instance has finished reading.
+    ///
+    /// An outer join that gathered the side it keeps is why this is here. It pairs a driving row
+    /// with what it matched as the row arrives, which is a stream, and it also owes a padded row
+    /// for every gathered row nothing matched, which is not known until the last driving row has
+    /// been through. Without somewhere to put that second half such a join has to be a sink, and a
+    /// sink materialises the whole answer rather than the part of it nobody could have produced
+    /// earlier. TPC-H q13's `LEFT JOIN` produces 1.5 million pairs and owes about fifty thousand
+    /// padded rows, so the part that has to wait is three percent of the answer and the other
+    /// ninety seven percent streams.
+    ///
+    /// Called once per run of the pipeline, after every instance has finished its morsels and
+    /// before the sink is finalised, on one thread. `out` takes each chunk and pushes it through
+    /// whatever sits below this operator and into the sink, and answers [`Progress::Done`] when
+    /// nothing below wants any more, which an implementation should take as leave to stop.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the operator reports, and whatever `out` reports from below it.
+    fn drain(&self, out: &mut dyn FnMut(&mut Chunk) -> Result<Progress>) -> Result<()> {
+        let _ = out;
+        Ok(())
+    }
+
     /// Transform `chunk` in place.
     ///
     /// May shrink it through its selection and may replace its columns. May not grow it past the

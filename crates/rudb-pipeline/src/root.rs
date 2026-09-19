@@ -96,6 +96,17 @@ impl Order {
             }
         }
     }
+
+    /// Move everything still waiting onto the ready queue, in key order.
+    ///
+    /// For the end of a run, once every instance has combined and nothing is being read, so there
+    /// is nothing left that could still arrive before any of it. [`Order::release`] cannot do this
+    /// on its own because it stops at the first morsel that has not finished, and a chunk that came
+    /// out of a drain rather than a morsel is keyed after every morsel a source will ever hand out.
+    /// See `crate::serial::drain`.
+    fn rest(&mut self, ready: &mut VecDeque<Chunk>) {
+        ready.extend(std::mem::take(&mut self.waiting).into_values());
+    }
 }
 
 /// A sink that hands finished chunks to a caller outside the engine.
@@ -252,7 +263,7 @@ impl Sink for RootSink {
             let mut queue = self.shared.queue.lock().map_err(poisoned)?;
             let Queue { ready, order } = &mut *queue;
             if let Some(order) = order.as_mut() {
-                order.release(ready);
+                order.rest(ready);
             }
         }
         self.shared.finished.store(true, Ordering::Release);
