@@ -125,3 +125,18 @@ COPY (SELECT '5' AS a) TO 'parts/widen/b_text.parquet';
 DuckDB reads `parts/p*.parquet` as 7 rows summing to 49, `parts/*/p*.parquet` as 2 rows summing to 201, and `parts/**/p*.parquet` as 9 rows summing to 250.
 
 The three names that are not `p` something are the awkward cases and are kept out of the way of the patterns above on purpose. `odd` is a pair of files that do not agree about their columns, which is the schema mismatch message. `widen` is a pair that agree about the name and not the type, where the first file decides and the second is cast to it, so the two rows read as the integers 1 and 5.
+
+## sorted.parquet
+
+Written by DuckDB, Snappy, eight row groups of 2048 rows. The file the zone map estimates are measured against, and the one thing that makes it different from the others here is that `k` is in ascending order, so every row group's bounds cover a different stretch of it and a filter on `k` rules groups out.
+
+```sql
+COPY (
+  SELECT i::BIGINT AS k, (i % 97)::INTEGER AS g
+  FROM range(16384) tbl(i)
+) TO 'sorted.parquet' (FORMAT parquet, ROW_GROUP_SIZE 2048, COMPRESSION snappy);
+```
+
+Eight groups is not an accident. The estimator holds its guess under the rows in the groups the bounds leave, and the guess for one condition is a fifth of the file, so a ceiling only bites when fewer than a fifth of the groups survive. Four groups of 4096 would never reach that and would test nothing.
+
+DuckDB reads it as n=16384, sum(k)=134209536, sum(g)=786036, and answers 100 rows for `k < 100`, 8192 for `k >= 8192`, 169 for `g = 5` and none for `k > 999999`. `g` is `i % 97`, so every row group holds every value of it and no filter on `g` rules a group out, which is the control.

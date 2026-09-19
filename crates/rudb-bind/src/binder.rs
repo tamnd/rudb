@@ -12,7 +12,10 @@
 //! the plan as [`Expr::Cast`] nodes, so an executor never has to decide what a comparison between
 //! an `INTEGER` and a `BIGINT` does.
 
+use std::sync::Arc;
+
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
+use rudb_common::bounds::Zones;
 use rudb_common::{
     Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, Value,
 };
@@ -157,8 +160,8 @@ struct WindowParts {
 ///
 /// The answers travel together because they come out of the same footer. A Parquet file states its
 /// columns, its row count and its statistics in the same few kilobytes at the end of it, so a
-/// binder that has read one has read all of them, and splitting them into three arguments would
-/// mean three ways to forget one.
+/// binder that has read one has read all of them, and splitting them into four arguments would
+/// mean four ways to forget one.
 #[derive(Debug)]
 struct Read {
     /// The columns the call produces, in the order the file stores them.
@@ -167,12 +170,14 @@ struct Read {
     rows: Stat<u64>,
     /// How many distinct values a column holds, by name, for the columns anybody counted.
     distincts: Vec<(String, u64)>,
+    /// The bounds the files keep per part of themselves, where anything can answer for them.
+    zones: Option<Arc<dyn Zones>>,
 }
 
 impl Read {
     /// Columns that came from somewhere other than a file, so nothing counted anything.
     fn uncounted(fields: Vec<Field>) -> Self {
-        Self { fields, rows: Stat::Unknown, distincts: Vec::new() }
+        Self { fields, rows: Stat::Unknown, distincts: Vec::new(), zones: None }
     }
 }
 
@@ -1699,6 +1704,7 @@ impl<'a> Binder<'a> {
         // columns are fixed, because none of those reads a file to find out how tall it is.
         let mut measured = Stat::Unknown;
         let mut counted: Vec<(String, u64)> = Vec::new();
+        let mut bounded: Option<Arc<dyn Zones>> = None;
         let fields = match resolved.columns {
             Columns::Fixed(fields) => fields,
             columns => {
@@ -1715,6 +1721,7 @@ impl<'a> Binder<'a> {
                         let footers = parquet_footers(&paths)?;
                         measured = footers.rows;
                         counted = footers.distincts;
+                        bounded = footers.zones;
                         footers.fields
                     }
                 };
@@ -1766,7 +1773,7 @@ impl<'a> Binder<'a> {
             resolved.function,
             &cast,
             &written_options,
-            Read { fields, rows: measured, distincts: counted },
+            Read { fields, rows: measured, distincts: counted, zones: bounded },
             &label,
             &names,
         )
@@ -2001,7 +2008,12 @@ impl<'a> Binder<'a> {
         let read = match function {
             TableFunction::ReadParquet => {
                 let footers = parquet_footers(&paths)?;
-                Read { fields: footers.fields, rows: footers.rows, distincts: footers.distincts }
+                Read {
+                    fields: footers.fields,
+                    rows: footers.rows,
+                    distincts: footers.distincts,
+                    zones: footers.zones,
+                }
             }
             _ => Read::uncounted(csv_fields(&paths, Given::default())?),
         };
@@ -2065,7 +2077,7 @@ impl<'a> Binder<'a> {
         label: &str,
         names: &[&str],
     ) -> Result<(NodeRef, Scope)> {
-        let Read { fields, rows, distincts } = read;
+        let Read { fields, rows, distincts, zones } = read;
         let index = self.fresh_index();
         // Against the table index rather than against the node, because a pass is free to move the
         // node and none of them can move an index: an index is what a column reference names and
@@ -2076,6 +2088,9 @@ impl<'a> Binder<'a> {
         }
         for (column, distinct) in distincts {
             self.plan.measure_distinct(index, &column, distinct);
+        }
+        if let Some(zones) = zones {
+            self.plan.set_zones(index, zones);
         }
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {

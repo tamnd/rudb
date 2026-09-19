@@ -184,6 +184,57 @@ impl Bound {
     }
 }
 
+/// One comparison against one column, with the bound it is testing for.
+///
+/// Here rather than beside whichever store answers it, for the same reason [`Op`] and [`Bound`] are
+/// here: the question does not depend on where the minimum and the maximum came from. A Parquet row
+/// group and a chunk of a table in memory get asked the same thing in the same words, and the
+/// planner asks it of both without knowing which it is holding.
+#[derive(Debug, Clone)]
+pub struct Test {
+    /// Which column of the store's flat schema, numbered the way the store numbers its columns.
+    pub column: usize,
+    /// The comparison, written with the column on the left.
+    pub op: Op,
+    /// The constant the column is compared against.
+    pub value: Bound,
+}
+
+/// A store that keeps rows in parts and a minimum and a maximum per part, asked how much of itself
+/// a filter can rule out.
+///
+/// The planner wants this and cannot compute it. Deciding which parts a filter rules out needs the
+/// bounds, the bounds are in the file, and by the time anything plans over the file the file is
+/// closed. So whatever read the bounds answers the question, and the planner holds the answer
+/// behind this trait rather than holding the bounds themselves: a hundred and five columns across
+/// eight thousand row groups is not something to copy into a plan, and it is already parsed and
+/// already in memory on the side that read it.
+///
+/// The row count is not here. How many rows there are in total is a count, it is [`Stat`] shaped,
+/// and it already rides on the plan on its own. What is here is the part that needs the bounds.
+///
+/// [`Stat`]: crate::Stat
+pub trait Zones: std::fmt::Debug + Send + Sync {
+    /// Which column of this store's own numbering the column called `name` is.
+    ///
+    /// The planner has a name and this wants a position, and nothing else can do the translation.
+    /// A plan numbers a scan's columns by where they sit in what that scan produces, which column
+    /// pruning moves and which is not the file's order once anything has been pruned. The store
+    /// knows its own order, so the store is asked. `None` for a name it does not have, which is
+    /// what a column the query computed rather than read looks like from here.
+    fn column(&self, name: &str) -> Option<usize>;
+
+    /// How many rows are in the parts that `tests` cannot rule out.
+    ///
+    /// A ceiling and not a count: a part that survives holds rows the filter wants, or it holds
+    /// none and the bounds could not say so. With no tests at all this is every row, which is the
+    /// honest answer to a question nothing was asked.
+    ///
+    /// `None` where the store cannot say, which is a count it cannot represent rather than a store
+    /// with no bounds. No bounds means nothing is ruled out, which is a number.
+    fn surviving(&self, tests: &[Test]) -> Option<u64>;
+}
+
 /// Whether `column op value` is false for every value between `low` and `high`.
 ///
 /// `low` and `high` are the smallest and the largest value of the stretch being tested, either of

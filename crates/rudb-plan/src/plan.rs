@@ -1,7 +1,9 @@
 //! The arena a plan lives in, and the invariant that keeps its indices honest.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use rudb_common::bounds::Zones;
 use rudb_common::{Error, Field, LogicalType, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
@@ -60,6 +62,19 @@ pub struct Plan {
     /// and moves nothing else, and a number keyed to a position a pass has since changed is worse
     /// than no number.
     distincts: BTreeMap<(u32, String), u64>,
+    /// The minimum and the maximum per part of the table bound at an index, where anything kept
+    /// them.
+    ///
+    /// Here for the same reason as `measured`, and behind a trait object rather than as numbers
+    /// because of how many numbers there are. A Parquet file this matters on has a hundred and five
+    /// columns in eight thousand row groups, which is one and a half million pairs, and they are
+    /// already parsed and already in memory on the side that read the footer. What the planner
+    /// wants out of them is one number per filter, so the question goes to the bounds rather than
+    /// the bounds onto the plan.
+    ///
+    /// Shared and never mutated, so cloning a plan shares these rather than copying them, which is
+    /// what makes the optimizer running its passes twice to check they settle cost nothing here.
+    zones: BTreeMap<u32, Arc<dyn Zones>>,
 }
 
 impl Default for Plan {
@@ -100,6 +115,7 @@ impl Plan {
             root: 0,
             measured: BTreeMap::new(),
             distincts: BTreeMap::new(),
+            zones: BTreeMap::new(),
         }
     }
 
@@ -154,6 +170,28 @@ impl Plan {
     #[must_use]
     pub fn distinct_count(&self) -> usize {
         self.distincts.len()
+    }
+
+    /// Records what the table bound at `index` keeps as bounds per part of itself.
+    ///
+    /// Called only for a table something can answer for, which today is a `read_parquet` of a
+    /// single file. A table with no entry answers `None` and the estimate falls back to the guess
+    /// it made before there was anything better, which is the right answer for a store that keeps
+    /// no bounds as well as for one nobody asked.
+    pub fn set_zones(&mut self, index: u32, zones: Arc<dyn Zones>) {
+        self.zones.insert(index, zones);
+    }
+
+    /// What the table bound at `index` keeps as bounds, where anything does.
+    #[must_use]
+    pub fn zones(&self, index: u32) -> Option<&Arc<dyn Zones>> {
+        self.zones.get(&index)
+    }
+
+    /// How many tables carry bounds, which is what a test about this asks.
+    #[must_use]
+    pub fn zones_count(&self) -> usize {
+        self.zones.len()
     }
 
     /// How many nodes are in the arena, reachable or not.
@@ -1259,6 +1297,43 @@ mod tests {
         assert_eq!(plan.distinct_measured(4, "n_name"), None);
         assert_eq!(plan.distinct_measured(5, "n_nationkey"), None);
         assert_eq!(plan.distinct_count(), 1);
+    }
+
+    /// A store that says it has one column called `d` and that a filter on it leaves 42 rows.
+    #[derive(Debug)]
+    struct Stub;
+
+    impl Zones for Stub {
+        fn column(&self, name: &str) -> Option<usize> {
+            (name == "d").then_some(0)
+        }
+
+        fn surviving(&self, _tests: &[rudb_common::bounds::Test]) -> Option<u64> {
+            Some(42)
+        }
+    }
+
+    #[test]
+    fn a_table_with_no_bounds_recorded_answers_nothing_and_is_not_an_empty_set_of_bounds() {
+        // Same distinction as the row counts above. A store nobody asked and a store that rules
+        // nothing out are different, and the estimator falls back to its guess only for the first.
+        let mut plan = Plan::new();
+        assert!(plan.zones(0).is_none());
+        assert_eq!(plan.zones_count(), 0);
+        plan.set_zones(3, Arc::new(Stub));
+        assert!(plan.zones(3).is_some());
+        assert!(plan.zones(4).is_none(), "the index has to match, two scans are two stores");
+        assert_eq!(plan.zones_count(), 1);
+    }
+
+    #[test]
+    fn the_store_recorded_for_a_table_is_the_one_that_answers_for_it() {
+        let mut plan = Plan::new();
+        plan.set_zones(0, Arc::new(Stub));
+        let zones = plan.zones(0).expect("just recorded");
+        assert_eq!(zones.column("d"), Some(0));
+        assert_eq!(zones.column("e"), None);
+        assert_eq!(zones.surviving(&[]), Some(42));
     }
 
     #[test]

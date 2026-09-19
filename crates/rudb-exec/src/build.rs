@@ -54,8 +54,8 @@ use rudb_pipeline::{
     BufferId, DynSink, DynStream, Pipeline, PipelineId, Source, Watched, root, root_in_order,
 };
 use rudb_plan::{
-    BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
-    PipelineRef, Plan, ROOT, Shape, Slice, seams_of,
+    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, PipelineRef, Plan,
+    ROOT, Shape, Slice, seams_of,
 };
 use rudb_seam::Settings;
 
@@ -823,86 +823,6 @@ fn count(rows: u64) -> Result<Value> {
     ))
 }
 
-/// What a filter over a scan can tell that scan before it reads anything.
-///
-/// Both kinds of scan keep the smallest and the largest value of each of their columns: a Parquet
-/// file keeps them per row group in its footer, and a table in memory keeps them per chunk in a zone
-/// map. A conjunct comparing one of those columns against a constant can rule a whole unit out
-/// without touching a row of it. This pulls out the conjuncts of that shape and drops everything
-/// else, which is the conservative direction: a test that is not here costs time, a test that is
-/// here wrongly costs rows.
-///
-/// Only an `AND` is walked into. Under an `OR` a conjunct being false says nothing about the row,
-/// and a `NOT` is already gone by the time the plan is bound. Of the table functions only
-/// `read_parquet` is worth doing this for, because a CSV has no footer to read. Only a comparison
-/// against this scan's own columns counts, since a binding into some other operator's output is not
-/// in this table at all.
-fn bounds(plan: &Plan, input: NodeRef, predicate: ExprRef) -> Vec<(usize, Op, Bound)> {
-    let index = match *plan.node(input) {
-        Node::TableFunction { index, function, .. } => {
-            if TableFunction::lookup(plan.string(function)) != Some(TableFunction::ReadParquet) {
-                return Vec::new();
-            }
-            index
-        }
-        Node::Get { index, .. } => index,
-        _ => return Vec::new(),
-    };
-    let mut tests = Vec::new();
-    conjuncts(plan, predicate, index, &mut tests);
-    tests
-}
-
-/// Every conjunct of `predicate` that reads as a bounds test, appended to `out`.
-fn conjuncts(plan: &Plan, predicate: ExprRef, index: u32, out: &mut Vec<(usize, Op, Bound)>) {
-    match *plan.expr(predicate) {
-        Expr::Conjunction { op: ConjunctionOp::And, children } => {
-            for child in plan.expr_list(children) {
-                conjuncts(plan, *child, index, out);
-            }
-        }
-        Expr::Compare { op, left, right } => {
-            if let Some(test) = comparison(plan, op, left, right, index) {
-                out.push(test);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// One comparison read as a test on a column of the scan numbered `index`, if it is one.
-///
-/// Written either way round, because `5 < a` and `a > 5` say the same thing and the optimizer does
-/// not normalise which side the constant sits on. The comparisons that survive a null are the four
-/// orderings and equality: `<>` rules out a row group only when the group holds one distinct value,
-/// which the footer does not say, and the two distinctness operators are about nulls rather than
-/// about bounds.
-fn comparison(
-    plan: &Plan,
-    op: CompareOp,
-    left: ExprRef,
-    right: ExprRef,
-    index: u32,
-) -> Option<(usize, Op, Bound)> {
-    let op = match op {
-        CompareOp::Equal => Op::Equal,
-        CompareOp::Less => Op::Less,
-        CompareOp::LessOrEqual => Op::LessOrEqual,
-        CompareOp::Greater => Op::Greater,
-        CompareOp::GreaterOrEqual => Op::GreaterOrEqual,
-        CompareOp::NotEqual | CompareOp::DistinctFrom | CompareOp::NotDistinctFrom => return None,
-    };
-    let (op, binding, value) = match (plan.expr(left), plan.expr(right)) {
-        (Expr::Column(binding), Expr::Constant(value)) => (op, *binding, *value),
-        (Expr::Constant(value), Expr::Column(binding)) => (op.flipped(), *binding, *value),
-        _ => return None,
-    };
-    if binding.table != index {
-        return None;
-    }
-    Some((binding.column as usize, op, Bound::of_value(plan.value(value))?))
-}
-
 /// A pipeline being built from the bottom up.
 ///
 /// It is not a [`Pipeline`] yet because it has no sink. What ends it is whichever node above it
@@ -1298,7 +1218,7 @@ impl<'a> Building<'a, '_> {
                 below.then(Arc::new(Watched::new(fetch, counters)), schema)
             }
             Node::Filter { input, predicate } => {
-                self.pruning = bounds(plan, input, predicate);
+                self.pruning = rudb_opt::bounds::of(plan, input, predicate);
                 let below = match count_having_aggregate(plan, input, predicate) {
                     Some((aggregate, call, minimum)) => {
                         let Node::Aggregate { input: under, index, groups, aggregates } =
