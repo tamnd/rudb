@@ -80,7 +80,7 @@ use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::settingnames::settingnames;
-use crate::sideways::{Keyed, Sideways};
+use crate::sideways::{self, Keyed, Sideways};
 use crate::sort::Sort;
 use crate::source::{Dummy, FileScan, Frequencies, Scan, Series, Summary, Values};
 use crate::strategies::strategies;
@@ -1039,10 +1039,15 @@ impl<'a> Building<'a, '_> {
         let pipeline = self.shape.pipeline(reference);
         // A runtime filter reaches a scan through a filter and a projection and through nothing
         // else, because everything else either rebinds the column it is about or decides which rows
-        // come out by counting them. See `Builder::sideways`.
+        // come out by counting them. See `Builder::sideways`. A table function is a scan for this
+        // purpose when it reads a file, and the branch below takes the filter whether it is one or
+        // not, so a table function that is not a file scan drops it here all the same.
         if !matches!(
             *plan.node(reference),
-            Node::Get { .. } | Node::Filter { .. } | Node::Project { .. }
+            Node::Get { .. }
+                | Node::Filter { .. }
+                | Node::Project { .. }
+                | Node::TableFunction { .. }
         ) {
             self.sideways = None;
         }
@@ -1076,12 +1081,15 @@ impl<'a> Building<'a, '_> {
             }
             Node::TableFunction { index, function, args, options, settings, columns } => {
                 let name = plan.string(function);
+                // Taken here rather than inside the file scan arm so that a table function that is
+                // not one leaves nothing behind for whatever is built next.
+                let runtime = self.sideways.take();
                 match TableFunction::lookup(name) {
                     Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
                         let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
                         let tests = std::mem::take(&mut self.pruning);
                         let scan = FileScan::new(
-                            plan, index, function, args, options, settings, columns, tests,
+                            plan, index, function, args, options, settings, columns, tests, runtime,
                         )?
                         .watched(counters.clone());
                         let schema = scan.schema().clone();
@@ -1411,7 +1419,14 @@ impl<'a> Building<'a, '_> {
                     // to hand over is a question about the conditions and only this operator has
                     // split them. A join that answers nothing leaves the filter inert, which is a
                     // scan that reads everything exactly as it did before.
-                    if let Some((key, binding)) = probe.sideways() {
+                    // The binding the join knows is the one the projection above the scan hands it,
+                    // so it is turned into the scan's own before either half is armed. Both halves
+                    // together, because the build side pass that fills the filter is only worth
+                    // making when there is a scan that will read it.
+                    let armed = probe.sideways().and_then(|(key, binding)| {
+                        Some((key, sideways::beneath(plan, driving, binding)?))
+                    });
+                    if let Some((key, binding)) = armed {
                         sideways.keying(Keyed::new(
                             plan,
                             key,

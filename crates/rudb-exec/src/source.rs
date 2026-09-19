@@ -1028,8 +1028,14 @@ impl Source for Series {
 /// parsed footer through [`Reader::split`]. So the scan holds no lock across a read, which is the
 /// whole point: the version of this before #486 had one morsel, one reader and a mutex around it,
 /// and a second thread asking for work got none.
+///
+/// `sideways` is what a join above this scan worked out about the key it is going to look these
+/// rows up by, which is the same handoff [`Scan`] takes and for the same reason. It arrives here
+/// rather than in the plan because it is not known until the join's other side has finished. Only
+/// the filter tier is read: the range tier would have to reach the row group bounds, and those are
+/// asked before the build side has run.
 #[derive(Debug)]
-pub(crate) struct FileScan {
+pub(crate) struct FileScan<'a> {
     function: TableFunction,
     paths: Vec<String>,
     given: Given,
@@ -1062,6 +1068,13 @@ pub(crate) struct FileScan {
     /// reader once the rows are out and because a driver is allowed to ask again.
     open: Mutex<HashMap<u64, Arc<Mutex<Piece>>>>,
     counters: Option<Arc<Counters>>,
+    /// The runtime filter of the join this scan drives, empty for a scan that drives no join.
+    sideways: Option<Arc<Sideways<'a>>>,
+    /// Which table index this scan's columns bind against, which is how the runtime filter knows
+    /// whether it is about one of them.
+    index: u32,
+    /// Whether the runtime filter has been earning the hash it costs.
+    paying: Paying,
 }
 
 /// How many rows a scan aims to put in one morsel.
@@ -1260,7 +1273,7 @@ struct Piece {
     row: i64,
 }
 
-impl FileScan {
+impl<'a> FileScan<'a> {
     /// The rows of a `read_parquet` or `read_csv` call, over every file it names.
     ///
     /// # Errors
@@ -1280,6 +1293,7 @@ impl FileScan {
         settings: Slice,
         columns: Slice,
         tests: Vec<(usize, Op, Bound)>,
+        sideways: Option<Arc<Sideways<'a>>>,
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
         let given = csv_options(plan, options, settings)?;
@@ -1315,6 +1329,9 @@ impl FileScan {
             }),
             open: Mutex::new(HashMap::new()),
             counters: None,
+            sideways,
+            index,
+            paying: Paying::default(),
         };
         // The first file is opened now rather than on the first read, so that a file that has gone
         // missing since binding is reported where a caller is still asking a question about this
@@ -1324,6 +1341,40 @@ impl FileScan {
             scan.advance(&mut cutting)?;
         }
         Ok(scan)
+    }
+
+    /// Drops the rows of one chunk that a join above this scan cannot hold a match for.
+    ///
+    /// The same test [`Scan::sift`] makes and the same argument for it, applied where the rows come
+    /// out of a file rather than out of a stored table. One hash of one column and one cache line
+    /// touched per row, against a filter holding the keys the build side turned out to have.
+    ///
+    /// Nothing at all for a scan with no join above it, which is two loads and a branch per chunk,
+    /// and nothing either once [`Paying`] has decided the filter is not turning enough rows away to
+    /// be worth hashing for.
+    ///
+    /// # Errors
+    ///
+    /// Whatever narrowing the chunk to the rows that survived raises.
+    fn sift(&self, chunk: &mut Chunk) -> Result<()> {
+        let Some((at, filter)) = self.sideways.as_ref().and_then(|s| s.sifting(self.index)) else {
+            return Ok(());
+        };
+        if !self.paying.worth() {
+            return Ok(());
+        }
+        let Ok(column) = chunk.column(at) else { return Ok(()) };
+        let rows = chunk.len();
+        let mut hashes = Vec::new();
+        hash(std::slice::from_ref(column), rows, &mut hashes, Across::TwoInputs);
+        let kept = Selection::from_predicate(rows, |row| filter.holds(hashes[row]));
+        self.paying.saw(rows, kept.len());
+        if kept.len() == rows {
+            return Ok(());
+        }
+        let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+        *chunk = whole.select(&kept)?;
+        Ok(())
     }
 
     /// Connects this source's file counters to the operator row that owns it.
@@ -1494,7 +1545,7 @@ impl FileScan {
     }
 }
 
-impl Source for FileScan {
+impl Source for FileScan<'_> {
     fn morsel(&self) -> Option<Morsel> {
         let mut cutting = self.cutting.lock().ok()?;
         loop {
@@ -1561,6 +1612,10 @@ impl Source for FileScan {
             if self.numbered {
                 chunk = self.number(chunk, &mut piece)?;
             }
+            // After the row numbers rather than before them, because the number a row carries is
+            // its ordinal in the file and dropping rows first would renumber the ones that are
+            // left.
+            self.sift(&mut chunk)?;
             *out = chunk;
             return Ok(Progress::More);
         }
@@ -2087,12 +2142,12 @@ mod tests {
     /// Built from a plan written as text, the way every other operator test in this crate builds
     /// one, because the fields a table function node carries are arena slices and writing them out
     /// by hand would be a test of the arena builders.
-    fn fixture() -> FileScan {
+    fn fixture() -> FileScan<'static> {
         pruned(Vec::new())
     }
 
     /// The same scan with bounds tests on it, which is what a filter above the scan compiles to.
-    fn pruned(tests: Vec<(usize, Op, Bound)>) -> FileScan {
+    fn pruned(tests: Vec<(usize, Op, Bound)>) -> FileScan<'static> {
         let path = format!("{}/../rudb-parquet/testdata/mixed.parquet", env!("CARGO_MANIFEST_DIR"));
         let path = path.replace('\\', "\\\\").replace('\'', "''");
         let text = format!(
@@ -2113,12 +2168,13 @@ mod tests {
             settings,
             columns,
             tests,
+            None,
         )
         .expect("the fixture is there")
     }
 
     /// Every morsel the scan hands out, drained.
-    fn morsels(scan: &FileScan) -> Vec<usize> {
+    fn morsels(scan: &FileScan<'_>) -> Vec<usize> {
         let mut rows = Vec::new();
         while let Some(mut morsel) = scan.morsel() {
             let mut chunk = Chunk::empty(&[]);
