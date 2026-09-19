@@ -519,27 +519,59 @@ fn worth_sifting(working: usize, threads: usize, rows: usize) -> bool {
     working < threads.min(native_instances(rows))
 }
 
-/// The live parts cut into the runs a morsel covers.
+/// The live parts cut into the runs a morsel covers, by the rows they hold rather than by the stripe.
 ///
-/// A stripe is the unit by default, because sixty four parts under one page is the read the disk
-/// wants and a worker that owns the whole stripe owns the page. That only divides the work when
-/// enough stripes have work in them, so a stripe is cut further when they do not, into as many runs
-/// as it takes to give every worker a couple. The cost of cutting is that two workers can end up
-/// inside one stripe and read the same page, and it is paid only when the alternative is a worker
-/// with no page at all.
-fn runs_of(live: &[Vec<usize>], instances: usize) -> Vec<Range<usize>> {
-    let working = live.iter().filter(|parts| !parts.is_empty()).count();
-    let cuts =
-        if working >= instances { 1 } else { instances.saturating_mul(2).div_ceil(working.max(1)) };
-    let mut runs = Vec::with_capacity(working.saturating_mul(cuts));
+/// The unit used to be the stripe, because sixty four parts under one page is the read the disk wants
+/// and a worker that owns the whole stripe owns the page, and a stripe was cut further only when there
+/// were not enough stripes with work in them to go round. What that missed is that two stripes with
+/// work in them are not two equal pieces of work. The statistics leave hundreds of live parts in one
+/// and three in the next, both of them count as a stripe with work in it, and a morsel apiece hands
+/// one worker a hundred times what it hands another. On ClickBench 39 that showed up as the slowest of
+/// five instances taking 2.2 milliseconds against a mean of 0.96, which is more than half the query
+/// spent waiting for one thread.
+///
+/// So the question is how many rows a stripe holds and not whether it holds any. A stripe holding no
+/// more than one worker's share stays one run and reads its own page, which is every stripe of a table
+/// nothing was pruned from, so the ownership the old rule was protecting is untouched in the case it
+/// was written for. A stripe holding more than a share is cut, and it is cut into half shares rather
+/// than into shares, because by then its page is being shared whatever happens and the only thing left
+/// to play for is letting a worker that drew a slow piece be overtaken instead of waited for.
+///
+/// Runs never cross a stripe either way. One that did would own two pages, which is the thing all of
+/// this is avoiding.
+fn runs_of(
+    live: &[Vec<usize>],
+    instances: usize,
+    rows: impl Fn(usize) -> usize,
+) -> Vec<Range<usize>> {
+    let held = |parts: &[usize]| parts.iter().map(|&at| rows(at)).sum::<usize>();
+    let total: usize = live.iter().map(|parts| held(parts)).sum();
+    let share = total.div_ceil(instances.max(1)).max(1);
+    let mut runs: Vec<Range<usize>> = Vec::with_capacity(instances.saturating_mul(2));
     for parts in live {
-        if parts.is_empty() {
+        let Some((&first, &last)) = parts.first().zip(parts.last()) else { continue };
+        if held(parts) <= share {
+            runs.push(first..last + 1);
             continue;
         }
-        let per = parts.len().div_ceil(cuts).max(1);
-        for piece in parts.chunks(per) {
-            let (first, last) = (piece[0], piece[piece.len() - 1]);
-            runs.push(first..last + 1);
+        let piece = share.div_ceil(2).max(1);
+        let mut taken = 0;
+        let mut open = false;
+        for &at in parts {
+            let size = rows(at);
+            // Closed before the part that would take it over rather than after, so a run is at most a
+            // piece. A part bigger than a piece on its own is its own run, because a part is the
+            // smallest thing a morsel can point at.
+            if open && taken + size <= piece {
+                if let Some(run) = runs.last_mut() {
+                    run.end = at + 1;
+                }
+                taken += size;
+            } else {
+                runs.push(at..at + 1);
+                taken = size;
+                open = true;
+            }
         }
     }
     runs
@@ -589,7 +621,7 @@ impl Source for Scan<'_> {
             // each worker has moved on to as well as the one it is in is what stops a straggler
             // reading its own page again, and it costs a page per worker per column.
             self.table.rows().keep_stripes(instances.saturating_mul(2));
-            let runs = runs_of(&live, instances);
+            let runs = runs_of(&live, instances, |at| self.table.rows().chunk_len(at).unwrap_or(0));
             let _ = self.spread.set(Spread { handout: Handout::new(runs.len()), runs });
         }
         Some(instances)
@@ -1988,13 +2020,30 @@ mod tests {
         assert!(!worth_sifting(1, 32, 1_000), "a thousand rows pay for one worker either way");
     }
 
-    /// The cutting rule on its own. Enough stripes with work and a stripe stays one morsel.
+    /// The cutting rule on its own. A stripe holding no more than a share stays one morsel.
     #[test]
-    fn a_stripe_that_has_company_stays_one_run() {
+    fn a_stripe_holding_no_more_than_a_share_stays_one_run() {
         let live = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
 
-        assert_eq!(runs_of(&live, 3), [0..4, 4..8, 8..12]);
-        assert_eq!(runs_of(&live, 1), [0..4, 4..8, 8..12], "one worker is still one run a stripe");
+        assert_eq!(runs_of(&live, 1, |_| 1), [0..4, 4..8, 8..12], "one worker, one run a stripe");
+        assert_eq!(runs_of(&live, 3, |_| 1), [0..4, 4..8, 8..12], "a stripe is a share exactly");
+        let four = runs_of(&live, 4, |_| 1);
+        assert_eq!(four, [0..2, 2..4, 4..6, 6..8, 8..10, 10..12], "over a share, so half shares");
+    }
+
+    /// The reason the cut is by rows. Three stripes with work in them are not three pieces of work
+    /// when the statistics left one of them holding almost all of it, and the old rule handed that
+    /// one to a single worker while the other two finished at once.
+    #[test]
+    fn the_stripe_holding_the_rows_is_the_one_that_gets_cut() {
+        let live = vec![vec![0], vec![1, 2, 3, 4, 5, 6, 7, 8], vec![9]];
+        let rows = |at: usize| if (1..9).contains(&at) { 1_000 } else { 10 };
+
+        let runs = runs_of(&live, 2, rows);
+
+        assert_eq!(runs, [0..1, 1..3, 3..5, 5..7, 7..9, 9..10], "the big stripe in four, not one");
+        let held: Vec<usize> = runs.iter().map(|run| run.clone().map(rows).sum()).collect();
+        assert_eq!(held, [10, 2_000, 2_000, 2_000, 2_000, 10], "and the four are the same size");
     }
 
     /// And the other half of it. One stripe holding all the work is cut into runs of its live parts,
@@ -2004,7 +2053,7 @@ mod tests {
     fn a_stripe_that_holds_all_the_work_is_cut_up() {
         let live = vec![vec![1, 3, 5, 7], Vec::new()];
 
-        let runs = runs_of(&live, 2);
+        let runs = runs_of(&live, 2, |_| 1);
 
         assert_eq!(runs, [1..2, 3..4, 5..6, 7..8], "a run apiece, two workers, four to go round");
         assert!(runs.iter().all(|run| run.start >= 1 && run.end <= 8));
