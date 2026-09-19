@@ -337,6 +337,18 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             };
             filter(plan, above, pending)
         }
+        // A share of the input is even less permeable than a row count. A filter moved under a
+        // plain limit would change which rows come out; moved under this one it would change how
+        // many there are as well, because the share is worked out from what arrives.
+        Node::LimitPercent { input, percent, offset } => {
+            let rebuilt = node(plan, input, Vec::new(), tables);
+            let above = if rebuilt == input {
+                at
+            } else {
+                plan.add_node(Node::LimitPercent { input: rebuilt, percent, offset })
+            };
+            filter(plan, above, pending)
+        }
         Node::TopN { input, keys, count, offset } => {
             let rebuilt = node(plan, input, Vec::new(), tables);
             let above = if rebuilt == input {

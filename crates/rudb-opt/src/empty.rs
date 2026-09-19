@@ -106,6 +106,8 @@ fn empty(plan: &Plan, at: NodeRef) -> bool {
         Node::Values { rows, .. } => plan.row_list(rows).is_empty(),
         Node::Filter { input, predicate } => never(plan, predicate) || empty(plan, input),
         Node::Limit { input, count, .. } => count == Some(0) || empty(plan, input),
+        // A zero share of anything is nothing, which is the same rule one line up.
+        Node::LimitPercent { input, percent, .. } => percent == 0.0 || empty(plan, input),
         Node::TopN { input, count, .. } => count == 0 || empty(plan, input),
         Node::Sort { input, .. } | Node::Distinct { input, .. } | Node::Project { input, .. } => {
             empty(plan, input)
@@ -152,6 +154,7 @@ fn columns_of(plan: &mut Plan, at: NodeRef) -> Option<(u32, Slice)> {
         Node::Filter { input, .. }
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
+        | Node::LimitPercent { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => columns_of(plan, input),
         _ => None,

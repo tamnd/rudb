@@ -54,7 +54,10 @@ pub struct WindowFrame {
 ///
 /// Children are the inputs, in the order [`Node::children`] returns them, which is the order they
 /// print in and the order the reader expects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` and not `Eq`, because [`Node::LimitPercent`] holds a percentage as a `f64`.
+/// [`Value`](rudb_common::Value) is the same shape for the same reason.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     /// A base table scan.
     ///
@@ -230,6 +233,29 @@ pub enum Node {
         input: NodeRef,
         /// How many rows to emit, or all of them.
         count: Option<u64>,
+        /// How many rows to skip first.
+        offset: u64,
+    },
+    /// A limit written as a share of the input rather than as a row count.
+    ///
+    /// `LIMIT 30 PERCENT` over ten rows is three rows, and it is a node of its own rather than a
+    /// [`Node::Limit`] with another field for three reasons. The share is of the whole input, so
+    /// this cannot emit anything until it has counted every row, where a plain limit hands each
+    /// chunk on as it arrives and stops the scan early. The rewrites that fire on a plain limit are
+    /// wrong here: a filter pushed under this one changes how many rows there are to take a share
+    /// of, and the sort underneath it cannot become a top n because the count is not known until
+    /// the sort has finished. And the pin builds a separate `Limit Percent` operator for it, which
+    /// is the same split one layer down.
+    ///
+    /// The percentage is between nought and a hundred inclusive, checked while the query is bound,
+    /// because that is where the pin refuses `LIMIT 101 PERCENT` too. The offset is applied after
+    /// the share has been worked out, so `LIMIT 30 PERCENT OFFSET 2` over ten rows is three rows
+    /// starting at the third.
+    LimitPercent {
+        /// The input.
+        input: NodeRef,
+        /// The share of the input to emit, from nought to a hundred.
+        percent: f64,
         /// How many rows to skip first.
         offset: u64,
     },
@@ -419,6 +445,7 @@ impl Node {
             Self::Window { .. } => "Window",
             Self::Sort { .. } => "Sort",
             Self::Limit { .. } => "Limit",
+            Self::LimitPercent { .. } => "LimitPercent",
             Self::TopN { .. } => "TopN",
             Self::Fetch { .. } => "Fetch",
             Self::TableFetch { .. } => "TableFetch",
@@ -451,6 +478,7 @@ impl Node {
             | Self::Window { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. }
+            | Self::LimitPercent { input, .. }
             | Self::TopN { input, .. }
             | Self::Fetch { input, .. }
             | Self::TableFetch { input, .. }
@@ -669,6 +697,7 @@ mod tests {
             Node::Aggregate { input: 0, index: 0, groups: Slice::EMPTY, aggregates: Slice::EMPTY },
             Node::Sort { input: 0, keys: Slice::EMPTY },
             Node::Limit { input: 0, count: None, offset: 0 },
+            Node::LimitPercent { input: 0, percent: 50.0, offset: 0 },
             Node::Distinct { input: 0, on: Slice::EMPTY },
             Node::Join {
                 left: 0,

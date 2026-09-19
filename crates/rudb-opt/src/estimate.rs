@@ -419,6 +419,12 @@ pub fn rows_stat_into(
                 },
             }
         }
+        // A share of an unknown number of rows is still unknown, which is the difference from the
+        // arm above: a row count is a ceiling whatever feeds it and a percentage is not.
+        Node::LimitPercent { input, percent, offset } => of(input).map(|n| {
+            let share = percent / 100.0 * n as f64;
+            (share as u64).saturating_sub(offset)
+        }),
         Node::TopN { input, count, offset, .. } => match of(input) {
             Stat::Unknown => {
                 Stat::Known { value: count, class: CEILING, provenance: FROM_A_CONSTANT }

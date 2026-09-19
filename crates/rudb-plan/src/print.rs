@@ -181,6 +181,9 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             }
             write!(out, " offset {offset}")
         }
+        // The percentage prints through `Display` for a `f64`, which is the shortest text that
+        // reads back as the same number, so the reader in `parse.rs` gets the bits it was given.
+        Node::LimitPercent { percent, offset, .. } => write!(out, " {percent}% offset {offset}"),
         Node::TopN { keys, count, offset, .. } => {
             write!(out, " {count} offset {offset} ")?;
             write_sort_keys(plan, out, keys)

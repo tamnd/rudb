@@ -1370,14 +1370,65 @@ impl<'a> Binder<'a> {
 
     fn apply_limit(&mut self, ast: &Ast, query: &ast::Query, input: NodeRef) -> Result<NodeRef> {
         if query.limit_percent {
-            return Err(Error::not_implemented("LIMIT with a percentage"));
+            let percent = self.constant_percent(ast, query.limit)?;
+            let offset = self.constant_count(ast, query.offset, "OFFSET")?.unwrap_or(0);
+            return Ok(match percent {
+                Some(percent) => self.add_node(Node::LimitPercent { input, percent, offset }),
+                // A null share is no limit at all, the same as a null row count, so what is left
+                // is whatever the offset asked for.
+                None => self.limited(input, None, offset),
+            });
         }
         let count = self.constant_count(ast, query.limit, "LIMIT")?;
         let offset = self.constant_count(ast, query.offset, "OFFSET")?.unwrap_or(0);
+        Ok(self.limited(input, count, offset))
+    }
+
+    /// A row count limit over `input`, or `input` itself when neither half of the clause asks for
+    /// anything.
+    fn limited(&mut self, input: NodeRef, count: Option<u64>, offset: u64) -> NodeRef {
         if count.is_none() && offset == 0 {
-            return Ok(input);
+            return input;
         }
-        Ok(self.add_node(Node::Limit { input, count, offset }))
+        self.add_node(Node::Limit { input, count, offset })
+    }
+
+    /// The share of the input a `LIMIT n PERCENT` names.
+    ///
+    /// The same evaluation as a row count and a different type at the end of it: the value is cast
+    /// to `DOUBLE` rather than to `BIGINT`, so `LIMIT '30'%` is thirty percent and `LIMIT true%` is
+    /// one percent, which is what the pin answers. A null is no limit at all.
+    ///
+    /// The range is checked here because the pin checks it here. `LIMIT 101 PERCENT` fails an
+    /// `EXPLAIN` on the pinned binary, so it is refused while the query is planned and not when it
+    /// is run, and a `NAN` is outside the range like any other value that is not between nought and
+    /// a hundred.
+    fn constant_percent(&mut self, ast: &Ast, written: ast::ExprRef) -> Result<Option<f64>> {
+        if written == NONE {
+            return Ok(None);
+        }
+        self.clause = "LIMIT clause";
+        let scope = Scope::empty();
+        let bound = self.bind_expr(ast, written, &scope)?;
+        let Some(value) = fold::value_of(&self.plan, bound)? else {
+            return Err(Error::not_implemented("a LIMIT holding a subquery"));
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let cast = cast_value(&value, &LogicalType::Double, false)?;
+        let Value::Double(percent) = cast else {
+            return Err(Error::binder(format!(
+                "LIMIT takes a percentage, not a value of type {}",
+                value.logical_type()
+            )));
+        };
+        if !(0.0..=100.0).contains(&percent) {
+            return Err(Error::out_of_range(
+                "Limit percent out of range, should be between 0% and 100%",
+            ));
+        }
+        Ok(Some(percent))
     }
 
     /// The row count a `LIMIT` or an `OFFSET` names.

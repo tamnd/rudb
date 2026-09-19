@@ -100,6 +100,7 @@ mod lookup;
 mod metadata;
 mod ordering;
 mod pairs;
+mod percent;
 mod prepared;
 mod query;
 mod register;

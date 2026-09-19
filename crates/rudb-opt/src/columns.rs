@@ -286,7 +286,7 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
                 walk(plan, key.expr, found);
             }
         }
-        Node::Limit { .. } => {}
+        Node::Limit { .. } | Node::LimitPercent { .. } => {}
         Node::Distinct { on, .. } => list(plan, on, found),
         Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
             list(plan, conditions, found);

@@ -76,6 +76,7 @@ use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
+use crate::percent::LimitPercent;
 use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
@@ -283,6 +284,7 @@ fn ordered(plan: &Plan, node: NodeRef) -> bool {
         Node::Project { input, .. }
         | Node::Filter { input, .. }
         | Node::Limit { input, .. }
+        | Node::LimitPercent { input, .. }
         | Node::Fetch { input, .. } => ordered(plan, input),
         _ => false,
     }
@@ -1408,6 +1410,18 @@ impl<'a> Building<'a, '_> {
                 let limit = Limit::new(count, offset);
                 let counters = self.watch(reference, id, pipeline, "Limit", None);
                 below.then(Arc::new(Watched::new(limit, counters)), schema)
+            }
+            Node::LimitPercent { input, percent, offset } => {
+                // A breaker rather than a stream, because a share of the input is not known until
+                // the input has ended. So the pipeline below this one closes here and the rows come
+                // back out of the buffer the finish fills.
+                let below = self.node(input)?;
+                let schema = below.schema.clone();
+                let (limit, out) = LimitPercent::new(percent, offset, memory);
+                let counters = self.watch(reference, id, pipeline, "LimitPercent", None);
+                let reading = Arc::clone(&counters);
+                self.close(below, pipeline, Arc::new(Watched::new(limit, counters)));
+                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
             Node::TopN { input, keys, count, offset } => {
                 if let Some((aggregate, call)) = count_top_aggregate(plan, input, keys) {
