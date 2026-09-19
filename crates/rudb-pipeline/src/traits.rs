@@ -162,6 +162,29 @@ pub trait Sink: Send + Sync + fmt::Debug {
         true
     }
 
+    /// How many threads this sink could use in [`Sink::finalize`], given the chance.
+    ///
+    /// A pipeline used to borrow as many threads as its source had morsels, and finishing the sink
+    /// happens after every one of those has joined, on the same borrowed threads. So a scan that
+    /// cut itself into sixteen morsels on a thirty two thread machine left a hash aggregate
+    /// finishing a million groups on sixteen threads, and the other half of the machine parked,
+    /// because nothing in the pipeline ever said that the finish is a separate piece of work from
+    /// the scan and is not the same width.
+    ///
+    /// This is a sink saying so. The default is one, which is what almost everything means: it
+    /// finishes on the thread that asked and the lease does not need to be any wider than the
+    /// source made it. A sink that finishes in parallel answers with what it could use, and the
+    /// pipeline borrows the larger of that and what the source wants.
+    ///
+    /// It is asked before a row has been read, so a sink that cannot know yet should answer with
+    /// what it would want if the query turns out to be large. Borrowing a thread that is then not
+    /// used costs the borrow and nothing else, because the threads are parked in the pool and are
+    /// never woken unless there is a piece of work to hand them.
+    fn finalize_degree(&self, ceiling: usize) -> usize {
+        let _ = ceiling;
+        1
+    }
+
     /// Told which morsel the chunks that come next were read from.
     ///
     /// Called once per morsel, by the driver, on the instance that took it, before any
