@@ -688,8 +688,7 @@ fn poisoned<T>(_: T) -> Error {
 mod tests {
     use std::mem::size_of;
 
-    use rudb_common::{LogicalType, Memory, Value};
-    use rudb_vector::Vector;
+    use rudb_common::{Memory, Value};
 
     use crate::pairs::{Held, PARTITIONS, Run, distinct_pairs, group_hash, scatter, shift};
 

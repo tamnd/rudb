@@ -33,7 +33,7 @@ use crate::pairs::{
     self, Counted, Grouped, Held, PARTITIONS, Run, distinct_pairs, in_parallel, scatter,
 };
 use crate::rows;
-use crate::signed::SignedReader;
+use crate::signed::SignedBlock;
 
 const EMPTY: u32 = u32::MAX;
 
@@ -210,9 +210,9 @@ pub(crate) struct Key<'a> {
     pub(crate) codes: Codes<'a>,
 }
 
-/// One chunk's group column, with the layout decided once instead of once a row.
+/// One chunk's group column, read as a flat run before any row is looked at.
 enum ColumnReader<'a> {
-    Signed(SignedReader<'a>),
+    Signed(&'a [i64]),
     Dictionary(&'a [u32]),
 }
 
@@ -225,7 +225,7 @@ impl ColumnReader<'_> {
     #[inline]
     fn at(&self, row: usize) -> i64 {
         match self {
-            Self::Signed(reader) => reader.at(row) as i64,
+            Self::Signed(values) => values[row],
             Self::Dictionary(codes) => i64::from(codes[row]),
         }
     }
@@ -241,7 +241,7 @@ enum GroupReader<'a> {
     /// code is inside the range the layout gave it, and a column at a time that check is one
     /// predictable compare in a loop over a single vector. Row by row it would be a loop over the
     /// columns per row with a branch on each column's layout inside it.
-    Many(Vec<i32>),
+    Many(&'a [i32]),
 }
 
 impl GroupReader<'_> {
@@ -281,11 +281,26 @@ fn lay(
     Ok(())
 }
 
+/// The buffers one chunk's columns are read into, kept between chunks.
+///
+/// Every one of them lives for as long as the instance does, so a chunk after the first allocates
+/// nothing for any of this. See [`SignedBlock`] for what reading a column this way saves.
+#[derive(Debug, Default)]
+struct Scratch {
+    /// One buffer per group column, filled only for the columns held as numbers.
+    keys: Vec<SignedBlock>,
+    /// The distinct argument.
+    user: SignedBlock,
+    /// The composite every row's key is built in, when there is more than one column.
+    codes: Vec<i32>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Local {
     used: bool,
     partitions: Vec<Run>,
     memory: Reservation,
+    scratch: Scratch,
 }
 
 impl Local {
@@ -294,6 +309,7 @@ impl Local {
             used: false,
             partitions: (0..PARTITIONS).map(|_| Run::default()).collect(),
             memory: memory.reservation(),
+            scratch: Scratch::default(),
         }
     }
 
@@ -318,32 +334,52 @@ impl Exchange {
     ) -> Result<bool> {
         let state = slot.get_or_init(|| Shape::plan(keys).map(Self::new));
         let Some(state) = state else { return Ok(false) };
-        let reader = state.reader(keys, rows)?;
+        // The buffers come out of the instance for the length of the loop, because the readers
+        // below hand out borrows of them while every row scattered borrows the instance again.
+        let mut scratch = std::mem::take(&mut local.scratch);
+        let outcome = state.scatter_blocks(keys, user, rows, &mut scratch, local);
+        local.scratch = scratch;
+        outcome?;
+        Ok(true)
+    }
+
+    /// One chunk's columns read as blocks and then scattered a row at a time.
+    ///
+    /// Split out of [`Self::buffer`] only so that the buffers can be lent out while the instance is
+    /// borrowed for the scatter.
+    fn scatter_blocks(
+        &self,
+        keys: &[Key<'_>],
+        user: &Vector,
+        rows: usize,
+        scratch: &mut Scratch,
+        local: &mut Local,
+    ) -> Result<()> {
+        let Scratch { keys: blocks, user: values, codes } = scratch;
+        values.read(rows, user)?;
+        let nulled = values.nulled();
+        let held_user = values.cut(rows)?;
+        let reader = self.reader(keys, rows, blocks, codes)?;
         // With one column the record's validity carries the null, so the loop below has to know
         // where to look for it. With several the null is already inside the code.
-        let group_nulls = match &state.shape {
+        let group_nulls = match &self.shape {
             Shape::Alone(_) => nulls_of(keys[0].vector, rows),
             Shape::Many(_) => None,
         };
         let before = local.partitions.iter().map(Run::footprint).sum::<usize>();
         let shift = pairs::shift();
-        if !user.validity().has_nulls(rows) {
-            // The distinct argument has no null, so the layout is the only thing that changes
-            // between rows and it is picked once here rather than once a row. See `SignedReader`.
-            let values = SignedReader::new(user);
+        if !nulled {
             match group_nulls {
                 None => {
                     for row in 0..rows {
-                        let user = values.at(row) as i64;
-                        scatter(&mut local.partitions, shift, reader.at(row), true, user);
+                        scatter(&mut local.partitions, shift, reader.at(row), true, held_user[row]);
                     }
                 }
                 Some(nulls) => {
                     for row in 0..rows {
                         let valid = !nulls.is_null_at(row);
                         let group = if valid { reader.at(row) } else { 0 };
-                        let user = values.at(row) as i64;
-                        scatter(&mut local.partitions, shift, group, valid, user);
+                        scatter(&mut local.partitions, shift, group, valid, held_user[row]);
                     }
                 }
             }
@@ -352,31 +388,42 @@ impl Exchange {
                 if user.is_null_at(row) {
                     continue;
                 }
-                let user = i64::try_from(user.signed_at(row).ok_or_else(|| {
-                    Error::internal("a distinct BIGINT value has no signed representation")
-                })?)
-                .map_err(|_| Error::internal("a distinct BIGINT value is out of range"))?;
                 let valid = group_nulls.is_none_or(|nulls| !nulls.is_null_at(row));
                 let group = if valid { reader.at(row) } else { 0 };
-                scatter(&mut local.partitions, shift, group, valid, user);
+                scatter(&mut local.partitions, shift, group, valid, held_user[row]);
             }
         }
         let after = local.partitions.iter().map(Run::footprint).sum::<usize>();
         local.memory.grow(width(after.saturating_sub(before)))?;
         local.used = true;
-        Ok(true)
+        Ok(())
     }
 
     /// One chunk's keys read the way the shape says they are held.
-    fn reader<'a>(&self, keys: &[Key<'a>], rows: usize) -> Result<GroupReader<'a>> {
+    fn reader<'a>(
+        &self,
+        keys: &[Key<'a>],
+        rows: usize,
+        blocks: &'a mut Vec<SignedBlock>,
+        codes: &'a mut Vec<i32>,
+    ) -> Result<GroupReader<'a>> {
         if keys.len() != self.shape.columns().len() {
             return Err(Error::internal(
                 "a grouped distinct exchange received the wrong key width",
             ));
         }
+        blocks.resize_with(keys.len(), SignedBlock::default);
+        // Every buffer is filled before any reader is built, because a reader hands out a borrow of
+        // the buffer it reads and nothing can be written into them while one of those is out.
+        for ((key, column), block) in keys.iter().zip(self.shape.columns()).zip(blocks.iter_mut()) {
+            if matches!(column, Column::Signed(_)) {
+                block.read(rows, key.vector)?;
+            }
+        }
+        let blocks: &[SignedBlock] = blocks;
         let mut readers = Vec::with_capacity(keys.len());
-        for (key, column) in keys.iter().zip(self.shape.columns()) {
-            readers.push(column_reader(key, column, rows)?);
+        for ((key, column), block) in keys.iter().zip(self.shape.columns()).zip(blocks) {
+            readers.push(column_reader(key, column, rows, block)?);
         }
         match &self.shape {
             Shape::Alone(_) => readers
@@ -384,9 +431,10 @@ impl Exchange {
                 .map(GroupReader::Alone)
                 .ok_or_else(|| Error::internal("a grouped distinct exchange received no key")),
             Shape::Many(composite) => {
-                let mut codes = vec![0_i32; rows];
+                codes.clear();
+                codes.resize(rows, 0);
                 for (at, (reader, key)) in readers.iter().zip(keys).enumerate() {
-                    lay(&mut codes, reader, nulls_of(key.vector, rows), at, composite)?;
+                    lay(codes, reader, nulls_of(key.vector, rows), at, composite)?;
                 }
                 Ok(GroupReader::Many(codes))
             }
@@ -482,11 +530,14 @@ impl Exchange {
 }
 
 /// One chunk's column read the way the shape says that column is held.
-fn column_reader<'a>(key: &Key<'a>, column: &Column, rows: usize) -> Result<ColumnReader<'a>> {
+fn column_reader<'a>(
+    key: &Key<'a>,
+    column: &Column,
+    rows: usize,
+    block: &'a SignedBlock,
+) -> Result<ColumnReader<'a>> {
     match (column, &key.codes) {
-        (Column::Signed(_), Codes::Signed) => {
-            Ok(ColumnReader::Signed(SignedReader::new(key.vector)))
-        }
+        (Column::Signed(_), Codes::Signed) => Ok(ColumnReader::Signed(block.cut(rows)?)),
         (Column::Dictionary(held), Codes::Dictionary(codes, dictionary))
             if Arc::ptr_eq(held, dictionary) =>
         {
