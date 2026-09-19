@@ -1,6 +1,8 @@
 //! The arena a plan lives in, and the invariant that keeps its indices honest.
 
-use rudb_common::{Error, Field, LogicalType, Result, Span, Value};
+use std::collections::BTreeMap;
+
+use rudb_common::{Error, Field, LogicalType, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
 use crate::node::{JoinKind, Node};
@@ -42,6 +44,15 @@ pub struct Plan {
     arms: Vec<Arm>,
     rows: Vec<Slice>,
     root: NodeRef,
+    /// How many rows the binder measured behind a table index, where it measured anything.
+    ///
+    /// Beside the pools rather than in them because it is not part of what the plan computes. A
+    /// plan prints and parses back without this, two plans that differ only here are the same plan,
+    /// and a pass that drops the node an entry belongs to leaves a stale entry nobody reads. What
+    /// it is for is the one fact that cannot be recovered from the shape of the tree: the binder
+    /// has the Parquet footer open in its hand and the optimizer does not, and by the time anything
+    /// wants the number the file is closed.
+    measured: BTreeMap<u32, Stat<u64>>,
 }
 
 impl Default for Plan {
@@ -80,6 +91,7 @@ impl Plan {
             arms: Vec::new(),
             rows: Vec::new(),
             root: 0,
+            measured: BTreeMap::new(),
         }
     }
 
@@ -92,6 +104,27 @@ impl Plan {
     /// Roots the plan at `node`.
     pub fn set_root(&mut self, node: NodeRef) {
         self.root = node;
+    }
+
+    /// Records what the binder found out about the table bound at `index`.
+    ///
+    /// Called once per bound table that anybody measured, and never called for one nobody did,
+    /// because a table with no entry reads back as [`Stat::Unknown`] and that is the right answer
+    /// for it. Recording [`Stat::Unknown`] explicitly would say the same thing and is allowed.
+    pub fn measure(&mut self, index: u32, rows: Stat<u64>) {
+        self.measured.insert(index, rows);
+    }
+
+    /// What the binder found out about the table bound at `index`, or [`Stat::Unknown`].
+    #[must_use]
+    pub fn measured(&self, index: u32) -> Stat<u64> {
+        self.measured.get(&index).copied().unwrap_or(Stat::Unknown)
+    }
+
+    /// How many tables anybody measured, which is what a test about this asks.
+    #[must_use]
+    pub fn measured_count(&self) -> usize {
+        self.measured.len()
     }
 
     /// How many nodes are in the arena, reachable or not.
@@ -1166,6 +1199,25 @@ mod tests {
         plan.set_root(17);
         let message = plan.validate().unwrap_err().to_string();
         assert!(message.contains("rooted at node 17"), "unhelpful message: {message}");
+    }
+
+    #[test]
+    fn a_table_nobody_measured_reads_back_as_unknown_rather_than_as_zero() {
+        // The difference is the whole reason this is a map and not a vector of counts. A table of
+        // no rows and a table nobody counted are not the same table, and an optimizer that reads
+        // the second as the first will build its hash table from the wrong side.
+        let plan = Plan::new();
+        assert_eq!(plan.measured(0), Stat::Unknown);
+        assert_eq!(plan.measured_count(), 0);
+    }
+
+    #[test]
+    fn what_the_binder_measured_comes_back_the_way_it_went_in() {
+        let mut plan = Plan::new();
+        plan.measure(4, Stat::exact(4096, rudb_common::Provenance::RowCount));
+        assert_eq!(plan.measured(4), Stat::exact(4096, rudb_common::Provenance::RowCount));
+        assert_eq!(plan.measured(5), Stat::Unknown);
+        assert_eq!(plan.measured_count(), 1);
     }
 
     #[test]

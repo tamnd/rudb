@@ -14,11 +14,11 @@
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
 use rudb_common::{
-    Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Value,
+    Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, Value,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, FunctionKind, Given, Resolved, TableFunction, csv_fields, csv_given,
-    files, is_file, is_pattern, kind_of, parquet_fields, resolve, resolve_pragma, resolve_table,
+    files, is_file, is_pattern, kind_of, parquet_footers, resolve, resolve_pragma, resolve_table,
 };
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
@@ -151,6 +151,27 @@ struct WindowParts {
     order: Vec<SortKey>,
     /// The frame, with both ends and the exclusion.
     frame: WindowFrame,
+}
+
+/// What opening the files behind a table function call said about them.
+///
+/// The two answers travel together because they come out of the same footer. A Parquet file states
+/// its columns and its row count in the same few kilobytes at the end of it, so a binder that has
+/// read one has read the other, and splitting them into two arguments would mean two ways to
+/// forget one.
+#[derive(Debug)]
+struct Read {
+    /// The columns the call produces, in the order the file stores them.
+    fields: Vec<Field>,
+    /// How many rows all of the files hold, where anybody counted.
+    rows: Stat<u64>,
+}
+
+impl Read {
+    /// Columns that came from somewhere other than a file, so nothing counted the rows.
+    fn uncounted(fields: Vec<Field>) -> Self {
+        Self { fields, rows: Stat::Unknown }
+    }
 }
 
 /// A materialised `WITH` definition that has been bound and can be read by name.
@@ -1672,6 +1693,9 @@ impl<'a> Binder<'a> {
             };
             return self.bind_pragma(ast, resolved.function, &fields, argument, alias, columns);
         }
+        // Filled in by the arm below that has the file names, and left alone by a function whose
+        // columns are fixed, because none of those reads a file to find out how tall it is.
+        let mut measured = Stat::Unknown;
         let fields = match resolved.columns {
             Columns::Fixed(fields) => fields,
             columns => {
@@ -1680,12 +1704,15 @@ impl<'a> Binder<'a> {
                 // directory and the answer cannot change between binding a prepared statement and
                 // running it, which is the same reason the schema is settled here.
                 let paths = self.file_paths(cast[0], resolved.function.name())?;
-                let first = paths.first().map_or("", String::as_str);
                 let mut fields = match columns {
                     // Parquet takes the first file's footer as the answer and CSV sniffs all of
                     // them, which is not a choice made here. See `csv_fields`.
                     Columns::Csv => csv_fields(&paths, options.given)?,
-                    _ => parquet_fields(first)?,
+                    _ => {
+                        let (fields, rows) = parquet_footers(&paths)?;
+                        measured = rows;
+                        fields
+                    }
                 };
                 if options.all_varchar {
                     // The sniffer still ran, because the names come out of the same pass over the
@@ -1735,7 +1762,7 @@ impl<'a> Binder<'a> {
             resolved.function,
             &cast,
             &written_options,
-            fields,
+            Read { fields, rows: measured },
             &label,
             &names,
         )
@@ -1967,10 +1994,12 @@ impl<'a> Binder<'a> {
         // DuckDB's order and it is the helpful one: somebody who wrote a file name wants to hear
         // about the file.
         let paths = files(path)?;
-        let first = paths.first().map_or("", String::as_str);
-        let fields = match function {
-            TableFunction::ReadParquet => parquet_fields(first)?,
-            _ => csv_fields(&paths, Given::default())?,
+        let read = match function {
+            TableFunction::ReadParquet => {
+                let (fields, rows) = parquet_footers(&paths)?;
+                Read { fields, rows }
+            }
+            _ => Read::uncounted(csv_fields(&paths, Given::default())?),
         };
         // The name the columns answer to is the file's stem, so `SELECT mixed.a FROM
         // 'data/mixed.parquet'` works. That is DuckDB's choice and it is the useful one, since the
@@ -1989,7 +2018,7 @@ impl<'a> Binder<'a> {
         };
         let arguments: Vec<ExprRef> = paths.iter().map(|path| self.path_constant(path)).collect();
         let names: Vec<&str> = ast.name(columns).collect();
-        self.table_function_source(function, &arguments, &[], fields, &label, &names)
+        self.table_function_source(function, &arguments, &[], read, &label, &names)
     }
 
     /// One file name, as a constant expression in the plan.
@@ -2018,16 +2047,29 @@ impl<'a> Binder<'a> {
     ///
     /// The half a written out call shares with a replacement scan, which is everything after the
     /// question of what the file is called has been answered one way or the other.
+    ///
+    /// `read` is what the caller found out about the files, which comes in here rather than being
+    /// read here because this function has the names and not the files: a replacement scan has
+    /// already expanded its pattern and a written out call has already cast its argument, and
+    /// neither of them wants to do it twice.
     fn table_function_source(
         &mut self,
         function: TableFunction,
         args: &[ExprRef],
         written: &[(&'static str, Value, ExprRef)],
-        fields: Vec<Field>,
+        read: Read,
         label: &str,
         names: &[&str],
     ) -> Result<(NodeRef, Scope)> {
+        let Read { fields, rows } = read;
         let index = self.fresh_index();
+        // Against the table index rather than against the node, because a pass is free to move the
+        // node and none of them can move an index: an index is what a column reference names and
+        // rewriting one would mean rewriting every expression above it. Nothing is recorded for a
+        // function nobody measured, since an absent entry already reads back as unknown.
+        if rows.is_known() {
+            self.plan.measure(index, rows);
+        }
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
             scope.push(Visible {
