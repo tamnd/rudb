@@ -143,7 +143,7 @@ fn a_column_whose_groups_all_look_alike_is_estimated_the_way_it_always_was() {
     // ninety seven is 168 against a truth of 169, where the constant said 3,276.
     let database = Database::new();
     let line = estimated(&database, "g = 5");
-    assert!(line.contains("[~168 rows estimated from sketch]"), "{line}");
+    assert!(line.contains("[~168 rows estimated from dictionary]"), "{line}");
     assert_eq!(answered(&database, "g = 5"), 169);
 }
 

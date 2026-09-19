@@ -49,7 +49,7 @@ use rudb_metrics::{Document, Operator};
 use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, seams_of};
 use rudb_seam::{Registries, SeamId, Settings};
 
-use crate::estimate::{CARDINALITY, Facts, rows_stat};
+use crate::estimate::{CARDINALITY, DISTINCT, Facts, rows_stat, rows_stat_into};
 
 /// Whether `EXPLAIN` was asked what the planner knew.
 ///
@@ -393,9 +393,18 @@ impl Reads {
 /// same reason: a node the plan folded away is not a decision anybody acted on.
 fn reads(plan: &Plan, facts: &Facts, shape: &Shape) -> Reads {
     let mut reads = Reads::default();
+    let mut distincts = Vec::new();
     for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         if shape.operator_of(node).is_some() {
-            reads.record(CARDINALITY, &rows_stat(plan, node, facts));
+            distincts.clear();
+            let rows = rows_stat_into(plan, node, facts, &mut distincts);
+            reads.record(CARDINALITY, &rows);
+            // The distinct counts a filter's selectivity and a join's cardinality read on the way to
+            // that number. They never appear on a plan line, so this section is the only place a
+            // reader can see that they were read at all, and whether anybody had one.
+            for distinct in &distincts {
+                reads.record(DISTINCT, distinct);
+            }
         }
     }
     reads
