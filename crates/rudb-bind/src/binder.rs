@@ -169,7 +169,7 @@ struct Read {
     /// How many rows all of the files hold, where anybody counted.
     rows: Stat<u64>,
     /// How many distinct values a column holds, by name, for the columns anybody counted.
-    distincts: Vec<(String, u64)>,
+    distincts: Vec<(String, Stat<u64>)>,
     /// The bounds the files keep per part of themselves, where anything can answer for them.
     zones: Option<Arc<dyn Zones>>,
 }
@@ -1725,7 +1725,7 @@ impl<'a> Binder<'a> {
         // Filled in by the arm below that has the file names, and left alone by a function whose
         // columns are fixed, because none of those reads a file to find out how tall it is.
         let mut measured = Stat::Unknown;
-        let mut counted: Vec<(String, u64)> = Vec::new();
+        let mut counted: Vec<(String, Stat<u64>)> = Vec::new();
         let mut bounded: Option<Arc<dyn Zones>> = None;
         let fields = match resolved.columns {
             Columns::Fixed(fields) => fields,

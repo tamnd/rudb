@@ -45,6 +45,23 @@ COPY (
 
 DuckDB reads it as n=20000, sum(a)=959289, min(a)=0, max(a)=96, sum(b)=9990000000, count(s)=17142, min(s)='https://example.com/page/0', max(s)='https://example.com/page/999', sum(d)=944232.0.
 
+## counted.parquet
+
+Written by duckdb v1.5.5, Snappy, 2000 rows in one row group.
+
+One row group is the whole point of it. A row group's stated distinct count is exact for that row group, so a file with one of them is the only file whose footer counts the column rather than bracketing it, and this is the fixture where a distinct count comes back exact instead of certified. `few` and `label` get a count because DuckDB wrote them with a dictionary page, `many` gets none because every value in it is different and the writer gave up on the dictionary, so the same file holds both the stated case and the unstated one.
+
+```sql
+COPY (
+  SELECT (i % 97)::INTEGER AS few,
+         i::BIGINT AS many,
+         ('tag' || (i % 5)) AS label
+  FROM range(2000) tbl(i)
+) TO 'counted.parquet' (FORMAT parquet, ROW_GROUP_SIZE 100000, COMPRESSION snappy);
+```
+
+DuckDB reads it as n=2000, sum(few)=94890, min(few)=0, max(few)=96, min(many)=0, max(many)=1999, min(label)='tag0', max(label)='tag4', and it counts 97 distinct in `few`, 5 in `label` and 2000 in `many`. The footer states 97 for `few` and 5 for `label` and nothing for `many`, so the first two agree with the count exactly.
+
 ## delta.parquet and lengths.parquet
 
 Written by pyarrow 23.0.1, Snappy, format version 2.6, two row groups of 2048 rows, dictionaries off so the delta encodings are actually used.

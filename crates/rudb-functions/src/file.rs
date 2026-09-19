@@ -27,6 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rudb_common::bounds::Zones;
+use rudb_common::stat::Direction;
 use rudb_common::{Error, Field, Provenance, Result, Stat, Value};
 use rudb_csv::{Given, Reader as CsvReader};
 use rudb_io::glob::has_magic;
@@ -163,7 +164,11 @@ pub struct Footers {
     /// How many rows all of the files hold.
     pub rows: Stat<u64>,
     /// How many distinct values each column holds, by name, for the columns that were stated.
-    pub distincts: Vec<(String, u64)>,
+    ///
+    /// A [`Stat`] and not a number, because the footer states this per row group and the question is
+    /// about the column. A file of one row group comes back exact and a file of several comes back
+    /// as a certified lower bound with the gap between the two ends of the bracket stated on it.
+    pub distincts: Vec<(String, Stat<u64>)>,
     /// The minimum and the maximum of every column of every row group, where anything can answer.
     ///
     /// Behind a trait object and not a table of numbers, because the file this matters most on has
@@ -199,9 +204,14 @@ pub struct Footers {
 /// groups, which is the ordinary case, and an undercount when the file is sorted on the column and
 /// each group holds its own stretch of values. The caller is the optimizer deciding whether a join
 /// key is low enough cardinality to make a join produce more rows than its larger side, and an
-/// undercount there makes the estimate too large rather than too small. Adding the row groups up
-/// would be the other bound and it is useless: a column with the same ten thousand values in every
-/// one of fifty groups would come out at five hundred thousand.
+/// undercount there makes the estimate too large rather than too small.
+///
+/// What comes back says which of those two it is, as far as the file can tell. Adding the row groups
+/// up is the other bound, and it is useless as an answer for the reason above, a column with the
+/// same ten thousand values in every one of fifty groups would come out at five hundred thousand.
+/// It is not useless as the other end of a bracket: where the two ends meet, which is a file of one
+/// row group, the count is exact, and where they do not, the gap between them is the relative error
+/// of the lower one and is what makes it a certificate rather than a guess.
 ///
 /// A pattern pays one footer per file for this, against a scan that is about to read all of them in
 /// full. The alternative is the first file's count multiplied by the number of files, which is a
@@ -224,10 +234,10 @@ pub fn parquet_footers(paths: &[String]) -> Result<Footers> {
     let reader = open_parquet(first)?;
     let fields = reader.fields();
     let zones = (paths.len() == 1).then(|| Arc::new(reader.zones()) as Arc<dyn Zones>);
-    let mut largest: Vec<(String, Option<u64>)> =
-        reader.metadata().schema.iter().map(|column| (column.name.clone(), Some(0))).collect();
+    let mut largest: Vec<Counted> =
+        reader.metadata().schema.iter().map(|column| Counted::new(&column.name)).collect();
     largest_distincts(&reader, &mut largest);
-    let counted = |rows: Option<u64>, largest: Vec<(String, Option<u64>)>| {
+    let counted = |rows: Option<u64>, largest: Vec<Counted>| {
         let Some(rows) = rows else {
             // Nothing is capped and nothing is claimed. A count that covers some of the files is
             // worse than no count, and a total that did not add up says the set of files is not
@@ -242,7 +252,13 @@ pub fn parquet_footers(paths: &[String]) -> Result<Footers> {
         };
         let distincts = largest
             .into_iter()
-            .filter_map(|(name, count)| count.map(|count| (name, count.min(rows))))
+            .filter_map(|column| {
+                let name = column.name.clone();
+                match column.stat(rows) {
+                    Stat::Unknown => None,
+                    stat => Some((name, stat)),
+                }
+            })
             .collect();
         Footers {
             fields: fields.clone(),
@@ -262,12 +278,79 @@ pub fn parquet_footers(paths: &[String]) -> Result<Footers> {
     Ok(counted(Some(total), largest))
 }
 
-/// Folds one file's stated distinct counts into the largest seen for each column so far.
+/// What the row groups of one column said about how many distinct values it holds.
+///
+/// Two numbers rather than one, because a column's distinct count is not in the footer and what is
+/// there brackets it. A row group's count is exact for that row group, so the whole column holds at
+/// least as many distinct values as the largest row group does, and no more than all of them added
+/// up. Keeping both ends is what lets the answer say how far apart they are instead of handing the
+/// larger of them over as though somebody had counted the column.
+struct Counted {
+    /// The column's name, which is what the plan asks by.
+    name: String,
+    /// The most any one row group stated, and nothing where one of them stated nothing.
+    largest: Option<u64>,
+    /// All of them added up, and nothing where one of them stated nothing or the sum overflowed.
+    total: Option<u64>,
+}
+
+impl Counted {
+    /// A column nothing has been read for yet.
+    fn new(name: &str) -> Self {
+        Self { name: name.to_owned(), largest: Some(0), total: Some(0) }
+    }
+
+    /// How many distinct values the column holds, with how well that is known.
+    ///
+    /// [`Class::Exact`] where the two ends meet, which is a file of one row group and is every file
+    /// small enough to be written in one. Otherwise the larger end is a lower bound the file proves,
+    /// so it goes back as [`Class::Certified`] with [`Direction::AtLeast`] and the gap between the
+    /// two ends stated as the relative error, which is the one thing a certificate is not allowed to
+    /// leave out. The smaller end is the value rather than the larger one because a lower bound is
+    /// the safe end for every consumer there is today: an equality divides by it, and dividing by
+    /// too small a number keeps too many rows, which costs a scan rather than an answer.
+    ///
+    /// [`Stat::Unknown`] where a row group stated nothing, and where a row group stated more
+    /// distinct values than the file has rows, which is a file contradicting itself and not a number
+    /// to cap and use.
+    ///
+    /// [`Class::Certified`]: rudb_common::stat::Class::Certified
+    /// [`Class::Exact`]: rudb_common::stat::Class::Exact
+    /// [`Direction::AtLeast`]: rudb_common::stat::Direction::AtLeast
+    fn stat(&self, rows: u64) -> Stat<u64> {
+        let (Some(largest), Some(total)) = (self.largest, self.total) else { return Stat::Unknown };
+        if largest > rows {
+            return Stat::Unknown;
+        }
+        let ceiling = total.min(rows);
+        if ceiling == largest {
+            return Stat::exact(largest, Provenance::Dictionary);
+        }
+        // A column of nothing but nulls states zero everywhere and never reaches here, and a column
+        // whose largest row group states zero while another states more is a file contradicting
+        // itself the same way the row count check above catches. Either way there is no relative
+        // error to state against a zero, so there is no certificate to hand over.
+        let Some(bound) = relative(largest, ceiling) else { return Stat::Unknown };
+        Stat::certified(largest, bound, Direction::AtLeast, Provenance::Dictionary)
+    }
+}
+
+/// How far `ceiling` is above `value`, as a fraction of `value`, and nothing where that has no
+/// meaning.
+fn relative(value: u64, ceiling: u64) -> Option<f64> {
+    if value == 0 {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "a relative error is a fraction, not a count")]
+    Some((ceiling - value) as f64 / value as f64)
+}
+
+/// Folds one file's stated distinct counts into what is known about each column so far.
 ///
 /// A column starts at zero and stays a number for as long as every row group of every file states
 /// one. One that did not say leaves it at nothing however many others did, because the ones that
 /// said nothing could hold anything.
-fn largest_distincts(reader: &Reader, largest: &mut [(String, Option<u64>)]) {
+fn largest_distincts(reader: &Reader, largest: &mut [Counted]) {
     for group in &reader.metadata().row_groups {
         for chunk in &group.columns {
             let Some(held) = largest.get_mut(chunk.column) else {
@@ -275,8 +358,12 @@ fn largest_distincts(reader: &Reader, largest: &mut [(String, Option<u64>)]) {
             };
             let stated = chunk.stats.as_ref().and_then(|stats| stats.distinct);
             let stated = stated.and_then(|count| u64::try_from(count).ok());
-            held.1 = match (held.1, stated) {
+            held.largest = match (held.largest, stated) {
                 (Some(held), Some(stated)) => Some(held.max(stated)),
+                _ => None,
+            };
+            held.total = match (held.total, stated) {
+                (Some(held), Some(stated)) => held.checked_add(stated),
                 _ => None,
             };
         }
@@ -340,9 +427,73 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../rudb-parquet/testdata/mixed.parquet");
         let footers = parquet_footers(&[path.to_string()]).expect("the fixture");
         assert_eq!(footers.rows, Stat::exact(4096, Provenance::RowCount));
+        // Both row groups state the same three counts, so the column holds at least what one of
+        // them does and at most both of them added up, and the certificate says the gap is a
+        // factor of two. Nothing here is exact, because a count of a row group is not a count of a
+        // column and this file has two of them.
         assert_eq!(
             footers.distincts,
-            vec![("a".to_string(), 97), ("s".to_string(), 5), ("d".to_string(), 64)]
+            vec![
+                ("a".to_string(), certified(97, 1.0)),
+                ("s".to_string(), certified(5, 1.0)),
+                ("d".to_string(), certified(64, 1.0)),
+            ]
         );
+    }
+
+    /// A count that is a lower bound, wrong by no more than `bound` of itself.
+    fn certified(value: u64, bound: f64) -> Stat<u64> {
+        Stat::certified(value, bound, Direction::AtLeast, Provenance::Dictionary)
+    }
+
+    /// A column whose row groups stated `stated`, in a file of `rows` rows.
+    fn counted(stated: &[Option<u64>], rows: u64) -> Stat<u64> {
+        let mut column = Counted::new("c");
+        for group in stated {
+            column.largest = match (column.largest, *group) {
+                (Some(held), Some(stated)) => Some(held.max(stated)),
+                _ => None,
+            };
+            column.total = match (column.total, *group) {
+                (Some(held), Some(stated)) => held.checked_add(stated),
+                _ => None,
+            };
+        }
+        column.stat(rows)
+    }
+
+    #[test]
+    fn a_file_of_one_row_group_counted_the_column_and_the_count_says_so() {
+        // The one case where the footer holds the answer to the question being asked. The row
+        // group is the column, so the count of the one is the count of the other.
+        assert_eq!(counted(&[Some(97)], 4096), Stat::exact(97, Provenance::Dictionary));
+    }
+
+    #[test]
+    fn a_file_of_several_row_groups_states_how_far_apart_the_two_ends_are() {
+        // Four groups of a thousand each. The column holds at least a thousand, because one group
+        // does, and at most four thousand, because that is all of them, so the lower end is wrong
+        // by no more than three times itself.
+        assert_eq!(counted(&[Some(1000); 4], 100_000), certified(1000, 3.0));
+    }
+
+    #[test]
+    fn the_rows_are_the_other_ceiling_and_they_tighten_the_certificate() {
+        // Ten groups of a hundred is a thousand added up, and the file has four hundred rows in
+        // it, so four hundred is the ceiling and the certificate is three rather than nine.
+        assert_eq!(counted(&[Some(100); 10], 400), certified(100, 3.0));
+    }
+
+    #[test]
+    fn one_row_group_that_stated_nothing_gives_up_the_column_however_many_others_stated() {
+        // A group that said nothing could hold anything, so neither end of the bracket holds.
+        assert_eq!(counted(&[Some(97), None, Some(97)], 4096), Stat::Unknown);
+    }
+
+    #[test]
+    fn a_count_larger_than_the_file_has_rows_is_a_file_contradicting_itself() {
+        // Capping it would turn a lower bound into the row count, which is the one thing a lower
+        // bound must not be, so the number is refused rather than repaired.
+        assert_eq!(counted(&[Some(500)], 400), Stat::Unknown);
     }
 }

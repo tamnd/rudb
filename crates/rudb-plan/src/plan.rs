@@ -61,7 +61,7 @@ pub struct Plan {
     /// not by the position the column has in the scan, because column pruning moves the position
     /// and moves nothing else, and a number keyed to a position a pass has since changed is worse
     /// than no number.
-    distincts: BTreeMap<(u32, String), u64>,
+    distincts: BTreeMap<(u32, String), Stat<u64>>,
     /// The minimum and the maximum per part of the table bound at an index, where anything kept
     /// them.
     ///
@@ -156,14 +156,17 @@ impl Plan {
     ///
     /// Called only for the columns somebody counted, which behind a Parquet scan is the columns
     /// the writer stated a count for and is usually a handful of the low cardinality ones.
-    pub fn measure_distinct(&mut self, index: u32, column: &str, distinct: u64) {
+    ///
+    /// A [`Stat`] and not a number, because a Parquet footer counts per row group and the question
+    /// is about the column, so the two are the same number only where the file is one row group.
+    pub fn measure_distinct(&mut self, index: u32, column: &str, distinct: Stat<u64>) {
         self.distincts.insert((index, column.to_owned()), distinct);
     }
 
     /// How many distinct values that column holds, where the binder counted.
     #[must_use]
-    pub fn distinct_measured(&self, index: u32, column: &str) -> Option<u64> {
-        self.distincts.get(&(index, column.to_owned())).copied()
+    pub fn distinct_measured(&self, index: u32, column: &str) -> Stat<u64> {
+        self.distincts.get(&(index, column.to_owned())).copied().unwrap_or(Stat::Unknown)
     }
 
     /// How many columns anybody counted, which is what a test about this asks.
@@ -1339,10 +1342,17 @@ mod tests {
         // The name and the index both have to match, because two scans in one query can produce a
         // column of the same name and they are not the same column.
         let mut plan = Plan::new();
-        plan.measure_distinct(4, "n_nationkey", 25);
-        assert_eq!(plan.distinct_measured(4, "n_nationkey"), Some(25));
-        assert_eq!(plan.distinct_measured(4, "n_name"), None);
-        assert_eq!(plan.distinct_measured(5, "n_nationkey"), None);
+        plan.measure_distinct(
+            4,
+            "n_nationkey",
+            Stat::exact(25, rudb_common::Provenance::Dictionary),
+        );
+        assert_eq!(
+            plan.distinct_measured(4, "n_nationkey"),
+            Stat::exact(25, rudb_common::Provenance::Dictionary)
+        );
+        assert_eq!(plan.distinct_measured(4, "n_name"), Stat::Unknown);
+        assert_eq!(plan.distinct_measured(5, "n_nationkey"), Stat::Unknown);
         assert_eq!(plan.distinct_count(), 1);
     }
 
