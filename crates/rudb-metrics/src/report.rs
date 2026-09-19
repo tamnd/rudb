@@ -123,6 +123,9 @@ impl Report {
                 let (wall_ns, cpu_ns) = driver.spent();
                 pipeline.wall_ns = pipeline.wall_ns.saturating_add(wall_ns);
                 pipeline.cpu_ns = pipeline.cpu_ns.saturating_add(cpu_ns);
+                let (slowest_ns, finalize_ns) = driver.waits();
+                pipeline.slowest_ns = pipeline.slowest_ns.max(slowest_ns);
+                pipeline.finalize_ns = pipeline.finalize_ns.saturating_add(finalize_ns);
                 instances = instances.saturating_add(driver.instances());
                 driven = true;
             }

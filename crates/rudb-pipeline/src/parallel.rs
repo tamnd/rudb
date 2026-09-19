@@ -30,6 +30,40 @@ use crate::pipeline::Pipeline;
 use crate::pool::Lease;
 use crate::serial::{Stop, instance, run_serial};
 
+/// What a parallel run cost that the thread which started it cannot see for itself.
+///
+/// All three are here for the same reason. A pipeline's wall clock is one number and the work
+/// inside it happened on several threads, so the difference between that number and the work has
+/// to be explained by something, and until this existed the only way to ask was to subtract the
+/// operators from the pipeline and guess at what was left. On ClickBench 39 what was left is more
+/// than half the query, and it could have been the finalize, the straggler or the cost of starting
+/// the threads at all. Those three have nothing in common and three different fixes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Spread {
+    /// CPU nanoseconds burned on the threads that were not the caller's.
+    ///
+    /// The clock this engine reads for CPU time is per thread, which is the right clock for
+    /// attributing work to an operator and the wrong one for a span that wants the whole query, so
+    /// a caller timing the execution has to be told what it could not see.
+    pub worker_cpu_ns: u64,
+
+    /// The wall of the longest single instance, which is the one everything else waited for.
+    ///
+    /// Not summed and not averaged. A pipeline is done when its slowest instance is done, so this
+    /// is the part of the wall clock that parallelism has already bought whatever it is going to
+    /// buy. What sits between this and the pipeline's own wall is the starting and the joining.
+    /// What sits between this and the average instance is the imbalance.
+    pub slowest_ns: u64,
+
+    /// The wall of the sink's finalize, which runs once after every instance has combined.
+    ///
+    /// One thread by definition, whatever it does inside. A grouped aggregate does most of its work
+    /// here and starts its own threads to do it, and until this was measured that time was charged
+    /// to the operator and then divided by the instance count, which made it look like a sixteenth
+    /// of what it is.
+    pub finalize_ns: u64,
+}
+
 /// Run a pipeline on the threads the lease covers and combine what they produced.
 ///
 /// The caller's thread is one of them, so a lease of one is exactly the serial driver and is handed
@@ -37,39 +71,48 @@ use crate::serial::{Stop, instance, run_serial};
 /// and [`Lease::scatter`] is what wakes them and what makes sure this does not return until they
 /// have all put down the pipeline they borrowed.
 ///
-/// Returns the CPU nanoseconds burned on the threads that were not the caller's. The clock this
-/// engine reads for CPU time is per thread, which is the right clock for attributing work to an
-/// operator and the wrong one for a span that wants the whole query, so a caller timing the
-/// execution has to be told what it could not see. Wall time is not reported for the same reason in
-/// reverse: a worker ran at the same time as the caller, and adding its wall clock would make a
-/// query that got faster look like it took longer.
+/// Returns the three numbers in [`Spread`]. Wall time for the pipeline as a whole is not among them
+/// and does not want to be: a worker ran at the same time as the caller, and adding its wall clock
+/// would make a pipeline that got faster look like it took longer.
 ///
 /// # Errors
 ///
 /// The first error any instance reported. The rest are dropped, because a query answers with one
 /// error and the useful one is the one that happened first.
-pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>) -> Result<u64> {
+pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>) -> Result<Spread> {
     let degree = lease.degree();
     if degree <= 1 {
+        let measured = Span::start();
         run_serial(pipeline, cancel)?;
-        return Ok(0);
+        let (wall, _) = measured.stop();
+        return Ok(Spread { worker_cpu_ns: 0, slowest_ns: wall, finalize_ns: 0 });
     }
 
     let stop = Stop::default();
     let failed = AtomicBool::new(false);
     let spent = AtomicU64::new(0);
+    let slowest = AtomicU64::new(0);
     let failure = Mutex::new(None);
 
     // What a borrowed worker runs. It is the caller's own instance with a clock around it, because
-    // the CPU clock this engine reads is per thread and the caller cannot see a worker's.
+    // the CPU clock this engine reads is per thread and the caller cannot see a worker's, and
+    // because the wall of the longest of them is what the pipeline actually waited for.
     let task = || {
         let measured = Span::start();
         let ran = one(pipeline, cancel, &stop, &failed);
-        let (_, cpu) = measured.stop();
+        let (wall, cpu) = measured.stop();
         spent.fetch_add(cpu, Ordering::Relaxed);
+        slowest.fetch_max(wall, Ordering::Relaxed);
         keep(&failure, ran);
     };
-    let (mine, panicked) = lease.scatter(&task, || one(pipeline, cancel, &stop, &failed));
+    let caller = || {
+        let measured = Span::start();
+        let ran = one(pipeline, cancel, &stop, &failed);
+        let (wall, _) = measured.stop();
+        slowest.fetch_max(wall, Ordering::Relaxed);
+        ran
+    };
+    let (mine, panicked) = lease.scatter(&task, caller);
     keep(&failure, mine);
     if panicked {
         keep(&failure, Err(panicked_thread()));
@@ -79,8 +122,15 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>)
         return Err(error);
     }
 
-    pipeline.sink().finalize_state()?;
-    Ok(spent.load(Ordering::Relaxed))
+    let measured = Span::start();
+    let finalized = pipeline.sink().finalize_state();
+    let (finalize_ns, _) = measured.stop();
+    finalized?;
+    Ok(Spread {
+        worker_cpu_ns: spent.load(Ordering::Relaxed),
+        slowest_ns: slowest.load(Ordering::Relaxed),
+        finalize_ns,
+    })
 }
 
 /// Keeps the first error and drops the rest.

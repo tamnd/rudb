@@ -99,7 +99,7 @@ pub use compact::{Compaction, Copied, Gauge, compaction, narrow};
 pub use dynamic::{DynSink, DynStream, LocalState};
 pub use morsel::Morsel;
 pub use pages::keep_pages;
-pub use parallel::run_parallel;
+pub use parallel::{Spread, run_parallel};
 pub use pipeline::{Locals, Pipeline};
 pub use pool::{Lease, Pool};
 pub use progress::{Blocked, BlockedReason, BufferId, IoToken, MemoryToken, PipelineId, Progress};

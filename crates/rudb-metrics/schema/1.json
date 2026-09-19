@@ -70,6 +70,8 @@
       "depends_on": [],
       "wall_ns": 980000000,
       "cpu_ns": 7600000000,
+      "slowest_ns": 940000000,
+      "finalize_ns": 31000000,
       "blocked_ns": {
         "io": 120000000,
         "memory": 0,
@@ -85,6 +87,8 @@
       ],
       "wall_ns": 343000000,
       "cpu_ns": 2280000000,
+      "slowest_ns": 343000000,
+      "finalize_ns": 0,
       "blocked_ns": {
         "io": 0,
         "memory": 0,
