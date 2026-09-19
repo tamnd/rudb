@@ -124,6 +124,7 @@ impl Binder<'_> {
             dependent: !correlations.is_empty(),
             reads: correlations,
             index: column.binding.table,
+            inside_aggregate: self.in_aggregate,
         });
         Ok(expr)
     }
@@ -154,6 +155,7 @@ impl Binder<'_> {
             dependent: !correlations.is_empty(),
             reads: correlations,
             index,
+            inside_aggregate: self.in_aggregate,
         });
         self.against_null(
             if negated { CompareOp::NotDistinctFrom } else { CompareOp::DistinctFrom },
@@ -733,6 +735,7 @@ impl Binder<'_> {
             dependent: !correlations.is_empty(),
             reads: correlations,
             index: projected,
+            inside_aggregate: self.in_aggregate,
         });
         if negate { self.call("not", vec![marker]) } else { Ok(marker) }
     }

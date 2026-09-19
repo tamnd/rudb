@@ -212,6 +212,13 @@ pub(crate) struct PendingSubquery {
     /// joined above the grouping rather than from the table underneath it. Those columns are not
     /// the table's and the grouping rule has nothing to say about them.
     pub(crate) index: u32,
+    /// Whether the query was written inside an aggregate call's argument or its `FILTER`.
+    ///
+    /// One written there is read once per row going into the aggregate, so it has to be joined in
+    /// underneath the grouping however uncorrelated it is. Every other query a grouped block writes
+    /// is one row for the whole block and is lifted over the grouping instead, which is what
+    /// [`Binder::lift_over_aggregate`] decides.
+    pub(crate) inside_aggregate: bool,
 }
 
 /// Which input of a join a query written in that join's `ON` is joined into.
@@ -379,8 +386,15 @@ impl<'a> Binder<'a> {
     /// inputs, since a join condition is evaluated by the join and can only read what the join was
     /// given.
     fn attach_subquery(&mut self, input: NodeRef, pending: PendingSubquery) -> NodeRef {
-        let PendingSubquery { node: mut right, kind, conditions, dependent, reads: _, index: _ } =
-            pending;
+        let PendingSubquery {
+            node: mut right,
+            kind,
+            conditions,
+            dependent,
+            reads: _,
+            index: _,
+            inside_aggregate: _,
+        } = pending;
         if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows() {
             right = self.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
         }
@@ -807,6 +821,11 @@ impl<'a> Binder<'a> {
         // without a subquery in between, so the outer block's runs are put aside for the duration
         // rather than left where a nested block would append to them.
         let outer_windows = std::mem::take(&mut self.windows);
+        // Same argument for the queries lifted over this block's grouping. They are recorded while
+        // the select list is being bound and read until the sort keys are done, and a block bound
+        // inside that stretch has its own set, so the outer block's is put aside rather than left
+        // where the inner one would clear it.
+        let outer_joined_above = std::mem::take(&mut self.joined_above);
         let (mut node, input) = self.bind_from(ast, written.from)?;
         node = self.attach_scalar_subqueries(node);
 
@@ -837,47 +856,25 @@ impl<'a> Binder<'a> {
             self.aggregation = Some(Aggregation { index, groups, aggregates: Vec::new() });
         }
 
+        // The queries this block's clauses wrote that are joined in above the grouping rather than
+        // below it. TPC-H q11 is the case in a `HAVING`: `HAVING sum(ps_supplycost * ps_availqty) >
+        // (SELECT sum(...))` compares one group's total against a total over the whole table, and
+        // the second total is one row that has nothing to do with the groups. Joined underneath the
+        // grouping it would be a column of every input row and the grouping rule would ask for it in
+        // the GROUP BY, which is the complaint this used to make.
+        let mut above = Vec::new();
+
         self.clause = "SELECT clause";
-        let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input)?;
+        let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
         let visible = exprs.len();
 
         let mut having = None;
-        // The queries a `HAVING` wrote, which are joined in above the grouping rather than below
-        // it. TPC-H q11 is the case: `HAVING sum(ps_supplycost * ps_availqty) > (SELECT sum(...))`
-        // compares one group's total against a total over the whole table, and the second total is
-        // one row that has nothing to do with the groups. Joined underneath the grouping it would
-        // be a column of every input row and the grouping rule would ask for it in the GROUP BY,
-        // which is the complaint this used to make.
-        let mut above = Vec::new();
         if written.having != NONE {
             self.clause = "HAVING clause";
             let before = self.scalar_subqueries.len();
             let predicate = self.bind_expr(ast, written.having, &input)?;
-            // A correlated one still goes underneath, because what it correlates to is a column of
-            // the rows going into the grouping and there is nothing above the grouping to read.
-            for pending in self.scalar_subqueries.split_off(before) {
-                if pending.dependent {
-                    self.scalar_subqueries.push(pending);
-                } else {
-                    above.push(pending);
-                }
-            }
-            self.joined_above = above.iter().map(|pending| pending.index).collect();
+            self.lift_over_aggregate(before, &mut above, &input)?;
             let predicate = self.over_aggregate(predicate, &input)?;
-            // A mark join carries its comparison rather than the predicate carrying it, and that
-            // comparison is written over the outer rows, so it needs the same rewrite.
-            let mut rewritten = Vec::with_capacity(above.len());
-            for mut pending in above {
-                let conditions = std::mem::take(&mut pending.conditions);
-                let mut over = Vec::with_capacity(conditions.len());
-                for condition in conditions {
-                    over.push(self.over_aggregate(condition, &input)?);
-                }
-                pending.conditions = over;
-                rewritten.push(pending);
-            }
-            above = rewritten;
-            self.joined_above.clear();
             having = Some(self.as_boolean(predicate, "HAVING")?);
         }
 
@@ -898,8 +895,9 @@ impl<'a> Binder<'a> {
         self.clause = "ORDER BY clause";
         let mut extra = Vec::new();
         let keys = self.select_sort_keys(
-            ast, query, &input, &output, project, &mut exprs, &mut names, &mut extra,
+            ast, query, &input, &output, project, &mut exprs, &mut names, &mut extra, &mut above,
         )?;
+        self.joined_above = outer_joined_above;
         if !extra.is_empty() && written.distinct != Distinct::No {
             return Err(Error::binder(
                 "For SELECT DISTINCT, ORDER BY expressions must appear in the select list",
@@ -990,11 +988,62 @@ impl<'a> Binder<'a> {
     }
 
     /// Binds the target list, expanding every star into the columns it stands for.
+    /// Moves the queries a clause just wrote from under this block's grouping to over it.
+    ///
+    /// A query written in a select list, a `HAVING` or an `ORDER BY` is one row that has nothing to
+    /// do with the groups, so it belongs on top of the grouping and not underneath it. Underneath,
+    /// its column is a column of every row going into the aggregate, which the grouping rule then
+    /// asks for in the `GROUP BY`, and the aggregate carries nothing but its groups and its
+    /// aggregates upward, so the projection could not read the column even if the rule let it
+    /// through. That is both halves of #1027.
+    ///
+    /// A correlated one still goes underneath, because what it correlates to is a column of the
+    /// rows going into the grouping and there is nothing above the grouping to read. So does one
+    /// written inside an aggregate call, since that is read once per row going into the aggregate
+    /// and lifting it over would put it where the aggregate that reads it cannot.
+    ///
+    /// `before` is what [`Self::scalar_subqueries`] held before the clause was bound, so only the
+    /// queries that clause wrote are considered.
+    fn lift_over_aggregate(
+        &mut self,
+        before: usize,
+        above: &mut Vec<PendingSubquery>,
+        scope: &Scope,
+    ) -> Result<()> {
+        if self.aggregation.is_none() {
+            return Ok(());
+        }
+        let mut lifted = Vec::new();
+        for pending in self.scalar_subqueries.split_off(before) {
+            if pending.dependent || pending.inside_aggregate {
+                self.scalar_subqueries.push(pending);
+            } else {
+                self.joined_above.push(pending.index);
+                lifted.push(pending);
+            }
+        }
+        // A mark join carries its comparison rather than the expression carrying it, and that
+        // comparison is written over the outer rows, so it needs the same rewrite the expression
+        // gets. It is done in a second pass so that a comparison reading another query lifted by
+        // the same clause finds that query's index already recorded.
+        for pending in &mut lifted {
+            let conditions = std::mem::take(&mut pending.conditions);
+            let mut over = Vec::with_capacity(conditions.len());
+            for condition in conditions {
+                over.push(self.over_aggregate(condition, scope)?);
+            }
+            pending.conditions = over;
+        }
+        above.append(&mut lifted);
+        Ok(())
+    }
+
     fn bind_targets(
         &mut self,
         ast: &Ast,
         targets: &[ast::Target],
         input: &Scope,
+        above: &mut Vec<PendingSubquery>,
     ) -> Result<(Vec<ExprRef>, Vec<String>)> {
         let mut exprs = Vec::with_capacity(targets.len());
         let mut names = Vec::with_capacity(targets.len());
@@ -1013,6 +1062,7 @@ impl<'a> Binder<'a> {
                     // way the replace list spells it rather than the way the table does. That only
                     // shows when the two differ in case, and `AS EventDate` over a column called
                     // `eventdate` is exactly the case that shows it.
+                    let before = self.scalar_subqueries.len();
                     let (expr, name) = match found {
                         Some((replacement, used)) => {
                             *used = true;
@@ -1024,6 +1074,7 @@ impl<'a> Binder<'a> {
                             column.name,
                         ),
                     };
+                    self.lift_over_aggregate(before, above, input)?;
                     exprs.push(self.over_aggregate(expr, input)?);
                     names.push(name);
                 }
@@ -1037,7 +1088,9 @@ impl<'a> Binder<'a> {
                 }
                 continue;
             }
+            let before = self.scalar_subqueries.len();
             let expr = self.bind_expr(ast, target.expr, input)?;
+            self.lift_over_aggregate(before, above, input)?;
             exprs.push(self.over_aggregate(expr, input)?);
             names.push(if target.alias == NONE {
                 self.output_name(ast, target.expr, input)
@@ -1140,6 +1193,7 @@ impl<'a> Binder<'a> {
         exprs: &mut Vec<ExprRef>,
         names: &mut Vec<String>,
         extra: &mut Vec<usize>,
+        above: &mut Vec<PendingSubquery>,
     ) -> Result<Vec<SortKey>> {
         if query.order_by_all {
             return Ok(self.every_column(output));
@@ -1151,7 +1205,9 @@ impl<'a> Binder<'a> {
             let position = match self.output_position(ast, item.expr, output)? {
                 Some(position) => position,
                 None => {
+                    let before = self.scalar_subqueries.len();
                     let bound = self.bind_expr(ast, item.expr, input)?;
+                    self.lift_over_aggregate(before, above, input)?;
                     let bound = self.over_aggregate(bound, input)?;
                     match exprs.iter().position(|&held| self.same_expr(held, bound)) {
                         Some(position) => position,
@@ -2809,6 +2865,11 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Whether a column is the result of a query this block wrote and has not joined in yet.
+    fn is_pending_subquery(&self, binding: ColumnBinding) -> bool {
+        self.scalar_subqueries.iter().any(|pending| pending.index == binding.table)
+    }
+
     /// Whether a column is the result of a window this block is building.
     fn is_window_output(&self, binding: ColumnBinding) -> bool {
         self.windows.iter().any(|run| run.index == binding.table)
@@ -2872,6 +2933,17 @@ impl<'a> Binder<'a> {
             // its own. The grouping rule is about columns of this query's own `FROM`, and a name
             // that resolved past it is not one of those. That is #995.
             Expr::Column(binding) if self.is_correlation(binding) => Ok(expr),
+            // A query this block wrote that is still waiting to be joined in underneath the
+            // grouping, which is a correlated one, since an uncorrelated one was lifted over the
+            // grouping by [`Self::lift_over_aggregate`] and is not here. It has to stay underneath,
+            // because what it correlates to is a column of the rows going into the aggregate, and
+            // underneath is where the aggregate cannot carry its column upward. That is a thing
+            // this engine cannot plan rather than a GROUP BY the query is missing, and it is worth
+            // saying so, because the column belongs to no table anybody wrote and the sentence
+            // below could not name it. That is #1032.
+            Expr::Column(binding) if self.is_pending_subquery(binding) => Err(Error::binder(
+                "a correlated subquery over a grouped query is not supported here yet",
+            )),
             Expr::Column(binding) => {
                 let name = self.name_of(binding, scope);
                 Err(Error::binder(format!(
