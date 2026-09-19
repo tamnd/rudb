@@ -185,6 +185,25 @@ pub trait Sink: Send + Sync + fmt::Debug {
         1
     }
 
+    /// Do whatever this operator needs doing once, before any instance of it runs.
+    ///
+    /// The same hook as [`Stream::prepare`] and it is there for the same reason. A join that
+    /// gathered the side it produces ends its pipeline rather than sitting in the middle of one,
+    /// so it is a sink, and its table is still shared by every instance and still wants building
+    /// on the whole lease rather than by whichever instance asked for it first.
+    ///
+    /// Called once per run of the pipeline, on the thread that is about to hand the instances out,
+    /// so an implementation may assume it is alone and may borrow the lease. An operator with
+    /// nothing to do before it starts leaves this as it is and pays a virtual call per pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the operator reports. A failure here fails the pipeline before any of it has run.
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        let _ = threads;
+        Ok(())
+    }
+
     /// Told which morsel the chunks that come next were read from.
     ///
     /// Called once per morsel, by the driver, on the instance that took it, before any

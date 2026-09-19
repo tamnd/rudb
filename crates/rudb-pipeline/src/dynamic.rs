@@ -115,6 +115,13 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     /// Whether more than one instance of this operator may run at once.
     fn parallel(&self) -> bool;
 
+    /// Do whatever this operator needs doing once, before any instance of it runs.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the typed operator reports.
+    fn prepare_once(&self, threads: &Lease<'_>) -> Result<()>;
+
     /// Told which morsel the chunks that come next were read from.
     ///
     /// # Errors
@@ -154,6 +161,10 @@ impl<S: Sink> DynSink for S {
 
     fn parallel(&self) -> bool {
         Sink::parallel(self)
+    }
+
+    fn prepare_once(&self, threads: &Lease<'_>) -> Result<()> {
+        self.prepare(threads)
     }
 
     fn at_state(&self, morsel: &Morsel, local: &mut LocalState) -> Result<()> {

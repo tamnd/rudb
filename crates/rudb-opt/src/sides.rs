@@ -53,10 +53,20 @@
 //! # What it leaves alone
 //!
 //! A join whose kind names a side. Swapping the inputs of a join means running it as its mirror,
-//! and [`rudb_plan::JoinKind::mirrored`] is where the kinds that have one are listed. `SEMI`,
-//! `ANTI`, `SINGLE` and `MARK` produce the left input's rows, or a column about them, so their left
-//! input is the subject rather than a side, and `POSITIONAL` pairs the nth row with the nth row,
-//! which nothing about one input alone preserves. Those keep whatever they were given.
+//! and [`rudb_plan::JoinKind::mirrored`] is where the kinds that have one are listed. `SINGLE` and
+//! `MARK` produce the left input's rows, or a column about them, so their left input is the subject
+//! rather than a side, and `POSITIONAL` pairs the nth row with the nth row, which nothing about one
+//! input alone preserves. Those keep whatever they were given.
+//!
+//! `SEMI` and `ANTI` have no mirror either and do get a choice, because the executor has a second
+//! operator for them rather than a second kind. `crates/rudb-exec/src/join.rs::Marking` gathers the
+//! subject side, marks a gathered row when some row of the other side matches it, and produces the
+//! marked rows, or the unmarked ones, once the other side is finished. So the subject can be the
+//! gathered side after all, and when it is the smaller of the two it should be: TPC-H q21's
+//! `EXISTS` is a semi join over a subject of about seventy five thousand rows and a `lineitem` of
+//! six million, and the operator that cannot turn around has to build its table out of the six
+//! million. Only when a lookup answers the join, since that second operator is a hash join and
+//! there is no nested loop written the other way round.
 //!
 //! A join where either estimate is `None`, which is a scan of a table nobody measured and anything
 //! above one. Guessing between two sides when one of the two numbers is missing is how an optimizer
@@ -176,12 +186,21 @@ fn choose(plan: &mut Plan, stats: &Facts) {
         let Node::Join { left, right, kind, conditions, .. } = *plan.node(node) else {
             continue;
         };
-        if kind.mirrored().is_none() {
+        // A semi or an anti join has no mirror and is still a choice, because the executor runs a
+        // turned around one as a different operator rather than as a different kind. See the
+        // module documentation.
+        let turned = matches!(kind, JoinKind::Semi | JoinKind::Anti);
+        if kind.mirrored().is_none() && !turned {
             continue;
         }
         let below = (produced(plan, left), produced(plan, right));
         let held: Vec<_> = plan.expr_list(conditions).to_vec();
         let lookup = filter::lookup(plan, &mut tables, &held, &below);
+        // That operator is a hash join and there is no nested loop written the other way round, so
+        // a semi join the lookup cannot answer keeps the side the binder gave it.
+        if turned && !lookup {
+            continue;
+        }
         let wanted = match forced(kind, lookup) {
             Some(side) => side,
             None => {

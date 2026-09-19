@@ -52,6 +52,7 @@ pub fn run_serial(pipeline: &Pipeline<'_>, cancel: &Cancel) -> Result<()> {
     for stream in pipeline.streams() {
         stream.prepare_once(&alone)?;
     }
+    pipeline.sink().prepare_once(&alone)?;
     let mut locals = pipeline.locals();
     instance(pipeline, cancel, &stop, &mut locals)?;
     pipeline.sink().combine_state(locals.sink)?;

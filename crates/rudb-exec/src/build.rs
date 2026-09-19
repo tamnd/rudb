@@ -72,7 +72,7 @@ use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
-use crate::join::{CrossProduct, Gathered, Join, Probe};
+use crate::join::{CrossProduct, Gathered, Join, Marking, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
 use crate::query::Query;
@@ -1391,7 +1391,14 @@ impl<'a> Building<'a, '_> {
                 let marker = mark_binding(plan, right, kind);
                 let swapped = build == BuildSide::Left;
                 let (held, driving) = if swapped { (left, right) } else { (right, left) };
-                let kind = if swapped {
+                // A semi or an anti join has no mirror, because the kind it would be mirrored into
+                // is not a kind: its left input is the subject rather than a side and swapping the
+                // two does not give a join anybody can write down. What it gives is a different
+                // operator over the same join, one that gathers the subject and marks it as the
+                // other side streams past, and `crate::join::Marking` is that operator. The kind
+                // stays the plan's own, so the swap costs no new spelling of anything either.
+                let marking = swapped && matches!(kind, JoinKind::Semi | JoinKind::Anti);
+                let kind = if swapped && !marking {
                     kind.mirrored().ok_or_else(|| {
                         Error::internal(format!(
                             "a {} join was given a build side it has no mirror for",
@@ -1443,30 +1450,60 @@ impl<'a> Building<'a, '_> {
                 // `rudb_plan` the same question this line asks, in a second place, where the two
                 // could disagree and the disagreement would be a wrong plan rather than a coarse
                 // profile.
+                // Armed now rather than when the filter was made, because whether there is a key
+                // to hand over is a question about the conditions and only the operator has split
+                // them. A join that answers nothing leaves the filter inert, which is a scan that
+                // reads everything exactly as it did before.
+                // The binding the join knows is the one the projection above the scan hands it, so
+                // it is turned into the scan's own before either half is armed. Both halves
+                // together, because the build side pass that fills the filter is only worth making
+                // when there is a scan that will read it.
+                let zone = self.session.session_time_zone();
+                let arm = |keyed: Option<(ExprRef, ColumnBinding)>| {
+                    let Some((key, binding)) = keyed else {
+                        return;
+                    };
+                    let Some(binding) = sideways::beneath(plan, driving, binding) else {
+                        return;
+                    };
+                    sideways.keying(Keyed::new(plan, key, held_schema.clone(), zone));
+                    sideways.about(binding);
+                };
+                // The join turned around, which is the subject side gathered and marked while the
+                // other side streams past. It ends the pipeline rather than sitting in it, because
+                // no gathered row can be said to have matched nothing until the last driving row
+                // has been through. See `crate::join::Marking`.
+                if marking {
+                    let made = Marking::new(
+                        plan,
+                        &left.schema,
+                        &side,
+                        kind,
+                        conditions,
+                        self.cancel,
+                        memory,
+                    );
+                    let Some((mark, out)) = made else {
+                        return Err(Error::internal(format!(
+                            "a {} join was given a build side no lookup can answer it from",
+                            kind.keyword()
+                        )));
+                    };
+                    let mark = mark.in_session(self.session);
+                    arm(mark.sideways());
+                    let schema = mark.schema().clone();
+                    let counters = self.watch(reference, id, pipeline, "Mark", None);
+                    let reading = Arc::clone(&counters);
+                    left.after.push(gathering);
+                    self.close(left, pipeline, Arc::new(Watched::new(mark, counters)));
+                    let reader = Arc::new(Watched::new(out, reading));
+                    return Ok(Segment::reading(reader, schema, pipeline));
+                }
                 if let Some(probe) =
                     Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
                 {
                     let probe = probe.in_session(self.session);
-                    // Armed now rather than when the filter was made, because whether there is a key
-                    // to hand over is a question about the conditions and only this operator has
-                    // split them. A join that answers nothing leaves the filter inert, which is a
-                    // scan that reads everything exactly as it did before.
-                    // The binding the join knows is the one the projection above the scan hands it,
-                    // so it is turned into the scan's own before either half is armed. Both halves
-                    // together, because the build side pass that fills the filter is only worth
-                    // making when there is a scan that will read it.
-                    let armed = probe.sideways().and_then(|(key, binding)| {
-                        Some((key, sideways::beneath(plan, driving, binding)?))
-                    });
-                    if let Some((key, binding)) = armed {
-                        sideways.keying(Keyed::new(
-                            plan,
-                            key,
-                            held_schema.clone(),
-                            self.session.session_time_zone(),
-                        ));
-                        sideways.about(binding);
-                    }
+                    arm(probe.sideways());
                     let schema = probe.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Probe", None);
                     left.after.push(gathering);
