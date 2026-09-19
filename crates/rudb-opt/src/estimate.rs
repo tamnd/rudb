@@ -428,7 +428,16 @@ fn follow(plan: &Plan, binding: ColumnBinding, stats: &Statistics, depth: u32) -
 /// condition nobody understood could be the one doing all the work and a divisor that left it out
 /// would claim more rows than the join can produce.
 fn keyspace(plan: &Plan, conditions: Slice, stats: &Statistics) -> Option<u64> {
-    let conditions = plan.expr_list(conditions);
+    keyspace_of(plan, plan.expr_list(conditions), stats)
+}
+
+/// `keyspace` over conditions the caller is holding rather than over a slice of the arena.
+///
+/// Join ordering wants this. It is deciding which pair to join next and the conditions that would
+/// apply at that pair are the ones it has just worked out are testable there, which is a list it
+/// built and not a list any node in the arena holds.
+#[must_use]
+pub fn keyspace_of(plan: &Plan, conditions: &[ExprRef], stats: &Statistics) -> Option<u64> {
     if conditions.is_empty() {
         return None;
     }
@@ -449,6 +458,36 @@ fn keyspace(plan: &Plan, conditions: Slice, stats: &Statistics) -> Option<u64> {
     // A column with no distinct values at all is an empty column or a column of nothing but nulls,
     // and neither is something to divide by.
     (product > 0).then_some(product)
+}
+
+/// How many rows an equijoin of two sides of these sizes over that many key values produces.
+///
+/// The containment assumption: every row of the smaller side finds a match, so an equijoin produces
+/// about as many rows as its larger side. It is the standard guess and it is right whenever one side
+/// of the condition is a key, which is most joins anybody writes and none of the joins that hurt.
+///
+/// Where the key has a distinct count, the join can also be counted directly. Each side spreads its
+/// rows over the same set of key values, so a value gets `left / keys` rows from one side and
+/// `right / keys` from the other, and the pairs come to `left * right / keys`. On a key that is a
+/// key the two agree: a thousand rows joined to a million on a column with a million values is a
+/// million rows either way. On a column with twenty five values in it they do not agree at all, and
+/// the second one is right. TPC-H q5 joins a hundred and fifty thousand customers to ten thousand
+/// suppliers on a nation, and the containment assumption calls that a hundred and fifty thousand
+/// rows when it is sixty million.
+///
+/// The larger of the two is taken rather than the second one outright, so this can only ever raise
+/// an estimate above what shape alone said. A distinct count larger than the rows on the smaller
+/// side is the case where it would lower one, and that happens when the count came from a table
+/// that a filter underneath has already cut down, which makes the count stale rather than the join
+/// small.
+///
+/// Public because the join ordering pass scores an order with it. The two have to be one function
+/// rather than two that agree today, since an order chosen by one arithmetic and kept by another is
+/// an order nobody can reason about.
+#[must_use]
+pub fn matched(left: u64, right: u64, keys: Option<u64>) -> u64 {
+    let counted = keys.map_or(0, |keys| left.saturating_mul(right) / keys);
+    left.max(right).max(counted)
 }
 
 /// The join kinds, each of which is a different question.
@@ -489,28 +528,7 @@ fn join(
                     provenance: from,
                 };
             }
-            // The containment assumption: every row of the smaller side finds a match, so an
-            // equijoin produces about as many rows as its larger side. It is the standard guess and
-            // it is right whenever one side of the condition is a key, which is most joins anybody
-            // writes and none of the joins that hurt.
-            //
-            // Where the key has a distinct count, the join can also be counted directly. Each side
-            // spreads its rows over the same set of key values, so a value gets `left / keys` rows
-            // from one side and `right / keys` from the other, and the pairs come to
-            // `left * right / keys`. On a key that is a key the two agree: a thousand rows joined
-            // to a million on a column with a million values is a million rows either way. On a
-            // column with twenty five values in it they do not agree at all, and the second one is
-            // right. TPC-H q5 joins a hundred and fifty thousand customers to ten thousand
-            // suppliers on a nation, and the containment assumption calls that a hundred and fifty
-            // thousand rows when it is sixty million.
-            //
-            // The larger of the two is taken rather than the second one outright, so this can only
-            // ever raise an estimate above what shape alone said. A distinct count larger than the
-            // rows on the smaller side is the case where it would lower one, and that happens when
-            // the count came from a table that a filter underneath has already cut down, which
-            // makes the count stale rather than the join small.
-            let counted = keys.map_or(0, |keys| left.saturating_mul(right) / keys);
-            let matched = left.max(right).max(counted);
+            let matched = matched(left, right, keys);
             let value = match kind {
                 // An outer join emits every row of the preserved side whether it matched or not,
                 // so the estimate cannot fall below that side.

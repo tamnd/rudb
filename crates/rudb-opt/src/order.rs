@@ -23,26 +23,22 @@
 //!
 //! The order is chosen greedily. Repeatedly take the pair of parts with a condition between them
 //! that produces the fewest rows, join them, and put the result back, until one part is left. A pair
-//! with a condition between them is estimated at the larger of the two, which is the containment
-//! assumption [`crate::estimate`] already makes. A pair with no condition between them is taken only
-//! when no pair in the region has one, which is the case where a cross product is the only thing
-//! left to build, and `cheapest` is where that rule is and why it is not a tie break.
+//! with a condition between them is scored with [`crate::estimate::matched`], which is the larger of
+//! the two sides and the keyspace reading of the conditions that become testable at that pair,
+//! whichever is bigger. A pair with no condition between them is taken only when no pair in the
+//! region has one, which is the case where a cross product is the only thing left to build, and
+//! `cheapest` is where that rule is and why it is not a tie break.
 //!
-//! The order that comes out replaces the one that was there only when it builds fewer cross products
-//! than the region already had. That is the one comparison the row counts in this file can be
-//! trusted on and the reason for it is under the last of the refusals below. On TPC-H at SF1 three
-//! of the twenty two queries are regions this applies to and the other nineteen come out of the pass
-//! byte for byte the plan they went in as.
+//! The order that comes out replaces the one that was there when the sum of the rows its joins
+//! produce is smaller, and never when it builds more cross products than the region already had.
+//! Both orders are scored the same way and by the same function the greedy step minimises one pair
+//! at a time.
 //!
-//! Greedy rather than the dynamic program over connected subgraphs that the literature wants. The
-//! two reasons are that the dynamic program is exponential in the number of leaves and needs a
-//! deadline and a fallback, and that neither of them is worth building against a cardinality model
-//! this blunt. Under the containment assumption every join with a condition in it is estimated at
-//! the size of its larger side, so most of the orders a search would compare come out equal and the
-//! search would be choosing between them by its tie break. What is worth having today is the part
-//! that does not depend on the model at all, which is never building a cross product the query did
-//! not ask for. Distinct counts are what make a real search worth running, and they are what
-//! [`crate::estimate`] does not have yet.
+//! Greedy rather than the dynamic program over connected subgraphs that the literature wants, which
+//! is exponential in the number of leaves and needs a deadline and a fallback. Greedy is one pass
+//! over the pairs per join and it gets the orders that matter here, which are the ones where a join
+//! on a low cardinality key is being built before the joins that would have cut the sides down. The
+//! search goes in when there is a query it gets wrong.
 //!
 //! # What it refuses
 //!
@@ -62,15 +58,17 @@
 //! of them, and it means a plan can only be replaced by one this pass believes is better rather than
 //! by one it merely built later.
 //!
-//! An order that builds as many cross products as the region already had, which is the rule that
-//! keeps this pass to the one claim its numbers support. A cross product is worse than a join with a
-//! condition on it whatever the two sides are, and that is true without knowing a single distinct
-//! count. Everything else the cost function says is the containment assumption talking, and on q5 it
-//! is wrong by two orders: it estimates customer joined to supplier on `nationkey` at a hundred and
-//! fifty thousand rows, the size of the larger side, when there are twenty five nations in the table
-//! and the real answer is twelve million. Greedy believed the estimate, built that join first and
-//! made q5 seventy times slower. So the pass acts when it can take a cross product out and does
-//! nothing otherwise, and it stays that way until [`crate::estimate`] can count distinct values.
+//! An order that builds more cross products than the region already had. A cross product is worse
+//! than a join with a condition on it whatever the two sides are, and that is true without knowing a
+//! single distinct count, so it is refused whatever the rest of the sum says.
+//!
+//! This pass was held to removing cross products and nothing else until #917, because the only thing
+//! the cost function could say about a join with a condition on it was the containment assumption,
+//! and on q5 that is wrong by two orders: it put customer joined to supplier on `nationkey` at a
+//! hundred and fifty thousand rows, the size of the larger side, when there are twenty five nations
+//! in the table and the answer is sixty million. Greedy believed it, built that join first and made
+//! q5 seventy times slower. The distinct counts are what took the refusal out, and the same join now
+//! scores at what it produces, so greedy leaves it until the sides have been cut down.
 
 use rudb_common::Result;
 use rudb_plan::{BuildSide, ExprRef, JoinKind, Node, NodeRef, Plan};
@@ -233,7 +231,7 @@ fn order(
     let mut after = 0u64;
     let mut built = 0usize;
     while parts.len() > 1 {
-        let (left, right, rows) = cheapest(&parts, &pending);
+        let (left, right, rows) = cheapest(plan, &parts, &pending, stats);
         let mut union = parts[left].tables.clone();
         union.extend(&parts[right].tables);
         let conditions: Vec<ExprRef> = pending
@@ -250,11 +248,13 @@ fn order(
         after = after.saturating_add(rows);
         parts.push(Part { build: builds.len() - 1, tables: union, rows });
     }
-    // Removing a cross product is the one thing the row counts here can be trusted on, so it is the
-    // one thing the order is allowed to change for. An order that builds as many cross products as
-    // the region already had is not taken however much cheaper the rest of it estimates, because the
-    // estimate that said so is [`estimate::join`] on a chain, and that cannot lose a row.
-    if built >= was || after >= before {
+    // An order that builds more cross products than the region already had is refused whatever the
+    // sum says, because a cross product is worse than a join with a condition on it whatever the two
+    // sides are and no estimate is needed to know that. Otherwise the sum decides, which it can now
+    // that the rows it adds up come from [`estimate::matched`] rather than from the containment
+    // assumption alone. That is the change #917 made: a join on a low cardinality key is scored at
+    // what it produces, so the order that puts one first no longer looks like the cheap one.
+    if built > was || after >= before {
         return None;
     }
     Some(put(plan, &builds, parts[0].build))
@@ -302,15 +302,26 @@ fn put(plan: &mut Plan, builds: &[Build], at: usize) -> NodeRef {
 ///
 /// After that, the fewest rows, then the pair whose two inputs are smallest between them, then the
 /// pair that came first, which is what makes the choice the same on every run.
-fn cheapest(parts: &[Part], pending: &[(ExprRef, TableSet)]) -> (usize, usize, u64) {
+fn cheapest(
+    plan: &Plan,
+    parts: &[Part],
+    pending: &[(ExprRef, TableSet)],
+    stats: &Statistics,
+) -> (usize, usize, u64) {
     let mut best: Option<Pick> = None;
     for left in 0..parts.len() {
         for right in left + 1..parts.len() {
             let mut union = parts[left].tables.clone();
             union.extend(&parts[right].tables);
-            let linked = pending.iter().any(|(_, reads)| reads.is_subset_of(&union));
+            let testable: Vec<ExprRef> = pending
+                .iter()
+                .filter(|(_, reads)| reads.is_subset_of(&union))
+                .map(|(condition, _)| *condition)
+                .collect();
+            let linked = !testable.is_empty();
             let rows = if linked {
-                parts[left].rows.max(parts[right].rows)
+                let keys = estimate::keyspace_of(plan, &testable, stats);
+                estimate::matched(parts[left].rows, parts[right].rows, keys)
             } else {
                 parts[left].rows.saturating_mul(parts[right].rows)
             };
@@ -344,16 +355,22 @@ struct Pick {
 /// [`crate::estimate`], because the two have to be the same measure for the comparison to mean
 /// anything, and because this is the measure the greedy step is minimising one pair at a time.
 fn cost(plan: &Plan, at: NodeRef, stats: &Statistics) -> Option<(u64, u64, usize)> {
-    let (left, right, linked) = match *plan.node(at) {
-        Node::CrossProduct { left, right } => (left, right, false),
+    let (left, right, testable) = match *plan.node(at) {
+        Node::CrossProduct { left, right } => (left, right, Vec::new()),
         Node::Join { left, right, kind: JoinKind::Inner, conditions, .. } => {
-            (left, right, !plan.expr_list(conditions).is_empty())
+            (left, right, plan.expr_list(conditions).to_vec())
         }
         _ => return Some((estimate::rows(plan, at, stats)?, 0, 0)),
     };
+    let linked = !testable.is_empty();
     let (left, under_left, crossed_left) = cost(plan, left, stats)?;
     let (right, under_right, crossed_right) = cost(plan, right, stats)?;
-    let rows = if linked { left.max(right) } else { left.saturating_mul(right) };
+    let rows = if linked {
+        let keys = estimate::keyspace_of(plan, &testable, stats);
+        estimate::matched(left, right, keys)
+    } else {
+        left.saturating_mul(right)
+    };
     Some((
         rows,
         under_left.saturating_add(under_right).saturating_add(rows),
@@ -377,6 +394,22 @@ mod tests {
         let mut counts = Statistics::new();
         for (table, rows) in [("t", 1000), ("u", 10), ("v", 100), ("w", 100_000)] {
             counts.record("memory", "main", table, rows);
+        }
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        reorder(&mut plan, &counts);
+        plan.validate().unwrap_or_else(|error| panic!("{text} did not stay valid: {error}"));
+        plan.to_string()
+    }
+
+    /// The same with distinct counts handed in as well, the counts named table then column.
+    fn counted(text: &str, columns: &[(&str, &str, u64)]) -> String {
+        let mut counts = Statistics::new();
+        for (table, rows) in [("t", 1000), ("u", 10), ("v", 100), ("w", 100_000)] {
+            counts.record("memory", "main", table, rows);
+        }
+        for (table, column, distinct) in columns {
+            counts.record_distinct("memory", "main", table, column, *distinct);
         }
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
@@ -499,25 +532,34 @@ mod tests {
     }
 
     #[test]
-    fn a_region_with_no_path_between_two_parts_is_left_as_it_is() {
-        // Nothing here has a condition to anything, so every order of it is the same number of cross
-        // products and the pass has no claim to make about which one is better.
-        let text = concat!(
-            "CrossProduct\n",
-            "  CrossProduct\n",
-            "    Get memory.main.w AS w #3 [d::BIGINT]\n",
-            "    Get memory.main.v AS v #2 [c::BIGINT]\n",
-            "  Get memory.main.u AS u #1 [b::BIGINT]\n",
+    fn a_region_with_no_path_between_any_of_it_still_builds_the_smallest_middle() {
+        // Nothing here has a condition to anything, so the answer is the product either way and
+        // every order builds two cross products. What differs is what is held in between: crossing
+        // the hundred thousand with the hundred first makes ten million rows to cross again, and
+        // taking the two small ones first makes a thousand. The sum is the measure and it says so.
+        assert_eq!(
+            ordered(concat!(
+                "CrossProduct\n",
+                "  CrossProduct\n",
+                "    Get memory.main.w AS w #3 [d::BIGINT]\n",
+                "    Get memory.main.v AS v #2 [c::BIGINT]\n",
+                "  Get memory.main.u AS u #1 [b::BIGINT]\n",
+            )),
+            concat!(
+                "CrossProduct\n",
+                "  Get memory.main.w AS w #3 [d::BIGINT]\n",
+                "  CrossProduct\n",
+                "    Get memory.main.v AS v #2 [c::BIGINT]\n",
+                "    Get memory.main.u AS u #1 [b::BIGINT]\n",
+            )
         );
-        assert_eq!(ordered(text), text);
     }
 
     #[test]
-    fn an_order_that_is_cheaper_but_has_the_cross_products_it_already_had_is_not_taken() {
-        // `v` joins to nothing, so one cross product is built however the region is ordered. The
-        // search would rather cross `v` with `u` than with the join of `t` and `u` and by its own
-        // measure that is cheaper, but the claim it rests on is the containment assumption and not
-        // the cross product count, so the region is left alone.
+    fn an_order_the_search_reaches_and_does_not_beat_leaves_the_region_alone() {
+        // `v` joins to nothing, so one cross product is built however the region is ordered. Greedy
+        // takes the linked pair before any unlinked one, so it builds the same shape that is there
+        // and scores it the same, and an order that only ties is not an order worth rebuilding for.
         let text = concat!(
             "CrossProduct\n",
             "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
@@ -526,6 +568,36 @@ mod tests {
             "  Get memory.main.v AS v #2 [c::BIGINT]\n",
         );
         assert_eq!(ordered(text), text);
+    }
+
+    #[test]
+    fn a_join_on_a_column_with_two_values_in_it_is_left_until_the_sides_have_been_cut_down() {
+        // The q5 shape. `u` joins to `w` on a column with two values in it and `t` joins to `w` on
+        // a key. Both pairs read the same under the containment assumption, which puts each of them
+        // at the size of `w`, and the tie goes to the pair whose inputs are smaller between them,
+        // which is `u` and `w`. That is the wrong one: ten rows against a hundred thousand on two
+        // values is half a million rows and not a hundred thousand.
+        let text = concat!(
+            "Join INNER on=[(#0.0::BIGINT = #3.1::BIGINT)::BOOLEAN]\n",
+            "  Join INNER on=[(#1.0::BIGINT = #3.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.u AS u #1 [b::BIGINT]\n",
+            "    Get memory.main.w AS w #3 [d::BIGINT, e::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [a::BIGINT]\n",
+        );
+        // Nobody counted anything, so the pass has nothing to say and the region stays as written.
+        assert_eq!(ordered(text), text);
+        // With the counts the low cardinality pair is scored at what it produces, so greedy joins
+        // `t` to `w` on the key first and leaves `u` for last.
+        assert_eq!(
+            counted(text, &[("u", "b", 2), ("w", "d", 2), ("t", "a", 1000), ("w", "e", 100_000)]),
+            concat!(
+                "Join INNER on=[(#1.0::BIGINT = #3.0::BIGINT)::BOOLEAN]\n",
+                "  Get memory.main.u AS u #1 [b::BIGINT]\n",
+                "  Join INNER on=[(#0.0::BIGINT = #3.1::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.w AS w #3 [d::BIGINT, e::BIGINT]\n",
+                "    Get memory.main.t AS t #0 [a::BIGINT]\n",
+            )
+        );
     }
 
     #[test]
