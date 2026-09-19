@@ -78,8 +78,14 @@ pub struct Spread {
 ///
 /// The caller's thread is one of them, so a lease of one is exactly the serial driver and is handed
 /// to it rather than being a special case in here. The rest are workers the pool already has parked,
-/// and [`Lease::scatter`] is what wakes them and what makes sure this does not return until they
-/// have all put down the pipeline they borrowed.
+/// and [`Lease::scatter_at_most`] is what wakes them and what makes sure this does not return until
+/// they have all put down the pipeline they borrowed.
+///
+/// `instances` is how many copies of the pipeline to run and is not the same number as the lease.
+/// The lease is the wider of what the source wants and what the sink says it can finish on, so a
+/// scan that cuts sixteen morsels ahead of an aggregate that can merge on thirty two borrows thirty
+/// two and runs sixteen. The threads the instances do not use stay parked until the finish asks for
+/// them. See [`Pipeline::lease_degree`](crate::Pipeline::lease_degree).
 ///
 /// Returns the three numbers in [`Spread`]. Wall time for the pipeline as a whole is not among them
 /// and does not want to be: a worker ran at the same time as the caller, and adding its wall clock
@@ -89,9 +95,14 @@ pub struct Spread {
 ///
 /// The first error any instance reported. The rest are dropped, because a query answers with one
 /// error and the useful one is the one that happened first.
-pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>) -> Result<Spread> {
-    let degree = lease.degree();
-    if degree <= 1 {
+pub fn run_parallel(
+    pipeline: &Pipeline<'_>,
+    cancel: &Cancel,
+    lease: &Lease<'_>,
+    instances: usize,
+) -> Result<Spread> {
+    let instances = instances.clamp(1, lease.degree());
+    if instances <= 1 && lease.degree() <= 1 {
         let measured = Span::start();
         run_serial(pipeline, cancel)?;
         let (wall, cpu) = measured.stop();
@@ -146,7 +157,7 @@ pub fn run_parallel(pipeline: &Pipeline<'_>, cancel: &Cancel, lease: &Lease<'_>)
         record(wall, cpu);
         ran
     };
-    let (mine, panicked) = lease.scatter(&task, caller);
+    let (mine, panicked) = lease.scatter_at_most(instances, &task, caller);
     keep(&failure, mine);
     if panicked {
         keep(&failure, Err(panicked_thread()));

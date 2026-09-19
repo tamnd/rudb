@@ -123,6 +123,23 @@ impl<'a> Pipeline<'a> {
         }
     }
 
+    /// How many threads to borrow for this pipeline, which is not always how many instances to run.
+    ///
+    /// The instances are what [`Pipeline::degree`] says, and that is decided by the source. What
+    /// happens after them is the sink's finish, and it runs on the same borrowed threads with every
+    /// instance already joined, so it is bounded by a number that was chosen for the scan. On a
+    /// thirty two thread machine a million row scan cuts sixteen morsels and a hash aggregate then
+    /// merged a million groups on sixteen threads with the other half of the machine parked.
+    ///
+    /// So the borrow is the larger of the two and the instance count stays the smaller. A thread
+    /// borrowed and not used is parked in the pool and is never woken, which is what makes asking
+    /// for the wider of the two cheap enough to do on every pipeline.
+    #[must_use]
+    pub fn lease_degree(&self, ceiling: usize) -> usize {
+        let ceiling = ceiling.max(1);
+        self.degree(ceiling).max(self.sink.finalize_width(ceiling)).clamp(1, ceiling)
+    }
+
     /// Fresh local state for one instance of this pipeline.
     #[must_use]
     pub fn locals(&self) -> Locals {

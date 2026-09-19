@@ -142,6 +142,9 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     ///
     /// Whatever the typed operator reports.
     fn finalize_state(&self, threads: &Lease<'_>) -> Result<()>;
+
+    /// How many threads the typed operator could finish on. See [`Sink::finalize_degree`].
+    fn finalize_width(&self, ceiling: usize) -> usize;
 }
 
 impl<S: Sink> DynSink for S {
@@ -167,5 +170,9 @@ impl<S: Sink> DynSink for S {
 
     fn finalize_state(&self, threads: &Lease<'_>) -> Result<()> {
         self.finalize(threads)
+    }
+
+    fn finalize_width(&self, ceiling: usize) -> usize {
+        self.finalize_degree(ceiling)
     }
 }
