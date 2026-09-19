@@ -43,27 +43,64 @@
 //! [`read_stats`]: crate::metadata::read_stats
 //! [`Stats`]: crate::metadata::Stats
 
-use rudb_common::LogicalType;
+use std::sync::Arc;
 
-use crate::metadata::{ColumnChunk, Physical, RowGroup, SchemaColumn};
+use rudb_common::LogicalType;
+use rudb_common::bounds::Zones;
+
+use crate::metadata::{ColumnChunk, Metadata, Physical, RowGroup, SchemaColumn};
 
 /// The bounds vocabulary, which is shared rather than restated.
 ///
-/// [`Op`] and [`Bound`] live in `rudb-common` because a Parquet row group is one of three places
-/// this engine keeps a minimum and a maximum, and the reasoning about what those two numbers rule
-/// out is the same wherever they came from. What is Parquet's own is everything below: decoding a
-/// writer's bytes into a bound, and knowing which chunk of which row group to look in.
-pub use rudb_common::bounds::{Bound, Op};
+/// [`Op`], [`Bound`] and [`Test`] live in `rudb-common` because a Parquet row group is one of three
+/// places this engine keeps a minimum and a maximum, and the reasoning about what those two numbers
+/// rule out is the same wherever they came from. What is Parquet's own is everything below:
+/// decoding a writer's bytes into a bound, and knowing which chunk of which row group to look in.
+pub use rudb_common::bounds::{Bound, Op, Test};
 
-/// One comparison against one column, with the bound it is testing for.
-#[derive(Debug, Clone)]
-pub struct Test {
-    /// Which column of the file's flat schema, which is what a row group's chunks are indexed by.
-    pub column: usize,
-    /// The comparison, written with the column on the left.
-    pub op: Op,
-    /// The constant the column is compared against.
-    pub value: Bound,
+/// The footer's zone maps, asked what the planner asks rather than what a scan asks.
+///
+/// A scan walks the groups and skips the ones it can. The planner wants the same walk summed rather
+/// than iterated: how many rows are left once the skippable groups are gone. That is the same
+/// [`skips`] over the same footer, which is why this is here and not somewhere that would have to
+/// parse it again.
+///
+/// It holds the metadata the reader already parsed, shared rather than copied, so building one
+/// costs a refcount. That matters: the file it is built over on ClickBench has a hundred and five
+/// columns in eight thousand row groups, and copying the bounds out would cost more than the answer
+/// is worth.
+#[derive(Debug)]
+pub struct Footer {
+    /// What the reader parsed out of the end of the file.
+    metadata: Arc<Metadata>,
+}
+
+impl Footer {
+    /// The zone maps of a file whose footer has been read.
+    #[must_use]
+    pub fn new(metadata: Arc<Metadata>) -> Self {
+        Self { metadata }
+    }
+}
+
+impl Zones for Footer {
+    fn column(&self, name: &str) -> Option<usize> {
+        self.metadata.schema.iter().position(|column| column.name == name)
+    }
+
+    fn surviving(&self, tests: &[Test]) -> Option<u64> {
+        let mut total: u64 = 0;
+        for group in &self.metadata.row_groups {
+            if skips(tests, group, &self.metadata.schema) {
+                continue;
+            }
+            // A group whose count does not read as a row count gives up the whole answer rather
+            // than being left out of the sum. Leaving it out would turn a ceiling into a number
+            // below the truth, which is the one way this can be wrong that costs rows.
+            total = total.checked_add(u64::try_from(group.rows).ok()?)?;
+        }
+        Some(total)
+    }
 }
 
 /// Whether the bounds say no row of this group can satisfy every one of these tests.
@@ -132,10 +169,15 @@ fn read(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::LogicalType;
+    use std::sync::Arc;
 
-    use super::{Bound, Op, Test, skips};
-    use crate::metadata::{ColumnChunk, Encoding, Physical, RowGroup, SchemaColumn, Stats};
+    use rudb_common::LogicalType;
+    use rudb_common::bounds::Zones;
+
+    use super::{Bound, Footer, Op, Test, skips};
+    use crate::metadata::{
+        ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats,
+    };
 
     /// A schema of one `INTEGER` column called `d`, which every test here filters on.
     fn schema() -> Vec<SchemaColumn> {
@@ -261,5 +303,65 @@ mod tests {
         let group = group(Some(bytes(3_000_000_000)), Some(bytes(4_000_000_000)));
         let test = vec![Test { column: 0, op: Op::Greater, value: Bound::Int(2_000_000_000) }];
         assert!(!skips(&test, &group, &schema), "the group is entirely above two billion");
+    }
+
+    /// A footer over the given groups, with the one column schema every test here uses.
+    fn footer(groups: Vec<RowGroup>) -> Footer {
+        let rows = groups.iter().map(|group| group.rows).sum();
+        Footer::new(Arc::new(Metadata {
+            version: 2,
+            rows,
+            schema: schema(),
+            row_groups: groups,
+            created_by: None,
+        }))
+    }
+
+    #[test]
+    fn a_column_is_found_by_the_name_the_file_wrote_and_not_by_any_other() {
+        let footer = footer(vec![group(Some(1), Some(10))]);
+        assert_eq!(footer.column("d"), Some(0));
+        // A column the query computed rather than read looks like this from here, and the caller
+        // has to give up on the whole estimate rather than test some other column by accident.
+        assert_eq!(footer.column("nothing_of_the_sort"), None);
+    }
+
+    #[test]
+    fn the_surviving_rows_are_the_rows_of_the_groups_that_were_not_ruled_out() {
+        let footer = footer(vec![
+            group(Some(1), Some(10)),
+            group(Some(20), Some(30)),
+            group(Some(40), Some(50)),
+        ]);
+        assert_eq!(footer.surviving(&[]), Some(300), "no test rules anything out");
+        assert_eq!(footer.surviving(&test(Op::Greater, 35)), Some(100), "only the last one");
+        assert_eq!(footer.surviving(&test(Op::Less, 15)), Some(100), "only the first one");
+        assert_eq!(footer.surviving(&test(Op::Greater, 15)), Some(200), "the last two");
+    }
+
+    #[test]
+    fn a_constant_outside_every_group_leaves_no_rows_at_all() {
+        // The answer the estimator turns into an exact zero, which is the one case where bounds
+        // say something certain rather than something smaller than the guess.
+        let footer = footer(vec![group(Some(1), Some(10)), group(Some(20), Some(30))]);
+        assert_eq!(footer.surviving(&test(Op::Greater, 1000)), Some(0));
+        assert_eq!(footer.surviving(&test(Op::Equal, 15)), Some(0));
+    }
+
+    #[test]
+    fn a_group_nothing_can_decide_is_counted_in_full() {
+        // Which is the conservative direction. A group kept that could have gone costs an estimate
+        // above the truth, and an estimate above the truth is a slower plan and not a wrong answer.
+        let mut unwritten = group(Some(1), Some(10));
+        unwritten.columns[0].stats = None;
+        let footer = footer(vec![group(Some(20), Some(30)), unwritten]);
+        assert_eq!(footer.surviving(&test(Op::Greater, 1000)), Some(100));
+    }
+
+    #[test]
+    fn a_file_of_no_row_groups_answers_zero_rather_than_nothing() {
+        // Zero rows is a fact about the file and the estimator is right to take it as one. The
+        // `None` this returns is reserved for a count that did not read as a row count.
+        assert_eq!(footer(Vec::new()).surviving(&test(Op::Equal, 1)), Some(0));
     }
 }

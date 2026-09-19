@@ -36,13 +36,14 @@
 
 use std::collections::BTreeMap;
 
+use rudb_common::bounds::Test;
 use rudb_common::stat::{Class, Direction, Provenance, Stat};
 use rudb_plan::{
     ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
     SetOpKind, Slice,
 };
 
-use crate::walk;
+use crate::{bounds, walk};
 
 /// What one conjunct of a filter is assumed to keep.
 ///
@@ -221,7 +222,27 @@ pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Statistics) -> Stat<u64> {
         Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
             let kept = KEPT_BY_A_CONDITION.powi(conjuncts(plan, predicate));
-            guess(of(input), kept)
+            // The bounds are a ceiling over the guess and not a new thing to guess about. A store
+            // that keeps a minimum and a maximum per part can say which parts this filter rules
+            // out, and the rows in the parts that survive is a number no answer to this filter can
+            // exceed. So the guess runs exactly as it always did and the ceiling is applied to it,
+            // which is the one composition that cannot be worse than the guess alone: the ceiling
+            // is never below the truth, so it replaces the guess only where the guess was above
+            // the truth and it lands no further from it than the guess was.
+            //
+            // Taking the ceiling as the estimate instead, or taking a fifth of it, both measured
+            // better on the fourteen predicates in the pull request that added this and neither is
+            // safe in general. A fifth of a ceiling that is already tight is a number below the
+            // truth, which is the direction that picks the wrong build side, and a ceiling read as
+            // an estimate is above the guess on any predicate the bounds barely narrow.
+            match surviving(plan, input, predicate) {
+                // Provably none. Every part is ruled out by bounds that cannot be wrong in this
+                // direction, so this is a fact and not an estimate, and it is the one answer here
+                // that is allowed below the one row floor `guess` puts in.
+                Some(0) => Stat::exact(0, Provenance::ZoneMap),
+                Some(ceiling) => capped(guess(of(input), kept), ceiling),
+                None => guess(of(input), kept),
+            }
         }
         // A projection changes the width and not the height, and a sort changes neither.
         // A fetch reads a column of each row it is handed, so it is as tall as its input too.
@@ -319,6 +340,35 @@ fn guess(input: Stat<u64>, kept: f64) -> Stat<u64> {
     }
 }
 
+/// A guess held under a number the answer provably cannot exceed.
+///
+/// The ceiling comes from the bounds a store keeps per part of itself, so it is a real fact about
+/// this filter over this file, and the guess is a constant that knows nothing about either. Where
+/// the guess is already under the ceiling it is left alone, because a ceiling says nothing about
+/// how far under it the answer sits and overwriting an estimate with a bound would be trading a
+/// number for a worse one. Where the ceiling bites, it is the answer and it says so: the value is
+/// certain from above and unknown from below, which is what [`CEILING`] means, and it names the
+/// zone map rather than the constant it replaced.
+///
+/// That is the whole reason this is a minimum rather than a new base to take a fraction of. A
+/// ceiling is never below the truth, so a minimum of it and the guess is never further from the
+/// truth than the guess was. This cannot make an estimate worse, ever, and nothing else that reads
+/// these bounds has that property.
+fn capped(guessed: Stat<u64>, ceiling: u64) -> Stat<u64> {
+    match guessed {
+        // Not `Unknown` any more. A filter over a table nobody counted still cannot produce more
+        // rows than the parts the bounds leave hold, and that is the same kind of answer a `LIMIT`
+        // over an unknown input gives.
+        Stat::Unknown => {
+            Stat::Known { value: ceiling, class: CEILING, provenance: Provenance::ZoneMap }
+        }
+        Stat::Known { value, .. } if ceiling < value => {
+            Stat::Known { value: ceiling, class: CEILING, provenance: Provenance::ZoneMap }
+        }
+        known => known,
+    }
+}
+
 /// The same number, said as a ceiling rather than as a count.
 fn ceiling(stat: Stat<u64>) -> Stat<u64> {
     match stat {
@@ -353,6 +403,41 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> i32 {
         _ => usize::from(!walk::constant(plan, predicate)),
     };
     i32::try_from(counted.min(8)).unwrap_or(8)
+}
+
+/// How many rows sit in the parts of `input` that `predicate` cannot rule out.
+///
+/// `None` unless the filter sits straight on a scan whose store kept bounds and at least one
+/// conjunct reads as a test. Straight on, with no projection in between, because a projection
+/// renames columns and the name is what the store is asked by, and following one through would be a
+/// second place that has to agree with the first about what a column is called.
+///
+/// A conjunct that is not a test is not a refusal. Dropping it leaves parts in that a full reading
+/// would have ruled out, so the answer stays a ceiling, and the guess above it still applies. What
+/// is a refusal is a test naming a column the store does not have, which means this plan and this
+/// store disagree about what is being read, and a number worked out from that disagreement would
+/// rule out parts holding rows the query wants.
+///
+/// The position is turned into a name and the name is given to the store, rather than the position
+/// being handed over directly. Column pruning moves a scan's positions and moves nothing else, so a
+/// position is about the plan and the store numbers its columns the way the file does.
+fn surviving(plan: &Plan, input: NodeRef, predicate: ExprRef) -> Option<u64> {
+    let index = bounds::scanned(plan, input)?;
+    let zones = plan.zones(index)?;
+    let names = match *plan.node(input) {
+        Node::Get { columns, .. } | Node::TableFunction { columns, .. } => plan.field_list(columns),
+        _ => return None,
+    };
+    let read = bounds::of(plan, input, predicate);
+    if read.is_empty() {
+        return None;
+    }
+    let mut tests = Vec::with_capacity(read.len());
+    for (position, op, value) in read {
+        let name = &names.get(position)?.name;
+        tests.push(Test { column: zones.column(name)?, op, value });
+    }
+    zones.surviving(&tests)
 }
 
 /// How many distinct values the column a binding names holds, where anybody counted.
@@ -560,6 +645,9 @@ fn scale(rows: u64, by: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use rudb_common::bounds::{Op, Test, Zones};
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
@@ -1051,5 +1139,143 @@ mod tests {
         let tables = &[("l", 1_000), ("r", 1_000)];
         let counts = &[("l", "a", 0), ("r", "a", 0)];
         assert_eq!(counted(&text, tables, counts), Some(1_000));
+    }
+
+    /// A store of two columns, `a` then `b`, answering with a count fixed when it is built.
+    ///
+    /// The columns are deliberately in the other order from the scan above, because that is the
+    /// case the name mapping exists for. A plan numbers a scan's columns by where they sit in what
+    /// the scan produces, column pruning moves that, and the file's own order never moves. Handing
+    /// the plan's position straight to the store would test the wrong column.
+    #[derive(Debug)]
+    struct Stub {
+        /// What [`Zones::surviving`] answers, whatever it is asked.
+        surviving: Option<u64>,
+        /// Every test it was asked, so a test can check which column the estimator named.
+        asked: Mutex<Vec<Test>>,
+    }
+
+    impl Stub {
+        fn new(surviving: Option<u64>) -> Arc<Self> {
+            Arc::new(Self { surviving, asked: Mutex::new(Vec::new()) })
+        }
+    }
+
+    impl Zones for Stub {
+        fn column(&self, name: &str) -> Option<usize> {
+            match name {
+                "b" => Some(0),
+                "a" => Some(1),
+                _ => None,
+            }
+        }
+
+        fn surviving(&self, tests: &[Test]) -> Option<u64> {
+            self.asked.lock().expect("no test panics while holding this").extend_from_slice(tests);
+            self.surviving
+        }
+    }
+
+    /// A two column scan, whose columns the stub above numbers the other way round.
+    fn bounded_scan() -> String {
+        "Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n".to_string()
+    }
+
+    /// The estimate for a plan whose table zero is the given store.
+    fn zoned(text: &str, rows: u64, zones: &Arc<Stub>) -> Stat<u64> {
+        let stats = statistics(&[("t", rows)]);
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        plan.set_zones(0, Arc::clone(zones) as Arc<dyn Zones>);
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    #[test]
+    fn a_filter_the_bounds_rule_out_entirely_is_exactly_no_rows() {
+        // The one answer bounds give that is a fact rather than a guess. No row group holds a
+        // value the constant falls inside, so there is no row to produce, and saying so exactly
+        // lets everything above it plan against zero instead of against a fifth of the file.
+        let text = format!("Filter (#0.0::INTEGER > 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let zones = Stub::new(Some(0));
+        assert_eq!(zoned(&text, 10_000_000, &zones), Stat::exact(0, Provenance::ZoneMap));
+    }
+
+    #[test]
+    fn a_ceiling_below_the_guess_replaces_it_and_says_it_is_a_ceiling() {
+        // On the ten million row smoke file `id < 1000` guesses two million and the bounds leave
+        // 122,880, against a truth of a thousand. The number the planner gets is the smaller one
+        // and it is marked as a bound rather than as an estimate, because that is what it is: the
+        // answer is somewhere between no rows and this, and no guess is involved in the ceiling.
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let zones = Stub::new(Some(100_000));
+        let capped = zoned(&text, 10_000_000, &zones);
+        assert_eq!(capped.value(), Some(&100_000));
+        assert_eq!(
+            capped.class(),
+            Some(Class::Certified { bound: 1.0, direction: Direction::AtMost })
+        );
+        assert_eq!(capped.provenance(), Some(Provenance::ZoneMap));
+        // A ceiling of one row is allowed, unlike the guess, which floors at one for a different
+        // reason: the guess floors because a relation estimated away is a subtree nobody reads,
+        // and a ceiling of one is a fact that happens to be one.
+        let tiny = Stub::new(Some(1));
+        assert_eq!(zoned(&text, 10_000_000, &tiny).value(), Some(&1));
+    }
+
+    #[test]
+    fn a_ceiling_above_the_guess_leaves_the_guess_alone() {
+        // This is what makes the whole thing safe. A bound says nothing about how far under it the
+        // answer sits, so replacing a guess that is already below it would be trading a number for
+        // a worse one. `k = 42` on the smoke file is the case: every row group holds a 42 in its
+        // range, the bounds rule nothing out, and the estimate stays the two million it was.
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let wide = Stub::new(Some(10_000_000));
+        assert_eq!(
+            zoned(&text, 10_000_000, &wide),
+            Stat::estimated(2_000_000, Provenance::Default)
+        );
+    }
+
+    #[test]
+    fn a_store_that_cannot_answer_leaves_the_estimate_exactly_as_it_was() {
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let quiet = Stub::new(None);
+        assert_eq!(zoned(&text, 1_000_000, &quiet), stat(&text, &[("t", 1_000_000)]));
+        assert_eq!(zoned(&text, 1_000_000, &quiet), Stat::estimated(200_000, Provenance::Default));
+    }
+
+    #[test]
+    fn a_filter_that_reads_as_no_test_at_all_does_not_ask_the_store() {
+        // Asking with no tests would come back with the whole file, which is the right number and
+        // the wrong provenance: nothing was ruled out by any bound, so nothing should claim to
+        // have been. A comparison of two columns is the case, since bounds on one say nothing
+        // about the other's value in the same row.
+        let text = format!("Filter (#0.0::INTEGER = #0.1::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let zones = Stub::new(Some(7));
+        assert_eq!(zoned(&text, 1_000_000, &zones), Stat::estimated(200_000, Provenance::Default));
+        assert!(zones.asked.lock().expect("not poisoned").is_empty(), "it was never asked");
+    }
+
+    #[test]
+    fn the_column_the_store_is_asked_about_is_the_one_the_plan_named_and_not_the_position() {
+        // The bug this mapping exists to stop. The plan's column zero is `a` and the store's
+        // column zero is `b`, so a test handed straight through would rule out row groups on the
+        // wrong column's bounds. That drops rows the query wanted, which is a wrong answer and not
+        // a slow one.
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let zones = Stub::new(Some(100));
+        zoned(&text, 1_000_000, &zones);
+        let asked = zones.asked.lock().expect("not poisoned");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].column, 1, "`a` is the store's column one");
+        assert_eq!(asked[0].op, Op::Less);
+    }
+
+    #[test]
+    fn a_table_with_no_store_recorded_is_estimated_the_way_it_always_was() {
+        // Which is every table today except a `read_parquet` of one file, so this is the path
+        // almost every query still takes and it has to be untouched.
+        let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        assert_eq!(stat(&text, &[("t", 1_000_000)]), Stat::estimated(200_000, Provenance::Default));
     }
 }

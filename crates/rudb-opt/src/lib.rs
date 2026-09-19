@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bounds;
 pub mod columns;
 pub mod cte;
 pub mod delim;
