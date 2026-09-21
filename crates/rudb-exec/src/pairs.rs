@@ -44,7 +44,7 @@ pub(crate) const ROWS_PER_PARTITION: usize = 16_384;
 /// How many rows a finishing pass wants before it asks for a thread beyond the first few.
 ///
 /// See [`finish_degree`].
-const ROWS_PER_EXTRA_THREAD: usize = 65_536;
+pub(crate) const ROWS_PER_EXTRA_THREAD: usize = 65_536;
 
 /// How many threads a finishing pass gets for `input` rows of radix partitions.
 ///
