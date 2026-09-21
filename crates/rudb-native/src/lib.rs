@@ -685,10 +685,17 @@ const DICTIONARY_DECIDE_ROWS: usize = 4_096;
 /// first stripe held a value that stripe had not seen before.
 ///
 /// See [`Writer::encode_column`]. Nine and not five, because the properties a dictionary buys are
-/// worth keeping everywhere they are real and nothing is claimed here about where between the two
-/// the crossover sits. TPC-H o_comment, c_comment and ps_comment are above it at 0.97 of their
-/// first stripe. l_comment is at 0.883 and so keeps its dictionary under this number, which is left
-/// alone until the same measurement has been run on a column of ClickBench's shape.
+/// worth keeping everywhere they are real. On ClickBench the widest string column is `Referer` at
+/// 0.131 of its first stripe and every other one is below that, so nothing there is near this and
+/// every one of them keeps its dictionary, which is what a group by on codes wants. On TPC-H
+/// `o_comment` and `c_comment` are at 0.97 and are what this catches.
+///
+/// `l_comment` sits at 0.883 and so keeps its dictionary. Eight was built and measured rather than
+/// argued about, and it is not a clear win: it takes `select l_comment from lineitem` from 4.335 G
+/// instructions to 3.473 G and the file from 280.2 MB to 260.4 MB, and it takes a `like` over the
+/// same column from 3.29 G to 4.27 G, because a dictionary runs the predicate once a distinct value
+/// and there are 3.6 M of those to 6.0 M rows. The 22 query suite came out 6.91 s against 7.07 s in
+/// favour of nine. So nine stays until there is a reason to prefer one of those shapes. See #1137.
 const DICTIONARY_DISTINCT_IN_TEN: usize = 9;
 
 /// Bytes one part takes in a stripe's index page: four for the length, eight for the checksum.
