@@ -490,11 +490,11 @@ where
 
 /// The rows that compare true against the value already known to sit at `rank`, or `None`.
 ///
-/// [`by_rank`] with the search taken out. It searches because it is given a literal and has to find
-/// out where the literal sits, and the search is not cheap: about nineteen probes of a dictionary of
-/// half a million, and a probe that cannot settle on the eight bytes the file stores per rank has to
-/// read a value, which decodes the block the value sits in. On ClickBench 25 that search and the
-/// block decoding under it were most of the query.
+/// The `by_rank` path with the search taken out. That path searches because it is handed a literal
+/// and has to find out where the literal sits, and the search is not cheap: about nineteen probes of
+/// a dictionary of a hundred thousand, and a probe that cannot settle on the eight bytes the file
+/// stores per rank has to read a value, which decodes the block the value sits in. On ClickBench 25
+/// that search and the block decoding under it were most of the query.
 ///
 /// A caller that already knows the rank pays none of it. The one this was written for is the top N,
 /// whose bound is not a literal from the query at all: it is a value that came out of this same

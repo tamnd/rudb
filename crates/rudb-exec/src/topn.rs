@@ -318,15 +318,19 @@ impl Sink for TopN {
             let full = self.bound > 0 && local.kept.len() == self.bound;
             // The rank pass where the candidates carry ranks and the value pass where they do not.
             // Both answer the same question and the second one searches the dictionary to do it.
+            // The second is still tried when the first declines, because a chunk that does not
+            // arrive as a dictionary over the one the ranks belong to is a chunk the ranks say
+            // nothing about and the search says as much as it ever did.
             let narrowed = full
-                .then(|| match local.ranked.worst(local.kept.len()) {
-                    Some((dictionary, rank)) => {
-                        beats_rank(&self.keys, &keys, dictionary, rank, rows)
-                    }
-                    None => {
+                .then(|| {
+                    let ranked =
+                        local.ranked.worst(local.kept.len()).and_then(|(dictionary, rank)| {
+                            beats_rank(&self.keys, &keys, dictionary, rank, rows)
+                        });
+                    ranked.or_else(|| {
                         let worst = &local.kept[self.bound - 1].0;
                         worth_looking_at(&self.keys, &keys, worst, rows)
-                    }
+                    })
                 })
                 .flatten();
             let offer = |row: usize, local: &mut Running| {
