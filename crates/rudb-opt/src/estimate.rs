@@ -1209,7 +1209,14 @@ mod tests {
     fn counted(text: &str, tables: &[(&str, u64)], columns: &[(&str, &str, u64)]) -> Option<u64> {
         let mut stats = facts(tables);
         for (table, column, distinct) in columns {
-            stats.record_distinct("memory", "main", table, column, *distinct, Provenance::Dictionary);
+            stats.record_distinct(
+                "memory",
+                "main",
+                table,
+                column,
+                *distinct,
+                Provenance::Dictionary,
+            );
         }
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
@@ -1224,7 +1231,14 @@ mod tests {
     ) -> Stat<u64> {
         let mut stats = facts(tables);
         for (table, column, distinct) in columns {
-            stats.record_distinct("memory", "main", table, column, *distinct, Provenance::Dictionary);
+            stats.record_distinct(
+                "memory",
+                "main",
+                table,
+                column,
+                *distinct,
+                Provenance::Dictionary,
+            );
         }
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));

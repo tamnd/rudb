@@ -431,7 +431,14 @@ mod tests {
             counts.record("memory", "main", table, rows);
         }
         for (table, column, distinct) in columns {
-            counts.record_distinct("memory", "main", table, column, *distinct, Provenance::Dictionary);
+            counts.record_distinct(
+                "memory",
+                "main",
+                table,
+                column,
+                *distinct,
+                Provenance::Dictionary,
+            );
         }
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));

@@ -569,7 +569,8 @@ mod tests {
         assert_eq!(counts.exact(0), None);
         let (estimate, exact) = counts.distinct(0).expect("an estimate");
         assert!(!exact);
-        let error = (estimate as f64 - f64::from(DEFAULT_K as u32)).abs() / f64::from(DEFAULT_K as u32);
+        let error =
+            (estimate as f64 - f64::from(DEFAULT_K as u32)).abs() / f64::from(DEFAULT_K as u32);
         assert!(error < 0.05, "{estimate} against {DEFAULT_K}, which is {error} out");
     }
 
