@@ -710,6 +710,73 @@ fn index_section(parts: usize) -> Result<usize> {
 }
 
 impl Writer {
+    /// Opens a committed file and starts a table in the generation after the one it holds.
+    ///
+    /// The tables already in the file are carried forward by name and by directory pointer, and
+    /// their pages are not read. Nothing in the file is overwritten: the new table's pages and the
+    /// new catalog go on the end, past the catalog the committed generation points at, and the one
+    /// write that is not an append is the slot in the header that [`Writer::finish`] does last.
+    ///
+    /// That slot is the other one. A file committed at generation 1 is named by the slot at 16 and
+    /// generation 2 writes the one at 44, so until the last four bytes of the commit land the file
+    /// still reads as the generation before it, and a slot torn across a write fails its checksum
+    /// and the reader falls back to the one beside it. This is what the second slot has always been
+    /// for.
+    ///
+    /// # Errors
+    ///
+    /// If the file has no valid committed directory, is not this build's format, repeats the name
+    /// of a table already in it, has a field with no scalar encoding, or cannot be written.
+    pub fn open(
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        fields: Vec<Field>,
+    ) -> Result<Self> {
+        for field in &fields {
+            type_tag(&field.ty)?;
+        }
+        let name = name.into();
+        let path = path.as_ref();
+        let (_, size, slot, bytes, _) = slot_bytes(path)?;
+        let closed = decode_catalog(&bytes, size)?;
+        if closed.iter().any(|held| held.name == name) {
+            return Err(invalid("two tables in one native file have the same name"));
+        }
+        // The generation of the slot whose bytes checksummed, and not the highest number in the
+        // header. A slot torn across a write can hold any number at all, and taking that one would
+        // be choosing which slot to overwrite from a value nothing has vouched for, which is how a
+        // half written commit gets to destroy the one good copy beside it.
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("native file generation overflow"))?;
+        let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
+        Ok(Self {
+            file,
+            // The end of the file, so that the committed generation's catalog stays where its slot
+            // says it is and keeps naming a file a reader can still open.
+            at: size,
+            dictionaries: fields
+                .iter()
+                .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .collect(),
+            table: Table {
+                name,
+                dictionaries: vec![None; fields.len()],
+                distincts: vec![None; fields.len()],
+                fields,
+                stripes: Vec::new(),
+                rows: 0,
+                frequencies: Vec::new(),
+            },
+            generation,
+            order: Vec::new(),
+            next_order: 0,
+            pending: Vec::with_capacity(STRIPE_PARTS),
+            closed,
+        })
+    }
+
     /// Creates a new v10 file and its first table.
     ///
     /// # Errors
@@ -1520,7 +1587,9 @@ impl Writer {
         };
         // The one write that is not an append, and the last one. It goes back over the slot in the
         // header, so it names its offset rather than going through `put`, and `at` does not move.
-        write_at(&self.file, 16, &slot.bytes())?;
+        // Which of the two slots it is alternates with the generation, so the one naming the
+        // generation before this is still intact and still valid until this write lands.
+        write_at(&self.file, slot_offset(self.generation), &slot.bytes())?;
         self.file.sync_all().map_err(io)?;
         Ok(self.table)
     }
@@ -2402,7 +2471,7 @@ impl Catalog {
     ///
     /// If the file has no valid committed catalog or a catalog pointer is out of bounds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let (file, size, bytes, opening) = slot_bytes(path)?;
+        let (file, size, _, bytes, opening) = slot_bytes(path)?;
         let entries = decode_catalog(&bytes, size)?;
         Ok(Self { file: Arc::new(file), size, entries: Arc::new(entries), opening })
     }
@@ -2453,11 +2522,19 @@ impl Catalog {
     }
 }
 
+/// Where the slot naming `generation` goes, which is the one the generation before it did not use.
+///
+/// Generation 1 takes the slot at 16, so a file written once is byte for byte the file this wrote
+/// before there was a second generation to write.
+fn slot_offset(generation: u64) -> u64 {
+    16 + (generation - 1) % 2 * SLOT_BYTES as u64
+}
+
 /// The header and the bytes the highest valid slot points at.
 ///
 /// Both levels of the directory are reached this way, so the magic check, the version check and the
 /// choice between the two slots live here rather than being written out twice.
-fn slot_bytes(path: impl AsRef<Path>) -> Result<(File, u64, Vec<u8>, Opening)> {
+fn slot_bytes(path: impl AsRef<Path>) -> Result<(File, u64, Slot, Vec<u8>, Opening)> {
     let mut file = File::open(path).map_err(io)?;
     let size = file.metadata().map_err(io)?.len();
     if size < HEADER {
@@ -2503,8 +2580,8 @@ fn slot_bytes(path: impl AsRef<Path>) -> Result<(File, u64, Vec<u8>, Opening)> {
             selected = Some((slot, bytes));
         }
     }
-    let (_, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
-    Ok((file, size, bytes, opening))
+    let (slot, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
+    Ok((file, size, slot, bytes, opening))
 }
 
 impl Reader {
