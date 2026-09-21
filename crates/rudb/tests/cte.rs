@@ -202,11 +202,20 @@ fn the_name_is_gone_once_the_query_that_wrote_it_is_over() {
 }
 
 #[test]
-fn a_definition_written_inside_a_plain_one_is_held_once_per_use() {
-    // A plain `WITH` goes into every place it is named, so a materialised one written inside it is
-    // bound once per use and each of those holds rows of its own. Two uses, two materialisations,
-    // and the answer is the same as if the text had been written out twice.
+fn a_definition_written_inside_an_inlined_one_is_held_once_per_use() {
+    // A plain `WITH` read once goes into the place it is named, so a materialised one written
+    // inside it is bound there and holds rows of its own. Read twice the outer one is held instead
+    // and the inner one is bound once, which is the second query here, and both answer the same
+    // thing as writing the text out by hand.
     let database = Database::new();
+    assert_eq!(
+        integers(
+            &database,
+            "WITH plain AS (WITH held AS MATERIALIZED (SELECT 1 AS n) SELECT n FROM held) \
+             SELECT n FROM plain"
+        ),
+        [1]
+    );
     assert_eq!(
         integers(
             &database,
@@ -214,6 +223,49 @@ fn a_definition_written_inside_a_plain_one_is_held_once_per_use() {
              SELECT n FROM plain UNION ALL SELECT n FROM plain"
         ),
         [1, 1]
+    );
+}
+
+#[test]
+fn a_plain_definition_read_twice_answers_what_reading_it_twice_means() {
+    // Reading a plain definition twice holds its rows rather than running it twice, which is the
+    // pin's rule and is worth having whether or not it is: a definition two places read is a
+    // definition that would otherwise be computed two times. What must not change is the answer,
+    // so these are the shapes where holding the rows could have gone wrong. The product of a
+    // definition with itself is every pair, not a cursor shared between the two sides. A read
+    // filtered one way and the same read filtered another way each see all the rows, since the
+    // filter is above the read and not inside the definition. And a definition read from two
+    // scalar subqueries answers both of them.
+    let database = ran(&["CREATE TABLE t (n INTEGER)", "INSERT INTO t VALUES (1), (2), (3)"]);
+    assert_eq!(
+        integers(
+            &database,
+            "WITH c AS (SELECT n FROM t) SELECT a.n * 10 + b.n FROM c a, c b ORDER BY 1"
+        ),
+        [11, 12, 13, 21, 22, 23, 31, 32, 33]
+    );
+    assert_eq!(
+        integers(
+            &database,
+            "WITH c AS (SELECT n FROM t) \
+             SELECT a.n FROM c a WHERE a.n < 3 UNION ALL SELECT b.n FROM c b WHERE b.n > 1 \
+             ORDER BY 1"
+        ),
+        [1, 2, 2, 3]
+    );
+    assert_eq!(
+        integers(
+            &database,
+            "WITH c AS (SELECT n FROM t) \
+             SELECT (SELECT max(n) FROM c) * 10 + (SELECT min(n) FROM c)"
+        ),
+        [31]
+    );
+    // An empty definition read twice is still empty both times, which is the case where a pipeline
+    // that waits for rows could have waited for rows that never come.
+    assert_eq!(
+        integers(&database, "WITH c AS (SELECT n FROM t WHERE n > 100) SELECT a.n FROM c a, c b"),
+        []
     );
 }
 
