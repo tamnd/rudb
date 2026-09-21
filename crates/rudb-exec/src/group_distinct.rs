@@ -588,9 +588,19 @@ struct Output {
 /// Every pair of a group lands in the same split, because the split is picked by the group hash, so
 /// nothing here has to agree with any other split about a count and the top rows it picks are final.
 ///
-/// The table is made once at the size the input can need, rather than started small and doubled,
-/// because the number of pairs coming in is known before any of them are read and a group cannot
-/// appear more often than that.
+/// The table is sized by the groups it finds rather than by the pairs it is handed, which is the
+/// difference between a probe that stays in the first level of cache and one that does not. The two
+/// numbers are far apart on the query this path exists for: a split of `COUNT(DISTINCT UserID)
+/// GROUP BY RegionID` over a million rows is fourteen thousand pairs and ten groups, so a table
+/// sized by the pairs is a hundred and thirty kilobytes with ten things in it, spread so thinly that
+/// almost every one of those fourteen thousand probes lands on a line nothing else touches. Sized by
+/// the groups it is two hundred and fifty six bytes and every probe is a hit.
+///
+/// So it starts at [`SPLIT_SEED`] slots and doubles while it is less than half empty, up to the size
+/// the input could need, which is the size this used to start at. The doubling is a rehash of the
+/// groups found so far and nothing else, because the counts stay where they are and the buckets hold
+/// an index into them rather than a key, so the whole cost of growing is bounded by the group count
+/// and the group count is what was too small to be worth the big table in the first place.
 fn count_groups(
     counted: &[Counted],
     split: usize,
@@ -600,11 +610,12 @@ fn count_groups(
 ) -> Result<Output> {
     let reserving = stage::Timing::start(Stage::Reserve);
     let input = counted.iter().map(|part| part.splits[split].len()).sum::<usize>();
-    let capacity = input.saturating_mul(2).max(64).next_power_of_two();
+    let ceiling = input.saturating_mul(2).max(SPLIT_SEED).next_power_of_two();
+    let mut capacity = SPLIT_SEED.min(ceiling);
     let mut working = memory.reservation();
     working.grow(width(capacity * size_of::<u32>()))?;
     let mut buckets = vec![EMPTY; capacity];
-    let mask = capacity - 1;
+    let mut mask = capacity - 1;
     let mut groups: Vec<Grouped> = Vec::new();
     let mut counts: Vec<i64> = Vec::new();
     reserving.stop(0);
@@ -621,6 +632,12 @@ fn count_groups(
                     })?;
                     groups.push(*pair);
                     counts.push(1);
+                    if groups.len().saturating_mul(2) > capacity && capacity < ceiling {
+                        capacity *= 2;
+                        mask = capacity - 1;
+                        working.grow(width(capacity * size_of::<u32>()))?;
+                        buckets = rehashed(capacity, &groups)?;
+                    }
                     break;
                 }
                 let slot = slot as usize;
@@ -666,6 +683,32 @@ fn count_groups(
     let chunks = rows::chunks(&kinds, &output, &mut held)?;
     timing.stop(0);
     Ok(Output { chunks, held })
+}
+
+/// The slots a split's group table starts with, which is one cache line of them and then some.
+///
+/// Small enough that the table a query with a handful of groups builds fits in the first level of
+/// cache beside everything else the fold is touching, and large enough that a query with a handful
+/// of groups never has to grow it at all. See [`count_groups`].
+const SPLIT_SEED: usize = 64;
+
+/// A fresh table of `capacity` slots holding every group in `groups` at its index.
+///
+/// Only the groups are rehashed. The counts are indexed by the same number the buckets hold, so
+/// nothing about them moves when the table grows.
+fn rehashed(capacity: usize, groups: &[Grouped]) -> Result<Vec<u32>> {
+    let mask = capacity - 1;
+    let mut buckets = vec![EMPTY; capacity];
+    for (slot, group) in groups.iter().enumerate() {
+        let slot = u32::try_from(slot)
+            .map_err(|_| Error::out_of_memory("a grouped distinct radix split is too large"))?;
+        let mut at = group.group_hash as usize & mask;
+        while buckets[at] != EMPTY {
+            at = (at + 1) & mask;
+        }
+        buckets[at] = slot;
+    }
+    Ok(buckets)
 }
 
 fn width(value: usize) -> u64 {
