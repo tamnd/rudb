@@ -930,6 +930,30 @@ impl Column {
                 }
             }
         }
+        // A packed run, either the column's own or one a dictionary points into. Neither has `Data`
+        // for the match below to index, so before this both of them went to [`Self::holds`] a row at
+        // a time and a row there is a walk down through the form, an unpack, a widening to 128 bits
+        // and a narrowing back, once per probe step rather than once per row. TPC-H q20 groups
+        // lineitem by two keys and reads the second of them as a dictionary over a packed run.
+        if let Some(packed) = column.packed_parts() {
+            if self.packed_run(here, seen, same, &packed, |row| !validity.is_valid(row), |row| row)
+            {
+                return;
+            }
+        } else if let Some((at, values)) = column.positions() {
+            if let Some(packed) = values.packed_parts() {
+                // A dictionary keeps its nulls in the vector it points at, so a row is null when
+                // either the column says so or the value its code names does.
+                let inner = values.validity();
+                let nulled = |row: usize| {
+                    !validity.is_valid(row)
+                        || at.get(row).is_none_or(|&code| !inner.is_valid(code as usize))
+                };
+                if self.packed_run(here, seen, same, &packed, nulled, |row| at[row] as usize) {
+                    return;
+                }
+            }
+        }
         if let Some(data) = column.data() {
             match (&self.data, data) {
                 (StoredData::TinyInt(stored), Data::Int8(values)) => run!(stored, values),
@@ -957,6 +981,56 @@ impl Column {
             if *flag {
                 *flag = self.holds(slot_of(bucket) as usize, column, step.row);
             }
+        }
+    }
+
+    /// [`Self::holds_run`] for a batch whose column reads its values out of a packed run.
+    ///
+    /// `nulled` says whether a row is null and `code` says which code of the run it reads, and the
+    /// two are separate because a dictionary answers the first from two validities and the second
+    /// through its codes while a packed column answers both from the row.
+    ///
+    /// `false` when the stored column is not one of the four signed runs, which sends the batch on
+    /// to whatever the caller has after this. The comparison is in 128 bits because that is the one
+    /// width all four stored runs and any packed value fit in, and the widening is two moves against
+    /// a probe step that would otherwise walk a form and unpack.
+    fn packed_run(
+        &self,
+        here: &[Step],
+        seen: &[u64],
+        same: &mut [bool],
+        packed: &rudb_vector::Packed<'_>,
+        nulled: impl Fn(usize) -> bool,
+        code: impl Fn(usize) -> usize,
+    ) -> bool {
+        /// One pass over the batch against a stored run of one width.
+        macro_rules! run {
+            ($stored:expr) => {{
+                let stored = $stored;
+                let base = packed.base();
+                for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                    if !*flag {
+                        continue;
+                    }
+                    let slot = slot_of(bucket) as usize;
+                    let missing = nulled(step.row);
+                    *flag = if !self.valid[slot] {
+                        missing
+                    } else if missing {
+                        false
+                    } else {
+                        base + i128::from(packed.code(code(step.row))) == i128::from(stored[slot])
+                    };
+                }
+                return true;
+            }};
+        }
+        match &self.data {
+            StoredData::TinyInt(stored) => run!(stored),
+            StoredData::SmallInt(stored) => run!(stored),
+            StoredData::Integer(stored) => run!(stored),
+            StoredData::BigInt(stored) => run!(stored),
+            _ => false,
         }
     }
 
@@ -1271,28 +1345,17 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
             return;
         }
     }
+    // What the unpacked integer is read as, decided once for the column rather than once for every
+    // row of it. The match was inside the loop, which made a pass over a packed column a logical
+    // type comparison per row on top of the unpack.
+    let wide = matches!(
+        column.logical_type(),
+        rudb_common::LogicalType::HugeInt
+            | rudb_common::LogicalType::UHugeInt
+            | rudb_common::LogicalType::Decimal { .. }
+    );
     if let Some(packed) = column.packed_parts() {
-        // What the unpacked integer is read as, decided once for the column rather than once for
-        // every row of it. The match was inside the loop, which made a pass over a packed column a
-        // logical type comparison per row on top of the unpack.
-        let wide = matches!(
-            column.logical_type(),
-            rudb_common::LogicalType::HugeInt
-                | rudb_common::LogicalType::UHugeInt
-                | rudb_common::LogicalType::Decimal { .. }
-        );
-        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-            if !validity.is_valid(row) {
-                *state = mix(*state, NOTHING);
-                continue;
-            }
-            let value = packed.base() + i128::from(packed.code(row));
-            *state = if wide {
-                mix(mix(*state, value as u64), (value >> 64) as u64)
-            } else {
-                mix(*state, value as u64)
-            };
-        }
+        fold_packed(&packed, wide, rows, hashes, |row| validity.is_valid(row).then_some(row));
         return;
     }
     if let Some(data) = column.data() {
@@ -1326,6 +1389,25 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
                 return;
             }
         }
+        // The same again where what the codes point at is a packed run rather than a run of `Data`.
+        // That is the form our own storage writes for a column of few distinct numbers over a wide
+        // range, and until this was here it fell all the way to the value at a time loop below,
+        // because the arm above has `Data` to index and a packed run is not `Data`.
+        //
+        // TPC-H q20 is the query that shows it. It groups nine hundred thousand rows of lineitem by
+        // two keys, one of which arrives in exactly that form, so a fifth of the whole query was
+        // building a `Value` per row to hash it.
+        if let Some(packed) = values.packed_parts() {
+            let inner = values.validity();
+            fold_packed(&packed, wide, rows, hashes, |row| {
+                if !validity.is_valid(row) {
+                    return None;
+                }
+                let code = *at.get(row)? as usize;
+                inner.is_valid(code).then_some(code)
+            });
+            return;
+        }
     }
     // Whether the bytes are a string, asked once for the column rather than once for every row of
     // it, which is what it was.
@@ -1342,6 +1424,37 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
             }
         } else {
             fold_value(*state, &column.value_at(row))
+        };
+    }
+}
+
+/// Folds one packed run into the running hash, with `pick` saying which code a row reads.
+///
+/// `None` from `pick` is a null, the same way it is for [`fold_data`]. `wide` says the type needs
+/// both halves of the value mixed in rather than the low one, and it is the caller's because it is
+/// a question about the column rather than about the run.
+///
+/// What this produces has to be what the value at a time path at the bottom of [`fold`] produces
+/// for the same number, since the same column is a packed run in one chunk and something else in
+/// the next, and the base plus the code is that number.
+fn fold_packed(
+    packed: &rudb_vector::Packed<'_>,
+    wide: bool,
+    rows: usize,
+    hashes: &mut [u64],
+    pick: impl Fn(usize) -> Option<usize>,
+) {
+    let base = packed.base();
+    for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+        let Some(code) = pick(row) else {
+            *state = mix(*state, NOTHING);
+            continue;
+        };
+        let value = base + i128::from(packed.code(code));
+        *state = if wide {
+            mix(mix(*state, value as u64), (value >> 64) as u64)
+        } else {
+            mix(*state, value as u64)
         };
     }
 }
@@ -1655,6 +1768,49 @@ mod tests {
         ];
         let (_, through) = a_batch_at_a_time(&indirect, numbers.len(), &types);
         assert_eq!(before, through);
+    }
+
+    /// The two forms our own storage writes for a column of numbers keep their values where no run
+    /// of `Data` reaches: a packed run, and a dictionary whose codes point into a packed run. Both
+    /// have to hash as the flat column they stand for and both have to group the same rows the same
+    /// way, since the same column is packed in one row group and flat in the next.
+    #[test]
+    fn a_packed_run_and_a_dictionary_over_one_group_as_the_flat_column_they_stand_for() {
+        let rows = 30_000i64;
+        let number = |row: i64| (row * 7919) % 5003;
+        let values: Vec<Value> = (0..rows)
+            .map(|row| match row % 61 {
+                0 => Value::Null,
+                _ => Value::BigInt(number(row) + 1_000_000),
+            })
+            .collect();
+        let types = [LogicalType::BigInt];
+        let flatly = [flat(LogicalType::BigInt, &values)];
+        let (was, before) = one_at_a_time(&flatly, values.len(), &types);
+        assert!(was.buckets.len() > HOT, "the test has to reach the batched path");
+
+        let packed = [flatly[0].bit_packed().expect("a packed run of those values")];
+        assert_eq!(
+            packed[0].form(),
+            rudb_vector::Form::BitPacked,
+            "the test needs the packed form"
+        );
+        assert_eq!(hashed(&flatly[0]), hashed(&packed[0]));
+        let (_, through_packed) = a_batch_at_a_time(&packed, values.len(), &types);
+        assert_eq!(before, through_packed);
+
+        let distinct: Vec<Value> = (0..5003).map(|at| Value::BigInt(at + 1_000_000)).collect();
+        let held = flat(LogicalType::BigInt, &distinct)
+            .bit_packed()
+            .expect("a packed run of the distinct values");
+        let valid =
+            rudb_vector::Validity::from_iter(values.len(), |row| values[row] != Value::Null);
+        let coded = [Vector::dictionary((0..rows).map(|row| number(row) as u32).collect(), held)
+            .expect("a dictionary over that packed run")
+            .with_validity(valid)];
+        assert_eq!(hashed(&flatly[0]), hashed(&coded[0]));
+        let (_, through_coded) = a_batch_at_a_time(&coded, values.len(), &types);
+        assert_eq!(before, through_coded);
     }
 
     /// The reason a vacancy cannot be filled inside the batch. Every row of this batch is the first
