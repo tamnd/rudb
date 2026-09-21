@@ -1,3 +1,13 @@
 # `cargo xtask <task>` rather than `cargo run -p xtask -- <task>`, per spec/18-package-layout.md.
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# spec/05-storage-format.md asks that the same input produce the same bytes, and CI checks the
+# weaker version of it that is available today by building the shell twice and comparing the two
+# binaries. mimalloc is C, its options.c puts `__DATE__` and `__TIME__` into the binary, and a clock
+# reading is different every build. Both gcc and clang freeze those three macros when
+# SOURCE_DATE_EPOCH is set, which is the switch the reproducible builds effort defined for exactly
+# this, so setting it here makes every build of this workspace comparable rather than only the two
+# that CI runs.
+[env]
+SOURCE_DATE_EPOCH = "1"
