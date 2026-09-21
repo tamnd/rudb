@@ -31,6 +31,13 @@
 //! pieces is usually borrowing scratch space to produce each one and cannot hold two of them at
 //! once. [`Assembly::place`] reads a piece and is done with it, so the borrow ends between arms and
 //! nothing has to be cloned to keep it alive.
+//!
+//! # The simpler thing next to it
+//!
+//! [`concat()`] is the case where the pieces arrive in order and claim every row, which is what a row
+//! group of a stored table is built out of. An assembly would answer it, and it would pay for a
+//! position per row and a flatten per piece to answer something that is a run of `memcpy`s, so it is
+//! its own function. What the two share is the typed append underneath both of them.
 
 use std::sync::Arc;
 
@@ -38,7 +45,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 
 use crate::string::StringView;
 use crate::validity::Validity;
-use crate::vector::{Data, NOWHERE, Vector, copy_of, empty_data_for, layout_of};
+use crate::vector::{Data, Form, NOWHERE, Vector, copy_of, data_for, empty_data_for, layout_of};
 
 /// A vector being built out of pieces, each landing at the positions it is given.
 ///
@@ -188,6 +195,99 @@ impl Assembly {
         let gathered = copy_of(&self.data, &self.at);
         Ok(Vector::flat(self.ty, gathered)?.with_validity(validity))
     }
+}
+
+/// Several vectors of one type laid end to end as one page, or `None` for a run this will not lay.
+///
+/// What a row group of a stored table is built out of. The chunks arrive one at a time and each one
+/// is a separate allocation, and holding a hundred and twenty of them is a hundred and twenty places
+/// a scan of the column has to jump to instead of one run it walks. So they are copied once, into a
+/// page, and every chunk the table hands out afterwards is a window cut out of that page.
+///
+/// # What it will not lay
+///
+/// Anything that is not already a flat run of values, which is answered with `None` rather than with
+/// an error, because a caller that gets one has somewhere to put the pieces and this is a choice
+/// about layout rather than a failure. The reason is that laying an encoded piece end to end means
+/// flattening it, and a dictionary encoded string column flattened is larger than it was and has
+/// thrown away the thing that made it small. A column whose chunks arrive encoded is better left as
+/// the chunks it arrived as, and that is what `None` tells the caller to do.
+///
+/// It is worth saying that this is not a permanent answer. Two encoded chunks that share a
+/// dictionary can be laid end to end by appending their codes, and two that do not can be laid by
+/// merging the two dictionaries, and both are worth doing once there is a measurement asking for
+/// them. Neither is this, and the fallback has to exist either way for the run that mixes forms.
+///
+/// # Strings
+///
+/// A flat varchar piece owns its arena, so a window cut out of a flat varchar page copies every byte
+/// of every long string in the window, which is the whole reason [`Form::StringView`] exists.
+/// So the varlen page comes back as views over one shared arena: the bytes are copied once
+/// here and never again, and a cut afterwards moves sixteen bytes a row the same way it does for a
+/// column of integers.
+///
+/// # Errors
+///
+/// If the type has no flat layout, or if a piece holds fewer values than it says it has rows.
+pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
+    if pieces.is_empty() {
+        return Ok(None);
+    }
+    // Checked before anything is copied, because the fallback is for the caller to keep the pieces
+    // it already has and a half built page would be work thrown away.
+    let laid = pieces
+        .iter()
+        .all(|piece| piece.form() == Form::Flat && piece.logical_type() == ty && !piece.is_empty());
+    if !laid {
+        return Ok(None);
+    }
+    let rows = pieces.iter().map(Vector::len).sum();
+    // Sized before the first value moves, so the page is one allocation and holds no more than the
+    // rows that went into it. Growing from empty instead ends at the next power of two, which on a
+    // full row group is eight thousand values of slack carried for the life of the table.
+    let mut data = data_for(ty, rows)?;
+    for piece in pieces {
+        let from = piece
+            .data()
+            .ok_or_else(|| Error::internal("a flat vector with no run of data in it"))?;
+        let appended = extend(&mut data, from)?;
+        if appended != piece.len() {
+            return Err(Error::internal(format!(
+                "a piece of {} rows laid {appended} values end to end",
+                piece.len()
+            )));
+        }
+    }
+    let validity = run_of(pieces, rows);
+    if let Data::Varlen(column) = data {
+        let (views, arena) = column.into_parts();
+        let page = Vector::string_views(ty.clone(), views, Arc::new(arena))?;
+        return Ok(Some(page.with_validity(validity)));
+    }
+    Ok(Some(Vector::flat(ty.clone(), data)?.with_validity(validity).into_pages()))
+}
+
+/// The validity of the pieces laid end to end, in `rows` rows.
+///
+/// The two cheap answers are checked for first because they are the answers real data gives. A
+/// column that was never null anywhere is a page with no mask on it at all, and a bit per row read
+/// out of every piece to build a mask that is all ones would be throwing that away.
+fn run_of(pieces: &[Vector], rows: usize) -> Validity {
+    if pieces.iter().all(|piece| matches!(piece.validity(), Validity::AllValid)) {
+        return Validity::AllValid;
+    }
+    if pieces.iter().all(|piece| matches!(piece.validity(), Validity::AllInvalid)) {
+        return Validity::AllInvalid;
+    }
+    let mut live = Vec::with_capacity(rows);
+    for piece in pieces {
+        // row at a time: the mixed case, which is a bit per row however it is written, and it runs
+        // once per column per row group rather than once per chunk.
+        for row in 0..piece.len() {
+            live.push(!piece.is_null_at(row));
+        }
+    }
+    Validity::from_run(&live)
 }
 
 /// Whether row `n` reads position `n` for every row, which makes the final gather a copy onto itself.
@@ -487,5 +587,90 @@ mod tests {
         let built = agrees(&LogicalType::BigInt, 2, &[(vec![1, 0], piece)]);
         let chunk = Chunk::new(vec![built]).expect("a chunk of one column");
         assert_eq!(chunk.len(), 2, "two rows");
+    }
+
+    /// A run of pieces, as values, in the order they were given.
+    fn all_of(pieces: &[Vector]) -> Vec<Value> {
+        pieces.iter().flat_map(values).collect()
+    }
+
+    /// The pieces laid end to end, checked against the values that went in.
+    fn laid(ty: &LogicalType, pieces: &[Vector]) -> Vector {
+        let built = concat(ty, pieces).expect("the pieces lay").expect("this run lays");
+        assert_eq!(built.len(), pieces.iter().map(Vector::len).sum::<usize>(), "the row count");
+        assert_eq!(values(&built), all_of(pieces), "the values laid end to end");
+        built
+    }
+
+    #[test]
+    fn pieces_laid_end_to_end_read_back_in_the_order_they_were_given() {
+        let piece = |from: i64, to: i64| {
+            let held: Vec<Value> = (from..to).map(Value::BigInt).collect();
+            Vector::from_values(LogicalType::BigInt, &held).expect("a run of bigints")
+        };
+        let pieces = [piece(0, 4), piece(4, 9), piece(9, 10)];
+        let built = laid(&LogicalType::BigInt, &pieces);
+        assert_eq!(built.form(), Form::Flat, "a run of flat pieces lays flat");
+        // The point of the page: a window cut out of it is a reference count bump and not a copy,
+        // which is what the table cuts a chunk with.
+        let window = built.slice(4, 5).expect("a window into the page");
+        assert_eq!(values(&window), all_of(&pieces[1..2]), "the second piece, cut back out");
+    }
+
+    #[test]
+    fn a_null_in_a_piece_is_a_null_in_the_same_row_of_the_page() {
+        let ty = LogicalType::Integer;
+        let whole = Vector::from_values(ty.clone(), &[Value::Integer(1), Value::Integer(2)])
+            .expect("no nulls");
+        let holed =
+            Vector::from_values(ty.clone(), &[Value::Null, Value::Integer(4)]).expect("one null");
+        let built = laid(&ty, &[whole.clone(), holed.clone()]);
+        assert!(!built.is_null_at(1), "a row that was not null became one");
+        assert!(built.is_null_at(2), "the null did not come through");
+        // A run with no null anywhere keeps the cheap answer rather than growing a mask of ones.
+        let clean = laid(&ty, &[whole.clone(), whole]);
+        assert_eq!(clean.validity(), &Validity::AllValid, "a mask nothing needed");
+        let empty = laid(&ty, &[holed.clone(), holed]);
+        assert!(empty.is_null_at(0) && empty.is_null_at(2), "both nulls came through");
+    }
+
+    /// The string case, which is the one that would be a byte copy per cut if it laid flat.
+    #[test]
+    fn strings_lay_into_one_arena_and_come_back_as_views() {
+        let ty = LogicalType::Varchar;
+        let word = |text: &str| {
+            Vector::from_values(ty.clone(), &[Value::Varchar(text.to_string())]).expect("a string")
+        };
+        let pieces = [word("a string too long to sit inside a view"), word("short")];
+        let built = laid(&ty, &pieces);
+        assert_eq!(
+            built.form(),
+            Form::StringView,
+            "a varchar page that is not views cuts by copying"
+        );
+        let window = built.slice(0, 1).expect("a window into the page");
+        assert_eq!(values(&window), all_of(&pieces[..1]), "the long string, cut back out");
+    }
+
+    /// What will not lay, which is a layout answer and not an error.
+    #[test]
+    fn an_encoded_piece_is_left_alone_rather_than_flattened() {
+        let ty = LogicalType::BigInt;
+        let flat = Vector::from_values(ty.clone(), &[Value::BigInt(1)]).expect("a flat piece");
+        let values = Vector::from_values(ty.clone(), &[Value::BigInt(7), Value::BigInt(8)])
+            .expect("two distinct values");
+        let coded = Vector::dictionary(vec![0, 1, 0], values).expect("a dictionary piece");
+        let one = std::slice::from_ref(&coded);
+        assert!(concat(&ty, one).expect("no error").is_none(), "a dictionary laid");
+        assert!(
+            concat(&ty, &[flat.clone(), coded]).expect("no error").is_none(),
+            "a mixed run laid"
+        );
+        assert!(concat(&ty, &[]).expect("no error").is_none(), "nothing laid into something");
+        // A piece of another type is the caller's mistake and is still answered as a layout it will
+        // not build, because the fallback keeps the pieces and keeping them is always correct.
+        let other =
+            Vector::from_values(LogicalType::Integer, &[Value::Integer(1)]).expect("an int");
+        assert!(concat(&ty, &[flat, other]).expect("no error").is_none(), "two types laid");
     }
 }

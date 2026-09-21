@@ -228,3 +228,69 @@ The third row is the control. No filter, no change, and the number says the scan
 The fourth row is the one to keep looking at. A needle in a scattered column is chunks ruled out rather than chunks waved through, and that part was already here, so the win is only the filter operator that is no longer built and no longer handed anything. DuckDB is still two and a half times faster, and the reason is that it decides this over row groups of 122,880 rows while rudb decides it 19,532 times over chunks of 1,024. That is issues #984 and #480, in that order, and it is the next thing.
 
 One note about the apparatus rather than the engine. `scan.py` grouped its runs by counting positions past the `CREATE TABLE`, which stopped reporting a timing at some point, so every label was one query out. It groups by the query text now. The numbers in section 11 were taken before that happened and a spot check of them holds.
+
+## 13. What the row groups measured, and the allocator that was hiding in front of them
+
+Written on 21 September 2026, after the second item of section 9, the one section 12 called the next thing. The in memory table now holds one page per column per row group of 122,880 rows, and a chunk is a window into a page rather than an allocation of its own. Twenty million rows of two columns went from 19,532 chunks and about 39,000 buffers to 163 groups and 326 pages.
+
+The first time this was measured it read as a mixed result and one clear regression: `count(*) WHERE k = 7` eleven percent slower, the load nineteen percent slower, and peak memory up from 336 MB to 619 MB. None of that was the change. `perf record` over the query phase alone put eleven percent of the time in `unlink_chunk`, seven and a half in `malloc_consolidate` and three in `_int_malloc`, none of which appear in the build without row groups. Sealing a group allocates a 983 KB page per column and frees 240 chunk buffers of 8 KB, the chunks were produced on the worker threads and are freed on the thread draining the query, and glibc returns a block to the arena of the thread that allocated it. Three checks confirmed it: turning sealing off put the memory back at 337 MB, a `malloc_trim` per group held it flat, and `SET threads=1` on the load made the whole thing disappear.
+
+So the allocator went first, as #1060, and everything below is measured on top of it. That is worth stating as a method rather than as a footnote. A change that moves allocation patterns cannot be measured against a baseline whose allocator is the bottleneck, because what gets measured is the allocator.
+
+### What the row groups are worth
+
+server2, six cores, twenty million rows, nanoseconds per row, best of four, against the commit before this one. The DuckDB column is v2.0.0-dev84237 on the same box with the same `threads` setting, best of four, out of its own timer.
+
+One thread:
+
+| query | before | after | | DuckDB |
+| --- | ---: | ---: | ---: | ---: |
+| `count(*) WHERE v >= 10` | 1.00 | 0.83 | -17% | 0.70 |
+| `sum(v) WHERE v >= 10` | 2.82 | 2.11 | -25% | 1.50 |
+| `sum(k + v)` | 4.21 | 3.69 | -12% | 2.50 |
+| `count(*) WHERE k = 7` | 0.84 | 0.77 | -8% | 0.10 |
+
+Six threads:
+
+| query | before | after | | DuckDB |
+| --- | ---: | ---: | ---: | ---: |
+| `count(*) WHERE v >= 10` | 0.53 | 0.50 | -6% | 0.30 |
+| `sum(v) WHERE v >= 10` | 0.82 | 0.88 | +7% | 0.45 |
+| `sum(k + v)` | 1.03 | 1.04 | 0% | 0.75 |
+| `count(*) WHERE k = 7` | 0.39 | 0.20 | -49% | 0.10 |
+
+The single threaded column is the one the change was made for and it moves everywhere, because the read that used to copy a chunk out of the table now bumps a reference count. The six thread column is flat on the three queries that read every row, which is the honest reading of it: six cores over twenty million rows are already waiting on memory, and taking a copy out of a loop that was bound by bandwidth gives the bandwidth back rather than the time.
+
+### The needle, which is not the query anybody thought it was
+
+`count(*) WHERE k = 7` is the row section 12 said to keep looking at, and looking at it turned up something about the benchmark rather than about either engine.
+
+DuckDB answers it in 2.3 ms and its own `EXPLAIN ANALYZE` says why: `Row Groups Scanned: 5 / 163`. That is not a clever technique, it is the data. `k` is `(i * 104729) % 20000000`, which is a permutation of the whole range, so a row group of 122,880 rows holds values spread over all of it: the second group runs from 1,029 to 19,999,972. The maximum rules nothing out and the minimum rules out almost everything, because the smallest of 122,880 values drawn from twenty million lands near a thousand and the needle is 7. Move the needle into the middle of the range and the pruning goes away completely. `count(*) WHERE k = 12345678` scans 163 of 163 row groups and takes 49.9 ms.
+
+So there are two queries here and the table above only has one of them. Both, one thread, wall clock:
+
+| query | before | after | DuckDB |
+| --- | ---: | ---: | ---: |
+| `count(*) WHERE k = 7`, prunes | 19.7 ms | 16.1 ms | 2.3 ms |
+| `count(*) WHERE k = 12345678`, does not | 101.4 ms | 83.0 ms | 49.9 ms |
+
+The second row is a scan and rudb is 1.7 times behind on it, which is the same gap as everywhere else in this note. The first row is a pruning benchmark and rudb is seven times behind, and it is behind for a reason that has nothing to do with how well it prunes. rudb prunes better than DuckDB does here: a zone map over 1,024 rows has a minimum near twenty thousand rather than near a thousand, so almost every chunk is ruled out. Then it pays 16.1 ms to rule them out, which over 19,532 chunks is 824 nanoseconds each, and 824 nanoseconds a chunk is section 4's number. The scan is proving there is nothing to read and then paying the full price of a chunk to say so.
+
+The cause is in `crates/rudb-exec/src/source.rs`. A morsel for an in memory table is one chunk, so `Source::morsels` hands out 19,532 of them, and the loop in `Scan::read` that walks past ruled out parts without returning cannot walk anywhere, because the morsel it is walking is one chunk long. Every pruned chunk costs a full call into the pipeline to produce nothing. The native file path already solves this: a morsel there is a stripe, the walk has somewhere to go, and `stripe_skips` rules out a whole stripe out of the directory before any of it is looked at.
+
+That is the rest of this box and it is the next change: a zone map per row group, and a morsel that is a row group. The group bound is weaker than the chunk bound, so it is asked first and the chunk bounds still decide inside a group that survives, which is the two level shape the native reader already has. On this query it should take the 824 nanoseconds a chunk down to 163 comparisons and the chunks of whichever groups those leave.
+
+### The load, which got worse
+
+| | before | after |
+| --- | ---: | ---: |
+| wall | 0.44 s | 0.73 s |
+| peak RSS | 336 MB | 588 MB |
+
+This is real and it is worth being plain about. A `CREATE TABLE AS` materialises the whole result before it appends any of it, so at the moment the last chunk arrives the process is holding twenty million rows as chunks and is about to hold them again as pages. Before row groups the append moved the chunk into the table and there was only ever one copy. Now it copies into the page and frees the chunk, and freed 8 KB blocks do not come back as 983 KB pages, so both are resident at the peak. The extra 0.3 seconds is mostly the fresh page faults on the 250 MB the second copy takes.
+
+The fix is not in the storage layer. It is to stop materialising the result: `run` in `crates/rudb/src/database.rs` collects every chunk into a `Vec` and hands it back, and the insert paths then walk it. A sink that takes each chunk as it is produced would mean the chunks are freed as fast as they are made and the peak would be the table and nothing else. That is the next box after this one, and it is what the 588 MB is waiting for.
+
+### What this says about the list in section 9
+
+Two of the four items are done and the third, the chunk size, is now the biggest single number left: section 4 measured 8192 as worth about 1.9 times on `sum(v)` and the row groups have removed the reason the chunk had to be small, which was that it was also the unit of storage. It is not removed for free, because 163 groups of 1024 row chunks are 19,532 pipeline calls and at 8192 they would be 2,442, which is most of what the morsel change above is trying to win. The two interact and the morsel change is the cheaper of them, so it goes first.

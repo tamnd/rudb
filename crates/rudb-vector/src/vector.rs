@@ -3301,6 +3301,34 @@ pub(crate) fn empty_data_for(ty: &LogicalType) -> Result<Data> {
     Ok(crate::for_each_layout!(fixed, empties))
 }
 
+/// An empty run of the type's layout with room for `rows` values already taken.
+///
+/// For a caller that knows how many values are going in before the first one does, which is a
+/// producer laying pieces end to end. Growing from empty instead reallocates once per doubling and
+/// finishes holding a run rounded up to the next power of two, and on a row group of 122,880 values
+/// that rounding is the last 8,192 of them carried for the life of the table.
+///
+/// Bytes are not reserved for a varlen run, because how many of them there are is not the number of
+/// rows and the caller appending them is the one that can work it out.
+///
+/// # Errors
+///
+/// If the type has no flat layout, the same as [`empty_data_for`].
+pub(crate) fn data_for(ty: &LogicalType, rows: usize) -> Result<Data> {
+    let mut data = empty_data_for(ty)?;
+    macro_rules! reserved {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match &mut data {
+                Data::Empty => {}
+                $(Data::$variant(values) => values.reserve(rows),)+
+                Data::Varlen(values) => values.reserve_views(rows),
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, reserved);
+    Ok(data)
+}
+
 /// Appends one value to a run of data, or a zero of the right shape when it is null.
 ///
 /// The zero matters. A null still occupies a position, the validity mask is what says it is null,

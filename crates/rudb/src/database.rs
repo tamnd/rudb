@@ -424,7 +424,7 @@ fn persist(path: &Path, catalog: &Catalog) -> Result<()> {
         let chunk = table.rows().chunk(at).ok_or_else(|| {
             Error::not_implemented("checkpointing a table already backed by a native file")
         })?;
-        writer.append(chunk)?;
+        writer.append(&chunk)?;
     }
     writer.finish()?;
     std::fs::rename(&temporary, path).map_err(|error| Error::io(error.to_string()))?;
