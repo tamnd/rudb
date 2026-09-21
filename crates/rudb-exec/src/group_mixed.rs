@@ -383,14 +383,23 @@ impl Exchange {
             .iter()
             .map(|partition| partition.lock().map(|held| held.rows()).map_err(poisoned))
             .sum::<Result<usize>>()?;
-        let degree = input.div_ceil(16_384).clamp(1, PARTITIONS).min(threads.degree());
+        let degree =
+            input.div_ceil(pairs::ROWS_PER_PARTITION).clamp(1, PARTITIONS).min(threads.degree());
+        // How many of the scattered partitions are worth keeping apart, which the scatter itself
+        // could not know. See [`pairs::used`]. The splits below are not the same question: a split
+        // has to be an owner, because the owner is what already holds the group's numeric state.
+        let used = pairs::used(input, degree);
         let counted = in_parallel(
             threads,
-            PARTITIONS,
+            used,
             degree,
             "deduplicated the pairs of radix partition",
             |at| {
-                let mut partition = self.pairs[at].lock().map_err(poisoned)?;
+                let mut partition = Held::default();
+                for from in pairs::merged(at, used) {
+                    let mut held = self.pairs[from].lock().map_err(poisoned)?;
+                    partition.runs.append(&mut held.runs);
+                }
                 distinct_pairs(&mut partition, PARTITIONS, memory)
             },
         )?;
@@ -801,7 +810,7 @@ mod tests {
         for group in [-9_i32, 0, 1, 7, 1_000, i32::MAX] {
             for valid in [true, false] {
                 let hash = group_hash(group, valid);
-                assert_eq!(crate::pairs::split_of(hash, 16), (hash >> shift()) as usize);
+                assert_eq!(crate::pairs::split_of(hash, PARTITIONS), (hash >> shift()) as usize);
             }
         }
         assert_eq!(size_of::<Key>(), 12);
