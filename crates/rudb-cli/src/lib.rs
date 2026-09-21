@@ -30,7 +30,7 @@ pub mod shell;
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
-use rudb::{Config, Database};
+use rudb::{Config, Database, VECTOR_SIZE};
 
 pub use args::{Action, Command, Options, parse};
 pub use format::{Format, Settings};
@@ -145,11 +145,15 @@ fn print_config(out: &mut dyn Write) {
     for (name, value) in Config::default().settings() {
         let _ = writeln!(out, "{name}: {value}");
     }
-    let _ = writeln!(out, "vector-size: 1024");
+    // The vector size comes from the constant the engine actually runs on rather than from a
+    // literal here. It was a literal, it said 1024, and the engine had been on 8192 for months,
+    // which is the exact failure this whole subcommand exists to prevent: a build reporting a
+    // settled decision it is not making.
+    let _ = writeln!(out, "vector-size: {VECTOR_SIZE}");
     let _ = writeln!(out, "row-group-size: 122880");
     let _ = writeln!(out, "storage-format: native (rudb v1), DuckDB import and export");
     let _ = writeln!(out, "execution-tiers: interpreted");
-    let _ = writeln!(out, "duckdb-compat-level: 0 (nothing is implemented yet)");
+    let _ = writeln!(out, "duckdb-compat-level: none claimed, spec/12-duckdb-compat.md");
     let _ = writeln!(out, "target: {}", std::env::consts::ARCH);
     let _ = writeln!(out, "os: {}", std::env::consts::OS);
 }
