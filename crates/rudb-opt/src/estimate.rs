@@ -654,12 +654,18 @@ fn kept(
 ) -> (f64, Provenance) {
     let mut fraction = 1.0;
     let mut counted = 0;
+    let mut source: Option<Provenance> = None;
     let mut pending = Vec::new();
     for conjunct in conjuncts(plan, predicate) {
         match values(plan, conjunct, stats, reads) {
-            Some(values) => {
+            Some((values, from)) => {
                 fraction /= widened(values);
                 counted += 1;
+                source = match source {
+                    None => Some(from),
+                    Some(one) if one == from => Some(one),
+                    Some(_) => Some(Provenance::Propagation),
+                };
             }
             None => pending.push(conjunct),
         }
@@ -677,13 +683,14 @@ fn kept(
     // A fraction two different suppliers contributed to came from the arithmetic over them rather
     // than from either, which is what `Propagation` is for. A reader chasing a bad estimate wants to
     // know which supplier to go and look at without reading the predicate back.
-    // A distinct count says `Dictionary` and not `Sketch`. There is no sketch in this engine and
-    // there never was: the number came from a native table's dictionary or from what a Parquet
-    // writer counted per row group, and naming a structure that does not exist sends a reader
-    // chasing a bad estimate to look for something nobody has written.
+    // A distinct count says where it came from rather than naming one source for all of them. It is
+    // a native table's dictionary, or what a Parquet writer counted per row group, or the sketch a
+    // table in memory builds as its rows arrive, and a reader chasing a bad estimate wants to know
+    // which of the three to go and look at. Two conditions whose counts came from different places
+    // say `Propagation` for the same reason a fraction two suppliers contributed to does.
     let from = match (counted, interpolated, guessed) {
         (0, 0, _) => FROM_A_CONSTANT,
-        (_, 0, 0) => Provenance::Dictionary,
+        (_, 0, 0) => source.unwrap_or(FROM_A_CONSTANT),
         (0, _, 0) => Provenance::ZoneMap,
         _ => Provenance::Propagation,
     };
@@ -752,7 +759,7 @@ fn values(
     conjunct: ExprRef,
     stats: &Facts,
     reads: &mut Vec<Stat<u64>>,
-) -> Option<u64> {
+) -> Option<(u64, Provenance)> {
     let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(conjunct) else {
         return None;
     };
@@ -768,7 +775,10 @@ fn values(
     reads.push(stat);
     // A column with no values in it is an empty column or a column of nothing but nulls, and
     // neither is something to divide by.
-    stat.read(DISTINCT).copied().filter(|&values| values > 0)
+    let values = stat.read(DISTINCT).copied().filter(|&values| values > 0)?;
+    // A known stat always has a provenance, so the fallback is for a shape that cannot occur and
+    // not for a case anybody has to read.
+    Some((values, stat.provenance().unwrap_or(FROM_A_CONSTANT)))
 }
 
 /// How many rows sit in the parts of `input` that `predicate` cannot rule out.
@@ -1256,6 +1266,22 @@ mod tests {
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         unfiltered(&plan, plan.root(), &stats).value().copied()
+    }
+
+    /// The same as [`counted_stat`], with each count carrying the provenance it was recorded
+    /// under rather than all of them carrying one.
+    fn sourced_stat(
+        text: &str,
+        tables: &[(&str, u64)],
+        columns: &[(&str, &str, u64, Provenance)],
+    ) -> Stat<u64> {
+        let mut stats = facts(tables);
+        for (table, column, distinct, provenance) in columns {
+            stats.record_distinct("memory", "main", table, column, *distinct, *provenance);
+        }
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        rows_stat(&plan, plan.root(), &stats)
     }
 
     /// A filter of the given predicate over a two column scan of `t`.
@@ -1926,6 +1952,47 @@ mod tests {
         assert_eq!(
             counted_stat(&both, tables, &[("t", "a", 50)]).provenance(),
             Some(Provenance::Propagation)
+        );
+    }
+
+    #[test]
+    fn a_filter_says_which_of_the_three_places_its_count_came_from() {
+        // A distinct count is a native table's dictionary, what a Parquet writer counted per row
+        // group, or the sketch a table in memory builds as its rows arrive. The estimate names the
+        // one it read rather than naming the same one every time, because a reader chasing a bad
+        // estimate has to know which of the three to go and look at.
+        let tables = &[("t", 1_000_000)];
+        let one = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
+        assert_eq!(
+            sourced_stat(&one, tables, &[("t", "a", 50, Provenance::Sketch)]).provenance(),
+            Some(Provenance::Sketch)
+        );
+        assert_eq!(
+            sourced_stat(&one, tables, &[("t", "a", 50, Provenance::Dictionary)]).provenance(),
+            Some(Provenance::Dictionary)
+        );
+        let both = filtered(
+            "((#0.0::INTEGER = 3::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+        // Two counts from two places is neither of them.
+        assert_eq!(
+            sourced_stat(
+                &both,
+                tables,
+                &[("t", "a", 50, Provenance::Sketch), ("t", "b", 40, Provenance::Dictionary)]
+            )
+            .provenance(),
+            Some(Provenance::Propagation)
+        );
+        // Two counts from the same place is that place.
+        assert_eq!(
+            sourced_stat(
+                &both,
+                tables,
+                &[("t", "a", 50, Provenance::Sketch), ("t", "b", 40, Provenance::Sketch)]
+            )
+            .provenance(),
+            Some(Provenance::Sketch)
         );
     }
 
