@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Eighteen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Nineteen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -23,6 +23,7 @@ pub mod explain;
 pub mod extremes;
 pub mod filter;
 pub mod fold;
+pub mod fromkey;
 pub mod keys;
 pub mod late;
 pub mod limit;
@@ -112,6 +113,14 @@ pub const RANK: u8 = 11;
 /// output fires, which is the idempotence assertion below failing. Folding has no opinion about
 /// either spelling of an aggregate, so nothing is given up by putting it in front.
 ///
+/// Collapsing an aggregate onto its group key is fourth, immediately after the pass that takes
+/// dependent expressions out of a group key. Both of them end up with a projection over an
+/// aggregate, and the order between them decides how much the second one sees: `GROUP BY c, f(c)` is
+/// a two key aggregate until dependent group keys have run and a one key aggregate afterwards, and
+/// only the second of those is a shape the collapse applies to. It is also before filter pushdown,
+/// because the expressions it leaves in a projection are the ones a `HAVING` should get to run
+/// before, and pushdown is what moves the `HAVING` under them.
+///
 /// Top N is last of the passes that rewrite the shape of a plan, because it is the one that fuses
 /// two operators into one rather than moving something around. Everything before it is written
 /// against a sort and a limit, and a pass that had to know about both spellings of the same plan is
@@ -130,10 +139,11 @@ pub const RANK: u8 = 11;
 /// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
-pub static PASSES: [&(dyn Pass + Sync); 18] = [
+pub static PASSES: [&(dyn Pass + Sync); 19] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
+    &fromkey::AnswersFromTheKey,
     &filter::FilterPushdown,
     &delim::Deliminator,
     &keys::GroupKeyPushdown,
