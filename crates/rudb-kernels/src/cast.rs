@@ -92,6 +92,11 @@ pub fn cast_in_time_zone(
         let single = cast_value_in_time_zone(&input.try_value_at(0)?, target, try_cast, time_zone)?;
         return Ok(Vector::constant(target.clone(), single, input.len()));
     }
+    // A widening that changes nothing about how the values are stored, before the sweep, because
+    // the sweep would answer it correctly by copying a column into a column holding the same bytes.
+    if let Some(vector) = input.as_wider_decimal(target) {
+        return Ok(vector);
+    }
     if let Some(vector) = swept(input, target) {
         return Ok(vector);
     }
@@ -2837,6 +2842,57 @@ mod tests {
         assert_eq!(widened.value_at(1), Value::Null);
         assert_eq!(widened.value_at(2), Value::BigInt(7));
         assert_eq!(widened.value_at(3), Value::Null);
+    }
+
+    /// A flat decimal that only gets wider keeps its values and its nulls, and a dictionary one
+    /// keeps taking the pass, because what the arithmetic above wants from it is a flat run.
+    #[test]
+    fn widening_a_flat_decimal_keeps_its_values_and_a_coded_one_is_still_flattened() {
+        let from = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let into = LogicalType::decimal(18, 2).expect("a legal decimal");
+        let values = Vector::from_values(
+            from.clone(),
+            &[
+                Value::Decimal { unscaled: 1234, width: 15, scale: 2 },
+                Value::Null,
+                Value::Decimal { unscaled: -99, width: 15, scale: 2 },
+            ],
+        )
+        .expect("three decimals");
+        let coded = Vector::dictionary(vec![2, 0, 1, 2], values.clone()).expect("codes in range");
+        assert!(coded.as_wider_decimal(&into).is_none(), "a dictionary is left to the pass");
+        for input in [&values, &coded] {
+            let wider = cast(input, &into, false).expect("a widening cannot fail");
+            assert_eq!(wider.logical_type(), &into);
+            assert_eq!(wider.form(), Form::Flat, "what the arithmetic above reads");
+            assert_eq!(wider.len(), input.len());
+            for index in 0..input.len() {
+                let want = cast_value(&input.value_at(index), &into, false).expect("one value");
+                assert_eq!(wider.value_at(index), want, "row {index}");
+            }
+        }
+    }
+
+    /// The three things a widening is not, each of which has to keep taking the pass it took.
+    #[test]
+    fn a_decimal_that_changes_more_than_its_width_still_takes_the_pass() {
+        let from = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let input = Vector::from_values(
+            from.clone(),
+            &[Value::Decimal { unscaled: 1234, width: 15, scale: 2 }],
+        )
+        .expect("one decimal");
+        for into in [
+            // Narrower, which is a range every value has to be checked against.
+            LogicalType::decimal(10, 2).expect("a legal decimal"),
+            // A different scale, which moves the point.
+            LogicalType::decimal(18, 4).expect("a legal decimal"),
+            // A wider container, which is a different run and a real conversion.
+            LogicalType::decimal(30, 2).expect("a legal decimal"),
+        ] {
+            assert!(input.as_wider_decimal(&into).is_none(), "{from} to {into}");
+            agrees(&input, &into);
+        }
     }
 
     /// Every spelling in here was measured against the pinned binary one statement at a time, and
