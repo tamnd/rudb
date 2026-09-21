@@ -343,3 +343,57 @@ The load is unchanged: 0.60 seconds and about 600 MB either way, which is what f
 ### What is left
 
 The chunk size, which is section 9's third item and now the biggest one. The morsel change has taken most of the pipeline call overhead the 8192 chunk was going to win, so the number will be smaller than section 4's 1.9 times, but the rest of that number was the vectorised loops themselves and those are untouched. Then the streaming insert for the load, and then the page pool, so that the 983 KB pages a seal allocates come from somewhere other than the allocator every time.
+
+## 15. What the vector size measured
+
+Written on 21 September 2026, the day after section 14, and it closes #480. Section 9 named the chunk size as the third of four things to change and section 14's last paragraph said it was the biggest number left. This is the sweep.
+
+Five binaries were built from the same commit with `VECTOR_SIZE` set to 1024, 2048, 4096, 8192 and 32768, and each was run against the twenty million row table of section 1 and against ClickBench over `hits_0.parquet`. Every scan number below is the minimum of four runs of the query in one process, which is what `~/jb/scan.sh` has reported since section 1, and every ClickBench number is the best of three whole processes. Milliseconds.
+
+### The table in memory, one thread
+
+| query | 1024 | 2048 | 4096 | 8192 | 32768 | DuckDB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `count(*) WHERE v >= 10` | 14.0 | 7.3 | 4.5 | 1.9 | 0.9 | 18.0 |
+| `sum(v) WHERE v >= 10` | 39.6 | 32.5 | 30.4 | 29.6 | 25.5 | 37.0 |
+| `sum(k + v)` | 66.8 | 58.7 | 54.6 | 52.6 | 46.3 | 60.0 |
+| `count(*) WHERE k = 7` | 0.3 | 0.3 | 0.3 | 0.2 | 0.8 | 3.0 |
+
+### The same, six threads
+
+| query | 1024 | 2048 | 4096 | 8192 | 32768 | DuckDB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `count(*) WHERE v >= 10` | 6.7 | 4.5 | 1.8 | 2.0 | 1.2 | 9.0 |
+| `sum(v) WHERE v >= 10` | 11.8 | 8.6 | 7.2 | 6.8 | 6.5 | 20.0 |
+| `sum(k + v)` | 17.2 | 16.1 | 13.3 | 11.7 | 11.6 | 21.0 |
+| `count(*) WHERE k = 7` | 0.3 | 0.3 | 0.6 | 0.6 | 0.5 | 3.0 |
+
+The shape is one curve, not four. Everything that reads every row gets faster monotonically and the gain is nearly all spent by 8192, and the query with the most time in it per row gains the least, which is what it should do if what is being removed is a fixed cost per call. `count(*)` with a filter is the extreme of that: at 1024 it is almost entirely pipeline overhead and it loses fifteen sixteenths of itself by the time the vector is 32768.
+
+### The needle, and why it is the reason 32768 is not the answer
+
+`count(*) WHERE k = 7` is the query that is answered by zone maps rather than by reading, and it is the only row in either table that gets worse. At 32768 a chunk zone covers thirty two thousand rows of a column whose values are `(i * 104729) % 20000000`, which is to say scattered, so a wider zone is a wider bracket and fewer chunks can be ruled out. It goes from 0.2 milliseconds to 0.8. That is four times on a number small enough not to matter here, and it is a real property that would matter on a table where the needle query is the workload.
+
+The same effect is visible from the other side on `count(*) WHERE k = 12345678`, the needle that matches nothing and prunes nothing, which is a full scan wearing a filter: 72.7, 65.7, 60.0, 55.2 and 47.6 milliseconds at one thread against DuckDB's 51.0. It improves all the way to 32768 because it never prunes, so there is no zone map precision to lose.
+
+### The load, and the string case
+
+Loading the table takes 0.59, 0.53, 0.55, 0.52 and 0.64 seconds, with peak RSS flat at about 590 MB. 32768 is the slowest of the five and it is the one that allocates a quarter megabyte at a time to hold a chunk that will be copied into a page and freed.
+
+That is also the argument that does not show up in any of these numbers, because none of these queries has a string in it. A vector of 16 byte string views at 8192 is 128 KB and at 32768 it is half a megabyte, and an operator holding several of those at once is out of L2 on the reporting target. `spec/engine/03-data-plane.md` section 3.7 expected the cache to decide this and it did not, but it decides the top of the range rather than the whole of it.
+
+### ClickBench
+
+Twenty nine of the forty three queries run today. Over those, the total is 1.649, 1.565, 1.500, 1.532 and 1.489 seconds and the geometric mean per query is 33.3, 31.8, 31.1, 31.3 and 31.4 milliseconds. Every answer was hashed and every hash agrees across the five sizes, except q18, which is a `GROUP BY` with a `LIMIT` and no `ORDER BY`, so its ten rows are not determined and a rerun had all five agreeing.
+
+Eight percent between the worst and the best, and nothing to choose between 4096, 8192 and 32768. That is the expected result and it is worth stating plainly: on Parquet the time is Snappy, the page decoders and the hash aggregation, and next to those the cost of entering and leaving the pipeline is small however often it is paid. The in-memory numbers are where the vector size shows, because there is nothing else in them, and eight percent on the queries people quote is the honest version of what this change is worth outside the microbenchmark.
+
+### The answer
+
+8192. It is best or within noise of best on every full scan at both thread counts, it keeps the pruning that 32768 gives up, it is the fastest of the five on the load, and it leaves a string view vector at 128 KB rather than half a megabyte. It is eight FastLanes units, so nothing in the encoding layer has to regroup, and the reason the constant was 1024 in the first place survives as the rule that the size is a multiple of 1024 rather than as the size itself.
+
+It also unlocks a piece of the DuckDB corpus that was out of reach. 141 files in upstream's test tree carry `require vector_size 2048`, which upstream reads as a floor, and every one of them was skipped at 1024 and is eligible at 8192. The 5 that say `require exact_vector_size 2048`, the 1 that says 512 and the 1 that says 2 stay skipped, which is correct, because they are testing a boundary at a size we do not use. Collecting that is a change in `rudb-compat` rather than here: it keeps its own copy of the constant, which it had to because the `rudb` facade did not export one, and this PR exports `rudb::VECTOR_SIZE` so the harness can read it instead of repeating it.
+
+### What is left
+
+Section 9's fourth item, the per-chunk cost of the metrics shim, is now mostly amortised by the same change that made it worth measuring, which was the point of putting it last. What is left of the list is not on the list: the streaming insert, so that a `CREATE TABLE AS` stops holding the result and the table at the same time, and the page pool, so that the 983 KB pages a seal allocates come from somewhere other than the allocator every time. Both are about the load rather than the scan, and the load is the row of every table in this document that has not moved.

@@ -6,7 +6,7 @@ Document 06 specified what an encoded vector is and what an operator is allowed 
 
 This is the widest interface in the system, every operator depends on it, and changing it after twenty operators exist is expensive. It is specified before any operator is written and changed only by RFC.
 
-A vector is a type, a length up to 1024, a physical form, a validity representation and a buffer. The physical forms are flat, constant, dictionary, sequence and encoded, per document 4.3.
+A vector is a type, a length up to 8192, a physical form, a validity representation and a buffer. The physical forms are flat, constant, dictionary, sequence and encoded, per document 4.3.
 
 **Validity has three representations and the distinction is load-bearing.** All-valid, represented by the absence of a mask, which is the case that gets the fastest kernels. All-invalid, represented by a flag, which short-circuits entirely. And a bitmap. Photon's published result is that separate no-null kernels are worth a measurable amount on real data because real data is mostly not null, and the cost of the distinction is one branch per vector rather than per value.
 

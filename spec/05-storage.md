@@ -29,7 +29,7 @@ A database is one file. The layout is:
 
 ## 5.3 Row groups and column chunks
 
-**A row group is 122,880 rows**, which is 120 vectors of 1024. DuckDB uses the same count as 60 vectors of 2048. Keeping the same row group size preserves comparability of every per-row-group statistic against DuckDB and, more practically, means an imported DuckDB table maps one to one onto our row groups with no re-chunking.
+**A row group is 122,880 rows**, which is 15 vectors of 8192. DuckDB uses the same count as 60 vectors of 2048. Keeping the same row group size preserves comparability of every per-row-group statistic against DuckDB and, more practically, means an imported DuckDB table maps one to one onto our row groups with no re-chunking.
 
 **Within a row group, each column is a column chunk**, and a column chunk is a sequence of encoded vectors plus a chunk header. The chunk header holds the encoding tree (document 06.3), the statistics, and the offsets needed for random access to any vector in the chunk. A column chunk is the unit of I/O and the unit at which an encoding decision is made.
 
@@ -37,7 +37,7 @@ A database is one file. The layout is:
 
 **Every column chunk carries statistics**: min, max, null count, distinct count estimate, and for string columns the FSST symbol table identifier and the dictionary identifier if one applies. Statistics are used for zone-map skipping at scan time and for cardinality estimation at plan time, and the same numbers serve both, which means a statistic that is expensive to maintain is expensive twice and one that is cheap is useful twice.
 
-**Zone maps are per column chunk and per vector.** Per-chunk skipping avoids 122,880 rows of work, per-vector skipping avoids 1024. ClickHouse's granule is 8192 and its sparse index operates at that granularity; ours is finer, which costs more metadata and skips more precisely. The per-vector statistics are themselves stored compressed, because 105 columns times 814 row groups times 120 vectors is 10.3 million entries and storing that naively would be a measurable fraction of the 2.05 GB target.
+**Zone maps are per column chunk and per vector.** Per-chunk skipping avoids 122,880 rows of work, per-vector skipping avoids 8192. That is the same granularity as ClickHouse's granule, which it did not used to be: the per-vector zone was finer than anything else when the vector was 1024, and #480 gave that up on measurement. The two levels are what matter and the finer one landing where ClickHouse's did is a reasonable place for it to land. The per-vector statistics are still stored compressed, though the case for it is weaker now, because 105 columns times 814 row groups times 15 vectors is 1.28 million entries rather than the 10.3 million it was.
 
 ## 5.4 Global structures
 

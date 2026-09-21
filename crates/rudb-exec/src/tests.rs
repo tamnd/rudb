@@ -16,6 +16,7 @@ use rudb_common::{Cancel, Field, LogicalType, Memory, Value};
 use rudb_pipeline::Pool;
 use rudb_plan::Plan;
 use rudb_seam::Settings;
+use rudb_vector::VECTOR_SIZE;
 
 use crate::{build, build_with};
 
@@ -726,14 +727,17 @@ fn a_group_by_that_outgrows_its_budget_spills_and_answers_anyway() {
     // is what ten of the forty three ClickBench queries did. It now keeps the groups it has and
     // writes the rest of the rows to a file, so the same query answers over as many passes as the
     // budget needs.
-    const GROUPS: i32 = 4096;
+    // Four chunks' worth of groups, so that the table the budget has to be too small for stays
+    // large next to one chunk however large a chunk is. Written down as 4096 it stopped being four
+    // chunks the day the vector grew, and the budget below went from tight to impossible.
+    let groups = i32::try_from(VECTOR_SIZE * 4).expect("a small number");
     const QUERY: &str = "Aggregate #1 groups=[#0.0::INTEGER, #0.1::VARCHAR] \
          aggregates=[count_star()::BIGINT, sum(#0.0::INTEGER)::HUGEINT]\n  \
          Get memory.main.crowd AS crowd #0 [x::INTEGER, s::VARCHAR]\n";
-    let catalog = crowd(GROUPS);
+    let catalog = crowd(groups);
     let open = Memory::unlimited();
     let want = under(&catalog, QUERY, &open);
-    assert_eq!(want.len(), GROUPS as usize, "one row per group");
+    assert_eq!(want.len(), groups as usize, "one row per group");
 
     // Three quarters of what the query took when nothing was stopping it. It has to be under the
     // whole, or the query never spills and this tests nothing, and it has to be over what the
@@ -753,15 +757,15 @@ fn a_spilled_row_carries_its_distinct_argument_and_its_filter() {
     // argument itself, because the set that decides whether a value has been counted is rebuilt in
     // the pass that finishes the group, and a `FILTER` needs the answer the predicate already gave,
     // because the row it was evaluated against is not written out and cannot be evaluated again.
-    const GROUPS: i32 = 4096;
+    let groups = i32::try_from(VECTOR_SIZE * 4).expect("a small number");
     const QUERY: &str = "Aggregate #1 groups=[#0.0::INTEGER] \
          aggregates=[count(DISTINCT #0.1::VARCHAR)::BIGINT, \
          count_star(FILTER (#0.0::INTEGER > 1000::INTEGER)::BOOLEAN)::BIGINT]\n  \
          Get memory.main.crowd AS crowd #0 [x::INTEGER, s::VARCHAR]\n";
-    let catalog = crowd(GROUPS);
+    let catalog = crowd(groups);
     let open = Memory::unlimited();
     let want = under(&catalog, QUERY, &open);
-    assert_eq!(want.len(), GROUPS as usize, "one row per group");
+    assert_eq!(want.len(), groups as usize, "one row per group");
 
     let tight = Memory::with_limit(open.peak() / 4 * 3);
     let got = under(&catalog, QUERY, &tight);

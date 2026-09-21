@@ -68,7 +68,7 @@ Pipeline construction, morsel sizing and exchange placement are physical-plannin
 
 **Bushy join trees are more parallel than left-deep ones**, which is a second reason document 07 lets the enumerator produce them rather than restricting the search space.
 
-**Vector size is 1024, not DuckDB's 2048**, because 1024 is the FastLanes unit. That does not change any pass in this folder; it changes the constants in document 06's cost model, and the constants come from `rudb-bench` measurements rather than from arithmetic anyway.
+**Vector size is 8192, not DuckDB's 2048**, measured in #480 and eight times the FastLanes unit. That does not change any pass in this folder; it changes the constants in document 06's cost model, and the constants come from `rudb-bench` measurements rather than from arithmetic anyway.
 
 ## 10.5 The order to build this in
 
