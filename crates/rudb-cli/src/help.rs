@@ -12,8 +12,9 @@ Usage: rudb [OPTIONS] [FILENAME [SQL...]]
 
 An embedded analytical database, compatible with DuckDB.
 
-FILENAME is the database to open. Only :memory: works today, because there is no storage format
-yet. A second argument is SQL to run, after which the shell exits.
+FILENAME is the database to open, which is a file in rudb's own native format or :memory: for one
+that is never written. CHECKPOINT writes the file. A second argument is SQL to run, after which the
+shell exits.
 
 Options:
   -bail                  stop after the first error

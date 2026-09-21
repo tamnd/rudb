@@ -1,8 +1,13 @@
 //! Rudb's single-file columnar snapshot format.
 //!
-//! A committed directory names independently readable column pages. The first version handles
-//! scalar columns and one table; the file header already has two generation slots so an unfinished
-//! replacement directory cannot hide the last complete one.
+//! A committed directory names independently readable column pages. It has two levels: a catalog
+//! directory naming every table in the file, which is what a footer slot points at and what opening
+//! a database reads, and one directory per table under it holding that table's stripes, pages and
+//! statistics. One slot write publishes all of them, so a commit is atomic across tables.
+//!
+//! This version handles scalar columns; the file header has two generation slots so an unfinished
+//! replacement directory cannot hide the last complete one. See
+//! `spec/storage-v3/12-many-tables-in-one-file.md`.
 //!
 //! # Parts and stripes
 //!
@@ -48,7 +53,8 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
-const FORMAT: u32 = 21;
+const CATALOG: &[u8; 8] = b"RUDBCA10";
+const FORMAT: u32 = 22;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -353,6 +359,26 @@ impl Table {
     }
 }
 
+/// One table's line in the catalog directory.
+///
+/// The small level of the two. It holds what opening a database needs and nothing else: the name to
+/// bind, the shape to plan against, the row count, and where the table's own directory sits. A file
+/// of eight tables is eight of these, and reading them costs the same whether the tables hold a
+/// thousand rows or a billion.
+///
+/// The name, the fields and the row count are repeated here rather than pointed at inside the table
+/// directory, which is the entire point of having two levels. A catalog that pointed at them would
+/// have to read every table directory at open to answer what tables there are, which is the cost
+/// this level exists to avoid.
+#[derive(Debug, Clone)]
+struct Entry {
+    name: String,
+    fields: Vec<Field>,
+    rows: usize,
+    /// Where this table's own directory sits, with the checksum it was committed under.
+    directory: Page,
+}
+
 /// Where one column's bytes went, taken from the directory rather than by reading pages.
 #[derive(Debug, Clone)]
 pub struct ColumnLayout {
@@ -547,7 +573,13 @@ impl GlobalDictionary {
     }
 }
 
-/// Appends pages and commits a new directory for one table.
+/// Appends pages and commits a new directory.
+///
+/// One writer covers a whole file rather than one table. [`Writer::next`] closes the table it is on
+/// and opens another over the same file, and [`Writer::finish`] commits every table it has closed in
+/// one generation. That is what makes a checkpoint atomic across tables: there is one slot write at
+/// the end of it and a reader sees every table at the generation before it or every table at the
+/// generation after it.
 #[derive(Debug)]
 pub struct Writer {
     file: File,
@@ -567,6 +599,8 @@ pub struct Writer {
     next_order: u64,
     dictionaries: Vec<Option<GlobalDictionary>>,
     pending: Vec<PendingChunk>,
+    /// The tables already closed in this generation, in the order they were written.
+    closed: Vec<Entry>,
 }
 
 /// A chunk that has arrived and is waiting for the rest of its stripe.
@@ -672,6 +706,52 @@ impl Writer {
                 frequencies: Vec::new(),
             },
             generation: 1,
+            order: Vec::new(),
+            next_order: 0,
+            pending: Vec::with_capacity(STRIPE_PARTS),
+            closed: Vec::new(),
+        })
+    }
+
+    /// Closes the table this writer is on and starts another one in the same file.
+    ///
+    /// Nothing is published here. The closed table's directory is written so that the bytes are on
+    /// disk and its span is known, and the catalog that names it is only written by
+    /// [`Writer::finish`], so a crash between two tables leaves the previous generation intact.
+    ///
+    /// # Errors
+    ///
+    /// If the name repeats a table already closed, a field has no scalar encoding, or the table
+    /// being closed cannot be written.
+    pub fn next(mut self, name: impl Into<String>, fields: Vec<Field>) -> Result<Self> {
+        for field in &fields {
+            type_tag(&field.ty)?;
+        }
+        let name = name.into();
+        let entry = self.close()?;
+        if self.closed.iter().chain(std::iter::once(&entry)).any(|held| held.name == name) {
+            return Err(invalid("two tables in one native file have the same name"));
+        }
+        let Self { file, at, generation, mut closed, .. } = self;
+        closed.push(entry);
+        Ok(Self {
+            file,
+            at,
+            generation,
+            closed,
+            dictionaries: fields
+                .iter()
+                .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .collect(),
+            table: Table {
+                name,
+                dictionaries: vec![None; fields.len()],
+                distincts: vec![None; fields.len()],
+                fields,
+                stripes: Vec::new(),
+                rows: 0,
+                frequencies: Vec::new(),
+            },
             order: Vec::new(),
             next_order: 0,
             pending: Vec::with_capacity(STRIPE_PARTS),
@@ -1247,12 +1327,17 @@ impl Writer {
         Ok(frequencies)
     }
 
-    /// Commits the directory and syncs the file before publishing its header slot.
+    /// Writes the directory of the table this writer is on and says where it went.
+    ///
+    /// Everything [`Writer::finish`] used to do except the two writes that publish. Pulling it out
+    /// is what lets a second table follow a first: the bytes of a closed table are complete and
+    /// addressable while nothing yet points at them, and the pointer is the last write of the
+    /// commit.
     ///
     /// # Errors
     ///
-    /// If directory encoding, writing, or syncing fails.
-    pub fn finish(mut self) -> Result<Table> {
+    /// If directory encoding or writing fails.
+    fn close(&mut self) -> Result<Entry> {
         self.flush_pending()?;
         let mut stripes = std::mem::take(&mut self.order)
             .into_iter()
@@ -1304,13 +1389,47 @@ impl Writer {
         }
         let offset = self.at;
         self.put(&directory)?;
+        Ok(Entry {
+            name: self.table.name.clone(),
+            fields: self.table.fields.clone(),
+            rows: self.table.rows,
+            directory: Page {
+                offset,
+                length: u32::try_from(directory.len())
+                    .map_err(|_| invalid("directory length overflow"))?,
+                hash: checksum(&directory),
+            },
+        })
+    }
+
+    /// Commits every table this writer has written and syncs the file before publishing its header
+    /// slot.
+    ///
+    /// The table handed back is the one the writer was on, which is the last of them. Callers that
+    /// wrote several already know the others, since they named them.
+    ///
+    /// # Errors
+    ///
+    /// If directory encoding, writing, or syncing fails.
+    pub fn finish(mut self) -> Result<Table> {
+        let entry = self.close()?;
+        let mut tables = std::mem::take(&mut self.closed);
+        tables.push(entry);
+        let catalog = encode_catalog(&tables)?;
+        if catalog.len() > MAX_DIRECTORY {
+            return Err(invalid("catalog exceeds the configured bound"));
+        }
+        let offset = self.at;
+        self.put(&catalog)?;
+        // Every page and every table directory is on the disk before anything points at them. The
+        // slot write below is what makes this generation the one a reader picks, so the order of
+        // these two syncs is the whole of the commit.
         self.file.sync_all().map_err(io)?;
         let slot = Slot {
             offset,
-            length: u32::try_from(directory.len())
-                .map_err(|_| invalid("directory length overflow"))?,
+            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
             generation: self.generation,
-            hash: checksum(&directory),
+            hash: checksum(&catalog),
         };
         // The one write that is not an append, and the last one. It goes back over the slot in the
         // header, so it names its offset rather than going through `put`, and `at` does not move.
@@ -2130,61 +2249,161 @@ fn remember(cached: &mut Cached, held: &CachedColumn, kept: usize) {
     }
 }
 
-impl Reader {
-    /// Opens the highest valid directory slot.
+/// Every table a native file holds, without the directory of any of them.
+///
+/// This is what opening a database reads. It is the small level of the directory, so the cost is
+/// proportional to how many tables there are rather than to how much data they hold, and a session
+/// that touches two tables of eight decodes two table directories.
+///
+/// The file handle is shared with every reader this hands out. Eight tables in one file is one open
+/// file descriptor, not eight, which is the other thing one file buys over a file per table.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    file: Arc<File>,
+    size: u64,
+    entries: Arc<Vec<Entry>>,
+    opening: Opening,
+}
+
+impl Catalog {
+    /// Reads the highest valid catalog slot and nothing under it.
     ///
     /// # Errors
     ///
-    /// If the file has no valid committed directory or a directory pointer is out of bounds.
+    /// If the file has no valid committed catalog or a catalog pointer is out of bounds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut file = File::open(path).map_err(io)?;
-        let size = file.metadata().map_err(io)?.len();
-        if size < HEADER {
-            return Err(invalid("file is shorter than its header"));
+        let (file, size, bytes, opening) = slot_bytes(path)?;
+        let entries = decode_catalog(&bytes, size)?;
+        Ok(Self { file: Arc::new(file), size, entries: Arc::new(entries), opening })
+    }
+
+    /// The tables in the file, in the order they were written.
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
+    /// How many tables the file holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the file holds no table at all, which a committed file never does.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Opens one table by name, decoding its directory now.
+    ///
+    /// # Errors
+    ///
+    /// If there is no table by that name, or its directory is torn or points outside the file.
+    pub fn table(&self, name: &str) -> Result<Reader> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let mut bytes = vec![0; entry.directory.length as usize];
+        read_at(&self.file, entry.directory.offset, &mut bytes)?;
+        if checksum(&bytes) != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
         }
-        let mut header = [0; HEADER as usize];
-        file.read_exact(&mut header).map_err(io)?;
-        let mut opening = Opening { reads: 1, bytes: HEADER };
-        let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-        // The two halves are worth telling apart. A wrong magic is a file that was never ours and
-        // the answer is to look at the path. A wrong version is our own file from another build,
-        // and the number this build wants is the only thing that tells the reader whether to
-        // rebuild the file or to go back to the binary that wrote it.
-        if &header[..8] != MAGIC {
-            return Err(invalid("the header does not begin with a rudb native magic"));
-        }
-        if version != FORMAT {
-            return Err(invalid(&format!(
-                "the file is format {version} and this build reads format {FORMAT}, so it has to \
+        let mut opening = self.opening;
+        opening.reads += 1;
+        opening.bytes += u64::from(entry.directory.length);
+        Reader::build(
+            Arc::clone(&self.file),
+            self.size,
+            decode_directory(&bytes, self.size)?,
+            u64::from(entry.directory.length),
+            opening,
+        )
+    }
+}
+
+/// The header and the bytes the highest valid slot points at.
+///
+/// Both levels of the directory are reached this way, so the magic check, the version check and the
+/// choice between the two slots live here rather than being written out twice.
+fn slot_bytes(path: impl AsRef<Path>) -> Result<(File, u64, Vec<u8>, Opening)> {
+    let mut file = File::open(path).map_err(io)?;
+    let size = file.metadata().map_err(io)?.len();
+    if size < HEADER {
+        return Err(invalid("file is shorter than its header"));
+    }
+    let mut header = [0; HEADER as usize];
+    file.read_exact(&mut header).map_err(io)?;
+    let mut opening = Opening { reads: 1, bytes: HEADER };
+    let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    // The two halves are worth telling apart. A wrong magic is a file that was never ours and
+    // the answer is to look at the path. A wrong version is our own file from another build,
+    // and the number this build wants is the only thing that tells the reader whether to
+    // rebuild the file or to go back to the binary that wrote it.
+    if &header[..8] != MAGIC {
+        return Err(invalid("the header does not begin with a rudb native magic"));
+    }
+    if version != FORMAT {
+        return Err(invalid(&format!(
+            "the file is format {version} and this build reads format {FORMAT}, so it has to \
                  be written again"
-            )));
+        )));
+    }
+    let mut selected = None;
+    for start in [16, 16 + SLOT_BYTES] {
+        let slot = Slot::read(&header[start..start + SLOT_BYTES]);
+        if slot.generation == 0 || slot.length == 0 || slot.length as usize > MAX_DIRECTORY {
+            continue;
         }
-        let mut selected = None;
-        for start in [16, 16 + SLOT_BYTES] {
-            let slot = Slot::read(&header[start..start + SLOT_BYTES]);
-            if slot.generation == 0 || slot.length == 0 || slot.length as usize > MAX_DIRECTORY {
-                continue;
-            }
-            let Some(end) = slot.offset.checked_add(u64::from(slot.length)) else { continue };
-            if slot.offset < HEADER || end > size {
-                continue;
-            }
-            let mut bytes = vec![0; slot.length as usize];
-            file.seek(SeekFrom::Start(slot.offset)).map_err(io)?;
-            file.read_exact(&mut bytes).map_err(io)?;
-            opening.reads += 1;
-            opening.bytes += u64::from(slot.length);
-            if checksum(&bytes) == slot.hash
-                && selected
-                    .as_ref()
-                    .is_none_or(|(old, _): &(Slot, Vec<u8>)| old.generation < slot.generation)
-            {
-                selected = Some((slot, bytes));
-            }
+        let Some(end) = slot.offset.checked_add(u64::from(slot.length)) else { continue };
+        if slot.offset < HEADER || end > size {
+            continue;
         }
-        let (slot, bytes) =
-            selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
-        let table = decode_directory(&bytes, size)?;
+        let mut bytes = vec![0; slot.length as usize];
+        file.seek(SeekFrom::Start(slot.offset)).map_err(io)?;
+        file.read_exact(&mut bytes).map_err(io)?;
+        opening.reads += 1;
+        opening.bytes += u64::from(slot.length);
+        if checksum(&bytes) == slot.hash
+            && selected
+                .as_ref()
+                .is_none_or(|(old, _): &(Slot, Vec<u8>)| old.generation < slot.generation)
+        {
+            selected = Some((slot, bytes));
+        }
+    }
+    let (_, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
+    Ok((file, size, bytes, opening))
+}
+
+impl Reader {
+    /// Opens a file that holds exactly one table.
+    ///
+    /// # Errors
+    ///
+    /// If the file has no valid committed directory, a directory pointer is out of bounds, or the
+    /// file holds more than one table, which is a file that has to be opened by name.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let catalog = Catalog::open(path)?;
+        let mut names = catalog.names();
+        let name = names.next().ok_or_else(|| invalid("the file holds no table"))?.to_string();
+        if names.next().is_some() {
+            return Err(invalid(
+                "the file holds more than one table, so it has to be opened by name",
+            ));
+        }
+        catalog.table(&name)
+    }
+
+    /// Builds a reader over one decoded table directory.
+    fn build(
+        file: Arc<File>,
+        size: u64,
+        table: Table,
+        directory: u64,
+        opening: Opening,
+    ) -> Result<Self> {
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
         let table_fields = table.fields.len();
@@ -2205,7 +2424,7 @@ impl Reader {
             .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
             .collect();
         Ok(Self {
-            file: Arc::new(file),
+            file,
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
@@ -2218,7 +2437,7 @@ impl Reader {
             indexes: Arc::new(AtomicUsize::new(0)),
             kept: Arc::new(AtomicUsize::new(CACHED_STRIPES_PER_COLUMN)),
             size,
-            directory: u64::from(slot.length),
+            directory,
             opening,
         })
     }
@@ -3382,6 +3601,84 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// The small level of the directory, naming every table in the file.
+///
+/// This is what a footer slot points at. Each entry carries its own checksum over its table
+/// directory, so a table whose directory is torn is found when that table is first touched rather
+/// than being trusted because the catalog around it checksummed.
+fn encode_catalog(entries: &[Entry]) -> Result<Vec<u8>> {
+    let mut out = CATALOG.to_vec();
+    put_u32(&mut out, u32::try_from(entries.len()).map_err(|_| invalid("too many tables"))?);
+    for entry in entries {
+        let name = entry.name.as_bytes();
+        put_u16(&mut out, u16::try_from(name.len()).map_err(|_| invalid("table name too long"))?);
+        out.extend_from_slice(name);
+        put_u64(&mut out, u64::try_from(entry.rows).map_err(|_| invalid("row count overflow"))?);
+        put_u16(
+            &mut out,
+            u16::try_from(entry.fields.len()).map_err(|_| invalid("too many columns"))?,
+        );
+        for field in &entry.fields {
+            let name = field.name.as_bytes();
+            put_u16(
+                &mut out,
+                u16::try_from(name.len()).map_err(|_| invalid("column name too long"))?,
+            );
+            out.extend_from_slice(name);
+            out.push(type_tag(&field.ty)?);
+            out.push(u8::from(field.not_null));
+        }
+        put_u64(&mut out, entry.directory.offset);
+        put_u32(&mut out, entry.directory.length);
+        put_u64(&mut out, entry.directory.hash);
+    }
+    Ok(out)
+}
+
+/// Reads the catalog directory back, checking every span against the file before anything is
+/// allocated for it.
+fn decode_catalog(bytes: &[u8], size: u64) -> Result<Vec<Entry>> {
+    let mut cur = Cursor { bytes, at: 0 };
+    if cur.take(8)? != CATALOG {
+        return Err(invalid("catalog magic differs"));
+    }
+    let count = cur.u32()? as usize;
+    let mut entries: Vec<Entry> = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let name = cur.text()?;
+        let rows = usize::try_from(cur.u64()?).map_err(|_| invalid("row count does not fit"))?;
+        let width = cur.u16()? as usize;
+        let mut fields = Vec::with_capacity(width);
+        for _ in 0..width {
+            let name = cur.text()?;
+            let ty = tag_type(cur.u8()?)?;
+            let not_null = match cur.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid("nullability flag differs")),
+            };
+            fields.push(Field { name, ty, not_null });
+        }
+        let directory = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+        let end = directory
+            .offset
+            .checked_add(u64::from(directory.length))
+            .ok_or_else(|| invalid("table directory offset overflow"))?;
+        if directory.offset < HEADER
+            || end > size
+            || directory.length as usize > MAX_DIRECTORY
+            || directory.length == 0
+        {
+            return Err(invalid("table directory range is outside the file"));
+        }
+        if entries.iter().any(|held| held.name == name) {
+            return Err(invalid("two tables in the catalog have the same name"));
+        }
+        entries.push(Entry { name, fields, rows, directory });
+    }
+    Ok(entries)
 }
 
 struct Cursor<'a> {
@@ -7010,5 +7307,131 @@ mod tests {
         assert_eq!(read.value_at(0, 1), Value::BigInt(0));
         fs::remove_file(first).expect("remove scratch file");
         fs::remove_file(second).expect("remove scratch file");
+    }
+
+    /// Three tables of different shapes in one file, read back by name.
+    fn three_tables(path: &PathBuf) {
+        let writer = Writer::create(
+            path,
+            "region",
+            vec![
+                Field::new("r_key", LogicalType::Integer),
+                Field::new("r_name", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        let mut writer = writer;
+        writer
+            .append(
+                &Chunk::new(vec![
+                    Vector::from_values(
+                        LogicalType::Integer,
+                        &[Value::Integer(0), Value::Integer(1)],
+                    )
+                    .expect("keys"),
+                    Vector::from_values(
+                        LogicalType::Varchar,
+                        &[Value::Varchar("AFRICA".to_owned()), Value::Varchar("ASIA".to_owned())],
+                    )
+                    .expect("names"),
+                ])
+                .expect("two columns"),
+            )
+            .expect("a part");
+        let mut writer = writer
+            .next("empty", vec![Field::new("nothing", LogicalType::BigInt)])
+            .expect("a second table");
+        writer
+            .append(
+                &Chunk::new(vec![
+                    Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7)]).expect("a row"),
+                ])
+                .expect("one column"),
+            )
+            .expect("a part");
+        let mut writer =
+            writer.next("wide", vec![Field::new("n", LogicalType::BigInt)]).expect("a third table");
+        for part in 0..70_i64 {
+            let values = (0..64).map(|row| Value::BigInt(part * 64 + row)).collect::<Vec<_>>();
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::BigInt, &values).expect("a column"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("a part");
+        }
+        writer.finish().expect("commit");
+    }
+
+    #[test]
+    fn three_tables_in_one_file_read_back_by_name() {
+        let file = path("three-tables");
+        three_tables(&file);
+        let catalog = Catalog::open(&file).expect("a committed catalog");
+        assert_eq!(catalog.names().collect::<Vec<_>>(), ["region", "empty", "wide"]);
+
+        let region = catalog.table("region").expect("the first table");
+        assert_eq!(region.table().rows(), 2);
+        assert_eq!(
+            region.read(0, &[1]).expect("names").value_at(1, 0),
+            Value::Varchar("ASIA".to_owned())
+        );
+
+        let wide = catalog.table("wide").expect("the third table");
+        assert_eq!(wide.table().rows(), 70 * 64);
+        assert_eq!(wide.read(0, &[0]).expect("the first part").value_at(0, 0), Value::BigInt(0));
+
+        // The middle table is reached without the one after it having been touched, which is what
+        // a directory per table buys over one directory of everything.
+        let empty = catalog.table("empty").expect("the second table");
+        assert_eq!(empty.table().rows(), 1);
+        assert_eq!(empty.read(0, &[0]).expect("the row").value_at(0, 0), Value::BigInt(7));
+
+        fs::remove_file(file).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_name_the_file_does_not_hold_is_an_error_rather_than_the_first_table() {
+        let file = path("three-tables-missing");
+        three_tables(&file);
+        let catalog = Catalog::open(&file).expect("a committed catalog");
+        let error = catalog.table("nation").expect_err("no such table");
+        assert!(error.message().contains("nation"), "{}", error.message());
+        fs::remove_file(file).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_file_of_three_tables_will_not_open_as_one() {
+        let file = path("three-tables-unnamed");
+        three_tables(&file);
+        let error = Reader::open(&file).expect_err("more than one table");
+        assert!(error.message().contains("more than one table"), "{}", error.message());
+        fs::remove_file(file).expect("remove scratch file");
+    }
+
+    #[test]
+    fn two_tables_of_one_name_are_refused_before_anything_is_committed() {
+        let file = path("two-of-a-name");
+        let writer = Writer::create(&file, "t", vec![Field::new("a", LogicalType::BigInt)])
+            .expect("new file");
+        let error = writer
+            .next("t", vec![Field::new("a", LogicalType::BigInt)])
+            .expect_err("the same name twice");
+        assert!(error.message().contains("same name"), "{}", error.message());
+        fs::remove_file(file).expect("remove scratch file");
+    }
+
+    #[test]
+    fn opening_the_catalog_reads_no_table_directory() {
+        let file = path("catalog-only");
+        three_tables(&file);
+        let catalog = Catalog::open(&file).expect("a committed catalog");
+        // The header and one slot, and nothing under it. The third table's directory covers seventy
+        // stripes and reading it here would be the whole point of the two levels thrown away.
+        assert_eq!(catalog.opening.reads, 2, "opening the catalog read more than the slot");
+        assert_eq!(catalog.names().len(), 3);
+        fs::remove_file(file).expect("remove scratch file");
     }
 }
