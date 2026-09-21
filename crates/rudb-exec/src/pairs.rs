@@ -94,11 +94,27 @@ pub(crate) struct Record {
     pub(crate) pair_hash: u32,
 }
 
+/// The hash of a group before it is folded to thirty two bits, which is where both hashes start.
+///
+/// A row of a mixed aggregate wants two hashes, the group's own to pick the owner that holds its
+/// numeric state and the pair's to pick the partition that deduplicates it, and the second is the
+/// first with the counted value mixed into it. Handing the wide form over lets that caller pay the
+/// two multiplies underneath once a row rather than twice.
+#[inline]
+pub(crate) fn group_seed(group: i32, valid: bool) -> u64 {
+    let word = if valid { i64::from(group) as u64 } else { NOTHING };
+    spread(mix(0, word))
+}
+
+/// A wide hash cut to thirty two bits with the ones it loses folded into the ones it keeps.
+#[inline]
+pub(crate) fn folded(wide: u64) -> u32 {
+    (wide ^ (wide >> 32)) as u32
+}
+
 /// The hash of a group on its own, which is what the counting pass groups by.
 pub(crate) fn group_hash(group: i32, valid: bool) -> u32 {
-    let word = if valid { i64::from(group) as u64 } else { NOTHING };
-    let wide = spread(mix(0, word));
-    (wide ^ (wide >> 32)) as u32
+    folded(group_seed(group, valid))
 }
 
 /// One instance's rows for one radix partition.
@@ -110,6 +126,7 @@ pub(crate) struct Run {
 }
 
 impl Run {
+    #[inline]
     pub(crate) fn push(&mut self, row: Record, valid: bool) {
         self.rows.push(row);
         if self.validity.is_empty() {
@@ -173,9 +190,20 @@ impl Held {
 /// probes with the low ones, so the bits the partition used are not the bits it then goes without.
 #[inline]
 pub(crate) fn scatter(partitions: &mut [Run], shift: u32, group: i32, valid: bool, user: i64) {
-    let group_word = if valid { i64::from(group) as u64 } else { NOTHING };
-    let wide_pair = spread(mix(spread(mix(0, group_word)), user as u64));
-    let pair_hash = (wide_pair ^ (wide_pair >> 32)) as u32;
+    scatter_seeded(partitions, shift, group_seed(group, valid), group, valid, user);
+}
+
+/// The same scatter for a caller that already asked [`group_seed`] about this row's group.
+#[inline]
+pub(crate) fn scatter_seeded(
+    partitions: &mut [Run],
+    shift: u32,
+    seed: u64,
+    group: i32,
+    valid: bool,
+    user: i64,
+) {
+    let pair_hash = folded(spread(mix(seed, user as u64)));
     partitions[(pair_hash >> shift) as usize].push(Record { user, group, pair_hash }, valid);
 }
 
@@ -424,7 +452,10 @@ fn poisoned<T>(_: T) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs, merged, used};
+    use super::{
+        Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs, folded, group_hash,
+        group_seed, merged, scatter, scatter_seeded, shift, used,
+    };
 
     /// The fan out the finishing pass picks, and that what it drops is merged rather than lost.
     ///
@@ -478,5 +509,39 @@ mod tests {
         let mut found: Vec<bool> = counted.splits[0].iter().map(|pair| pair.valid).collect();
         found.sort_unstable();
         assert_eq!(found, [false, true]);
+    }
+
+    /// The seeded scatter is the plain one with its first two multiplies handed in.
+    ///
+    /// Two ways of working out the same partition and the same hash is two ways for a row to end up
+    /// somewhere a later pass does not look for it, so they have to agree on every input and not
+    /// only on the ones the mixed aggregate happens to send.
+    #[test]
+    fn scattering_from_a_seed_puts_a_row_where_scattering_from_the_group_would() {
+        for group in [i32::MIN, -7, 0, 1, 4096, i32::MAX] {
+            for valid in [true, false] {
+                assert_eq!(group_hash(group, valid), folded(group_seed(group, valid)));
+                for user in [i64::MIN, -1, 0, 99, i64::MAX] {
+                    let mut plain: Vec<Run> = (0..PARTITIONS).map(|_| Run::default()).collect();
+                    let mut seeded: Vec<Run> = (0..PARTITIONS).map(|_| Run::default()).collect();
+                    scatter(&mut plain, shift(), group, valid, user);
+                    scatter_seeded(
+                        &mut seeded,
+                        shift(),
+                        group_seed(group, valid),
+                        group,
+                        valid,
+                        user,
+                    );
+                    let at = |runs: &[Run]| {
+                        runs.iter().position(|run| !run.rows.is_empty()).expect("a row landed")
+                    };
+                    let left = at(&plain);
+                    assert_eq!(left, at(&seeded), "{group} {valid} {user}");
+                    assert_eq!(plain[left].rows[0].pair_hash, seeded[left].rows[0].pair_hash);
+                    assert_eq!(plain[left].validity, seeded[left].validity);
+                }
+            }
+        }
     }
 }
