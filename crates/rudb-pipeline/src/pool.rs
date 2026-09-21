@@ -147,15 +147,32 @@ impl Pool {
     /// it: every worker looks at the queue again after each job, so a job that is in the queue while
     /// a worker is between jobs is a job that worker will find.
     fn enqueue(&self, batch: &Arc<Batch>, tasks: usize) {
-        let shortfall = {
+        let (shortfall, idle) = {
             let mut queue = self.shared.queue.lock().unwrap_or_else(PoisonError::into_inner);
             for _ in 0..tasks {
                 queue.jobs.push_back(Arc::clone(batch));
             }
-            tasks.saturating_sub(queue.idle)
+            (tasks.saturating_sub(queue.idle), queue.idle)
         };
-        for _ in 0..tasks {
-            self.shared.ready.notify_one();
+        // One wake rather than one per worker, whenever there is a job for every worker that is
+        // parked. A `notify_one` is a wake syscall each, paid one after another by the thread that
+        // is dispatching, which is the thread every instance of the pipeline is waiting on, and a
+        // sixteen way pipeline paid fifteen of them before its first row was read. It showed up in
+        // the metrics as dispatch: 0.087 to 0.158 ms on queries that run for a millisecond, which
+        // is ten percent of them spent telling workers there is work.
+        //
+        // Waking them all is only right when none of them would wake to find nothing, because a
+        // worker that parks again has cost a wake and a lock for nothing and the herd contends on
+        // the queue on its way past. That is the test here: more jobs than parked workers means
+        // every one of them has a job waiting, and the ones that are still running have not parked
+        // so they are not woken at all. Below that the wakes are counted out one at a time, which
+        // is what the queue is short of workers for anyway.
+        if tasks >= idle {
+            self.shared.ready.notify_all();
+        } else {
+            for _ in 0..tasks {
+                self.shared.ready.notify_one();
+            }
         }
         for _ in 0..shortfall {
             if self.live.load(Ordering::Relaxed) >= self.threads().saturating_sub(1) {
