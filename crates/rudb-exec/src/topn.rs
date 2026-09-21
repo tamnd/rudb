@@ -429,7 +429,7 @@ impl TopN {
             trim(&self.keys, kept, self.bound, failure);
             *trimmed = true;
             *cut = (kept.len() == self.bound && self.bound > 0)
-                .then(|| kept[self.bound - 1].0.clone());
+                .then(|| kept[self.bound - 1].key.clone());
             if let Some(reached) = cut.as_ref() {
                 self.reached(reached);
             }
