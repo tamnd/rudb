@@ -532,9 +532,11 @@ impl Walk {
 
 /// One key column in its common physical width.
 ///
-/// ClickBench's high-cardinality keys are mostly `BIGINT`, `INTEGER`, and `VARCHAR`. Keeping those
-/// in a general tagged value made every number 32 bytes wide. The validity is separate because a
-/// nullable integer represented as `Option<i64>` is 16 bytes, while `Vec<bool>` uses one bit.
+/// ClickBench's keys are `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT` and `VARCHAR`, and half its
+/// schema is `SMALLINT`. Keeping those in a general tagged value made every number 32 bytes wide
+/// and, worse than the width, made the comparison that runs once per input row per probe step build
+/// a tagged value on each side of it. The validity is separate because a nullable integer
+/// represented as `Option<i64>` is 16 bytes, while `Vec<bool>` uses one bit.
 #[derive(Debug)]
 struct Column {
     valid: Vec<bool>,
@@ -543,6 +545,8 @@ struct Column {
 
 #[derive(Debug)]
 enum StoredData {
+    TinyInt(Vec<i8>),
+    SmallInt(Vec<i16>),
     Integer(Vec<i32>),
     BigInt(Vec<i64>),
     Varchar(StringColumn),
@@ -553,6 +557,8 @@ enum StoredData {
 impl Column {
     fn new(ty: &rudb_common::LogicalType) -> Self {
         let data = match ty {
+            rudb_common::LogicalType::TinyInt => StoredData::TinyInt(Vec::new()),
+            rudb_common::LogicalType::SmallInt => StoredData::SmallInt(Vec::new()),
             rudb_common::LogicalType::Integer => StoredData::Integer(Vec::new()),
             rudb_common::LogicalType::BigInt => StoredData::BigInt(Vec::new()),
             rudb_common::LogicalType::Varchar => StoredData::Varchar(StringColumn::default()),
@@ -564,6 +570,10 @@ impl Column {
     fn push(&mut self, value: Value) -> Result<()> {
         let present = !matches!(value, Value::Null);
         match (&mut self.data, value) {
+            (StoredData::TinyInt(values), Value::TinyInt(value)) => values.push(value),
+            (StoredData::TinyInt(values), Value::Null) => values.push(0),
+            (StoredData::SmallInt(values), Value::SmallInt(value)) => values.push(value),
+            (StoredData::SmallInt(values), Value::Null) => values.push(0),
             (StoredData::Integer(values), Value::Integer(value)) => values.push(value),
             (StoredData::Integer(values), Value::Null) => values.push(0),
             (StoredData::BigInt(values), Value::BigInt(value)) => values.push(value),
@@ -590,9 +600,9 @@ impl Column {
     /// below, whose capacity `footprint` counts, and counting it here as well would charge every
     /// group twice for the part of it that is not a string.
     ///
-    /// The three stored widths read the row straight out of the vector, so an `INTEGER` or a
-    /// `BIGINT` key costs a range check and a push and a `VARCHAR` key costs a copy of its bytes.
-    /// Everything else builds a value, which is what all of this used to do.
+    /// The stored widths read the row straight out of the vector, so an integer key costs a range
+    /// check and a push and a `VARCHAR` key costs a copy of its bytes. Everything else builds a
+    /// value, which is what all of this used to do.
     fn push_from(&mut self, column: &Vector, row: usize) -> Result<u64> {
         if matches!(&self.data, StoredData::Varchar(values) if values.ends.is_empty()) {
             if let Some((codes, dictionary)) = column.stable_dictionary_parts() {
@@ -610,25 +620,23 @@ impl Column {
         if column.is_null_at(row) {
             return self.push(Value::Null).map(|()| 0);
         }
+        /// One signed run taking the row where it lies, when the value fits the run's width.
+        macro_rules! signed {
+            ($values:expr, $width:ty) => {
+                match column.signed_at(row).and_then(|value| <$width>::try_from(value).ok()) {
+                    Some(value) => {
+                        $values.push(value);
+                        true
+                    }
+                    None => false,
+                }
+            };
+        }
         let taken = match &mut self.data {
-            StoredData::Integer(values) => {
-                match column.signed_at(row).and_then(|value| i32::try_from(value).ok()) {
-                    Some(value) => {
-                        values.push(value);
-                        true
-                    }
-                    None => false,
-                }
-            }
-            StoredData::BigInt(values) => {
-                match column.signed_at(row).and_then(|value| i64::try_from(value).ok()) {
-                    Some(value) => {
-                        values.push(value);
-                        true
-                    }
-                    None => false,
-                }
-            }
+            StoredData::TinyInt(values) => signed!(values, i8),
+            StoredData::SmallInt(values) => signed!(values, i16),
+            StoredData::Integer(values) => signed!(values, i32),
+            StoredData::BigInt(values) => signed!(values, i64),
             StoredData::Varchar(values) => match column.bytes_at(row) {
                 Some(bytes) => {
                     values.push(bytes)?;
@@ -662,6 +670,8 @@ impl Column {
 
     fn footprint(&self) -> usize {
         let values = match &self.data {
+            StoredData::TinyInt(values) => values.capacity(),
+            StoredData::SmallInt(values) => values.capacity() * size_of::<i16>(),
             StoredData::Integer(values) => values.capacity() * size_of::<i32>(),
             StoredData::BigInt(values) => values.capacity() * size_of::<i64>(),
             StoredData::Varchar(values) => values.footprint(),
@@ -681,6 +691,14 @@ impl Column {
             // decoration: a form that cannot hand its rows over as integers answers `None` here,
             // and treating that as a key that does not match would put every row of a packed
             // column in a group of its own.
+            StoredData::TinyInt(values) => match column.signed_at(row) {
+                Some(value) => value == i128::from(values[slot]),
+                None => same(&Value::TinyInt(values[slot]), &column.value_at(row)),
+            },
+            StoredData::SmallInt(values) => match column.signed_at(row) {
+                Some(value) => value == i128::from(values[slot]),
+                None => same(&Value::SmallInt(values[slot]), &column.value_at(row)),
+            },
             StoredData::Integer(values) => match column.signed_at(row) {
                 Some(value) => value == i128::from(values[slot]),
                 None => same(&Value::Integer(values[slot]), &column.value_at(row)),
@@ -765,6 +783,8 @@ impl Column {
         }
         if let Some(data) = column.data() {
             match (&self.data, data) {
+                (StoredData::TinyInt(stored), Data::Int8(values)) => run!(stored, values),
+                (StoredData::SmallInt(stored), Data::Int16(values)) => run!(stored, values),
                 (StoredData::Integer(stored), Data::Int32(values)) => run!(stored, values),
                 (StoredData::BigInt(stored), Data::Int64(values)) => run!(stored, values),
                 (StoredData::Varchar(stored), Data::Varlen(strings)) => {
@@ -813,6 +833,8 @@ impl Column {
     ) -> Result<Vector> {
         let (start, len) = (range.start, range.len());
         let data = match &self.data {
+            StoredData::TinyInt(values) => Data::Int8(values[range.clone()].to_vec().into()),
+            StoredData::SmallInt(values) => Data::Int16(values[range.clone()].to_vec().into()),
             StoredData::Integer(values) => Data::Int32(values[range.clone()].to_vec().into()),
             StoredData::BigInt(values) => Data::Int64(values[range.clone()].to_vec().into()),
             StoredData::Varchar(values) => {
@@ -857,6 +879,8 @@ impl Column {
                     return Value::Null;
                 }
                 match &self.data {
+                    StoredData::TinyInt(values) => Value::TinyInt(values[slot]),
+                    StoredData::SmallInt(values) => Value::SmallInt(values[slot]),
                     StoredData::Integer(values) => Value::Integer(values[slot]),
                     StoredData::BigInt(values) => Value::BigInt(values[slot]),
                     StoredData::Varchar(values) => Value::Varchar(values.string(slot)),
@@ -877,6 +901,8 @@ impl Column {
                     return Value::Null;
                 }
                 match &self.data {
+                    StoredData::TinyInt(values) => Value::TinyInt(values[slot]),
+                    StoredData::SmallInt(values) => Value::SmallInt(values[slot]),
                     StoredData::Integer(values) => Value::Integer(values[slot]),
                     StoredData::BigInt(values) => Value::BigInt(values[slot]),
                     StoredData::Varchar(values) => Value::Varchar(values.string(slot)),
@@ -1694,6 +1720,52 @@ mod tests {
             grouped.push(slots);
         }
         assert_eq!(grouped[0], grouped[1]);
+    }
+
+    /// Half of ClickBench's schema is `SMALLINT`, and a narrow integer key used to land in the
+    /// general run. There the comparison that runs once per input row per probe step built a tagged
+    /// value on each side of itself, and the batched comparison had no arm for it at all and fell
+    /// back to the row at a time one. A run of their own has to group the way the values do, under
+    /// the batched probe as well as the single one, and give the type back on the way out.
+    ///
+    /// `SMALLINT` gets enough distinct values to push the table past [`HOT`], which is what makes
+    /// the batched path really taken. `TINYINT` cannot reach it, because two hundred and fifty six
+    /// values is every group such a column can have.
+    #[test]
+    fn narrow_integer_keys_group_by_value_and_come_back_in_their_own_width() {
+        for (ty, modulus) in [(LogicalType::TinyInt, 251i64), (LogicalType::SmallInt, 12_007i64)] {
+            let tiny = ty == LogicalType::TinyInt;
+            let held = |row: i64| {
+                let value = (row * 7919) % modulus - modulus / 2;
+                if tiny { Value::TinyInt(value as i8) } else { Value::SmallInt(value as i16) }
+            };
+            let values: Vec<Value> = (0..40_000)
+                .map(|row: i64| if row % 53 == 0 { Value::Null } else { held(row) })
+                .collect();
+            let keys = [flat(ty.clone(), &values)];
+            let types = [ty.clone()];
+            let (was, before) = one_at_a_time(&keys, values.len(), &types);
+            let (now, after) = a_batch_at_a_time(&keys, values.len(), &types);
+            assert_eq!(
+                before, after,
+                "{ty:?} was batched into groups it did not make one at a time"
+            );
+            assert_eq!(was.len(), now.len());
+            assert!(tiny || now.buckets.len() > HOT, "the test has to reach the batched path");
+
+            let bytes = now.columns[0].footprint();
+            assert!(
+                bytes < now.len() * size_of::<Stored>(),
+                "{bytes} bytes held {} keys",
+                now.len()
+            );
+            let column = now.column(0, &ty, 0..now.len()).expect("a narrow key column");
+            // row at a time: every row has to find its own value again under the slot it was given,
+            // which is what says the emit narrowed back to the width the key arrived in.
+            for (row, &slot) in before.iter().enumerate() {
+                assert_eq!(column.value_at(slot), values[row], "row {row} of {ty:?}");
+            }
+        }
     }
 
     /// What `column` has to keep right now that it builds the vector itself rather than handing back
