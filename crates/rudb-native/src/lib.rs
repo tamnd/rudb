@@ -684,11 +684,11 @@ const DICTIONARY_DECIDE_ROWS: usize = 4_096;
 /// Out of ten. A varchar column loses its dictionary when more than this many rows in ten of the
 /// first stripe held a value that stripe had not seen before.
 ///
-/// See [`Writer::encode_column`]. Nine and not five, because the cost this avoids is real only at
-/// the very top of the range and the properties a dictionary buys are worth keeping everywhere
-/// else. TPC-H l_comment is above it and ClickBench URL, which has tens of millions of distinct
-/// values and is still repetitive enough that a group by on its codes is the cheap way to run one,
-/// is well below.
+/// See [`Writer::encode_column`]. Nine and not five, because the properties a dictionary buys are
+/// worth keeping everywhere they are real and nothing is claimed here about where between the two
+/// the crossover sits. TPC-H o_comment, c_comment and ps_comment are above it at 0.97 of their
+/// first stripe. l_comment is at 0.883 and so keeps its dictionary under this number, which is left
+/// alone until the same measurement has been run on a column of ClickBench's shape.
 const DICTIONARY_DISTINCT_IN_TEN: usize = 9;
 
 /// Bytes one part takes in a stripe's index page: four for the length, eight for the checksum.
@@ -902,10 +902,11 @@ impl Writer {
     /// dozen values repeated down the table: the pages become small integers, a filter against a
     /// literal is one search of the sorted order rather than a comparison a row, and a group by is
     /// on the codes. It is the wrong shape for a column whose values are nearly all different.
-    /// There the codes are as wide as row numbers, nothing is saved on the pages, and handing the
-    /// column out costs a random read of a decoded payload block per row where a column stored as
-    /// its own bytes hands out views over a page and moves nothing. On TPC-H lineitem that is
-    /// l_comment read in 456 ms against 202 ms for the same values in a parquet file.
+    /// There the codes are as wide as row numbers, nothing is saved on the pages, and the
+    /// membership index of a stripe is a list of very nearly every code in the column. On TPC-H the
+    /// orders table written on its own goes from 52.3 MB to 41.4 MB, the load from 6.9 s to 5.8 s,
+    /// and `select o_comment from orders` from 1.810 G instructions to 1.213 G, which is what the
+    /// rudb parquet reader takes over the same values.
     ///
     /// So the first stripe of a column is the sample and the decision is made once on it. Once,
     /// rather than per stripe, because the codes of one column have to mean the same thing in every
@@ -4508,22 +4509,33 @@ fn cascaded(
 /// The result is taken only when it is smaller than the plain form. A cascade is allowed to come
 /// out larger on a part whose codes are genuinely wide, `URL` has about sixty million distinct
 /// values, and there is no reason to pay for the decode when it does.
-/// A varchar page through the string cascade, or `None` when the cascade did not pay.
+/// A varchar page as one FSST layer, or `None` when it did not pay.
 ///
-/// This is the same encoder the payload blocks of a global dictionary go through, pointed at a page
-/// of the column itself. Until now a varchar page that neither the global dictionary nor the per
-/// page dictionary claimed was written out raw: four bytes of offset a row and then the bytes. That
-/// is the right answer for a page of values that have nothing in common and the wrong one for
-/// nearly everything else, because the cascade front codes a sorted run, finds repeats with its
-/// matcher and packs the lengths, and a page of a thousand values has plenty of all three.
+/// Until now a varchar page that neither the global dictionary nor the per page dictionary claimed
+/// was written out raw: four bytes of offset a row and then the bytes. That is the right answer for
+/// a page of values with nothing in common and the wrong one for a page of English, and a column of
+/// comments is the case this exists for.
 ///
-/// The page dictionary gets first refusal because it is cheaper to read, and it wins on a page whose
+/// One layer and not the full string cascade, which is what the payload blocks of a global
+/// dictionary go through. The cascade is a search: it encodes the page under every candidate it has
+/// and recurses into the integer cascade for the lengths of each one, and on TPC-H `orders` that
+/// took the write from 6.9 s to 48.3 s. It reads back no faster than the dictionary it replaced
+/// either, 1.807 G instructions against 1.810 G for `select o_comment from orders`, because
+/// unpicking a nest of layers a value at a time costs what the dictionary's payload block decode
+/// cost. Raw pages of the same column read in 0.686 G, which says the whole of the difference is
+/// what the page has to be put back together from.
+///
+/// FSST alone keeps most of what the cascade found and gives all of that back. Decoding it is one
+/// pass over the payload into one buffer, the values are laid end to end in it the way the raw form
+/// already lays them out, and what the reader hands a chunk is views over that buffer.
+///
+/// The page dictionary gets first refusal because it is cheaper still, and it wins on a page whose
 /// values repeat. What is left for this is the page whose values mostly do not, which is exactly the
 /// page that was being written raw.
 ///
 /// Taken only when it comes out smaller than the raw form, so a page of incompressible values pays
-/// nothing at read time for having been offered to the cascade.
-fn text_cascaded(flat: &Vector) -> Result<Option<Vec<u8>>> {
+/// nothing at read time for having been offered.
+fn text_compressed(flat: &Vector) -> Result<Option<Vec<u8>>> {
     let mut values: Vec<&[u8]> = Vec::with_capacity(flat.len());
     let mut payload = 0_usize;
     for row in 0..flat.len() {
@@ -4533,7 +4545,9 @@ fn text_cascaded(flat: &Vector) -> Result<Option<Vec<u8>>> {
     }
     // What codec 0 writes for a varchar page: an offset a row and one more, then the payload.
     let plain = (flat.len() + 1).saturating_mul(4).saturating_add(payload);
-    let out = string::encode(&values)?;
+    let Some(out) = string::encode_only(string::Kind::Fsst, &values)? else {
+        return Ok(None);
+    };
     Ok((out.len() < plain).then_some(out))
 }
 
@@ -4569,9 +4583,9 @@ fn encode(
     } else {
         None
     };
-    let text_cascade =
+    let compressed_text =
         if global_codes.is_none() && dictionary.is_none() && ty == &LogicalType::Varchar {
-            text_cascaded(&flat)?
+            text_compressed(&flat)?
         } else {
             None
         };
@@ -4601,7 +4615,7 @@ fn encode(
         3
     } else if dictionary.is_some() {
         1
-    } else if text_cascade.is_some() {
+    } else if compressed_text.is_some() {
         6
     } else if packed.is_some() {
         2
@@ -4644,8 +4658,8 @@ fn encode(
         out.extend_from_slice(&dictionary);
         return Ok((out, membership));
     }
-    if let Some(text_cascade) = text_cascade {
-        out.extend_from_slice(&text_cascade);
+    if let Some(compressed_text) = compressed_text {
+        out.extend_from_slice(&compressed_text);
         return Ok((out, membership));
     }
     if let Some(packed) = packed {
@@ -5604,12 +5618,14 @@ fn decode(
     }
     if codec == 6 {
         if ty != &LogicalType::Varchar {
-            return Err(invalid("string cascade codec belongs to a non-string page"));
+            return Err(invalid("compressed text codec belongs to a non-string page"));
         }
-        // As codec 5, the cascade holds the whole tail of the page and says how long it is itself.
+        // As codec 5, the layer holds the whole tail of the page and says how long it is itself.
+        // It comes back as one buffer with the values laid end to end and where each one ends, which
+        // is the raw form's layout, so what is left to do here is what codec 0 does.
         let (payload, ends) = string::decode_flat(&bytes[cur.at..])?.into_parts();
         if ends.len() != rows {
-            return Err(invalid("string cascade page holds the wrong number of rows"));
+            return Err(invalid("compressed text page holds the wrong number of rows"));
         }
         // A page, because this is read once and handed out a chunk at a time, and a cut of a paged
         // payload moves views rather than bytes.
@@ -5618,7 +5634,7 @@ fn decode(
         for end in ends {
             let len = end
                 .checked_sub(start)
-                .ok_or_else(|| invalid("string cascade value ends before it starts"))?;
+                .ok_or_else(|| invalid("compressed text value ends before it starts"))?;
             values.push_in_place(start, len)?;
             start = end;
         }
