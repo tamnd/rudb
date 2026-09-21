@@ -3329,13 +3329,19 @@ pub(crate) fn copy_of(data: &Data, at: &[usize]) -> Data {
             match data {
                 Data::Empty => Data::Empty,
                 $(Data::$variant(values) => {
-                    let mut out = Buffer::with_capacity(at.len());
-                    for &index in at {
-                        // One bounds check rather than a null test and a bounds check, because
-                        // `NOWHERE` is past the end of every slice there can be.
-                        out.push(values.get(index).copied().unwrap_or($zero));
-                    }
-                    Data::$variant(out)
+                    let values = values.as_slice();
+                    // Into a `Vec` and then into a buffer, rather than pushing at the buffer. A
+                    // push asks the buffer whether it owns its run and copies the page out if it
+                    // does not, which is the copy on write point and is the right answer for a
+                    // caller writing one value. This caller is writing `at.len()` of them into a
+                    // run it made itself one line earlier, so the question has one answer and it
+                    // is asked once by not being asked at all. The map is exact sized, so the
+                    // extend reserves once and writes without a capacity check per value.
+                    let mut out: Vec<$native> = Vec::with_capacity(at.len());
+                    // One bounds check rather than a null test and a bounds check, because
+                    // `NOWHERE` is past the end of every slice there can be.
+                    out.extend(at.iter().map(|&index| values.get(index).copied().unwrap_or($zero)));
+                    Data::$variant(Buffer::from_vec(out))
                 })+
                 // The one layout where a gather is a copy of bytes rather than a copy of fixed
                 // width slots, and the reason compaction is a decision rather than a default on a
