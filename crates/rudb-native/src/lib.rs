@@ -3155,7 +3155,12 @@ impl Reader {
                 )));
             }
             let dictionary = self.dictionary(column)?;
-            picked.push(decode(&field.ty, rows, bytes, dictionary)?);
+            // Held as a page, because a column that came out of a file is handed out more than
+            // once. A group by clones its key columns out of the chunk so the keys outlive it, a
+            // projection of a bare column name does the same, and a cut of a flat run copies unless
+            // the run is a page. One `Arc` per column per part buys all of those, and it moves the
+            // run into the `Arc` without touching a value.
+            picked.push(decode(&field.ty, rows, bytes, dictionary)?.into_pages());
         }
         Chunk::with_rows(picked, rows)
     }
