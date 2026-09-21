@@ -10,6 +10,11 @@
 //! holds, which is what a join's estimate rests on. They are in one module because they are one
 //! idea, and because TPC-H q05 needs both of them and is the reason either exists.
 //!
+//! [`Common`] came later and is not out of the directory. It answers how many rows hold one
+//! particular value, off the frequency synopsis the writer takes per column, and it belongs here
+//! because it is the same idea pointed at the same reader: a number the file already holds that the
+//! planner was assuming its way past.
+//!
 //! # What q05 actually needed
 //!
 //! The filter is the easy half. The `o_orderdate` range over SF1 keeps 227,597 rows of 1,500,000.
@@ -39,9 +44,11 @@
 //! bound is worth reading when the question is which parts to skip, and that question is the scan's
 //! and is already answered by [`Reader::skips`].
 
+use std::cmp::Ordering;
+
 use rudb_common::Result;
 use rudb_common::Stat;
-use rudb_common::bounds::{Bound, End, Spread, Test, Zones, kept};
+use rudb_common::bounds::{Bound, End, Frequencies, Spread, Test, Zones, kept};
 use rudb_common::stat::{Direction, Provenance};
 use rudb_storage::Probe;
 
@@ -173,6 +180,62 @@ pub fn distincts(reader: &Reader) -> Result<Vec<(String, Stat<u64>)>> {
         ));
     }
     Ok(counted)
+}
+
+/// What a native table's frequency synopsis says about one value, as the planner asks for it.
+///
+/// Holds the reader for the reason [`Stripes`] does. The synopsis is small where it exists at all,
+/// but it exists per column and copying every column's into every plan would be paying for the
+/// columns nothing filters on, which is most of them.
+#[derive(Debug, Clone)]
+pub struct Common {
+    reader: Reader,
+}
+
+impl Common {
+    /// The frequencies of a table somebody has open.
+    #[must_use]
+    pub fn new(reader: Reader) -> Self {
+        Self { reader }
+    }
+}
+
+impl Frequencies for Common {
+    fn column(&self, name: &str) -> Option<usize> {
+        self.reader.table().fields().iter().position(|field| field.name == name)
+    }
+
+    fn rows(&self) -> u64 {
+        u64::try_from(self.reader.table().rows()).unwrap_or(u64::MAX)
+    }
+
+    fn rows_with(&self, column: usize, value: &Bound) -> Stat<u64> {
+        // Only the complete synopsis, by asking for it. A synopsis that dropped anything still says
+        // something useful about the values it kept, but what it says about a value it does not
+        // list is the difference between nothing and a count, and telling those apart is a second
+        // question with a second answer shape. This one is the exact half.
+        let Ok(Some(entries)) = self.reader.exact_frequencies(column) else {
+            return Stat::Unknown;
+        };
+        let mut comparable = false;
+        for (held, count) in entries {
+            // A null entry is the column's nulls, and no equality matches a null. Skipping it is
+            // both the right answer and the only one available, since a null has no bound.
+            let Some(bound) = Bound::of_value(&held) else {
+                continue;
+            };
+            match bound.order(value) {
+                Some(Ordering::Equal) => return Stat::exact(count, Provenance::FrequencySynopsis),
+                Some(_) => comparable = true,
+                None => {}
+            }
+        }
+        // Nothing in the list was the value. That is a count of zero when the list and the constant
+        // were in the same domain, because a complete synopsis accounts for every row. Where not
+        // one entry would even compare, the constant is of another type and the zero would be an
+        // artefact of that rather than a fact about the rows.
+        if comparable { Stat::exact(0, Provenance::FrequencySynopsis) } else { Stat::Unknown }
+    }
 }
 
 /// The tests as the storage layer spells them, which is the same three fields under another name.

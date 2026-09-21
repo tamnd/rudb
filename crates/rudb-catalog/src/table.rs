@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use rudb_common::bounds::{Bound, Zones};
+use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_native::{FrequencyOccurrences, Reader as NativeReader, Stripes};
+use rudb_native::{Common, FrequencyOccurrences, Reader as NativeReader, Stripes};
 use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
 
@@ -439,6 +439,18 @@ impl Rows {
         match self {
             Self::Memory(_) => None,
             Self::Native(reader) => Some(Arc::new(Stripes::new(reader.clone()))),
+        }
+    }
+
+    /// How many rows hold each value, for the planner to ask about one of them.
+    ///
+    /// `None` for a table in memory, which keeps no frequency synopsis at all yet. That is #1103
+    /// and not a decision: the file side is where the synopsis exists, so it is where this starts.
+    #[must_use]
+    pub fn frequencies(&self) -> Option<Arc<dyn Frequencies>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Native(reader) => Some(Arc::new(Common::new(reader.clone()))),
         }
     }
 

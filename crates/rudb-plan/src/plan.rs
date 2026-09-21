@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rudb_common::bounds::Zones;
+use rudb_common::bounds::{Frequencies, Zones};
 use rudb_common::{Error, Field, LogicalType, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
@@ -75,6 +75,12 @@ pub struct Plan {
     /// Shared and never mutated, so cloning a plan shares these rather than copying them, which is
     /// what makes the optimizer running its passes twice to check they settle cost nothing here.
     zones: BTreeMap<u32, Arc<dyn Zones>>,
+    /// How many rows hold each value of a column, where the table bound at an index counted.
+    ///
+    /// Here for the reason `zones` is here and behind a trait object for the same reason. A
+    /// synopsis is per column and the planner wants one number out of it per equality, so the
+    /// question goes to the store.
+    frequencies: BTreeMap<u32, Arc<dyn Frequencies>>,
 }
 
 impl Default for Plan {
@@ -116,6 +122,7 @@ impl Plan {
             measured: BTreeMap::new(),
             distincts: BTreeMap::new(),
             zones: BTreeMap::new(),
+            frequencies: BTreeMap::new(),
         }
     }
 
@@ -195,6 +202,27 @@ impl Plan {
     #[must_use]
     pub fn zones_count(&self) -> usize {
         self.zones.len()
+    }
+
+    /// Records what the table bound at `index` counted about how common each of its values is.
+    ///
+    /// Called only for a store that keeps a frequency synopsis, which today is a native table. A
+    /// table with no entry answers `None` and the estimate divides by the distinct count as it did
+    /// before, which is the right answer for a store that counted nothing.
+    pub fn set_frequencies(&mut self, index: u32, frequencies: Arc<dyn Frequencies>) {
+        self.frequencies.insert(index, frequencies);
+    }
+
+    /// What the table bound at `index` counted per value, where anything did.
+    #[must_use]
+    pub fn frequencies(&self, index: u32) -> Option<&Arc<dyn Frequencies>> {
+        self.frequencies.get(&index)
+    }
+
+    /// How many tables carry a frequency synopsis, which is what a test about this asks.
+    #[must_use]
+    pub fn frequencies_count(&self) -> usize {
+        self.frequencies.len()
     }
 
     /// How many nodes are in the arena, reachable or not.
@@ -1413,6 +1441,35 @@ mod tests {
         assert!(plan.zones(3).is_some());
         assert!(plan.zones(4).is_none(), "the index has to match, two scans are two stores");
         assert_eq!(plan.zones_count(), 1);
+    }
+
+    /// A store that says it counted one column called `d` and that one value holds 7 of its rows.
+    #[derive(Debug)]
+    struct Common;
+
+    impl Frequencies for Common {
+        fn column(&self, name: &str) -> Option<usize> {
+            (name == "d").then_some(0)
+        }
+
+        fn rows(&self) -> u64 {
+            100
+        }
+
+        fn rows_with(&self, _column: usize, _value: &rudb_common::bounds::Bound) -> Stat<u64> {
+            Stat::exact(7, rudb_common::stat::Provenance::FrequencySynopsis)
+        }
+    }
+
+    #[test]
+    fn a_table_with_no_counts_recorded_answers_nothing_and_is_not_a_store_that_counted_zero() {
+        let mut plan = Plan::new();
+        assert!(plan.frequencies(0).is_none());
+        assert_eq!(plan.frequencies_count(), 0);
+        plan.set_frequencies(3, Arc::new(Common));
+        assert!(plan.frequencies(3).is_some());
+        assert!(plan.frequencies(4).is_none(), "the index has to match, two scans are two stores");
+        assert_eq!(plan.frequencies_count(), 1);
     }
 
     #[test]
