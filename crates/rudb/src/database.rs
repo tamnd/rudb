@@ -544,6 +544,28 @@ fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Resu
     Ok(true)
 }
 
+/// Whether a table can be written straight into the file as its own generation.
+///
+/// The writer carries forward the tables the file names and nothing else, so the file and the
+/// catalog have to already agree about which those are. A table the file names and the catalog has
+/// dropped would come back, and a table the catalog holds that the file does not name would be left
+/// out of the generation this commits and would only reach the file at the next rewrite, which is a
+/// rewrite this was meant to avoid.
+fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<bool> {
+    let Some(held) = committed(path)? else { return Ok(false) };
+    if held.contains(&target.table) {
+        return Ok(false);
+    }
+    let native = catalog
+        .tables()
+        .filter(|table| table.name() != target && table.rows().is_native())
+        .map(|table| table.name().table.clone())
+        .collect::<BTreeSet<_>>();
+    // The count as well as the set, because a table that is in neither is a table with rows in
+    // memory that this generation would not carry.
+    Ok(held == native && catalog.tables().count() == native.len() + 1)
+}
+
 /// One pipeline instance's place in the source, and the run of chunks it is holding.
 ///
 /// The run is what makes the sink safe to instance. A stripe has to be a contiguous run of the
@@ -560,7 +582,11 @@ struct NativePlace {
 #[derive(Debug)]
 struct NativeSink {
     writer: Mutex<Option<rudb_native::Writer>>,
-    temporary: PathBuf,
+    /// The file being written, when it is not the database itself, and what gets renamed over the
+    /// database at the end. `None` for an append, which writes the database in place and has
+    /// nothing to rename: the bytes go past the catalog the committed generation points at, and
+    /// the file still reads as that generation until the last write lands in the header.
+    temporary: Option<PathBuf>,
     target: PathBuf,
     table: String,
     fields: Vec<Field>,
@@ -575,7 +601,20 @@ impl NativeSink {
         let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?;
         Ok(Self {
             writer: Mutex::new(Some(writer)),
-            temporary,
+            temporary: Some(temporary),
+            target: target.to_path_buf(),
+            table: name,
+            fields,
+        })
+    }
+
+    /// The same sink against a file that is already a database, as the generation after the one it
+    /// holds.
+    fn open(target: &Path, name: String, fields: Vec<Field>) -> Result<Self> {
+        let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?;
+        Ok(Self {
+            writer: Mutex::new(Some(writer)),
+            temporary: None,
             target: target.to_path_buf(),
             table: name,
             fields,
@@ -657,7 +696,8 @@ impl Sink for NativeSink {
             .take()
             .ok_or_else(|| Error::internal("native writer was already committed"))?;
         writer.finish()?;
-        std::fs::rename(&self.temporary, &self.target).map_err(|error| Error::io(error.to_string()))
+        let Some(temporary) = &self.temporary else { return Ok(()) };
+        std::fs::rename(temporary, &self.target).map_err(|error| Error::io(error.to_string()))
     }
 }
 
@@ -981,18 +1021,27 @@ impl Shared {
                     timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
                 if let Some(path) = &self.inner.path {
                     let target = catalog.table(&insert.name)?;
-                    // The sink writes a fresh file and renames it over the database, so it is only
-                    // safe while there is nothing in the database to lose. A load into a second
-                    // table takes the in-memory path and reaches the file at the next checkpoint,
-                    // which rewrites the whole file. Appending one table to a committed file is
-                    // what the two header slots are for and is not wired up yet.
+                    // Rows go from the source to the file without the table being held in memory on
+                    // the way, which is the difference between loading a table and having to fit
+                    // one in RAM. Either the sink writes a fresh file and renames it over the
+                    // database, which is only safe while there is nothing in the database to lose,
+                    // or it appends a generation to the file that is already there.
+                    //
+                    // A load that meets neither takes the in-memory path and reaches the file at
+                    // the next checkpoint.
+                    //
+                    // Asked in this order because the second question opens the file's catalog and
+                    // the first two are a `stat` and a count.
                     let alone = !path.exists() && catalog.tables().count() == 1;
-                    if alone && target.rows().is_empty() {
-                        let sink = Arc::new(NativeSink::create(
-                            path,
-                            target.name().table.clone(),
-                            target.columns().to_vec(),
-                        )?);
+                    let empty = target.rows().is_empty();
+                    if empty && (alone || appendable(path, &catalog, &insert.name)?) {
+                        let table = target.name().table.clone();
+                        let fields = target.columns().to_vec();
+                        let sink = Arc::new(if alone {
+                            NativeSink::create(path, table.clone(), fields)?
+                        } else {
+                            NativeSink::open(path, table.clone(), fields)?
+                        });
                         let query = rudb_exec::build_measured_into(
                             &insert.source,
                             &catalog,
@@ -1004,7 +1053,9 @@ impl Shared {
                         )?;
                         query.run(cancel, &self.inner.pool)?;
                         drop(query);
-                        let reader = rudb_native::Reader::open(path)?;
+                        // By name out of the file's catalog rather than as the one table in the
+                        // file, because after an append it is not the one table in the file.
+                        let reader = rudb_native::Catalog::open(path)?.table(&table)?;
                         catalog.table_mut(&insert.name)?.commit_native(reader)?;
                         return Ok(QueryResult::empty());
                     }

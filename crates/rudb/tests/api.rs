@@ -127,6 +127,48 @@ fn a_committed_table_is_carried_forward_and_not_written_again() {
     );
 }
 
+/// A load into a database that already has a table goes to the file as it runs.
+///
+/// The first table into an empty file has always streamed: the rows go from the source into the
+/// writer and the table is never held in memory. The second one did not, so loading a table needed
+/// room for the whole of it and a `CHECKPOINT` afterwards to get it out of memory again.
+///
+/// What this can check cheaply is the second half. A table that streamed is in the file the moment
+/// the insert returns, so a process that opens the database and never says `CHECKPOINT` still finds
+/// it there.
+#[test]
+fn a_load_beside_a_committed_table_reaches_the_file_without_a_checkpoint() {
+    let path = std::env::temp_dir().join(format!("rudb-api-stream-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let first = Database::open(&name).expect("a file name starts a native database");
+    first.execute("CREATE TABLE a (x INTEGER)").expect("creates");
+    first.execute("INSERT INTO a SELECT * FROM range(100)").expect("inserts");
+    drop(first);
+
+    let second = Database::open(&name).expect("the native database reopens");
+    second.execute("CREATE TABLE b (y INTEGER, s VARCHAR)").expect("creates the second");
+    second
+        .execute("INSERT INTO b SELECT i, 'row' || i FROM range(0, 100) t(i)")
+        .expect("inserts into the second");
+    drop(second);
+
+    let third = Database::open(&name).expect("the native database reopens again");
+    assert_eq!(
+        third.value("SELECT count(*) FROM b").expect("the second table is in the file"),
+        Value::BigInt(100)
+    );
+    assert_eq!(
+        third.value("SELECT s FROM b WHERE y = 7").expect("reads"),
+        Value::Varchar("row7".into())
+    );
+    assert_eq!(
+        third.value("SELECT sum(x) FROM a").expect("the first is still there"),
+        Value::HugeInt(4950)
+    );
+    drop(third);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
 /// Several appends in a row, which is what alternating the two header slots is for.
 ///
 /// One append writes the slot the committed generation did not use. The next one has to write the
