@@ -143,7 +143,7 @@ impl Sketch {
     ///
     /// # Errors
     ///
-    /// If `k` is zero, which would make every estimate a division by nothing, or above [`MAX_K`],
+    /// If `k` is zero, which would make every estimate a division by nothing, or above `MAX_K`,
     /// which is not a sketch anybody meant to ask for.
     pub fn new(k: usize) -> Result<Self> {
         if k == 0 {
