@@ -82,6 +82,18 @@ impl Pair {
         self.answered(&self.memory, query, "stored summary")
     }
 
+    /// Whether the file answered this at plan time, with no aggregate left to run at all.
+    ///
+    /// A step past [`Pair::summarised`] rather than a different route to it. Both read the answer
+    /// off the directory and neither touches a row, but the summary is an operator that produces
+    /// one row and this is the optimizer folding the aggregate into a constant and deleting the
+    /// scan under it, so there is nothing left in the pipeline to count.
+    fn folded(&self, query: &str) -> bool {
+        let result = self.file.query(query).expect("the query ran");
+        let metrics = result.metrics().expect("the query was measured");
+        metrics.operators.iter().all(|operator| operator.kind != "Aggregate")
+    }
+
     /// Whether the file built the groups of this out of the synopsis rather than out of the rows.
     ///
     /// A different operator from the one above, because a grouped count is answered by reading a
@@ -128,7 +140,9 @@ fn the_extremes_of_a_string_column_are_the_two_ends_of_the_order_beside_its_valu
     // that go up to v12. Both sides do that, which is the point of asking both.
     assert_eq!(pair.agree("SELECT MIN(s) FROM t"), Value::Varchar("v0".to_owned()));
     assert_eq!(pair.agree("SELECT MAX(s) FROM t"), Value::Varchar("v9".to_owned()));
-    assert!(pair.summarised("SELECT MIN(s), MAX(s) FROM t"), "the rows were read anyway");
+    // Folded rather than summarised. The file now hands its stripe bounds to the planner, so the
+    // aggregate is gone by the time anything is built and the answer is a row of constants.
+    assert!(pair.folded("SELECT MIN(s), MAX(s) FROM t"), "the rows were read anyway");
 }
 
 #[test]
@@ -152,7 +166,7 @@ fn a_column_with_a_null_in_it_is_counted_out_of_the_file_as_well() {
     // from the stripe ranges, and those were walked a row at a time with the nulls skipped, so the
     // empty string the nulls were written as never got near them.
     assert_eq!(pair.agree("SELECT MIN(s) FROM t"), Value::Varchar("v0".to_owned()));
-    assert!(pair.summarised("SELECT MIN(s) FROM t"), "the rows were read anyway");
+    assert!(pair.folded("SELECT MIN(s) FROM t"), "the rows were read anyway");
     // The count of the column is still the file's business, because a null count is written down
     // exactly rather than as a bound that is allowed to be wide.
     assert_eq!(pair.agree("SELECT COUNT(s) FROM t"), Value::BigInt(4545));

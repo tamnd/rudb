@@ -1680,6 +1680,16 @@ impl<'a> Binder<'a> {
         let table_name = self.plan.intern(&resolved.table);
         let alias = self.plan.intern(&label);
         let columns = self.plan.add_fields(&fields);
+        // What the store wrote down about itself, against the table index the same way a Parquet
+        // footer is. A table with nothing to say records nothing and the estimate falls back to the
+        // constants it used before, which is what every table did until the file had a directory
+        // worth asking.
+        if let Some(zones) = table.rows().zones() {
+            self.plan.set_zones(index, zones);
+        }
+        for (column, distinct) in table.rows().distincts() {
+            self.plan.measure_distinct(index, &column, distinct);
+        }
         let node = self.add_node(Node::Get {
             catalog: catalog_name,
             schema,
