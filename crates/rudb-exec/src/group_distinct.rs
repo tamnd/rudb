@@ -516,18 +516,27 @@ impl Exchange {
                 distinct_pairs(&mut partition, splits, memory)
             },
         )?;
-        let merged = in_parallel(threads, splits, degree, "counted the groups of split", |at| {
-            count_groups(&counted, at, &self.shape, bound, memory)
+        let pieces = counting_pieces(&sizes_of(&counted, splits), counted.len(), degree);
+        let tallied = in_parallel(threads, pieces.len(), degree, "counted the groups of", |at| {
+            let piece = &pieces[at];
+            count_groups(&counted, piece, &self.shape, bound, memory)
         })?;
         // The distinct pairs are read for the last time by the pass above, so the room they took
-        // goes back here rather than at the end of the query.
+        // goes back here rather than at the end of the query. Handing the four thousand vectors to
+        // the leased threads to free instead was tried and is not worth it: on the million row
+        // ClickBench file `COUNT(DISTINCT UserID) GROUP BY RegionID` frees them in 0.100 ms on this
+        // thread and in 0.114 ms on sixteen, because the allocator sends a block freed by a thread
+        // that did not allocate it down a slower path and because a pass this short is most of one
+        // scatter and join.
         for part in counted {
             drop(part.held);
         }
         let mut chunks = Vec::new();
         let mut held = self.held.lock().map_err(poisoned)?;
         held.clear();
-        for Output { chunks: mut part, held: charge } in merged {
+        for Output { chunks: mut part, held: charge } in
+            gathered(tallied, &self.shape, bound, memory)?
+        {
             chunks.append(&mut part);
             held.push(charge);
         }
@@ -583,10 +592,11 @@ struct Output {
     held: Reservation,
 }
 
-/// Adds up one split's groups across every pair partition and takes the best `bound` of them.
+/// Adds up the groups a split has in the pair partitions this piece was given.
 ///
 /// Every pair of a group lands in the same split, because the split is picked by the group hash, so
-/// nothing here has to agree with any other split about a count and the top rows it picks are final.
+/// a piece holding a whole split has nothing to agree with anybody about and the top rows it picks
+/// are final. A piece holding part of one hands its counts back instead. See [`counting_pieces`].
 ///
 /// The table is sized by the groups it finds rather than by the pairs it is handed, which is the
 /// difference between a probe that stays in the first level of cache and one that does not. The two
@@ -603,13 +613,15 @@ struct Output {
 /// and the group count is what was too small to be worth the big table in the first place.
 fn count_groups(
     counted: &[Counted],
-    split: usize,
+    piece: &Piece,
     shape: &Shape,
     bound: usize,
     memory: &Memory,
-) -> Result<Output> {
+) -> Result<Tallied> {
+    let split = piece.split;
+    let parts = &counted[piece.parts.clone()];
     let reserving = stage::Timing::start(Stage::Reserve);
-    let input = counted.iter().map(|part| part.splits[split].len()).sum::<usize>();
+    let input = parts.iter().map(|part| part.splits[split].len()).sum::<usize>();
     let ceiling = input.saturating_mul(2).max(SPLIT_SEED).next_power_of_two();
     let mut capacity = SPLIT_SEED.min(ceiling);
     let mut working = memory.reservation();
@@ -621,7 +633,7 @@ fn count_groups(
     reserving.stop(0);
 
     let timing = stage::Timing::start(Stage::Fold);
-    for part in counted {
+    for part in parts {
         for pair in &part.splits[split] {
             let mut at = pair.group_hash as usize & mask;
             loop {
@@ -654,11 +666,32 @@ fn count_groups(
             }
         }
     }
-    working.grow(width(
-        groups.capacity() * size_of::<Grouped>() + counts.capacity() * size_of::<i64>(),
-    ))?;
+    let kept =
+        width(groups.capacity() * size_of::<Grouped>() + counts.capacity() * size_of::<i64>());
+    working.grow(kept)?;
     timing.stop(0);
 
+    if !piece.whole {
+        // The table itself is finished with, but the two vectors it filled have to live until the
+        // rest of this split arrives, so the room they take is charged on its own and the room the
+        // buckets took goes back now.
+        drop(buckets);
+        let mut held = memory.reservation();
+        held.grow(kept)?;
+        drop(working);
+        return Ok(Tallied::Part(Partial { split, groups, counts, held }));
+    }
+    emit(&groups, &counts, shape, bound, memory).map(Tallied::Whole)
+}
+
+/// The best `bound` groups of a finished tally, as the rows they stand for.
+fn emit(
+    groups: &[Grouped],
+    counts: &[i64],
+    shape: &Shape,
+    bound: usize,
+    memory: &Memory,
+) -> Result<Output> {
     let timing = stage::Timing::start(Stage::Emit);
     let mut best: Vec<usize> = Vec::with_capacity(bound.min(groups.len()));
     for slot in 0..groups.len() {
@@ -683,6 +716,161 @@ fn count_groups(
     let chunks = rows::chunks(&kinds, &output, &mut held)?;
     timing.stop(0);
     Ok(Output { chunks, held })
+}
+
+/// What one piece of the counting pass made.
+enum Tallied {
+    /// The piece held a whole split, so its counts are final and it took its own top rows.
+    Whole(Output),
+    /// The piece held part of a split, so its counts still have to meet the rest of that split.
+    Part(Partial),
+}
+
+/// One piece's counts for part of a split, on their way to meeting the other pieces of it.
+struct Partial {
+    split: usize,
+    groups: Vec<Grouped>,
+    counts: Vec<i64>,
+    held: Reservation,
+}
+
+/// One piece of the counting pass, which is a split and which of the pair partitions to read of it.
+///
+/// See [`counting_pieces`] for why a split is ever read in more than one piece.
+struct Piece {
+    split: usize,
+    parts: std::ops::Range<usize>,
+    /// Whether this piece has the whole split and so can take its own top rows.
+    whole: bool,
+}
+
+/// How many pairs each split was handed, which is what decides how the counting pass is cut up.
+fn sizes_of(counted: &[Counted], splits: usize) -> Vec<usize> {
+    let mut sizes = vec![0_usize; splits];
+    for part in counted {
+        for (split, held) in part.splits.iter().enumerate().take(splits) {
+            sizes[split] += held.len();
+        }
+    }
+    sizes
+}
+
+/// The counting pass cut into pieces, with a split that is too big for one thread cut further.
+///
+/// A split is all the pairs of some set of groups, and which groups land together is the group hash,
+/// so a split is as lopsided as the grouping column is. On the million row ClickBench file
+/// `COUNT(DISTINCT UserID) GROUP BY RegionID` puts eighteen percent of the distinct pairs in one
+/// region, and that region is one group, so no number of splits divides it. Measured there, the
+/// counting pass had 2.42 ms of work to do, finished in 0.403 ms, and the thread that drew the big
+/// region took 0.376 ms of that against the 0.151 ms sixteen threads would have taken between them.
+///
+/// So a split whose share is more than one thread's worth is read in several pieces instead, each
+/// taking a range of the pair partitions the deduplication left. Those pieces cannot pick top rows,
+/// because none of them has all of any group's pairs, so they hand their counts back to be added up.
+/// That is cheap precisely when it happens: a split is only ever oversized because a few groups in it
+/// are huge, and it is the group count and not the pair count that the adding up walks.
+///
+/// A split that fits stays exactly as it was, one piece reading every partition and picking its own
+/// top rows, so an even grouping column pays nothing for this and nothing about its output moves.
+/// On that query five of the sixty seven pieces are cut ones and the pass finishes in 0.32 ms.
+fn counting_pieces(sizes: &[usize], parts: usize, degree: usize) -> Vec<Piece> {
+    let total = sizes.iter().sum::<usize>();
+    let fair = total.div_ceil(degree.max(1)).max(1);
+    let mut pieces = Vec::with_capacity(sizes.len());
+    for (split, &size) in sizes.iter().enumerate() {
+        let ways = if size > fair { size.div_ceil(fair).min(parts) } else { 1 };
+        if ways < 2 {
+            pieces.push(Piece { split, parts: 0..parts, whole: true });
+            continue;
+        }
+        let per = parts.div_ceil(ways);
+        let mut from = 0;
+        while from < parts {
+            let to = (from + per).min(parts);
+            pieces.push(Piece { split, parts: from..to, whole: false });
+            from = to;
+        }
+    }
+    pieces
+}
+
+/// Every piece's counts turned into output, adding up the pieces that only had part of a split.
+///
+/// The pieces arrive in split order and a split's pieces are next to each other, so a run of parts
+/// is gathered as it is reached and the splits that were read whole pass straight through. The
+/// output is in the same order it would have been in had nothing been cut up.
+fn gathered(
+    tallied: Vec<Tallied>,
+    shape: &Shape,
+    bound: usize,
+    memory: &Memory,
+) -> Result<Vec<Output>> {
+    let mut out = Vec::with_capacity(tallied.len());
+    let mut run: Vec<Partial> = Vec::new();
+    for piece in tallied {
+        match piece {
+            Tallied::Whole(output) => out.push(output),
+            Tallied::Part(part) => {
+                if run.first().is_some_and(|first| first.split != part.split) {
+                    out.push(added_up(std::mem::take(&mut run), shape, bound, memory)?);
+                }
+                run.push(part);
+            }
+        }
+    }
+    if !run.is_empty() {
+        out.push(added_up(run, shape, bound, memory)?);
+    }
+    Ok(out)
+}
+
+/// One split's pieces added together and then asked for its top rows.
+///
+/// The table is sized by the groups the pieces found, which is the whole reason cutting a split up
+/// is affordable. A split is cut up because one of its groups holds a great many pairs, and a group
+/// is one entry here however many pairs it had.
+fn added_up(parts: Vec<Partial>, shape: &Shape, bound: usize, memory: &Memory) -> Result<Output> {
+    let input = parts.iter().map(|part| part.groups.len()).sum::<usize>();
+    let capacity = input.saturating_mul(2).max(SPLIT_SEED).next_power_of_two();
+    let mask = capacity - 1;
+    let mut working = memory.reservation();
+    working.grow(width(capacity * size_of::<u32>()))?;
+    let mut buckets = vec![EMPTY; capacity];
+    let mut groups: Vec<Grouped> = Vec::with_capacity(input);
+    let mut counts: Vec<i64> = Vec::with_capacity(input);
+    for part in parts {
+        for (pair, &by) in part.groups.iter().zip(&part.counts) {
+            let mut at = pair.group_hash as usize & mask;
+            loop {
+                let slot = buckets[at];
+                if slot == EMPTY {
+                    buckets[at] = u32::try_from(groups.len()).map_err(|_| {
+                        Error::out_of_memory("a grouped distinct radix split is too large")
+                    })?;
+                    groups.push(*pair);
+                    counts.push(by);
+                    break;
+                }
+                let slot = slot as usize;
+                if groups[slot].group_hash == pair.group_hash
+                    && groups[slot].group == pair.group
+                    && groups[slot].valid == pair.valid
+                {
+                    counts[slot] = counts[slot]
+                        .checked_add(by)
+                        .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+                    break;
+                }
+                at = (at + 1) & mask;
+            }
+        }
+        // This piece's counts have been read for the last time, so what they took goes back now
+        // rather than at the end of a merge that could be holding several of them.
+        drop(part.groups);
+        drop(part.counts);
+        drop(part.held);
+    }
+    emit(&groups, &counts, shape, bound, memory)
 }
 
 /// The slots a split's group table starts with, which is one cache line of them and then some.
@@ -729,7 +917,7 @@ mod tests {
 
     use crate::pairs::{Held, Record, Run, distinct_pairs};
 
-    use super::{Column, Composite, Shape, count_groups};
+    use super::{Column, Composite, Shape, count_groups, counting_pieces, gathered, sizes_of};
 
     #[test]
     fn one_partition_deduplicates_pairs_and_counts_groups_across_the_runs_it_was_handed() {
@@ -883,6 +1071,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_split_read_in_pieces_counts_the_same_as_a_split_read_whole() {
+        // A split is cut up when it holds more pairs than one thread's fair share, and then no piece
+        // of it has all of any group and the counts have to be added up afterwards. Asking for a
+        // thread per pair makes every split too big for one, so every split here takes that path.
+        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let mut first = Run::default();
+        first.push(row(3, 10, 5), true);
+        first.push(row(3, 11, 5), true);
+        first.push(row(4, 12, 9), true);
+        let mut second = Run::default();
+        second.push(row(3, 12, 9), true);
+        second.push(row(3, 14, 9), true);
+        second.push(row(4, 13, 5), true);
+        let mut left = Held { runs: vec![first] };
+        let mut right = Held { runs: vec![second] };
+        let memory = Memory::unlimited();
+        let counted = vec![
+            distinct_pairs(&mut left, SPLITS, &memory).expect("a pair partition"),
+            distinct_pairs(&mut right, SPLITS, &memory).expect("a pair partition"),
+        ];
+        let whole = rows_of(&counted, SPLITS, &signed());
+        assert_eq!(
+            whole,
+            [vec![Value::Integer(3), Value::BigInt(4)], vec![Value::Integer(4), Value::BigInt(2)],]
+        );
+        assert_eq!(rows_at(&counted, SPLITS, &signed(), 64), whole);
+    }
+
     /// How many splits the tests count over, picked to be neither one nor the sixteen a big query gets.
     const SPLITS: usize = 4;
 
@@ -915,10 +1132,26 @@ mod tests {
 
     /// Every split merged and flattened into rows, sorted so the split order does not show.
     fn rows_of(counted: &[crate::pairs::Counted], splits: usize, shape: &Shape) -> Vec<Vec<Value>> {
+        rows_at(counted, splits, shape, 1)
+    }
+
+    /// The same, finishing on `degree` threads, which is what decides whether a split gets cut up.
+    fn rows_at(
+        counted: &[crate::pairs::Counted],
+        splits: usize,
+        shape: &Shape,
+        degree: usize,
+    ) -> Vec<Vec<Value>> {
+        let memory = Memory::unlimited();
+        let pieces = counting_pieces(&sizes_of(counted, splits), counted.len(), degree);
+        let tallied = pieces
+            .iter()
+            .map(|piece| {
+                count_groups(counted, piece, shape, 10, &memory).expect("a grouped distinct split")
+            })
+            .collect();
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        for split in 0..splits {
-            let output = count_groups(counted, split, shape, 10, &Memory::unlimited())
-                .expect("a grouped distinct split");
+        for output in gathered(tallied, shape, 10, &memory).expect("the counted splits") {
             for chunk in output.chunks {
                 for row in 0..chunk.len() {
                     rows.push(
