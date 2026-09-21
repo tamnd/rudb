@@ -133,10 +133,20 @@ fn run<V: AsRef<Vector>>(
         }
     }
 
+    // A batch of no rows has the same answer whichever function this is and whichever form the
+    // arguments came in, so there is nothing here to dispatch on. This is the same empty vector the
+    // row at a time path at the end builds out of no values, and it used to be built there: an
+    // empty batch fell past every path below and was recorded as a call that reached the row at a
+    // time path, which is what `scalar constant against constant 1248` in the TPC-H fallback ledger
+    // was. It was q19 evaluating `-` and `*` over an empty batch six hundred and twenty four times
+    // each, with no row read at all.
+    if rows == 0 {
+        return Vector::from_values(returns.clone(), &[]);
+    }
+
     // Every argument constant is one call rather than 1024 of them. This is `3 * 4` surviving
     // constant folding, and it is also every correlated scalar the optimizer has already evaluated.
-    if rows > 0 && !args.is_empty() && args.iter().all(|arg| arg.as_ref().form() == Form::Constant)
-    {
+    if !args.is_empty() && args.iter().all(|arg| arg.as_ref().form() == Form::Constant) {
         let row: Vec<Value> =
             args.iter().map(|arg| arg.as_ref().try_value_at(0)).collect::<Result<_>>()?;
         return Ok(Vector::constant(
@@ -3709,6 +3719,31 @@ mod tests {
         assert_eq!(sum.form(), Form::Constant);
         assert_eq!(sum.len(), 1024);
         assert_eq!(sum.value_at(1000), Value::Integer(7));
+    }
+
+    /// An empty batch is still a call, and a plan that hands one down often hands down a lot of
+    /// them. TPC-H q19 does it 624 times for `-` and again for `*`, and every one of those used to
+    /// be counted as work the row at a time path had to do, which made the ledger read as if a
+    /// third of the scalar fallbacks in the whole benchmark were real.
+    #[test]
+    fn a_call_on_an_empty_batch_costs_nothing_and_says_so() {
+        for forms in [
+            vec![
+                Vector::constant(LogicalType::Integer, Value::Integer(3), 0),
+                Vector::constant(LogicalType::Integer, Value::Integer(4), 0),
+            ],
+            vec![
+                Vector::from_values(LogicalType::Integer, &[]).expect("no rows"),
+                Vector::constant(LogicalType::Integer, Value::Integer(4), 0),
+            ],
+        ] {
+            let left = forms[0].form();
+            let right = forms[1].form();
+            let before = fallback::count(Kernel::Scalar, left, right);
+            let sum = call("+", &forms, &LogicalType::Integer, None).expect("adds nothing");
+            assert_eq!(sum.len(), 0);
+            assert_eq!(fallback::count(Kernel::Scalar, left, right), before);
+        }
     }
 
     /// A dictionary's nulls come from the vector it points at rather than from its own validity,
