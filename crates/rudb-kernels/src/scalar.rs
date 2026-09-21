@@ -1879,8 +1879,66 @@ enum Pattern {
     /// query is the cheaper of the two. It is 24 bytes on aarch64, which is why this only shows up
     /// when the build is on a Linux machine.
     Contains(Box<memmem::Finder<'static>>),
+    /// Literal text with `%` between the pieces and no `_` anywhere, such as `%a%b%` or `a%b%c`.
+    ///
+    /// This is the shape the four above are the short cases of, and it covers the rest of them:
+    /// `o_comment NOT LIKE '%special%requests%'` in TPC-H q13, and every `LIKE 'a%b%'` somebody
+    /// writes to mean two things in order.
+    ///
+    /// Boxed for the reason [`Self::Contains`] is boxed, since it holds finders of its own.
+    Segments(Box<Split>),
     /// Anything else, walked with one backtracking point.
     General(Vec<char>),
+}
+
+/// A `LIKE` pattern cut at its `%` signs.
+///
+/// The first piece is anchored at the start of the text and the last at the end, and the pieces
+/// between them are looked for in order in what is left over. The two ends may be empty, which is
+/// what a pattern starting or ending with `%` gives, and then that end is not anchored at all.
+#[derive(Debug)]
+struct Split {
+    prefix: String,
+    suffix: String,
+    middles: Vec<memmem::Finder<'static>>,
+}
+
+impl Split {
+    /// Whether the text matches, on bytes and without backtracking.
+    ///
+    /// Taking the leftmost occurrence of each middle piece is the right answer and not a guess.
+    /// The pieces are separated by `%`, which stands for any run at all, so a match that puts a
+    /// piece later can always be rewritten to put it earlier without disturbing the pieces before
+    /// it, and leaving the most text over for the pieces after it can only help them. That is the
+    /// whole of why this does not need the backtracking point [`like`] keeps: a `_` would break the
+    /// argument, because then the run between two pieces has a length to satisfy, which is why
+    /// [`Pattern::compile`] only builds this for a spelling with no `_` in it.
+    ///
+    /// Bytes rather than characters for the reason given on [`Pattern`]: a byte substring of valid
+    /// UTF-8 found in valid UTF-8 starts and ends on a character boundary, because the leading byte
+    /// of a sequence cannot appear inside another one.
+    fn holds(&self, text: &[u8]) -> bool {
+        if !text.starts_with(self.prefix.as_bytes()) || !text.ends_with(self.suffix.as_bytes()) {
+            return false;
+        }
+        // The two ends are matched against the same text and may have found the same bytes, which
+        // the pattern does not allow: there is a `%` between them and so they sit side by side at
+        // the closest. A text shorter than the two of them together is the case where they did.
+        let Some(end) = text.len().checked_sub(self.suffix.len()) else {
+            return false;
+        };
+        if self.prefix.len() > end {
+            return false;
+        }
+        let mut rest = &text[self.prefix.len()..end];
+        for finder in &self.middles {
+            let Some(at) = finder.find(rest) else {
+                return false;
+            };
+            rest = &rest[at + finder.needle().len()..];
+        }
+        true
+    }
 }
 
 impl Pattern {
@@ -1904,6 +1962,24 @@ impl Pattern {
                 return Self::Prefix(head.to_owned());
             }
         }
+        // Everything left that has no `_` in it is literal text with `%` between the pieces, since
+        // the four shapes above are the cases of that with one piece or two. A spelling with no `%`
+        // either went to `Exact` already.
+        if !spelling.contains('_') {
+            let mut pieces: Vec<&str> = spelling.split('%').collect();
+            if pieces.len() >= 2 {
+                let suffix = pieces.pop().unwrap_or_default().to_owned();
+                let prefix = pieces.remove(0).to_owned();
+                // An empty piece is what two `%` in a row give, and two in a row mean what one
+                // means, so dropping it is the same pattern with one fewer search per row.
+                let middles = pieces
+                    .into_iter()
+                    .filter(|piece| !piece.is_empty())
+                    .map(|piece| memmem::Finder::new(piece).into_owned())
+                    .collect();
+                return Self::Segments(Box::new(Split { prefix, suffix, middles }));
+            }
+        }
         Self::General(spelling.chars().collect())
     }
 
@@ -1915,6 +1991,7 @@ impl Pattern {
             Self::Prefix(against) => text.starts_with(against.as_str()),
             Self::Suffix(against) => text.ends_with(against.as_str()),
             Self::Contains(finder) => finder.find(text.as_bytes()).is_some(),
+            Self::Segments(split) => split.holds(text.as_bytes()),
             Self::General(against) => {
                 characters.clear();
                 characters.extend(text.chars());
@@ -1929,6 +2006,7 @@ impl Pattern {
             Self::Prefix(against) => text.starts_with(against.as_bytes()),
             Self::Suffix(against) => text.ends_with(against.as_bytes()),
             Self::Contains(finder) => finder.find(text).is_some(),
+            Self::Segments(split) => split.holds(text),
             Self::General(_) => false,
         }
     }
@@ -2998,11 +3076,11 @@ mod tests {
 
     /// A percent sign in the string is a character and a percent sign in the pattern is a wildcard.
     ///
-    /// Every pattern below is one the compiled shapes in [`Pattern`] do not cover, so every one of
-    /// them reaches the backtracking walk, which is the only place this was ever wrong. The pairs
-    /// worth reading together are `ax%b` against `a%b`, where the match is at the same offset and
-    /// the only difference is the character after it, and `a%` against `a%b`, where the pattern is
-    /// the same and the string grows by one.
+    /// The pairs worth reading together are `ax%b` against `a%b`, where the match is at the same
+    /// offset and the only difference is the character after it, and `a%` against `a%b`, where the
+    /// pattern is the same and the string grows by one. The percent sign in the text is the part
+    /// that was once wrong, and it is wrong in the same way whichever of the compiled shapes or the
+    /// backtracking walk answers, so the list runs across both.
     #[test]
     fn a_percent_sign_in_the_string_is_a_character_and_not_a_wildcard() {
         for (text, pattern, expected) in [
@@ -3056,6 +3134,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every pattern of literal text cut at its `%` signs, against every string of the same shape.
+    ///
+    /// The greedy search [`Split::holds`] does is the whole of the claim that it can drop the
+    /// backtracking point, and the strings that catch a greedy search out are the ones where a
+    /// piece appears more than once, which is what an alphabet of two letters and a wildcard gives
+    /// at almost every length. A percent sign is in the alphabet on both sides so that the pattern
+    /// runs `%` together and the text holds one as a character of its own.
+    #[test]
+    fn the_segment_search_answers_what_the_backtracking_walk_answers() {
+        let mut alphabet = vec![String::new()];
+        let mut words = vec![String::new()];
+        for _ in 0..4 {
+            alphabet = alphabet
+                .iter()
+                .flat_map(|word| ['a', 'b', '%'].map(|letter| format!("{word}{letter}")))
+                .collect();
+            words.extend(alphabet.iter().cloned());
+        }
+        let mut characters = Vec::new();
+        let mut seen = 0_usize;
+        for pattern in &words {
+            let compiled = Pattern::compile(pattern);
+            if !matches!(compiled, Pattern::Segments(_)) {
+                continue;
+            }
+            seen += 1;
+            let spelling: Vec<char> = pattern.chars().collect();
+            for text in &words {
+                let walked = like(&text.chars().collect::<Vec<char>>(), &spelling);
+                assert_eq!(
+                    compiled.holds(text, &mut characters),
+                    walked,
+                    "{text:?} LIKE {pattern:?}"
+                );
+                assert_eq!(
+                    compiled.holds_bytes(text.as_bytes()),
+                    walked,
+                    "{text:?} LIKE {pattern:?} on bytes"
+                );
+            }
+        }
+        assert!(seen > 20, "the segment shape was reached {seen} times");
     }
 
     #[test]
