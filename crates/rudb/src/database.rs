@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGua
 
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, View};
+use rudb_common::stat::Provenance;
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_metrics::{Document, Report, Span};
-
 use rudb_parse::ast::Ast;
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_vector::{Chunk, Form, Vector};
@@ -723,10 +723,24 @@ impl Shared {
             let name = table.name();
             let rows = u64::try_from(table.rows().len()).unwrap_or(u64::MAX);
             facts.record(&name.catalog, &name.schema, &name.table, rows);
+            // Where a distinct count comes from here, which is a property of the table and not of
+            // the column. A file counts the entries of a dictionary and a table in memory reads the
+            // sketch `rudb-storage`'s `count.rs` built as the rows arrived.
+            // Named the long way round because this file has a `Rows` of its own, which is the
+            // shape a result set comes back in and has nothing to do with where a table keeps its
+            // rows.
+            let provenance = match table.rows() {
+                rudb_catalog::table::Rows::Memory(_) => Provenance::Sketch,
+                rudb_catalog::table::Rows::Native(_) => Provenance::Dictionary,
+            };
             for (at, column) in table.columns().iter().enumerate() {
-                // A table that cannot answer leaves the column out, which is every in memory table
-                // and every column of a native one that has no dictionary. The estimate falls back
-                // to the shape it used before there were any of these.
+                // A table that cannot answer leaves the column out, which is a column of a native
+                // table that has no dictionary and a column of a memory table with more distinct
+                // values in it than its sketch holds. The estimate falls back to the shape it used
+                // before there were any of these. Only an exact count is asked for, because this
+                // goes into `Facts` and everything in there is read back as exact. The estimate a
+                // wider column does have reaches the optimizer the other way, through the plan,
+                // where it carries the class that says what it is.
                 let Ok(Some(distinct)) = table.rows().distinct_values(at) else {
                     continue;
                 };
@@ -736,6 +750,7 @@ impl Shared {
                     &name.table,
                     &column.name,
                     distinct,
+                    provenance,
                 );
             }
         }

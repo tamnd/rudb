@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use rudb_common::bounds::{Bound, Zones};
-use rudb_common::stat::Stat;
+use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_native::{FrequencyOccurrences, Reader as NativeReader, Stripes};
 use rudb_storage::{MemoryTable, Probe};
@@ -68,13 +68,20 @@ impl Rows {
     }
 
     /// How many distinct non-null values one column holds, when the rows are stored somewhere that
-    /// already knows.
+    /// already knows it exactly.
     ///
-    /// A table still being built in memory answers `None`, which means whoever asked has to count
-    /// the rows the ordinary way.
+    /// Exactly, because this is read as an answer and not as a guess: `known_rows` in `rudb-exec`
+    /// turns it straight into the result of a `COUNT(DISTINCT c)`. A file answers from a dictionary
+    /// that holds every distinct value once. A table in memory answers from the sketch it built as
+    /// the rows arrived, and only while that sketch is inside the regime where it is holding every
+    /// distinct hash there was rather than estimating from the ones it kept.
+    ///
+    /// `None` means whoever asked has to count the rows the ordinary way. For a memory table that is
+    /// a column with at least `rudb_encoding::sketch::DEFAULT_K` distinct values in it, and
+    /// [`Rows::distincts`] is where the estimate for one of those comes out.
     pub fn distinct_values(&self, column: usize) -> Result<Option<u64>> {
         match self {
-            Self::Memory(_) => Ok(None),
+            Self::Memory(rows) => Ok(rows.distinct_values(column)),
             Self::Native(reader) => reader.distinct_values(column),
         }
     }
@@ -435,9 +442,11 @@ impl Rows {
         }
     }
 
-    /// How many distinct values each column holds, for the columns this store can say.
+    /// How many distinct values each column holds, for the columns the file can say.
     ///
-    /// Empty for a table in memory, for the same reason [`Rows::zones`] is `None` there.
+    /// Only the file, because this is the half that reads its own column names out of the stored
+    /// schema. A table in memory does not have its names here, so [`Table::distincts`] is where the
+    /// two are put together and it is what the binder asks.
     #[must_use]
     pub fn distincts(&self) -> Vec<(String, Stat<u64>)> {
         match self {
@@ -544,6 +553,36 @@ impl Table {
     #[must_use]
     pub fn rows(&self) -> &Rows {
         &self.rows
+    }
+
+    /// How many distinct values each column holds, named, for the columns something can say.
+    ///
+    /// Here rather than on [`Rows`] because half of it needs the column names and only this type has
+    /// them for both kinds of table: a file keeps its own schema and a table in memory keeps only
+    /// its types, so the names of a memory table's columns are in the catalog entry and nowhere
+    /// else.
+    ///
+    /// A file answers from a dictionary or, failing that, from the span between the two ends of an
+    /// integer column, which is a ceiling and comes back certified. A table in memory answers from
+    /// the sketch `count.rs` built as the rows arrived, exact for a column under the sketch's k and
+    /// estimated at about one and a half percent above it. A column neither of them can say anything
+    /// about is left out, and a column left out is the estimator's `Unknown`.
+    #[must_use]
+    pub fn distincts(&self) -> Vec<(String, Stat<u64>)> {
+        let Rows::Memory(rows) = &self.rows else { return self.rows.distincts() };
+        self.columns
+            .iter()
+            .enumerate()
+            .filter_map(|(at, column)| {
+                let (value, exact) = rows.distinct_estimate(at)?;
+                let stat = if exact {
+                    Stat::exact(value, Provenance::Sketch)
+                } else {
+                    Stat::estimated(value, Provenance::Sketch)
+                };
+                Some((column.name.clone(), stat))
+            })
+            .collect()
     }
 
     /// Replaces an empty mutable table with its committed native snapshot.

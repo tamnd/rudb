@@ -750,11 +750,27 @@ fn stored_summary(
         let Expr::Aggregate { name, args, distinct, filter: None } = *plan.expr(aggregate) else {
             return Ok(None);
         };
-        if distinct {
-            return Ok(None);
-        }
         let call = plan.string(name);
         let args = plan.expr_list(args);
+        // `COUNT(DISTINCT c)` that the distinct rewrite left where it was, which is the one column
+        // `BIGINT` shape `rudb-opt`'s `already_cheap` hands to the operator's inline integer state
+        // rather than staging into a grouping. It never becomes the grouping the arm further down
+        // reads, so without this the column type most likely to be a key is the one type a whole
+        // table distinct count cannot be answered for.
+        if distinct {
+            if call != "count" {
+                return Ok(None);
+            }
+            let [only] = args else { return Ok(None) };
+            let Expr::Column(binding) = *plan.expr(*only) else { return Ok(None) };
+            let Some((table, index, columns)) = below else { return Ok(None) };
+            let Some(column) = stored_column(plan, table, index, columns, binding) else {
+                return Ok(None);
+            };
+            let Some(counted) = table.rows().distinct_values(column)? else { return Ok(None) };
+            values.push(count(counted)?);
+            continue;
+        }
         if call == "count_star" && args.is_empty() {
             let Some(rows) = known_rows(plan, catalog, input)? else { return Ok(None) };
             values.push(count(rows)?);
