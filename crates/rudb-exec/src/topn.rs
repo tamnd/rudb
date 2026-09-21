@@ -44,6 +44,15 @@
 //! ClickBench's four `LIMIT 10 OFFSET 1000` queries, which come out of a group by with a `URL` in
 //! the key, building those for every row was most of what the operator did.
 //!
+//! That key is also what the row under the pass rejects against, the same one comparison the sorted
+//! path makes before it materializes anything, and the trim that sets it runs inside the row loop
+//! rather than at the end of a chunk. Both of those are there for the instance that is handed fewer
+//! rows than twice its bound. Thirteen thousand groups spread over thirty two instances is four
+//! hundred rows each, and with the trim at the end of the chunk none of them reached it, so none of
+//! them ever had a cut, so none of them rejected anything and all thirteen thousand rows were built
+//! in full. That query cost four times what the same query one row under `SORTED_BOUND` cost, for
+//! one more row of answer.
+//!
 //! Three things make it step aside and look at every row instead. A worst candidate whose first key
 //! is null, because then what beats it depends on where the query puts nulls and the comparison
 //! kernel answers null rather than true. A `NULLS FIRST` ordering over a column that has nulls, for
@@ -288,6 +297,44 @@ impl TopN {
         let Some(bound) = worst.first().and_then(Bound::of_value) else { return };
         cutoff.reached(bound);
     }
+
+    /// Offers one row to the unordered candidates, and returns what holding it took.
+    ///
+    /// Two things happen before the row is read out of the columns, and both of them are the sorted
+    /// path's, brought down here. The trim, so that an instance that never sees twice its bound
+    /// still ends up with a cut. And the one comparison against that cut, which is the whole reason
+    /// the sorted path is cheap: a row that loses costs one [`Value`] read and never allocates.
+    ///
+    /// The cut can be a trim or more behind, and rejecting against a stale one is still right. The
+    /// candidates only improve, so a key that could not beat the worst of them then cannot beat the
+    /// worst of them now. That is the same argument the pass above the loop already runs on.
+    fn offer(
+        &self,
+        keys: &[Vector],
+        chunk: &Chunk,
+        row: usize,
+        local: &mut Running,
+        trimmed: &mut bool,
+    ) -> Result<u64> {
+        let Running { kept, failure, place, cut, .. } = local;
+        if kept.len() > self.bound.saturating_mul(2) {
+            trim(&self.keys, kept, self.bound, failure);
+            *trimmed = true;
+            *cut = (kept.len() == self.bound && self.bound > 0)
+                .then(|| kept[self.bound - 1].0.clone());
+            if let Some(reached) = cut.as_ref() {
+                self.reached(reached);
+            }
+        }
+        let lost = cut
+            .as_ref()
+            .is_some_and(|cut| against(&self.keys, keys, row, cut, failure) != Ordering::Less);
+        if lost {
+            return Ok(0);
+        }
+        let arrival = place.of(row);
+        hold(keys, chunk, row, arrival, kept)
+    }
 }
 
 impl Sink for TopN {
@@ -374,34 +421,29 @@ impl Sink for TopN {
             .as_ref()
             .and_then(|cut| worth_looking_at(&self.keys, &keys, cut, chunk.len()));
         let mut taken = 0;
+        let mut trimmed = false;
         match narrowed {
             // row at a time: the rows the pass kept are the ones that can still win, and each of
             // them has to be read out of the columns rather than counted.
             Some(rows) => {
                 for row in rows.iter() {
-                    let arrival = local.place.of(row);
-                    taken += hold(&keys, chunk, row, arrival, &mut local.kept)?;
+                    taken += self.offer(&keys, chunk, row, local, &mut trimmed)?;
                 }
             }
             // row at a time: the key still has the same Value layout the sort holds, and 2i (#63)
             // replaces it with one normalized comparable byte string per row.
             None => {
                 for row in 0..chunk.len() {
-                    let arrival = local.place.of(row);
-                    taken += hold(&keys, chunk, row, arrival, &mut local.kept)?;
+                    taken += self.offer(&keys, chunk, row, local, &mut trimmed)?;
                 }
             }
         }
         local.place.past(chunk.len());
         local.charged.grow(taken)?;
-        if local.kept.len() > self.bound.saturating_mul(2) {
-            trim(&self.keys, &mut local.kept, self.bound, &mut local.failure);
+        // Only when a trim ran, since settling walks every candidate and the trims are inside the
+        // loop now. Without one the reservation already holds exactly what the candidates weigh.
+        if trimmed {
             recharge(&local.kept, &mut local.charged)?;
-            local.cut = (local.kept.len() == self.bound && self.bound > 0)
-                .then(|| local.kept[self.bound - 1].0.clone());
-            if let Some(cut) = local.cut.as_ref() {
-                self.reached(cut);
-            }
         }
         Ok(Progress::More)
     }
