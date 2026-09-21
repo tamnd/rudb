@@ -36,8 +36,8 @@
 //! A candidate that is kept is usually beaten later, and on ClickBench 24 an instance keeps about
 //! sixty seven rows to hand ten back. Reading a row out of the chunk is what that costs, and for a
 //! text column read out of a native file it is the most expensive read there is: the dictionary is
-//! compressed in blocks and one value means one block decoded. `SELECT *` over a hundred columns
-//! with a dozen strings in them pays that a dozen times for a row nobody asks for.
+//! compressed in blocks and one value means one block decoded. A wide row pays that per string
+//! column, for a row nobody ends up asking for.
 //!
 //! So a candidate holds a code where the column gave it one, and the value is read in `finalize`,
 //! for the rows that came out on top and no others. See [`Cell`]. The chunk is gone by then and the
@@ -126,7 +126,12 @@ struct Candidate {
 /// A column read out of a native file arrives as codes over a dictionary the whole query shares, and
 /// a code is four bytes that name the value without reading it. So a candidate coming off such a
 /// column keeps the code, and the value is read in `finalize` for the rows that came out on top.
-/// That turned about a thousand payload block decodes a query into ten.
+/// ClickBench 24 went from 130 million instructions to 87 million on that, a third of the query.
+///
+/// It buys nothing where the same column is also a sort key, since keeping the row is then not what
+/// read the value, and ClickBench 26 pays about seven percent for the bookkeeping. Keys are read a
+/// value at a time and compared as values, and making them codes as well is the change after this
+/// one.
 ///
 /// Everything else is read where it is met. A value that is not a code has to be copied out of the
 /// chunk before the chunk goes, and a null is a value like any other here, since the dictionary has
