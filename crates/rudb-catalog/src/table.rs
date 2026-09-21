@@ -341,13 +341,27 @@ impl Rows {
 
     /// The parts of each stripe, in the same numbering [`Self::read`] takes.
     ///
-    /// Empty for an in memory table, which has chunks and no stripes. A scan uses it to hand a
-    /// whole stripe to one worker instead of handing its parts to whoever asks first.
+    /// A scan uses it to hand a whole stripe to one worker instead of handing its parts to whoever
+    /// asks first. An in memory table answers its row groups here, because a group and a stripe are
+    /// the same thing to a scan: a run of chunks that were written together and can be ruled out
+    /// together. It used to answer nothing, and a scan of it was handed a morsel per chunk.
     #[must_use]
     pub fn stripe_parts(&self) -> Vec<std::ops::Range<usize>> {
         match self {
-            Self::Memory(_) => Vec::new(),
+            Self::Memory(rows) => rows.group_parts(),
             Self::Native(reader) => reader.stripe_parts(),
+        }
+    }
+
+    /// How many rows one stripe holds, in the numbering [`Self::stripe_parts`] hands back.
+    ///
+    /// The number a scan divides its work by, and it comes off the directory on both sides rather
+    /// than out of a walk over [`Self::chunk_len`]. Both sides were already holding it.
+    #[must_use]
+    pub fn stripe_rows(&self, stripe: usize) -> usize {
+        match self {
+            Self::Memory(rows) => rows.group_rows(stripe),
+            Self::Native(reader) => reader.stripe_rows(stripe),
         }
     }
 
@@ -392,13 +406,14 @@ impl Rows {
 
     /// Whether the bounds of a whole stripe prove that none of it can match.
     ///
-    /// Always false for an in memory table, which has no stripes and so has nothing to say at that
-    /// size. This is the half of [`Self::skips`] that reads nothing, which is what makes it the one
-    /// to ask when the question is where the work is rather than whether a part holds any.
+    /// This is the half of [`Self::skips`] that reads nothing, which is what makes it the one to ask
+    /// when the question is where the work is rather than whether a part holds any. An in memory
+    /// table answers it from the zone of the row group, in the same numbering
+    /// [`Self::stripe_parts`] hands back.
     #[must_use]
     pub fn stripe_skips(&self, stripe: usize, probes: &[Probe]) -> bool {
         match self {
-            Self::Memory(_) => false,
+            Self::Memory(rows) => rows.group_skips(stripe, probes),
             Self::Native(reader) => reader.stripe_skips(stripe, probes),
         }
     }

@@ -2297,6 +2297,15 @@ impl Reader {
         runs
     }
 
+    /// How many rows one stripe holds, in the numbering [`Self::stripe_parts`] hands back.
+    ///
+    /// Off the directory, which is already in memory, rather than by the caller asking for each
+    /// part in turn through the catalog. Nothing past the end holds any rows.
+    #[must_use]
+    pub fn stripe_rows(&self, stripe: usize) -> usize {
+        self.table.stripes.get(stripe).map_or(0, |held| held.rows)
+    }
+
     /// Asks the page cache to keep `stripes` stripes of every column instead of the default.
     ///
     /// This only ever raises the number. A scan that gives each worker a whole stripe has one page

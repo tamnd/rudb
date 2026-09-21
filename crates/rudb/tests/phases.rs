@@ -78,8 +78,13 @@ fn one_thread_has_no_table_to_merge_and_several_threads_do() {
     // A merge is one worker's table folded into another's, so the thing that decides whether there
     // is one is how many workers there were and not how large the aggregate got. Ten groups never
     // divide a table by hash, and four workers each holding a small table still have to meet.
-    let alone = measured(4_000, 10, 1);
-    let together = measured(4_000, 10, 4);
+    //
+    // The rows are what get four workers started and they are nothing to do with the aggregate. A
+    // scan of a table in memory now asks for as many instances as the rows behind it can pay for,
+    // the same rule the native files have always used, and below twenty five thousand rows that is
+    // one however many threads the setting allows.
+    let alone = measured(200_000, 10, 1);
+    let together = measured(200_000, 10, 4);
     assert_eq!(phase(&alone, "merge"), 0, "one worker merged a table with itself");
     assert!(phase(&together, "merge") > 0, "four workers' tables met without being charged");
 }
