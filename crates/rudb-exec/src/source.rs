@@ -680,39 +680,44 @@ impl<'a> Scan<'a> {
     /// price of doing serially what the workers were about to do at the same time. ClickBench 19 is
     /// the query that pays it: an equality on an identifier, where no stripe bound rules anything out
     /// and the sieves rule out all but nine parts, and doing them here made it half as fast.
-    fn living(&self, threads: usize) -> (Vec<Vec<usize>>, usize) {
+    fn living(&self, threads: usize) -> (Vec<Live>, usize) {
         let (mut live, rows) = self.bounded();
-        let working = live.iter().filter(|parts| !parts.is_empty()).count();
+        let working = live.iter().filter(|stripe| !stripe.parts.is_empty()).count();
         let probes = self.testing();
         if probes.is_empty() || !worth_sifting(working, threads, rows) {
             return (live, rows);
         }
         let mut sifted = 0;
-        for parts in &mut live {
-            parts.retain(|&at| !self.table.rows().skips(at, probes));
-            for &at in parts.iter() {
-                sifted += self.table.rows().chunk_len(at).unwrap_or(0);
-            }
+        for stripe in &mut live {
+            stripe.parts.retain(|&at| !self.table.rows().skips(at, probes));
+            stripe.rows =
+                stripe.parts.iter().map(|&at| self.table.rows().chunk_len(at).unwrap_or(0)).sum();
+            sifted += stripe.rows;
         }
         (live, sifted)
     }
 
     /// The first of those two passes, the one that reads nothing.
-    fn bounded(&self) -> (Vec<Vec<usize>>, usize) {
+    ///
+    /// A stripe nothing was pruned from takes its row count off the directory rather than by adding
+    /// up its parts, which is the same answer without the walk. It is worth not doing rather than
+    /// worth doing: this runs on the one thread every worker is waiting for, and a table in memory
+    /// puts a hundred and twenty chunks in a row group, so on twenty million rows the walk was
+    /// 19,532 lookups to arrive at 163 numbers the groups were already holding. It does not show up
+    /// in a query time, and the reason to say so is that the same walk on a native file is sixty
+    /// four parts to a stripe and nobody would have thought to look.
+    fn bounded(&self) -> (Vec<Live>, usize) {
         let probes = self.testing();
         let mut rows = 0;
         let mut live = Vec::with_capacity(self.stripes.len());
         for (stripe, parts) in self.stripes.iter().enumerate() {
             if !probes.is_empty() && self.table.rows().stripe_skips(stripe, probes) {
-                live.push(Vec::new());
+                live.push(Live::default());
                 continue;
             }
-            let mut kept = Vec::with_capacity(parts.len());
-            for at in parts.clone() {
-                rows += self.table.rows().chunk_len(at).unwrap_or(0);
-                kept.push(at);
-            }
-            live.push(kept);
+            let held = self.table.rows().stripe_rows(stripe);
+            rows += held;
+            live.push(Live { parts: parts.clone().collect(), rows: held });
         }
         (live, rows)
     }
@@ -721,6 +726,20 @@ impl<'a> Scan<'a> {
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
+}
+
+/// What one stripe has left in it after the statistics have been asked.
+///
+/// The two numbers travel together because they are answered together and because keeping them apart
+/// is how the row count ends up being worked out twice: once to size the instances and once to cut
+/// the runs. Empty parts and no rows is a stripe that was ruled out, which is a case the callers
+/// test for rather than drop, since a run never crosses a stripe and the positions have to line up.
+#[derive(Debug, Default)]
+struct Live {
+    /// The parts still worth reading, in order.
+    parts: Vec<usize>,
+    /// How many rows those parts hold.
+    rows: usize,
 }
 
 /// Whether reading the sieves before the workers start is worth what it costs.
@@ -733,7 +752,7 @@ impl<'a> Scan<'a> {
 /// stripe apiece leaves most of the machine idle. When the work is already spread the workers find it
 /// themselves, at the same time, each reading the sieves of the stripe it is in.
 fn worth_sifting(working: usize, threads: usize, rows: usize) -> bool {
-    working < threads.min(native_instances(rows))
+    working < threads.min(instances_for(rows))
 }
 
 /// The live parts cut into the runs a morsel covers, by the rows they hold rather than by the stripe.
@@ -767,14 +786,9 @@ fn worth_sifting(working: usize, threads: usize, rows: usize) -> bool {
 ///
 /// Runs never cross a stripe either way. One that did would own two pages, which is the thing all of
 /// this is avoiding.
-fn runs_of(
-    live: &[Vec<usize>],
-    instances: usize,
-    rows: impl Fn(usize) -> usize,
-) -> Vec<Range<usize>> {
-    let held = |parts: &[usize]| parts.iter().map(|&at| rows(at)).sum::<usize>();
-    let total: usize = live.iter().map(|parts| held(parts)).sum();
-    let working = live.iter().filter(|parts| !parts.is_empty()).count();
+fn runs_of(live: &[Live], instances: usize, rows: impl Fn(usize) -> usize) -> Vec<Range<usize>> {
+    let total: usize = live.iter().map(|stripe| stripe.rows).sum();
+    let working = live.iter().filter(|stripe| !stripe.parts.is_empty()).count();
     let share = total.div_ceil(instances.max(1)).max(1);
     // The biggest run allowed, and the size of the pieces an oversized stripe is cut into. They are
     // the same number in the piled case because there is nothing left to protect there.
@@ -785,9 +799,10 @@ fn runs_of(
         (piece, piece)
     };
     let mut runs: Vec<Range<usize>> = Vec::with_capacity(instances.saturating_mul(2));
-    for parts in live {
+    for stripe in live {
+        let parts = &stripe.parts;
         let Some((&first, &last)) = parts.first().zip(parts.last()) else { continue };
-        if held(parts) <= whole {
+        if stripe.rows <= whole {
             runs.push(first..last + 1);
             continue;
         }
@@ -827,18 +842,22 @@ impl Source for Scan<'_> {
 
     fn morsels(&self, threads: usize) -> Option<usize> {
         let chunks = self.chunks.total();
-        if !self.table.rows().is_native() {
+        // A table that says nothing about how its chunks are grouped has nothing to divide by, so
+        // its chunks go out one at a time to whoever asks, which is what every table did before
+        // there were row groups. The test is on the grouping and not on the format, because an in
+        // memory table has row groups now and they are the same thing to everything below.
+        if self.stripes.is_empty() {
             return Some(chunks);
         }
         let (live, rows) = self.living(threads);
         // An instance is not free, so a scan asks for as many as the rows behind it can pay for
         // rather than for every worker the machine has. What one costs is a thread, and what it
-        // buys is a share of the work, and `native_instances` is where those two are weighed. The
+        // buys is a share of the work, and `instances_for` is where those two are weighed. The
         // rows it is handed are the ones the zone maps leave rather than the ones the table holds,
         // because a query that reads a fifteenth of a file is a query the size of a fifteenth of a
         // file and asking for a worker per stripe of the whole of it is asking for fifteen threads
         // that start, find their stripe ruled out and stop.
-        let useful = native_instances(rows);
+        let useful = instances_for(rows);
         let instances = chunks.min(threads).min(useful);
         // A stripe per worker only divides the work when there are at least as many stripes as
         // workers. Below that it would leave workers with nothing, and the duplicate reads it
@@ -923,7 +942,7 @@ fn more(morsel: &Morsel) -> Progress {
     if morsel.is_drained() { Progress::Done } else { Progress::More }
 }
 
-/// How many instances of a scan over a stored table are worth running.
+/// How many instances of a scan over a table cut into row groups are worth running.
 ///
 /// An instance costs a worker, and a worker costs a lock, a push and a notify now that the pool
 /// parks its threads rather than starting one per pipeline per run. It used to cost a thread
@@ -960,7 +979,7 @@ fn more(morsel: &Morsel) -> Progress {
 /// percent at a hundred thousand, and the numbers stay where they are. What that says is that the
 /// scan is no longer what limits how much of this machine a query uses, and the next thing to look
 /// at is the operators above it.
-fn native_instances(rows: usize) -> usize {
+fn instances_for(rows: usize) -> usize {
     let small = rows.div_ceil(25_000).min(8);
     let large = rows.div_ceil(62_500);
     small.max(large).max(1)
@@ -2064,9 +2083,9 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Across, Bound, Cutoff, FileScan, Filters, Handout, OnceLock, Op, Paying, Probe, Pushdown,
-        RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP, cut_rows,
-        hash, native_instances, next_piece, parts, runs_of, worth_sifting,
+        Across, Bound, Cutoff, FileScan, Filters, Handout, Live, OnceLock, Op, Paying, Probe,
+        Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP,
+        cut_rows, hash, instances_for, next_piece, parts, runs_of, worth_sifting,
     };
     use crate::sideways::Found;
 
@@ -2336,12 +2355,23 @@ mod tests {
         assert!(!worth_sifting(1, 32, 1_000), "a thousand rows pay for one worker either way");
     }
 
+    /// The live parts of each stripe, with the rows they hold worked out the way `bounded` does.
+    fn living(stripes: &[&[usize]], rows: impl Fn(usize) -> usize) -> Vec<Live> {
+        stripes
+            .iter()
+            .map(|parts| Live {
+                parts: parts.to_vec(),
+                rows: parts.iter().map(|&at| rows(at)).sum(),
+            })
+            .collect()
+    }
+
     /// The cutting rule on its own. A stripe holding no more than a share stays one morsel while
     /// there are as many stripes with work in them as there are workers, and once there are fewer the
     /// stripes are shared anyway and the cut gets finer.
     #[test]
     fn a_stripe_holding_no_more_than_a_share_stays_one_run() {
-        let live = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
+        let live = living(&[&[0, 1, 2, 3], &[4, 5, 6, 7], &[8, 9, 10, 11]], |_| 1);
 
         assert_eq!(runs_of(&live, 1, |_| 1), [0..4, 4..8, 8..12], "one worker, one run a stripe");
         assert_eq!(runs_of(&live, 3, |_| 1), [0..4, 4..8, 8..12], "a stripe is a share exactly");
@@ -2356,8 +2386,8 @@ mod tests {
     /// one to a single worker while the other two finished at once.
     #[test]
     fn the_stripe_holding_the_rows_is_the_one_that_gets_cut() {
-        let live = vec![vec![0], vec![1, 2, 3, 4, 5, 6, 7, 8], vec![9]];
         let rows = |at: usize| if (1..9).contains(&at) { 1_000 } else { 10 };
+        let live = living(&[&[0], &[1, 2, 3, 4, 5, 6, 7, 8], &[9]], rows);
 
         let runs = runs_of(&live, 2, rows);
 
@@ -2371,7 +2401,7 @@ mod tests {
     /// two that survived, which a morsel walks past without reading.
     #[test]
     fn a_stripe_that_holds_all_the_work_is_cut_up() {
-        let live = vec![vec![1, 3, 5, 7], Vec::new()];
+        let live = living(&[&[1, 3, 5, 7], &[]], |_| 1);
 
         let runs = runs_of(&live, 2, |_| 1);
 
@@ -2909,7 +2939,7 @@ mod tests {
             (2_500_000, 40),
             (9_999_750, 160),
         ] {
-            assert_eq!(native_instances(rows), workers, "{rows} rows");
+            assert_eq!(instances_for(rows), workers, "{rows} rows");
         }
     }
 

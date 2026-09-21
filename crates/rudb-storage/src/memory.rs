@@ -32,13 +32,20 @@
 //!
 //! # It does have statistics
 //!
-//! A zone map per chunk, and per chunk rather than per group on purpose. The group is the unit of
-//! layout and the chunk is still the unit of pruning, because the whole value of a zone map is how
-//! few rows it speaks for: the note at the top of `zone.rs` measures ClickBench query 37 skipping 75
-//! percent of its chunks and running two and a half times faster, and a synopsis covering a hundred
-//! and twenty times as many rows would skip almost nothing. A coarser second level on top of these,
-//! so that a group can be ruled out without reading its chunks' zones at all, is worth having and is
-//! its own piece of work.
+//! A zone map per chunk, and the chunk is the unit of pruning, because the whole value of a zone map
+//! is how few rows it speaks for: the note at the top of `zone.rs` measures ClickBench query 37
+//! skipping 75 percent of its chunks and running two and a half times faster, and a synopsis
+//! covering a hundred and twenty times as many rows would skip almost nothing.
+//!
+//! There is a second level on top of them anyway, one per group, folded out of the chunk zones as
+//! the group fills rather than walked for. What it buys is not selectivity, and measuring it as
+//! though it were is how you talk yourself out of building it. What it buys is that a group it rules
+//! out is a group whose hundred and twenty chunk zones are never asked at all, and asking one is not
+//! free: before this, a `count(*)` with an equality that ruled out every chunk of a twenty million
+//! row table still cost 16 milliseconds, which is 824 nanoseconds a chunk to decide to do nothing,
+//! because the scan above was handed one chunk per morsel and had to return through the whole
+//! pipeline between each of them. [`MemoryTable::group_parts`] is what lets it be handed a run
+//! instead, and [`MemoryTable::group_skips`] is what lets it drop the run without walking it.
 //!
 //! What they are is built on the way in, which is `zone.rs`. They were put here to skip a chunk
 //! a filter rules out, and they hold more than that: an exact null count for every column whatever
@@ -72,6 +79,10 @@ struct Group {
     columns: Vec<Vector>,
     /// How many rows every one of those columns has.
     rows: usize,
+    /// The chunks this group holds, in the numbering a scan reads.
+    chunks: std::ops::Range<usize>,
+    /// The zones of those chunks folded together, which is what rules the whole group out.
+    zone: Zone,
 }
 
 /// Where one chunk's rows are.
@@ -100,6 +111,9 @@ pub struct MemoryTable {
     open: Vec<Chunk>,
     /// How many rows are in `open`, which is what decides when it seals.
     open_rows: usize,
+    /// The zones of the chunks in `open` folded together, so the group's zone is built as it fills
+    /// rather than in a second pass at the seal.
+    open_zone: Option<Zone>,
     /// One per chunk, in the same numbering as `slots`.
     zones: Vec<Zone>,
     rows: usize,
@@ -116,6 +130,7 @@ impl MemoryTable {
             slots: Vec::new(),
             open: Vec::new(),
             open_rows: 0,
+            open_zone: None,
             zones: Vec::new(),
             rows: 0,
             stats_ns: 0,
@@ -189,6 +204,10 @@ impl MemoryTable {
         }
         let started = Instant::now();
         let zone = Zone::of(&chunk);
+        match &mut self.open_zone {
+            Some(open) => open.widen(&zone),
+            None => self.open_zone = Some(zone.clone()),
+        }
         self.stats_ns += started.elapsed().as_nanos() as u64;
         self.rows += chunk.len();
         self.zones.push(zone);
@@ -220,6 +239,7 @@ impl MemoryTable {
             return;
         }
         let first = self.slots.len() - self.open.len();
+        let last = self.slots.len();
         match self.laid() {
             Some(columns) => {
                 let group = self.groups.len();
@@ -228,18 +248,81 @@ impl MemoryTable {
                     *slot = Slot::Window { group, at, len: chunk.len() };
                     at += chunk.len();
                 }
-                self.groups.push(Group { columns, rows: at });
+                let zone = self.open_zone.take().unwrap_or_default();
+                self.groups.push(Group { columns, rows: at, chunks: first..last, zone });
             }
             None => {
-                for (slot, chunk) in self.slots[first..].iter_mut().zip(self.open.drain(..)) {
-                    *slot = Slot::Window { group: self.groups.len(), at: 0, len: chunk.len() };
+                // A group per chunk, so each one's zone is the chunk's own and the fold is thrown
+                // away. It is the right answer rather than a shortcut: a group covering one chunk
+                // that claimed the range of a hundred and twenty would rule out nothing.
+                for (at, chunk) in (first..last).zip(self.open.drain(..)) {
+                    let group = self.groups.len();
                     let rows = chunk.len();
-                    self.groups.push(Group { columns: chunk.into_columns(), rows });
+                    self.slots[at] = Slot::Window { group, at: 0, len: rows };
+                    let zone = self.zones.get(at).cloned().unwrap_or_default();
+                    let columns = chunk.into_columns();
+                    self.groups.push(Group { columns, rows, chunks: at..at + 1, zone });
                 }
             }
         }
         self.open.clear();
         self.open_rows = 0;
+        self.open_zone = None;
+    }
+
+    /// The chunks of each row group, in the numbering [`Self::read`] takes.
+    ///
+    /// One entry per group, and a last entry for the run still filling when there is one, because a
+    /// scan started in the middle of an insert has to be able to reach those rows and they are not
+    /// in any group yet. Together they cover every chunk exactly once and in order, which is what
+    /// the scan above divides the work by.
+    ///
+    /// This is the same shape a native file answers from its directory, and it is answered here for
+    /// the same reason: a morsel that covers a run of chunks is one a scan can walk ruled out chunks
+    /// inside of, and a morsel that covers one chunk is drained the moment that chunk is ruled out.
+    #[must_use]
+    pub fn group_parts(&self) -> Vec<std::ops::Range<usize>> {
+        let mut parts: Vec<std::ops::Range<usize>> =
+            self.groups.iter().map(|group| group.chunks.clone()).collect();
+        if !self.open.is_empty() {
+            parts.push((self.slots.len() - self.open.len())..self.slots.len());
+        }
+        parts
+    }
+
+    /// How many rows group `index` holds, in the numbering [`Self::group_parts`] hands back.
+    ///
+    /// A group knows its own height, so a scan dividing its work by rows does not have to add up a
+    /// hundred and twenty chunk lengths to find out.
+    #[must_use]
+    pub fn group_rows(&self, index: usize) -> usize {
+        match self.groups.get(index) {
+            Some(group) => group.rows,
+            // The open run, which is the entry `group_parts` puts after the groups.
+            None if index == self.groups.len() => self.open_rows,
+            None => 0,
+        }
+    }
+
+    /// Whether the probes rule out every row of group `index`.
+    ///
+    /// The coarse level the note at the top of this file said was worth having. It is one test per
+    /// hundred and twenty chunks, so it cannot be as selective as the chunk zones are, and what it
+    /// buys is not selectivity: it is that a group ruled out here is a group whose chunks are never
+    /// looked at, one at a time, to be ruled out again.
+    ///
+    /// A group with no zone is a group that is read, and so is an index past the end, for the same
+    /// reason a chunk with no zone is read.
+    #[must_use]
+    pub fn group_skips(&self, index: usize, probes: &[Probe]) -> bool {
+        match self.groups.get(index) {
+            Some(group) => group.zone.skips(probes),
+            // The open run, which is the entry `group_parts` puts after the groups.
+            None if index == self.groups.len() => {
+                self.open_zone.as_ref().is_some_and(|zone| zone.skips(probes))
+            }
+            None => false,
+        }
     }
 
     /// The open chunks as one page per column, or `None` if any column will not lay end to end.
@@ -837,6 +920,75 @@ mod tests {
         let probes = [Probe { column: 0, op, value: Bound::Int(7) }];
         assert!(!table.skips(0, &probes), "the chunk holding the value was skipped");
         assert!(table.skips(1, &probes), "the chunk that cannot hold the value was read");
+    }
+
+    /// The directory the scan divides its work by. Every chunk in exactly one part, parts in order.
+    #[test]
+    fn the_groups_say_which_chunks_are_theirs_and_the_run_still_filling_says_so_too() {
+        let per_group = ROWS_PER_GROUP / VECTOR_SIZE;
+        let table = filled(per_group + 3);
+        assert_eq!(table.group_parts(), vec![0..per_group, per_group..per_group + 3]);
+        // And with nothing open, there is no trailing part to read an empty run out of.
+        let whole = filled(per_group);
+        assert_eq!(whole.group_parts(), vec![0..per_group]);
+        let empty = MemoryTable::new(vec![LogicalType::BigInt]);
+        assert!(empty.group_parts().is_empty());
+    }
+
+    /// The coarse level. One test instead of a hundred and twenty, and it has to agree with them.
+    #[test]
+    fn a_group_is_ruled_out_only_when_every_chunk_in_it_would_have_been() {
+        let per_group = ROWS_PER_GROUP / VECTOR_SIZE;
+        let table = filled(per_group + 3);
+        let op = rudb_common::bounds::Op::Equal;
+        let probes = |value: i128| [Probe { column: 0, op, value: Bound::Int(value) }];
+        // A value in the sealed group, which is rows 0 to ROWS_PER_GROUP - 1.
+        assert!(!table.group_skips(0, &probes(7)));
+        assert!(table.group_skips(1, &probes(7)), "the open run cannot hold row 7");
+        // A value in the run still filling, which is the part after the last group.
+        let inside = ROWS_PER_GROUP as i128 + 100;
+        assert!(table.group_skips(0, &probes(inside)), "the sealed group cannot hold it");
+        assert!(!table.group_skips(1, &probes(inside)));
+        // Past every row, so nothing holds it, and past the parts, where nothing is known.
+        assert!(table.group_skips(0, &probes(9_000_000)));
+        assert!(table.group_skips(1, &probes(9_000_000)));
+        assert!(!table.group_skips(2, &probes(9_000_000)), "an index nothing describes is read");
+        // The group has to agree with its chunks, which is the whole correctness condition: a
+        // group it rules out is a group every chunk of which is ruled out.
+        for at in 0..table.chunk_count() {
+            for value in [7_i128, inside, 9_000_000] {
+                let group = table.group_parts().iter().position(|part| part.contains(&at));
+                let group = group.expect("every chunk is in a part");
+                if table.group_skips(group, &probes(value)) {
+                    assert!(table.skips(at, &probes(value)), "chunk {at} kept, group {group} not");
+                }
+            }
+        }
+    }
+
+    /// The fallback leaves a group per chunk, so the coarse level is the chunk's own zone and the
+    /// parts are one chunk each. Nothing gets ruled out that the chunk zones would have kept.
+    #[test]
+    fn a_run_that_would_not_lay_end_to_end_has_a_part_and_a_zone_per_chunk() {
+        let mut table = MemoryTable::new(vec![LogicalType::BigInt]);
+        let chunks = ROWS_PER_GROUP / VECTOR_SIZE;
+        for chunk in 0..chunks {
+            let base = (chunk * VECTOR_SIZE) as i64;
+            let values = Vector::from_values(
+                LogicalType::BigInt,
+                &[Value::BigInt(base), Value::BigInt(base + 1)],
+            )
+            .expect("two distinct values");
+            let codes: Vec<u32> = (0..VECTOR_SIZE).map(|row| (row % 2) as u32).collect();
+            let column = Vector::dictionary(codes, values).expect("a dictionary column");
+            table.append(Chunk::new(vec![column]).expect("one column")).expect("a full chunk");
+        }
+        assert_eq!(table.group_count(), chunks, "the run laid after all");
+        assert_eq!(table.group_parts(), (0..chunks).map(|at| at..at + 1).collect::<Vec<_>>());
+        let op = rudb_common::bounds::Op::Equal;
+        let probes = [Probe { column: 0, op, value: Bound::Int(VECTOR_SIZE as i128) }];
+        assert!(table.group_skips(0, &probes), "chunk 0 holds 0 and 1, and not that");
+        assert!(!table.group_skips(1, &probes), "chunk 1 is the one holding it");
     }
 
     /// Nulls are the thing a laid out page can silently lose, since they live beside the values.
