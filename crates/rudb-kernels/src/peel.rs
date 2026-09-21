@@ -165,7 +165,7 @@ impl Lookup {
 /// What one probe costs is entirely up to whoever wrote the file, and a format that keeps the start
 /// of each value beside its rank answers almost every probe without reading a value at all. Asking
 /// the source to compare rather than asking it for a position is what leaves room for that.
-fn search(dictionary: &Vector, ranks: usize, wanted: &[u8]) -> Result<Found> {
+pub(crate) fn search(dictionary: &Vector, ranks: usize, wanted: &[u8]) -> Result<Found> {
     let mut low = 0;
     let mut high = ranks;
     while low < high {

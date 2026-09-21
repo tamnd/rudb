@@ -22,10 +22,12 @@
 //! Anything this refuses stays the `OR` the binder built, which is correct and is counted.
 
 use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
 use rudb_common::{LogicalType, Result, Value};
 use rudb_vector::{Data, Form, Validity, Vector};
 
+use crate::peel::{Found, Peel, search};
 use crate::shape::{first, identity, nulls_of, single};
 
 /// The list of an `IN`, in the shape a loop can look a row up in.
@@ -44,6 +46,25 @@ pub struct Members {
     has_null: bool,
     /// Whether this was a `NOT IN`, which the binder wrote as an `AND` of inequalities.
     negated: bool,
+    /// Where the list's values sit in the dictionary a column arrives with, when that dictionary
+    /// came with its own sorted order. Searched once for the whole query.
+    sought: OnceLock<Sought>,
+    /// The per value memo for a dictionary that has no order to search.
+    peel: Peel,
+}
+
+/// The codes one list sits at in one dictionary, searched once and remembered.
+///
+/// The same idea as [`crate::peel::Lookup`], which does it for a single literal, and a separate
+/// type because a list is several literals and the answer is therefore a set of codes rather than
+/// one. Short, since it is as long as the list the query wrote out.
+#[derive(Debug)]
+struct Sought {
+    /// The dictionary these codes are in, recognised by pointer the way a peel does it.
+    dictionary: Arc<Vector>,
+    /// The codes the list's values sit at, and no entry at all for a value the dictionary does not
+    /// hold, since no row can be that value.
+    codes: Vec<u32>,
 }
 
 /// The set itself, in the one layout per kind of value that hashes the way SQL compares.
@@ -103,7 +124,56 @@ impl Members {
         } else {
             Held::Text(text)
         };
-        Some(Self { held, has_null, negated })
+        Some(Self { held, has_null, negated, sought: OnceLock::new(), peel: Peel::default() })
+    }
+
+    /// The codes this list's values sit at in `column`'s dictionary, or `None` when there is no
+    /// sorted order to find them with.
+    ///
+    /// This is the whole of what a sorted dictionary buys an `IN`. The list is a handful of
+    /// literals and the dictionary knows where each of them sits, so one binary search per literal
+    /// for the whole query turns the predicate into a code against a handful of codes, and no
+    /// value is read at any point. `l_shipmode IN ('MAIL', 'SHIP')` over SF1 lineitem is two
+    /// searches of a seven entry dictionary rather than six million string comparisons.
+    ///
+    /// Text only, because the search is over bytes. A list of numbers against a dictionary is left
+    /// to the loop below, which reads the codes' values as a run and is already one lookup a row.
+    fn sought(&self, column: &Vector) -> Option<Result<&[u32]>> {
+        let Held::Text(set) = &self.held else { return None };
+        let (_, dictionary) = column.shared_dictionary_parts()?;
+        if self.sought.get().is_none() {
+            let ranks = dictionary.ranks()?;
+            let mut codes = Vec::with_capacity(set.len());
+            for text in set {
+                match search(dictionary, ranks, text.as_bytes()) {
+                    Ok(Found::At(code)) => codes.push(code),
+                    Ok(Found::Absent) => {}
+                    // Returned rather than remembered, so a caller that retries gets the error
+                    // again rather than a wrong answer cached from a half finished search.
+                    Err(error) => return Some(Err(error)),
+                }
+            }
+            // Two threads that get here at once do the same searches and set the same codes, and
+            // the one that loses the race drops its own copy of them.
+            let _ = self.sought.set(Sought { dictionary: Arc::clone(dictionary), codes });
+        }
+        // Read back what is actually there rather than what this call built, and check it belongs
+        // to the dictionary in hand, which is what declines a second column at the same node.
+        let memo = self.sought.get()?;
+        Arc::ptr_eq(&memo.dictionary, dictionary).then_some(Ok(memo.codes.as_slice()))
+    }
+
+    /// Whether the value at `code` of `dictionary` is in the list, for the memo to remember.
+    fn at_code(&self, dictionary: &Vector, code: usize) -> Result<bool> {
+        Ok(match &self.held {
+            Held::Text(set) => dictionary
+                .try_bytes_at(code)?
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .is_some_and(|text| set.contains(text)),
+            Held::Whole(set) => {
+                number(&dictionary.try_value_at(code)?).is_some_and(|held| set.contains(&held))
+            }
+        })
     }
 
     /// How many distinct values the list holds, for a caller that wants to say so.
@@ -156,6 +226,27 @@ pub fn in_set(input: &Vector, members: &Members, returns: &LogicalType) -> Resul
             None => row_at_a_time(input, members, &base, rows, returns),
         },
         Form::Dictionary | Form::Rle => {
+            // A dictionary column asks the same question about the same value once a row, so both
+            // paths here ask it once a value instead. The search goes first because it reads no
+            // value at all, and the memo takes the dictionaries that have no order to search.
+            if let Some(found) = members.sought(input) {
+                let found = found?;
+                let (codes, _) = input.shared_dictionary_parts().ok_or_else(|| {
+                    rudb_common::Error::internal("a searched column lost its codes")
+                })?;
+                if codes.len() >= rows {
+                    return answer(rows, &base, members, returns, |index| {
+                        found.contains(&codes[index])
+                    });
+                }
+            }
+            if let Some(found) = members
+                .peel
+                .answer(input, rows, identity, |dictionary, code| members.at_code(dictionary, code))
+            {
+                let found = found?;
+                return answer(rows, &base, members, returns, |index| found[index]);
+            }
             let Some((codes, values)) = input.positions() else {
                 return row_at_a_time(input, members, &base, rows, returns);
             };
@@ -289,6 +380,10 @@ fn row_at_a_time(
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as Memory};
+
     use rudb_common::{LogicalType, Value};
     use rudb_vector::Vector;
 
@@ -396,6 +491,106 @@ mod tests {
     #[test]
     fn a_list_of_nothing_but_nulls_does_not_fold() {
         assert!(Members::of(&[Value::Null, Value::Null], false).is_none());
+    }
+
+    /// Values a storage reader hands over one at a time, which know the order the writer sorted
+    /// them into. This is the shape a text column of a native file arrives in, and the whole point
+    /// of the shape is that nothing has to read a value to find out where one sits.
+    #[derive(Debug)]
+    struct Filed {
+        values: Vec<Vec<u8>>,
+        order: Vec<u32>,
+        /// How many values were read to answer, which is what the searching path drives to zero.
+        reads: AtomicUsize,
+    }
+
+    impl rudb_vector::TextSource for Filed {
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> rudb_common::Result<Option<&[u8]>> {
+            self.reads.fetch_add(1, Memory::Relaxed);
+            Ok(self.values.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.values.iter().map(Vec::len).sum()
+        }
+
+        fn ranks(&self) -> Option<usize> {
+            Some(self.order.len())
+        }
+
+        fn compare_rank(&self, rank: usize, wanted: &[u8]) -> rudb_common::Result<Ordering> {
+            // No read counted, because a format that keeps the start of each value beside its rank
+            // settles a probe without going near the payload, and that is the case being tested.
+            Ok(self.values[self.order[rank] as usize].as_slice().cmp(wanted))
+        }
+
+        fn code_at_rank(&self, rank: usize) -> rudb_common::Result<u32> {
+            Ok(self.order[rank])
+        }
+    }
+
+    /// A dictionary column over values that came out of a file with their sorted order, beside the
+    /// same rows written out flat so the two can be compared.
+    fn filed(words: &[&str], codes: Vec<u32>) -> (Vector, Vector, Arc<Filed>) {
+        let values: Vec<Vec<u8>> = words.iter().map(|text| text.as_bytes().to_vec()).collect();
+        let mut order = (0..values.len() as u32).collect::<Vec<_>>();
+        order.sort_by(|&left, &right| values[left as usize].cmp(&values[right as usize]));
+        let source = Arc::new(Filed { values, order, reads: AtomicUsize::new(0) });
+        let dictionary = Arc::new(
+            Vector::external_text(LogicalType::Varchar, Arc::clone(&source) as Arc<_>)
+                .expect("a filed vector"),
+        );
+        let flat = Vector::from_values(
+            LogicalType::Varchar,
+            &codes
+                .iter()
+                .map(|&code| Value::Varchar(words[code as usize].into()))
+                .collect::<Vec<_>>(),
+        )
+        .expect("the same rows written out");
+        let column = Vector::stable_dictionary(codes, dictionary).expect("codes are in range");
+        (column, flat, source)
+    }
+
+    /// The case the searching path exists for. The list is found in the dictionary once for the
+    /// whole query and the rows are then codes against codes, so the answer is the answer the flat
+    /// column gives and the payload is never touched.
+    #[test]
+    fn a_sorted_dictionary_is_searched_once_and_no_value_is_read() {
+        let (column, flat, source) =
+            filed(&["AIR", "MAIL", "RAIL", "SHIP", "TRUCK"], vec![1, 0, 3, 4, 1, 2, 3]);
+        let list = [Value::Varchar("MAIL".into()), Value::Varchar("SHIP".into())];
+        assert_eq!(over(&column, &list, false), over(&flat, &list, false));
+        assert_eq!(over(&column, &list, true), over(&flat, &list, true));
+        assert_eq!(source.reads.load(Memory::Relaxed), 0);
+    }
+
+    /// A list the dictionary holds none of, which the search settles for the whole column without
+    /// looking at a single code.
+    #[test]
+    fn a_list_the_dictionary_does_not_hold_is_false_everywhere() {
+        let (column, flat, _) = filed(&["AIR", "MAIL", "SHIP"], vec![0, 1, 2, 1]);
+        let list = [Value::Varchar("BOAT".into()), Value::Varchar("CART".into())];
+        assert_eq!(over(&column, &list, false), over(&flat, &list, false));
+        assert_eq!(over(&column, &list, false), vec![Value::Boolean(false); 4]);
+    }
+
+    /// Half in and half out, which is the case a search that stopped at the first miss would get
+    /// wrong, and the nulls of the column on top of it.
+    #[test]
+    fn a_list_the_dictionary_holds_some_of_answers_what_the_flat_column_answers() {
+        let (column, flat, _) = filed(&["AIR", "MAIL", "SHIP"], vec![0, 1, 2, 1, 0]);
+        let list = [Value::Varchar("MAIL".into()), Value::Varchar("BOAT".into())];
+        assert_eq!(over(&column, &list, false), over(&flat, &list, false));
+        let holed = column
+            .with_validity(rudb_vector::Validity::from_run(&[true, false, true, true, false]));
+        let holed_flat =
+            flat.with_validity(rudb_vector::Validity::from_run(&[true, false, true, true, false]));
+        assert_eq!(over(&holed, &list, false), over(&holed_flat, &list, false));
     }
 
     #[test]
