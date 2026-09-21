@@ -41,7 +41,7 @@
 //! left in it is not rebuilt, which is where the binary does it too.
 
 use rudb_common::{Field, Result};
-use rudb_plan::{Expr, ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_plan::{Bound, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::pass::{Context, Pass};
 
@@ -105,7 +105,7 @@ fn empty(plan: &Plan, at: NodeRef) -> bool {
     match *plan.node(at) {
         Node::Values { rows, .. } => plan.row_list(rows).is_empty(),
         Node::Filter { input, predicate } => never(plan, predicate) || empty(plan, input),
-        Node::Limit { input, count, .. } => count == Some(0) || empty(plan, input),
+        Node::Limit { input, count, .. } => count == Bound::Rows(0) || empty(plan, input),
         // A zero share of anything is nothing, which is the same rule one line up.
         Node::LimitPercent { input, percent, .. } => percent == 0.0 || empty(plan, input),
         Node::TopN { input, count, .. } => count == 0 || empty(plan, input),

@@ -7,7 +7,7 @@ use rudb_common::bounds::Zones;
 use rudb_common::{Error, Field, LogicalType, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
-use crate::node::{JoinKind, Node};
+use crate::node::{Bound, JoinKind, Node};
 use crate::{ExprRef, NodeRef, Slice, StrRef, ValueRef};
 
 /// A bound logical plan.
@@ -856,7 +856,19 @@ impl Plan {
                     self.checked_expr(key.expr, reference)?;
                 }
             }
-            Node::Limit { .. } | Node::LimitPercent { .. } => {}
+            Node::Limit { count, offset, .. } => {
+                for bound in [count, offset] {
+                    if let Some(expr) = bound.read() {
+                        self.checked_expr(expr, reference)?;
+                    }
+                }
+                // Not a bound the query could have written, and a limit that skipped every row
+                // would be a silent wrong answer rather than a failure further down.
+                if offset == Bound::All {
+                    return fail("skips ALL rows, which is not an offset");
+                }
+            }
+            Node::LimitPercent { .. } => {}
             Node::Distinct { on, .. } => {
                 self.checked_expr_list(on, reference)?;
             }
@@ -947,8 +959,12 @@ impl Plan {
             | Node::MaterializedCte { .. }
             | Node::CteScan { .. }
             | Node::SetOp { .. }
-            | Node::Limit { .. }
             | Node::LimitPercent { .. } => Vec::new(),
+            // The two ends of a limit hold an expression only when the query wrote something the
+            // binder could not work out, which is a column read off the row the limit is given.
+            Node::Limit { count, offset, .. } => {
+                plain(&[count.read(), offset.read()].into_iter().flatten().collect::<Vec<_>>())
+            }
             Node::Values { rows, .. } => {
                 self.row_list(rows).iter().flat_map(|row| plain(self.expr_list(*row))).collect()
             }

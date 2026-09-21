@@ -19,7 +19,7 @@
 
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
-    Arm, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    Arm, Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
     NodeRef, Plan, SetOpKind, Slice, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame,
     WindowUnit,
 };
@@ -712,9 +712,12 @@ impl Generator {
             }
             4 => {
                 let input = self.node(depth - 1);
-                let count =
-                    if self.random.chance(4) { None } else { Some(self.random.next() % 50) };
-                let offset = self.random.next() % 20;
+                let count = if self.random.chance(4) {
+                    Bound::All
+                } else {
+                    Bound::Rows(self.random.next() % 50)
+                };
+                let offset = Bound::Rows(self.random.next() % 20);
                 Node::Limit { input, count, offset }
             }
             5 => {

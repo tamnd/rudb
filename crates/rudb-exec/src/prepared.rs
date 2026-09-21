@@ -206,7 +206,7 @@ struct PreparedArm {
 /// documentation describes. It is handed back in rather than made inside [`Prepared::evaluate`] so
 /// that the array of slots survives from one chunk to the next instead of being allocated a hundred
 /// thousand times over a scan.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Scratch {
     /// What each step produced, or `None` for a step that produces nothing and for one that has not
     /// run yet.

@@ -50,6 +50,53 @@ pub struct WindowFrame {
     pub exclude: WindowExclude,
 }
 
+/// One end of a [`Node::Limit`], which is a row count or an offset.
+///
+/// Nearly every limit written is a number, and a number is what the binder writes down when it can
+/// work one out. What it cannot work out is a subquery, which has to run before there is a value,
+/// and a call that answers differently every time it is made, such as `RANDOM()` or `nextval`. The
+/// pin takes both of those and so does this, by evaluating the expression while the query runs
+/// rather than while it is planned.
+///
+/// [`Bound::Read`] is how. The binder joins the query or the call in underneath as a single row,
+/// which puts its one value in a column of every row the limit sees, and the limit reads that
+/// column off the first chunk that reaches it and uses the number for the rest of the query. The
+/// column is a column the query did not ask for, so the binder puts a projection over the limit
+/// that drops it again.
+///
+/// A [`Bound::Read`] count is why the rewrites that need a number have to check: a limit over a
+/// sort only becomes a [`Node::TopN`] when the count is known while the plan is built, and a limit
+/// cannot move below the projection that produces the column it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// Every row, which is what leaving a `LIMIT` off means. Never an offset.
+    All,
+    /// A number the binder worked out.
+    Rows(u64),
+    /// A column of the input holding the number, the same in every row.
+    Read(ExprRef),
+}
+
+impl Bound {
+    /// The number, when it is one already.
+    #[must_use]
+    pub fn rows(self) -> Option<u64> {
+        match self {
+            Self::Rows(rows) => Some(rows),
+            Self::All | Self::Read(_) => None,
+        }
+    }
+
+    /// The column this reads, when it reads one.
+    #[must_use]
+    pub fn read(self) -> Option<ExprRef> {
+        match self {
+            Self::Read(expr) => Some(expr),
+            Self::All | Self::Rows(_) => None,
+        }
+    }
+}
+
 /// One logical operator.
 ///
 /// Children are the inputs, in the order [`Node::children`] returns them, which is the order they
@@ -226,15 +273,16 @@ pub enum Node {
     },
     /// A row count limit and an offset.
     ///
-    /// Both are constants. `LIMIT` over an expression is legal SQL and DuckDB evaluates it before
-    /// the plan runs, so by the time it is here it is a number or the query did not bind.
+    /// Both are a [`Bound`], which is a number when the query said one and a column of the input
+    /// when it wrote something the binder could not settle. See [`Bound`] for what puts the value
+    /// in that column and who reads it.
     Limit {
         /// The input.
         input: NodeRef,
         /// How many rows to emit, or all of them.
-        count: Option<u64>,
+        count: Bound,
         /// How many rows to skip first.
-        offset: u64,
+        offset: Bound,
     },
     /// A limit written as a share of the input rather than as a row count.
     ///
@@ -696,7 +744,7 @@ mod tests {
             Node::Project { input: 0, index: 0, exprs: Slice::EMPTY, names: Slice::EMPTY },
             Node::Aggregate { input: 0, index: 0, groups: Slice::EMPTY, aggregates: Slice::EMPTY },
             Node::Sort { input: 0, keys: Slice::EMPTY },
-            Node::Limit { input: 0, count: None, offset: 0 },
+            Node::Limit { input: 0, count: Bound::All, offset: Bound::Rows(0) },
             Node::LimitPercent { input: 0, percent: 50.0, offset: 0 },
             Node::Distinct { input: 0, on: Slice::EMPTY },
             Node::Join {

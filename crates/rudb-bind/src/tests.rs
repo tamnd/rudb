@@ -456,10 +456,25 @@ fn identifiers_match_without_regard_to_case_and_keep_the_case_they_were_created_
 
 #[test]
 fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_plan() {
-    for query in ["SELECT counter ** 2 FROM hits", "SELECT url FROM hits LIMIT (SELECT 3)"] {
+    for query in
+        ["SELECT counter ** 2 FROM hits", "SELECT url FROM hits LIMIT 10 PERCENT OFFSET (SELECT 3)"]
+    {
         let message = failure(query);
         assert!(!message.is_empty(), "{query} should say what it cannot do");
     }
+}
+
+/// A row count the binder cannot work out is joined in under the limit and read off a column.
+///
+/// The join is a `SINGLE` one because a subquery standing where a value should be is at most one
+/// row, and the projection over the top drops the column that join added, so the query still
+/// answers the columns it asked for.
+#[test]
+fn a_row_count_the_binder_cannot_work_out_is_read_off_a_column() {
+    let text = plan("SELECT url FROM hits LIMIT (SELECT 3)");
+    assert!(text.contains("Limit #2.0::INTEGER offset 0"), "{text}");
+    assert!(text.contains("Join SINGLE"), "{text}");
+    assert!(text.starts_with("Project #3 [#1.0::VARCHAR AS url]"), "{text}");
 }
 
 /// A limit written as a share of the input binds to a node of its own.

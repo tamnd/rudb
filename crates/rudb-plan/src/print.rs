@@ -19,7 +19,7 @@ use rudb_common::LogicalType;
 use rudb_common::Value;
 
 use crate::expr::Expr;
-use crate::node::{BuildSide, Node, WindowBound, WindowExclude, WindowFrame, WindowUnit};
+use crate::node::{Bound, BuildSide, Node, WindowBound, WindowExclude, WindowFrame, WindowUnit};
 use crate::plan::Plan;
 use crate::{ExprRef, NodeRef, Slice};
 
@@ -175,11 +175,10 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             write_sort_keys(plan, out, keys)
         }
         Node::Limit { count, offset, .. } => {
-            match count {
-                Some(count) => write!(out, " {count}")?,
-                None => out.write_str(" ALL")?,
-            }
-            write!(out, " offset {offset}")
+            out.write_str(" ")?;
+            write_bound(plan, out, count)?;
+            out.write_str(" offset ")?;
+            write_bound(plan, out, offset)
         }
         // The percentage prints through `Display` for a `f64`, which is the shortest text that
         // reads back as the same number, so the reader in `parse.rs` gets the bits it was given.
@@ -237,6 +236,18 @@ fn write_schema<W: Write>(plan: &Plan, out: &mut W, columns: Slice) -> fmt::Resu
         write!(out, "::{}", field.ty)?;
     }
     out.write_char(']')
+}
+
+/// One end of a limit, which is a word, a number or the column the number is read out of.
+///
+/// The column prints as an expression so that a limit holding one reads back as itself, and there
+/// is no ambiguity with a number because an expression never starts with a digit.
+fn write_bound<W: Write>(plan: &Plan, out: &mut W, bound: Bound) -> fmt::Result {
+    match bound {
+        Bound::All => out.write_str("ALL"),
+        Bound::Rows(rows) => write!(out, "{rows}"),
+        Bound::Read(expr) => write_expr(plan, out, expr),
+    }
 }
 
 /// The keys of a sort, in priority order, each with its direction and its null placement.

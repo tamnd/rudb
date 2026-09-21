@@ -510,6 +510,33 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     }
 }
 
+/// The number of rows a value written as a `LIMIT` or an `OFFSET` asks for.
+///
+/// Both clauses take anything that casts to `BIGINT` rather than a whole number written out, so
+/// `LIMIT '3'` is three rows, `LIMIT 2.5` is three because the cast rounds, and `LIMIT true` is one.
+/// The failures are the cast's own, so a date says the cast does not do dates rather than saying
+/// something worse about limits.
+///
+/// This lives next to the cast because both ends of a limit reach it. The binder calls it when it
+/// can work the number out while the plan is built, and the limit operator calls it when it cannot
+/// and the number has to be read off the rows instead, and a limit that answered two different ways
+/// depending on which of those it went through would be a wrong answer nobody would look for.
+///
+/// # Errors
+///
+/// If the value does not cast to `BIGINT`, or if it casts to a negative number.
+pub fn row_count(value: &Value, clause: &str) -> Result<u64> {
+    let count = cast_value(value, &LogicalType::BigInt, false)?.as_i64().ok_or_else(|| {
+        Error::binder(format!(
+            "{clause} takes a whole number of rows, not a value of type {}",
+            value.logical_type()
+        ))
+    })?;
+    // One message for both clauses, spelled the way the pin spells it, which names the clause it
+    // did not get rather than the one it did.
+    u64::try_from(count).map_err(|_| Error::binder("LIMIT/OFFSET cannot be negative"))
+}
+
 /// Whether `TRY_CAST` turns this failure into a null.
 ///
 /// Invalid input is here for the two range failures a written interval has, which upstream throws

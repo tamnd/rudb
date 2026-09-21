@@ -13,6 +13,7 @@
 //! of a pipeline in the order `build.rs` stacked them.
 
 use rudb_common::{Field, Result, Session};
+use rudb_kernels::row_count;
 use rudb_pipeline::{Compaction, Gauge, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, Node, NodeRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
@@ -244,27 +245,93 @@ impl Stream for Project {
 /// wrong answer. The chunk that reaches the count comes back with [`Progress::Done`] on it, which
 /// is how `LIMIT 10` over a large table stops the scan instead of reading rows in order to throw
 /// them away.
+///
+/// Either end can be a number the query did not write out, which is what `LIMIT (SELECT 3)` and
+/// `LIMIT RANDOM() * 10` are. Those arrive as an expression over the input, because the binder put
+/// the value in a column of every row, and the number is read off the first chunk and kept for the
+/// rest of the query. Read once and not per chunk: a volatile call would otherwise answer a
+/// different limit every chunk, and the pin reads it once too.
 #[derive(Debug)]
 pub(crate) struct Limit {
-    count: Option<u64>,
-    offset: u64,
+    count: Edge,
+    offset: Edge,
 }
 
-/// How much of the limit one instance has used up.
+/// One end of a limit while the query runs.
+#[derive(Debug)]
+pub(crate) enum Edge {
+    /// Every row, which is only ever a count.
+    All,
+    /// A number the binder worked out.
+    Rows(u64),
+    /// An expression over the input, holding the number in every row.
+    Read(Prepared),
+}
+
+/// How much of the limit one instance has used up, and what the limit turned out to be.
 #[derive(Debug, Default)]
 pub(crate) struct Taken {
     skipped: u64,
     emitted: u64,
+    /// The count and the offset, once the first chunk has been looked at. `None` until then.
+    settled: Option<(Option<u64>, u64)>,
+    /// Working space for whichever ends are read off the rows. Empty for the ends that are not.
+    counting: Scratch,
+    skipping: Scratch,
 }
 
 impl Limit {
-    pub(crate) fn new(count: Option<u64>, offset: u64) -> Self {
+    pub(crate) fn new(count: Edge, offset: Edge) -> Self {
         Self { count, offset }
     }
 
+    /// Applies the session semantics to whatever casts the two ends hold.
+    #[must_use]
+    pub(crate) fn in_session(mut self, session: &Session) -> Self {
+        self.count = self.count.in_session(session);
+        self.offset = self.offset.in_session(session);
+        self
+    }
+
     /// How many rows are still wanted, given what has already been emitted.
-    fn room(&self, taken: &Taken) -> Option<u64> {
-        self.count.map(|count| count.saturating_sub(taken.emitted))
+    fn room(count: Option<u64>, taken: &Taken) -> Option<u64> {
+        count.map(|count| count.saturating_sub(taken.emitted))
+    }
+}
+
+impl Edge {
+    #[must_use]
+    fn in_session(self, session: &Session) -> Self {
+        match self {
+            Self::Read(prepared) => Self::Read(prepared.in_session(session)),
+            settled => settled,
+        }
+    }
+
+    /// Working space sized for this end, which is nothing at all unless it is read off the rows.
+    fn scratch(&self) -> Scratch {
+        match self {
+            Self::Read(prepared) => prepared.scratch(),
+            Self::All | Self::Rows(_) => Scratch::default(),
+        }
+    }
+
+    /// The number this end asks for, reading the chunk when that is where the number is.
+    ///
+    /// `None` is every row, which only a count answers. A null reads as every row too, because
+    /// `LIMIT (SELECT NULL)` is every row on the pin, the same as `LIMIT NULL` written out.
+    fn rows(&self, chunk: &Chunk, scratch: &mut Scratch, clause: &str) -> Result<Option<u64>> {
+        match self {
+            Self::All => Ok(None),
+            Self::Rows(rows) => Ok(Some(*rows)),
+            Self::Read(prepared) => {
+                let value = prepared.evaluate_one(chunk, scratch)?.value_at(0);
+                if value.is_null() {
+                    return Ok(None);
+                }
+                row_count(&value, clause).map(Some)
+            }
+        }
     }
 }
 
@@ -272,7 +339,11 @@ impl Stream for Limit {
     type Local = Taken;
 
     fn local(&self) -> Taken {
-        Taken::default()
+        Taken {
+            counting: self.count.scratch(),
+            skipping: self.offset.scratch(),
+            ..Taken::default()
+        }
     }
 
     /// Never, and this is the one operator in the tree that says so.
@@ -289,10 +360,25 @@ impl Stream for Limit {
 
     fn push(&self, chunk: &mut Chunk, taken: &mut Taken) -> Result<Progress> {
         let rows = chunk.len() as u64;
-        let skipping = (self.offset - taken.skipped).min(rows);
+        // Nothing to take from and, more to the point, no row to read a bound out of. An empty
+        // chunk is skipped by whoever is driving, so this is belt and braces rather than the way
+        // the first chunk usually arrives.
+        if rows == 0 {
+            return Ok(Progress::More);
+        }
+        let (count, offset) = match taken.settled {
+            Some(settled) => settled,
+            None => {
+                let count = self.count.rows(chunk, &mut taken.counting, "LIMIT")?;
+                // No offset written and a null offset are the same thing, which is none skipped.
+                let offset = self.offset.rows(chunk, &mut taken.skipping, "OFFSET")?.unwrap_or(0);
+                *taken.settled.insert((count, offset))
+            }
+        };
+        let skipping = (offset - taken.skipped).min(rows);
         taken.skipped += skipping;
         let available = rows - skipping;
-        let taking = match self.room(taken) {
+        let taking = match Self::room(count, taken) {
             Some(room) => room.min(available),
             None => available,
         };
@@ -304,7 +390,7 @@ impl Stream for Limit {
             }
             keep(chunk, &kept)?;
         }
-        match self.room(taken) {
+        match Self::room(count, taken) {
             Some(0) => Ok(Progress::Done),
             _ => Ok(Progress::More),
         }
@@ -334,7 +420,7 @@ mod tests {
     use rudb_common::{LogicalType, Value};
     use rudb_vector::{Data, Vector};
 
-    use super::{Limit, Progress, Stream};
+    use super::{Edge, Limit, Progress, Stream};
     use rudb_vector::Chunk;
 
     fn chunk(values: &[i32]) -> Chunk {
@@ -349,7 +435,7 @@ mod tests {
 
     #[test]
     fn the_chunk_that_fills_the_count_is_the_one_that_says_done() {
-        let limit = Limit::new(Some(3), 0);
+        let limit = Limit::new(Edge::Rows(3), Edge::Rows(0));
         let mut taken = limit.local();
 
         let mut first = chunk(&[1, 2]);
@@ -363,7 +449,7 @@ mod tests {
 
     #[test]
     fn an_offset_that_falls_inside_a_chunk_is_counted_in_rows() {
-        let limit = Limit::new(None, 3);
+        let limit = Limit::new(Edge::All, Edge::Rows(3));
         let mut taken = limit.local();
 
         let mut first = chunk(&[1, 2]);
@@ -380,7 +466,7 @@ mod tests {
     /// the call that starts it.
     #[test]
     fn a_limit_of_nothing_is_done_on_the_first_chunk() {
-        let limit = Limit::new(Some(0), 0);
+        let limit = Limit::new(Edge::Rows(0), Edge::Rows(0));
         let mut taken = limit.local();
         let mut first = chunk(&[1, 2]);
         assert_eq!(limit.push(&mut first, &mut taken).expect("nothing wanted"), Progress::Done);
@@ -391,7 +477,7 @@ mod tests {
     /// off one limit both get their own three rows.
     #[test]
     fn two_instances_of_one_limit_do_not_share_a_count() {
-        let limit = Limit::new(Some(3), 0);
+        let limit = Limit::new(Edge::Rows(3), Edge::Rows(0));
         let mut one = limit.local();
         let mut two = limit.local();
 
