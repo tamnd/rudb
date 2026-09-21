@@ -347,6 +347,10 @@ mod tests {
     use super::*;
 
     use rudb_catalog::Catalog;
+    // The only test below that names a `Bound` builds under `debug_assertions`, so in a release
+    // test build this import is unused and `-D warnings` turns that into an error. That is the
+    // release job on main since #1092.
+    #[cfg(debug_assertions)]
     use rudb_plan::Bound;
 
     /// How wide the plan a text prints is, before anything has run over it.
