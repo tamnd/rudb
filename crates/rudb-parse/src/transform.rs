@@ -71,6 +71,7 @@ pub fn transform_with_case(
         current_span: Span::new(0, 0),
         ctes: Vec::new(),
         named_windows: Vec::new(),
+        query_depth: 0,
     };
     transform.program(tree.root())?;
     Ok(transform.ast)
@@ -121,6 +122,13 @@ struct Transform<'a> {
     /// `SELECT (SELECT sum(j) OVER w FROM s) FROM t WINDOW w AS (ORDER BY j)` resolves `w` on the
     /// reference binary and comes back out of the catalog with it inlined.
     named_windows: Vec<(StrRef, WindowRef, bool)>,
+    /// How many queries deep the one being transformed is, counting itself.
+    ///
+    /// A statement's own query is one, a subquery written inside it is two, and a `WITH`
+    /// definition is one deeper than the query that wrote it. Only [`Transform::worth_holding`]
+    /// reads it, to tell a definition with nothing outside it from one that may name a column of
+    /// the query it sits in.
+    query_depth: usize,
 }
 
 /// What a `WITH` name stands for.
@@ -356,6 +364,25 @@ impl<'a> Transform<'a> {
         let text = leaves.last().map_or("", |&leaf| self.text(leaf));
         let text = self.fold_identifier(text.strip_suffix('.').unwrap_or(text));
         self.intern(&text)
+    }
+
+    /// The one part of a name written with nothing qualifying it, folded the way a name is folded.
+    ///
+    /// `None` for a name with a schema or a table in front of it, which is the same test
+    /// [`Transform::inner_table_ref`] makes before it looks a name up in the `WITH` list, since a
+    /// definition is reachable by its bare name and by nothing else.
+    fn bare_name(&self, node: u32) -> Option<String> {
+        let mut leaves = Vec::new();
+        self.leaves(node, &mut leaves);
+        let mut parts = leaves
+            .iter()
+            .map(|&leaf| self.text(leaf))
+            .filter(|text| !text.is_empty() && *text != "*");
+        let only = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(self.fold_identifier(only.strip_suffix('.').unwrap_or(only)))
     }
 
     /// Every part of a qualified name, outermost first.
@@ -957,7 +984,13 @@ impl<'a> Transform<'a> {
     fn query(&mut self, node: u32) -> Result<QueryRef> {
         let span = self.span(node);
         let outer = std::mem::replace(&mut self.current_span, span);
+        // Every query in a statement is reached through here, including the one a `WITH`
+        // definition is and the one a subquery is, so the count is how deeply nested the query
+        // being read is and one means the statement's own. [`Self::worth_holding`] is the only
+        // reader of it.
+        self.query_depth += 1;
         let result = self.query_inner(node);
+        self.query_depth -= 1;
         self.current_span = outer;
         result
     }
@@ -970,28 +1003,31 @@ impl<'a> Transform<'a> {
             if self.find(with, "Recursive") != NONE {
                 return self.unsupported(self.find(with, "Recursive"));
             }
-            for statement in self.kids(with) {
-                if self.name(statement) != "WithStatement" {
-                    continue;
-                }
+            let written: Vec<u32> =
+                self.kids(with).filter(|&kid| self.name(kid) == "WithStatement").collect();
+            for (at, &statement) in written.iter().enumerate() {
                 // `MATERIALIZED` says the definition runs once and every reference reads the rows
-                // it produced, and `NOT MATERIALIZED` and the plain form say the query goes into
-                // each place the name is used. That is the choice recorded here rather than left
-                // to the optimizer, because the pinned build records it in the same place: its
-                // `EXPLAIN` for a plain `WITH` used twice is two copies of the definition and its
-                // `EXPLAIN` for a materialised one is a CTE node with two scans of it.
+                // it produced and `NOT MATERIALIZED` says the query goes into each place the name
+                // is used. Neither word was written for most definitions, and what the plain form
+                // means is a decision rather than a default: the pinned build holds the rows of a
+                // plain definition that is named more than once and puts one named once into the
+                // place it is named, so that is what happens here. It is settled at the parse
+                // rather than left to the optimizer because the pin settles it there too, which is
+                // visible in its `EXPLAIN`.
                 //
-                // The pin has one more rule that rudb does not, and it is written down here rather
-                // than implemented because nothing can reach it yet. A plain definition holding a
-                // volatile call is held anyway: `WITH c AS (SELECT random() AS r) SELECT a.r, b.r
-                // FROM c a, c b` gives the same number twice on the pin and plans as a CTE node,
-                // where the same query over `SELECT 1 AS n` is inlined twice. rudb inlines either
-                // one, which is the same answer until there is a volatile function to call, and
-                // the function table has no `random`, no `nextval` and no `now` in it yet.
-                let materialized = self.find(statement, "Materialized");
-                let materialized = materialized != NONE
-                    && !self.text(materialized).eq_ignore_ascii_case("NOT MATERIALIZED");
+                // Holding rather than inlining is also what makes a definition holding a volatile
+                // call answer the way the pin answers it. `WITH c AS (SELECT random() AS r) SELECT
+                // a.r, b.r FROM c a, c b` gives the same number twice on the pin, which is what a
+                // definition run once gives, and two numbers is what inlining gives. The function
+                // table has no `random`, no `nextval` and no `now` in it yet, so nothing reaches
+                // that today, but the rule is now the one that will be right when something does.
+                let word = self.find(statement, "Materialized");
+                let asked =
+                    word != NONE && !self.text(word).eq_ignore_ascii_case("NOT MATERIALIZED");
+                let refused = word != NONE && !asked;
                 let name = self.identifier(self.first(statement));
+                let materialized =
+                    asked || (!refused && self.worth_holding(node, &written[..=at], name));
                 let list = self.find(statement, "InsertColumnList");
                 let columns = if list == NONE {
                     Slice::default()
@@ -1033,6 +1069,72 @@ impl<'a> Transform<'a> {
         }
         self.ctes.truncate(mark);
         Ok(query)
+    }
+
+    /// Whether a plain `WITH` definition is one to hold the rows of rather than to inline.
+    ///
+    /// Two things have to hold. The name has to be read more than once, because a definition read
+    /// once is cheaper inlined: it becomes part of the query that reads it and the filters and the
+    /// columns that query asks for reach the scan underneath, where holding the rows stops them at
+    /// the definition. Read twice it is the other way round, and q15 of TPC-H is the query that
+    /// says so, since its definition groups a quarter of lineitem and the query names it twice.
+    ///
+    /// And the definition has to be the statement's own rather than one written inside a subquery,
+    /// which is what the depth is for. A definition written inside a subquery can name a column of
+    /// the query around it, and rows held once for the whole statement cannot answer per outer
+    /// row, so inlining is the only thing that is certainly the same query. A nested definition
+    /// with nothing correlated in it would be worth holding too, and telling those apart is a
+    /// question about resolved columns that this pass does not have and the binder does.
+    ///
+    /// `held` is this definition and the ones written before it. A name read inside one of those is
+    /// not a read of this one: either it is this definition's own subtree, where the name means
+    /// whatever it meant outside the clause, or it is an earlier definition, which was transformed
+    /// before this name existed.
+    fn worth_holding(&self, query: u32, held: &[u32], name: StrRef) -> bool {
+        if self.query_depth != 1 {
+            return false;
+        }
+        let name = self.ast.string(name);
+        // A definition of the same name further in takes the name over for the part of the query
+        // under it, and which reads belong to which is a question about scopes that a count of
+        // spellings cannot ask. Inlining is what every definition got until now, so it is what a
+        // query that asks the harder question gets.
+        if self.redefines(query, name, held) {
+            return false;
+        }
+        let mut seen = 0;
+        self.counts_reads(query, name, held, &mut seen);
+        seen > 1
+    }
+
+    /// Counts the bare table names under `at` that spell `name`, skipping the subtrees in `held`.
+    fn counts_reads(&self, at: u32, name: &str, held: &[u32], seen: &mut usize) {
+        if held.contains(&at) {
+            return;
+        }
+        if self.name(at) == "BaseTableName"
+            && self.bare_name(at).is_some_and(|read| read.eq_ignore_ascii_case(name))
+        {
+            *seen += 1;
+        }
+        for kid in self.kids(at) {
+            self.counts_reads(kid, name, held, seen);
+        }
+    }
+
+    /// Whether any `WITH` definition under `at` outside `held` is written with this name.
+    fn redefines(&self, at: u32, name: &str, held: &[u32]) -> bool {
+        if held.contains(&at) {
+            return false;
+        }
+        if self.name(at) == "WithStatement"
+            && self
+                .bare_name(self.first(at))
+                .is_some_and(|written| written.eq_ignore_ascii_case(name))
+        {
+            return true;
+        }
+        self.kids(at).any(|kid| self.redefines(kid, name, held))
     }
 
     /// `SelectSetOpChain <- IntersectChain SelectSetOpChainTail*`, left associative.
@@ -4121,6 +4223,72 @@ mod tests {
         let query = "WITH RECURSIVE t(x) AS (SELECT 1) SELECT x FROM t";
         let error = parse_ast(query).expect_err("the unsupported CTE shape is refused");
         assert!(error.to_string().starts_with("Not implemented Error"), "{query}: {error}");
+    }
+
+    /// A plain definition named twice is held, and the same one named once is not.
+    ///
+    /// Inlining a definition that two places read means running it twice, so the rule is the count
+    /// of reads and the word written only settles the cases where somebody wrote one. `NOT
+    /// MATERIALIZED` is the one that says inline it anyway, and it says so however many times the
+    /// name is read.
+    #[test]
+    fn a_plain_cte_read_twice_is_held_and_one_read_once_is_inlined() {
+        assert_eq!(
+            round("WITH t AS (SELECT 1 AS x) SELECT * FROM t a, t b"),
+            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT * FROM t AS a, t AS b"
+        );
+        assert_eq!(
+            round("WITH t AS (SELECT 1 AS x) SELECT x FROM t"),
+            "SELECT x FROM (SELECT 1 AS x) AS t"
+        );
+        assert_eq!(
+            round("WITH t AS NOT MATERIALIZED (SELECT 1 AS x) SELECT * FROM t a, t b"),
+            "SELECT * FROM (SELECT 1 AS x) AS a, (SELECT 1 AS x) AS b"
+        );
+        // A name a later definition reads is read, since that definition runs too.
+        assert_eq!(
+            round("WITH t AS (SELECT 1 AS x), u AS (SELECT x FROM t) SELECT x FROM t"),
+            "WITH t AS MATERIALIZED (SELECT 1 AS x) SELECT x FROM t"
+        );
+        // Qualified, so it is not a read of the definition and there is only the one.
+        assert_eq!(
+            round("WITH t AS (SELECT 1 AS x) SELECT * FROM t a, main.t b"),
+            "SELECT * FROM (SELECT 1 AS x) AS a, main.t AS b"
+        );
+    }
+
+    /// A definition written inside a subquery is inlined however many times it is read.
+    ///
+    /// The rows of a held definition are produced once for the whole statement, and a definition
+    /// written inside a subquery can name a column of the query around it, which is an answer per
+    /// outer row. Telling the two apart is a question about resolved columns, so what is asked here
+    /// is the question this pass can answer: whether there is any query around it at all.
+    #[test]
+    fn a_cte_written_inside_a_subquery_is_inlined_however_often_it_is_read() {
+        assert_eq!(
+            round("SELECT * FROM (WITH t AS (SELECT 1 AS x) SELECT * FROM t a, t b) c"),
+            "SELECT * FROM (SELECT * FROM (SELECT 1 AS x) AS a, (SELECT 1 AS x) AS b) AS c"
+        );
+        assert_eq!(
+            round("WITH o AS (WITH i AS (SELECT 1 AS x) SELECT * FROM i a, i b) SELECT * FROM o"),
+            "SELECT * FROM (SELECT * FROM (SELECT 1 AS x) AS a, (SELECT 1 AS x) AS b) AS o"
+        );
+    }
+
+    /// A name a definition further in takes over is left alone.
+    ///
+    /// Which of the two definitions a read means is a question about scopes, and the count here is
+    /// a count of spellings, so a query that writes the name twice gets what every query got before
+    /// the count existed.
+    #[test]
+    fn a_plain_cte_whose_name_is_written_again_further_in_is_inlined() {
+        assert_eq!(
+            round(
+                "WITH t AS (SELECT 1 AS x) SELECT * FROM t a, \
+                 (WITH t AS (SELECT 2 AS x) SELECT x FROM t) b"
+            ),
+            "SELECT * FROM (SELECT 1 AS x) AS a, (SELECT x FROM (SELECT 2 AS x) AS t) AS b"
+        );
     }
 
     /// A materialised one keeps its definition, because putting it in two places runs it twice.
