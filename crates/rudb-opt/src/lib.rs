@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Seventeen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
+//! Eighteen passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`] is
 //! the start of it. Column pruning came first, because it is the pass whose absence is measured in
 //! gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -23,6 +23,7 @@ pub mod explain;
 pub mod extremes;
 pub mod filter;
 pub mod fold;
+pub mod keys;
 pub mod late;
 pub mod limit;
 pub mod nulls;
@@ -78,6 +79,13 @@ pub const RANK: u8 = 11;
 /// behind is a semi join where there was a join back to a domain, and the pass that decides which
 /// order to build a region in should be reading the joins that are going to run.
 ///
+/// Pushing the keys of a correlated subquery into the aggregate that answers it goes between the
+/// deliminator and join ordering, for the two reasons the deliminator is there. After pushdown,
+/// because the relation it copies is the one the filters have already been moved into and copying
+/// it before they move would copy a whole table. Before join ordering, because the semi join it
+/// writes is a join that is going to run and a region the pass reads should be the region the
+/// executor gets.
+///
 /// Empty result pullup is after filter pushdown, because pushdown is what moves an unsatisfiable
 /// predicate down to the scan it should stop and what drops the conjuncts that were always true, so
 /// the pass that looks for a predicate nothing can satisfy should look after that has happened. It
@@ -122,12 +130,13 @@ pub const RANK: u8 = 11;
 /// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
-pub static PASSES: [&(dyn Pass + Sync); 17] = [
+pub static PASSES: [&(dyn Pass + Sync); 18] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &filter::FilterPushdown,
     &delim::Deliminator,
+    &keys::GroupKeyPushdown,
     &order::JoinOrder,
     &semi::MarkToSemi,
     &semi::DistinctToSemi,
