@@ -267,19 +267,54 @@ pub(crate) fn in_parallel<T: Send>(
 ) -> Result<Vec<T>> {
     let next = AtomicUsize::new(0);
     let slots: Vec<Mutex<Option<Result<T>>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    let probe = std::time::Instant::now();
+    let trace: Mutex<Vec<(f64, f64, u64)>> = Mutex::new(Vec::new());
     let step = || {
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
             if at >= count {
                 return;
             }
+            let began = probe.elapsed().as_secs_f64() * 1e3;
             let done = run(at);
+            let ended = probe.elapsed().as_secs_f64() * 1e3;
+            let who = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::thread::current().id().hash(&mut hasher);
+                hasher.finish()
+            };
+            if let Ok(mut held) = trace.lock() {
+                held.push((began, ended, who));
+            }
             if let Ok(mut slot) = slots[at].lock() {
                 *slot = Some(done);
             }
         }
     };
     together(threads, degree.min(count), &step)?;
+    if let Ok(held) = trace.lock() {
+        let mut seen: Vec<u64> = held.iter().map(|piece| piece.2).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let work: f64 = held.iter().map(|piece| piece.1 - piece.0).sum();
+        let first = held.iter().map(|piece| piece.0).fold(f64::MAX, f64::min);
+        let last_start = held.iter().map(|piece| piece.0).fold(0.0, f64::max);
+        let end = held.iter().map(|piece| piece.1).fold(0.0, f64::max);
+        let mut each: Vec<f64> = seen
+            .iter()
+            .map(|who| {
+                held.iter().filter(|piece| piece.2 == *who).map(|piece| piece.1 - piece.0).sum()
+            })
+            .collect();
+        each.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let busiest = each.first().copied().unwrap_or(0.0);
+        eprintln!(
+            "  probe parallel \"{what}\" pieces={count} degree={degree} threads={} work={work:.3} wall={end:.3} first={first:.3} laststart={last_start:.3} busiest={busiest:.3} ideal={:.3}",
+            seen.len(),
+            work / degree as f64,
+        );
+    }
     let mut out = Vec::with_capacity(count);
     for (at, slot) in slots.iter().enumerate() {
         out.push(
