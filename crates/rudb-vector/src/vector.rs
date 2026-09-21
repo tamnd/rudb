@@ -570,6 +570,25 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         let _ = (rank, wanted);
         Err(Error::internal("a text source without a sorted order was asked to compare a rank"))
     }
+    /// How many values sort before `wanted`, and whether one of them is `wanted`.
+    ///
+    /// The whole search rather than a probe of it, so that a source which can answer the same
+    /// question twice without repeating the work is allowed to. The default runs the search through
+    /// [`compare_rank`](Self::compare_rank) and remembers nothing, which is right for a source whose
+    /// probes are cheap.
+    ///
+    /// The reason it is on the trait at all is the top N. `ORDER BY <varchar> LIMIT 10` asks once a
+    /// chunk whether anything left can beat the worst candidate, and the worst candidate stops
+    /// changing long before the chunks run out, so nearly every one of those searches is the one
+    /// before it asked again. A probe of a file backed dictionary is not cheap: it settles on the
+    /// stored head where it can and reads a value where it cannot, and reading a value means
+    /// decoding the payload block it sits in. On ClickBench 25 that search was 29 percent of the
+    /// query's instructions and the block decoding under it another 40.
+    ///
+    /// Only called when [`ranks`](Self::ranks) is `Some`, and `ranks` is what it answered.
+    fn below(&self, ranks: usize, wanted: &[u8]) -> Result<(usize, bool)> {
+        search_below(self, ranks, wanted)
+    }
     /// The position of the value at `rank`, which is what a search returns once it has found one.
     ///
     /// Called about once per search rather than once per probe, so unlike
@@ -612,6 +631,38 @@ impl PartialEq for dyn TextSource {
     fn eq(&self, other: &Self) -> bool {
         self.equal(other)
     }
+}
+
+/// The binary search behind [`TextSource::below`], written once so an override can still use it.
+///
+/// A source that remembers its answers overrides `below` to look in what it remembers first, and
+/// then it still has to do the search when it does not find one. This is that search. It carries on
+/// past an equal probe to the first rank holding the value, so what it returns is a boundary rather
+/// than wherever the halving happened to touch down, and the values are distinct so there is exactly
+/// one such rank.
+///
+/// # Errors
+///
+/// Whatever [`TextSource::compare_rank`] gives for a probe.
+pub fn search_below<S>(source: &S, ranks: usize, wanted: &[u8]) -> Result<(usize, bool)>
+where
+    S: TextSource + ?Sized,
+{
+    let mut low = 0;
+    let mut high = ranks;
+    let mut equal = false;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match source.compare_rank(middle, wanted)? {
+            Ordering::Less => low = middle + 1,
+            Ordering::Greater => high = middle,
+            Ordering::Equal => {
+                equal = true;
+                high = middle;
+            }
+        }
+    }
+    Ok((low, equal))
 }
 
 impl Vector {
@@ -2022,6 +2073,18 @@ impl Vector {
             _ => {
                 Err(Error::internal("a vector without a sorted order was asked to compare a rank"))
             }
+        }
+    }
+
+    /// Where `wanted` would go in the sorted order. See [`TextSource::below`].
+    ///
+    /// # Errors
+    ///
+    /// If this vector has no sorted order, or if a probe of it fails.
+    pub fn below(&self, ranks: usize, wanted: &[u8]) -> Result<(usize, bool)> {
+        match &self.body {
+            Body::ExternalText { source } => source.below(ranks, wanted),
+            _ => Err(Error::internal("a vector without a sorted order was asked for a boundary")),
         }
     }
 

@@ -49,7 +49,7 @@ use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
-use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
+use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
@@ -1649,7 +1649,30 @@ struct NativeText {
     /// a little early, which is the harmless direction, and it costs one relaxed add a block rather
     /// than a lock on the path every scan of a string column goes through.
     payload_kept: AtomicUsize,
+    /// The boundaries this dictionary has already been searched for, by the value searched for.
+    ///
+    /// A search is the expensive thing this type does. It settles a probe on the stored head where
+    /// it can and reads a value where it cannot, and reading a value decodes the payload block it
+    /// sits in, so one search can cost several blocks. The thing that makes remembering worth it is
+    /// that the same search comes back: a top N asks once a chunk whether anything left can beat its
+    /// worst candidate, and the worst candidate settles long before the chunks run out.
+    ///
+    /// Shared across the instances of a scan rather than kept per instance, because each of them has
+    /// its own worst candidate and all of them are searching the same dictionary. One lock per chunk
+    /// is nothing next to a probe of a file.
+    ///
+    /// Bounded by [`TEXT_SEARCH_MEMO`] and emptied rather than evicted when it is full. What fills
+    /// it is a top N improving its bound, which happens a few dozen times and then stops, so the
+    /// bound is there for the filter that searches for a different literal every chunk rather than
+    /// for anything this is meant to help.
+    searched: Mutex<HashMap<Vec<u8>, (usize, bool)>>,
 }
+
+/// How many searched for values a column's dictionary remembers the boundary of.
+///
+/// See [`NativeText::searched`]. Small because the case it is for repeats one value, not because a
+/// larger one would be wrong.
+const TEXT_SEARCH_MEMO: usize = 64;
 
 /// How many values of a dictionary go in one block of the payload.
 ///
@@ -2064,6 +2087,26 @@ impl TextSource for NativeText {
 
     fn ranks(&self) -> Option<usize> {
         (self.ranks > 0).then_some(self.ranks)
+    }
+
+    /// The boundary for `wanted`, out of [`Self::searched`] where it is there and put there where
+    /// it is not.
+    ///
+    /// The lock is held over the search rather than dropped and taken again, so that two threads
+    /// asking for the same value at the same time do the work once between them. That is the shape
+    /// the scan actually arrives in: sixteen instances of a top N, all reading the same column, all
+    /// improving their bound over the same early chunks.
+    fn below(&self, ranks: usize, wanted: &[u8]) -> Result<(usize, bool)> {
+        let mut memo = self.searched.lock().map_err(|_| invalid("a poisoned dictionary search"))?;
+        if let Some(&answer) = memo.get(wanted) {
+            return Ok(answer);
+        }
+        let answer = search_below(self, ranks, wanted)?;
+        if memo.len() >= TEXT_SEARCH_MEMO {
+            memo.clear();
+        }
+        memo.insert(wanted.to_vec(), answer);
+        Ok(answer)
     }
 
     fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<Ordering> {
@@ -5330,6 +5373,7 @@ fn open_global_dictionary(
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
             keep_budget,
             payload_kept: AtomicUsize::new(0),
+            searched: Mutex::new(HashMap::new()),
         }),
     )
 }
