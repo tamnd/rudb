@@ -554,6 +554,18 @@ const DENSE_PARTITIONS: usize = 4;
 /// same peak memory. Both numbers were measured in the same sweep and the lower one won everywhere.
 const PARTITION_FROM: usize = 4_096;
 
+/// How much of one set of tables per instance the cache is taken to hold.
+///
+/// Read by [`Aggregate::cache_holds_local`], which is where the reasoning is. It is a constant
+/// rather than a reading off the machine because nothing portable reports a cache size, and it is
+/// the last level that matters here rather than a core's own, since the instances are sharing it.
+/// Sixteen megabytes is what the laptop this was measured on holds and is the same order as every
+/// desktop and server part worth running this on, so a machine with more cache keeps its tables
+/// private slightly later than it could and a machine with less shares slightly later than it
+/// should. Both of those are a few per cent on an aggregate near the line and nothing at all on one
+/// far from it.
+const LOCAL_CACHE: u64 = 16 * 1024 * 1024;
+
 impl<'a> Aggregate<'a> {
     /// Applies the session semantics to group keys and aggregate inputs.
     #[must_use]
@@ -2187,18 +2199,42 @@ impl<'a> Aggregate<'a> {
     /// file that no number of later passes will get through. The check has to happen while there is
     /// still room to be wrong about.
     ///
-    /// Three things end it and all three are about room. A table that has opened a spill file can
+    /// Four things end it. Three of them are about room. A table that has opened a spill file can
     /// never be merged with another table, because a key can be in one table and in the other's
     /// file at once and the merge would finish a group the file is still holding rows for. A budget
-    /// already half spent is the same crowding the single table path watches for. And the aggregate
+    /// already half spent is the same crowding the single table path watches for. The aggregate
     /// itself has to be small enough that one set of tables per instance still fits, which is what
     /// [`Aggregate::room_for_local`] asks.
     ///
+    /// The fourth is about the cache, and it is three questions rather than one, because a set of
+    /// copies is only worth giving up when it is too large to sit in the cache and is actually a
+    /// set of copies. [`cache_holds_local`](Aggregate::cache_holds_local) asks the first, and
+    /// [`copies_overlap`] and [`keys_arrive_together`] between them ask the second, one from the
+    /// number of rows a group has and one from where in the input those rows are. All three have to
+    /// say so before the tables go.
+    ///
     /// Once per chunk rather than once per row, and the answer is almost always yes.
-    fn still_local(&self, spreading: &mut Spreading, own: &mut [Option<Building>]) -> Result<bool> {
+    fn still_local(
+        &self,
+        folded: u64,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+    ) -> Result<bool> {
         // flatten: a partition this instance has not folded into has no table and nothing to say.
         let spilled = own.iter().flatten().any(|table| table.over.is_some());
-        if !spilled && !crowded(&self.memory) && self.room_for_local(own) {
+        let mine: u64 = own
+            .iter()
+            .flatten()
+            .map(|table| table.scratch.bytes() + table.containers.bytes())
+            .sum();
+        let groups: u64 = own.iter().flatten().map(|table| table.groups as u64).sum();
+        if !spilled
+            && !crowded(&self.memory)
+            && self.room_for_local(mine)
+            && (self.cache_holds_local(mine)
+                || !copies_overlap(folded, groups)
+                || keys_arrive_together(spreading))
+        {
             return Ok(true);
         }
         self.give_up_local(spreading)?;
@@ -2249,16 +2285,38 @@ impl<'a> Aggregate<'a> {
     /// This asks about the tables rather than about the process, which is the difference that makes
     /// it usable. `crowded` reads what the whole query is holding, and on a scan of a large table
     /// most of that is the table and none of it is the aggregate's to give back.
-    fn room_for_local(&self, own: &[Option<Building>]) -> bool {
+    fn room_for_local(&self, mine: u64) -> bool {
         let Some(limit) = self.memory.limit() else { return true };
-        // flatten: a partition with no table is holding nothing.
-        let mine: u64 = own
-            .iter()
-            .flatten()
-            .map(|table| table.scratch.bytes() + table.containers.bytes())
-            .sum();
         let instances = self.started.load(Ordering::Relaxed) as u64;
         mine.saturating_mul(instances) < limit / 4
+    }
+
+    /// Whether one set of tables per instance still fits in the cache.
+    ///
+    /// The budget question above and this one look alike and are not the same question. A set of
+    /// tables per instance can sit inside a twenty gigabyte budget with room to spare and still be
+    /// far too large to be touched at random, and a hash aggregate is nothing but random touches: a
+    /// bucket, then the key the bucket points at, then the accumulator beside it, three addresses
+    /// nothing knew until the one before it landed. Once those addresses stop coming out of the
+    /// cache each of them is a trip to memory, and the instances are not sharing the trips, they
+    /// are competing for the same cache with a private copy each.
+    ///
+    /// The shared tables hold what the private ones hold between them, so what this decides is
+    /// whether the aggregate's working set is one copy or as many copies as there are threads.
+    /// Below the line the copies are free and the locks are not worth taking. Above it the copies
+    /// are the whole cost and the locks are cheap beside them.
+    ///
+    /// `GROUP BY l_partkey` over TPC-H SF1 lineitem is what put the number here. It is six million
+    /// rows into two hundred thousand groups, which is about sixteen megabytes of tables, and the
+    /// fold costs 23 nanoseconds a row on one thread and 182 on ten, so the tenth thread was making
+    /// the work slower rather than faster and the aggregate scaled 1.3 times over ten threads. The
+    /// cache on the machine that was measured on holds about sixteen megabytes, and sixteen
+    /// megabytes across every instance is where the sweep put the line: below it the private tables
+    /// are as fast as they always were, and above it they are not tables any more, they are ten
+    /// copies of one table taking turns being evicted.
+    fn cache_holds_local(&self, mine: u64) -> bool {
+        let instances = self.started.load(Ordering::Relaxed) as u64;
+        mine.saturating_mul(instances) <= LOCAL_CACHE
     }
 
     /// The aggregate stops keeping a table per instance per partition, for good.
@@ -2336,7 +2394,7 @@ impl<'a> Aggregate<'a> {
     /// division is here and what is done with the pieces is not. The gather is a copy of every
     /// column of the batch and it happens before any lock is taken by either caller.
     fn split(&self, rows: &Rows, spreading: &mut Spreading) -> Result<Vec<Option<Rows>>> {
-        let Spreading { hashes, picks, keyed, spin, .. } = spreading;
+        let Spreading { hashes, picks, keyed, spin, split_rows, runs, .. } = spreading;
         crate::table::hash(&rows.keys, rows.rows, hashes, crate::table::Across::OneInput);
         for pick in picks.iter_mut() {
             pick.clear();
@@ -2345,11 +2403,17 @@ impl<'a> Aggregate<'a> {
             hashed.clear();
         }
         let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
+        let mut before: Option<u64> = None;
         for (row, &hash) in hashes.iter().enumerate() {
+            if before != Some(hash) {
+                *runs += 1;
+                before = Some(hash);
+            }
             let partition = (hash >> shift) as usize;
             picks[partition].push(row as u32);
             keyed[partition].push(hash);
         }
+        *split_rows += rows.rows as u64;
         let mut ready: Vec<Option<Rows>> = Vec::with_capacity(RADIX_PARTITIONS);
         for pick in picks.iter() {
             ready.push(if pick.is_empty() { None } else { Some(rows.gather(pick)?) });
@@ -2768,6 +2832,11 @@ pub(crate) struct Partitioned {
     /// until [`Aggregate::close`] merges the four, and what it buys is that the fold itself never
     /// waits for anybody.
     own: Vec<Option<Building>>,
+    /// How many rows this instance has folded, counting the ones that went into `single`.
+    ///
+    /// Against the groups those rows opened it says how much a table is repeating itself, which is
+    /// what [`copies_overlap`] reads it for.
+    folded: u64,
 }
 
 /// The four columns a fixed width record is built from, read once per chunk rather than once per row.
@@ -2839,6 +2908,13 @@ struct Spreading {
     spin: usize,
     /// The partitions a sweep found locked, kept here so the second pass does not allocate.
     waiting: Vec<usize>,
+    /// How many rows this instance has split into partitions, and how many runs of equal keys
+    /// those rows arrived in.
+    ///
+    /// Counted inside the loop that reads the hashes, so it is one comparison a row on a pass that
+    /// was happening anyway. What it is for is in [`keys_arrive_together`].
+    split_rows: u64,
+    runs: u64,
 }
 
 impl Spreading {
@@ -2849,6 +2925,8 @@ impl Spreading {
             keyed: vec![Vec::new(); RADIX_PARTITIONS],
             spin: 0,
             waiting: Vec::new(),
+            split_rows: 0,
+            runs: 0,
         }
     }
 }
@@ -3221,6 +3299,51 @@ fn crowded(memory: &Memory) -> bool {
     }
 }
 
+/// Whether the tables the instances keep to themselves are mostly copies of each other.
+///
+/// Two instances hold the same group only when that group has rows on both of them, and the rows
+/// are dealt out a morsel at a time, so a group with one row is on one instance and a group with
+/// fifty is on all of them. A hundred thousand groups of fifty rows is ten instances holding a
+/// hundred thousand groups each while a shared table holds a hundred thousand between them, which
+/// is ten copies of everything. A hundred thousand groups of one row is ten instances holding ten
+/// thousand each and a shared table holds the same hundred thousand, so there is nothing to remove
+/// and the lock would be paid for nothing.
+///
+/// An instance can read which of the two it is in off its own table. It folded `folded` rows and
+/// they opened `groups` groups, so a group of its own has `folded / groups` rows in it. Call that
+/// `m`. If the keys arrive in no particular order then a group with `k` rows in the whole input has
+/// `k / t` of them here, and `m` and the share of the aggregate's groups this instance holds move
+/// together: `m` of one is a table holding almost nothing twice, `m` of one point four is a table
+/// holding half of every group there is, and `m` of three is a table holding all of them.
+///
+/// One point four is the line, which is the point where the shared table would be half the size of
+/// the copies put together. TPC-H q17 groups six million lineitem rows by part key into two hundred
+/// thousand and ends at three, which is the query this helps most. q20 groups a seventh of them by
+/// part key and supplier key into about as many groups as it has rows and stays at one, and sharing
+/// those tables costs the locks and saves nothing, which is what this is here to notice.
+fn copies_overlap(folded: u64, groups: u64) -> bool {
+    groups > 0 && folded.saturating_mul(5) >= groups.saturating_mul(7)
+}
+
+/// Whether the rows of a group arrive together, in which case no two instances hold the same group.
+///
+/// [`copies_overlap`] reads the number of rows a group has and assumes the input says nothing about
+/// where they are, which is true of a key the file is not sorted on and false of one it is. TPC-H
+/// lineitem is written in order key order, so the four rows of an order are next to each other, one
+/// morsel gets all four and no other instance ever sees that order at all. The tables are already
+/// divided between the instances by the input itself, there is nothing for a shared table to
+/// remove, and `GROUP BY l_orderkey` has exactly the rows a group that [`copies_overlap`] would
+/// call worth sharing.
+///
+/// So the aggregate counts, as it hashes each chunk, how many runs of equal keys the rows arrived
+/// in. Two rows a run is enough to say the input is ordered on the key: a key the file is not sorted
+/// on gives one run a row until the keys run out, and six million lineitem rows over two hundred
+/// thousand part keys give one run a row, while the same rows over a million and a half order keys
+/// give one run every four.
+fn keys_arrive_together(spreading: &Spreading) -> bool {
+    spreading.runs > 0 && spreading.split_rows >= spreading.runs.saturating_mul(2)
+}
+
 /// Fills `key` with one row of `columns`, reusing what the row before it left behind.
 ///
 /// The point of filling rather than collecting is the strings. A `Value::Varchar` owns its bytes, so
@@ -3298,6 +3421,7 @@ impl Sink for Aggregate<'_> {
             expressions: self.inputs.scratch(),
             spreading: Spreading::new(),
             own: (0..RADIX_PARTITIONS).map(|_| None).collect(),
+            folded: 0,
         }
     }
 
@@ -3365,6 +3489,7 @@ impl Sink for Aggregate<'_> {
             expressions,
             spreading,
             own,
+            folded,
         } = local;
         let rows = self.read(chunk, expressions)?;
         if self.mixed_top_count() {
@@ -3516,6 +3641,7 @@ impl Sink for Aggregate<'_> {
                 }
             }
         }
+        *folded += rows.rows as u64;
         if let Some(table) = single {
             if let Some(error) = table.failure.take() {
                 return Err(error);
@@ -3537,7 +3663,7 @@ impl Sink for Aggregate<'_> {
             self.hand(handing, spreading, own)?;
             return Ok(Progress::More);
         }
-        if self.locally.load(Ordering::Relaxed) && self.still_local(spreading, own)? {
+        if self.locally.load(Ordering::Relaxed) && self.still_local(*folded, spreading, own)? {
             self.spread_own(&rows, spreading, own)?;
             return Ok(Progress::More);
         }
@@ -5334,10 +5460,13 @@ mod tests {
         }
         aggregate.combine(left).expect("the first instance");
         aggregate.combine(right).expect("the second instance");
+        let built = aggregate.built.lock().expect("readable");
         assert!(
-            aggregate.built.lock().expect("readable").partitioning,
+            built.partitioning,
             "five thousand groups on two instances is meant to take the partitioned path"
         );
+        assert!(built.local, "five thousand groups fit in the cache twice over");
+        drop(built);
         aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         let mut seen: Vec<i32> = Vec::new();
@@ -5347,6 +5476,107 @@ mod tests {
                 Value::Integer(key) => seen.push(key),
                 ref other => panic!("the group is {other:?} and not an integer"),
             }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, values);
+    }
+
+    /// An aggregate whose private tables outgrow the cache gives them up and still answers once.
+    ///
+    /// The budget is unlimited here, so neither [`Aggregate::worth_local`] nor
+    /// [`Aggregate::room_for_local`] has anything to object to. What ends local mode is the three
+    /// cache questions together, and this arranges for all three to say so. Three calls a group
+    /// over a hundred and twenty thousand groups on two instances is past [`LOCAL_CACHE`]. Each
+    /// chunk goes in twice, so a group has two rows and [`copies_overlap`] says the instances are
+    /// holding the same groups as each other. The chunks themselves are runs of distinct keys, so
+    /// [`keys_arrive_together`] says the input has not divided the keys between the instances
+    /// already.
+    ///
+    /// The handover is the part worth pinning. Some of each instance's rows went into a private
+    /// table and the rest went straight into a shared one, and the two halves have to meet exactly
+    /// once: a group counted in both is a group whose private table was folded in twice, and a
+    /// group missing entirely is one whose table was dropped on the way over.
+    #[test]
+    fn an_aggregate_too_large_for_the_cache_gives_up_its_own_tables_and_still_answers_once() {
+        let plan = parsed(concat!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT, ",
+            "sum(#0.0::INTEGER)::BIGINT, min(#0.0::INTEGER)::INTEGER]"
+        ));
+        let (aggregate, out) = aggregate(&plan);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        let values: Vec<i32> = (0..120_000).collect();
+        for part in values.chunks(1_024) {
+            for instance in [&mut left, &mut right] {
+                aggregate.sink(&chunk(part), instance).expect("a chunk of groups");
+                aggregate.sink(&chunk(part), instance).expect("the same chunk a second time");
+            }
+        }
+        assert!(
+            !aggregate.built.lock().expect("readable").local,
+            "a hundred and twenty thousand groups of three calls is past what the cache holds"
+        );
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+
+        let mut seen: Vec<i32> = Vec::new();
+        for row in answer(&out) {
+            let Value::Integer(key) = row[0] else {
+                panic!("the group is {:?} and not an integer", row[0]);
+            };
+            assert_eq!(row[1], Value::BigInt(4), "{row:?} was not counted four times");
+            assert_eq!(
+                row[2],
+                Value::BigInt(i64::from(key) * 4),
+                "{row:?} was not summed four times"
+            );
+            assert_eq!(row[3], Value::Integer(key), "{row:?} kept the wrong least value");
+            seen.push(key);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, values);
+    }
+
+    /// Tables the input has already divided between the instances are left where they are.
+    ///
+    /// The same size and the same shape as the test above, and the only thing that changes is the
+    /// order the keys arrive in: each group's four rows are next to each other rather than a chunk
+    /// apart. That is what TPC-H lineitem looks like grouped by order key, and it means no two
+    /// instances are holding the same group, so folding the tables into shared ones would take the
+    /// locks and remove nothing. [`keys_arrive_together`] is what notices, and the answer still has
+    /// to be right either way.
+    #[test]
+    fn an_aggregate_whose_keys_arrive_in_runs_keeps_its_own_tables() {
+        let plan = parsed(concat!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT, ",
+            "sum(#0.0::INTEGER)::BIGINT, min(#0.0::INTEGER)::INTEGER]"
+        ));
+        let (aggregate, out) = aggregate(&plan);
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        let values: Vec<i32> = (0..120_000).collect();
+        let runs: Vec<i32> = values.iter().flat_map(|&key| [key, key]).collect();
+        for part in runs.chunks(1_024) {
+            for instance in [&mut left, &mut right] {
+                aggregate.sink(&chunk(part), instance).expect("a chunk of runs");
+            }
+        }
+        assert!(
+            aggregate.built.lock().expect("readable").local,
+            "keys that arrive in runs are already divided between the instances"
+        );
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+
+        let mut seen: Vec<i32> = Vec::new();
+        for row in answer(&out) {
+            let Value::Integer(key) = row[0] else {
+                panic!("the group is {:?} and not an integer", row[0]);
+            };
+            assert_eq!(row[1], Value::BigInt(4), "{row:?} was not counted four times");
+            seen.push(key);
         }
         seen.sort_unstable();
         assert_eq!(seen, values);
