@@ -29,14 +29,14 @@ path = "src/main.rs"
 # that ships, so this is the only manifest that can name one. See `main.rs` for what it is worth and
 # `spec/18-package-layout.md` section 18.5 for why it is allowed to be here and nowhere else.
 [dependencies]
-mimalloc = { workspace = true, optional = true }
+libmimalloc-sys = { workspace = true, optional = true }
 rudb.workspace = true
 
 [features]
 default = ["mimalloc"]
 # Off gives a build with no C in it, which is what a packager that wants one asks for and what the
 # measurement is taken against.
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:libmimalloc-sys"]
 
 [lints]
 workspace = true

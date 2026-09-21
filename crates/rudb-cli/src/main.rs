@@ -53,9 +53,16 @@
 //! workspace that ships, and `cargo build --no-default-features` turns it off for a packager that
 //! wants a build with no C in it.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`, and the difference buys exactly one thing. [`heap`] implements a
+// trait that cannot be implemented safely, because it is the thing the safe world is built on, and
+// it is four calls into a C library. Nothing else in this binary, this crate or the workspace is
+// allowed any, and the lint still says so everywhere else.
+#![deny(unsafe_code)]
 
 use std::process::ExitCode;
+
+#[cfg(feature = "mimalloc")]
+mod heap;
 
 /// The allocator every allocation in the shell goes through.
 ///
@@ -63,7 +70,7 @@ use std::process::ExitCode;
 /// initialisation happens on the first allocation rather than here.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOCATOR: heap::MiMalloc = heap::MiMalloc;
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
