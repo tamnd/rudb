@@ -67,6 +67,7 @@ mod plan;
 mod print;
 mod seams;
 mod shape;
+mod unique;
 
 pub use expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
 pub use node::{
@@ -75,6 +76,7 @@ pub use node::{
 pub use plan::Plan;
 pub use seams::seams_of;
 pub use shape::{ROOT, Shape};
+pub use unique::{Keys, keys_of};
 
 /// A reference to an expression in [`Plan`]'s expression arena.
 pub type ExprRef = u32;
