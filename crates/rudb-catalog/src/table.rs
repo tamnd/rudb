@@ -533,6 +533,27 @@ impl Table {
         Ok(())
     }
 
+    /// Points this table at a snapshot of the rows it already holds.
+    ///
+    /// What a checkpoint does after it has written the file. The rows are not changing, only where
+    /// they are read from, which is why this takes a table that has rows where
+    /// [`Table::commit_native`] refuses one. The row count is checked rather than trusted, because
+    /// a snapshot that lost rows would be a silent deletion and this is the last place to catch it.
+    ///
+    /// # Errors
+    ///
+    /// If the snapshot's schema or row count differs from this table's.
+    pub fn rebind_native(&mut self, reader: NativeReader) -> Result<()> {
+        if reader.table().fields() != self.columns {
+            return Err(Error::internal("a committed native snapshot changed its table schema"));
+        }
+        if reader.table().rows() != self.rows.len() {
+            return Err(Error::internal("a committed native snapshot changed its row count"));
+        }
+        self.rows = Rows::Native(reader);
+        Ok(())
+    }
+
     /// The rows, to add to.
     ///
     /// This is the way past the constraint check, and the two `append` methods here are the way
