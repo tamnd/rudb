@@ -1506,6 +1506,11 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             // has been looked at.
             let codes = codes.get(..rows)?;
             let Some(data) = values.data() else {
+                // A dictionary over a packed run, which is what a stored column of numbers with
+                // few distinct values in it is, and where every decimal of TPC-H arrives.
+                if let Some(packed) = values.packed_parts() {
+                    return from_packed(&packed, |row| codes[row] as usize, rows, nulls, want);
+                }
                 // A dictionary whose values sit in a file rather than in a run of memory, which is
                 // what a scan of a native column hands over. There is nothing for the loops below
                 // to read, but an extreme is decided on the bytes and the bytes can be asked for
@@ -1524,52 +1529,72 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             }
             collect::<false, _>(data, |index| codes[index] as usize, rows, nulls, want)
         }
-        Form::BitPacked => {
-            let packed = input.packed_parts()?;
-            match want {
-                Want::Whole => {
-                    let mut total = 0_i128;
-                    for row in 0..rows {
-                        if nulls.is_valid(row) {
-                            total += packed.base() + i128::from(packed.code(row));
-                        }
-                    }
-                    Some(Contribution::Whole(total))
-                }
-                Want::Real { from, .. } => {
-                    let mut total = from;
-                    let mut seen = 0_i64;
-                    for row in 0..rows {
-                        if nulls.is_valid(row) {
-                            total += (packed.base() + i128::from(packed.code(row))) as f64;
-                            seen += 1;
-                        }
-                    }
-                    Some(Contribution::Real { total, seen })
-                }
-                Want::Extreme(least) => {
-                    let mut found: Option<(usize, u64)> = None;
-                    for row in 0..rows {
-                        if !nulls.is_valid(row) {
-                            continue;
-                        }
-                        let code = packed.code(row);
-                        if found.is_none_or(
-                            |(_, held)| {
-                                if least { code < held } else { code > held }
-                            },
-                        ) {
-                            found = Some((row, code));
-                        }
-                    }
-                    Some(Contribution::Extreme(found.map(|(row, _)| row)))
-                }
-            }
-        }
+        Form::BitPacked => from_packed(&input.packed_parts()?, identity, rows, nulls, want),
         // A constant folds in as one value repeated and a sequence as an arithmetic series, and
         // both have a closed form that is better than any loop. Neither is what a scan of a column
         // produces, so both wait for the counter to ask for them.
         _ => None,
+    }
+}
+
+/// A packed run read once, either the vector's own or one a dictionary points into.
+///
+/// A packed vector's value is its base plus its code, so the three loops add the base and carry on
+/// exactly as the flat ones do. An extreme does not add anything at all: a code is a monotone
+/// function of the value it stands for, so the largest code is the largest value and the base only
+/// matters when the winning row is read at the end.
+///
+/// The mapping is a generic parameter for the reason the rest of this file gives, and it is what
+/// lets a dictionary over a packed run come here with its codes rather than through the row at a
+/// time path. That is the form every decimal column of a stored TPC-H table arrives in.
+fn from_packed<M: Fn(usize) -> usize>(
+    packed: &rudb_vector::Packed<'_>,
+    at: M,
+    rows: usize,
+    nulls: &Validity,
+    want: Want,
+) -> Option<Contribution> {
+    match want {
+        Want::Whole => {
+            let mut total = 0_i128;
+            for row in 0..rows {
+                if nulls.is_valid(row) {
+                    total += packed.base() + i128::from(packed.code(at(row)));
+                }
+            }
+            Some(Contribution::Whole(total))
+        }
+        // The scale has to be taken off here the way the flat path takes it off, per row and by
+        // the same factor, or a mean over a `DECIMAL(15, 2)` column comes back a hundred times too
+        // large. The unscaled integer is what a packed run holds, so the division is the only
+        // thing that turns it back into the number the column says it is.
+        Want::Real { scale, from } => {
+            let factor = pow10(scale) as f64;
+            let scaled = scale != 0;
+            let mut total = from;
+            let mut seen = 0_i64;
+            for row in 0..rows {
+                if nulls.is_valid(row) {
+                    let number = (packed.base() + i128::from(packed.code(at(row)))) as f64;
+                    total += if scaled { number / factor } else { number };
+                    seen += 1;
+                }
+            }
+            Some(Contribution::Real { total, seen })
+        }
+        Want::Extreme(least) => {
+            let mut found: Option<(usize, u64)> = None;
+            for row in 0..rows {
+                if !nulls.is_valid(row) {
+                    continue;
+                }
+                let code = packed.code(at(row));
+                if found.is_none_or(|(_, held)| if least { code < held } else { code > held }) {
+                    found = Some((row, code));
+                }
+            }
+            Some(Contribution::Extreme(found.map(|(row, _)| row)))
+        }
     }
 }
 
@@ -2495,6 +2520,45 @@ mod tests {
         update_scattered(&mut states, &slots, 1, 0, Some(&words), 3).expect("folds them in");
         assert_eq!(states[0].finish().expect("finishes"), Value::Varchar("a".into()));
         assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 0);
+    }
+
+    /// The two forms our own storage hands out for a column of numbers, a packed run and a
+    /// dictionary over one. Every aggregate over both against the row at a time path, and the
+    /// counter to say that neither of them reached it.
+    #[test]
+    fn a_packed_run_and_a_dictionary_over_one_do_not_reach_the_row_at_a_time_path() {
+        fallback::reset();
+        let ty = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let values: Vec<Value> = (0..24)
+            .map(|row| {
+                if row % 7 == 0 {
+                    Value::Null
+                } else {
+                    Value::Decimal { unscaled: 900 + row * 13, width: 15, scale: 2 }
+                }
+            })
+            .collect();
+        let packed = Vector::from_values(ty.clone(), &values)
+            .expect("a flat decimal")
+            .bit_packed()
+            .expect("a three hundred wide range packs");
+        assert_eq!(packed.form(), Form::BitPacked);
+        let codes: Vec<u32> = (0..64).map(|row| ((row * 5) % 24) as u32).collect();
+        let over = Vector::dictionary(codes, packed.clone()).expect("codes are in range");
+        assert_eq!(over.form(), Form::Dictionary);
+        for (name, returns) in [
+            ("count", LogicalType::BigInt),
+            ("sum", LogicalType::decimal(38, 2).expect("a legal decimal")),
+            ("avg", LogicalType::Double),
+            ("min", ty.clone()),
+            ("max", ty.clone()),
+        ] {
+            agrees(name, &returns, std::slice::from_ref(&packed), name);
+            agrees(name, &returns, std::slice::from_ref(&over), name);
+        }
+        assert_eq!(fallback::count(Kernel::Aggregate, Form::BitPacked, Form::BitPacked), 0);
+        assert_eq!(fallback::count(Kernel::Aggregate, Form::Dictionary, Form::Dictionary), 0);
+        fallback::reset();
     }
 
     /// The point of the shared accessor. A run length column goes down the same loop a dictionary
