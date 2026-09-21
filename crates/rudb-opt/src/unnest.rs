@@ -4,10 +4,11 @@
 //! Execution never implements that node because each rule here has to remove the dependency before the plan can run.
 //! Scalar projections over correlated filters carry inner filter columns as hidden outputs before the dependent join becomes an ordinary `SINGLE` join.
 //! Scalar aggregates add equality keys directly to their grouping or join against a distinct outer-key domain for arbitrary predicates, so the inner input is still scanned and aggregated once rather than once per outer row.
+//! A correlated side whose shape no rule recognises is refused here and the message names that shape, because this is the last point at which the plan still looks like what someone wrote.
 
 use std::collections::HashMap;
 
-use rudb_common::{LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_plan::{
     Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
     NodeRef, Plan,
@@ -25,6 +26,27 @@ pub fn lower(plan: &mut Plan) -> Result<()> {
     let root = walk::restack(plan, plan.root(), &mut changed, &mut rewrite);
     if changed {
         plan.set_root(root);
+    }
+    refused(plan, plan.root())
+}
+
+/// The error for a dependent join every rule above declined, named by what stopped them.
+///
+/// Each rule is allowed to say it does not recognise a shape, so a plan can come out of the walk
+/// with the dependent join still in it, and this is where that query is refused. Refusing it here
+/// rather than leaving it for execution is what lets the message name the construct in the
+/// subquery: the plan is still the shape the binder gave, and the node that has no rule is still
+/// there to be found and named. Execution keeps a guard of its own, but by then the only thing left
+/// to say is that a node arrived which should not have.
+fn refused(plan: &Plan, at: NodeRef) -> Result<()> {
+    if let Node::DependentJoin { left, right, .. } = *plan.node(at) {
+        let outer = produced(plan, left);
+        let what = domain::unsupported(plan, right, &outer)
+            .unwrap_or_else(|| "a correlated subquery of this shape".to_owned());
+        return Err(Error::not_implemented(what));
+    }
+    for child in plan.node(at).children().into_iter().flatten() {
+        refused(plan, child)?;
     }
     Ok(())
 }

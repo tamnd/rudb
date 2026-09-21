@@ -1697,8 +1697,11 @@ impl<'a> Building<'a, '_> {
                 self.close(left, pipeline, Arc::new(Watched::new(setop, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
+            // Unnesting either removes this node or refuses the query, and it runs before every
+            // other pass, so nothing a query can be written as arrives here. What is left is a
+            // pass that built one, which is a bug in that pass rather than a gap anyone wrote.
             Node::DependentJoin { .. } => {
-                return Err(Error::not_implemented(
+                return Err(Error::internal(
                     "a dependent join reached execution before subquery unnesting",
                 ));
             }
