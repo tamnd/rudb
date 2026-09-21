@@ -346,13 +346,16 @@ impl Value {
     /// Formats a value in a session offset rather than the UTC fallback used by [`std::fmt::Display`].
     #[must_use]
     pub fn to_string_at_offset(&self, offset_seconds: i32) -> String {
-        let offset = offset_text(offset_seconds);
+        // The offset is spelled out only in the two arms that print it. Two of the three arms here
+        // do not, and building the text for them was a string allocated and dropped per value.
         match self {
             Self::TimestampTz(micros) => {
                 let local = micros.saturating_add(i64::from(offset_seconds) * 1_000_000);
-                format!("{}{offset}", Self::Timestamp(local))
+                format!("{}{}", Self::Timestamp(local), offset_text(offset_seconds))
             }
-            Self::TimeTz(micros) => format!("{}{offset}", Self::Time(*micros)),
+            Self::TimeTz(micros) => {
+                format!("{}{}", Self::Time(*micros), offset_text(offset_seconds))
+            }
             other => other.to_string(),
         }
     }

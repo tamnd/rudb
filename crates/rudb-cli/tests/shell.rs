@@ -132,6 +132,11 @@ fn every_positional_after_the_database_is_another_statement() {
 /// above it, a column count beside it, and the hint in the gap between the two. The dots are in
 /// there too, both the alignment of them and the fact that the value they line up under is the
 /// shorter of the two either side of the gap rather than the shortest on show.
+///
+/// The last two lines are a long value hidden in the gap and the same long value down in the tail.
+/// Only the second one widens its column, because a box is as wide as the rows it prints and not as
+/// wide as the rows it has. rudb measured the ones in the gap as well until #1119, which made a
+/// column thirty wide to hold a value it never printed.
 #[test]
 fn the_counts_under_a_table_are_the_ones_duckdb_prints() {
     let queries = golden("counts.sql");
@@ -142,6 +147,27 @@ fn the_counts_under_a_table_are_the_ones_duckdb_prints() {
         let want = golden(&format!("counts-{}.txt", at + 1));
         if !same_ignoring_trailing_space(&out, &want) {
             wrong.push(format!("--- {query}\nwant:\n{want}\ngot:\n{out}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Which modes leave rows out of a long result, which is `duckbox` and nothing else.
+///
+/// All four of these draw a box, so it reads like an oversight that only one of them elides, and it
+/// is not: `.mode box`, `.mode table` and `.mode markdown` print all hundred rows. rudb elided in
+/// all four until #1119, because the eliding lived in the writer every box mode shares rather than
+/// in `duckbox`, so `.mode box` on a hundred rows printed 47 lines where DuckDB prints 104.
+#[test]
+fn only_duckbox_leaves_rows_out() {
+    let mut wrong = Vec::new();
+    for mode in ["duckbox", "box", "table", "markdown"] {
+        let (out, err, failed) =
+            run(&["-cmd", &format!(".mode {mode}"), "-c", "SELECT a AS n FROM range(100) t(a)"]);
+        assert!(!failed, "mode {mode} failed: {err}");
+        let want = golden(&format!("rows-{mode}.txt"));
+        if !same_ignoring_trailing_space(&out, &want) {
+            wrong.push(format!("--- {mode}\nwant:\n{want}\ngot:\n{out}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

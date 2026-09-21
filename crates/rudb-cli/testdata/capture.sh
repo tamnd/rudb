@@ -55,3 +55,10 @@ while IFS= read -r query; do
   at=$((at + 1))
   duckdb -batch -init /dev/null -c "$query" >"$here/counts-$at.txt"
 done <"$here/counts.sql"
+# Which modes leave rows out of a hundred row result. Only duckbox does, and the three table modes
+# beside it print all hundred, which is not a thing anybody would guess from the fact that all four
+# draw a box.
+for mode in duckbox box table markdown; do
+  duckdb -batch -init /dev/null -cmd ".mode $mode" \
+    -c "SELECT a AS n FROM range(100) t(a)" >"$here/rows-$mode.txt"
+done
