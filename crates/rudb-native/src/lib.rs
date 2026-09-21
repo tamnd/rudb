@@ -1677,10 +1677,10 @@ impl NativeText {
     /// value, one for the end and one for the start that is the end before it, and on the ClickBench
     /// `URL` dictionary of eighteen million that was most of the half second a `LIKE` over it took.
     ///
-    /// [`bitpack::unpack_tail`] walks the run instead, which makes the window a fixed sixteen bytes
-    /// and so an unaligned load, and reads the bit position off a counter. A run is five hundred and
-    /// twelve values and a block is two of them, so a block of a thousand and twenty four values
-    /// costs two calls here and nothing per value.
+    /// [`bitpack::unpack_tail`] walks the run instead, which makes the window a fixed width and so
+    /// an unaligned load, and reads the bit position off a counter. A run is five hundred and twelve
+    /// values and a block is two of them, so a block of a thousand and twenty four values costs two
+    /// calls here and nothing per value.
     fn ends_within(&self, first: usize, last: usize) -> Result<Vec<u64>> {
         let mut ends = Vec::with_capacity(last.saturating_sub(first));
         let mut at = first;
@@ -1710,9 +1710,30 @@ impl NativeText {
     }
 
     /// Where the value at `index` starts and ends inside its payload block.
+    ///
+    /// The two offsets sit next to each other in the same run unless the value opens one, and a run
+    /// of seventeen bit offsets, which is what a block of a thousand strings needs, puts a pair of
+    /// them inside one eight byte load. So the common case reads the packed bytes once rather than
+    /// twice and does the bounds arithmetic once. This is asked once per string a text column hands
+    /// out, and on ClickBench 27 the two reads together were a quarter of the query.
     fn span_within(&self, index: usize) -> Result<(u32, u32)> {
-        let end = self.end_within(index)?;
-        let start = self.start_within(index)?;
+        let within = index % TEXT_OFFSET_RUN;
+        let (start, end) = if within == 0 {
+            (self.start_within(index)?, self.end_within(index)?)
+        } else {
+            let run = index / TEXT_OFFSET_RUN;
+            let bytes = self
+                .offsets
+                .get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)
+                .ok_or_else(|| invalid("global dictionary offsets are short"))?;
+            let (start, end) = bitpack::tail_pair(bytes, self.offset_bits, within)
+                .map_err(|_| invalid("global dictionary offsets are short"))?;
+            let ends = u32::try_from(end)
+                .map_err(|_| invalid("global dictionary offset is past the payload"))?;
+            let starts = u32::try_from(start)
+                .map_err(|_| invalid("global dictionary offset is past the payload"))?;
+            (starts, ends)
+        };
         if start > end {
             return Err(invalid("global dictionary value ends before it starts"));
         }
