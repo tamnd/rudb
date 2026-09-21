@@ -314,18 +314,20 @@ fn compare(
 ///
 /// Whatever reading either value raises, and whatever comparing two values of different types does.
 fn place(left: &Cell, right: &Cell, key: SortKey) -> Result<Ordering> {
-    if let (
-        Cell::Coded { dictionary: one, rank: Some(here), .. },
-        Cell::Coded { dictionary: other, rank: Some(there), .. },
-    ) = (left, right)
-    {
-        if Arc::ptr_eq(one, other) {
+    match (left, right) {
+        (Cell::Ready(here), Cell::Ready(there)) => rank(here, there, key),
+        (
+            Cell::Coded { dictionary: one, rank: Some(here), .. },
+            Cell::Coded { dictionary: other, rank: Some(there), .. },
+        ) if Arc::ptr_eq(one, other) => {
             let ordering = here.cmp(there);
-            return Ok(if key.descending { ordering.reverse() } else { ordering });
+            Ok(if key.descending { ordering.reverse() } else { ordering })
+        }
+        _ => {
+            let (here, there) = (left.read()?, right.read()?);
+            rank(&here, &there, key)
         }
     }
-    let (here, there) = (left.read()?, right.read()?);
-    rank(&here, &there, key)
 }
 
 /// The first rows of an ordering, without holding the rest.
@@ -762,17 +764,26 @@ fn against(
 /// this row sits in the same dictionary, which is two loads and an integer compare, and the row's
 /// value is never read. Everything else reads it, which is what this did for every row before.
 ///
+/// A key already sitting there as a value goes straight out the top, rather than through
+/// [`Cell::read`], because that path is what a key that is not a text column out of a file does for
+/// every row of the input and building a `Cow` around a borrow it already had was worth four percent
+/// of ClickBench 24.
+///
 /// # Errors
 ///
 /// Whatever reading either side raises, and whatever comparing two values of different types does.
 fn at_row(column: &Vector, row: usize, held: &Cell, key: SortKey) -> Result<Ordering> {
-    if let Cell::Coded { dictionary, rank: Some(held), .. } = held {
+    let (dictionary, code, place) = match held {
+        Cell::Ready(there) => return rank(&column.try_value_at(row)?, there, key),
+        Cell::Coded { dictionary, code, rank } => (dictionary, code, rank),
+    };
+    if let Some(there) = place {
         if let Some(here) = rank_within(column, row, dictionary) {
-            let ordering = here.cmp(held);
+            let ordering = here.cmp(there);
             return Ok(if key.descending { ordering.reverse() } else { ordering });
         }
     }
-    let (here, there) = (column.try_value_at(row)?, held.read()?);
+    let (here, there) = (column.try_value_at(row)?, dictionary.try_value_at(*code as usize)?);
     rank(&here, &there, key)
 }
 
