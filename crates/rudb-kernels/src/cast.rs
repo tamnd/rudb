@@ -163,6 +163,10 @@ fn swept(input: &Vector, target: &LogicalType) -> Option<Vector> {
             // way in, so the gather below indexes without a bound of its own.
             convert_run(values.data()?, |index| codes[index] as usize, rows, from, into, physical)?
         }
+        // A packed column has no `Data` of its own to read through a mapping, because its values
+        // are not in a container of a width any layout names. They are added out here instead and
+        // the run that comes out goes through the same two exact source quadrants.
+        Form::BitPacked => from_packed(&input.packed_parts()?, rows, from, into, physical)?,
         _ => return None,
     };
     Some(Vector::flat(target.clone(), converted).ok()?.with_validity(nulls_of(input)))
@@ -235,6 +239,61 @@ fn convert_run<M: Fn(usize) -> usize>(
         (Numeric::Approximate { .. }, Numeric::Approximate { single }) => {
             let run = float_run(data, at, rows)?;
             approximate_out(run, single)
+        }
+    }
+}
+
+/// A bit packed column converted, which is the shape a column of our own storage arrives in.
+///
+/// A packed vector's value is its base plus its code, so the run is built by adding the base to
+/// every code and then handed to the same scale move and the same fit the other exact sources use.
+/// The base is added once out here rather than asked about per row: the largest value the width can
+/// hold is checked against the base before the loop starts, and a pair that does not fit goes back
+/// to the row at a time path rather than wrapping.
+///
+/// There is no equivalent of [`straight`] here. That one exists to avoid the `i128` pivot on an
+/// integer to integer cast, and a packed column has to be added into a run of something before
+/// anything can be done with it, so the pivot is already paid and the fit below is the same fit
+/// `straight` does.
+///
+/// A float is never packed, since packing is a range of integers, so the approximate source
+/// quadrants are `None` rather than a loop that cannot be reached.
+///
+/// On TPC-H this is `1 - l_discount` and `l_extendedprice * (1 - l_discount)`, where the binder
+/// widens a `DECIMAL(15, 2)` column on the way into the arithmetic, which is q01, q06, q14 and q19.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
+)]
+fn from_packed(
+    packed: &rudb_vector::Packed<'_>,
+    rows: usize,
+    from: Numeric,
+    into: Numeric,
+    physical: PhysicalType,
+) -> Option<Data> {
+    let Numeric::Exact { scale: was, .. } = from else {
+        return None;
+    };
+    let base = packed.base();
+    let mask = u64::MAX >> (u64::BITS - packed.width());
+    base.checked_add(i128::from(mask))?;
+    let mut run = Vec::with_capacity(rows);
+    for row in 0..rows {
+        run.push(base + i128::from(packed.code(row)));
+    }
+    match into {
+        Numeric::Exact { scale: now, width } => {
+            restage(&mut run, was, now)?;
+            exact_out(run, width, physical)
+        }
+        Numeric::Approximate { single } => {
+            let factor = pow10(was) as f64;
+            let loosened = run
+                .into_iter()
+                .map(|whole| if was == 0 { whole as f64 } else { whole as f64 / factor })
+                .collect();
+            approximate_out(loosened, single)
         }
     }
 }
@@ -2541,6 +2600,10 @@ mod tests {
                 let codes: Vec<u32> = (0..len).map(|_| rng.below(len as u64) as u32).collect();
                 let dictionary =
                     Vector::dictionary(codes, flat.clone()).expect("codes are in range");
+                // A float has no range to pack and a narrow column is not worth packing, and both
+                // of those hand the vector back as it was, so this is the flat case a second time
+                // for some of the fifteen types rather than something to assert about.
+                let packed = flat.bit_packed().expect("packs or hands the vector back");
                 for into in &types {
                     // A cast to the type it already is hands the vector straight back, which for a
                     // dictionary means a dictionary, and the loop below always builds a flat one.
@@ -2551,6 +2614,7 @@ mod tests {
                     }
                     agrees(&flat, into);
                     agrees(&dictionary, into);
+                    agrees(&packed, into);
                 }
             }
         }
@@ -2577,6 +2641,35 @@ mod tests {
         assert_eq!(fallback::count(Kernel::Cast, Form::Flat, Form::Flat), 0);
         cast(&input, &LogicalType::Varchar, false).expect("prints");
         assert_eq!(fallback::count(Kernel::Cast, Form::Flat, Form::Flat), 1);
+        fallback::reset();
+    }
+
+    /// The form a stored decimal column arrives in, widened the way the binder widens it on the
+    /// way into arithmetic, which is the cast q01 and q06 pay once per chunk.
+    #[test]
+    fn a_packed_column_does_not_reach_the_row_at_a_time_path() {
+        fallback::reset();
+        let narrow = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let values: Vec<Value> = (0..64)
+            .map(|row| Value::Decimal { unscaled: 100 + row * 3, width: 15, scale: 2 })
+            .collect();
+        let input = Vector::from_values(narrow, &values)
+            .expect("a flat decimal")
+            .bit_packed()
+            .expect("a two hundred wide range packs");
+        assert_eq!(input.form(), Form::BitPacked);
+        for target in [
+            LogicalType::decimal(18, 2).expect("a legal decimal"),
+            LogicalType::decimal(38, 4).expect("a legal decimal"),
+            LogicalType::BigInt,
+            LogicalType::Double,
+            LogicalType::Float,
+        ] {
+            agrees(&input, &target);
+        }
+        assert_eq!(fallback::count(Kernel::Cast, Form::BitPacked, Form::BitPacked), 0);
+        cast(&input, &LogicalType::Varchar, false).expect("prints");
+        assert_eq!(fallback::count(Kernel::Cast, Form::BitPacked, Form::BitPacked), 1);
         fallback::reset();
     }
 
