@@ -891,25 +891,6 @@ impl Column {
     /// falls through to `holds` a row at a time, exactly as it did before.
     fn holds_run(&self, here: &[Step], seen: &[u64], column: &Vector, same: &mut [bool]) {
         let validity = column.validity();
-        /// One pass over a run of values of the same width as the run the table stored.
-        macro_rules! run {
-            ($stored:expr, $values:expr) => {{
-                let stored = $stored;
-                let values = $values.as_slice();
-                for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
-                    if !*flag {
-                        continue;
-                    }
-                    let slot = slot_of(bucket) as usize;
-                    *flag = match values.get(step.row) {
-                        _ if !self.valid[slot] => !validity.is_valid(step.row),
-                        Some(value) => validity.is_valid(step.row) && *value == stored[slot],
-                        None => self.holds(slot, column, step.row),
-                    };
-                }
-                return;
-            }};
-        }
         if let StoredData::StableText { dictionary, codes: stored } = &self.data {
             if let Some((values, incoming)) = column.stable_dictionary_parts() {
                 if Arc::ptr_eq(dictionary, incoming) {
@@ -941,46 +922,116 @@ impl Column {
                 return;
             }
         } else if let Some((at, values)) = column.positions() {
+            // A dictionary keeps its nulls in the vector it points at, so a row is null when
+            // either the column says so or the value its code names does.
+            let inner = values.validity();
+            let nulled = |row: usize| {
+                !validity.is_valid(row)
+                    || at.get(row).is_none_or(|&code| !inner.is_valid(code as usize))
+            };
+            let code = |row: usize| at.get(row).map_or(usize::MAX, |&code| code as usize);
             if let Some(packed) = values.packed_parts() {
-                // A dictionary keeps its nulls in the vector it points at, so a row is null when
-                // either the column says so or the value its code names does.
-                let inner = values.validity();
-                let nulled = |row: usize| {
-                    !validity.is_valid(row)
-                        || at.get(row).is_none_or(|&code| !inner.is_valid(code as usize))
-                };
-                if self.packed_run(here, seen, same, &packed, nulled, |row| at[row] as usize) {
+                if self.packed_run(here, seen, same, &packed, nulled, code) {
+                    return;
+                }
+            } else if let Some(data) = values.data() {
+                // A dictionary over a plain run, which is what a filter leaves behind on a column
+                // the scan handed over flat: the values stay where they were and the rows that got
+                // through are a list of codes into them. That is the shape the driving side of
+                // every join after a filter arrives in, and before this it was the one shape with
+                // no pass of its own, so a probe step walked down through the form and built a
+                // `Value` per row per column. TPC-H q13 probes 1.5 million filtered `o_custkey`
+                // against a table of 150,000 customers this way.
+                if self.flat_run(here, seen, same, column, data, nulled, code) {
                     return;
                 }
             }
         }
         if let Some(data) = column.data() {
-            match (&self.data, data) {
-                (StoredData::TinyInt(stored), Data::Int8(values)) => run!(stored, values),
-                (StoredData::SmallInt(stored), Data::Int16(values)) => run!(stored, values),
-                (StoredData::Integer(stored), Data::Int32(values)) => run!(stored, values),
-                (StoredData::BigInt(stored), Data::Int64(values)) => run!(stored, values),
-                (StoredData::Varchar(stored), Data::Varlen(strings)) => {
-                    for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
-                        if !*flag {
-                            continue;
-                        }
-                        let slot = slot_of(bucket) as usize;
-                        *flag = match strings.bytes(step.row) {
-                            _ if !self.valid[slot] => !validity.is_valid(step.row),
-                            Some(bytes) => validity.is_valid(step.row) && bytes == stored.get(slot),
-                            None => self.holds(slot, column, step.row),
-                        };
-                    }
-                    return;
-                }
-                _ => {}
+            if self.flat_run(
+                here,
+                seen,
+                same,
+                column,
+                data,
+                |row| !validity.is_valid(row),
+                |row| row,
+            ) {
+                return;
             }
         }
         for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
             if *flag {
                 *flag = self.holds(slot_of(bucket) as usize, column, step.row);
             }
+        }
+    }
+
+    /// [`Self::holds_run`] for a batch whose values lie in a plain run, read through a mapping.
+    ///
+    /// The mapping is what lets one function serve both a flat column, where a row is its own
+    /// index, and a dictionary over a flat run, where a row names a code. `nulled` is separate from
+    /// it for the reason [`Self::packed_run`] gives: a dictionary answers the null from two
+    /// validities and the value from the code, and the two questions do not go to the same place.
+    ///
+    /// `false` when the stored column and the run are not a pair this compares, which sends the
+    /// batch on to whatever the caller has after this.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the batch as three parallel runs, the column and the run inside it, and the two \
+                  mappings that say where a row's value and a row's nulls are"
+    )]
+    fn flat_run<N: Fn(usize) -> bool, C: Fn(usize) -> usize>(
+        &self,
+        here: &[Step],
+        seen: &[u64],
+        same: &mut [bool],
+        column: &Vector,
+        data: &Data,
+        nulled: N,
+        code: C,
+    ) -> bool {
+        /// One pass over a run of values of the same width as the run the table stored.
+        macro_rules! run {
+            ($stored:expr, $values:expr) => {{
+                let stored = $stored;
+                let values = $values.as_slice();
+                for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                    if !*flag {
+                        continue;
+                    }
+                    let slot = slot_of(bucket) as usize;
+                    *flag = match values.get(code(step.row)) {
+                        _ if !self.valid[slot] => nulled(step.row),
+                        Some(value) => !nulled(step.row) && *value == stored[slot],
+                        // A row whose code is out of the run is one this cannot answer, and the
+                        // row at a time path is where it went before any of this existed.
+                        None => self.holds(slot, column, step.row),
+                    };
+                }
+                return true;
+            }};
+        }
+        match (&self.data, data) {
+            (StoredData::TinyInt(stored), Data::Int8(values)) => run!(stored, values),
+            (StoredData::SmallInt(stored), Data::Int16(values)) => run!(stored, values),
+            (StoredData::Integer(stored), Data::Int32(values)) => run!(stored, values),
+            (StoredData::BigInt(stored), Data::Int64(values)) => run!(stored, values),
+            (StoredData::Varchar(stored), Data::Varlen(strings)) => {
+                for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                    if !*flag {
+                        continue;
+                    }
+                    let slot = slot_of(bucket) as usize;
+                    *flag = match strings.bytes(code(step.row)) {
+                        _ if !self.valid[slot] => nulled(step.row),
+                        Some(bytes) => !nulled(step.row) && bytes == stored.get(slot),
+                        None => self.holds(slot, column, step.row),
+                    };
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1838,8 +1889,8 @@ mod tests {
     /// The batched compare is [`Column::holds`] with its two type matches lifted out of the row loop,
     /// so what has to be shown is that it did not change its mind about anything on the way up. An
     /// integer and a string cover both runs it has an arm for, the nulls cover the validity half of
-    /// each arm, and the same values as a dictionary cover the form it has no arm for and falls
-    /// through on. All three have to put the same rows in the same groups in the same order.
+    /// each arm, and the same values as a dictionary cover reading the run through a mapping rather
+    /// than by row. All three have to put the same rows in the same groups in the same order.
     #[test]
     fn the_batched_key_compare_agrees_with_the_one_at_a_time_one_on_every_form() {
         let rows = 30_000;
@@ -1926,6 +1977,52 @@ mod tests {
         assert_eq!(hashed(&flatly[0]), hashed(&coded[0]));
         let (_, through_coded) = a_batch_at_a_time(&coded, values.len(), &types);
         assert_eq!(before, through_coded);
+    }
+
+    /// A dictionary that keeps its nulls in the values it points at rather than in a mask over its
+    /// codes.
+    ///
+    /// The test above puts the nulls in the mask, which is the half of the question the batched
+    /// compare answers off the column's own validity. This puts them where a dictionary built by a
+    /// reader usually puts them, which is in the vector the codes name, and the batched compare has
+    /// to reach through the code to find them. Both are the same column and the row at a time path
+    /// answers both through one call, so the grouping has to come out the same.
+    #[test]
+    fn a_dictionary_whose_nulls_are_in_its_values_groups_as_the_flat_column_it_stands_for() {
+        let rows = 30_000i64;
+        let number = |row: i64| (row * 7919) % 5003;
+        let word = |row: i64| (row * 104_729) % 4001;
+        // Every seventy first code names a null, so the nulls arrive through the dictionary.
+        let digit =
+            |code: i64| if code % 71 == 0 { Value::Null } else { Value::BigInt(code + 1_000_000) };
+        let phrase = |code: i64| {
+            if code % 53 == 0 { Value::Null } else { Value::Varchar(format!("row {code}")) }
+        };
+        let numbers: Vec<Value> = (0..rows).map(|row| digit(number(row))).collect();
+        let words: Vec<Value> = (0..rows).map(|row| phrase(word(row))).collect();
+        let types = [LogicalType::BigInt, LogicalType::Varchar];
+        let flatly = [flat(LogicalType::BigInt, &numbers), flat(LogicalType::Varchar, &words)];
+        let (was, before) = one_at_a_time(&flatly, numbers.len(), &types);
+        assert!(was.buckets.len() > HOT, "the test has to reach the batched path");
+
+        let digits: Vec<Value> = (0..5003).map(digit).collect();
+        let phrases: Vec<Value> = (0..4001).map(phrase).collect();
+        let coded = [
+            Vector::dictionary(
+                (0..rows).map(|row| number(row) as u32).collect(),
+                flat(LogicalType::BigInt, &digits),
+            )
+            .expect("a dictionary over those numbers"),
+            Vector::dictionary(
+                (0..rows).map(|row| word(row) as u32).collect(),
+                flat(LogicalType::Varchar, &phrases),
+            )
+            .expect("a dictionary over those words"),
+        ];
+        assert_eq!(hashed(&flatly[0]), hashed(&coded[0]));
+        assert_eq!(hashed(&flatly[1]), hashed(&coded[1]));
+        let (_, through) = a_batch_at_a_time(&coded, numbers.len(), &types);
+        assert_eq!(before, through);
     }
 
     /// The reason a vacancy cannot be filled inside the batch. Every row of this batch is the first
