@@ -110,7 +110,7 @@ impl Peel {
 
 /// Where one literal sits in a dictionary that came with its sorted order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Found {
+pub enum Found {
     /// The dictionary holds the literal under this code, so a row matches exactly when its code is
     /// this one.
     At(u32),
@@ -121,7 +121,7 @@ pub(crate) enum Found {
 
 /// The result of searching one dictionary for one literal, kept for the life of a query node.
 #[derive(Debug, Default)]
-pub(crate) struct Lookup {
+pub struct Lookup {
     memo: OnceLock<Searched>,
 }
 
@@ -141,7 +141,7 @@ impl Lookup {
     ///
     /// A failed read is returned rather than remembered, so a caller that retries gets the error
     /// again rather than a wrong answer cached from a half finished search.
-    pub(crate) fn find(&self, column: &Vector, wanted: &[u8]) -> Option<Result<Found>> {
+    pub fn find(&self, column: &Vector, wanted: &[u8]) -> Option<Result<Found>> {
         let (_, dictionary) = column.shared_dictionary_parts()?;
         if let Some(memo) = self.memo.get() {
             return Arc::ptr_eq(&memo.dictionary, dictionary).then_some(Ok(memo.found));

@@ -37,12 +37,13 @@ use rudb_common::{
     Error, LogicalType, PhysicalType, Result, Session, SessionTimeZone, Span, Value,
 };
 use rudb_kernels::{
-    Comparison, Connective, Held, Members, Recipe, cast_in_time_zone, combine, compare_prepared,
-    in_set, is_true, refine_flags, refine_prepared, selection,
+    Comparison, Connective, Found, Held, Lookup, Members, Recipe, cast_in_time_zone, combine,
+    compare_prepared, in_set, is_true, refine_flags, refine_prepared, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Assembly, Chunk, Selection, Vector};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::ordering::Ordering;
 use crate::schema::Schema;
@@ -188,6 +189,8 @@ enum Step {
         arms: Vec<PreparedArm>,
         /// The `ELSE`, if there is one. Absent means null.
         otherwise: Option<Prepared>,
+        /// How to answer it as codes, for the shape that can be. Absent means read the values.
+        blend: Option<Blend>,
     },
 }
 
@@ -198,6 +201,45 @@ struct PreparedArm {
     when: Prepared,
     /// The result if the condition is true.
     then: Prepared,
+}
+
+/// A `CASE` over text whose every branch is a column or a literal, answered as codes.
+///
+/// What the general path does with the branches is read their values and write them into a vector of
+/// their own, which for a text column out of a native file decodes a compressed dictionary block per
+/// row and then throws the dictionary away. An operator above that has to work with strings even
+/// though every string it sees came out of one dictionary it could have kept.
+///
+/// It does not have to. The branches here name values rather than compute them, so if they all name
+/// values of one dictionary then so does the answer, and the answer is the codes: one code per row
+/// copied from the branch that claimed the row, and a literal is one code for all of its rows once
+/// the dictionary has been searched for it. Nothing is read and the dictionary comes out the other
+/// side, so a group by over the `CASE` groups on codes the way a group by over the bare column does.
+///
+/// ClickBench 39 is the query this is for. It groups by `CASE WHEN (SearchEngineID = 0 AND
+/// AdvEngineID = 0) THEN Referer ELSE '' END` beside `URL`, and writing that one column out as
+/// strings was a quarter of the query.
+///
+/// The shape is narrow on purpose. A branch that computes anything is not here, because then the
+/// answer is a value that no dictionary holds. A literal the dictionary does not hold is not here
+/// either, for the same reason, and that is decided per dictionary at run time rather than when the
+/// expression is prepared. And a `CASE` with no `ELSE` is not here, because the rows nothing claims
+/// are null and a null is not a code.
+#[derive(Debug)]
+struct Blend {
+    /// Where each branch takes its value from: one per arm in order, and the `ELSE` last.
+    branches: Vec<Branch>,
+    /// The literals the branches name, each with the search that finds it in a dictionary.
+    literals: Vec<(String, Lookup)>,
+}
+
+/// Where one branch of a [`Blend`] takes its value from.
+#[derive(Debug, Clone, Copy)]
+enum Branch {
+    /// A column of the chunk, by resolved position. Its rows keep the codes they arrived with.
+    Column(usize),
+    /// The literal at this index of [`Blend::literals`]. Its rows all get one code.
+    Literal(usize),
 }
 
 /// The per chunk working space of one [`Prepared`].
@@ -728,8 +770,8 @@ impl Prepared {
             Step::InSet { input, members } => {
                 Some(in_set(self.operand(*input, chunk, slots)?, members, ty)?)
             }
-            Step::Case { arms, otherwise } => {
-                Some(self.case(chunk, arms, otherwise.as_ref(), ty)?)
+            Step::Case { arms, otherwise, blend } => {
+                Some(self.case(chunk, arms, otherwise.as_ref(), blend.as_ref(), ty)?)
             }
         };
         Ok(produced)
@@ -820,13 +862,50 @@ impl Prepared {
         chunk: &Chunk,
         arms: &[PreparedArm],
         otherwise: Option<&Prepared>,
+        blend: Option<&Blend>,
         ty: &LogicalType,
     ) -> Result<Vector> {
+        let claimed = self.claims(chunk, arms)?;
+        if let Some(blend) = blend {
+            if let Some(blended) = blended(chunk, &claimed, blend)? {
+                return Ok(blended);
+            }
+        }
         let mut built = Assembly::new(ty.clone(), chunk.len())?;
+        let branches = arms.iter().map(|arm| &arm.then).map(Some).chain([otherwise]);
+        for (branch, rows) in branches.zip(&claimed) {
+            let (Some(branch), false) = (branch, rows.is_empty()) else { continue };
+            // The same cut the conditions skip above, skipped here for the same reason: a branch
+            // that claimed every row claimed them in order, so narrowing to them is a copy of every
+            // column in the chunk to arrive back at the chunk.
+            let cut;
+            let matched = if rows.len() == chunk.len() {
+                chunk
+            } else {
+                cut = narrow(chunk, rows)?;
+                &cut
+            };
+            let mut scratch = branch.scratch();
+            let results = branch.evaluate_one(matched, &mut scratch)?;
+            built.place(&placed(rows)?, results)?;
+        }
+        built.finish()
+    }
+
+    /// The rows each branch of a `CASE` answers, one list per arm in order and the `ELSE` last.
+    ///
+    /// Only the conditions are run here, which is what keeps the rule the doc above states: an arm's
+    /// condition is evaluated over the rows no earlier arm claimed, so a condition that would raise
+    /// on a row an earlier arm took is never asked about it. The results are worked out afterwards,
+    /// once, from these lists, and both ways of working them out want the same thing, which is the
+    /// rows of one branch in the order they arrived in.
+    fn claims(&self, chunk: &Chunk, arms: &[PreparedArm]) -> Result<Vec<Vec<usize>>> {
+        let mut claimed = Vec::with_capacity(arms.len() + 1);
         let mut pending: Vec<usize> = (0..chunk.len()).collect();
         for arm in arms {
             if pending.is_empty() {
-                break;
+                claimed.push(Vec::new());
+                continue;
             }
             // `pending` starts as every row in order and only ever shrinks, so the same length is
             // the same rows in the same order and there is nothing to cut. That is the whole of the
@@ -842,42 +921,22 @@ impl Prepared {
             let mut scratch = arm.when.scratch();
             let flags = arm.when.evaluate_one(narrowed, &mut scratch)?;
             let mut taken = Vec::new();
-            let mut claimed = Vec::new();
             let mut still = Vec::new();
             // row at a time: splitting the rows an arm claims from the ones it leaves is a test per
             // row, and what replaces it is the selection threading the rest of #57 asks for rather
             // than anything that can be done here.
             for (at, &row) in pending.iter().enumerate() {
                 if is_true(&flags.value_at(at)) {
-                    taken.push(at);
-                    claimed.push(row);
+                    taken.push(row);
                 } else {
                     still.push(row);
                 }
             }
-            if !taken.is_empty() {
-                let matched = narrow(narrowed, &taken)?;
-                let mut scratch = arm.then.scratch();
-                let results = arm.then.evaluate_one(&matched, &mut scratch)?;
-                built.place(&placed(&claimed)?, results)?;
-            }
+            claimed.push(taken);
             pending = still;
         }
-        if let Some(otherwise) = otherwise {
-            if !pending.is_empty() {
-                let cut;
-                let narrowed = if pending.len() == chunk.len() {
-                    chunk
-                } else {
-                    cut = narrow(chunk, &pending)?;
-                    &cut
-                };
-                let mut scratch = otherwise.scratch();
-                let results = otherwise.evaluate_one(narrowed, &mut scratch)?;
-                built.place(&placed(&pending)?, results)?;
-            }
-        }
-        built.finish()
+        claimed.push(pending);
+        Ok(claimed)
     }
 
     /// Flattens one expression, appending its steps and returning the index of its last one.
@@ -950,7 +1009,8 @@ impl Prepared {
                     Some(otherwise) => Some(Self::one(plan, otherwise, schema)?),
                     None => None,
                 };
-                Step::Case { arms: prepared, otherwise }
+                let blend = blending(&ty, &prepared, otherwise.as_ref());
+                Step::Case { arms: prepared, otherwise, blend }
             }
         };
         self.steps.push(step);
@@ -1137,6 +1197,104 @@ fn placed(rows: &[usize]) -> Result<Vec<u32>> {
             u32::try_from(row).map_err(|_| Error::internal("a chunk of more than u32 rows"))
         })
         .collect()
+}
+
+/// A `CASE` answered as codes over the dictionary its branches share, or `None` for a chunk that
+/// cannot be.
+///
+/// Declined per chunk rather than once, because whether a column arrives coded is a fact about the
+/// chunk and not about the expression. The same query reads codes out of a native file and plain
+/// strings out of rows held in memory, and one file can hand a column over as a dictionary in one
+/// part and as plain data in the next. Everything that declines does so before a code is written, so
+/// the caller starts the general path from nothing rather than from a half filled answer.
+fn blended(chunk: &Chunk, claimed: &[Vec<usize>], blend: &Blend) -> Result<Option<Vector>> {
+    let Some((dictionary, literals)) = agreed(chunk, blend)? else { return Ok(None) };
+    let mut codes = vec![0; chunk.len()];
+    for (branch, rows) in blend.branches.iter().zip(claimed) {
+        match *branch {
+            Branch::Column(position) => {
+                let Some((from, _)) = chunk.column(position)?.stable_dictionary_parts() else {
+                    return Ok(None);
+                };
+                for &row in rows {
+                    codes[row] = from[row];
+                }
+            }
+            Branch::Literal(at) => {
+                for &row in rows {
+                    codes[row] = literals[at];
+                }
+            }
+        }
+    }
+    Vector::stable_dictionary(codes, dictionary).map(Some)
+}
+
+/// The one dictionary every branch of a blend names values in, and the code each literal sits at.
+///
+/// Three things say no. A column that did not arrive as a stable dictionary has no codes to copy. A
+/// second column over a different dictionary would have codes that mean something else, and a code
+/// is a position in one dictionary and nothing anywhere else. And a literal the dictionary does not
+/// hold has no code at all, which for `ELSE ''` over a column where no row is empty is the honest
+/// answer rather than a missing one.
+///
+/// The null check is the fourth. A dictionary keeps its nulls in the values it points at rather than
+/// beside its codes, so a column carrying its own validity is one whose codes do not say everything
+/// the column says, and copying them would turn its nulls into whatever their codes happen to name.
+fn agreed(chunk: &Chunk, blend: &Blend) -> Result<Option<(Arc<Vector>, Vec<u32>)>> {
+    let mut held: Option<(&Vector, &Arc<Vector>)> = None;
+    for branch in &blend.branches {
+        let Branch::Column(position) = *branch else { continue };
+        let column = chunk.column(position)?;
+        let Some((_, dictionary)) = column.stable_dictionary_parts() else { return Ok(None) };
+        if column.validity().has_nulls(chunk.len()) {
+            return Ok(None);
+        }
+        match held {
+            Some((_, first)) if !Arc::ptr_eq(first, dictionary) => return Ok(None),
+            Some(_) => {}
+            None => held = Some((column, dictionary)),
+        }
+    }
+    let Some((column, dictionary)) = held else { return Ok(None) };
+    let mut codes = Vec::with_capacity(blend.literals.len());
+    for (text, lookup) in &blend.literals {
+        match lookup.find(column, text.as_bytes()) {
+            Some(Ok(Found::At(code))) => codes.push(code),
+            Some(Err(error)) => return Err(error),
+            Some(Ok(Found::Absent)) | None => return Ok(None),
+        }
+    }
+    Ok(Some((Arc::clone(dictionary), codes)))
+}
+
+/// The blend a `CASE` can be answered by, or `None` for one that has to read its branches' values.
+fn blending(ty: &LogicalType, arms: &[PreparedArm], otherwise: Option<&Prepared>) -> Option<Blend> {
+    if !matches!(ty, LogicalType::Varchar) {
+        return None;
+    }
+    let otherwise = otherwise?;
+    let mut branches = Vec::with_capacity(arms.len() + 1);
+    let mut literals = Vec::new();
+    for branch in arms.iter().map(|arm| &arm.then).chain([otherwise]) {
+        branches.push(named(branch, &mut literals)?);
+    }
+    // All of them literals means there is no dictionary to name any of them in, and a `CASE` whose
+    // every branch is a constant is not a thing anybody writes.
+    let any = branches.iter().any(|branch| matches!(branch, Branch::Column(_)));
+    any.then_some(Blend { branches, literals })
+}
+
+/// The branch a prepared expression stands for, when it names a value rather than computing one.
+fn named(prepared: &Prepared, literals: &mut Vec<(String, Lookup)>) -> Option<Branch> {
+    match prepared.steps.as_slice() {
+        [Step::Column(position)] => Some(Branch::Column(*position)),
+        [Step::Constant(Value::Varchar(text))] => {
+            literals.push((text.clone(), Lookup::default()));
+            Some(Branch::Literal(literals.len() - 1))
+        }
+        _ => None,
+    }
 }
 
 /// The chunk cut down to the given rows.
