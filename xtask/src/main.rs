@@ -252,8 +252,30 @@ fn ci(full: bool) -> Result<(), String> {
     // alone. A change that broke the corpus broke it in a way the tests here did not see, which is
     // the whole reason the corpus lives in the other repository.
     step("corpus", || conform::check(&root))?;
-    println!("everything the gate runs is green in {}", took(whole));
+    println!("everything the gate runs is green in {} on {}", took(whole), machine());
     Ok(())
+}
+
+/// The machine the number beside it was measured on.
+///
+/// A gate that took eighteen minutes on eight cores at load nineteen and a gate that takes forty
+/// seconds on an idle machine are the same gate, and without this line the only thing anybody has
+/// to go on is the eighteen minutes. The run that prompted this was sharing a box with two other
+/// full workspace test runs and nothing in the output said so, which sent an afternoon after a
+/// slow gate that was not slow. The same argument `step` makes one stage at a time: a measurement
+/// costs nothing next to the thing it measures and it replaces a guess.
+///
+/// The load average is a Linux file and the machines that run into this are Linux. Elsewhere the
+/// core count on its own is still worth more than nothing.
+fn machine() -> String {
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string));
+    match load {
+        Some(load) => format!("{cores} cores at load {load}"),
+        None => format!("{cores} cores"),
+    }
 }
 
 /// The format check, over the crates that changed rather than over the whole workspace.
@@ -395,7 +417,12 @@ fn msrv_scoped(scope: &[String]) -> Result<(), String> {
 /// warning, CI sets `RUSTFLAGS: -D warnings` and does not, and the difference is discovered on a
 /// pull request instead of on the machine that made it. Both are overridable from the environment
 /// for the case where somebody genuinely wants to build through a warning while debugging.
-fn cargo(args: &[&str]) -> Result<(), String> {
+/// Every compile the gate runs goes through here, and that is the point rather than a convenience.
+/// Cargo hashes `RUSTFLAGS` into every unit it builds, so two stages that disagree about it by one
+/// variable share not a single artifact: the second one walks the whole crate graph again, printing
+/// the same crate names the first one just printed. The corpus step used to build the shell through
+/// `compare::build`, which leaves `RUSTFLAGS` alone on purpose, and paid exactly that.
+pub(crate) fn cargo(args: &[&str]) -> Result<(), String> {
     println!("cargo {}", args.join(" "));
     let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     if std::env::var_os("RUSTFLAGS").is_none() {
@@ -407,6 +434,13 @@ fn cargo(args: &[&str]) -> Result<(), String> {
     let status = command
         .args(args)
         .current_dir(root())
+        // `cargo xtask` is itself a cargo run, so these arrive set to this task's own package and
+        // would be inherited by every compile below. Cargo does not read them, but a build script
+        // in the tree might, and one that reads the wrong package name is a failure that takes an
+        // afternoon to find. `compare::build` removes them for the same reason.
+        .env_remove("CARGO_MANIFEST_DIR")
+        .env_remove("CARGO_PKG_NAME")
+        .env_remove("CARGO_PKG_VERSION")
         .status()
         .map_err(|e| format!("could not run cargo: {e}"))?;
     if status.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }

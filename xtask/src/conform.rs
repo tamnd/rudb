@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::compare::{binary, build};
+use crate::compare::binary;
 
 /// Run the committed corpus and fail when the checkout is missing, which is what the task does.
 pub(crate) fn run(root: &Path) -> Result<(), String> {
@@ -52,7 +52,13 @@ fn corpus(root: &Path, harness: &Path) -> Result<(), String> {
     // Debug, unlike `cargo xtask bench`, which builds the release binary because it is producing a
     // number. This is producing an answer, the answer is the same at either optimization level, and
     // the debug binary is the one the rest of the gate has already built.
-    build(root, &["build", "--package", "rudb-cli"], "rudb")?;
+    //
+    // Through the same door the rest of the gate compiles through, and not through
+    // `compare::build`, which leaves `RUSTFLAGS` alone on purpose because the benchmark path wants
+    // it that way. The gate sets `-D warnings`, cargo hashes that into every unit, and so this step
+    // used to disagree with the stage above it by one variable and rebuild the entire crate graph
+    // before it could run a single query. Now the shell is almost always already sitting there.
+    crate::cargo(&["build", "--package", "rudb-cli"])?;
     let shell = root.join("target").join("debug").join(binary("rudb"));
     if !shell.is_file() {
         return Err(format!("built rudb-cli and then could not find {}", shell.display()));
