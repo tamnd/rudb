@@ -167,9 +167,17 @@ enum State {
     /// `exact` goes false the first time a value is not a whole number, or the first time the total
     /// would overflow, and from then on `real` carries it. A column of doubles therefore lands on
     /// the same additions in the same order as before, which is what the float path has to keep.
+    ///
+    /// A decimal column is whole numbers too. What it stores is an integer and the type says where
+    /// the point goes, so `total` carries the sum of those integers and `scale` says how far to move
+    /// the point once, at the end. That is the same argument the paragraph above makes for an
+    /// integer column, and the alternative is what this used to do: turn each row into a double,
+    /// divide it by a hundred and add that, which is a conversion and a division per row to reach a
+    /// worse number than one division of an exact sum reaches. `scale` is zero for every type that
+    /// is not a decimal, where dividing by one is what it has always done.
     // The exact and floating totals are mutually exclusive. The floating total's bits occupy the
     // same word as the exact i128 after `exact` becomes false, cutting every AVG state by 16 bytes.
-    Mean { total: i128, seen: i64, exact: bool, returns: Return },
+    Mean { total: i128, seen: i64, exact: bool, scale: u8, returns: Return },
     /// A running total at a fixed decimal scale.
     Scaled { total: i128, scale: u8, seen: bool, returns: Return },
     /// The smallest or largest value so far.
@@ -264,9 +272,20 @@ impl Accumulator {
     }
 
     /// Finish an exact integer AVG held in a compact grouped state.
+    ///
+    /// The scale is zero because every caller of this has already checked that what it added up was
+    /// an integer column. A decimal never reaches a compact state.
     #[must_use]
     pub fn exact_avg(total: i128, seen: i64, returns: &LogicalType) -> Self {
-        Self { state: State::Mean { total, seen, exact: true, returns: Return::new(returns) } }
+        Self {
+            state: State::Mean {
+                total,
+                seen,
+                exact: true,
+                scale: 0,
+                returns: Return::new(returns),
+            },
+        }
     }
 
     fn kind(&self) -> Kind {
@@ -328,7 +347,9 @@ impl Accumulator {
             Kind::CountStar | Kind::Count => {
                 State::Counted { count: 0, star: kind == Kind::CountStar }
             }
-            Kind::Avg => State::Mean { total: 0, seen: 0, exact: true, returns },
+            // The scale is the argument's and not the result's, and the argument is not known here,
+            // so it arrives with the first vector or the first value folded in.
+            Kind::Avg => State::Mean { total: 0, seen: 0, exact: true, scale: 0, returns },
             Kind::Min | Kind::Max => State::Extreme { held: None, least: kind == Kind::Min },
             Kind::Sum => match returns {
                 Return::Decimal(_) => State::Scaled { total: 0, scale, seen: false, returns },
@@ -374,18 +395,29 @@ impl Accumulator {
                 *total += approximate_or_error(value)?;
                 *seen += 1;
             }
-            State::Mean { total, seen, exact, .. } => {
-                match integral(value)
-                    .filter(|_| *exact)
-                    .and_then(|number| total.checked_add(number))
-                {
+            State::Mean { total, seen, exact, scale, .. } => {
+                // A decimal is the integer it is stored as, with the point put back once at the
+                // end, so it counts as whole here exactly as an integer does. See [`State::Mean`].
+                let whole = match *value {
+                    Value::Decimal { unscaled, scale: held, .. } => {
+                        *scale = held;
+                        Some(unscaled)
+                    }
+                    _ => integral(value),
+                };
+                match whole.filter(|_| *exact).and_then(|number| total.checked_add(number)) {
                     Some(sum) => *total = sum,
                     None => {
                         // The first value that is not whole, or the first one that would overflow.
                         // What was counted exactly so far comes across as one conversion, and the
-                        // rest of the column is added the way it always was.
+                        // rest of the column is added the way it always was. A decimal that got
+                        // here adds its unscaled integer, since that is the unit the total is in.
                         let real = if *exact { exactly(*total) } else { mean_real(*total) };
-                        *total = mean_bits(real + approximate_or_error(value)?);
+                        let add = match whole {
+                            Some(number) => exactly(number),
+                            None => approximate_or_error(value)?,
+                        };
+                        *total = mean_bits(real + add);
                         *exact = false;
                     }
                 }
@@ -487,18 +519,33 @@ impl Accumulator {
         {
             return Ok(true);
         }
+        // A mean has to know the scale of what it is adding up, and the column is where that comes
+        // from. It is set before the total is touched rather than alongside it, because a vector
+        // that contributes nothing still says what the column is.
+        if let (State::Mean { scale, .. }, LogicalType::Decimal { scale: held, .. }) =
+            (&mut self.state, input.logical_type())
+        {
+            *scale = *held;
+        }
         let want = match (&self.state, input.logical_type()) {
             (State::Whole { .. }, _) => Want::Whole,
             (State::Real { total, .. }, ty) => {
                 Want::Real { scale: decimal_scale(ty), from: *total }
             }
-            // An exact mean over an integer column is read the way a sum is and divided at the end.
-            // Anything else is the float path, carried on from wherever the total is now, which for
-            // a mean that was exact until this vector is the exact total converted once.
-            (State::Mean { exact: true, .. }, ty) if ty.is_integer() => Want::Whole,
-            (State::Mean { total, exact, .. }, ty) => {
+            // An exact mean over an integer or a decimal column is read the way a sum is and
+            // divided at the end. Anything else is the float path, carried on from wherever the
+            // total is now, which for a mean that was exact until this vector is the exact total
+            // converted once.
+            (State::Mean { exact: true, .. }, ty)
+                if ty.is_integer() || matches!(ty, LogicalType::Decimal { .. }) =>
+            {
+                Want::Whole
+            }
+            // The scale is zero whatever the column is, because the total a mean carries is already
+            // in the units the column stores, and moving the point is the finish's job.
+            (State::Mean { total, exact, .. }, _) => {
                 let from = if *exact { exactly(*total) } else { mean_real(*total) };
-                Want::Real { scale: decimal_scale(ty), from }
+                Want::Real { scale: 0, from }
             }
             // A total at the scale the column is already held at is a sum of the raw unscaled
             // integers and nothing else, which is the case every real query is in, because the sum
@@ -619,9 +666,15 @@ impl Accumulator {
                 *seen += more;
             }
             (
-                State::Mean { total, seen, exact, .. },
-                State::Mean { total: added, seen: more, exact: whole, .. },
+                State::Mean { total, seen, exact, scale, .. },
+                State::Mean { total: added, seen: more, exact: whole, scale: from, .. },
             ) => {
+                // Two states over one call are over one column, so where both have folded a row
+                // they agree about the scale. Where this one has not, it has no scale of its own
+                // and takes the one the other learned.
+                if *seen == 0 {
+                    *scale = *from;
+                }
                 // Both sides exact and the sum still fitting is the case worth keeping exact,
                 // because it is `AVG` over an integer column and it is what gives the same answer
                 // however the rows were divided. Anything else falls to the floating total, and it
@@ -710,16 +763,24 @@ impl Accumulator {
                 }
                 Ok(Value::Double(answer))
             }
-            State::Mean { total, seen, exact, .. } => {
+            State::Mean { total, seen, exact, scale, .. } => {
                 if *seen == 0 {
                     return Ok(Value::Null);
                 }
                 let total = if *exact { exactly(*total) } else { mean_real(*total) };
+                // One division, by the count and the scale together. Where the column was a decimal
+                // the total is the sum of the integers it stores, so the point has still to go back,
+                // and dividing by the count and then by a hundred rounds twice where dividing by a
+                // hundred times the count rounds once. That last digit is what duckdb answers with,
+                // and on the eight cells of TPC-H query 1 where the two orders differ the single
+                // division is the one that agrees with it. A power of ten is exact as a double well
+                // past any scale a decimal can declare, so the product is exact too.
                 #[expect(
                     clippy::cast_precision_loss,
                     reason = "the count of rows in one group is well inside the exact range"
                 )]
-                let answer = total / *seen as f64;
+                let divisor = *seen as f64 * pow10(*scale) as f64;
+                let answer = total / divisor;
                 if self.returns() == Return::Float {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -1143,8 +1204,13 @@ impl Where<'_> {
 enum Feed {
     /// A count of the rows that are not null, which reads the mask and not the data.
     Counted,
-    /// An exact number per row.
-    Whole,
+    /// An exact number per row, at the scale the column holds it at.
+    ///
+    /// The scale is carried rather than applied. A total of the integers a decimal column stores is
+    /// the total of the column with the point moved, so the point moves once where the total is
+    /// read and not once per row on the way in. Everything but a mean ignores it, because a sum of
+    /// a decimal is declared at the column's own scale and so is already the answer.
+    Whole { scale: u8 },
     /// A number per row in floating point, at the scale a decimal column is held at.
     Real { scale: u8 },
     /// A number per row against the best that group has seen, the smallest one if true.
@@ -1159,14 +1225,21 @@ enum Feed {
 fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
     match (&first.state, ty) {
         (State::Counted { .. }, _) => Some(Feed::Counted),
-        (State::Whole { .. }, _) => Some(Feed::Whole),
+        (State::Whole { .. }, _) => Some(Feed::Whole { scale: 0 }),
         (State::Scaled { scale, .. }, LogicalType::Decimal { scale: held, .. })
             if held == scale =>
         {
-            Some(Feed::Whole)
+            Some(Feed::Whole { scale: 0 })
         }
         (State::Scaled { .. }, _) => None,
-        (State::Mean { .. }, ty) if ty.is_integer() => Some(Feed::Whole),
+        (State::Mean { .. }, ty) if ty.is_integer() => Some(Feed::Whole { scale: 0 }),
+        // A mean over a decimal adds the integers the column stores and moves the point once, at
+        // the finish. See [`State::Mean`], which is where the scale ends up.
+        (State::Mean { .. }, LogicalType::Decimal { scale, .. }) => {
+            Some(Feed::Whole { scale: *scale })
+        }
+        // A mean whose column is a float carries its total in that column's own units, which is
+        // why the scale here is the column's and is zero for everything that reaches this arm.
         (State::Mean { .. } | State::Real { .. }, ty) => {
             Some(Feed::Real { scale: decimal_scale(ty) })
         }
@@ -1264,7 +1337,7 @@ fn scatter<M: Fn(usize) -> usize>(
 ) -> Result<bool> {
     match feed {
         Feed::Counted => Ok(true),
-        Feed::Whole => whole_into(states, into, run, at),
+        Feed::Whole { scale } => whole_into(states, into, run, at, scale),
         Feed::Real { scale } => real_into(states, into, run, at, scale),
         Feed::Extreme(least) => extreme_into(states, into, run, at, least),
     }
@@ -1276,6 +1349,7 @@ fn whole_into<M: Fn(usize) -> usize>(
     into: Where<'_>,
     run: &Run<'_>,
     at: M,
+    scale: u8,
 ) -> Result<bool> {
     macro_rules! each {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
@@ -1286,7 +1360,7 @@ fn whole_into<M: Fn(usize) -> usize>(
                             continue;
                         }
                         let Some(index) = into.index(row) else { continue };
-                        fold_whole(&mut states[index], i128::from(values[at(row)]))?;
+                        fold_whole(&mut states[index], i128::from(values[at(row)]), scale)?;
                     }
                 })+
                 // A total of hugeints can overflow inside one group, and then the overflow is the
@@ -1330,7 +1404,7 @@ fn packed_into<M: Fn(usize) -> usize>(
     let base = packed.base();
     match feed {
         Feed::Counted => Ok(true),
-        Feed::Whole => {
+        Feed::Whole { scale } => {
             if wide {
                 return Ok(false);
             }
@@ -1339,7 +1413,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                     continue;
                 }
                 let Some(index) = into.index(row) else { continue };
-                fold_whole(&mut states[index], base + i128::from(packed.code(at(row))))?;
+                fold_whole(&mut states[index], base + i128::from(packed.code(at(row))), scale)?;
             }
             Ok(true)
         }
@@ -1389,13 +1463,17 @@ fn packed_into<M: Fn(usize) -> usize>(
 }
 
 /// One exact number into one accumulator, which is [`Accumulator::update`] with the `Value` gone.
-fn fold_whole(into: &mut Accumulator, number: i128) -> Result<()> {
+///
+/// `scale` is where the column keeps its point, which only a mean needs and which it needs on every
+/// state it touches, since a state is finished without the column being in reach.
+fn fold_whole(into: &mut Accumulator, number: i128, scale: u8) -> Result<()> {
     match &mut into.state {
         State::Whole { total, seen, .. } | State::Scaled { total, seen, .. } => {
             *total = total.checked_add(number).ok_or_else(overflowed)?;
             *seen = true;
         }
-        State::Mean { total, seen, exact, .. } => {
+        State::Mean { total, seen, exact, scale: held, .. } => {
+            *held = scale;
             match total.checked_add(number).filter(|_| *exact) {
                 Some(sum) => *total = sum,
                 None => {
@@ -3068,6 +3146,63 @@ mod tests {
             Value::HugeInt(3),
             "only the three ones"
         );
+    }
+
+    /// A mean over a decimal column is the exact total divided once.
+    ///
+    /// A decimal stores an integer and the type says where the point goes, so the column adds up
+    /// exactly and the only rounding is the division at the end. Turning each row into a double and
+    /// dividing it by a hundred before adding it rounds once per row instead, and those roundings do
+    /// not cancel: the two answers below differ, and the first is the one duckdb gives.
+    ///
+    /// The same total whichever way the rows were divided is the other half of it. Two workers over
+    /// one column reach an answer that does not depend on where the split fell, which a running
+    /// double does not, and that is what makes a parallel `AVG` over a decimal repeatable.
+    #[test]
+    fn a_mean_of_a_decimal_column_adds_exactly_and_divides_once() {
+        let ty = LogicalType::Decimal { width: 15, scale: 2 };
+        let rows: Vec<Value> = (0..10_000)
+            .map(|row: i64| Value::Decimal {
+                unscaled: i128::from(row % 97 + 3),
+                width: 15,
+                scale: 2,
+            })
+            .collect();
+        let total: i128 = (0..10_000i64).map(|row| i128::from(row % 97 + 3)).sum();
+        #[expect(clippy::cast_precision_loss, reason = "the test is about which double comes out")]
+        let exact = total as f64 / (rows.len() as f64 * 100.0);
+        assert_eq!(run("avg", &LogicalType::Double, &rows), Value::Double(exact));
+
+        // What the same column comes to when every row is descaled before it is added, which is
+        // what this used to do. It has to differ, or the test above is asserting nothing.
+        #[expect(clippy::cast_precision_loss, reason = "the test is about which double comes out")]
+        let drifted = rows
+            .iter()
+            .map(|row| match row {
+                Value::Decimal { unscaled, .. } => *unscaled as f64 / 100.0,
+                other => unreachable!("{other:?}"),
+            })
+            .sum::<f64>()
+            / rows.len() as f64;
+        assert_ne!(drifted, exact, "the naive order has to round differently");
+
+        let vector = Vector::from_values(ty, &rows).expect("a decimal vector");
+        let mut whole = Accumulator::new("avg", &LogicalType::Double).expect("a known one");
+        whole.update_run(std::slice::from_ref(&vector), rows.len()).expect("totals");
+        assert_eq!(whole.finish().expect("finishes"), Value::Double(exact), "one vector");
+
+        for cut in [1, 3_000, 9_999] {
+            let mut first = Accumulator::new("avg", &LogicalType::Double).expect("a known one");
+            let mut rest = Accumulator::new("avg", &LogicalType::Double).expect("a known one");
+            for row in &rows[..cut] {
+                first.update(std::slice::from_ref(row)).expect("accumulates");
+            }
+            for row in &rows[cut..] {
+                rest.update(std::slice::from_ref(row)).expect("accumulates");
+            }
+            first.combine(&rest).expect("two halves of one column");
+            assert_eq!(first.finish().expect("finishes"), Value::Double(exact), "split at {cut}");
+        }
     }
 
     /// Why the whole sum stops at sixty four bits: at a hundred and twenty eight the total of one
