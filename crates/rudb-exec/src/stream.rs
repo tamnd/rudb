@@ -102,6 +102,14 @@ impl Stream for Filter {
         }
         Ok(Progress::More)
     }
+
+    /// A pass over the rows for every step of the predicate that does anything to one.
+    ///
+    /// A comparison against a literal is one, and a filter of five of them under an `AND` is six.
+    /// See [`Prepared::passes`].
+    fn weight(&self) -> usize {
+        self.predicate.passes()
+    }
 }
 
 /// How many more times the rows a filter keeps will be read, counted from the plan above it.
@@ -235,6 +243,14 @@ impl Stream for Project {
         self.exprs.evaluate(chunk, scratch, &mut columns)?;
         *chunk = Chunk::with_rows(columns, chunk.len())?;
         Ok(Progress::More)
+    }
+
+    /// A pass over the rows for every step that does anything to one. See [`Prepared::passes`].
+    ///
+    /// A projection that only names columns answers zero, which is what most of them are and what
+    /// the rule above the scan was calibrated against.
+    fn weight(&self) -> usize {
+        self.exprs.passes()
     }
 }
 

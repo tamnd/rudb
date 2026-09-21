@@ -93,7 +93,7 @@ impl Source for Buffered {
         Some(Morsel::new(index, index, index + 1))
     }
 
-    fn morsels(&self, threads: usize) -> Option<usize> {
+    fn morsels(&self, threads: usize, _weight: usize) -> Option<usize> {
         let chunks = self.shared.chunks.lock().ok()?;
         let rows = chunks.iter().map(Chunk::len).sum::<usize>();
         let useful = rows.div_ceil(50_000).clamp(1, 4);

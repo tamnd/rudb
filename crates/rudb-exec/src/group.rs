@@ -26,7 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use rudb_common::{
-    Error, Field, LogicalType, Memory, Reservation, Result, Session, Stage, Value, stage,
+    Error, Field, LogicalType, Memory, PhysicalType, Reservation, Result, Session, Stage, Value,
+    stage,
 };
 use rudb_kernels::{Accumulator, NOWHERE, is_true, settle_extremes, update_scattered};
 use rudb_pipeline::{Lease, Progress, Sink};
@@ -3580,6 +3581,36 @@ impl Sink for Aggregate<'_> {
     /// whatever its source wanted.
     fn finalize_degree(&self, ceiling: usize) -> usize {
         if self.groups.is_empty() { 1 } else { ceiling }
+    }
+
+    /// A row costs a grouped aggregate far more than it costs the operators it sits above.
+    ///
+    /// It builds the row's key, hashes it, probes a table with the hash, and compares the key
+    /// against whatever it landed on, and only then does it fold the row's values into a state.
+    /// None of that is the one load and one store an ordinary operator spends, and the probe is a
+    /// random access into a table that a query with many groups has no hope of keeping in cache.
+    ///
+    /// What is counted is the key, because the key is what all four of those steps are about and
+    /// it is the one thing about the cost that is known before a row is read. A column of it is
+    /// worth one and a variable width column of it is worth three more, since a `VARCHAR` key is
+    /// hashed over its bytes rather than over a register and compared the same way. Measured on
+    /// ClickBench 39, whose key is three narrow integers beside two wide strings, the aggregate
+    /// spends a hundred and eleven nanoseconds a row against the two or three a plain projection
+    /// does, and this counts it as eleven.
+    ///
+    /// The key and the arguments are worked out here rather than by a projection underneath, so
+    /// the steps that compute them are counted too. ClickBench 42 groups by
+    /// `DATE_TRUNC('minute', EventTime)` and there is no `Project` in its pipeline at all, because
+    /// the truncation is a step of this operator's own expressions.
+    ///
+    /// An ungrouped aggregate over bare columns has no key, no table and nothing to compute, so it
+    /// answers zero and the rule above the scan is left exactly as it was.
+    fn weight(&self) -> usize {
+        let keys = self.keys.iter().map(|&key| {
+            let ty = self.plan.expr_type(key);
+            if ty.physical() == PhysicalType::Varlen || ty.is_nested() { 4 } else { 1 }
+        });
+        keys.sum::<usize>() + self.inputs.passes()
     }
 
     fn local(&self) -> Partitioned {

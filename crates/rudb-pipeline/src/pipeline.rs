@@ -117,10 +117,22 @@ impl<'a> Pipeline<'a> {
     #[must_use]
     pub fn degree(&self, ceiling: usize) -> usize {
         let ceiling = if self.parallel() { ceiling.max(1) } else { 1 };
-        match self.source.morsels(ceiling) {
+        match self.source.morsels(ceiling, self.weight()) {
             Some(work) => work.clamp(1, ceiling),
             None => ceiling,
         }
+    }
+
+    /// What one row costs this pipeline, counted in what the source spends reading it.
+    ///
+    /// One for the source, plus whatever each operator says it spends beyond an ordinary one. See
+    /// [`Stream::weight`](crate::Stream::weight). The source is the only caller, and it is the
+    /// caller because the source is what decides how many instances to run and the row count it
+    /// used to decide on was only ever standing in for the work behind those rows.
+    #[must_use]
+    pub fn weight(&self) -> usize {
+        let streams = self.streams.iter().map(|stream| stream.row_weight()).sum::<usize>();
+        1_usize.saturating_add(streams).saturating_add(self.sink.row_weight())
     }
 
     /// How many threads to borrow for this pipeline, which is not always how many instances to run.

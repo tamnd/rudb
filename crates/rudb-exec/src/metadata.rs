@@ -107,7 +107,7 @@ impl Source for Metadata {
         self.handout.take()
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
+    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
         Some(self.handout.total())
     }
 
