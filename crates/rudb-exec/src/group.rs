@@ -110,10 +110,10 @@ fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
 ///
 /// # Radix partition ownership
 ///
-/// A grouped aggregate hashes a chunk once and divides its rows by the high four hash bits. Each of
-/// the sixteen partitions owns one table behind its own lock. Workers can update different tables
-/// together, while equal keys always reach the same table and are stored once. This avoids both the
-/// duplicate table memory and the second probe that a merge of per-worker tables requires.
+/// A grouped aggregate hashes a chunk once and divides its rows by the high six hash bits. Each of
+/// the sixty four partitions owns one table behind its own lock. Workers can update different
+/// tables together, while equal keys always reach the same table and are stored once. This avoids
+/// both the duplicate table memory and the second probe that a merge of per-worker tables requires.
 ///
 /// The rows of a partition are gathered into typed vectors before they are folded. That keeps the
 /// existing column kernels and table probe intact. An ungrouped aggregate and a grouping under a
@@ -284,8 +284,8 @@ struct EncodedCountExchange {
 /// The same move [`BigIntDistinctRuns`] is, for the same reason and with the same saving. An
 /// instance used to append its records onto the shared run while holding the partition's lock, which
 /// on the million row ClickBench file is twenty two of the twenty four megabytes it scattered copied
-/// a second time, with sixteen instances queueing behind sixteen locks to do it. Handing the run
-/// over is a move, and the fold walks the runs one after another instead of one flat array.
+/// a second time, with sixteen instances queueing behind one lock per partition to do it. Handing
+/// the run over is a move, and the fold walks the runs one after another instead of one flat array.
 #[derive(Debug, Default)]
 struct EncodedCountRuns {
     runs: Vec<EncodedCountPartition>,
@@ -327,9 +327,9 @@ fn widest_run(lengths: impl Iterator<Item = usize>) -> Option<usize> {
 
 /// How many of a bucket's bits hold the slot its group sits at, the rest being the tag.
 ///
-/// Twenty four, which is sixteen million groups in one radix partition and two hundred and sixty
-/// eight million across the sixteen. A partition that outgrows it says so rather than wrapping, and
-/// the ClickBench file would have to be two hundred times larger before one did.
+/// Twenty four, which is sixteen million groups in one radix partition and a billion across the
+/// sixty four. A partition that outgrows it says so rather than wrapping, and the ClickBench file
+/// would have to be hundreds of times larger before one did.
 const SLOT_BITS: u32 = 24;
 
 /// The part of a bucket that is the slot.
@@ -473,8 +473,8 @@ struct Built {
     /// What those chunks are charged, held for as long as they are readable.
     ///
     /// One per partition rather than one in total, because the partitions are finished on separate
-    /// threads and a reservation belongs to the thread growing it. Moving sixteen charges into one
-    /// at the end would mean holding both the old and the new charge for as long as the move took,
+    /// threads and a reservation belongs to the thread growing it. Moving a charge per partition
+    /// into one at the end would mean holding both charges for as long as the move took,
     /// and the thing being charged for here is the whole answer.
     held: Vec<Reservation>,
     /// How many instances have combined, which is one per thread the pipeline ran on.
@@ -541,10 +541,11 @@ const DENSE_PARTITIONS: usize = 4;
 /// How many groups an instance holds before it stops keeping them to itself.
 ///
 /// Partitioning is not free. Every chunk is hashed, split, and gathered into one set of vectors per
-/// partition, which is a copy of every column it carries, and then sixteen locks are taken to fold
-/// the pieces. On a small aggregate that is all cost: ClickBench at a thousand rows ran 41 percent
-/// slower and at ten thousand rows 19 percent slower when every grouped aggregate partitioned from
-/// its first chunk, because none of those tables is large enough for the sharing to pay for itself.
+/// partition, which is a copy of every column it carries, and then a lock is taken per partition to
+/// fold the pieces. On a small aggregate that is all cost: ClickBench at a thousand rows ran 41
+/// percent slower and at ten thousand rows 19 percent slower when every grouped aggregate
+/// partitioned from its first chunk, because none of those tables is large enough for the sharing
+/// to pay for itself.
 ///
 /// Four thousand is where the measurement put it. Sixteen thousand was tried first, on the argument
 /// that it is where a table stops fitting comfortably in cache, and it left a five percent loss at a
@@ -2243,7 +2244,7 @@ impl<'a> Aggregate<'a> {
     /// And the table has to be large enough to be worth the split, which is [`PARTITION_FROM`].
     ///
     /// A crowded budget counts as large enough whatever the group count says. An instance that is
-    /// about to be told to spill is better off in the partitions, because sixteen shared tables hold
+    /// about to be told to spill is better off in the partitions, because the shared tables hold
     /// what N instance tables held and the room that frees may be all that was needed. It also keeps
     /// the ordinary case away from the awkward one: a table that spills before it is handed over has
     /// a file covering every partition, and [`Aggregate::hand_over`] has to drain it row by row.
@@ -2258,14 +2259,23 @@ impl<'a> Aggregate<'a> {
     ///
     /// [`PARTITION_FROM`] ordinarily, and more than that when a count descending TopN above has
     /// pushed its bound down here. That bound is applied when a table is finished, and after a split
-    /// there are sixteen tables to finish rather than one, so it is applied sixteen times and lets
-    /// through sixteen times as many rows. It only stops letting through more than it should once
-    /// each partition would still hold more groups than the bound, which is what this asks for.
+    /// there is a table to finish per partition rather than one, so it is applied once per
+    /// [`RADIX_PARTITIONS`] and lets through that many times as many rows. It only stops letting
+    /// through more than it should once each partition would still hold more groups than the bound,
+    /// which is what this asks for.
     ///
     /// ClickBench 39 is the query that showed it. It groups five columns down to 5445 groups under a
-    /// bound of 1010, so one table gives the pipeline above 1010 rows and sixteen give it all 5445,
-    /// and those rows carry two wide URLs apiece through a project and a top n that run on one
-    /// thread. Partitioning made the aggregate itself scale and handed the difference straight back.
+    /// bound of 1010, so one table gives the pipeline above 1010 rows and a split gives it all
+    /// 5445, and those rows carry two wide URLs apiece through a project and a top n that run on
+    /// one thread. Partitioning made the aggregate itself scale and handed the difference straight
+    /// back.
+    ///
+    /// The multiplier is [`RADIX_PARTITIONS`] because that is how many tables a split makes, and it
+    /// is worth knowing that the two have moved together once already. #1000 raised the partition
+    /// count from sixteen to sixty four so that a merge could run on more threads, which quadrupled
+    /// this threshold as a side effect and took every aggregate under a bound of a thousand from
+    /// splitting at sixteen thousand groups to splitting at sixty four thousand. #486 has the
+    /// measurement that found it.
     fn partition_from(&self) -> usize {
         match self.top_counts {
             Some((bound, _)) => PARTITION_FROM.max(bound.saturating_mul(self.merged.len())),
@@ -2580,17 +2590,18 @@ impl<'a> Aggregate<'a> {
     ///
     /// What it costs is a group seen by four instances held in four tables until
     /// [`Aggregate::close`] merges them. That merge is one probe per group rather than per row, it
-    /// runs on sixteen threads at once, and the tables it merges are only ever the ones belonging
-    /// to a single partition.
+    /// runs on as many threads at once as there are partitions, and the tables it merges are only
+    /// ever the ones belonging to a single partition.
     fn spread_own(
         &self,
         rows: &Rows,
         spreading: &mut Spreading,
         own: &mut [Option<Building>],
     ) -> Result<()> {
-        // Timed here rather than around each `fold` below, because there are sixteen of those to a
-        // chunk and a pair of clock readings on each of them would be a measurable share of what
-        // they measure. One reading a chunk is the granularity rule the stage clock is written to.
+        // Timed here rather than around each `fold` below, because there is one of those per
+        // partition to a chunk and a pair of clock readings on each would be a measurable share of
+        // what they measure. One reading a chunk is the granularity rule the stage clock is written
+        // to.
         let timing = stage::Timing::start(Stage::Fold);
         let spread = self.spreading_own(rows, spreading, own);
         timing.stop(0);
@@ -2959,7 +2970,7 @@ pub(crate) struct Partitioned {
     dense_memory: Reservation,
     /// The table this instance folds into while it still keeps its groups to itself.
     ///
-    /// Every instance starts with one, because splitting a chunk sixteen ways is not free and a
+    /// Every instance starts with one, because splitting a chunk sixty four ways is not free and a
     /// small aggregate never earns it back. It goes when [`Aggregate::ought_to_partition`] says the
     /// table has grown enough to be worth sharing, and from then on this is `None` and the chunks go
     /// straight into the partitions.
@@ -5750,12 +5761,13 @@ mod tests {
 
     /// The same five thousand groups, under a pushed down bound, stay in one table.
     ///
-    /// The bound is applied when a table is finished, so sixteen partitions apply it sixteen times
-    /// and let through sixteen times as many rows as one table would. With five thousand groups
-    /// spread over sixteen partitions not one of them reaches a bound of a thousand, so the bound
-    /// stops doing anything at all and the pipeline above gets every group instead of a thousand of
-    /// them. Splitting is only worth it once a partition would still hold more groups than the bound,
-    /// and that is what the threshold asks, so this table stays whole and the bound bites.
+    /// The bound is applied when a table is finished, so a split applies it once per partition and
+    /// lets through that many times as many rows as one table would. With five thousand groups
+    /// spread over sixty four partitions not one of them reaches a bound of a thousand, so the
+    /// bound stops doing anything at all and the pipeline above gets every group instead of a
+    /// thousand of them. Splitting is only worth it once a partition would still hold more groups
+    /// than the bound, and that is what the threshold asks, so this table stays whole and the bound
+    /// bites.
     #[test]
     fn an_aggregate_under_a_pushed_down_bound_keeps_its_table_in_one_piece() {
         let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
@@ -5772,7 +5784,7 @@ mod tests {
         aggregate.combine(right).expect("the second instance");
         assert!(
             !aggregate.built.lock().expect("readable").partitioning,
-            "sixteen partitions of three hundred groups would let the bound through untouched"
+            "sixty four partitions of eighty groups would let the bound through untouched"
         );
         aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
