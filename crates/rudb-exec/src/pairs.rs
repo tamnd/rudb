@@ -30,6 +30,7 @@ use crate::key::{mix, spread};
 /// How many radix partitions the pairs are spread over.
 pub(crate) const PARTITIONS: usize = 16;
 
+/// A pair bucket nobody has written to yet.
 const EMPTY: u32 = u32::MAX;
 
 /// What stands in for the group of a row whose group key is null.
@@ -259,6 +260,20 @@ pub(crate) fn distinct_pairs(
     working.grow(width(pair_capacity * size_of::<u32>()))?;
     let mut pair_buckets = vec![EMPTY; pair_capacity];
     let pair_mask = pair_capacity - 1;
+    // A bucket says which pair it stands for as well as where that pair is, so that a probe landing
+    // on somebody else's pair can tell from the bucket alone. The low bits are the index into
+    // `unique` and the high bits are the part of the hash the bucket's own position did not already
+    // fix, which is the only part of it worth comparing. Reading the record instead is a second
+    // random load into a run of about a megabyte, and on ClickBench 8 nine rows in ten are a pair
+    // nobody has seen before, so that load was paid on nearly every row to be told what the bucket
+    // could have said.
+    //
+    // No real bucket reads as `EMPTY`, because that needs every index bit set and the table is twice
+    // the rows it can hold, so the largest index there can be is below half of it. That also makes
+    // the conversion here the only place a partition too large to index has to be caught.
+    let index_mask = u32::try_from(pair_mask)
+        .map_err(|_| Error::out_of_memory("a radix pair partition is too large"))?;
+    let tag_mask = !index_mask;
     let all_valid = partition.runs.iter().all(|run| run.validity.is_empty());
     // The deduplicated pairs used to be compacted into the front of the one run the partition held.
     // There is no one run to compact into now, so they are collected here instead, and this is where
@@ -270,27 +285,28 @@ pub(crate) fn distinct_pairs(
     for run in &partition.runs {
         for (source, &row) in run.rows.iter().enumerate() {
             let valid = all_valid || run.valid_at(source);
+            let tag = row.pair_hash & tag_mask;
             let mut at = row.pair_hash as usize & pair_mask;
             loop {
                 let slot = pair_buckets[at];
                 if slot == EMPTY {
-                    pair_buckets[at] = u32::try_from(unique.len())
-                        .map_err(|_| Error::out_of_memory("a radix pair partition is too large"))?;
+                    pair_buckets[at] = tag | unique.len() as u32;
                     unique.push(row);
                     if !all_valid {
                         unique_validity.push(valid);
                     }
                     break;
                 }
-                let slot = slot as usize;
-                let held = unique[slot];
-                let held_valid = all_valid || unique_validity[slot];
-                if held.pair_hash == row.pair_hash
-                    && held.group == row.group
-                    && held.user == row.user
-                    && held_valid == valid
-                {
-                    break;
+                if slot & tag_mask == tag {
+                    // The group and the user are what the hash was taken of, so two rows that agree
+                    // on both agree on the whole of it. The tag above is a filter and this is the
+                    // answer, which is why the hash itself is not compared here at all.
+                    let held_at = (slot & index_mask) as usize;
+                    let held = unique[held_at];
+                    let held_valid = all_valid || unique_validity[held_at];
+                    if held.group == row.group && held.user == row.user && held_valid == valid {
+                        break;
+                    }
                 }
                 at = (at + 1) & pair_mask;
             }
