@@ -297,6 +297,13 @@ fn from_packed<M: Fn(usize) -> usize>(
     let base = packed.base();
     let mask = u64::MAX >> (u64::BITS - packed.width());
     base.checked_add(i128::from(mask))?;
+    if let Numeric::Exact { scale: now, width } = into {
+        if now == was {
+            if let Some(data) = packed_straight(packed, &at, rows, width, physical) {
+                return Some(data);
+            }
+        }
+    }
     let mut run = Vec::with_capacity(rows);
     for index in 0..rows {
         run.push(base + i128::from(packed.code(at(index))));
@@ -315,6 +322,81 @@ fn from_packed<M: Fn(usize) -> usize>(
             approximate_out(loosened, single)
         }
     }
+}
+
+/// The packed to exact case with no scale to move, which is a column of our own storage widened on
+/// the way into arithmetic.
+///
+/// Every value a packed column holds is between its base and its base plus the widest code its
+/// width can hold, so those two ends answer the fit for the whole run and the per row question
+/// [`exact_out`] asks does not have to be asked at all. With the fit settled and no scale to move,
+/// the cast is a read of a code, an add and a store into the container the answer belongs in. The
+/// general path gathers into a run of `i128`, walks that run to check it, and then walks it again
+/// to narrow it into a second run, which is three passes over sixteen kilobytes to reach what this
+/// writes in one pass over eight.
+///
+/// The add is done at sixty four bits rather than at a hundred and twenty eight. Both ends fit the
+/// target, the values between them are between them, and a range that fits at both ends fits all
+/// the way along, so the narrowing is a move of bits the checks above have already accounted for.
+///
+/// `None` here is not a refusal, only a decline: the caller falls through to the general path,
+/// which asks each row rather than the two ends and so still answers for a column whose widest
+/// code is wider than any value actually in it.
+///
+/// On TPC-H this is `l_extendedprice` and `l_discount` on the way into q01, q06, q14 and q19, where
+/// the binder widens a `DECIMAL(15, 2)` to a `DECIMAL(18, 2)` and the scale is the same at both
+/// ends.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "the two ends are checked against the target above, so nothing between them is lost"
+)]
+fn packed_straight<M: Fn(usize) -> usize>(
+    packed: &rudb_vector::Packed<'_>,
+    at: M,
+    rows: usize,
+    width: Option<u8>,
+    physical: PhysicalType,
+) -> Option<Data> {
+    let base = packed.base();
+    let mask = u64::MAX >> (u64::BITS - packed.width());
+    let high = base.checked_add(i128::from(mask))?;
+    if let Some(width) = width {
+        let limit = pow10(width).unsigned_abs();
+        if base.unsigned_abs() >= limit || high.unsigned_abs() >= limit {
+            return None;
+        }
+    }
+    macro_rules! added {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match physical {
+                $(PhysicalType::$variant => {
+                    <$native>::try_from(base).ok()?;
+                    <$native>::try_from(high).ok()?;
+                    let low = i64::try_from(base).ok()?;
+                    let reach = i64::try_from(mask).ok()?;
+                    low.checked_add(reach)?;
+                    let mut out = Vec::with_capacity(rows);
+                    for index in 0..rows {
+                        out.push((low + packed.code(at(index)) as i64) as $native);
+                    }
+                    Data::$variant(out.into())
+                })+
+                // The hugeint target has nothing to narrow into, so it adds at its own width and
+                // is still one pass rather than three.
+                PhysicalType::Int128 => {
+                    let mut out = Vec::with_capacity(rows);
+                    for index in 0..rows {
+                        out.push(base + i128::from(packed.code(at(index))));
+                    }
+                    Data::Int128(out.into())
+                }
+                _ => return None,
+            }
+        };
+    }
+    Some(rudb_vector::for_each_layout!(narrow, added))
 }
 
 /// The exact to exact case with nothing to do in between, which is every integer widening and
@@ -2722,6 +2804,38 @@ mod tests {
         cast(&input, &LogicalType::Varchar, false).expect("prints");
         assert_eq!(fallback::count(Kernel::Cast, Form::BitPacked, Form::BitPacked), 1);
         fallback::reset();
+    }
+
+    /// The direct path for a packed column with no scale to move answers what the loop answers.
+    ///
+    /// It settles the fit from the base and the widest code rather than from the rows, and it adds
+    /// at sixty four bits and stores at the target width, so the cases worth naming are a base
+    /// below zero, a range that crosses zero, a target narrow enough to be a real narrowing, and a
+    /// target too narrow to hold the column at all. The last of those has to be the same error the
+    /// loop gives and not a wrong answer.
+    #[test]
+    fn the_direct_packed_path_answers_what_the_loop_answers_at_every_sign() {
+        for (first, step) in [(-500_i128, 7_i128), (-64, 1), (0, 3), (900, 11)] {
+            let narrow = LogicalType::decimal(15, 2).expect("a legal decimal");
+            let values: Vec<Value> = (0..96)
+                .map(|row| Value::Decimal { unscaled: first + row * step, width: 15, scale: 2 })
+                .collect();
+            let input = Vector::from_values(narrow, &values)
+                .expect("a flat decimal")
+                .bit_packed()
+                .expect("a range this narrow packs");
+            assert_eq!(input.form(), Form::BitPacked, "the range {first} by {step} packs");
+            for target in [
+                LogicalType::decimal(18, 2).expect("a legal decimal"),
+                LogicalType::decimal(4, 2).expect("a legal decimal"),
+                LogicalType::decimal(3, 2).expect("a legal decimal"),
+                LogicalType::SmallInt,
+                LogicalType::TinyInt,
+                LogicalType::BigInt,
+            ] {
+                agrees(&input, &target);
+            }
+        }
     }
 
     /// The same column with a dictionary over it, which is what a stored decimal column with few
