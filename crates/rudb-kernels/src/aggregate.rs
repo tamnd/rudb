@@ -1348,7 +1348,7 @@ fn scatter<M: Fn(usize) -> usize>(
     match feed {
         Feed::Counted => Ok(true),
         Feed::Total => total_into(states, into, run, at),
-        Feed::Whole { scale } => whole_into(states, into, run, at, scale),
+        Feed::Whole { scale } => mean_into(states, into, run, at, scale),
         Feed::Real { scale } => real_into(states, into, run, at, scale),
         Feed::Extreme(least) => extreme_into(states, into, run, at, least),
     }
@@ -1356,11 +1356,9 @@ fn scatter<M: Fn(usize) -> usize>(
 
 /// An exact number per row into the plain running total of the group that row belongs to.
 ///
-/// This is [`whole_into`] with the state question taken out of the row loop. Every accumulator a
+/// The state question is out of the row loop here, as it is in [`mean_into`]. Every accumulator a
 /// call owns was made by that call, so they are all the same variant, and [`feed_of`] has already
-/// read that variant off the first of them. What is left per row is a load, an add and a store,
-/// where before it was a call that could not be inlined because four other loops share it, and a
-/// match inside that call on a state which is the same state every time round.
+/// read that variant off the first of them. What is left per row is a load, an add and a store.
 ///
 /// A sum of a decimal is declared at the column's own scale, so unlike a mean there is no scale to
 /// carry here and nothing to do to the number between reading it and adding it.
@@ -1390,7 +1388,7 @@ fn total_into<M: Fn(usize) -> usize>(
                         *seen = true;
                     }
                 })+
-                // The same width `whole_into` leaves, for the same reason it leaves it.
+                // The same width `mean_into` leaves, for the same reason it leaves it.
                 _ => return Ok(false),
             }
         };
@@ -1399,14 +1397,18 @@ fn total_into<M: Fn(usize) -> usize>(
     Ok(true)
 }
 
-/// An exact number per row into the running total of the group that row belongs to.
+/// An exact number per row into the running mean of the group that row belongs to.
 ///
-/// The widths run up to 128 bits because [`fold_whole`] adds with a check per row and raises the
-/// same overflow the row at a time path raises on the same row, so a total that does not fit says
-/// so either way. `UInt128` is the one width left out, since a value above `i128::MAX` has no
-/// exact accumulator here at all. This is where q11's grouped sum over `DECIMAL(34, 2)` and q09's
-/// over `DECIMAL(19, 4)` used to leave, which was most of what was left in the fallback ledger.
-fn whole_into<M: Fn(usize) -> usize>(
+/// A mean is the only state [`feed_of`] answers [`Feed::Whole`] for, so the state is read here once
+/// per row and not asked about, the same way [`total_into`] reads a sum. That matters more here
+/// than it does there, because a mean is the one exact state that has to carry the column's scale
+/// and so is the one that used to reach the shared fold through a call.
+///
+/// The widths run up to 128 bits because the add below is checked per row and raises the same
+/// overflow the row at a time path raises on the same row, so a total that does not fit says so
+/// either way. `UInt128` is the one width left out, since a value above `i128::MAX` has no exact
+/// accumulator here at all.
+fn mean_into<M: Fn(usize) -> usize>(
     states: &mut [Accumulator],
     into: Where<'_>,
     run: &Run<'_>,
@@ -1422,7 +1424,18 @@ fn whole_into<M: Fn(usize) -> usize>(
                             continue;
                         }
                         let Some(index) = into.index(row) else { continue };
-                        fold_whole(&mut states[index], i128::from(values[at(row)]), scale)?;
+                        let number = i128::from(values[at(row)]);
+                        let State::Mean { total, seen, exact, scale: held, .. } =
+                            &mut states[index].state
+                        else {
+                            return Err(Error::internal("a mean into another".to_string()));
+                        };
+                        *held = scale;
+                        match total.checked_add(number).filter(|_| *exact) {
+                            Some(sum) => *total = sum,
+                            None => widened(total, exact, number),
+                        }
+                        *seen += 1;
                     }
                 })+
                 // A value wider than an `i128` can hold has no exact accumulator here, so it goes
@@ -1443,7 +1456,7 @@ fn whole_into<M: Fn(usize) -> usize>(
 /// a decimal column out of a native file as a dictionary over a packed run, and with no path for
 /// that shape every row of it built a `Value` on the way into its group.
 ///
-/// `UInt128` is declined here for the reason [`whole_into`] declines it, which is that a value
+/// `UInt128` is declined here for the reason [`mean_into`] declines it, which is that a value
 /// above `i128::MAX` has no exact accumulator here at all. A packing never holds one anyway, since
 /// the span a packing is built from is read at the widths that fit an `i128`.
 #[expect(
@@ -1489,6 +1502,7 @@ fn packed_into<M: Fn(usize) -> usize>(
             }
             Ok(true)
         }
+        // The same loop `mean_into` is, and the same reason for it.
         Feed::Whole { scale } => {
             if wide {
                 return Ok(false);
@@ -1498,7 +1512,17 @@ fn packed_into<M: Fn(usize) -> usize>(
                     continue;
                 }
                 let Some(index) = into.index(row) else { continue };
-                fold_whole(&mut states[index], base + i128::from(packed.code(at(row))), scale)?;
+                let number = base + i128::from(packed.code(at(row)));
+                let State::Mean { total, seen, exact, scale: held, .. } = &mut states[index].state
+                else {
+                    return Err(Error::internal("a mean into another".to_string()));
+                };
+                *held = scale;
+                match total.checked_add(number).filter(|_| *exact) {
+                    Some(sum) => *total = sum,
+                    None => widened(total, exact, number),
+                }
+                *seen += 1;
             }
             Ok(true)
         }
@@ -1547,34 +1571,17 @@ fn packed_into<M: Fn(usize) -> usize>(
     }
 }
 
-/// One exact number into one accumulator, which is [`Accumulator::update`] with the `Value` gone.
+/// A mean's total once it has stopped being exact, which is the way out of [`mean_into`]'s add.
 ///
-/// `scale` is where the column keeps its point, which only a mean needs and which it needs on every
-/// state it touches, since a state is finished without the column being in reach.
-fn fold_whole(into: &mut Accumulator, number: i128, scale: u8) -> Result<()> {
-    match &mut into.state {
-        State::Whole { total, seen, .. } | State::Scaled { total, seen, .. } => {
-            *total = total.checked_add(number).ok_or_else(overflowed)?;
-            *seen = true;
-        }
-        State::Mean { total, seen, exact, scale: held, .. } => {
-            *held = scale;
-            match total.checked_add(number).filter(|_| *exact) {
-                Some(sum) => *total = sum,
-                None => {
-                    let real = if *exact { exactly(*total) } else { mean_real(*total) };
-                    *total = mean_bits(real + exactly(number));
-                    *exact = false;
-                }
-            }
-            *seen += 1;
-        }
-        // `feed_of` chose this loop off the state, so the states left over cannot be here.
-        other => {
-            return Err(Error::internal(format!("an exact total into {other:?}")));
-        }
-    }
-    Ok(())
+/// A total goes inexact when the exact sum overflows an `i128`, and from then on it is a double
+/// kept in the bits of one. Out of line and marked cold because a mean of a column whose sum fits
+/// is every mean TPC-H takes, so the row loop is laid out for the add that works and this is the
+/// branch it does not take.
+#[cold]
+fn widened(total: &mut i128, exact: &mut bool, number: i128) {
+    let real = if *exact { exactly(*total) } else { mean_real(*total) };
+    *total = mean_bits(real + exactly(number));
+    *exact = false;
 }
 
 /// A number per row in floating point into the running total of the group that row belongs to.
