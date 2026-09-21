@@ -5432,7 +5432,9 @@ fn decode(
         {
             return Err(invalid("dictionary offsets do not bound the payload"));
         }
-        let mut strings = StringColumn::over(Buffer::from_vec(payload));
+        // A page, because every chunk cut out of this dictionary points at the same payload and a
+        // page is what lets a cut be the views and nothing else.
+        let mut strings = StringColumn::over(Buffer::from_vec(payload).into_page());
         for pair in offsets.windows(2) {
             strings.push_in_place(pair[0] as usize, (pair[1] - pair[0]) as usize)?;
         }
@@ -5654,7 +5656,10 @@ fn decode(
             {
                 return Err(invalid("string offsets do not bound the payload"));
             }
-            let mut values = StringColumn::over(Buffer::from_vec(payload));
+            // A page for the reason the dictionary payload above is one: the page is read once and
+            // handed out a chunk at a time, and a cut of a paged payload moves views rather than
+            // bytes.
+            let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
             for pair in offsets.windows(2) {
                 values.push_in_place(pair[0] as usize, (pair[1] - pair[0]) as usize)?;
             }
