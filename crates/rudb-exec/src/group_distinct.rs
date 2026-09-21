@@ -600,7 +600,7 @@ fn count_groups(
     bound: usize,
     memory: &Memory,
 ) -> Result<Output> {
-    let timing = stage::Timing::start(Stage::Fold);
+    let reserving = stage::Timing::start(Stage::Reserve);
     let input = counted.iter().map(|part| part.splits[split].len()).sum::<usize>();
     let capacity = input.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -609,6 +609,9 @@ fn count_groups(
     let mask = capacity - 1;
     let mut groups: Vec<Grouped> = Vec::new();
     let mut counts: Vec<i64> = Vec::new();
+    reserving.stop(0);
+
+    let timing = stage::Timing::start(Stage::Fold);
     for part in counted {
         for pair in &part.splits[split] {
             let mut at = pair.group_hash as usize & mask;

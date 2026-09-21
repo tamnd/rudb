@@ -338,6 +338,7 @@ pub(crate) fn distinct_pairs(
     splits: usize,
     memory: &Memory,
 ) -> Result<Counted> {
+    let reserving = stage::Timing::start(Stage::Reserve);
     let held_rows = partition.rows();
     let pair_capacity = held_rows.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -406,6 +407,7 @@ pub(crate) fn distinct_pairs(
     let even = held_rows.div_ceil(splits);
     let share = (even + even.isqrt() * 4).min(held_rows);
     let mut parts: Vec<Vec<Grouped>> = (0..splits).map(|_| Vec::with_capacity(share)).collect();
+    reserving.stop(0);
 
     let timing = stage::Timing::start(Stage::Fold);
     for run in &partition.runs {
@@ -441,8 +443,11 @@ pub(crate) fn distinct_pairs(
             }
         }
     }
+    timing.stop(0);
+
     // The rows themselves are not read again, only the distinct pairs, so give the memory back
     // before the group pass rather than at the end of the query.
+    let reserving = stage::Timing::start(Stage::Reserve);
     partition.runs.clear();
     drop(unique);
     drop(unique_validity);
@@ -461,7 +466,7 @@ pub(crate) fn distinct_pairs(
     held.grow(width(
         parts.iter().map(|split| split.capacity() * size_of::<Grouped>()).sum::<usize>(),
     ))?;
-    timing.stop(0);
+    reserving.stop(0);
     Ok(Counted { splits: parts, held })
 }
 
