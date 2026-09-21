@@ -54,7 +54,7 @@
 
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_vector::{Data, Form, Validity, Vector};
 
 use crate::compare::order;
@@ -1216,11 +1216,30 @@ fn spread(
             if codes.len() < rows {
                 return Ok(false);
             }
-            let Some(data) = values.data() else { return Ok(false) };
+            let Some(data) = values.data() else {
+                // A dictionary whose values are a packed run, which is the form a stored column of
+                // numbers with few distinct values in it arrives in, and the form every decimal of
+                // a grouped TPC-H query is read out of a native file as.
+                let Some(packed) = values.packed_parts() else { return Ok(false) };
+                return packed_into(
+                    states,
+                    into,
+                    input,
+                    &packed,
+                    |index| codes[index] as usize,
+                    rows,
+                    nulls,
+                    feed,
+                );
+            };
             let run = Run { input, data, rows, nulls };
             // Every code is inside the dictionary because `Vector::dictionary` checks that on the
             // way in, so the gather below indexes without a bound of its own.
             scatter(states, into, &run, |index| codes[index] as usize, feed)
+        }
+        Form::BitPacked => {
+            let Some(packed) = input.packed_parts() else { return Ok(false) };
+            packed_into(states, into, input, &packed, identity, rows, nulls, feed)
         }
         // A constant and a sequence both have a closed form per group that is better than any loop,
         // and neither is what a scan of a column produces, so both wait for the counter to ask.
@@ -1278,6 +1297,95 @@ fn whole_into<M: Fn(usize) -> usize>(
     }
     rudb_vector::for_each_layout!(narrow, each);
     Ok(true)
+}
+
+/// The same three loops over a packed run, either the vector's own or one a dictionary points into.
+///
+/// A packed vector's value is its base plus its code, so each loop below is the matching flat one
+/// with the base added and the type dispatch gone, since a packing has one width for the whole
+/// column rather than a layout per variant. What it is for is the grouped half of #1088: q01 reads
+/// a decimal column out of a native file as a dictionary over a packed run, and with no path for
+/// that shape every row of it built a `Value` on the way into its group.
+///
+/// The two 128 bit layouts are declined here for the reason [`whole_into`] declines them, which is
+/// that a total of them can overflow inside one group and the overflow is the answer rather than a
+/// detail.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
+)]
+#[expect(clippy::too_many_arguments, reason = "the flat path's Run plus the packing it replaces")]
+fn packed_into<M: Fn(usize) -> usize>(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    input: &Vector,
+    packed: &rudb_vector::Packed<'_>,
+    at: M,
+    rows: usize,
+    nulls: &Validity,
+    feed: Feed,
+) -> Result<bool> {
+    let wide =
+        matches!(input.logical_type().physical(), PhysicalType::Int128 | PhysicalType::UInt128);
+    let base = packed.base();
+    match feed {
+        Feed::Counted => Ok(true),
+        Feed::Whole => {
+            if wide {
+                return Ok(false);
+            }
+            for row in 0..rows {
+                if !nulls.is_valid(row) {
+                    continue;
+                }
+                let Some(index) = into.index(row) else { continue };
+                fold_whole(&mut states[index], base + i128::from(packed.code(at(row))))?;
+            }
+            Ok(true)
+        }
+        Feed::Real { scale } => {
+            let factor = pow10(scale) as f64;
+            let scaled = scale != 0;
+            for row in 0..rows {
+                if !nulls.is_valid(row) {
+                    continue;
+                }
+                let Some(index) = into.index(row) else { continue };
+                let number = (base + i128::from(packed.code(at(row)))) as f64;
+                fold_real(&mut states[index], if scaled { number / factor } else { number });
+            }
+            Ok(true)
+        }
+        Feed::Extreme(least) => {
+            if wide {
+                return Ok(false);
+            }
+            for row in 0..rows {
+                if !nulls.is_valid(row) {
+                    continue;
+                }
+                let Some(index) = into.index(row) else { continue };
+                let number = base + i128::from(packed.code(at(row)));
+                let State::Extreme { held, .. } = &mut states[index].state else {
+                    return Err(Error::internal("an extreme into a total".to_string()));
+                };
+                let replace = match held {
+                    None => true,
+                    Some(current) => {
+                        let current: &Value = current.settle()?;
+                        let mark = integral(current).ok_or_else(|| not_narrow(current))?;
+                        if least { number < mark } else { number > mark }
+                    }
+                };
+                // The `Value` is built on a win and not per row, exactly as the flat loop builds it.
+                if replace {
+                    let value = input.try_value_at(row)?;
+                    *held = Some(Box::new(Extremum::Held(value)));
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// One exact number into one accumulator, which is [`Accumulator::update`] with the `Value` gone.
@@ -2436,10 +2544,19 @@ mod tests {
                     let first = flat(ty, 97, nulls, &mut rng);
                     let second = flat(ty, 64, nulls, &mut rng);
                     let codes: Vec<u32> = (0..97).map(|index| (index % 13) as u32).collect();
-                    let coded = Vector::dictionary(codes, first.clone()).expect("codes in range");
+                    let coded =
+                        Vector::dictionary(codes.clone(), first.clone()).expect("codes in range");
+                    // The two forms our own file hands a column of numbers out in. A float, a
+                    // string and a column whose range is too wide to pay for a packing all hand
+                    // the vector back as it was, which makes those the flat case a second time.
+                    let packed = first.bit_packed().expect("packs or hands the vector back");
+                    let over_packed =
+                        Vector::dictionary(codes, packed.clone()).expect("codes in range");
                     for (shape, batches) in [
                         ("flat", vec![first.clone(), second.clone()]),
                         ("dictionary", vec![coded, second.clone()]),
+                        ("packed", vec![packed, second.clone()]),
+                        ("dictionary over packed", vec![over_packed, second.clone()]),
                     ] {
                         let dealt: Vec<(Vector, Vec<usize>)> = batches
                             .into_iter()
@@ -2558,6 +2675,80 @@ mod tests {
         }
         assert_eq!(fallback::count(Kernel::Aggregate, Form::BitPacked, Form::BitPacked), 0);
         assert_eq!(fallback::count(Kernel::Aggregate, Form::Dictionary, Form::Dictionary), 0);
+        fallback::reset();
+    }
+
+    /// The same two forms scattered into groups, which is the half of this that q01 is.
+    ///
+    /// A grouped aggregate does not go through [`Accumulator::update_run`] at all, it goes through
+    /// the scatter, so a packed column staying off the row at a time path there is a second thing
+    /// to prove. The extremes are over an integer column because a grouped `MIN` over a decimal
+    /// column is not a shape the scatter reads yet, whatever form the column is in.
+    #[test]
+    fn a_packed_column_scattered_into_groups_does_not_reach_the_row_at_a_time_path() {
+        let ty = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let values: Vec<Value> = (0..48)
+            .map(|row| {
+                if row % 7 == 0 {
+                    Value::Null
+                } else {
+                    Value::Decimal { unscaled: 900 + row * 13, width: 15, scale: 2 }
+                }
+            })
+            .collect();
+        let packed = Vector::from_values(ty.clone(), &values)
+            .expect("a flat decimal")
+            .bit_packed()
+            .expect("a six hundred wide range packs");
+        assert_eq!(packed.form(), Form::BitPacked);
+        let codes: Vec<u32> = (0..48).map(|row| ((row * 5) % 48) as u32).collect();
+        let over = Vector::dictionary(codes, packed.clone()).expect("codes are in range");
+        let whole = Vector::from_values(
+            LogicalType::Integer,
+            &(0..48).map(|row| Value::Integer(500 + (row * 7) % 29)).collect::<Vec<_>>(),
+        )
+        .expect("a flat integer column")
+        .bit_packed()
+        .expect("a range of twenty nine packs");
+        assert_eq!(whole.form(), Form::BitPacked);
+        let slots: Vec<usize> = (0..48).map(|row| row % 3).collect();
+        for (name, returns, column) in [
+            ("count", LogicalType::BigInt, &packed),
+            ("sum", LogicalType::decimal(38, 2).expect("a legal decimal"), &packed),
+            ("avg", LogicalType::Double, &packed),
+            ("count", LogicalType::BigInt, &over),
+            ("sum", LogicalType::decimal(38, 2).expect("a legal decimal"), &over),
+            ("avg", LogicalType::Double, &over),
+            ("min", LogicalType::Integer, &whole),
+            ("max", LogicalType::Integer, &whole),
+        ] {
+            fallback::reset();
+            let mut states = vec![Accumulator::new(name, &returns).expect("known"); 3];
+            update_scattered(&mut states, &slots, 1, 0, Some(column), 48).expect("folds them in");
+            let form = column.form();
+            assert_eq!(
+                fallback::count(Kernel::Aggregate, form, form),
+                0,
+                "{name} over a {form:?} column took the row at a time path"
+            );
+            // The groups against the same rows folded one accumulator at a time, so that staying
+            // off the slow path is not on its own enough to pass.
+            for (group, state) in states.iter().enumerate() {
+                let mut one = Accumulator::new(name, &returns).expect("known");
+                let mine: Vec<Value> = (0..48)
+                    .filter(|row| slots[*row] == group)
+                    .map(|row| column.try_value_at(row).expect("a value"))
+                    .collect();
+                for value in &mine {
+                    one.update(std::slice::from_ref(value)).expect("folds one in");
+                }
+                assert_eq!(
+                    state.clone().finish().expect("finishes"),
+                    one.finish().expect("finishes"),
+                    "{name} over group {group} of a {form:?} column"
+                );
+            }
+        }
         fallback::reset();
     }
 
