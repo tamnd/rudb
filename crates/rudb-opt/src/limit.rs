@@ -84,6 +84,12 @@ fn swap(plan: &mut Plan, at: NodeRef, shared: &[NodeRef]) -> Option<NodeRef> {
     let Node::Limit { input, count, offset } = *plan.node(at) else {
         return None;
     };
+    // A limit that reads its count off a column stays where it is. The column comes from the
+    // projection it would be traded with, or from the query joined in under that, so the trade
+    // would leave the limit above the only place the number can be read from.
+    if count.read().is_some() || offset.read().is_some() {
+        return None;
+    }
     let Node::Project { input: under, index, exprs, names } = *plan.node(input) else {
         return None;
     };
@@ -123,7 +129,7 @@ fn shared(plan: &Plan) -> Vec<NodeRef> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_plan::{BuildSide, JoinKind, Node, Plan, Slice};
+    use rudb_plan::{Bound, BuildSide, JoinKind, Node, Plan, Slice};
 
     use super::push;
 
@@ -230,7 +236,11 @@ mod tests {
             exprs: Slice::EMPTY,
             names: Slice::EMPTY,
         });
-        let limit = plan.add_node(Node::Limit { input: project, count: Some(10), offset: 0 });
+        let limit = plan.add_node(Node::Limit {
+            input: project,
+            count: Bound::Rows(10),
+            offset: Bound::Rows(0),
+        });
         let join = plan.add_node(Node::Join {
             left: limit,
             right: project,

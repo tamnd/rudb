@@ -46,7 +46,7 @@
 use std::collections::BTreeSet;
 
 use crate::expr::{ColumnBinding, CompareOp, ConjunctionOp, Expr};
-use crate::node::{JoinKind, Node};
+use crate::node::{Bound, JoinKind, Node};
 use crate::plan::Plan;
 use crate::{ExprRef, NodeRef, Slice};
 
@@ -300,9 +300,11 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Keys]) -> Keys {
         // underneath. A share of the input is a prefix whose length nothing here knows, so it keeps
         // the keys and claims nothing about how many rows there are: a percentage that works out at
         // one row is still one row of something this cannot count.
+        // A count that is read off the rows while the query runs is a number nobody has here, so
+        // it falls in with every other prefix this cannot measure.
         Node::Limit { input, count, .. } => match count {
-            Some(0 | 1) => Keys::single(),
-            _ => below(input),
+            Bound::Rows(0 | 1) => Keys::single(),
+            Bound::All | Bound::Rows(_) | Bound::Read(_) => below(input),
         },
         Node::LimitPercent { input, .. } => below(input),
         Node::TopN { input, count, .. } => {
@@ -462,7 +464,7 @@ mod tests {
 
     use super::{Keys, keys_of};
     use crate::expr::{ColumnBinding, CompareOp, Expr};
-    use crate::node::{JoinKind, Node};
+    use crate::node::{Bound, JoinKind, Node};
     use crate::plan::Plan;
 
     /// A scan of two integer columns bound against `index`.
@@ -751,7 +753,8 @@ mod tests {
     fn a_limit_of_one_row_is_one_row_whatever_was_underneath_it() {
         let mut plan = Plan::new();
         let input = scan(&mut plan, 0);
-        let node = plan.add_node(Node::Limit { input, count: Some(1), offset: 0 });
+        let node =
+            plan.add_node(Node::Limit { input, count: Bound::Rows(1), offset: Bound::Rows(0) });
         plan.set_root(node);
         assert!(root(&plan).at_most_one_row());
     }

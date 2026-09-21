@@ -9,7 +9,7 @@
 
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
-    Arm, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    Arm, Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
     NodeRef, Plan, SetOpKind, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
@@ -88,7 +88,8 @@ fn the_shape_of_a_grouped_top_n_survives_the_round_trip() {
     let keys =
         plan.add_sort_keys(&[SortKey { expr: by_count, descending: true, nulls_first: false }]);
     let sort = plan.add_node(Node::Sort { input: aggregate, keys });
-    let limit = plan.add_node(Node::Limit { input: sort, count: Some(10), offset: 0 });
+    let limit =
+        plan.add_node(Node::Limit { input: sort, count: Bound::Rows(10), offset: Bound::Rows(0) });
 
     let out_phrase = column(&mut plan, 1, 0, LogicalType::Varchar);
     let out_count = column(&mut plan, 1, 1, LogicalType::BigInt);
@@ -328,7 +329,8 @@ fn the_keyword_operators_survive_the_round_trip() {
     });
     let cross = get(&mut plan, "d", 4, &[("z", LogicalType::Integer)]);
     let product = plan.add_node(Node::CrossProduct { left: positional, right: cross });
-    let all = plan.add_node(Node::Limit { input: product, count: None, offset: 25 });
+    let all =
+        plan.add_node(Node::Limit { input: product, count: Bound::All, offset: Bound::Rows(25) });
     plan.set_root(all);
 
     let dump = round_trips(&plan);
@@ -358,6 +360,58 @@ fn a_percentage_limit_survives_the_round_trip() {
         let dump = round_trips(&plan);
         assert!(dump.contains(printed), "{printed} is not in\n{dump}");
     }
+}
+
+/// A limit that reads its ends off a column rather than holding numbers.
+///
+/// This is what `LIMIT (SELECT 3) OFFSET (SELECT 2)` leaves behind, and the two ends print as
+/// expressions where the ordinary ones print as numbers. Which of the three a printed end is can be
+/// told from its first character, because a number starts with a digit and an expression never
+/// does, and this is the case that would catch a printer that made the two look alike.
+#[test]
+fn a_limit_reading_its_ends_off_a_column_survives_the_round_trip() {
+    let mut plan = Plan::new();
+    let scan = get(
+        &mut plan,
+        "a",
+        0,
+        &[("x", LogicalType::Integer), ("n", LogicalType::BigInt), ("m", LogicalType::BigInt)],
+    );
+    let count = column(&mut plan, 0, 1, LogicalType::BigInt);
+    let offset = column(&mut plan, 0, 2, LogicalType::BigInt);
+    let limit = plan.add_node(Node::Limit {
+        input: scan,
+        count: Bound::Read(count),
+        offset: Bound::Read(offset),
+    });
+    plan.set_root(limit);
+
+    let dump = round_trips(&plan);
+    assert!(dump.contains("Limit #0.1::BIGINT offset #0.2::BIGINT"), "the limit is not in\n{dump}");
+}
+
+/// One end read off a column and the other written out, which is what `LIMIT (SELECT 3)` alone is.
+#[test]
+fn a_limit_with_one_end_read_and_one_end_written_survives_the_round_trip() {
+    let mut plan = Plan::new();
+    let scan = get(&mut plan, "a", 0, &[("x", LogicalType::Integer), ("n", LogicalType::BigInt)]);
+    let count = column(&mut plan, 0, 1, LogicalType::BigInt);
+    let limit = plan.add_node(Node::Limit {
+        input: scan,
+        count: Bound::Read(count),
+        offset: Bound::Rows(4),
+    });
+    plan.set_root(limit);
+
+    let dump = round_trips(&plan);
+    assert!(dump.contains("Limit #0.1::BIGINT offset 4"), "the limit is not in\n{dump}");
+}
+
+/// A limit that skips every row is not a limit anybody can write, so the reader refuses it.
+#[test]
+fn an_offset_of_all_rows_is_not_readable() {
+    let text = "Limit 10 offset ALL\n  Get memory.main.a AS a #0 [x::INTEGER]\n";
+    assert!(Plan::parse(text).is_err(), "it was accepted:\n{text}");
 }
 
 /// A share outside nought to a hundred is refused by the reader as well as by the binder.

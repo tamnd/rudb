@@ -23,11 +23,11 @@ use rudb_functions::{
     Columns, FILE_ROW_NUMBER, FunctionKind, Given, Resolved, TableFunction, csv_fields, csv_given,
     files, is_file, is_pattern, kind_of, parquet_footers, resolve, resolve_pragma, resolve_table,
 };
-use rudb_kernels::cast_value;
+use rudb_kernels::{cast_value, row_count};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
 use rudb_plan::{
-    BuildSide, ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+    Bound, BuildSide, ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
     SetOpKind, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
@@ -398,7 +398,11 @@ impl<'a> Binder<'a> {
             inside_aggregate: _,
         } = pending;
         if kind == JoinKind::Single && !self.semantics.scalar_subquery_error_on_multiple_rows() {
-            right = self.add_node(Node::Limit { input: right, count: Some(1), offset: 0 });
+            right = self.add_node(Node::Limit {
+                input: right,
+                count: Bound::Rows(1),
+                offset: Bound::Rows(0),
+            });
         }
         let conditions = self.plan.add_expr_list(&conditions);
         if dependent {
@@ -621,7 +625,7 @@ impl<'a> Binder<'a> {
             let keys = self.plan.add_sort_keys(&keys);
             node = self.add_node(Node::Sort { input: node, keys });
         }
-        node = self.apply_limit(ast, query, node)?;
+        node = self.apply_limit(ast, query, node, &mut scope)?;
         Ok((node, scope))
     }
 
@@ -720,7 +724,7 @@ impl<'a> Binder<'a> {
             let keys = self.plan.add_sort_keys(&keys);
             node = self.add_node(Node::Sort { input: node, keys });
         }
-        node = self.apply_limit(ast, query, node)?;
+        node = self.apply_limit(ast, query, node, &mut scope)?;
         Ok((node, scope))
     }
 
@@ -772,7 +776,7 @@ impl<'a> Binder<'a> {
             let keys = self.plan.add_sort_keys(&keys);
             node = self.add_node(Node::Sort { input: node, keys });
         }
-        node = self.apply_limit(ast, query, node)?;
+        node = self.apply_limit(ast, query, node, &mut scope)?;
         Ok((node, scope))
     }
 
@@ -964,7 +968,7 @@ impl<'a> Binder<'a> {
             let keys = self.plan.add_sort_keys(&keys);
             node = self.add_node(Node::Sort { input: node, keys });
         }
-        node = self.apply_limit(ast, query, node)?;
+        node = self.apply_limit(ast, query, node, &mut output)?;
 
         if extra.is_empty() {
             output.columns.truncate(visible);
@@ -978,7 +982,11 @@ impl<'a> Binder<'a> {
         let mut scope = Scope::empty();
         for (at, name) in names.iter().enumerate().take(visible) {
             let ty = output.columns[at].ty.clone();
-            kept.push(self.column(project, at, ty.clone()));
+            // Through the scope rather than through `project`, because a limit that had a query
+            // joined in under it put a projection of its own over the top and these columns are
+            // that projection's now.
+            let binding = output.columns[at].binding;
+            kept.push(self.plan.add_expr(Expr::Column(binding), ty.clone()));
             kept_names.push(self.plan.intern(name));
             scope.push(Visible {
                 table: String::new(),
@@ -1368,29 +1376,93 @@ impl<'a> Binder<'a> {
         Ok(on)
     }
 
-    fn apply_limit(&mut self, ast: &Ast, query: &ast::Query, input: NodeRef) -> Result<NodeRef> {
+    /// The `LIMIT` and the `OFFSET`, over the rows everything else in the query produced.
+    ///
+    /// The scope is taken by reference because a limit the binder could not work out reads its
+    /// number off a query joined in underneath, and that join puts a column in the rows which the
+    /// query did not ask for. A projection over the limit drops it again, and the scope has to say
+    /// so, since its bindings are what anything above this reads.
+    fn apply_limit(
+        &mut self,
+        ast: &Ast,
+        query: &ast::Query,
+        input: NodeRef,
+        scope: &mut Scope,
+    ) -> Result<NodeRef> {
+        let waiting = self.scalar_subqueries.len();
         if query.limit_percent {
             let percent = self.constant_percent(ast, query.limit)?;
-            let offset = self.constant_count(ast, query.offset, "OFFSET")?.unwrap_or(0);
+            let offset = self.count_bound(ast, query.offset, "OFFSET")?;
+            let offset = self.settled(offset, "OFFSET")?;
             return Ok(match percent {
                 Some(percent) => self.add_node(Node::LimitPercent { input, percent, offset }),
                 // A null share is no limit at all, the same as a null row count, so what is left
                 // is whatever the offset asked for.
-                None => self.limited(input, None, offset),
+                None => self.limited(input, Bound::All, Bound::Rows(offset)),
             });
         }
-        let count = self.constant_count(ast, query.limit, "LIMIT")?;
-        let offset = self.constant_count(ast, query.offset, "OFFSET")?.unwrap_or(0);
-        Ok(self.limited(input, count, offset))
+        let count = self.count_bound(ast, query.limit, "LIMIT")?;
+        // An offset the query left off is nought rows skipped, where a limit it left off is every
+        // row emitted, so the two clauses read the same word differently.
+        let offset = match self.count_bound(ast, query.offset, "OFFSET")? {
+            Bound::All => Bound::Rows(0),
+            named => named,
+        };
+        let joined = self.scalar_subqueries.split_off(waiting);
+        if joined.is_empty() {
+            return Ok(self.limited(input, count, offset));
+        }
+        let mut input = input;
+        for pending in joined {
+            input = self.attach_subquery(input, pending);
+        }
+        let limit = self.add_node(Node::Limit { input, count, offset });
+        Ok(self.reproject(limit, scope))
     }
 
     /// A row count limit over `input`, or `input` itself when neither half of the clause asks for
     /// anything.
-    fn limited(&mut self, input: NodeRef, count: Option<u64>, offset: u64) -> NodeRef {
-        if count.is_none() && offset == 0 {
+    fn limited(&mut self, input: NodeRef, count: Bound, offset: Bound) -> NodeRef {
+        if count == Bound::All && offset == Bound::Rows(0) {
             return input;
         }
         self.add_node(Node::Limit { input, count, offset })
+    }
+
+    /// The number a bound holds, for the one caller that has nowhere to put a column.
+    ///
+    /// A share of the input reads its offset through this, because `LIMIT 30 PERCENT` builds a
+    /// node that takes a number and not a [`Bound`], and a share written as a subquery is refused
+    /// a few lines above this anyway.
+    fn settled(&self, bound: Bound, clause: &str) -> Result<u64> {
+        match bound {
+            Bound::Rows(rows) => Ok(rows),
+            Bound::All => Ok(0),
+            Bound::Read(_) => Err(Error::not_implemented(format!(
+                "{clause} holding a subquery beside a LIMIT written as a percentage"
+            ))),
+        }
+    }
+
+    /// A projection over `node` handing back exactly the columns `scope` names.
+    ///
+    /// The scope's bindings are rewritten to this projection's, because its columns are the ones
+    /// anything above reads. Only a limit that had a query joined in under it wants this, and only
+    /// because there is not always a projection above to drop the column that join added.
+    fn reproject(&mut self, node: NodeRef, scope: &mut Scope) -> NodeRef {
+        let index = self.fresh_index();
+        let mut exprs = Vec::with_capacity(scope.columns.len());
+        let mut names = Vec::with_capacity(scope.columns.len());
+        for column in &scope.columns {
+            exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+            names.push(self.plan.intern(&column.name));
+        }
+        for (at, column) in scope.columns.iter_mut().enumerate() {
+            column.binding = ColumnBinding::new(index, at as u32);
+        }
+        let exprs = self.plan.add_expr_list(&exprs);
+        let names = self.plan.add_name_list(&names);
+        self.add_node(Node::Project { input: node, index, exprs, names })
     }
 
     /// The share of the input a `LIMIT n PERCENT` names.
@@ -1435,44 +1507,36 @@ impl<'a> Binder<'a> {
     ///
     /// It does not have to be a literal. Anything whose value is settled before the first row is
     /// read will do, so `LIMIT 1 + 1` and `LIMIT CAST(3 AS BIGINT)` are both two, and that is what
-    /// the pin does with them: its binder evaluates the expression and writes the number down. What
-    /// is left over is a subquery, which the pin answers by reading the value while the query runs
-    /// and this node has nowhere to keep.
+    /// the pin does with them: its binder evaluates the expression and writes the number down.
+    ///
+    /// What is left over is an expression the binder cannot settle, which is a subquery, because it
+    /// has to run first, and a call that answers differently every time it is made, such as
+    /// `RANDOM()` or `nextval`. Those become a [`Bound::Read`] holding the expression, and the
+    /// number comes off the first chunk that reaches the limit. The pin takes both and answers them
+    /// the same way.
     ///
     /// The value is cast to `BIGINT` whatever it was written as, which is the whole of the type
     /// rule. `LIMIT '3'` is three rows because the string converts, `LIMIT 2.5` is three rows
     /// because the conversion rounds, `LIMIT true` is one row, and `LIMIT DATE '2020-01-01'` is the
     /// cast refusing a date. Every one of those messages is the cast's own, which is why there is
-    /// no type check here to write a worse one.
-    fn constant_count(
-        &mut self,
-        ast: &Ast,
-        written: ast::ExprRef,
-        clause: &str,
-    ) -> Result<Option<u64>> {
+    /// no type check here to write a worse one. A limit that is read while the query runs is cast
+    /// the same way by the operator that reads it, so the two paths answer alike.
+    fn count_bound(&mut self, ast: &Ast, written: ast::ExprRef, clause: &str) -> Result<Bound> {
         if written == NONE {
-            return Ok(None);
+            return Ok(Bound::All);
         }
         self.clause = "LIMIT clause";
         let scope = Scope::empty();
         let bound = self.bind_expr(ast, written, &scope)?;
         let Some(value) = fold::value_of(&self.plan, bound)? else {
-            return Err(Error::not_implemented(format!("a {clause} holding a subquery")));
+            return Ok(Bound::Read(bound));
         };
         // A null is no limit at all, the same as leaving the clause off, and the pin agrees:
         // `LIMIT NULL` and `LIMIT CAST(NULL AS INTEGER)` both answer every row.
         if value.is_null() {
-            return Ok(None);
+            return Ok(Bound::All);
         }
-        let count = cast_value(&value, &LogicalType::BigInt, false)?.as_i64().ok_or_else(|| {
-            Error::binder(format!(
-                "{clause} takes a whole number of rows, not a value of type {}",
-                value.logical_type()
-            ))
-        })?;
-        // One message for both clauses, spelled the way the pin spells it, which names the clause
-        // it did not get rather than the one it did.
-        u64::try_from(count).map(Some).map_err(|_| Error::binder("LIMIT/OFFSET cannot be negative"))
+        row_count(&value, clause).map(Bound::Rows)
     }
 
     // ------------------------------------------------------------------- from

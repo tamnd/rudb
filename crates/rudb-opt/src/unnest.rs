@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use rudb_common::{LogicalType, Result, Value};
 use rudb_plan::{
-    BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
-    Plan,
+    Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    NodeRef, Plan,
 };
 
 use crate::domain;
@@ -281,7 +281,9 @@ fn exists_domain(
         return None;
     };
     let marker = *marker;
-    let Node::Limit { input: selected, count: Some(1), offset: 0 } = *plan.node(limited) else {
+    let Node::Limit { input: selected, count: Bound::Rows(1), offset: Bound::Rows(0) } =
+        *plan.node(limited)
+    else {
         return None;
     };
     let Node::Project { input: filtered, .. } = *plan.node(selected) else {
@@ -1148,7 +1150,9 @@ fn exists(
         return None;
     };
     let marker = *marker;
-    let Node::Limit { input: selected, count: Some(1), offset: 0 } = *plan.node(limited) else {
+    let Node::Limit { input: selected, count: Bound::Rows(1), offset: Bound::Rows(0) } =
+        *plan.node(limited)
+    else {
         return None;
     };
     let Node::Project { input: filtered, .. } = *plan.node(selected) else {
