@@ -493,10 +493,11 @@ impl Exchange {
         // the million row ClickBench file, dropping the ask from sixty five thousand to sixteen took
         // twelve percent off the two queries it moves and left the rest where they were, and asking
         // for less than sixteen thousand bought nothing back.
+        let degree =
+            input.div_ceil(pairs::ROWS_PER_PARTITION).clamp(1, PARTITIONS).min(threads.degree());
         // How many of the scattered partitions are worth keeping apart, which the scatter itself
         // could not know. See [`pairs::used`].
-        let used = pairs::used(input);
-        let degree = input.div_ceil(16_384).clamp(1, used).min(threads.degree());
+        let used = pairs::used(input, degree);
         // Either every split or one of it. A split is a vector per pair partition, so there are as
         // many of them as the two counts multiplied, and a query that is going to finish on one
         // thread should not be paying for a hundred vectors to hand itself its own rows. Anything
