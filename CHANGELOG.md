@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.70
+
+A patch release of two pull requests, both of them found by sampling one TPC-H query and both of them the same kind of mistake. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
+
+q20 was the query furthest behind DuckDB on our own format, and almost all of it is one decorrelated subquery that filters a year of lineitem and then groups nine hundred thousand rows by two keys. Splitting that in half at one thread gave two separate gaps, one in the scan and one in the aggregate, and this release is one pull request against each.
+
+The scan was calling a function pointer per row. Both bit packed comparison kernels decided the operator ahead of the loop and handed it to the loop as a `fn`, so a range predicate over a packed column was a bit extract, an indirect call and a return per row, and a loop with a call in it is a loop the compiler will not widen. The operator is a match outside the loop now with its own body under each arm. That bare q20 filter goes 1.50x, q10 1.35x, and q6, q14 and q15 gain a few per cent each, which is the right shape, because every query that moved is one with a range predicate on a packed column.
+
+The aggregate was building a value per row to hash it. A column of few distinct numbers over a wide range goes to the native file as a dictionary whose codes point into a packed run, and the hash had an arm for a dictionary over plain data and an arm for a straight packed run but not one for the two together, so every row of that form fell to the loop at the bottom that asks the vector for a `Value`. The batched key comparison fell through the same way. Both now read the run directly. That aggregate on its own goes 1.14x, q7 1.43x, q15 1.11x and q20 1.08x.
+
+All 22 answers are unchanged on both the native file and Parquet, apart from q1, whose two double averages differ in their last digits between any two runs of any binary because a parallel average adds its partial sums in whatever order the threads finish.
+
 ## 0.3.69
 
 A patch release of five pull requests, all of them about the native format carrying its weight. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
