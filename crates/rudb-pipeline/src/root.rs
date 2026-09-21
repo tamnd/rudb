@@ -40,6 +40,12 @@ struct Shared {
     buffer: BufferId,
     /// Whether this root restores the source order, kept out here so that asking costs no lock.
     ordered: bool,
+    /// Whether a chunk is flattened on its way into the queue, which is [`RootReader::flattening`].
+    ///
+    /// An atomic because the reader is the one that knows the answer and it is handed back after
+    /// the sink is built. It is written once, before the query runs, and read once per chunk, so
+    /// relaxed ordering is all it needs: there is no second thing whose visibility depends on it.
+    flatten: AtomicBool,
 }
 
 /// Everything the root holds under one lock.
@@ -172,9 +178,26 @@ fn build(
         capacity,
         buffer,
         ordered: order.is_some(),
+        flatten: AtomicBool::new(false),
         queue: Mutex::new(Queue { ready: VecDeque::new(), order }),
     });
     (RootSink { shared: Arc::clone(&shared) }, RootReader { shared })
+}
+
+impl RootSink {
+    /// The chunk as it goes into the queue.
+    ///
+    /// A copy of the handle either way, because the sink is handed a borrow and the queue holds a
+    /// chunk of its own. A flattening root spends that copy on the flatten rather than on a clone
+    /// of whatever form the chunk arrived in, so the caller outside the engine gets flat columns
+    /// and the decode that produces them happens on the worker that produced the chunk instead of
+    /// on the single thread that drains the queue afterwards.
+    fn taken(&self, chunk: &Chunk) -> Result<Chunk> {
+        if self.shared.flatten.load(Ordering::Relaxed) {
+            return chunk.clone().into_flat();
+        }
+        Ok(chunk.clone())
+    }
 }
 
 impl Sink for RootSink {
@@ -216,6 +239,12 @@ impl Sink for RootSink {
         if chunk.is_empty() {
             return Ok(Progress::More);
         }
+        // Before the lock and not after it. This is the one point every worker in the query queues
+        // through, so work done holding it is work the rest of the pool waits out, and the flatten
+        // is the most expensive thing that happens to a chunk on its way out of the engine. The
+        // cost of doing it here is that a root with a capacity on it can decide below that the
+        // queue is full and do it again on the retry. No root the engine builds has one.
+        let taken = self.taken(chunk)?;
         let mut queue = self.shared.queue.lock().map_err(poisoned)?;
         let full = |held: usize| self.shared.capacity.is_some_and(|capacity| held >= capacity);
         if full(queue.ready.len()) {
@@ -223,7 +252,7 @@ impl Sink for RootSink {
         }
         let Queue { ready, order } = &mut *queue;
         let Some(order) = order.as_mut() else {
-            ready.push_back(chunk.clone());
+            ready.push_back(taken);
             return Ok(Progress::More);
         };
         // An order restoring root whose driver never said which morsel this came from has nowhere to
@@ -237,7 +266,7 @@ impl Sink for RootSink {
         if full(order.waiting.len()) && order.next != morsel {
             return Ok(Progress::Blocked(Blocked::Downstream(self.shared.buffer)));
         }
-        order.waiting.insert((morsel, place.at), chunk.clone());
+        order.waiting.insert((morsel, place.at), taken);
         place.at += 1;
         Ok(Progress::More)
     }
@@ -272,6 +301,20 @@ impl Sink for RootSink {
 }
 
 impl RootReader {
+    /// Ask for every chunk to be in flat form by the time it is queued.
+    ///
+    /// For the caller outside the engine, which reads a value at a time and would otherwise have to
+    /// understand a dictionary and a packed run to read a row. It is asked for here, on the reader,
+    /// because the reader is the half the caller holds and the sink is already inside the query by
+    /// the time there is anybody to ask.
+    ///
+    /// Call it before the query runs. Setting it while chunks are arriving is not unsafe and the
+    /// answer is not wrong, it is just a result where the first chunks are in whatever form they
+    /// were produced in and the rest are flat, which is not a thing any caller wants.
+    pub fn flattening(&self) {
+        self.shared.flatten.store(true, Ordering::Relaxed);
+    }
+
     /// The next chunk, or `None` when there is nothing queued right now.
     ///
     /// `None` does not mean the query is over. Ask [`RootReader::is_finished`] for that. The two

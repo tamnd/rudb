@@ -467,6 +467,42 @@ fn the_root_hands_chunks_to_a_caller_outside_the_engine() {
     assert!(reader.next_chunk().unwrap().is_none());
 }
 
+/// Who flattens a chunk on its way out of the engine, which is the sink and not the caller.
+///
+/// A caller outside the engine reads a value at a time and cannot be handed a dictionary, so
+/// something has to flatten. It used to be the loop that drains this queue, which is one thread
+/// with every worker already finished and waiting, and on a six million row result that loop was
+/// most of the query. Asking the root instead puts the same work on the thread that produced the
+/// chunk, and there are as many of those as the pipeline is wide.
+///
+/// A root that was not asked queues the form the operator produced, which is what a chunk on its
+/// way into a table needs: storage holds the encoded forms and flattening one would throw away the
+/// thing that made it small.
+#[test]
+fn a_root_a_caller_is_reading_flattens_as_it_queues() {
+    let coded = Vector::dictionary(
+        vec![1, 0, 1],
+        Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7), Value::BigInt(8)]).unwrap(),
+    )
+    .unwrap();
+    let chunk = Chunk::new(vec![coded]).unwrap();
+    let want: Vec<Value> = chunk.columns()[0].iter().collect();
+
+    let (sink, reader) = root(BufferId(0), None);
+    reader.flattening();
+    let mut place = sink.local();
+    sink.sink(&chunk, &mut place).unwrap();
+    let queued = reader.next_chunk().unwrap().expect("the chunk was queued");
+    assert_eq!(queued.columns()[0].form(), rudb_vector::Form::Flat);
+    assert_eq!(queued.columns()[0].iter().collect::<Vec<Value>>(), want);
+
+    let (sink, reader) = root(BufferId(0), None);
+    let mut place = sink.local();
+    sink.sink(&chunk, &mut place).unwrap();
+    let queued = reader.next_chunk().unwrap().expect("the chunk was queued");
+    assert_eq!(queued.columns()[0].form(), rudb_vector::Form::Dictionary);
+}
+
 #[test]
 fn a_full_root_queue_reports_backpressure_through_the_same_four_reasons() {
     let (sink, reader) = root(BufferId(4), Some(1));

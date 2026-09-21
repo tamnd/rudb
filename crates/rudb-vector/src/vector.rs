@@ -2504,6 +2504,24 @@ impl Vector {
         self.copied((0..self.len).collect(), false)
     }
 
+    /// The same values in flat form, taking the vector rather than borrowing it.
+    ///
+    /// A vector that is already flat comes back as itself, which is the whole reason this exists
+    /// beside [`Self::flatten`]. Flattening through a borrow has to clone that vector, and a clone
+    /// of a flat vector that owns its values copies every one of them to produce a vector that is
+    /// identical to the one it was handed. Anything not already flat goes the same way it does
+    /// through [`Self::flatten`], since the copy is real work there rather than work for nothing.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::flatten`].
+    pub fn into_flat(self) -> Result<Self> {
+        if let Body::Flat(_) = self.body {
+            return Ok(self);
+        }
+        self.flatten()
+    }
+
     /// The values at the given positions, copied, in a form that does not point back at this vector.
     ///
     /// This is the copying counterpart to [`Self::dictionary`], and the two are the two halves of
@@ -4953,6 +4971,32 @@ mod tests {
     fn flattening_a_flat_vector_is_the_same_vector() {
         let vector = integers(&[1, 2, 3]);
         assert_eq!(vector.flatten().unwrap(), vector);
+    }
+
+    /// The same answer as `flatten` and, for the vector that is already flat and owns its values,
+    /// the same allocation. Asserted on the address because that is the whole claim: the values
+    /// come back where they were rather than in a copy of themselves. A flatten through a borrow
+    /// cannot do that, and at the top of a query it copied every column of every chunk of the
+    /// result to hand back the bytes it was given.
+    #[test]
+    fn flattening_a_vector_that_owns_its_values_moves_them_rather_than_copying_them() {
+        let vector = integers(&[1, 2, 3, 4]);
+        let address = |vector: &Vector| match vector.data() {
+            Some(Data::Int32(values)) => values.as_slice().as_ptr() as usize,
+            _ => panic!("the layout changed under the test"),
+        };
+        let stored = address(&vector);
+        let flat = vector.into_flat().unwrap();
+        assert_eq!(address(&flat), stored, "the values moved");
+        assert_eq!(
+            flat.iter().collect::<Vec<_>>(),
+            (1..=4).map(Value::Integer).collect::<Vec<_>>()
+        );
+        // And a form that is not flat is flattened, which is the case the copy is deserved in.
+        let dictionary = Vector::dictionary(vec![1, 0, 1], integers(&[7, 8])).unwrap();
+        let flat = dictionary.clone().into_flat().unwrap();
+        assert_eq!(flat.form(), Form::Flat);
+        assert_eq!(flat.iter().collect::<Vec<_>>(), dictionary.iter().collect::<Vec<_>>());
     }
 
     #[test]

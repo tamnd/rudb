@@ -337,6 +337,27 @@ impl Chunk {
         }
         Self::with_rows(columns, self.rows)
     }
+
+    /// The same rows in flat form, taking the chunk rather than borrowing it.
+    ///
+    /// The same answer [`Self::flatten`] gives and it costs less for the column that is already
+    /// flat, which is most of them: that column is moved out of this chunk and into the new one
+    /// rather than copied. Borrowing had no way to do that, so flattening a chunk of four flat
+    /// columns of eight thousand rows copied every value for nothing, and at the top of a query of
+    /// six million rows that was a hundred and sixty megabytes copied to produce the bytes it
+    /// already had.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::flatten`].
+    pub fn into_flat(self) -> Result<Self> {
+        let rows = self.rows;
+        let mut columns = Vec::with_capacity(self.columns.len());
+        for column in self.columns {
+            columns.push(column.into_flat()?);
+        }
+        Self::with_rows(columns, rows)
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +516,28 @@ mod tests {
         for row in 0..flat.len() {
             assert_eq!(flat.value_at(row, 0), selected.value_at(row, 0), "row {row}");
         }
+    }
+
+    /// Taking the chunk rather than borrowing it, which is the same flatten and is the one that
+    /// gets to move a column that is already flat instead of copying it.
+    #[test]
+    fn flattening_a_chunk_of_mixed_forms_moves_the_column_that_is_already_flat() {
+        let flat = integers(&[10, 20, 30]);
+        let address = |vector: &Vector| match vector.data() {
+            Some(Data::Int32(values)) => values.as_slice().as_ptr() as usize,
+            _ => panic!("the layout changed under the test"),
+        };
+        let stored = address(&flat);
+        let coded = Vector::dictionary(vec![2, 1, 0], integers(&[1, 2, 3])).expect("three codes");
+        let chunk = Chunk::new(vec![flat, coded]).expect("three rows of two columns");
+        let want: Vec<Vec<_>> = (0..3).map(|row| chunk.row(row).collect()).collect();
+        let flattened = chunk.into_flat().expect("integers flatten");
+        assert_eq!(address(flattened.column(0).expect("the first column")), stored);
+        for column in flattened.columns() {
+            assert_eq!(column.form(), Form::Flat);
+        }
+        let got: Vec<Vec<_>> = (0..3).map(|row| flattened.row(row).collect()).collect();
+        assert_eq!(got, want);
     }
 
     #[test]

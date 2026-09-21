@@ -163,6 +163,20 @@ impl<'a> Query<'a> {
         self.widest.load(Ordering::Relaxed)
     }
 
+    /// Say that these rows are going out of the engine, so every column is flat when it arrives.
+    ///
+    /// A query whose rows go into a table does not call this and gets the forms the operators
+    /// produced, which is what storage wants and is why this is asked for rather than always done.
+    /// A query whose rows go to a caller calls it before [`Query::run`], and then the flattening
+    /// happens on the worker that produced the chunk. Doing it afterwards, on the one thread that
+    /// drains the queue, is the same work in the one place in a parallel query where the rest of
+    /// the pool has nothing to do but wait for it.
+    pub fn for_a_caller(&self) {
+        if let Some(reader) = &self.reader {
+            reader.flattening();
+        }
+    }
+
     /// The next chunk of the answer, or `None` when there are no more.
     ///
     /// Only meaningful after [`Query::run`] has returned. The serial driver runs a pipeline to
