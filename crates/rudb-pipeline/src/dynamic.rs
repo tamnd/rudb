@@ -97,6 +97,10 @@ pub trait DynStream: Send + Sync + fmt::Debug {
     ///
     /// Whatever the typed operator reports, plus an internal error if the state is the wrong one.
     fn push_state(&self, chunk: &mut Chunk, local: &mut LocalState) -> Result<Progress>;
+
+    /// How much more than an ordinary operator the typed one spends on a row. See
+    /// [`Stream::weight`].
+    fn row_weight(&self) -> usize;
 }
 
 impl<S: Stream> DynStream for S {
@@ -122,6 +126,10 @@ impl<S: Stream> DynStream for S {
 
     fn push_state(&self, chunk: &mut Chunk, local: &mut LocalState) -> Result<Progress> {
         self.push(chunk, local.downcast_mut::<S::Local>()?)
+    }
+
+    fn row_weight(&self) -> usize {
+        Stream::weight(self)
     }
 }
 
@@ -170,6 +178,10 @@ pub trait DynSink: Send + Sync + fmt::Debug {
 
     /// How many threads the typed operator could finish on. See [`Sink::finalize_degree`].
     fn finalize_width(&self, ceiling: usize) -> usize;
+
+    /// How much more than an ordinary operator the typed one spends on a row. See
+    /// [`Sink::weight`].
+    fn row_weight(&self) -> usize;
 }
 
 impl<S: Sink> DynSink for S {
@@ -203,5 +215,9 @@ impl<S: Sink> DynSink for S {
 
     fn finalize_width(&self, ceiling: usize) -> usize {
         self.finalize_degree(ceiling)
+    }
+
+    fn row_weight(&self) -> usize {
+        Sink::weight(self)
     }
 }

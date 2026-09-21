@@ -146,7 +146,7 @@ impl Source for Frequencies {
         self.handout.take()
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
+    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
         Some(self.handout.total())
     }
 
@@ -195,7 +195,7 @@ impl Source for Summary {
         self.handout.take()
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
+    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
         Some(self.handout.total())
     }
 
@@ -685,11 +685,11 @@ impl<'a> Scan<'a> {
     /// price of doing serially what the workers were about to do at the same time. ClickBench 19 is
     /// the query that pays it: an equality on an identifier, where no stripe bound rules anything out
     /// and the sieves rule out all but nine parts, and doing them here made it half as fast.
-    fn living(&self, threads: usize) -> (Vec<Live>, usize) {
+    fn living(&self, threads: usize, weight: usize) -> (Vec<Live>, usize) {
         let (mut live, rows) = self.bounded();
         let working = live.iter().filter(|stripe| !stripe.parts.is_empty()).count();
         let probes = self.testing();
-        if probes.is_empty() || !worth_sifting(working, threads, rows) {
+        if probes.is_empty() || !worth_sifting(working, threads, rows, weight) {
             return (live, rows);
         }
         let mut sifted = 0;
@@ -756,8 +756,8 @@ struct Live {
 /// fewer stripes than there are workers to want it, because that is the case where handing out a
 /// stripe apiece leaves most of the machine idle. When the work is already spread the workers find it
 /// themselves, at the same time, each reading the sieves of the stripe it is in.
-fn worth_sifting(working: usize, threads: usize, rows: usize) -> bool {
-    working < threads.min(instances_for(rows))
+fn worth_sifting(working: usize, threads: usize, rows: usize, weight: usize) -> bool {
+    working < threads.min(instances_for(rows, weight))
 }
 
 /// The live parts cut into the runs a morsel covers, by the rows they hold rather than by the stripe.
@@ -845,7 +845,7 @@ impl Source for Scan<'_> {
         Some(Morsel::new(index, start, end))
     }
 
-    fn morsels(&self, threads: usize) -> Option<usize> {
+    fn morsels(&self, threads: usize, weight: usize) -> Option<usize> {
         let chunks = self.chunks.total();
         // A table that says nothing about how its chunks are grouped has nothing to divide by, so
         // its chunks go out one at a time to whoever asks, which is what every table did before
@@ -854,7 +854,7 @@ impl Source for Scan<'_> {
         if self.stripes.is_empty() {
             return Some(chunks);
         }
-        let (live, rows) = self.living(threads);
+        let (live, rows) = self.living(threads, weight);
         // An instance is not free, so a scan asks for as many as the rows behind it can pay for
         // rather than for every worker the machine has. What one costs is a thread, and what it
         // buys is a share of the work, and `instances_for` is where those two are weighed. The
@@ -862,8 +862,7 @@ impl Source for Scan<'_> {
         // because a query that reads a fifteenth of a file is a query the size of a fifteenth of a
         // file and asking for a worker per stripe of the whole of it is asking for fifteen threads
         // that start, find their stripe ruled out and stop.
-        let useful = instances_for(rows);
-        let instances = chunks.min(threads).min(useful);
+        let instances = chunks.min(threads).min(instances_for(rows, weight));
         // A stripe per worker only divides the work when there are at least as many stripes as
         // workers. Below that it would leave workers with nothing, and the duplicate reads it
         // avoids are cheaper than the half of the machine it would cost, so a small table keeps
@@ -984,8 +983,27 @@ fn more(morsel: &Morsel) -> Progress {
 /// percent at a hundred thousand, and the numbers stay where they are. What that says is that the
 /// scan is no longer what limits how much of this machine a query uses, and the next thing to look
 /// at is the operators above it.
-fn instances_for(rows: usize) -> usize {
-    let small = rows.div_ceil(25_000).min(8);
+///
+/// The operators above it are what `weight` is. Both slopes were in rows, and a row is not what an
+/// instance is worth, it is what the work behind the instance was being counted in. The two stop
+/// agreeing the moment two queries spend different amounts on a row. ClickBench 39, 40 and 42 are
+/// where that showed: each of them prunes to about twenty four thousand rows and each of them ran
+/// the whole query on one thread of thirty two, because twenty four thousand is under the first
+/// divisor. Twenty four thousand rows is small. Twenty four thousand rows of 39's aggregate, which
+/// spends a hundred and eleven nanoseconds on each one grouping five columns with two wide strings
+/// among them, is a millisecond of work on one core with thirty one idle.
+///
+/// So the small slope counts work and the large one still counts rows. That split is the whole of
+/// the rule and it is deliberate. The small slope is the one that says a query is too small to
+/// divide, and whether it is depends on what the query does with what it reads. The large slope is
+/// the one that says how far a big query is worth dividing, and the measurements above say that is
+/// sixteen at a million rows and that thirty two is worse, which is a fact about this machine and
+/// not about the query, so nothing the operators say should move it.
+///
+/// Ordinary work is a weight of 1 and gives back exactly the rule that was measured. See
+/// [`Stream::weight`](rudb_pipeline::Stream::weight) for what an operator is answering.
+fn instances_for(rows: usize, weight: usize) -> usize {
+    let small = rows.saturating_mul(weight.max(1)).div_ceil(25_000).min(8);
     let large = rows.div_ceil(62_500);
     small.max(large).max(1)
 }
@@ -1016,7 +1034,7 @@ impl Source for Dummy {
         self.one.take()
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
+    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
         Some(self.one.total())
     }
 
@@ -1202,7 +1220,7 @@ impl Source for Series {
             .then(|| Morsel::new(index, start, self.rows.min(start.saturating_add(RUN))))
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
+    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
         Some(usize::try_from(self.rows.div_ceil(RUN)).unwrap_or(usize::MAX))
     }
 
@@ -1830,7 +1848,7 @@ impl Source for FileScan<'_> {
     /// one writer and is the case worth being right about. A CSV file has one morsel however large
     /// it is, since a CSV reader cannot be positioned, so a list of CSV files is as many morsels as
     /// there are files.
-    fn morsels(&self, threads: usize) -> Option<usize> {
+    fn morsels(&self, threads: usize, _weight: usize) -> Option<usize> {
         let mut cutting = self.cutting.lock().ok()?;
         cutting.threads = threads;
         aim(&mut cutting);
@@ -2066,7 +2084,7 @@ impl Source for Values {
         self.handout.take()
     }
 
-    fn morsels(&self, _threads: usize) -> Option<usize> {
+    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
         Some(self.handout.total())
     }
 
@@ -2276,7 +2294,7 @@ mod tests {
         let stripes = table.rows().stripe_parts();
         assert_eq!(stripes.len(), 2, "two full stripes of sixty four parts");
 
-        assert_eq!(scan.morsels(2), Some(2), "one instance per stripe");
+        assert_eq!(scan.morsels(2, 1), Some(2), "one instance per stripe");
         let taken = taken(&scan);
 
         assert_eq!(taken.len(), 2, "one morsel per stripe");
@@ -2296,7 +2314,7 @@ mod tests {
         let scan = scan_of(&table);
         assert_eq!(table.rows().stripe_parts().len(), 1, "one stripe and more workers than that");
 
-        assert_eq!(scan.morsels(4), Some(2), "the rows behind it pay for two instances");
+        assert_eq!(scan.morsels(4, 1), Some(2), "the rows behind it pay for two instances");
         let taken = taken(&scan);
 
         assert_eq!(taken.len(), 64, "one morsel per part");
@@ -2337,7 +2355,7 @@ mod tests {
         assert_eq!(table.rows().stripe_parts().len(), 2, "two full stripes of sixty four parts");
         let scan = pruned_scan(&table, vec![(0, Op::GreaterOrEqual, Bound::Int(25_600))]);
 
-        assert_eq!(scan.morsels(2), Some(2), "the surviving half pays for two instances");
+        assert_eq!(scan.morsels(2, 1), Some(2), "the surviving half pays for two instances");
         let taken = taken(&scan);
 
         assert!(taken.len() > 2, "the one stripe with work is cut up, not handed out whole");
@@ -2359,10 +2377,14 @@ mod tests {
     /// of its time.
     #[test]
     fn the_sieves_are_read_early_only_when_the_bounds_have_left_the_work_in_a_heap() {
-        assert!(worth_sifting(2, 32, 1_000_000), "two stripes of work and a machine to fill");
-        assert!(!worth_sifting(16, 32, 1_000_000), "sixteen is as many instances as the rows buy");
-        assert!(!worth_sifting(1, 1, 1_000_000), "one worker has nowhere to spread it anyway");
-        assert!(!worth_sifting(1, 32, 1_000), "a thousand rows pay for one worker either way");
+        assert!(worth_sifting(2, 32, 1_000_000, 1), "two stripes of work and a machine to fill");
+        assert!(
+            !worth_sifting(16, 32, 1_000_000, 1),
+            "sixteen is as many instances as the rows buy"
+        );
+        assert!(!worth_sifting(1, 1, 1_000_000, 1), "one worker has nowhere to spread it anyway");
+        assert!(!worth_sifting(1, 32, 1_000, 1), "a thousand rows pay for one worker either way");
+        assert!(worth_sifting(1, 32, 1_000, 64), "a thousand rows of heavy work pay for more");
     }
 
     /// The live parts of each stripe, with the rows they hold worked out the way `bounded` does.
@@ -2958,7 +2980,44 @@ mod tests {
             (2_500_000, 40),
             (9_999_750, 160),
         ] {
-            assert_eq!(instances_for(rows), workers, "{rows} rows");
+            assert_eq!(instances_for(rows, 1), workers, "{rows} rows");
+        }
+    }
+
+    /// The same rule read the other way, where the rows are few and what is done to each is not.
+    ///
+    /// ClickBench 39 is the first row of this. It prunes to about twenty four thousand rows and
+    /// its aggregate groups five columns, two of them wide strings, so a row costs the pipeline
+    /// about a dozen times what reading it cost, and at a weight of one the whole query ran on one
+    /// thread of thirty two.
+    #[test]
+    fn native_workers_grow_with_the_work_behind_each_row() {
+        for (rows, weight, workers) in [
+            (24_576, 1, 1),
+            (24_576, 2, 2),
+            (24_576, 7, 7),
+            (24_576, 12, 8),
+            (1_000, 25, 1),
+            (3_000, 9, 2),
+            (0, 100, 1),
+        ] {
+            assert_eq!(instances_for(rows, weight), workers, "{rows} rows at weight {weight}");
+        }
+    }
+
+    /// A weight cannot make a large query wider, because how far a large query is worth dividing
+    /// is a fact about the machine and the measurements say sixteen at a million rows.
+    ///
+    /// The small slope caps at eight, so any query with enough rows to reach eight on that slope
+    /// alone is already there and there is nothing for a weight to add. That is everything from
+    /// two hundred thousand live rows up, which is where the whole of this change stops applying.
+    #[test]
+    fn a_weight_never_moves_the_slope_that_divides_a_large_query() {
+        for rows in [200_000, 500_000, 1_000_000, 2_500_000, 9_999_750] {
+            let plain = instances_for(rows, 1);
+            for weight in [2, 4, 12, 64] {
+                assert_eq!(instances_for(rows, weight), plain, "{rows} rows at weight {weight}");
+            }
         }
     }
 
