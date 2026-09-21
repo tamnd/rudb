@@ -213,6 +213,52 @@ pub(crate) fn correlated(plan: &Plan, at: NodeRef, outer: &TableSet) -> bool {
         .any(|child| correlated(plan, child, outer))
 }
 
+/// What in a correlated subtree the push has no rule for, named the way someone wrote it.
+///
+/// [`push`] walks down until the correlation stops, so what stopped it is the first node it met
+/// that still reads an outer column and is not one of the shapes it matches. Walking the subtree
+/// again afterwards to find that node costs a walk of a query that is about to be refused anyway,
+/// and it buys an error naming the construct rather than one naming the dependent join, which is a
+/// node the binder put there and nobody wrote.
+///
+/// The arms that answer `None` are the ones [`push`] has a rule for, so this stays in step with the
+/// match below by being written the same way round: adding a rule there and forgetting here gives a
+/// construct that works and is also named as unsupported, which the tests catch, rather than one
+/// that is refused with the wrong reason.
+pub(crate) fn unsupported(plan: &Plan, at: NodeRef, outer: &TableSet) -> Option<String> {
+    if !correlated(plan, at, outer) {
+        return None;
+    }
+    let here = match *plan.node(at) {
+        Node::Filter { .. }
+        | Node::Project { .. }
+        | Node::Aggregate { .. }
+        | Node::Distinct { .. }
+        | Node::Sort { .. }
+        | Node::Window { .. }
+        | Node::TopN { .. }
+        | Node::SetOp { .. }
+        | Node::Values { .. }
+        | Node::TableFunction { .. }
+        | Node::CrossProduct { .. } => None,
+        Node::Limit { count, offset, .. } => match (count, offset) {
+            (Bound::All | Bound::Rows(_), Bound::Rows(_)) => None,
+            _ => Some("a LIMIT holding a value that is not known until the query runs".to_owned()),
+        },
+        Node::LimitPercent { .. } => Some("a LIMIT written as a percentage".to_owned()),
+        Node::Join { kind: JoinKind::Positional, .. } => Some("a positional join".to_owned()),
+        Node::Join { .. } => None,
+        ref held => Some(format!("a {}", held.keyword())),
+    };
+    here.map(|what| format!("{what} in a correlated subquery")).or_else(|| {
+        plan.node(at)
+            .children()
+            .into_iter()
+            .flatten()
+            .find_map(|child| unsupported(plan, child, outer))
+    })
+}
+
 /// Puts the domain under `at` and rewrites everything that read the outer row to read it instead.
 fn push(
     plan: &mut Plan,
@@ -382,8 +428,6 @@ fn push(
             conditions,
             ..
         } => sides(plan, left, right, kind, conditions, domain, index, keys, outer),
-        // A positional join is what is left out. It pairs the nth row of one side with the nth row
-        // of the other, and crossing either side with the domain changes what the nth row is.
         Node::Join {
             left,
             right,
@@ -391,6 +435,10 @@ fn push(
             conditions,
             ..
         } => filtering(plan, left, right, kind, conditions, domain, index, keys, outer),
+        // A positional join is what is left out. It pairs the nth row of one side with the nth row
+        // of the other, and crossing either side with the domain changes what the nth row is. The
+        // reference binary refuses this as well rather than answering it, so a query written this
+        // way is refused by both and there is nothing here to be compatible with.
         _ => None,
     }
 }
@@ -1800,5 +1848,32 @@ mod tests {
         // listed again or the query above loses it. Four data columns across the two sides.
         assert!(after.contains("AS __kept_3"), "{after}");
         assert!(!after.contains("AS __kept_4"), "{after}");
+    }
+
+    /// A positional join under the correlation is refused, and the refusal says which construct it
+    /// was.
+    ///
+    /// The reference binary refuses the same query, so the answer being an error is the compatible
+    /// answer rather than a gap. What the message says is the part worth holding: naming the
+    /// positional join is something a person can act on, and naming the dependent join is telling
+    /// them about a node the binder invented.
+    #[test]
+    fn a_positional_join_under_the_correlation_is_refused_by_name() {
+        for (left, right) in [(READS, QUIET), (QUIET, READS)] {
+            let mut plan = correlated_join("POSITIONAL", left, right);
+            let error = unnest::lower(&mut plan).expect_err("a positional join has no rule");
+            let message = error.to_string();
+            assert!(message.contains("a positional join in a correlated subquery"), "{message}");
+        }
+    }
+
+    /// The same naming for the other construct with no rule, which is a share rather than a count.
+    #[test]
+    fn a_limit_written_as_a_percentage_under_the_correlation_is_refused_by_name() {
+        let mut plan =
+            correlated("  LimitPercent 10% offset 0\n    Project #2 [#1.1::INTEGER AS value]\n");
+        let error = unnest::lower(&mut plan).expect_err("a share has no rule");
+        let message = error.to_string();
+        assert!(message.contains("a LIMIT written as a percentage"), "{message}");
     }
 }
