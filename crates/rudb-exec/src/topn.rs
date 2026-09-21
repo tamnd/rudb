@@ -44,6 +44,26 @@
 //! dictionary is not, because it belongs to the file rather than to the chunk, and holding it is one
 //! pointer against the string it names.
 //!
+//! # Comparing two rows without reading either
+//!
+//! A key is not like the rest of the row. It is read because it is compared, so holding it as a code
+//! only pays if the comparison can be made on codes too, and a code on its own cannot: two codes in
+//! first appearance order say nothing about which of their two strings sorts first.
+//!
+//! A rank can. A native text column stores the sorted order of its dictionary, and the rank of a
+//! code is where that code's value sits in it, so two ranks in the same dictionary compare exactly
+//! as the two strings do and the comparison is one integer against another. A candidate's key is
+//! kept as a code and a rank when the column gave it both, and a row is rejected against it by
+//! looking its own rank up, which is two loads. Nothing decodes. On ClickBench 25, `ORDER BY
+//! SearchPhrase LIMIT 10`, reading the row's value to compare it was forty three percent of the
+//! whole query.
+//!
+//! Anything the dictionary cannot answer falls back to what it did before: the value is read on both
+//! sides and compared as a value. That covers a key that is not a text column, a null, a chunk
+//! arriving over a different dictionary from the one a candidate was kept from, and a file with no
+//! stored order. Ranks from two different dictionaries are never compared, because a rank means
+//! nothing outside the dictionary it was read out of.
+//!
 //! The bound moves while the chunk is being walked, since a winner replaces the worst candidate, so
 //! what the pass produces is a superset of the rows that really win. That is the point: it is a
 //! filter and not the decision, and every row it keeps is compared again properly.
@@ -86,13 +106,14 @@
 //! this hands back are the ten a single thread would have handed back. It costs sixteen bytes per
 //! candidate and the bound is ten.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
 use rudb_common::bounds::Bound;
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_kernels::{
-    Comparison, compare as compare_vectors, rank_at, select_against_rank, selection,
+    Comparison, compare as compare_vectors, rank_at, rank_within, select_against_rank, selection,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
@@ -103,15 +124,15 @@ use crate::cutoff::Cutoff;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
-use crate::sort::{Place, compare, rank};
+use crate::sort::{Place, rank};
 
 /// Above this bound, moving a sorted candidate array costs more than trimming in batches.
 const SORTED_BOUND: usize = 64;
 
-/// One row in the running: the values of its keys, the row itself, and where it arrived.
+/// One row in the running: its keys, the row itself, and where it arrived.
 #[derive(Debug)]
 struct Candidate {
-    key: Vec<Value>,
+    key: Vec<Cell>,
     values: Vec<Cell>,
     arrival: crate::sort::Arrival,
 }
@@ -128,20 +149,24 @@ struct Candidate {
 /// column keeps the code, and the value is read in `finalize` for the rows that came out on top.
 /// ClickBench 24 went from 130 million instructions to 87 million on that, a third of the query.
 ///
-/// It buys nothing where the same column is also a sort key, since keeping the row is then not what
-/// read the value, and ClickBench 26 pays about seven percent for the bookkeeping. Keys are read a
-/// value at a time and compared as values, and making them codes as well is the change after this
-/// one.
+/// A key is the same cell with one more thing in it. It is held to be compared rather than to be
+/// handed back, so a code alone would not save the read: two codes say nothing about which of their
+/// values sorts first. A rank does, and where the dictionary knows its own order the rank of the
+/// code is free at the moment the row is kept. See [`Cell::keyed`] and [`at_row`].
 ///
 /// Everything else is read where it is met. A value that is not a code has to be copied out of the
 /// chunk before the chunk goes, and a null is a value like any other here, since the dictionary has
 /// no code for one.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Cell {
     /// The value, read out of the chunk that carried it.
     Ready(Value),
     /// The code that names the value, and the dictionary to read it out of.
-    Coded { dictionary: Arc<Vector>, code: u32 },
+    ///
+    /// `rank` is where the value sits in that dictionary's own order, and it is `None` for every
+    /// cell of the row that is not a key. Working it out means inverting the order once per
+    /// dictionary, and there is no reason to pay that for a column nobody is going to compare.
+    Coded { dictionary: Arc<Vector>, code: u32, rank: Option<u32> },
 }
 
 impl Cell {
@@ -150,11 +175,25 @@ impl Cell {
         if let Some((codes, dictionary)) = column.shared_dictionary_parts() {
             if column.validity().is_valid(row) {
                 if let Some(code) = codes.get(row) {
-                    return Ok(Self::Coded { dictionary: Arc::clone(dictionary), code: *code });
+                    let dictionary = Arc::clone(dictionary);
+                    return Ok(Self::Coded { dictionary, code: *code, rank: None });
                 }
             }
         }
         Ok(Self::Ready(column.try_value_at(row)?))
+    }
+
+    /// The cell for one row of one key column, which is a code only when it comes with a rank.
+    ///
+    /// The difference from [`Cell::of`] is that a code without a rank is no use here. The key of a
+    /// candidate is read every time a row is rejected against it, so holding a code that has to be
+    /// turned back into a value to be compared would read the same value over and over instead of
+    /// once.
+    fn keyed(column: &Vector, row: usize) -> Result<Self> {
+        match placed(column, row) {
+            Some(cell) => Ok(cell),
+            None => Ok(Self::Ready(column.try_value_at(row)?)),
+        }
     }
 
     /// The value, read now where it was not read when the row was kept.
@@ -165,7 +204,25 @@ impl Cell {
     fn value(self) -> Result<Value> {
         match self {
             Self::Ready(value) => Ok(value),
-            Self::Coded { dictionary, code } => dictionary.try_value_at(code as usize),
+            Self::Coded { dictionary, code, .. } => dictionary.try_value_at(code as usize),
+        }
+    }
+
+    /// The value without giving the cell up, borrowed where it is already there.
+    ///
+    /// For the callers that need a value out of a key and are not finished with the key: a bound to
+    /// publish to the scan, and the fallback comparison for a pair of cells that ranks cannot
+    /// settle. Nothing is copied unless the value has to be decoded.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the dictionary raises when it cannot read the value the code names.
+    fn read(&self) -> Result<Cow<'_, Value>> {
+        match self {
+            Self::Ready(value) => Ok(Cow::Borrowed(value)),
+            Self::Coded { dictionary, code, .. } => {
+                dictionary.try_value_at(*code as usize).map(Cow::Owned)
+            }
         }
     }
 
@@ -176,6 +233,18 @@ impl Cell {
             Self::Coded { .. } => 0,
         }
     }
+}
+
+/// The key cell for a row that arrived as a code in a dictionary that knows its own order.
+///
+/// `None` for anything else, which the caller reads as a value instead. The code is looked up a
+/// second time rather than threaded out of `rank_at`, because this runs only when a row is kept and
+/// what a rank is stays in one place.
+fn placed(column: &Vector, row: usize) -> Option<Cell> {
+    let (dictionary, rank) = rank_at(column, row)?;
+    let (codes, _) = column.shared_dictionary_parts()?;
+    let code = *codes.get(row)?;
+    Some(Cell::Coded { dictionary, code, rank: Some(rank) })
 }
 
 /// What one candidate row of cells is charged.
@@ -193,7 +262,7 @@ fn charge(values: &[Cell]) -> u64 {
 /// Where two candidates sit relative to each other, ties settled by where they arrived.
 ///
 /// What [`crate::sort::settled`] does for the sort's own row, which this cannot use because a
-/// candidate holds its row as cells rather than as values.
+/// candidate holds its keys as cells rather than as values.
 fn settled(
     keys: &[SortKey],
     left: &Candidate,
@@ -203,6 +272,61 @@ fn settled(
     match compare(keys, &left.key, &right.key, failure) {
         Ordering::Equal => left.arrival.cmp(&right.arrival),
         ordering => ordering,
+    }
+}
+
+/// Where two rows of key cells sit relative to each other, under the key list in priority order.
+///
+/// [`crate::sort::compare`] over cells. The first key that separates them decides and the rest are
+/// never looked at, which is the reason a key is compared rather than read.
+fn compare(
+    keys: &[SortKey],
+    left: &[Cell],
+    right: &[Cell],
+    failure: &mut Option<Error>,
+) -> Ordering {
+    for (at, key) in keys.iter().enumerate() {
+        let ordering = match place(&left[at], &right[at], *key) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                failure.get_or_insert(error);
+                Ordering::Equal
+            }
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Where two key cells sit relative to each other under one sort key.
+///
+/// Two ranks in the same dictionary answer it outright, because a dictionary's order is the order of
+/// its values and the ranks are positions in it. The identity check is what makes that true and it
+/// is a pointer comparison: a rank is a position in one dictionary and means nothing in another.
+///
+/// Neither side can be null in that case, since a null row is one of the things that stops a cell
+/// being held as a code at all, so the null placement of the sort key has nothing to say here and
+/// only the direction does.
+///
+/// # Errors
+///
+/// Whatever reading either value raises, and whatever comparing two values of different types does.
+fn place(left: &Cell, right: &Cell, key: SortKey) -> Result<Ordering> {
+    match (left, right) {
+        (Cell::Ready(here), Cell::Ready(there)) => rank(here, there, key),
+        (
+            Cell::Coded { dictionary: one, rank: Some(here), .. },
+            Cell::Coded { dictionary: other, rank: Some(there), .. },
+        ) if Arc::ptr_eq(one, other) => {
+            let ordering = here.cmp(there);
+            Ok(if key.descending { ordering.reverse() } else { ordering })
+        }
+        _ => {
+            let (here, there) = (left.read()?, right.read()?);
+            rank(&here, &there, key)
+        }
     }
 }
 
@@ -253,87 +377,15 @@ pub(crate) struct Running {
     /// It stays true between trims because the running only improves. Once the bound of candidates
     /// are all at least as good as this key, a row worse than it cannot finish inside the bound, and
     /// neither can one that ties it, because everything it ties arrived first.
-    cut: Option<Vec<Value>>,
-    /// Where each candidate's first key sits in the dictionary the candidates all came from.
+    cut: Option<Vec<Cell>>,
+    /// Whether the worst candidate has changed since the last time it was published to the cutoff.
     ///
-    /// Only the sorted path keeps this, and only for a first key that is a shared dictionary over a
-    /// source that knows its order, which today means a text column read out of a native file.
-    ranked: Ranked,
-}
-
-/// The rank of every candidate's first key, kept beside the candidates rather than inside them.
-///
-/// The point of it is that the chunk pass never has to search. Asking whether any row of a chunk can
-/// still beat the worst candidate is a comparison against that candidate's value, and a comparison
-/// against a value in a sorted dictionary starts by finding out where the value sits, which is about
-/// nineteen probes and a decoded block or two for each probe that the stored head cannot settle. The
-/// value did not come from the query though. It came out of the same dictionary, carried by a row
-/// that arrived with its code, so its rank was free at the moment it was kept and searching for it
-/// again is work that was already done.
-///
-/// It sits next to the candidates rather than in them because it is a fact about the first key only,
-/// where a candidate is a whole row. The two are kept in step by the one place that inserts, and
-/// anything that cannot be given a rank turns the whole thing off rather than leaving a hole in it.
-#[derive(Debug, Default)]
-struct Ranked {
-    /// The dictionary the ranks are positions in, `None` until the first candidate says.
-    dictionary: Option<Arc<Vector>>,
-    /// One rank per candidate, in the order the candidates are held.
-    of: Vec<u32>,
-    /// Whether ranks are still being kept.
-    live: bool,
-}
-
-impl Ranked {
-    /// Ranks on, for a top N that has not seen a chunk yet.
-    fn new() -> Self {
-        Self { dictionary: None, of: Vec::new(), live: true }
-    }
-
-    /// Whether working a rank out for a row about to be kept is worth the trouble.
-    fn wanted(&self) -> bool {
-        self.live
-    }
-
-    /// The dictionary and the rank of the worst of `candidates` candidates, when both are known.
-    ///
-    /// The length check is the safety net. These are two containers kept in step by hand, so the one
-    /// place that can tell they have come apart checks, and coming apart turns the fast path off
-    /// rather than reading the wrong rank.
-    fn worst(&self, candidates: usize) -> Option<(&Arc<Vector>, u32)> {
-        if !self.live || self.of.len() != candidates {
-            return None;
-        }
-        Some((self.dictionary.as_ref()?, *self.of.last()?))
-    }
-
-    /// Mirrors an insert into the candidates, or gives up when the row has no rank to mirror.
-    fn inserted(&mut self, at: usize, rank: Option<(Arc<Vector>, u32)>, bound: usize) {
-        if !self.live {
-            return;
-        }
-        let Some((dictionary, rank)) = rank else {
-            self.give_up();
-            return;
-        };
-        match self.dictionary.as_ref() {
-            Some(known) if Arc::ptr_eq(known, &dictionary) => {}
-            Some(_) => {
-                self.give_up();
-                return;
-            }
-            None => self.dictionary = Some(dictionary),
-        }
-        self.of.insert(at, rank);
-        self.of.truncate(bound);
-    }
-
-    /// Stops keeping ranks for the rest of this instance.
-    fn give_up(&mut self) {
-        self.dictionary = None;
-        self.of = Vec::new();
-        self.live = false;
-    }
+    /// Publishing means reading the worst candidate's first key as a value, and a coded key is not
+    /// read until somebody asks. Without this the sorted path would decode one dictionary block per
+    /// chunk to hand the scan a bound it was given already. Every insert moves the worst candidate,
+    /// whether the running was full before it or not, so the flag is set in the one place that
+    /// inserts.
+    moved: bool,
 }
 
 impl TopN {
@@ -398,11 +450,15 @@ impl TopN {
     /// key publishes nothing, which under the `NULLS LAST` this is only ever armed for means the
     /// candidates do not yet rule out any value at all.
     ///
-    /// The arming is checked before the key is turned into a bound rather than after, because a
-    /// string key would be copied to find out that nobody was listening.
-    fn reached(&self, worst: &[Value]) {
+    /// The arming is checked before the key is read rather than after, because a coded key would
+    /// decode a dictionary block to find out that nobody was listening. A read that fails publishes
+    /// nothing and says nothing, since a cutoff is a hint and the same candidate is read again in
+    /// `finalize` where an error has somewhere to go.
+    fn reached(&self, worst: &[Cell]) {
         let Some(cutoff) = self.cutoff.as_ref().filter(|cutoff| cutoff.armed()) else { return };
-        let Some(bound) = worst.first().and_then(Bound::of_value) else { return };
+        let Some(first) = worst.first() else { return };
+        let Ok(value) = first.read() else { return };
+        let Some(bound) = Bound::of_value(&value) else { return };
         cutoff.reached(bound);
     }
 
@@ -456,7 +512,7 @@ impl Sink for TopN {
             failure: None,
             place: Place::default(),
             cut: None,
-            ranked: Ranked::new(),
+            moved: false,
         }
     }
 
@@ -471,21 +527,16 @@ impl Sink for TopN {
         if self.bound <= SORTED_BOUND {
             let rows = chunk.len();
             let full = self.bound > 0 && local.kept.len() == self.bound;
-            // The rank pass where the candidates carry ranks and the value pass where they do not.
-            // Both answer the same question and the second one searches the dictionary to do it.
-            // The second is still tried when the first declines, because a chunk that does not
-            // arrive as a dictionary over the one the ranks belong to is a chunk the ranks say
-            // nothing about and the search says as much as it ever did.
+            // The rank pass where the worst candidate's first key carries a rank and the value pass
+            // where it does not. Both answer the same question and the second one searches the
+            // dictionary to do it. The second is still tried when the first declines, because a
+            // chunk that does not arrive over the dictionary the rank belongs to is a chunk the
+            // rank says nothing about, and the search says as much as it ever did.
             let narrowed = full
                 .then(|| {
-                    let ranked =
-                        local.ranked.worst(local.kept.len()).and_then(|(dictionary, rank)| {
-                            beats_rank(&self.keys, &keys, dictionary, rank, rows)
-                        });
-                    ranked.or_else(|| {
-                        let worst = &local.kept[self.bound - 1].key;
-                        worth_looking_at(&self.keys, &keys, worst, rows)
-                    })
+                    let worst = &local.kept[self.bound - 1].key;
+                    let ranked = beats_rank(&self.keys, &keys, worst, rows);
+                    ranked.or_else(|| worth_looking_at(&self.keys, &keys, worst, rows))
                 })
                 .flatten();
             let offer = |row: usize, local: &mut Running| {
@@ -514,7 +565,8 @@ impl Sink for TopN {
             }
             local.place.past(chunk.len());
             recharge(&local.kept, &mut local.charged)?;
-            if self.bound > 0 && local.kept.len() == self.bound {
+            if local.moved && self.bound > 0 && local.kept.len() == self.bound {
+                local.moved = false;
                 self.reached(&local.kept[self.bound - 1].key);
             }
             return Ok(Progress::More);
@@ -616,11 +668,11 @@ fn hold(
     arrival: crate::sort::Arrival,
     kept: &mut Vec<Candidate>,
 ) -> Result<u64> {
-    let key: Vec<Value> =
-        keys.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
+    let key: Vec<Cell> =
+        keys.iter().map(|column| Cell::keyed(column, row)).collect::<Result<_>>()?;
     let values: Vec<Cell> =
         chunk.columns().iter().map(|column| Cell::of(column, row)).collect::<Result<_>>()?;
-    let taken = rows::footprint(&key) + charge(&values);
+    let taken = charge(&key) + charge(&values);
     kept.push(Candidate { key, values, arrival });
     Ok(taken)
 }
@@ -644,7 +696,7 @@ fn keep(
     {
         return;
     }
-    let key: Vec<Value> = match columns.iter().map(|column| column.try_value_at(row)).collect() {
+    let key: Vec<Cell> = match columns.iter().map(|column| Cell::keyed(column, row)).collect() {
         Ok(key) => key,
         Err(error) => {
             failure.get_or_insert(error);
@@ -659,13 +711,6 @@ fn keep(
                 return;
             }
         };
-    // Worked out before the insert rather than after, because after it the row's place among the
-    // candidates is known and where its value sits in the dictionary is not any easier to find.
-    let rank = local
-        .ranked
-        .wanted()
-        .then(|| columns.first().and_then(|column| rank_at(column, row)))
-        .flatten();
     // After every candidate whose key it ties, which is where its arrival puts it too: an instance
     // reads the morsels it is given in order and each of them from the start, so a row reaching
     // here arrived after everything already held.
@@ -674,7 +719,7 @@ fn keep(
     });
     local.kept.insert(at, Candidate { key, values, arrival });
     local.kept.truncate(bound);
-    local.ranked.inserted(at, rank, bound);
+    local.moved = true;
 }
 
 /// One row being offered to the candidates, which is five things that only travel together.
@@ -688,24 +733,18 @@ struct Where<'a> {
 
 /// Where one row of the key columns sits against a key already held.
 ///
-/// The same answer [`compare`] gives for the same two keys, read straight out of the columns rather
-/// than out of a `Vec` built for the purpose.
+/// The same answer [`compare`] gives for the same two keys, with the row read straight out of the
+/// columns rather than out of a `Vec` built for the purpose. This is the reject, so it runs on every
+/// row that reaches the operator and almost all of them lose on the first key.
 fn against(
     keys: &[SortKey],
     columns: &[Vector],
     row: usize,
-    held: &[Value],
+    held: &[Cell],
     failure: &mut Option<Error>,
 ) -> Ordering {
     for (at, key) in keys.iter().enumerate() {
-        let value = match columns[at].try_value_at(row) {
-            Ok(value) => value,
-            Err(error) => {
-                failure.get_or_insert(error);
-                return Ordering::Equal;
-            }
-        };
-        let ordering = match rank(&value, &held[at], *key) {
+        let ordering = match at_row(&columns[at], row, &held[at], *key) {
             Ok(ordering) => ordering,
             Err(error) => {
                 failure.get_or_insert(error);
@@ -719,23 +758,52 @@ fn against(
     Ordering::Equal
 }
 
+/// Where one row of one key column sits against one key cell already held.
+///
+/// [`place`] with the left side still in the chunk. A held key that is a rank asks the column where
+/// this row sits in the same dictionary, which is two loads and an integer compare, and the row's
+/// value is never read. Everything else reads it, which is what this did for every row before.
+///
+/// A key already sitting there as a value goes straight out the top, rather than through
+/// [`Cell::read`], because that path is what a key that is not a text column out of a file does for
+/// every row of the input and building a `Cow` around a borrow it already had was worth four percent
+/// of ClickBench 24.
+///
+/// # Errors
+///
+/// Whatever reading either side raises, and whatever comparing two values of different types does.
+fn at_row(column: &Vector, row: usize, held: &Cell, key: SortKey) -> Result<Ordering> {
+    let (dictionary, code, place) = match held {
+        Cell::Ready(there) => return rank(&column.try_value_at(row)?, there, key),
+        Cell::Coded { dictionary, code, rank } => (dictionary, code, rank),
+    };
+    if let Some(there) = place {
+        if let Some(here) = rank_within(column, row, dictionary) {
+            let ordering = here.cmp(there);
+            return Ok(if key.descending { ordering.reverse() } else { ordering });
+        }
+    }
+    let (here, there) = (column.try_value_at(row)?, dictionary.try_value_at(*code as usize)?);
+    rank(&here, &there, key)
+}
+
 /// The rows of a chunk that can still beat `worst`, or nothing when every row has to be looked at.
 ///
 /// One comparison of the first key column against a constant, for the reasons in the module doc.
 fn worth_looking_at(
     keys: &[SortKey],
     columns: &[Vector],
-    worst: &[Value],
+    worst: &[Cell],
     rows: usize,
 ) -> Option<Selection> {
     let key = *keys.first()?;
-    let bound = worst.first()?;
+    let bound = worst.first()?.read().ok()?;
     let column = columns.first()?;
     if bound.is_null() || (key.nulls_first && column.validity().has_nulls(rows)) {
         return None;
     }
     let op = still_wanted(key, keys.len() == 1);
-    let against = Vector::constant(column.logical_type().clone(), bound.clone(), rows);
+    let against = Vector::constant(column.logical_type().clone(), bound.into_owned(), rows);
     // The whole chunk is in play here, so this asks the kernel that reads its operands where they
     // lie rather than the one that reads them through a selection. Handing the threaded kernel an
     // identity selection would build a `u32` a row to say "all of them", check every one of them is
@@ -748,25 +816,30 @@ fn worth_looking_at(
 
 /// [`worth_looking_at`] for a worst candidate whose place in the dictionary is already known.
 ///
-/// The same question and the same answer, without the part that costs: placing the bound. See
-/// [`Ranked`] for where the rank comes from and `rudb_kernels::select_against_rank` for what is left
-/// once the search is gone, which is two loads and an integer compare per row.
+/// The same question and the same answer, without the part that costs: placing the bound. A
+/// comparison against a value in a sorted dictionary starts by finding out where the value sits,
+/// which is about nineteen probes and a decoded block or two for each probe the stored head cannot
+/// settle. The value did not come from the query though. It came out of the same dictionary, carried
+/// by a row that arrived with its code, so its rank was free at the moment it was kept and searching
+/// for it again is work that was already done. See `rudb_kernels::select_against_rank` for what is
+/// left once the search is gone, which is two loads and an integer compare per row.
 ///
 /// The two guards `worth_looking_at` starts with are here too, minus the one about a null bound,
-/// which cannot happen because a null first key is one of the things that stops ranks being kept.
+/// which cannot happen because a null row is one of the things that stops a key being held as a
+/// code.
 fn beats_rank(
     keys: &[SortKey],
     columns: &[Vector],
-    dictionary: &Arc<Vector>,
-    rank: u32,
+    worst: &[Cell],
     rows: usize,
 ) -> Option<Selection> {
     let key = *keys.first()?;
     let column = columns.first()?;
+    let Cell::Coded { dictionary, rank: Some(rank), .. } = worst.first()? else { return None };
     if key.nulls_first && column.validity().has_nulls(rows) {
         return None;
     }
-    select_against_rank(still_wanted(key, keys.len() == 1), column, dictionary, rank, rows)
+    select_against_rank(still_wanted(key, keys.len() == 1), column, dictionary, *rank, rows)
 }
 
 /// The comparison against the worst candidate that a row still in the running satisfies.
@@ -789,10 +862,8 @@ fn still_wanted(key: SortKey, single: bool) -> Comparison {
 /// and has no partial release. Nothing else can be holding the difference at this point, since the
 /// operator is between two reads of its input.
 fn recharge(kept: &[Candidate], scratch: &mut Reservation) -> Result<()> {
-    let footprint = kept
-        .iter()
-        .map(|candidate| rows::footprint(&candidate.key) + charge(&candidate.values))
-        .sum();
+    let footprint =
+        kept.iter().map(|candidate| charge(&candidate.key) + charge(&candidate.values)).sum();
     scratch.release();
     scratch.grow(footprint)
 }
