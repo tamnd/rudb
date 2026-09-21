@@ -51,6 +51,10 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector};
 
+mod zones;
+
+pub use zones::{Stripes, distincts};
+
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
@@ -309,6 +313,16 @@ impl Stripe {
     #[must_use]
     pub fn parts(&self) -> usize {
         self.parts.len()
+    }
+
+    /// The two ends and the null count of every column over the whole stripe.
+    ///
+    /// In the directory and so in memory, which is what makes it the one a planner can ask. The
+    /// finer ones are a page per column per stripe in the file, read by [`Reader::skips`] when a
+    /// scan wants to know which parts to open.
+    #[must_use]
+    pub fn zone(&self) -> &Zone {
+        &self.zone
     }
 }
 
