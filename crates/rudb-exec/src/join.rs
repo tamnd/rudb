@@ -303,6 +303,10 @@ impl<'a> Join<'a> {
             plan: self.plan,
             exprs: &equalities.residual,
             combined: &self.combined,
+            // Nothing, which reads as every column wanted. This operator answers a pair at a time
+            // through [`Residual::keep`], which never asks, and an empty list is the answer that
+            // cannot be wrong if it ever does.
+            wanted: &[],
             left_types: &left_types,
             time_zone: self.time_zone,
         });
@@ -749,6 +753,15 @@ pub(crate) struct Probe<'a> {
     /// This operator's order and not the plan's even when swapped, for the reason [`Join::swapped`]
     /// gives: a condition finds its columns by binding rather than by counting.
     combined: Schema,
+    /// Which of those columns the residual reads, in the same order.
+    ///
+    /// A residual is evaluated over a chunk of pairs, and building that chunk means gathering both
+    /// sides at the pair list. A conjunct the lookup could not answer usually reads one column of
+    /// each side, and everything else in the two schemas is gathered so that the column numbers
+    /// still line up. So the ones nothing reads are stood in for by a constant, which lines the
+    /// numbers up for nothing rather than for a pass over the pairs. TPC-H q21 is the case: the
+    /// residual is one comparison of two `l_suppkey` columns and the driving side carries four.
+    wanted: Vec<bool>,
     left_types: Vec<LogicalType>,
     right_types: Vec<LogicalType>,
     /// How many columns of the answer are the driving side's, which is how far to rotate a swapped
@@ -1029,6 +1042,24 @@ impl<'a> Probe<'a> {
             _ if swapped => Schema::concat(right_schema, left),
             _ => Schema::concat(left, right_schema),
         };
+        let combined = Schema::concat(left, right_schema);
+        let mut wanted = vec![false; combined.bindings().len()];
+        for &expr in &equalities.residual {
+            columns(plan, expr, &mut |binding| {
+                // A binding the combined schema cannot place is one this cannot rule out, so the
+                // whole of that side is gathered as it was. Nothing reaches here with one today,
+                // since a residual is a conjunct of the join's own condition, and the refusal is
+                // here so that a plan that did would be slow rather than wrong.
+                match combined.position_of(binding) {
+                    Some(at) => {
+                        if let Some(flag) = wanted.get_mut(at) {
+                            *flag = true;
+                        }
+                    }
+                    None => wanted.fill(true),
+                }
+            });
+        }
         Some(Self {
             plan,
             kind,
@@ -1036,7 +1067,8 @@ impl<'a> Probe<'a> {
             marker,
             left_schema: left.clone(),
             right_schema: right_schema.clone(),
-            combined: Schema::concat(left, right_schema),
+            combined,
+            wanted,
             left_types: left.types(),
             right_types: right_schema.types(),
             left_width: left.width(),
@@ -1155,6 +1187,7 @@ impl<'a> Probe<'a> {
             plan: self.plan,
             exprs: &self.equalities.residual,
             combined: &self.combined,
+            wanted: &self.wanted,
             left_types: &self.left_types,
             time_zone: self.time_zone,
         }
@@ -1965,6 +1998,8 @@ struct Residual<'a> {
     exprs: &'a [ExprRef],
     /// Both sides' columns in this operator's order, which is what those conjuncts resolve against.
     combined: &'a Schema,
+    /// Which of those columns the conjuncts actually read, in the same order.
+    wanted: &'a [bool],
     /// What a driving row looks like, for repeating one across the candidates.
     left_types: &'a [LogicalType],
     time_zone: SessionTimeZone,
@@ -2058,12 +2093,27 @@ impl Residual<'_> {
             // A vector at a time, which is the size the evaluator is written for. The batch above
             // this is larger so that a batch is full, and this is what it is broken back down into.
             let end = (at + VECTOR_SIZE).min(gathered.len());
+            // Where the mask stops being about the driving side, which is the driving schema's
+            // width and not the chunk's, because the mask was built against the two schemas.
+            let width = self.left_types.len();
             let mut columns: Vec<Vector> = left
                 .columns()
                 .iter()
-                .map(|column| column.gather(&driving[at..end]))
+                .enumerate()
+                .map(|(index, column)| {
+                    if self.wanted.get(index).copied().unwrap_or(true) {
+                        column.gather(&driving[at..end])
+                    } else {
+                        Ok(stood_in_for(column, end - at))
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
-            columns.extend(rows.gather(&gathered[at..end])?);
+            columns.extend(
+                rows.gather_wanted(
+                    &gathered[at..end],
+                    self.wanted.get(width..).unwrap_or_default(),
+                )?,
+            );
             // Driving columns and then gathered ones, which is the order this operator holds a pair
             // in and so the order `self.combined` resolves a conjunct against. See [`widen`], which
             // builds the same layout out of a single row.
@@ -2076,15 +2126,39 @@ impl Residual<'_> {
                 self.time_zone,
             )?;
             let merged = combine(Connective::And, &flags)?;
-            // row at a time: the flags are already a vector here, so what this wants is the
-            // selection that 2c (#57) threads.
-            for row in 0..end - at {
-                into.push(is_true(&merged.value_at(row)));
+            // A conjunction of comparisons over a chunk is a flat boolean, so the answer is a run
+            // of bits beside a validity and reading it is a pass over the two. What this wants in
+            // the end is the selection that 2c (#57) threads, which would leave the flags where
+            // they are rather than copying them into a list of `bool`.
+            let rows = end - at;
+            if let Some(Data::Bool(flags)) = merged.data() {
+                let valid = merged.validity();
+                let flags = flags.as_slice();
+                into.extend(
+                    (0..rows)
+                        .map(|row| valid.is_valid(row) && flags.get(row).copied().unwrap_or(false)),
+                );
+            } else {
+                // row at a time: whatever else a conjunct's result arrives as, a constant or a
+                // dictionary or a run, is read through the one accessor every form answers. The
+                // flat case above is the one this operator actually produces.
+                for row in 0..rows {
+                    into.push(is_true(&merged.value_at(row)));
+                }
             }
             at = end;
         }
         Ok(())
     }
+}
+
+/// A column of the right type and length that nothing is going to read.
+///
+/// What goes where a column the residual does not name would have gone, so that the columns after
+/// it are still where the conjuncts expect to find them. A constant is one value however many rows
+/// it stands for, so this costs nothing per pair, which is the whole of why it is here.
+fn stood_in_for(column: &Vector, rows: usize) -> Vector {
+    Vector::constant(column.logical_type().clone(), Value::Null, rows)
 }
 
 /// Which side of a join an expression reads.
@@ -3115,6 +3189,82 @@ mod tests {
                 _ => false,
             }),
             "every pair the residual kept is one it should have"
+        );
+    }
+
+    /// A side carrying a column the residual never names still answers that column.
+    ///
+    /// The chunk a residual is evaluated over is gathered at the pair list, and a column no
+    /// conjunct reads is stood in for rather than gathered, so that the column numbers the
+    /// conjuncts use still land where they did. Two ways that can go wrong and this catches both:
+    /// a column the residual does read gets stood in for, and then the comparison is against null
+    /// and the answer is empty, or the standing in reaches the output chunk, and then the payload
+    /// comes back null. The answer here has the payloads in it and the right pairs.
+    #[test]
+    fn a_column_the_residual_does_not_read_is_still_in_the_answer_with_its_own_values() {
+        let wide = |table: u32| {
+            Schema::numbered(
+                vec![
+                    Field::new("k", LogicalType::Integer),
+                    Field::new("g", LogicalType::Integer),
+                    Field::new("p", LogicalType::Integer),
+                ],
+                table,
+            )
+        };
+        let chunk = |rows: &[(i32, i32, i32)]| {
+            let each = |pick: fn(&(i32, i32, i32)) -> i32| {
+                Vector::flat(
+                    LogicalType::Integer,
+                    Data::Int32(rows.iter().map(pick).collect::<Vec<i32>>().into()),
+                )
+                .expect("integers are an i32 layout")
+            };
+            Chunk::new(vec![each(|row| row.0), each(|row| row.1), each(|row| row.2)])
+                .expect("three columns of one length")
+        };
+
+        let mut plan = Plan::new();
+        let (left, right) = (wide(0), wide(1));
+        let key = {
+            let one = column_at(&mut plan, 0, 0, LogicalType::Integer);
+            let other = column_at(&mut plan, 1, 0, LogicalType::Integer);
+            equal(&mut plan, one, other)
+        };
+        // Only position 1 of each side, so the payload at position 2 is read by nothing.
+        let beside = {
+            let one = column_at(&mut plan, 0, 1, LogicalType::Integer);
+            let other = column_at(&mut plan, 1, 1, LogicalType::Integer);
+            greater(&mut plan, one, other)
+        };
+        let conditions = plan.add_expr_list(&[key, beside]);
+
+        let memory = Memory::unlimited();
+        let (keep, rows) = Keep::new(&memory);
+        let mut local = keep.local();
+        keep.sink(&chunk(&[(2, 5, 200), (2, 50, 201), (3, 5, 202)]), &mut local)
+            .expect("the gathered rows");
+        keep.combine(local).expect("the one instance");
+        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+        let probe = Probe::new(
+            &plan,
+            &left,
+            &Gathered { schema: &right, chunks: rows, marker: None, swapped: false },
+            JoinKind::Inner,
+            conditions,
+            &Cancel::new(),
+            &memory,
+        )
+        .expect("one equality is enough to look up");
+        assert_eq!(probe.wanted, [false, true, false, false, true, false]);
+
+        let number = Value::Integer;
+        assert_eq!(
+            probed(&probe, &chunk(&[(1, 10, 100), (2, 10, 101), (3, 10, 102)]), 6),
+            [
+                vec![number(2), number(10), number(101), number(2), number(5), number(200)],
+                vec![number(3), number(10), number(102), number(3), number(5), number(202)],
+            ]
         );
     }
 

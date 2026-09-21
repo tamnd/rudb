@@ -95,6 +95,30 @@ impl Build {
         self.columns.iter().map(|column| column.gather(at)).collect()
     }
 
+    /// The same, gathering only the columns `wanted` marks and standing in for the rest.
+    ///
+    /// A residual condition reads a column or two of a side that may be twenty wide, and the ones
+    /// it does not read are only there so that the column numbers line up. A constant lines them up
+    /// without a pass over the pairs. A `wanted` shorter than the side gathers whatever it does not
+    /// cover, which is the answer that is never wrong.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Build::gather`].
+    pub(crate) fn gather_wanted(&self, at: &[u32], wanted: &[bool]) -> Result<Vec<Vector>> {
+        self.columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                if wanted.get(index).copied().unwrap_or(true) {
+                    column.gather(at)
+                } else {
+                    Ok(Vector::constant(column.logical_type().clone(), Value::Null, at.len()))
+                }
+            })
+            .collect()
+    }
+
     /// The chunk those positions make, which is what a residual condition is evaluated over.
     ///
     /// # Errors
