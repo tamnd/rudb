@@ -16,6 +16,8 @@ A vector is a type, a length up to 8192, a physical form, a validity representat
 
 **Selection vectors, not compaction, by default.** A filter produces a `u32` selection vector. Compaction happens when a measured selectivity threshold is crossed and the downstream operator is one that benefits, and the threshold is per-operator and measured rather than a single global constant.
 
+**The forms stop at the root, and the root is the last thing that runs in parallel.** A caller outside the engine reads a value at a time and cannot be handed a dictionary or a packed run, so every column of a result set is flat by the time it leaves. That decode happens in the sink at the root of the query, on the worker thread that produced the chunk, and not in the loop that drains the finished queue afterwards. The loop that drains is one thread with every worker already joined, so work moved into it is work the rest of the pool waits through, and on a six million row result it was three quarters of the query. A query whose rows go into a table asks for none of this and keeps the forms it produced, because storage holds the same forms execution does.
+
 ## 7.2 Operators
 
 Sources: table scan, Parquet scan, Arrow scan, values, table function, recursive CTE working table.
