@@ -1163,6 +1163,12 @@ where
     }
     let rows = left.len();
     let guarding = matches!(op, Op::Divide | Op::Modulo);
+    // The optimistic pass first, and the careful loop below only for what it hands back.
+    if let Some(answer) =
+        decimal_sweep(one, &at_left, other, &at_right, op, base, returns, width, scale, held, rows)?
+    {
+        return Ok(Some(answer));
+    }
     // What the answer's width will not hold, worked out once for the whole run rather than by
     // counting the digits of every row. See [`number::beyond`], which is the whole argument.
     let limit = beyond(width);
@@ -1213,6 +1219,110 @@ where
                             )),
                         }
                     })?;
+                    return finish(returns, Data::$variant(out.into()), validity);
+                }
+            )+
+        };
+    }
+    runs!(Int16 => i16, Int32 => i32, Int64 => i64, Int128 => i128);
+    Ok(None)
+}
+
+/// Adding, subtracting and multiplying a decimal in one pass on the run's own width.
+///
+/// The loop above widens every row to `i128`, computes, rescales, asks whether the answer fits and
+/// asks the vector for the two operands as `Value`s the moment it does not, and it does all of that
+/// inside a closure returning a `Result`, which is a shape nothing vectorizes and a compiler will
+/// not unroll. That was written on the reading that decimal arithmetic is rare on a scan. It is not
+/// rare on this workload: `l_extendedprice * (1 - l_discount)` is the argument of an aggregate in
+/// eight of the twenty two TPC-H queries, so the pass runs over every lineitem row those queries
+/// read, twice.
+///
+/// So the three operators that are one native instruction get the same treatment the integers get
+/// in [`fast_runs`]: compute at the run's own width, accumulate whether any row went wrong rather
+/// than branching on it, and hand the whole vector back to the loop above the moment one did. That
+/// loop then produces the right answer or the right error message, so nothing here has to know how
+/// to say what went wrong.
+///
+/// What "went wrong" means is two things at once. The native operation can wrap, and the answer can
+/// be wider than the answer's type allows. Both have to be caught, and the first has to be caught
+/// even though the second is the one the careful loop is checking, because a wrapped product is a
+/// small number that would sail through a range check. The range is a pair of constants worked out
+/// once per run, rather than [`beyond`]'s `u128` compared against a widened row, because the
+/// answer's width always fits the run it is stored in: four digits in an `i16`, nine in an `i32`,
+/// eighteen in an `i64` and thirty eight in an `i128` are each inside the type by a factor of at
+/// least one and a half.
+///
+/// Dividing keeps the careful loop because a zero divisor is an error rather than an answer, and a
+/// product whose operand scales do not already add up to the answer's keeps it because the rescale
+/// is a division per row and the careful loop is already the place division lives.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "two sides with an index each, the operator, the nulls, and the four numbers \
+              describing the answer, none of which is worth a struct that exists for one call"
+)]
+fn decimal_sweep<L, R>(
+    one: &Data,
+    at_left: L,
+    other: &Data,
+    at_right: R,
+    op: Op,
+    base: &Validity,
+    returns: &LogicalType,
+    width: u8,
+    scale: u8,
+    held: u8,
+    rows: usize,
+) -> Result<Option<Vector>>
+where
+    L: Fn(usize) -> usize,
+    R: Fn(usize) -> usize,
+{
+    match op {
+        Op::Add | Op::Subtract => {}
+        Op::Multiply if held == scale => {}
+        _ => return Ok(None),
+    }
+    macro_rules! runs {
+        ($($variant:ident => $native:ty),+ $(,)?) => {
+            $(
+                if let (Data::$variant(a), Data::$variant(b)) = (one, other) {
+                    // Refused rather than asserted, since a width the run cannot hold is a bug
+                    // elsewhere and the careful loop answers it correctly either way.
+                    let Some(cap) = <$native>::try_from(pow10(width)).ok() else {
+                        return Ok(None);
+                    };
+                    let checked = |value: $native, overflowed: bool| {
+                        (value, overflowed || value >= cap || value <= -cap)
+                    };
+                    let mut out = vec![0 as $native; rows];
+                    let trouble = match op {
+                        Op::Add => sweep(&mut out, a, &at_left, b, &at_right, |x, y| {
+                            let (value, overflowed) = <$native>::overflowing_add(x, y);
+                            checked(value, overflowed)
+                        }),
+                        Op::Subtract => sweep(&mut out, a, &at_left, b, &at_right, |x, y| {
+                            let (value, overflowed) = <$native>::overflowing_sub(x, y);
+                            checked(value, overflowed)
+                        }),
+                        Op::Multiply => sweep(&mut out, a, &at_left, b, &at_right, |x, y| {
+                            let (value, overflowed) = <$native>::overflowing_mul(x, y);
+                            checked(value, overflowed)
+                        }),
+                        // Never reached, because the match above sent them away already.
+                        Op::Divide | Op::Modulo => true,
+                    };
+                    if trouble {
+                        return Ok(None);
+                    }
+                    blank(&mut out, base);
+                    // What [`over_valid`] returns for the same run, so that the two paths cannot
+                    // produce vectors that differ in how they spell the same nulls.
+                    let validity = if rows == 0 {
+                        Validity::AllValid
+                    } else {
+                        base.clone().normalize(rows)
+                    };
                     return finish(returns, Data::$variant(out.into()), validity);
                 }
             )+
@@ -3247,8 +3357,15 @@ mod tests {
                 }
                 LogicalType::Float => Value::Float(small as f32 / 2.0),
                 LogicalType::Double => Value::Double(small as f64 / 2.0),
+                // The edge here is the largest value the width holds, so that a sum carries out of
+                // the width and a product overflows the run it is computed in, which is what
+                // [`decimal_sweep`] hands back to the careful loop and is otherwise never reached.
                 LogicalType::Decimal { width, scale } => Value::Decimal {
-                    unscaled: i128::from(small) * 37,
+                    unscaled: if edge {
+                        (pow10(*width) - 1) * if small < 0 { -1 } else { 1 }
+                    } else {
+                        i128::from(small) * 37
+                    },
                     width: *width,
                     scale: *scale,
                 },
@@ -3353,7 +3470,13 @@ mod tests {
             LogicalType::UInteger,
             LogicalType::Float,
             LogicalType::Double,
+            // One decimal per storage width, because the sweep works out its range from the width
+            // and the four ranges are four different constants in four different types.
+            LogicalType::decimal(4, 2).expect("a legal decimal"),
+            LogicalType::decimal(9, 4).expect("a legal decimal"),
             LogicalType::decimal(10, 2).expect("a legal decimal"),
+            LogicalType::decimal(18, 6).expect("a legal decimal"),
+            LogicalType::decimal(38, 4).expect("a legal decimal"),
         ];
         for ty in &types {
             for nulls in [0, 7, 1] {
@@ -3367,6 +3490,20 @@ mod tests {
                 for name in ["-", "abs"] {
                     for arg in forms(&left) {
                         agrees(name, std::slice::from_ref(&arg), ty);
+                    }
+                }
+                // The shape a bound product actually has, which the loop above cannot produce
+                // because it gives both sides and the answer one type. A real product takes its
+                // two sides at the answer's width with their own scales, which add up to the
+                // answer's, so the unscaled values multiply straight into the answer and there is
+                // no rescale. That is the case `l_extendedprice * (1 - l_discount)` is, it is the
+                // only case [`decimal_sweep`] computes a product in, and with the sides and the
+                // answer all one type it is never reached.
+                if let LogicalType::Decimal { width, scale } = ty {
+                    let doubled = LogicalType::decimal(*width, scale.saturating_mul(2))
+                        .expect("a scale of twice a legal one is inside the width");
+                    for (one, other) in pairings(&left, &right) {
+                        agrees("*", &[one, other], &doubled);
                     }
                 }
                 if matches!(ty, LogicalType::Double) {
