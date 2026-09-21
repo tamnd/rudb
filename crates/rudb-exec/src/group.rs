@@ -37,7 +37,7 @@ use crate::buffer::Buffered;
 use crate::group_distinct;
 use crate::group_mixed;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
-use crate::pairs::together;
+use crate::pairs::{self, together};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -4789,19 +4789,15 @@ struct Part {
 
 /// How many threads to finish `input` rows of radix partitions on.
 ///
-/// Two bounds and both of them matter. There is no point starting a thread for every partition when
-/// there are only a few thousand rows between all of them, because the wake and the join cost more
-/// than the rows do, and that is what the divisor says. And there is no point asking for more
-/// threads than the query was given, which is what the lease says and what this used to ignore: a
-/// session that set the thread count to one still finished an aggregate on sixteen.
-///
-/// The divisor was sixty five thousand, which on a million rows says sixteen threads whatever the
-/// machine has. That was the same number the scan happened to cut morsels at, so nothing showed,
-/// and now that a pipeline can borrow more threads than its source runs instances on it is what
-/// would hold the finish at half the machine. Sixteen thousand is the same argument at the size a
-/// woken thread is actually worth paying for.
+/// The rule itself is [`pairs::finish_degree`], which the grouped distinct finish shares, because
+/// the two passes are the same shape: a thread takes a partition, probes a table and writes what it
+/// finds. What is local to here is the two bounds it is capped by. There is no point starting more
+/// threads than there are partitions to give them, which is what [`RADIX_PARTITIONS`] says, and
+/// there is no point asking for more than the query was given, which is what the lease says and
+/// what this used to ignore: a session that set the thread count to one still finished an aggregate
+/// on sixteen.
 fn degree_for(input: usize, threads: &Lease<'_>) -> usize {
-    input.div_ceil(16_384).clamp(1, RADIX_PARTITIONS).min(threads.degree())
+    pairs::finish_degree(input, RADIX_PARTITIONS.min(threads.degree()))
 }
 
 impl Aggregate<'_> {

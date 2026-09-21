@@ -486,15 +486,13 @@ impl Exchange {
             .iter()
             .map(|partition| partition.lock().map(|held| held.rows()).map_err(poisoned))
             .sum::<Result<usize>>()?;
-        // Sixteen thousand rows is worth a thread here, where a plain aggregate asks for sixty five
-        // thousand before it takes one. A row costs more on this path: it probes a table that holds
-        // a slot per distinct pair, which is most of the way to a slot per row, so the probe misses
-        // cache where a plain aggregate's probe into a table of groups usually does not. Measured on
-        // the million row ClickBench file, dropping the ask from sixty five thousand to sixteen took
-        // twelve percent off the two queries it moves and left the rest where they were, and asking
-        // for less than sixteen thousand bought nothing back.
-        let degree =
-            input.div_ceil(pairs::ROWS_PER_PARTITION).clamp(1, PARTITIONS).min(threads.degree());
+        // The same rule a plain aggregate finishes on, for the same reason and rather more so. A row
+        // costs more on this path: it probes a table that holds a slot per distinct pair, which is
+        // most of the way to a slot per row, so the probe misses cache where a plain aggregate's
+        // probe into a table of groups usually does not. That is what makes the second half of
+        // [`pairs::finish_degree`] matter here, since a pass that is waiting on memory is the one a
+        // thread past the machine's memory level parallelism does nothing for.
+        let degree = pairs::finish_degree(input, PARTITIONS.min(threads.degree()));
         // How many of the scattered partitions are worth keeping apart, which the scatter itself
         // could not know. See [`pairs::used`].
         let used = pairs::used(input, degree);

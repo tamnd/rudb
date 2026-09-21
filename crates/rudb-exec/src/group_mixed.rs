@@ -389,8 +389,7 @@ impl Exchange {
             .iter()
             .map(|partition| partition.lock().map(|held| held.rows()).map_err(poisoned))
             .sum::<Result<usize>>()?;
-        let degree =
-            input.div_ceil(pairs::ROWS_PER_PARTITION).clamp(1, PARTITIONS).min(threads.degree());
+        let degree = pairs::finish_degree(input, PARTITIONS.min(threads.degree()));
         // How many of the scattered partitions are worth keeping apart, which the scatter itself
         // could not know. See [`pairs::used`]. The splits below are not the same question: a split
         // has to be an owner, because the owner is what already holds the group's numeric state.
