@@ -79,7 +79,7 @@ pub use aggregate::{Accumulator, NOWHERE, settle_extremes, update_scattered};
 pub use cast::{cast, cast_in_time_zone, cast_value, row_count};
 pub use compare::{
     Comparison, compare, compare_prepared, compare_values, order, order_with_nulls, rank_at,
-    refine, refine_prepared, select_against_rank,
+    rank_within, refine, refine_prepared, select_against_rank,
 };
 pub use fallback::Kernel;
 pub use logic::{Connective, combine, is_true};

@@ -567,6 +567,30 @@ pub fn rank_at(column: &Vector, row: usize) -> Option<(Arc<Vector>, u32)> {
     Some((Arc::clone(values), rank))
 }
 
+/// The rank of one row's value in a dictionary the caller is already holding.
+///
+/// [`rank_at`] for a caller that has a dictionary in hand and wants to know where one row sits in
+/// it, which is a top n rejecting a row against a candidate it kept earlier. It answers the question
+/// without the clone of the `Arc` that `rank_at` has to make, because a reject runs on every row
+/// that reaches the operator and an atomic increment per row is not nothing.
+///
+/// The identity check is what makes a rank mean anything, and it is the same one
+/// [`select_against_rank`] makes: a rank is a position in one dictionary and says nothing at all
+/// about any other, so this refuses a column that is not over the dictionary it was given.
+///
+/// `None` in every case `rank_at` answers `None` in, and additionally for a column over a different
+/// dictionary. The caller reads the value and compares it the old way.
+#[must_use]
+pub fn rank_within(column: &Vector, row: usize, dictionary: &Arc<Vector>) -> Option<u32> {
+    let (codes, values) = column.shared_dictionary_parts()?;
+    if !Arc::ptr_eq(values, dictionary) || !column.validity().is_valid(row) {
+        return None;
+    }
+    let order = values.code_ranks()?;
+    let code = *codes.get(row)?;
+    Some(*order.get(code as usize)?)
+}
+
 /// Every row's answer once the literal has been resolved to a code, or to nothing.
 ///
 /// This is the whole point of storing a dictionary's sorted order. The comparison is a `u32`
@@ -2753,6 +2777,32 @@ mod tests {
         let flat = Vector::constant(LogicalType::Varchar, Value::Varchar("one".into()), 2);
         assert!(select_against_rank(Comparison::Less, &flat, &dictionary, 1, 2).is_none());
         assert!(rank_at(&flat, 0).is_none(), "a column with no dictionary has no ranks");
+        assert!(rank_within(&other, 0, &dictionary).is_none(), "another dictionary says nothing");
+        assert!(rank_within(&flat, 0, &dictionary).is_none(), "no dictionary says nothing");
+    }
+
+    /// The top N's reject. Two rows of the same column ordered by their ranks come out in the order
+    /// their values come out in, which is the whole of what the rank comparison assumes.
+    #[test]
+    fn two_ranks_in_one_dictionary_order_their_values() {
+        let (column, dictionary) =
+            filed(&["", "one", "two", "four", "three"], vec![0, 1, 3, 2, 0, 4, 1, 0]);
+        let rows = column.len();
+        for left in 0..rows {
+            for right in 0..rows {
+                let here = rank_within(&column, left, &dictionary).expect("a ranked row");
+                let there = rank_within(&column, right, &dictionary).expect("a ranked row");
+                let values = (
+                    column.try_value_at(left).expect("a value"),
+                    column.try_value_at(right).expect("a value"),
+                );
+                let wanted = order(&values.0, &values.1).expect("two strings compare");
+                assert_eq!(here.cmp(&there), wanted, "rows {left} and {right}");
+                let (held, rank) = rank_at(&column, left).expect("a ranked row");
+                assert!(Arc::ptr_eq(&held, &dictionary), "the dictionary it came from");
+                assert_eq!(rank, here, "the same rank whichever way it is asked for");
+            }
+        }
     }
 
     /// Every equality and inequality against a handful of literals, whole and narrowed, checked
