@@ -377,6 +377,36 @@ pub(crate) fn distinct_pairs(
     working.grow(width(
         unique.capacity() * size_of::<Record>() + unique_validity.capacity() * size_of::<bool>(),
     ))?;
+
+    // Every distinct pair is one for its group to count, and the group goes to the split its hash
+    // picks so that the counting pass finds all of a group's pairs together. The user is not carried
+    // over because nothing after this asks which user it was, only how many there were.
+    //
+    // Counting the groups here first, and leaving the pass after only the partial counts to add up,
+    // was tried and is the wrong trade. It collapses a partition's pairs down to its groups, which
+    // is worth a pass when a group has hundreds of pairs and is worth nothing when it has one, and
+    // the second kind is `GROUP BY SearchPhrase`, where there are nearly as many phrases as there
+    // are pairs. Doing it in both places cost ten percent there and bought two percent on the
+    // lopsided queries it was meant for, because the pass after probes a table with one row per
+    // group and a query with few enough groups to skew has a table small enough to sit in cache.
+    //
+    // The splits are filled by the loop below rather than by a pass over its answer. A pair is
+    // written into its split at the moment it turns out to be new, when the record and its validity
+    // are both in registers already, and the pass that used to do it read all of `unique` back to
+    // learn what the loop that wrote it had just known. On ClickBench 8 that is nine hundred
+    // thousand records, sixteen bytes each, read out of memory for the second time to be turned into
+    // twelve.
+    //
+    // Each split is asked for a share of the rows up front and not left to double its way there. A
+    // hash spreads the groups evenly enough that the guess is close, and the alternative is every
+    // one of the vectors reallocating five or six times on a pass whose whole job is to move twelve
+    // bytes a pair. The share is measured against the rows the partition holds rather than against
+    // the pairs it will find, since the pairs are not counted yet, and a partition whose rows are
+    // mostly duplicates of each other gives the difference back below.
+    let even = held_rows.div_ceil(splits);
+    let share = (even + even.isqrt() * 4).min(held_rows);
+    let mut parts: Vec<Vec<Grouped>> = (0..splits).map(|_| Vec::with_capacity(share)).collect();
+
     let timing = stage::Timing::start(Stage::Fold);
     for run in &partition.runs {
         for (source, &row) in run.rows.iter().enumerate() {
@@ -391,6 +421,9 @@ pub(crate) fn distinct_pairs(
                     if !all_valid {
                         unique_validity.push(valid);
                     }
+                    let group_hash = group_hash(row.group, valid);
+                    let split = split_of(group_hash, splits);
+                    parts[split].push(Grouped { group: row.group, group_hash, valid });
                     break;
                 }
                 if slot & tag_mask == tag {
@@ -408,40 +441,21 @@ pub(crate) fn distinct_pairs(
             }
         }
     }
-    let pairs = unique.len();
     // The rows themselves are not read again, only the distinct pairs, so give the memory back
     // before the group pass rather than at the end of the query.
     partition.runs.clear();
-    let partition = Run { rows: unique, validity: unique_validity };
+    drop(unique);
+    drop(unique_validity);
 
-    // Every distinct pair is one for its group to count, and the group goes to the split its hash
-    // picks so that the counting pass finds all of a group's pairs together. The user is not carried
-    // over because nothing after this asks which user it was, only how many there were.
-    //
-    // Counting the groups here first, and leaving the pass after only the partial counts to add up,
-    // was tried and is the wrong trade. It collapses a partition's pairs down to its groups, which
-    // is worth a pass when a group has hundreds of pairs and is worth nothing when it has one, and
-    // the second kind is `GROUP BY SearchPhrase`, where there are nearly as many phrases as there
-    // are pairs. Doing it in both places cost ten percent there and bought two percent on the
-    // lopsided queries it was meant for, because the pass after probes a table with one row per
-    // group and a query with few enough groups to skew has a table small enough to sit in cache.
-    //
-    // Each split is asked for an even share of the pairs up front and not left to double its way
-    // there. A hash spreads the groups evenly enough that the guess is close, and the alternative is
-    // every one of the vectors reallocating five or six times on a pass whose whole job is to move
-    // twelve bytes a pair.
-    let even = pairs.div_ceil(splits);
-    let share = (even + even.isqrt() * 4).min(pairs);
-    let mut parts: Vec<Vec<Grouped>> = (0..splits).map(|_| Vec::with_capacity(share)).collect();
-    for row in 0..pairs {
-        let record = partition.rows[row];
-        let valid = all_valid || partition.validity[row];
-        let group_hash = group_hash(record.group, valid);
-        parts[split_of(group_hash, splits)].push(Grouped {
-            group: record.group,
-            group_hash,
-            valid,
-        });
+    // What the share above guessed too high, given back. A partition whose rows are nearly all new
+    // pairs, which on ClickBench 8 is nine in ten of them, keeps what it asked for and copies
+    // nothing. One whose rows are mostly repeats of each other is holding room for rows that turned
+    // out to be the same pair, and the copy that gives it back is over the few pairs there were
+    // rather than over the many rows there were.
+    for split in &mut parts {
+        if split.capacity() > split.len().saturating_mul(2) {
+            split.shrink_to_fit();
+        }
     }
     let mut held = memory.reservation();
     held.grow(width(
