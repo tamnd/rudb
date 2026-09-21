@@ -738,6 +738,9 @@ where
             let wanted = exact(held, right.logical_type(), value)?;
             return Some(packed_against(op.swapped(), &packed, wanted, len, map));
         }
+        if let (Some(one), Some(other)) = (packing(left), packing(right)) {
+            return packings_against_each_other(op, &one, &other, len, map);
+        }
     }
     if let (Some(one), Some(value)) = (&one, right.constant_value()) {
         let column = readied(held, left.logical_type(), value)?;
@@ -966,6 +969,143 @@ where
         answers.push(test(packed.code(map(row)), code));
     }
     answers
+}
+
+/// Two bit packed columns against each other, which is the pair a stored table produces.
+///
+/// A packed vector's value is its base plus its code, so a row is compared by adding each side's
+/// base to each side's code and comparing the two sums. Nothing is unpacked into a vector of its
+/// own and no `Value` is built, which is what the row at a time path underneath this was doing for
+/// both sides of every row.
+///
+/// The two bases are almost never the same number, since each one is the smallest value in its own
+/// column, so there is no shortcut in comparing the codes directly. What there is instead is that
+/// the ranges may not overlap at all: a column whose largest value is below the other's smallest
+/// answers every row the same way, and that is decided here out of four numbers with no bit of
+/// either column being read.
+///
+/// `None` for a pair whose base plus width does not fit, which sends it to the row at a time path
+/// rather than wrapping. A `DECIMAL(38)` column can be packed and its base can sit near the end of
+/// the range, and the loop adds without asking so the asking happens once out here.
+///
+/// Each side takes its own index mapping, which is what lets a dictionary over a packed run of
+/// values reach this with its codes as the mapping. A stored column of dates is that as often as it
+/// is a packed run on its own, and from here the two are one loop with a different index.
+///
+/// On TPC-H this is `l_commitdate < l_receiptdate` and `l_shipdate < l_commitdate`, two packed date
+/// columns of six million rows, which is q4, q12 and q21.
+fn packed_against_packed<L, R, M>(
+    op: Comparison,
+    left: &Packed<'_>,
+    at_left: L,
+    right: &Packed<'_>,
+    at_right: R,
+    len: usize,
+    map: M,
+) -> Option<Vec<bool>>
+where
+    L: Fn(usize) -> usize,
+    R: Fn(usize) -> usize,
+    M: Fn(usize) -> usize + Copy,
+{
+    let (low, high) = (left.base(), ceiling_of(left)?);
+    let (other_low, other_high) = (right.base(), ceiling_of(right)?);
+    if high < other_low || other_high < low {
+        // The two ranges are disjoint, so every row of the left column is on the same side of every
+        // row of the right one and the answer is arithmetic on four numbers.
+        let below = high < other_low;
+        let same = match op {
+            Comparison::Equal | Comparison::NotDistinctFrom => false,
+            Comparison::NotEqual | Comparison::DistinctFrom => true,
+            Comparison::Less | Comparison::LessOrEqual => below,
+            Comparison::Greater | Comparison::GreaterOrEqual => !below,
+        };
+        return Some(vec![same; len]);
+    }
+    // The operator is decided before the loop rather than inside it, the same way `packed_against`
+    // decides it and for the same reason.
+    let test: fn(i128, i128) -> bool = match op {
+        Comparison::Equal | Comparison::NotDistinctFrom => |one, other| one == other,
+        Comparison::NotEqual | Comparison::DistinctFrom => |one, other| one != other,
+        Comparison::Less => |one, other| one < other,
+        Comparison::LessOrEqual => |one, other| one <= other,
+        Comparison::Greater => |one, other| one > other,
+        Comparison::GreaterOrEqual => |one, other| one >= other,
+    };
+    let mut answers = Vec::with_capacity(len);
+    for slot in 0..len {
+        let row = map(slot);
+        answers.push(test(
+            low + i128::from(left.code(at_left(row))),
+            other_low + i128::from(right.code(at_right(row))),
+        ));
+    }
+    Some(answers)
+}
+
+/// A side whose values are a packed run, either its own or one a dictionary points into.
+///
+/// A dictionary of few distinct numbers over a wide range is what our own storage writes for a
+/// column like a date, and [`through`] answers `None` for it because a packed run is not a run of
+/// `Data` to index. This is the same question asked of the form underneath.
+enum Packing<'a> {
+    /// The run is this vector's own and row `n` is code `n` of it.
+    Straight(Packed<'a>),
+    /// The run belongs to a dictionary and row `n` is the code the run names for it.
+    Coded(Cow<'a, [u32]>, Packed<'a>),
+}
+
+/// How `vector` reaches a packed run, or `None` when it does not have one.
+fn packing(vector: &Vector) -> Option<Packing<'_>> {
+    if let Some(packed) = vector.packed_parts() {
+        return Some(Packing::Straight(packed));
+    }
+    let (codes, values) = vector.positions()?;
+    Some(Packing::Coded(codes, values.packed_parts()?))
+}
+
+/// The four ways a pair of packed runs can be indexed, resolved once out here so that the loop
+/// underneath is monomorphized on both mappings rather than calling through a pointer per row.
+fn packings_against_each_other<M>(
+    op: Comparison,
+    left: &Packing<'_>,
+    right: &Packing<'_>,
+    len: usize,
+    map: M,
+) -> Option<Vec<bool>>
+where
+    M: Fn(usize) -> usize + Copy,
+{
+    match (left, right) {
+        (Packing::Straight(one), Packing::Straight(other)) => {
+            packed_against_packed(op, one, identity, other, identity, len, map)
+        }
+        (Packing::Straight(one), Packing::Coded(codes, other)) => {
+            packed_against_packed(op, one, identity, other, |row| codes[row] as usize, len, map)
+        }
+        (Packing::Coded(codes, one), Packing::Straight(other)) => {
+            packed_against_packed(op, one, |row| codes[row] as usize, other, identity, len, map)
+        }
+        (Packing::Coded(codes, one), Packing::Coded(others, other)) => packed_against_packed(
+            op,
+            one,
+            |row| codes[row] as usize,
+            other,
+            |row| others[row] as usize,
+            len,
+            map,
+        ),
+    }
+}
+
+/// The largest value a packed vector can hold, or `None` if that number does not exist.
+///
+/// [`Packed::ceiling`] adds without asking, which is right where the caller has already put a
+/// literal through [`Packed::code_of`] and so knows the base and the width are a pair that works.
+/// A loop that adds a code to a base for every row has not asked anything yet, so it asks here.
+fn ceiling_of(packed: &Packed<'_>) -> Option<i128> {
+    let mask = u64::MAX >> (u64::BITS - packed.width());
+    packed.base().checked_add(i128::from(mask))
 }
 
 /// Where a side keeps its values, for the forms that reach them through a run of them.
@@ -2178,6 +2318,153 @@ mod tests {
         let flat_rows = refine(Comparison::Greater, &flat, &constant, &kept).expect("refines");
         assert_eq!(packed_rows.indices(), flat_rows.indices());
         assert!(!packed_rows.is_empty(), "the literal is inside the range");
+    }
+
+    /// Two packed columns whose ranges overlap, which is the pair a stored table produces and the
+    /// pair `l_commitdate < l_receiptdate` is. The two bases differ, so the answer has to come out
+    /// of the sums rather than out of the codes, and it has to be the oracle's answer.
+    #[test]
+    fn two_packed_columns_against_each_other_answer_what_the_oracle_answers() {
+        let before = fallback::count(Kernel::Compare, Form::BitPacked, Form::BitPacked);
+        let one: Vec<i32> = (0..64).map(|row| 9000 + (row * 37) % 500).collect();
+        let other: Vec<i32> = (0..64).map(|row| 9200 + (row * 53) % 400).collect();
+        let left = Vector::flat(LogicalType::Integer, Data::Int32(one.into()))
+            .expect("integers are an i32 layout")
+            .bit_packed()
+            .expect("a five hundred wide range packs");
+        let right = Vector::flat(LogicalType::Integer, Data::Int32(other.into()))
+            .expect("integers are an i32 layout")
+            .bit_packed()
+            .expect("a four hundred wide range packs");
+        assert_eq!(left.form(), Form::BitPacked);
+        assert_eq!(right.form(), Form::BitPacked);
+        assert_ne!(
+            left.packed_parts().expect("packed").base(),
+            right.packed_parts().expect("packed").base(),
+            "the two bases are the two column minimums and this test wants them apart"
+        );
+        for op in EVERY {
+            agrees(op, &left, &right);
+            agrees(op, &right, &left);
+        }
+        // The two total comparisons want the null rule inside the loop and the code space loop does
+        // not carry one, so those are the only ones that count themselves, the same way they do for
+        // a packed column against a literal.
+        let total = EVERY.iter().filter(|op| op.is_total()).count();
+        assert_eq!(
+            fallback::count(Kernel::Compare, Form::BitPacked, Form::BitPacked) - before,
+            (total * 2) as u64,
+            "only the two total comparisons fall through"
+        );
+    }
+
+    /// A column whose largest value is below the other's smallest answers every row the same way,
+    /// and the answer still has to be the one the oracle gives on all eight comparisons.
+    #[test]
+    fn two_packed_columns_whose_ranges_do_not_overlap_answer_the_whole_vector_at_once() {
+        let one: Vec<i32> = (0..32).map(|row| 100 + row).collect();
+        let other: Vec<i32> = (0..32).map(|row| 500 + row * 2).collect();
+        let low = Vector::flat(LogicalType::Integer, Data::Int32(one.into()))
+            .expect("integers are an i32 layout")
+            .bit_packed()
+            .expect("packs");
+        let high = Vector::flat(LogicalType::Integer, Data::Int32(other.into()))
+            .expect("integers are an i32 layout")
+            .bit_packed()
+            .expect("packs");
+        for op in EVERY {
+            agrees(op, &low, &high);
+            agrees(op, &high, &low);
+        }
+    }
+
+    /// The nulls of a packed column live in its validity rather than in its bits, so a pair of them
+    /// has to blank the rows either side is null in, and the bits under those rows are whatever the
+    /// packing wrote there.
+    #[test]
+    fn two_packed_columns_with_nulls_answer_what_the_oracle_answers() {
+        let one: Vec<i32> = (0..32).map(|row| 40 + row * 3).collect();
+        let other: Vec<i32> = (0..32).map(|row| 60 + row * 2).collect();
+        let left = Vector::flat(LogicalType::Integer, Data::Int32(one.into()))
+            .expect("integers are an i32 layout")
+            .with_validity(Validity::from_iter(32, |row| row % 5 != 0))
+            .bit_packed()
+            .expect("packs");
+        let right = Vector::flat(LogicalType::Integer, Data::Int32(other.into()))
+            .expect("integers are an i32 layout")
+            .with_validity(Validity::from_iter(32, |row| row % 3 != 0))
+            .bit_packed()
+            .expect("packs");
+        for op in EVERY {
+            agrees(op, &left, &right);
+        }
+    }
+
+    /// A dictionary over a packed run on either side or both, which is what a stored date column
+    /// comes back as and is the pair q04 and q21 fall through on. The nulls are in three places at
+    /// once here, the outer mask, the dictionary's values and the rows a code repeats, and the
+    /// oracle sees all three.
+    #[test]
+    fn a_dictionary_over_a_packed_run_answers_what_the_oracle_answers() {
+        let before = fallback::count(Kernel::Compare, Form::Dictionary, Form::Dictionary);
+        let distinct = |start: i32, step: i32, nulls: usize| {
+            let values: Vec<i32> = (0..24).map(|row| start + row * step).collect();
+            Vector::flat(LogicalType::Date, Data::Int32(values.into()))
+                .expect("dates are an i32 layout")
+                .with_validity(Validity::from_iter(24, |row| row % nulls != 0))
+                .bit_packed()
+                .expect("packs")
+        };
+        let codes =
+            |seed: usize| -> Vec<u32> { (0..64).map(|row| ((row * seed) % 24) as u32).collect() };
+        let one = Vector::dictionary(codes(7), distinct(9_000, 3, 5)).expect("codes are in range");
+        let other =
+            Vector::dictionary(codes(5), distinct(9_020, 2, 7)).expect("codes are in range");
+        let straight = Vector::flat(
+            LogicalType::Date,
+            Data::Int32((0..64).map(|row| 9_010 + row).collect::<Vec<i32>>().into()),
+        )
+        .expect("dates are an i32 layout")
+        .bit_packed()
+        .expect("packs");
+        assert_eq!(one.form(), Form::Dictionary);
+        assert_eq!(straight.form(), Form::BitPacked);
+        for op in EVERY {
+            agrees(op, &one, &other);
+            agrees(op, &one, &straight);
+            agrees(op, &straight, &other);
+        }
+        // Three pairs, and only the two total comparisons of each are left to count themselves.
+        let total = EVERY.iter().filter(|op| op.is_total()).count();
+        assert_eq!(
+            fallback::count(Kernel::Compare, Form::Dictionary, Form::Dictionary) - before,
+            total as u64,
+            "only the two total comparisons fall through"
+        );
+    }
+
+    /// The conjunct path reads the rows an earlier conjunct kept, so a pair of packed columns has
+    /// to be reached through the selection rather than through the row number, which is what q12
+    /// does with its two date comparisons one after the other.
+    #[test]
+    fn refining_a_selection_over_two_packed_columns_keeps_the_same_rows() {
+        let one: Vec<i32> = (0..64).map(|row| 200 + (row * 11) % 128).collect();
+        let other: Vec<i32> = (0..64).map(|row| 240 + (row * 17) % 96).collect();
+        let left = Vector::flat(LogicalType::Integer, Data::Int32(one.clone().into()))
+            .expect("integers are an i32 layout");
+        let right = Vector::flat(LogicalType::Integer, Data::Int32(other.clone().into()))
+            .expect("integers are an i32 layout");
+        let kept = Selection::from_predicate(64, |row| row % 3 == 0);
+        let packed_rows = refine(
+            Comparison::Less,
+            &left.bit_packed().expect("packs"),
+            &right.bit_packed().expect("packs"),
+            &kept,
+        )
+        .expect("refines");
+        let flat_rows = refine(Comparison::Less, &left, &right, &kept).expect("refines");
+        assert_eq!(packed_rows.indices(), flat_rows.indices());
+        assert!(!packed_rows.is_empty(), "the two ranges overlap");
     }
 
     /// A column of URLs, which is the shape the string view form exists for: a shared prefix that
