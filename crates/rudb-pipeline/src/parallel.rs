@@ -22,6 +22,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use rudb_common::{Cancel, Error, Result};
 use rudb_metrics::Span;
@@ -32,7 +33,7 @@ use crate::serial::{Stop, drain, instance, run_serial};
 
 /// What a parallel run cost that the thread which started it cannot see for itself.
 ///
-/// All three are here for the same reason. A pipeline's wall clock is one number and the work
+/// They are here for the same reason. A pipeline's wall clock is one number and the work
 /// inside it happened on several threads, so the difference between that number and the work has
 /// to be explained by something, and until this existed the only way to ask was to subtract the
 /// operators from the pipeline and guess at what was left. On ClickBench 39 what was left is more
@@ -72,6 +73,20 @@ pub struct Spread {
     /// to the operator and then divided by the instance count, which made it look like a sixteenth
     /// of what it is.
     pub finalize_ns: u64,
+
+    /// How long after the first instance started the last one did.
+    ///
+    /// The instances do not start together. They start as the dispatching thread gets round to
+    /// waking them, and the last one woken finishes last even when every instance is handed
+    /// identical work. Without this number that shows up as the gap between [`Spread::slowest_ns`]
+    /// and the average instance, which is the same place real imbalance shows up, and the two want
+    /// opposite fixes: imbalance wants the work cut finer and stagger wants the waking made cheaper.
+    ///
+    /// Telling them apart is not academic. A scan that hands a whole stripe to each of sixteen
+    /// workers has no stealing in it, which looks exactly like the explanation for a slowest
+    /// instance half again the average, and cutting the stripes up to fix it made the suite slower.
+    /// Most of that gap was this.
+    pub stagger_ns: u64,
 }
 
 /// Run a pipeline on the threads the lease covers and combine what they produced.
@@ -111,6 +126,7 @@ pub fn run_parallel(
             slowest_ns: wall,
             slowest_cpu_ns: cpu,
             finalize_ns: 0,
+            stagger_ns: 0,
         });
     }
 
@@ -143,10 +159,21 @@ pub fn run_parallel(
         }
     };
 
+    // When the handing out began, so that each instance can say how long after it started. The
+    // caller's own instance starts at roughly zero by construction, so the largest of these is the
+    // whole of the stagger. One clock read and one maximum per instance, both outside the work.
+    let opened = Instant::now();
+    let stagger = AtomicU64::new(0);
+    let began = || {
+        let late = u64::try_from(opened.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        stagger.fetch_max(late, Ordering::Relaxed);
+    };
+
     // What a borrowed worker runs. It is the caller's own instance with a clock around it, because
     // the CPU clock this engine reads is per thread and the caller cannot see a worker's, and
     // because the wall of the longest of them is what the pipeline actually waited for.
     let task = || {
+        began();
         let measured = Span::start();
         let ran = one(pipeline, cancel, &stop, &failed);
         let (wall, cpu) = measured.stop();
@@ -155,6 +182,7 @@ pub fn run_parallel(
         keep(&failure, ran);
     };
     let caller = || {
+        began();
         let measured = Span::start();
         let ran = one(pipeline, cancel, &stop, &failed);
         let (wall, cpu) = measured.stop();
@@ -186,6 +214,7 @@ pub fn run_parallel(
         slowest_ns,
         slowest_cpu_ns,
         finalize_ns,
+        stagger_ns: stagger.load(Ordering::Relaxed),
     })
 }
 
