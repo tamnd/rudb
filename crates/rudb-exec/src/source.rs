@@ -2632,17 +2632,23 @@ mod tests {
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 0, "nor ruled out");
     }
 
-    /// All three answers in one scan. Five chunks hold 0 to 5119 a thousand and twenty four at a
-    /// time and the filter keeps 2500 up, so the first two are ruled out, the third straddles the
-    /// constant and is compared, and the last two are waved through whole.
+    /// All three answers in one scan. Five chunks hold the rows a vector at a time and the filter
+    /// keeps everything from halfway through the third one up, so the first two are ruled out, the
+    /// third straddles the constant and is compared, and the last two are waved through whole.
+    ///
+    /// The cutoff is worked out from the vector size rather than written down, which it was until
+    /// the vector stopped being 1024 and the constant landed inside the first chunk instead of the
+    /// third. Every boundary in these tests is a multiple of the thing under test.
     #[test]
     fn a_scan_skips_waves_through_and_compares_in_the_one_pass() {
         let table = counted(VECTOR_SIZE * 5);
-        let (_plan, scan) = applying(&table, "(#0.0::INTEGER >= 2500::INTEGER)::BOOLEAN");
+        let cutoff = VECTOR_SIZE * 2 + VECTOR_SIZE / 2;
+        let (_plan, scan) =
+            applying(&table, &format!("(#0.0::INTEGER >= {cutoff}::INTEGER)::BOOLEAN"));
 
-        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5 - 2_500);
-        assert_eq!(scan.skipped.load(Ordering::Relaxed), 2, "0 to 2047 holds nothing wanted");
-        assert_eq!(scan.waved.load(Ordering::Relaxed), 2, "3072 to 5119 is all of it wanted");
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5 - cutoff);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 2, "the first two hold nothing wanted");
+        assert_eq!(scan.waved.load(Ordering::Relaxed), 2, "the last two are all of them wanted");
     }
 
     /// The filter is really applied and not only decided about.
@@ -2699,18 +2705,20 @@ mod tests {
     #[test]
     fn a_descending_top_n_skips_the_parts_below_its_cutoff() {
         let table = counted(VECTOR_SIZE * 5);
-        let scan = beaten(&table, Op::GreaterOrEqual, Some(Bound::Int(4_500)));
+        let cutoff = i128::try_from(VECTOR_SIZE * 4 + VECTOR_SIZE / 2).expect("a small number");
+        let scan = beaten(&table, Op::GreaterOrEqual, Some(Bound::Int(cutoff)));
 
-        assert_eq!(counted_rows(&scan), VECTOR_SIZE, "only the chunk holding 4096 to 5119");
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE, "only the last chunk");
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
     }
 
     /// A part that ties the cutoff is read like any other, which is what keeps ties settled the way
-    /// they were. The chunk holding 2048 to 3071 starts exactly at the cutoff and is read.
+    /// they were. The third chunk starts exactly at the cutoff and is read.
     #[test]
     fn a_part_that_only_ties_the_cutoff_is_still_read() {
         let table = counted(VECTOR_SIZE * 5);
-        let scan = beaten(&table, Op::LessOrEqual, Some(Bound::Int(2_048)));
+        let cutoff = i128::try_from(VECTOR_SIZE * 2).expect("a small number");
+        let scan = beaten(&table, Op::LessOrEqual, Some(Bound::Int(cutoff)));
 
         assert_eq!(counted_rows(&scan), VECTOR_SIZE * 3);
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 2);
@@ -2834,9 +2842,10 @@ mod tests {
     #[test]
     fn conjuncts_that_rule_out_every_chunk_read_nothing() {
         let table = counted(VECTOR_SIZE * 4);
+        let split = i128::try_from(VECTOR_SIZE * 2).expect("a small number");
         let scan = scanning(
             &table,
-            vec![(0, Op::GreaterOrEqual, Bound::Int(2_048)), (0, Op::Less, Bound::Int(2_048))],
+            vec![(0, Op::GreaterOrEqual, Bound::Int(split)), (0, Op::Less, Bound::Int(split))],
         );
 
         assert_eq!(counted_rows(&scan), 0);

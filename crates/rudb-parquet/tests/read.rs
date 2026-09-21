@@ -25,7 +25,26 @@ use std::path::{Path, PathBuf};
 use rudb_common::Value;
 use rudb_io::{Filesystem, OpenMode, RealFilesystem};
 use rudb_parquet::Reader;
-use rudb_vector::{Chunk, Form};
+use rudb_vector::{Chunk, Form, VECTOR_SIZE};
+
+/// How many rows are in each row group of the fixture.
+const GROUP: usize = 2_048;
+
+/// The chunk lengths one row group of the fixture comes back as.
+///
+/// A chunk never spans two row groups, so a group is cut into whole vectors and whatever is left
+/// over. At a vector of 1024 that is two chunks and at 2048 or more it is one, and writing down the
+/// rule rather than either answer is what keeps this test about the reader.
+fn cut() -> Vec<usize> {
+    let mut left = GROUP;
+    let mut lengths = Vec::new();
+    while left > 0 {
+        let take = left.min(VECTOR_SIZE);
+        lengths.push(take);
+        left -= take;
+    }
+    lengths
+}
 
 /// The fixture DuckDB wrote.
 fn fixture() -> PathBuf {
@@ -92,9 +111,12 @@ fn the_schema_is_the_one_the_footer_describes() {
 
 #[test]
 fn a_dictionary_encoded_column_reaches_the_chunk_as_a_dictionary() {
-    // The three the writer chose RLE_DICTIONARY for, against the four it wrote PLAIN. The pages are
-    // 2048 rows and a chunk is 1024, so every one of these is a cut page, and a cut that flattened
-    // would leave all seven flat and throw away the form a group by wants.
+    // The three the writer chose RLE_DICTIONARY for, against the four it wrote PLAIN. A read that
+    // flattened would leave all seven flat and throw away the form a group by wants.
+    //
+    // This covered the cut too while a page was 2048 rows and a chunk was 1024. It does not any
+    // more, because every fixture here has row groups of at most a vector now, so no page in this
+    // directory gets cut. #1081 is the fixture that would bring the cut back.
     let mut reader = reader();
     let chunk = &chunks(&mut reader)[0];
     let forms: Vec<Form> = chunk.columns().iter().map(rudb_vector::Vector::form).collect();
@@ -116,8 +138,9 @@ fn a_dictionary_encoded_column_reaches_the_chunk_as_a_dictionary() {
 fn a_row_group_comes_back_in_chunks_of_at_most_a_vector() {
     let mut reader = reader();
     let lengths: Vec<usize> = chunks(&mut reader).iter().map(Chunk::len).collect();
-    // Two row groups of 2048, each cut into two chunks of 1024, which divides exactly.
-    assert_eq!(lengths, [1024, 1024, 1024, 1024]);
+    // Two row groups of 2048, each cut the same way, because a chunk never spans two of them.
+    let want: Vec<usize> = cut().into_iter().chain(cut()).collect();
+    assert_eq!(lengths, want);
 }
 
 #[test]
@@ -309,7 +332,7 @@ fn a_split_reader_reads_nothing_outside_the_row_groups_it_was_given() {
     assert_eq!(none.bytes_read(), 0);
 
     let mut one = whole.split(0..1).expect("the first row group");
-    assert_eq!(chunks(&mut one).len(), 2, "2048 rows in chunks of 1024");
+    assert_eq!(chunks(&mut one).len(), cut().len(), "{GROUP} rows in chunks of {VECTOR_SIZE}");
     let mut all = reader();
     let _ = chunks(&mut all);
     assert!(one.bytes_read() < all.bytes_read(), "half a file is fewer bytes than all of it");

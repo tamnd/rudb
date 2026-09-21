@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rudb_common::{Field, LogicalType, Span, Value, days_from_civil};
 
-use crate::{Config, Database, arrow};
+use crate::{Config, Database, VECTOR_SIZE, arrow};
 
 /// `t(x INTEGER, s VARCHAR)` with a null in it, plus an empty table to test the degenerate cases.
 fn database() -> Database {
@@ -4146,21 +4146,27 @@ fn creating_a_table_twice_is_an_error_and_dropping_it_makes_room_again() {
 fn a_result_wider_than_one_vector_reads_across_chunks() {
     let db = Database::new();
     db.create_table("big", vec![Field::new("x", LogicalType::Integer)]).unwrap();
+    // A vector and a half, worked out from the constant rather than written down, so that the row
+    // count stays on the far side of the boundary whatever the boundary is. This test was 2,500
+    // rows and stopped crossing anything the day the vector went past that.
+    let total = VECTOR_SIZE + VECTOR_SIZE / 2;
     let mut rows = Vec::new();
-    for x in 0..2_500 {
+    for x in 0..i32::try_from(total).unwrap() {
         rows.push(vec![Value::Integer(x)]);
     }
     db.append("big", &rows).unwrap();
 
+    let first = i32::try_from(VECTOR_SIZE).unwrap();
+    let last = i32::try_from(total).unwrap() - 1;
     let result = db.query("SELECT x FROM big").unwrap();
-    assert_eq!(result.len(), 2_500);
+    assert_eq!(result.len(), total);
     assert!(result.chunks().len() > 1);
     assert_eq!(result.value_at(0, 0), integer(0));
-    assert_eq!(result.value_at(1_500, 0), integer(1_500));
-    assert_eq!(result.value_at(2_499, 0), integer(2_499));
-    assert_eq!(result.row(2_500), None);
-    assert_eq!(result.value_at(2_500, 0), Value::Null);
-    assert_eq!(db.value("SELECT count(*) FROM big").unwrap(), Value::BigInt(2_500));
+    assert_eq!(result.value_at(VECTOR_SIZE, 0), integer(first));
+    assert_eq!(result.value_at(total - 1, 0), integer(last));
+    assert_eq!(result.row(total), None);
+    assert_eq!(result.value_at(total, 0), Value::Null);
+    assert_eq!(db.value("SELECT count(*) FROM big").unwrap(), Value::BigInt(total as i64));
 }
 
 #[test]
@@ -4837,13 +4843,14 @@ fn an_aggregate_over_a_wide_result_keeps_every_chunk_as_its_own_batch() {
     // Batches are per chunk rather than one for the whole result, so a result that crossed the
     // vector boundary is the case that proves the rows are all there and none of them are twice.
     let db = Database::new();
-    let result = db.query("SELECT range FROM range(3000)").unwrap();
+    let total = VECTOR_SIZE + VECTOR_SIZE / 2;
+    let result = db.query(&format!("SELECT range FROM range({total})")).unwrap();
     let batches = result.to_arrow().unwrap();
-    assert!(batches.len() > 1, "3000 rows is more than one chunk");
+    assert!(batches.len() > 1, "{total} rows is more than one chunk");
     let rows: usize = batches.iter().map(rudb_arrow::RecordBatch::len).sum();
-    assert_eq!(rows, 3000);
+    assert_eq!(rows, total);
     let bytes: usize = batches.iter().map(|batch| batch.column(0).unwrap().values().len()).sum();
-    assert_eq!(bytes, 3000 * 8);
+    assert_eq!(bytes, total * 8);
 }
 
 #[test]

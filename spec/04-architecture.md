@@ -4,7 +4,7 @@ This is the shape of the system: what the layers are, what crosses between them,
 
 ## 4.1 The one-paragraph version
 
-A query arrives as text or as a prepared plan. The parser produces an AST, the binder resolves names against the catalog and produces a bound logical plan with fully resolved types, the optimizer rewrites it and chooses join orders and filters, the physical planner turns it into a pipeline graph, and the scheduler runs those pipelines over morsels of data drawn from the storage layer. Every layer has a textual form that round-trips. Data in flight is a vector of at most 1024 values, and the entire performance argument of this project is that a vector is allowed to still be compressed.
+A query arrives as text or as a prepared plan. The parser produces an AST, the binder resolves names against the catalog and produces a bound logical plan with fully resolved types, the optimizer rewrites it and chooses join orders and filters, the physical planner turns it into a pipeline graph, and the scheduler runs those pipelines over morsels of data drawn from the storage layer. Every layer has a textual form that round-trips. Data in flight is a vector of at most 8192 values, and the entire performance argument of this project is that a vector is allowed to still be compressed.
 
 ## 4.2 Layers
 
@@ -37,7 +37,7 @@ Document 18 gives the exact crate list, the dependency rules and the stability t
 
 ## 4.3 The unit of data
 
-**A vector is up to 1024 values of one type.** DuckDB uses 2048. We use 1024 because it is the FastLanes unit and because every bit-packing, delta and RLE kernel in the encoding layer works in units of 1024. Using a different execution vector size than the storage vector size means every scan does a regrouping step, and that step is pure overhead that also destroys the ability to hand an operator a still-encoded vector. This is the single decision that most constrains the rest of the system and it is settled in document 00.
+**A vector is up to 8192 values of one type.** DuckDB uses 2048. We use a multiple of 1024 because that is the FastLanes unit and because every bit-packing, delta and RLE kernel in the encoding layer works in units of 1024, so eight of those units fit a vector exactly and a scan never has to regroup. Which multiple it is was measured in #480 and is document 12 section 15. This is the single decision that most constrains the rest of the system and it is settled in document 00.
 
 **A vector has a physical form, and there are more than two of them.** The forms are: flat, meaning an array of values; constant, meaning one value logically repeated; dictionary, meaning an index vector plus a shared dictionary; sequence, meaning start and stride; and encoded, meaning the vector carries a compressed run of a known encoding along with the metadata needed to decode it. Encoded is the form that does not exist in DuckDB and it is why document 06.7 exists.
 

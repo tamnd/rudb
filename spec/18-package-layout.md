@@ -116,7 +116,7 @@ The claim in document 00 is that the crate structure lets modern work be adopted
 
 **A new file format.** A crate alongside `rudb-parquet`, depending only on `rudb-vector`.
 
-**What the tree does not make easy**, and it is worth being honest about it: changing the vector size, changing the physical form set, or changing the string representation. Those are in `rudb-vector` and they touch everything. That is the price of having a wide fast interface at the bottom, it is the right price, and it is exactly why document 00 settles the vector size at 1024 up front rather than leaving it to be discovered.
+**What the tree does not make easy**, and it is worth being honest about it: changing the vector size, changing the physical form set, or changing the string representation. Those are in `rudb-vector` and they touch everything. That is the price of having a wide fast interface at the bottom, it is the right price, and it is exactly why document 00 settles the vector size up front rather than leaving it to be discovered. #480 changed it anyway, from 1024 to 8192, and the blast radius was smaller than this paragraph expects: the constant itself, and eight tests across four crates that had written a length down instead of working it out from the constant. The tests were the whole of the cost, which says the thing to be careful about is not the size but whether the code that depends on it says so.
 
 ## 18.5 The zero dependency rule, and the one exception
 

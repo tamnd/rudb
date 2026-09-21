@@ -50,11 +50,27 @@ use crate::validity::Validity;
 
 /// How many values are in a full vector.
 ///
-/// 1024 rather than DuckDB's 2048, per `spec/04-architecture.md` section 4.3. It is the FastLanes
-/// unit, it makes a validity mask exactly 16 `u64` words, and it keeps a vector of 16 byte string
-/// views at 16 KiB, which is the size at which several of these fit in L1 together rather than
-/// evicting each other.
-pub const VECTOR_SIZE: usize = 1024;
+/// 8192, which is four times DuckDB's 2048 and eight times what this was. It started at 1024 for
+/// three reasons: the FastLanes unit is 1024, a validity mask comes out at exactly 16 `u64` words,
+/// and a vector of 16 byte string views is 16 KiB, which is small enough that several of them sit
+/// in L1 at once. The first two are still true of any multiple of 1024. The third was the argument
+/// and it was an argument about the wrong level, because it was also deciding how much of a table
+/// one zone map covered and how much work one call into the pipeline did, and those wanted a much
+/// larger number than L1 did.
+///
+/// #984 separated them: a table in memory is stored in row groups of 122,880 rows now and a chunk
+/// is a window into one, so the vector size is only the execution unit and is free to be chosen for
+/// what an operator costs per call. #480 measured it. On twenty million rows in memory, one thread,
+/// going from 1024 to 8192 takes `count(*)` with a filter from 14.0 milliseconds to 1.9, `sum(v)`
+/// with the same filter from 39.6 to 29.6 and `sum(k + v)` from 66.8 to 52.6. On ClickBench over
+/// Parquet, where the time is decode and hash aggregation rather than per call overhead, the same
+/// move is worth about eight percent on the total of the twenty nine queries that run.
+///
+/// 32768 was measured too and is not better: it wins another few percent on the full scans and
+/// loses on the load, on a needle that the chunk zone maps would otherwise prune, and on anything
+/// with a string column, where a vector of views is half a megabyte. 8192 is where the per call
+/// overhead has stopped mattering and the working set has not started to.
+pub const VECTOR_SIZE: usize = 8192;
 
 /// What the key field of a map's child struct is called.
 ///
@@ -4261,10 +4277,14 @@ mod tests {
 
     #[test]
     fn the_vector_size_is_the_one_the_design_is_built_around() {
-        // 1024 and not DuckDB's 2048. A validity mask is 16 u64 words and a vector of string views
-        // is 16 KiB, both of which are consequences of this number rather than coincidences.
-        assert_eq!(VECTOR_SIZE, 1024);
-        assert_eq!(VECTOR_SIZE / 64, 16);
+        // 8192, which is four times DuckDB's 2048, measured in #480 against 1024, 2048, 4096 and
+        // 32768. What the rest of the code assumes about it is not the value but the shape: a
+        // multiple of 1024, which is the FastLanes unit and is what makes a validity mask a whole
+        // number of u64 words with none of them half used.
+        assert_eq!(VECTOR_SIZE, 8192);
+        assert_eq!(VECTOR_SIZE % 1024, 0);
+        assert_eq!(VECTOR_SIZE % 64, 0);
+        assert_eq!(VECTOR_SIZE / 64, 128, "the words in a validity mask");
     }
 
     #[test]

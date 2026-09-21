@@ -21,7 +21,7 @@ Our answer is tiers, for a specific reason that is not about which is faster: th
 
 A tree of expression nodes, each evaluating its children into intermediate vectors and then applying a kernel. This is what DuckDB does and it is fine.
 
-Its costs are real and worth naming, because they are what the higher tiers exist to remove. Every intermediate result is materialized into a vector, so a three-node expression writes and reads two temporaries of 1024 values each. Every node dispatches through a function pointer. Every node re-checks the physical form of its inputs.
+Its costs are real and worth naming, because they are what the higher tiers exist to remove. Every intermediate result is materialized into a vector, so a three-node expression writes and reads two temporaries of 8192 values each. Every node dispatches through a function pointer. Every node re-checks the physical form of its inputs.
 
 For a scan-heavy query where the expression is `WHERE x > 5`, none of that matters and tier 0 is within noise of anything else. For a query whose expression is fifteen nodes deep it matters a great deal, and that is the shape tiers 1 and 2 target.
 
