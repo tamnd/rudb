@@ -70,6 +70,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value, interval_micros};
 use rudb_vector::{
@@ -485,6 +486,85 @@ where
         answers.push(((rank as usize) < cut) == under);
     }
     Ok(Some(answers))
+}
+
+/// The rows that compare true against the value already known to sit at `rank`, or `None`.
+///
+/// [`by_rank`] with the search taken out. It searches because it is given a literal and has to find
+/// out where the literal sits, and the search is not cheap: about nineteen probes of a dictionary of
+/// half a million, and a probe that cannot settle on the eight bytes the file stores per rank has to
+/// read a value, which decodes the block the value sits in. On ClickBench 25 that search and the
+/// block decoding under it were most of the query.
+///
+/// A caller that already knows the rank pays none of it. The one this was written for is the top N,
+/// whose bound is not a literal from the query at all: it is a value that came out of this same
+/// dictionary, carried by a row that arrived with its code, so its rank was known the moment it was
+/// kept and nothing has to be found. See `crate::topn`.
+///
+/// `None` when the column is not a dictionary over `dictionary`, when that dictionary will not hand
+/// its order back inverted, or for a comparison that is not one of the four inequalities. The
+/// identity check is the whole of what makes this safe to offer: a rank means nothing except against
+/// the dictionary it was read out of, so the caller hands that dictionary over and this refuses
+/// rather than trusting it.
+///
+/// Null rows are dropped, which is what [`crate::select::selection`] does with a null flag and
+/// therefore what the caller would have got by going the long way round.
+#[must_use]
+pub fn select_against_rank(
+    op: Comparison,
+    column: &Vector,
+    dictionary: &Arc<Vector>,
+    rank: u32,
+    rows: usize,
+) -> Option<Selection> {
+    let (codes, values) = column.shared_dictionary_parts()?;
+    if !Arc::ptr_eq(values, dictionary) {
+        return None;
+    }
+    let order = values.code_ranks()?;
+    let validity = column.validity();
+    let live = !validity.has_nulls(rows);
+    let rows = rows.min(codes.len());
+    let mut kept = vec![0_u32; rows];
+    let mut count = 0;
+    // row at a time: the comparison is the loop, and a row of it is two loads and an integer
+    // compare. Every slot writes its row at the current length and only a kept slot moves the
+    // length on, for the reason `narrowed` gives.
+    for (row, &code) in codes.iter().enumerate().take(rows) {
+        let at = *order.get(code as usize)?;
+        let held = match op {
+            Comparison::Less => at < rank,
+            Comparison::LessOrEqual => at <= rank,
+            Comparison::Greater => at > rank,
+            Comparison::GreaterOrEqual => at >= rank,
+            _ => return None,
+        };
+        kept[count] = u32::try_from(row).ok()?;
+        // A single `&` rather than `&&`, because the short circuit would put back the branch.
+        count += usize::from(held & (live || validity.is_valid(row)));
+    }
+    kept.truncate(count);
+    Some(Selection::from_indices(kept))
+}
+
+/// The rank of the value one row of a dictionary column holds, when that is knowable.
+///
+/// The other half of [`select_against_rank`]. A caller that wants to compare against a row's value
+/// later without searching for it asks for this when the row goes by and keeps the answer.
+///
+/// `None` for a column that is not a dictionary over a source that knows its order, for a row that
+/// is null, and for a code the order does not cover. The caller treats all three the same way, by
+/// giving up on ranks and doing what it did before.
+#[must_use]
+pub fn rank_at(column: &Vector, row: usize) -> Option<(Arc<Vector>, u32)> {
+    let (codes, values) = column.shared_dictionary_parts()?;
+    if !column.validity().is_valid(row) {
+        return None;
+    }
+    let order = values.code_ranks()?;
+    let code = *codes.get(row)?;
+    let rank = *order.get(code as usize)?;
+    Some((Arc::clone(values), rank))
 }
 
 /// Every row's answer once the literal has been resolved to a code, or to nothing.
@@ -2246,9 +2326,8 @@ mod tests {
     fn a_comparison_peeled_over_a_shared_dictionary_answers_what_the_oracle_answers() {
         let words = ["", "one", "two", "", "three"];
         let values: Vec<Value> = words.iter().map(|text| Value::Varchar((*text).into())).collect();
-        let values = std::sync::Arc::new(
-            Vector::from_values(LogicalType::Varchar, &values).expect("a vector of text"),
-        );
+        let values =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("a vector of text"));
         let codes = vec![0, 1, 3, 2, 0, 4, 1, 0];
         let column = Vector::stable_dictionary(codes.clone(), values).expect("codes are in range");
         same_as_the_oracle(&column);
@@ -2310,19 +2389,66 @@ mod tests {
     fn a_comparison_against_a_sorted_dictionary_answers_what_the_oracle_answers() {
         // Distinct, which is what a source promises by answering with an order at all, and which
         // a global dictionary is by construction.
-        let words = ["", "one", "two", "four", "three"];
+        let (column, _) = filed(&["", "one", "two", "four", "three"], vec![0, 1, 3, 2, 0, 4, 1, 0]);
+        same_as_the_oracle(&column);
+    }
+
+    /// A dictionary column over values that arrived from a file with their sorted order, handed
+    /// back with the dictionary so a caller can check what it is holding a rank against.
+    fn filed(words: &[&str], codes: Vec<u32>) -> (Vector, Arc<Vector>) {
         let values: Vec<Vec<u8>> = words.iter().map(|text| text.as_bytes().to_vec()).collect();
         let mut order = (0..values.len() as u32).collect::<Vec<_>>();
         order.sort_by(|&left, &right| values[left as usize].cmp(&values[right as usize]));
-        let values = Vector::external_text(
-            LogicalType::Varchar,
-            std::sync::Arc::new(Filed { values, order, ranked: std::sync::OnceLock::new() }),
-        )
-        .expect("a filed vector");
-        let codes = vec![0, 1, 3, 2, 0, 4, 1, 0];
-        let column = Vector::stable_dictionary(codes, std::sync::Arc::new(values))
-            .expect("codes are in range");
-        same_as_the_oracle(&column);
+        let dictionary = Arc::new(
+            Vector::external_text(
+                LogicalType::Varchar,
+                Arc::new(Filed { values, order, ranked: std::sync::OnceLock::new() }),
+            )
+            .expect("a filed vector"),
+        );
+        let column =
+            Vector::stable_dictionary(codes, Arc::clone(&dictionary)).expect("codes are in range");
+        (column, dictionary)
+    }
+
+    /// The top N's path. A bound whose rank is already known is compared without a search, and what
+    /// it keeps is what comparing against the same value the long way round keeps.
+    #[test]
+    fn a_comparison_against_a_known_rank_keeps_what_a_search_for_it_keeps() {
+        let (column, dictionary) =
+            filed(&["", "one", "two", "four", "three"], vec![0, 1, 3, 2, 0, 4, 1, 0]);
+        let rows = column.len();
+        for row in 0..rows {
+            let (held, rank) = rank_at(&column, row).expect("a row of a ranked dictionary");
+            assert!(Arc::ptr_eq(&held, &dictionary), "the dictionary it came from");
+            let value = column.try_value_at(row).expect("a value");
+            for op in [
+                Comparison::Less,
+                Comparison::LessOrEqual,
+                Comparison::Greater,
+                Comparison::GreaterOrEqual,
+            ] {
+                let against = Vector::constant(LogicalType::Varchar, value.clone(), rows);
+                let flags = compare(op, &column, &against).expect("the search path answers");
+                let wanted = crate::select::selection(&flags, rows);
+                let got = select_against_rank(op, &column, &dictionary, rank, rows)
+                    .expect("the rank path answers");
+                assert_eq!(got.indices(), wanted.indices(), "row {row} under {op:?}");
+            }
+        }
+    }
+
+    /// A rank is a position in one dictionary and means nothing in another, so a rank offered
+    /// against the wrong one is declined rather than answered out of the wrong order.
+    #[test]
+    fn a_rank_offered_against_another_dictionary_is_declined() {
+        let (column, dictionary) = filed(&["one", "two"], vec![0, 1]);
+        let (other, _) = filed(&["one", "two"], vec![1, 0]);
+        assert!(select_against_rank(Comparison::Less, &column, &dictionary, 1, 2).is_some());
+        assert!(select_against_rank(Comparison::Less, &other, &dictionary, 1, 2).is_none());
+        let flat = Vector::constant(LogicalType::Varchar, Value::Varchar("one".into()), 2);
+        assert!(select_against_rank(Comparison::Less, &flat, &dictionary, 1, 2).is_none());
+        assert!(rank_at(&flat, 0).is_none(), "a column with no dictionary has no ranks");
     }
 
     /// Every equality and inequality against a handful of literals, whole and narrowed, checked

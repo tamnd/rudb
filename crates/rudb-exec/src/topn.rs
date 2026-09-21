@@ -69,7 +69,9 @@ use std::sync::{Arc, Mutex};
 
 use rudb_common::bounds::Bound;
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
-use rudb_kernels::{Comparison, compare as compare_vectors, selection};
+use rudb_kernels::{
+    Comparison, compare as compare_vectors, rank_at, select_against_rank, selection,
+};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{Chunk, Selection, Vector};
@@ -135,6 +137,86 @@ pub(crate) struct Running {
     /// are all at least as good as this key, a row worse than it cannot finish inside the bound, and
     /// neither can one that ties it, because everything it ties arrived first.
     cut: Option<Vec<Value>>,
+    /// Where each candidate's first key sits in the dictionary the candidates all came from.
+    ///
+    /// Only the sorted path keeps this, and only for a first key that is a shared dictionary over a
+    /// source that knows its order, which today means a text column read out of a native file.
+    ranked: Ranked,
+}
+
+/// The rank of every candidate's first key, kept beside the candidates rather than inside them.
+///
+/// The point of it is that the chunk pass never has to search. Asking whether any row of a chunk can
+/// still beat the worst candidate is a comparison against that candidate's value, and a comparison
+/// against a value in a sorted dictionary starts by finding out where the value sits, which is about
+/// nineteen probes and a decoded block or two for each probe that the stored head cannot settle. The
+/// value did not come from the query though. It came out of the same dictionary, carried by a row
+/// that arrived with its code, so its rank was free at the moment it was kept and searching for it
+/// again is work that was already done.
+///
+/// It sits next to the candidates rather than in them because `Sortable` is the sort's type and the
+/// sort has no use for a rank. The two are kept in step by the one place that inserts, and anything
+/// that cannot be given a rank turns the whole thing off rather than leaving a hole in it.
+#[derive(Debug, Default)]
+struct Ranked {
+    /// The dictionary the ranks are positions in, `None` until the first candidate says.
+    dictionary: Option<Arc<Vector>>,
+    /// One rank per candidate, in the order the candidates are held.
+    of: Vec<u32>,
+    /// Whether ranks are still being kept.
+    live: bool,
+}
+
+impl Ranked {
+    /// Ranks on, for a top N that has not seen a chunk yet.
+    fn new() -> Self {
+        Self { dictionary: None, of: Vec::new(), live: true }
+    }
+
+    /// Whether working a rank out for a row about to be kept is worth the trouble.
+    fn wanted(&self) -> bool {
+        self.live
+    }
+
+    /// The dictionary and the rank of the worst of `candidates` candidates, when both are known.
+    ///
+    /// The length check is the safety net. These are two containers kept in step by hand, so the one
+    /// place that can tell they have come apart checks, and coming apart turns the fast path off
+    /// rather than reading the wrong rank.
+    fn worst(&self, candidates: usize) -> Option<(&Arc<Vector>, u32)> {
+        if !self.live || self.of.len() != candidates {
+            return None;
+        }
+        Some((self.dictionary.as_ref()?, *self.of.last()?))
+    }
+
+    /// Mirrors an insert into the candidates, or gives up when the row has no rank to mirror.
+    fn inserted(&mut self, at: usize, rank: Option<(Arc<Vector>, u32)>, bound: usize) {
+        if !self.live {
+            return;
+        }
+        let Some((dictionary, rank)) = rank else {
+            self.give_up();
+            return;
+        };
+        match self.dictionary.as_ref() {
+            Some(known) if Arc::ptr_eq(known, &dictionary) => {}
+            Some(_) => {
+                self.give_up();
+                return;
+            }
+            None => self.dictionary = Some(dictionary),
+        }
+        self.of.insert(at, rank);
+        self.of.truncate(bound);
+    }
+
+    /// Stops keeping ranks for the rest of this instance.
+    fn give_up(&mut self) {
+        self.dictionary = None;
+        self.of = Vec::new();
+        self.live = false;
+    }
 }
 
 impl TopN {
@@ -219,6 +301,7 @@ impl Sink for TopN {
             failure: None,
             place: Place::default(),
             cut: None,
+            ranked: Ranked::new(),
         }
     }
 
@@ -231,38 +314,42 @@ impl Sink for TopN {
         let mut keys = Vec::with_capacity(self.keys.len());
         self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
         if self.bound <= SORTED_BOUND {
+            let rows = chunk.len();
             let full = self.bound > 0 && local.kept.len() == self.bound;
+            // The rank pass where the candidates carry ranks and the value pass where they do not.
+            // Both answer the same question and the second one searches the dictionary to do it.
             let narrowed = full
-                .then(|| {
-                    worth_looking_at(&self.keys, &keys, &local.kept[self.bound - 1].0, chunk.len())
+                .then(|| match local.ranked.worst(local.kept.len()) {
+                    Some((dictionary, rank)) => {
+                        beats_rank(&self.keys, &keys, dictionary, rank, rows)
+                    }
+                    None => {
+                        let worst = &local.kept[self.bound - 1].0;
+                        worth_looking_at(&self.keys, &keys, worst, rows)
+                    }
                 })
                 .flatten();
-            let failure = &mut local.failure;
+            let offer = |row: usize, local: &mut Running| {
+                let arrival = local.place.of(row);
+                keep(
+                    Where { keys: &self.keys, columns: &keys, chunk, row, arrival },
+                    local,
+                    self.bound,
+                );
+            };
             match narrowed {
                 // row at a time: the rows the pass kept are the ones that can still win, and each
                 // of them has to be placed among the candidates rather than counted.
-                Some(rows) => {
-                    for row in rows.iter() {
-                        let arrival = local.place.of(row);
-                        keep(
-                            Where { keys: &self.keys, columns: &keys, chunk, row, arrival },
-                            &mut local.kept,
-                            self.bound,
-                            failure,
-                        );
+                Some(kept) => {
+                    for row in kept.iter() {
+                        offer(row, local);
                     }
                 }
                 // row at a time: the key still has the same Value layout the sort holds, and 2i
                 // (#63) replaces it with one normalized comparable byte string per row.
                 None => {
-                    for row in 0..chunk.len() {
-                        let arrival = local.place.of(row);
-                        keep(
-                            Where { keys: &self.keys, columns: &keys, chunk, row, arrival },
-                            &mut local.kept,
-                            self.bound,
-                            failure,
-                        );
+                    for row in 0..rows {
+                        offer(row, local);
                     }
                 }
             }
@@ -386,15 +473,15 @@ fn hold(
 /// value rather than three and never allocates the `Vec` that holds them. Almost every row loses.
 fn keep(
     Where { keys, columns, chunk, row, arrival }: Where<'_>,
-    kept: &mut Vec<Sortable>,
+    local: &mut Running,
     bound: usize,
-    failure: &mut Option<Error>,
 ) {
     if bound == 0 {
         return;
     }
-    if kept.len() == bound
-        && against(keys, columns, row, &kept[bound - 1].0, failure) != Ordering::Less
+    let failure = &mut local.failure;
+    if local.kept.len() == bound
+        && against(keys, columns, row, &local.kept[bound - 1].0, failure) != Ordering::Less
     {
         return;
     }
@@ -413,14 +500,22 @@ fn keep(
                 return;
             }
         };
+    // Worked out before the insert rather than after, because after it the row's place among the
+    // candidates is known and where its value sits in the dictionary is not any easier to find.
+    let rank = local
+        .ranked
+        .wanted()
+        .then(|| columns.first().and_then(|column| rank_at(column, row)))
+        .flatten();
     // After every candidate whose key it ties, which is where its arrival puts it too: an instance
     // reads the morsels it is given in order and each of them from the start, so a row reaching
     // here arrived after everything already held.
-    let at = kept.partition_point(|candidate| {
+    let at = local.kept.partition_point(|candidate| {
         compare(keys, &candidate.0, &key, failure) != Ordering::Greater
     });
-    kept.insert(at, (key, values, arrival));
-    kept.truncate(bound);
+    local.kept.insert(at, (key, values, arrival));
+    local.kept.truncate(bound);
+    local.ranked.inserted(at, rank, bound);
 }
 
 /// One row being offered to the candidates, which is five things that only travel together.
@@ -480,12 +575,7 @@ fn worth_looking_at(
     if bound.is_null() || (key.nulls_first && column.validity().has_nulls(rows)) {
         return None;
     }
-    let op = match (key.descending, keys.len() == 1) {
-        (false, true) => Comparison::Less,
-        (false, false) => Comparison::LessOrEqual,
-        (true, true) => Comparison::Greater,
-        (true, false) => Comparison::GreaterOrEqual,
-    };
+    let op = still_wanted(key, keys.len() == 1);
     let against = Vector::constant(column.logical_type().clone(), bound.clone(), rows);
     // The whole chunk is in play here, so this asks the kernel that reads its operands where they
     // lie rather than the one that reads them through a selection. Handing the threaded kernel an
@@ -495,6 +585,43 @@ fn worth_looking_at(
     // that was more instructions than decoding the column cost.
     let flags = compare_vectors(op, column, &against).ok()?;
     Some(selection(&flags, rows))
+}
+
+/// [`worth_looking_at`] for a worst candidate whose place in the dictionary is already known.
+///
+/// The same question and the same answer, without the part that costs: placing the bound. See
+/// [`Ranked`] for where the rank comes from and `rudb_kernels::select_against_rank` for what is left
+/// once the search is gone, which is two loads and an integer compare per row.
+///
+/// The two guards `worth_looking_at` starts with are here too, minus the one about a null bound,
+/// which cannot happen because a null first key is one of the things that stops ranks being kept.
+fn beats_rank(
+    keys: &[SortKey],
+    columns: &[Vector],
+    dictionary: &Arc<Vector>,
+    rank: u32,
+    rows: usize,
+) -> Option<Selection> {
+    let key = *keys.first()?;
+    let column = columns.first()?;
+    if key.nulls_first && column.validity().has_nulls(rows) {
+        return None;
+    }
+    select_against_rank(still_wanted(key, keys.len() == 1), column, dictionary, rank, rows)
+}
+
+/// The comparison against the worst candidate that a row still in the running satisfies.
+///
+/// With one sort key a row that ties the worst candidate has lost, because everything it ties
+/// arrived first. With more than one it has not, because a later key can still separate them, so the
+/// pass has to keep the ties and let the row path decide.
+fn still_wanted(key: SortKey, single: bool) -> Comparison {
+    match (key.descending, single) {
+        (false, true) => Comparison::Less,
+        (false, false) => Comparison::LessOrEqual,
+        (true, true) => Comparison::Greater,
+        (true, false) => Comparison::GreaterOrEqual,
+    }
 }
 
 /// Charges the scratch reservation for what is still held after a trim.
