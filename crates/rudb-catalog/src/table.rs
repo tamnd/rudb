@@ -126,9 +126,8 @@ impl Rows {
     pub fn chunk_len(&self, at: usize) -> Result<usize> {
         Ok(match self {
             Self::Memory(rows) => rows
-                .chunk(at)
-                .ok_or_else(|| Error::internal("row ordinal names a missing chunk"))?
-                .len(),
+                .chunk_len(at)
+                .ok_or_else(|| Error::internal("row ordinal names a missing chunk"))?,
             Self::Native(reader) => {
                 if at >= reader.parts() {
                     return Err(Error::internal("row ordinal names a missing part"));
@@ -405,8 +404,13 @@ impl Rows {
     }
 
     /// One whole in-memory chunk, used by checkpointing and tests.
+    ///
+    /// Owned rather than borrowed, because a chunk of an in memory table is a window cut out of its
+    /// row group's pages rather than something the table is holding. The cut is a reference count
+    /// bump per column and what a cut has to rewrite, so this is not the copy the signature used to
+    /// promise it was not.
     #[must_use]
-    pub fn chunk(&self, at: usize) -> Option<&Chunk> {
+    pub fn chunk(&self, at: usize) -> Option<Chunk> {
         match self {
             Self::Memory(rows) => rows.chunk(at),
             Self::Native(_) => None,

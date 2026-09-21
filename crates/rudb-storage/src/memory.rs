@@ -1,19 +1,46 @@
 //! A table that lives in memory, which is what M0 stores rows in.
 //!
-//! This is not the storage format. There are no blocks, no row groups, no compression and no buffer
-//! manager in here, and every one of those is what the rest of this crate becomes at M2. What this
-//! is, is somewhere for rows to be so that the binder and the executor can be written and tested
-//! against something real, and a shape that the real thing can replace without the layers above it
-//! noticing: a table is a sequence of chunks, a scan reads them in order, and a scan asks for the
-//! columns it wants rather than all of them.
+//! This is not the storage format. There are no blocks, no compression and no buffer manager in
+//! here, and every one of those is what the rest of this crate becomes at M2. What this is, is
+//! somewhere for rows to be so that the binder and the executor can be written and tested against
+//! something real, and a shape that the real thing can replace without the layers above it noticing:
+//! a table is a sequence of chunks, a scan reads them in order, and a scan asks for the columns it
+//! wants rather than all of them.
 //!
 //! The one thing it does get right on purpose is that a read is by chunk and by column, and not by
 //! row. A row-at-a-time interface here would be an interface every operator above would grow
 //! against, and unwinding that later is the rewrite this project exists to avoid.
 //!
+//! # Row groups
+//!
+//! What a scan reads and what the table stores are two different sizes, and they answer two
+//! different questions. How many values an operator should work on at once is a question about L1
+//! and L2, and the answer is [`VECTOR_SIZE`]. How many rows should sit together in one run of memory
+//! is a question about how many places a scan has to jump to, and the answer is much larger.
+//!
+//! So the rows are held in groups of [`ROWS_PER_GROUP`], one page per column per group, and a chunk
+//! is a window cut out of a page. A twenty million row table of two columns used to be 19,532 chunks
+//! and about 39,000 buffers, and is now 163 groups and 326 pages. Nothing above the storage seam
+//! sees it: the chunk numbering is what it always was, and [`MemoryTable::read`] still answers chunk
+//! `n` with the same rows it used to. What changed is where those rows are, which is next to the
+//! rows of the chunks either side of them.
+//!
+//! The directory that says where each chunk is, is kept rather than computed, because a chunk does
+//! not have to arrive [`VECTOR_SIZE`] rows long and the arithmetic would be wrong the first time one
+//! does not. It is three numbers a chunk and it is what lets a group that could not be laid end to
+//! end sit next to one that could without anything else knowing the difference.
+//!
 //! # It does have statistics
 //!
-//! A zone map per chunk, built on the way in, which is `zone.rs`. They were put here to skip a chunk
+//! A zone map per chunk, and per chunk rather than per group on purpose. The group is the unit of
+//! layout and the chunk is still the unit of pruning, because the whole value of a zone map is how
+//! few rows it speaks for: the note at the top of `zone.rs` measures ClickBench query 37 skipping 75
+//! percent of its chunks and running two and a half times faster, and a synopsis covering a hundred
+//! and twenty times as many rows would skip almost nothing. A coarser second level on top of these,
+//! so that a group can be ruled out without reading its chunks' zones at all, is worth having and is
+//! its own piece of work.
+//!
+//! What they are is built on the way in, which is `zone.rs`. They were put here to skip a chunk
 //! a filter rules out, and they hold more than that: an exact null count for every column whatever
 //! form it arrived in, the two ends, and the total of an integer column. So a `COUNT`, a `MIN`, a
 //! `MAX`, a `SUM` and an `AVG` over a whole table are questions this can answer out of numbers it
@@ -30,11 +57,50 @@ use rudb_vector::{Chunk, Vector};
 
 use crate::zone::{Probe, Range, Zone};
 
-/// A table held in memory as a sequence of chunks.
+/// How many rows one row group holds.
+///
+/// DuckDB's number, and what `spec/storage-v2/` is designed around, so a table in memory and a table
+/// in a file are cut the same way and a checkpoint is not also a re-layout. It is exactly 120
+/// [`VECTOR_SIZE`] chunks, which is not required by anything here and does mean a group filled by a
+/// loader that hands over full chunks holds a whole number of them.
+pub const ROWS_PER_GROUP: usize = 122_880;
+
+/// One group's columns, each the full height of the group.
+#[derive(Debug, Clone)]
+struct Group {
+    /// One page per column, in the table's column order.
+    columns: Vec<Vector>,
+    /// How many rows every one of those columns has.
+    rows: usize,
+}
+
+/// Where one chunk's rows are.
+///
+/// Two cases and not one, because a group is laid end to end when it seals and a table being written
+/// to has rows in it that no group has claimed yet. A reader in the middle of an insert sees those
+/// rows as the chunks they arrived as, which is what the table did for every chunk before there were
+/// groups, so it is a layout the read path already knows how to answer.
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    /// `len` rows starting at row `at` of group `group`.
+    Window { group: usize, at: usize, len: usize },
+    /// A chunk of the group still filling, at position `at` of the open run.
+    Open { at: usize },
+}
+
+/// A table held in memory as row groups, read a chunk at a time.
 #[derive(Debug, Clone)]
 pub struct MemoryTable {
     types: Vec<LogicalType>,
-    chunks: Vec<Chunk>,
+    /// The sealed groups, one page per column each.
+    groups: Vec<Group>,
+    /// Where each chunk is, in the chunk numbering a scan reads.
+    slots: Vec<Slot>,
+    /// The chunks of the group still filling, in the order they arrived.
+    open: Vec<Chunk>,
+    /// How many rows are in `open`, which is what decides when it seals.
+    open_rows: usize,
+    /// One per chunk, in the same numbering as `slots`.
     zones: Vec<Zone>,
     rows: usize,
     stats_ns: u64,
@@ -44,7 +110,16 @@ impl MemoryTable {
     /// An empty table of the given column types.
     #[must_use]
     pub fn new(types: Vec<LogicalType>) -> Self {
-        Self { types, chunks: Vec::new(), zones: Vec::new(), rows: 0, stats_ns: 0 }
+        Self {
+            types,
+            groups: Vec::new(),
+            slots: Vec::new(),
+            open: Vec::new(),
+            open_rows: 0,
+            zones: Vec::new(),
+            rows: 0,
+            stats_ns: 0,
+        }
     }
 
     /// The column types.
@@ -74,7 +149,16 @@ impl MemoryTable {
     /// How many chunks a scan will read.
     #[must_use]
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        self.slots.len()
+    }
+
+    /// How many groups the rows are laid out in, which is what a scan does not see.
+    ///
+    /// Here so that a test can say what the layout is rather than guess at it from the read path,
+    /// and so that anything measuring the table can report the number that actually moved.
+    #[must_use]
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
     }
 
     /// Appends a chunk, which has to have the table's column types.
@@ -108,10 +192,77 @@ impl MemoryTable {
         self.stats_ns += started.elapsed().as_nanos() as u64;
         self.rows += chunk.len();
         self.zones.push(zone);
-        // Stored as pages, because a stored chunk is read once per scan of the table and a page is
-        // what makes that read a reference count bump rather than a copy. See `read`.
-        self.chunks.push(chunk.into_pages());
+        self.open_rows += chunk.len();
+        self.slots.push(Slot::Open { at: self.open.len() });
+        // Stored as pages even before the group seals, because a chunk that goes through the
+        // fallback is never laid end to end and this is what makes reading it a reference count bump
+        // rather than a copy. A page laid end to end afterwards is copied out of once, here.
+        self.open.push(chunk.into_pages());
+        if self.open_rows >= ROWS_PER_GROUP {
+            self.seal();
+        }
         Ok(())
+    }
+
+    /// Lays the open chunks end to end into one group, or keeps them as the chunks they are.
+    ///
+    /// Every column has to lay for the group to lay, because a group holds one page per column of
+    /// the same height and half of one is not a group. A column that will not lay is a column that
+    /// arrived encoded, and encoded is the form worth keeping, so the answer is to leave the whole
+    /// run as it came: each chunk becomes a group of its own, which is three numbers in the
+    /// directory and is exactly what the table did before there were groups.
+    ///
+    /// Sealing is where the copy is. It is one pass over the rows of the group per column, and it
+    /// buys every read afterwards a window into one run instead of a jump to one of a hundred and
+    /// twenty allocations.
+    fn seal(&mut self) {
+        if self.open.is_empty() {
+            return;
+        }
+        let first = self.slots.len() - self.open.len();
+        match self.laid() {
+            Some(columns) => {
+                let group = self.groups.len();
+                let mut at = 0;
+                for (slot, chunk) in self.slots[first..].iter_mut().zip(&self.open) {
+                    *slot = Slot::Window { group, at, len: chunk.len() };
+                    at += chunk.len();
+                }
+                self.groups.push(Group { columns, rows: at });
+            }
+            None => {
+                for (slot, chunk) in self.slots[first..].iter_mut().zip(self.open.drain(..)) {
+                    *slot = Slot::Window { group: self.groups.len(), at: 0, len: chunk.len() };
+                    let rows = chunk.len();
+                    self.groups.push(Group { columns: chunk.into_columns(), rows });
+                }
+            }
+        }
+        self.open.clear();
+        self.open_rows = 0;
+    }
+
+    /// The open chunks as one page per column, or `None` if any column will not lay end to end.
+    ///
+    /// Collected a column at a time rather than a chunk at a time because that is the direction the
+    /// pages run in, and the borrow of each chunk's column ends inside the loop, so nothing is
+    /// cloned to build the list handed to [`rudb_vector::concat()`].
+    ///
+    /// An error from the concatenation is treated as a run that will not lay. It means a piece said
+    /// it was flat and did not hold a flat run of its own length, which the vector crate believes is
+    /// impossible, and the safe thing for a table to do about a layout it cannot build is to keep
+    /// the rows it was given rather than to fail an insert over it.
+    fn laid(&self) -> Option<Vec<Vector>> {
+        let mut pages = Vec::with_capacity(self.types.len());
+        let mut pieces = Vec::with_capacity(self.open.len());
+        for (column, ty) in self.types.iter().enumerate() {
+            pieces.clear();
+            for chunk in &self.open {
+                pieces.push(chunk.column(column).ok()?.clone());
+            }
+            pages.push(rudb_vector::concat(ty, &pieces).ok()??);
+        }
+        Some(pages)
     }
 
     /// How long this table has spent building statistics, in nanoseconds.
@@ -241,13 +392,21 @@ impl MemoryTable {
             )));
         }
         let mut found = Vec::with_capacity(self.zones.len());
-        for (zone, chunk) in self.zones.iter().zip(&self.chunks) {
+        for (zone, slot) in self.zones.iter().zip(&self.slots) {
             let range = zone
                 .column(column)
                 .ok_or_else(|| Error::internal("a chunk's zone is narrower than the table"))?;
-            found.push((range, chunk.len()));
+            found.push((range, self.rows_of(*slot)));
         }
         Ok(found)
+    }
+
+    /// How many rows one slot names.
+    fn rows_of(&self, slot: Slot) -> usize {
+        match slot {
+            Slot::Window { len, .. } => len,
+            Slot::Open { at } => self.open.get(at).map_or(0, Chunk::len),
+        }
     }
 
     /// Appends rows given one at a time, splitting them into chunks.
@@ -281,9 +440,10 @@ impl MemoryTable {
 
     /// One chunk's worth of the named columns, in the order they are named.
     ///
-    /// The columns are shared rather than copied. `append` stores every chunk as pages, so the
+    /// The columns are shared rather than copied. A chunk is a window into its group's pages, so the
     /// vector handed back here points at the stored values and the cost of this call is one atomic
-    /// increment per column. It used to copy, and `spec/perf/12-the-chunk-and-the-page.md` measured
+    /// increment per column and whatever the cut has to rewrite. It used to copy, and
+    /// `spec/perf/12-the-chunk-and-the-page.md` measured
     /// what that cost: 1,803 instructions a chunk of memcpy and 1,869 of malloc and free on a `sum`
     /// over a twenty million row table, which is 27 percent of the chunk and none of it the query's
     /// work.
@@ -303,23 +463,76 @@ impl MemoryTable {
     ///
     /// If there is no such chunk, or if a column is past the end of the table.
     pub fn read(&self, chunk: usize, columns: &[usize]) -> Result<Chunk> {
-        let held = self.chunks.get(chunk).ok_or_else(|| {
+        let slot = *self.slots.get(chunk).ok_or_else(|| {
             Error::internal(format!(
                 "chunk {chunk} of a table that has {} chunks",
-                self.chunks.len()
+                self.slots.len()
             ))
         })?;
-        let mut picked = Vec::with_capacity(columns.len());
-        for &column in columns {
-            picked.push(held.column(column)?.clone());
+        match slot {
+            Slot::Window { group, at, len } => {
+                let held = self
+                    .groups
+                    .get(group)
+                    .ok_or_else(|| Error::internal("a chunk names a group that is not there"))?;
+                // Checked once here rather than once per column, because a window past the end of
+                // its group is the directory disagreeing with the pages and the message wanted is
+                // that, not the same out of range cut reported by whichever column was read first.
+                if at + len > held.rows {
+                    return Err(Error::internal(format!(
+                        "chunk {chunk} is rows {at} to {} of a group of {}",
+                        at + len,
+                        held.rows
+                    )));
+                }
+                let mut picked = Vec::with_capacity(columns.len());
+                for &column in columns {
+                    let page = held.columns.get(column).ok_or_else(|| {
+                        Error::internal(format!(
+                            "column {column} of a table that has {}",
+                            self.types.len()
+                        ))
+                    })?;
+                    picked.push(page.slice(at, len)?);
+                }
+                Chunk::with_rows(picked, len)
+            }
+            Slot::Open { at } => {
+                let held = self
+                    .open
+                    .get(at)
+                    .ok_or_else(|| Error::internal("a chunk names an open chunk that is gone"))?;
+                let mut picked = Vec::with_capacity(columns.len());
+                for &column in columns {
+                    picked.push(held.column(column)?.clone());
+                }
+                Chunk::with_rows(picked, held.len())
+            }
         }
-        Chunk::with_rows(picked, held.len())
+    }
+
+    /// How many rows chunk `index` has, or `None` past the end.
+    ///
+    /// Answered out of the directory, which is why it is here rather than left to a caller that
+    /// reads the chunk and asks how long it is. A caller walking the table to turn a row ordinal
+    /// into a chunk and an offset wants the lengths and not the rows, and reading every column of
+    /// every chunk to find out how many rows are in them is the cost this is for.
+    #[must_use]
+    pub fn chunk_len(&self, index: usize) -> Option<usize> {
+        self.slots.get(index).map(|&slot| self.rows_of(slot))
     }
 
     /// One stored chunk, whole.
+    ///
+    /// Every column of it, which for a sealed group is a window per column and for an open one is a
+    /// reference count bump per column. It comes back owned rather than borrowed because a chunk is
+    /// something the table now builds when it is asked for rather than something it holds, and that
+    /// is the whole point of the groups: the rows of a chunk are next to the rows of its neighbours
+    /// instead of in an allocation of their own.
     #[must_use]
-    pub fn chunk(&self, index: usize) -> Option<&Chunk> {
-        self.chunks.get(index)
+    pub fn chunk(&self, index: usize) -> Option<Chunk> {
+        let columns: Vec<usize> = (0..self.types.len()).collect();
+        self.read(index, &columns).ok()
     }
 }
 
@@ -459,7 +672,7 @@ mod tests {
             Some(Data::Int64(values)) => values.as_slice().as_ptr() as usize,
             _ => panic!("a BIGINT column is not a run of i64"),
         };
-        let stored = address(table.chunk(0).expect("the only chunk"));
+        let stored = address(&table.chunk(0).expect("the only chunk"));
         let first = table.read(0, &[0]).expect("the only chunk");
         let second = table.read(0, &[0]).expect("the only chunk again");
         assert_eq!(address(&first), stored, "the read copied the column out");
@@ -510,6 +723,161 @@ mod tests {
         let error =
             table.append_rows(&[vec![Value::Integer(1)]]).expect_err("a row of one is not a row");
         assert!(error.message().contains("row 0"), "{error}");
+    }
+
+    /// A table of one bigint column, filled a full chunk at a time.
+    fn filled(chunks: usize) -> MemoryTable {
+        let mut table = MemoryTable::new(vec![LogicalType::BigInt]);
+        for chunk in 0..chunks {
+            let held: Vec<Value> = (0..VECTOR_SIZE)
+                .map(|row| Value::BigInt((chunk * VECTOR_SIZE + row) as i64))
+                .collect();
+            let column = Vector::from_values(LogicalType::BigInt, &held).expect("bigints");
+            table.append(Chunk::new(vec![column]).expect("one column")).expect("a full chunk");
+        }
+        table
+    }
+
+    /// Every row of every chunk, read back through the chunk numbering a scan uses.
+    fn every_row(table: &MemoryTable) -> Vec<Value> {
+        (0..table.chunk_count())
+            .flat_map(|at| {
+                let chunk = table.read(at, &[0]).expect("a chunk the table says it has");
+                (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The chunk numbering is what it was, and so are the rows in it. The layout is not.
+    #[test]
+    fn a_full_group_is_one_page_a_column_and_the_chunks_are_windows_into_it() {
+        let chunks = ROWS_PER_GROUP / VECTOR_SIZE;
+        let table = filled(chunks + 3);
+        assert_eq!(table.chunk_count(), chunks + 3, "the chunk numbering moved");
+        assert_eq!(table.group_count(), 1, "the full group did not seal");
+        assert_eq!(table.len(), (chunks + 3) * VECTOR_SIZE);
+        let wanted: Vec<Value> = (0..table.len()).map(|row| Value::BigInt(row as i64)).collect();
+        assert_eq!(every_row(&table), wanted, "the rows moved when the layout did");
+    }
+
+    /// What a window is, said on the address, because the values are the same either way.
+    #[test]
+    fn two_chunks_of_one_group_read_out_of_the_same_run_of_memory() {
+        use rudb_vector::vector::Data;
+
+        let table = filled(ROWS_PER_GROUP / VECTOR_SIZE);
+        assert_eq!(table.group_count(), 1, "one group to read two chunks out of");
+        let address = |chunk: &Chunk| match chunk.column(0).expect("one column").data() {
+            Some(Data::Int64(values)) => values.as_slice().as_ptr() as usize,
+            _ => panic!("a BIGINT column is not a run of i64"),
+        };
+        let first = address(&table.read(0, &[0]).expect("the first chunk"));
+        let second = address(&table.read(1, &[0]).expect("the second chunk"));
+        assert_eq!(
+            second - first,
+            VECTOR_SIZE * size_of::<i64>(),
+            "the second chunk is not the first one's neighbour, so the group did not lay"
+        );
+    }
+
+    /// Rows a group has not claimed yet are still readable, which is what a reader mid insert sees.
+    #[test]
+    fn the_chunks_of_the_group_still_filling_read_back_before_it_seals() {
+        let table = filled(3);
+        assert_eq!(table.group_count(), 0, "three chunks is not a group yet");
+        assert_eq!(table.chunk_count(), 3);
+        let wanted: Vec<Value> = (0..table.len()).map(|row| Value::BigInt(row as i64)).collect();
+        assert_eq!(every_row(&table), wanted);
+        assert_eq!(table.chunk_len(1), Some(VECTOR_SIZE));
+        assert_eq!(table.chunk_len(3), None, "a chunk past the end has no length");
+    }
+
+    /// The fallback. An encoded column is worth more than a laid out one, so the run is left alone.
+    #[test]
+    fn a_column_that_arrives_encoded_keeps_its_form_rather_than_being_flattened_into_a_page() {
+        let mut table = MemoryTable::new(vec![LogicalType::BigInt]);
+        let chunks = ROWS_PER_GROUP / VECTOR_SIZE;
+        for _ in 0..chunks {
+            let values = Vector::from_values(
+                LogicalType::BigInt,
+                &[Value::BigInt(7), Value::BigInt(8), Value::BigInt(9)],
+            )
+            .expect("three distinct values");
+            let codes: Vec<u32> = (0..VECTOR_SIZE).map(|row| (row % 3) as u32).collect();
+            let column = Vector::dictionary(codes, values).expect("a dictionary column");
+            table.append(Chunk::new(vec![column]).expect("one column")).expect("a full chunk");
+        }
+        assert_eq!(table.group_count(), chunks, "the dictionaries were laid end to end after all");
+        let chunk = table.read(0, &[0]).expect("the first chunk");
+        assert_eq!(
+            chunk.column(0).expect("one column").form(),
+            rudb_vector::Form::Dictionary,
+            "the fallback flattened the column it was there to protect"
+        );
+        let wanted: Vec<Value> =
+            (0..VECTOR_SIZE).map(|row| Value::BigInt(7 + (row % 3) as i64)).collect();
+        assert_eq!((0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect::<Vec<_>>(), wanted);
+    }
+
+    /// The statistics are per chunk and stay per chunk, whatever the rows were laid out as.
+    #[test]
+    fn a_group_does_not_coarsen_the_zone_maps_of_the_chunks_in_it() {
+        let table = filled(ROWS_PER_GROUP / VECTOR_SIZE + 1);
+        assert_eq!(table.chunk_count(), table.zones.len(), "a chunk lost its zone map");
+        let first = table.zone(0).expect("the first chunk's zone");
+        let range = first.column(0).expect("its only column");
+        assert_eq!(range.low, Some(Bound::Int(0)), "the first chunk's smallest value");
+        assert_eq!(
+            range.high,
+            Some(Bound::Int(VECTOR_SIZE as i128 - 1)),
+            "a zone map that speaks for the whole group rather than for the chunk"
+        );
+        // And the pruning that rests on them still answers, across the seal and outside it.
+        let op = rudb_common::bounds::Op::Equal;
+        let probes = [Probe { column: 0, op, value: Bound::Int(7) }];
+        assert!(!table.skips(0, &probes), "the chunk holding the value was skipped");
+        assert!(table.skips(1, &probes), "the chunk that cannot hold the value was read");
+    }
+
+    /// Nulls are the thing a laid out page can silently lose, since they live beside the values.
+    #[test]
+    fn the_nulls_of_a_column_survive_the_rows_being_laid_end_to_end() {
+        let table = counted(ROWS_PER_GROUP + VECTOR_SIZE);
+        assert!(table.group_count() > 0, "nothing sealed, so nothing was laid");
+        let rows = table.len();
+        let wanted = (0..rows).filter(|row| row % 5 == 0).count();
+        assert_eq!(table.null_count(0).expect("the only column"), wanted);
+        let read: Vec<Value> = (0..table.chunk_count())
+            .flat_map(|at| {
+                let chunk = table.read(at, &[0]).expect("a chunk");
+                (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect::<Vec<_>>()
+            })
+            .collect();
+        let expected: Vec<Value> = (0..rows)
+            .map(|row| if row % 5 == 0 { Value::Null } else { Value::Integer(row as i32 % 7) })
+            .collect();
+        assert_eq!(read, expected, "the values or the nulls moved when the layout did");
+    }
+
+    /// A string column, which is the one whose page is views rather than a flat run.
+    #[test]
+    fn a_string_column_is_laid_into_one_arena_and_cut_back_out_of_it() {
+        let mut table = MemoryTable::new(vec![LogicalType::Varchar]);
+        let rows: Vec<Vec<Value>> = (0..ROWS_PER_GROUP + 5)
+            .map(|row| vec![Value::Varchar(format!("a string of some length number {row}"))])
+            .collect();
+        table.append_rows(&rows).expect("strings");
+        assert_eq!(table.group_count(), 1, "the strings were not laid end to end");
+        let chunk = table.read(0, &[0]).expect("the first chunk");
+        assert_eq!(
+            chunk.column(0).expect("one column").form(),
+            rudb_vector::Form::StringView,
+            "a flat varchar page copies every byte of every long string in every cut"
+        );
+        assert_eq!(chunk.value_at(3, 0), rows[3][0]);
+        let last = table.chunk_count() - 1;
+        let tail = table.read(last, &[0]).expect("the last chunk");
+        assert_eq!(tail.value_at(tail.len() - 1, 0), rows[ROWS_PER_GROUP + 4][0]);
     }
 
     #[test]
