@@ -81,6 +81,8 @@ pub struct Driver {
     slowest_cpu_ns: AtomicU64,
     /// The sink's finalize, which is one thread whatever it does inside. See [`Driver::waited`].
     finalize_ns: AtomicU64,
+    /// How late the last instance started relative to the first. See [`Driver::waited`].
+    stagger_ns: AtomicU64,
     charged: Arc<Charged>,
 }
 
@@ -95,6 +97,7 @@ impl Driver {
             slowest_ns: AtomicU64::new(0),
             slowest_cpu_ns: AtomicU64::new(0),
             finalize_ns: AtomicU64::new(0),
+            stagger_ns: AtomicU64::new(0),
             charged,
         }
     }
@@ -149,24 +152,32 @@ impl Driver {
     /// more finely. The two fixes make each other worse, so the number that tells them apart is not
     /// optional.
     ///
+    /// The stagger is the other half of the same question and is a maximum for the same reason the
+    /// slowest is. An instance that started late finishes late whether or not it was handed more
+    /// than its share, so without it the gap between the slowest instance and the average reads as
+    /// imbalance when it is often nothing but the order the workers were woken in.
+    ///
     /// The slowest is a maximum across runs rather than a sum, because a pipeline drained twice
     /// waited for the slower of the two and not for both. The finalize adds, because there were two
     /// of them and both happened. The CPU follows whichever run held the maximum, so it is stored
     /// unconditionally when the wall is and left alone when it is not.
-    pub fn waited(&self, slowest_ns: u64, slowest_cpu_ns: u64, finalize_ns: u64) {
+    pub fn waited(&self, slowest_ns: u64, slowest_cpu_ns: u64, finalize_ns: u64, stagger_ns: u64) {
         if self.slowest_ns.fetch_max(slowest_ns, Ordering::Relaxed) < slowest_ns {
             self.slowest_cpu_ns.store(slowest_cpu_ns, Ordering::Relaxed);
         }
         self.finalize_ns.fetch_add(finalize_ns, Ordering::Relaxed);
+        self.stagger_ns.fetch_max(stagger_ns, Ordering::Relaxed);
     }
 
-    /// The longest single instance, its own CPU, and the total finalize this driver was told about.
+    /// The longest single instance, its own CPU, the total finalize and the worst stagger this
+    /// driver was told about.
     #[must_use]
-    pub fn waits(&self) -> (u64, u64, u64) {
+    pub fn waits(&self) -> (u64, u64, u64, u64) {
         (
             self.slowest_ns.load(Ordering::Relaxed),
             self.slowest_cpu_ns.load(Ordering::Relaxed),
             self.finalize_ns.load(Ordering::Relaxed),
+            self.stagger_ns.load(Ordering::Relaxed),
         )
     }
 

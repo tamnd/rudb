@@ -178,6 +178,7 @@ impl Document {
                     out.count("slowest_ns", pipeline.slowest_ns);
                     out.count("slowest_cpu_ns", pipeline.slowest_cpu_ns);
                     out.count("finalize_ns", pipeline.finalize_ns);
+                    out.count("stagger_ns", pipeline.stagger_ns);
                     out.key("blocked_ns");
                     out.object(|out| {
                         out.count("io", pipeline.blocked.io_ns);
@@ -492,9 +493,10 @@ pub struct Pipeline {
     /// The wall of the longest single instance, which is the one the rest waited for.
     ///
     /// What sits between this and `wall_ns` is what starting and joining the threads cost. What
-    /// sits between this and `cpu_ns` divided by `instances` is how unevenly the work was split.
-    /// Both of those used to be one unnamed number that had to be got at by subtracting the
-    /// operators from the pipeline, and on ClickBench 39 that number is more than half the query.
+    /// sits between this and `cpu_ns` divided by `instances` is how unevenly the work was split,
+    /// less whatever `stagger_ns` accounts for. Both of those used to be one unnamed number that
+    /// had to be got at by subtracting the operators from the pipeline, and on ClickBench 39 that
+    /// number is more than half the query.
     pub slowest_ns: u64,
     /// The CPU of that same instance, which says whether it was working or waiting.
     ///
@@ -508,6 +510,15 @@ pub struct Pipeline {
     /// the wall of the whole thing, undivided, which is the number that matters when the question
     /// is what the query waited for.
     pub finalize_ns: u64,
+    /// How long after the first instance started the last one did.
+    ///
+    /// The instances do not start together, they start as the dispatching thread wakes them, and
+    /// an instance woken last finishes last even when every instance is handed identical work. So
+    /// this is the part of the gap between `slowest_ns` and the average instance that is not
+    /// imbalance, and the two want opposite fixes: imbalance wants the work cut more finely and
+    /// stagger wants the waking made cheaper. Reading the gap as imbalance without this number is
+    /// how a scan came to be blamed for it once.
+    pub stagger_ns: u64,
     /// Where the waiting went.
     pub blocked: Blocked,
 }
@@ -525,6 +536,7 @@ impl Pipeline {
             slowest_ns: 0,
             slowest_cpu_ns: 0,
             finalize_ns: 0,
+            stagger_ns: 0,
             blocked: Blocked::default(),
         }
     }
@@ -754,6 +766,7 @@ mod tests {
         scan.slowest_ns = 940_000_000;
         scan.slowest_cpu_ns = 912_000_000;
         scan.finalize_ns = 31_000_000;
+        scan.stagger_ns = 7_000_000;
         scan.blocked.io_ns = 120_000_000;
         scan.blocked.downstream_ns = 3_000_000;
         let mut top = Pipeline::new(1);
