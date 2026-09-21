@@ -241,9 +241,15 @@ pub fn render(result: &QueryResult, settings: &Settings) -> String {
     if result.width() == 0 {
         return String::new();
     }
-    let cells = cells(result, settings);
+    // `duckbox` is the only mode that leaves rows out, so it is the only mode that needs fewer cells
+    // built than the result has rows. Everything else prints all of them and gets `None`.
+    let dots = match settings.format {
+        Format::DuckBox => shown(result.len()),
+        _ => None,
+    };
+    let cells = cells(result, settings, dots);
     match settings.format {
-        Format::DuckBox => duckbox(result, &cells),
+        Format::DuckBox => duckbox(result, &cells, dots),
         Format::Box => boxed(result, &cells, BOX_GLYPHS),
         Format::Table => boxed(result, &cells, TABLE_GLYPHS),
         Format::Markdown => markdown(result, &cells),
@@ -260,9 +266,24 @@ pub fn render(result: &QueryResult, settings: &Settings) -> String {
     }
 }
 
-/// Every value as the text it prints as, which the table modes then measure and pad.
-fn cells(result: &QueryResult, settings: &Settings) -> Vec<Vec<String>> {
-    (0..result.len())
+/// Every value a mode prints as the text it prints as, which the table modes then measure and pad.
+///
+/// `dots` is what the mode is going to leave out, and the rows it leaves out are not built at all.
+/// They used to be: every row of the result went through [`cell`] and then `write_rows` walked past
+/// the ones in the gap without printing them. On a two hundred thousand row result that is four
+/// hundred thousand strings built and dropped, and it cost 189ms against the duckdb binary's nothing
+/// for byte identical output, which is #1119. It also measured them, so a long value hidden in the
+/// gap widened a column it never printed in, which the duckdb binary does not do.
+fn cells(
+    result: &QueryResult,
+    settings: &Settings,
+    dots: Option<(usize, usize)>,
+) -> Vec<Vec<String>> {
+    let rows: Vec<usize> = match dots {
+        Some((head, tail)) => (0..head).chain(result.len() - tail..result.len()).collect(),
+        None => (0..result.len()).collect(),
+    };
+    rows.into_iter()
         .map(|row| {
             (0..result.width())
                 .map(|column| cell(result, &result.value_at(row, column), settings))
@@ -425,7 +446,7 @@ fn row(parts: &[String], vertical: &str) -> String {
 }
 
 /// The default mode: a box, a type row, and a count under it.
-fn duckbox(result: &QueryResult, cells: &[Vec<String>]) -> String {
+fn duckbox(result: &QueryResult, cells: &[Vec<String>], dots: Option<(usize, usize)>) -> String {
     let mut sizes = widths(result, cells, true);
     let counts = Counts::of(result);
     // The table cannot be narrower than the count that has to appear under it, which is the only
@@ -447,7 +468,7 @@ fn duckbox(result: &QueryResult, cells: &[Vec<String>]) -> String {
     let _ = writeln!(out, "{}", row(&types, BOX_GLYPHS.vertical));
     if !cells.is_empty() {
         let _ = writeln!(out, "{}", rule(&sizes, &BOX_GLYPHS.middle));
-        write_rows(&mut out, cells, &sizes, &right, BOX_GLYPHS.vertical);
+        write_rows(&mut out, cells, &sizes, &right, BOX_GLYPHS.vertical, dots);
     }
     let _ = writeln!(out, "{}", rule(&sizes, &BOX_GLYPHS.bottom));
     for text in counts.footer(box_width(&sizes)) {
@@ -586,14 +607,19 @@ fn middle(text: &str, total: usize, line: usize) -> String {
 }
 
 /// The rows of a box, with the dots in the middle if some were left out.
+///
+/// `cells` holds only the rows to print, so every one of them is printed. `dots` says how they were
+/// split, `head` of them and then `tail` of them, and the dots go in the join. Nothing here derives
+/// that from the length of `cells`, because a box that leaves out three rows and a box that has
+/// three fewer rows in it look the same by the time they get here and only one of them wants dots.
 fn write_rows(
     out: &mut String,
     cells: &[Vec<String>],
     sizes: &[usize],
     right: &[bool],
     vertical: &str,
+    dots: Option<(usize, usize)>,
 ) {
-    let dots = shown(cells.len());
     for (at, values) in cells.iter().enumerate() {
         if let Some((head, tail)) = dots {
             if at == head {
@@ -601,9 +627,6 @@ fn write_rows(
                 for _ in 0..ELIDED {
                     let _ = writeln!(out, "{}", row(&parts, vertical));
                 }
-            }
-            if at >= head && at < cells.len() - tail {
-                continue;
             }
         }
         let parts: Vec<String> = values
@@ -663,7 +686,7 @@ fn boxed(result: &QueryResult, cells: &[Vec<String>], glyphs: Glyphs) -> String 
         result.names().iter().zip(&sizes).map(|(name, size)| centre(name, *size)).collect();
     let _ = writeln!(out, "{}", row(&heads, glyphs.vertical));
     let _ = writeln!(out, "{}", rule(&sizes, &glyphs.middle));
-    write_rows(&mut out, cells, &sizes, &right, glyphs.vertical);
+    write_rows(&mut out, cells, &sizes, &right, glyphs.vertical, None);
     let _ = writeln!(out, "{}", rule(&sizes, &glyphs.bottom));
     out
 }
@@ -690,7 +713,7 @@ fn markdown(result: &QueryResult, cells: &[Vec<String>]) -> String {
         .collect();
     let _ = writeln!(out, "|{}|", rules.join("|"));
     let mut rows = String::new();
-    write_rows(&mut rows, cells, &sizes, &right, "|");
+    write_rows(&mut rows, cells, &sizes, &right, "|", None);
     out.push_str(&rows);
     out
 }
