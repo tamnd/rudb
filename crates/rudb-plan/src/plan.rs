@@ -1428,6 +1428,10 @@ mod tests {
         ) -> Stat<rudb_common::bounds::Bound> {
             Stat::Unknown
         }
+
+        fn nulls(&self, _column: usize) -> Stat<u64> {
+            Stat::Unknown
+        }
     }
 
     #[test]

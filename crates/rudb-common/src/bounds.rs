@@ -437,6 +437,27 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
     /// [`Class::Exact`]: crate::stat::Class::Exact
     /// [`Stat`]: crate::Stat
     fn extreme(&self, column: usize, end: End) -> Stat<Bound>;
+
+    /// How many rows of that column are null, across the whole store.
+    ///
+    /// Here rather than anywhere else because the null count sits in the same per part entry the
+    /// two bounds do. Every store that keeps a minimum and a maximum per part keeps the null count
+    /// beside them, both of them are written once and read by a scan that already has the entry in
+    /// its hand, and the planner could reach neither. So the question that reaches the bounds
+    /// reaches this at the same time and through the same object.
+    ///
+    /// [`Class::Exact`], because a null count is a count. A part states how many of its rows are
+    /// null and the store sums the parts, and nothing in that is a guess. That is what makes
+    /// `IS NULL` worth asking about: it is the one filter whose answer a store can state outright.
+    ///
+    /// [`Stat::Unknown`] for a column the store does not have, and for a store where any part
+    /// stated no null count. Summing the parts that did state one would report a number about part
+    /// of the store wearing the name of all of it, which for `IS NOT NULL` is a count below the
+    /// truth.
+    ///
+    /// [`Class::Exact`]: crate::stat::Class::Exact
+    /// [`Stat`]: crate::Stat
+    fn nulls(&self, column: usize) -> Stat<u64>;
 }
 
 /// A store that counted how many rows hold each value of a column, asked how many hold one value.
