@@ -1141,6 +1141,23 @@ fn a_sink_that_finishes_wider_than_its_source_gets_the_threads_without_the_insta
 }
 
 #[test]
+fn a_watched_sink_is_still_asked_how_wide_it_finishes() {
+    // The same sink as above with the metrics wrapper around it, which is how every sink reaches a
+    // real query. The wrapper forwarded everything else and dropped this one, so the answer the
+    // sink gave never got as far as the lease and the whole engine finished at its source's width.
+    // The prepare call went the same way once, which is what `Preparing` is there for.
+    let counters = Arc::new(Counters::new(0, 0, "WideFinish"));
+    let sink = Arc::new(Watched::new(WideFinish::default(), counters));
+    let built = pipeline(
+        Arc::new(Counting::new((1..=30).collect(), 10, 3)) as Arc<dyn Source>,
+        Arc::clone(&sink),
+    );
+
+    assert_eq!(built.degree(8), 3, "three morsels are three instances");
+    assert_eq!(built.lease_degree(8), 8, "and the wrapper passed the sink's answer along");
+}
+
+#[test]
 fn a_sink_that_says_nothing_about_finishing_leaves_the_lease_to_its_source() {
     let sink = Arc::new(Total::default());
     let built = pipeline(

@@ -37,10 +37,44 @@ pub(crate) const PARTITIONS: usize = 64;
 /// keeps and sixteen bytes of record, so sixteen thousand rows is a table of about three hundred and
 /// fifty kilobytes, and that is the largest one measured that was still worth having.
 ///
-/// It is the same number the finishing passes ask for before they take a second thread, which is
-/// not a coincidence. A partition is one thread's piece of work, so the row count that is worth a
-/// thread is the row count that is worth a partition.
+/// It is also the number the finishing passes ramp on. A partition is one thread's piece of work,
+/// so the row count that is worth a partition is the row count that is worth the first few threads.
 pub(crate) const ROWS_PER_PARTITION: usize = 16_384;
+
+/// How many rows a finishing pass wants before it asks for a thread beyond the first few.
+///
+/// See [`finish_degree`].
+pub(crate) const ROWS_PER_EXTRA_THREAD: usize = 65_536;
+
+/// How many threads a finishing pass gets for `input` rows of radix partitions.
+///
+/// Two rules and the larger wins, which is the shape the scan uses to cut morsels and it is the same
+/// argument. A small finish wants threads quickly, because a query that takes half a millisecond has
+/// no time to ramp, so the first rule gives one per [`ROWS_PER_PARTITION`] up to eight. A large one
+/// wants them slowly, and that is the part that is easy to get wrong.
+///
+/// It was one thread per [`ROWS_PER_PARTITION`] all the way up, which on a million rows asks for
+/// sixty two. Nothing showed, because the lease this is capped by was the scan's and the scan cut
+/// sixteen morsels, and because the sink's answer to how wide it could finish was being dropped
+/// before it reached the lease at all. Both of those are fixed, so the ask is now what arrives.
+///
+/// What arrives at sixty two is worse than what arrived at sixteen. Measured on the million row
+/// ClickBench file, `COUNT(DISTINCT UserID) GROUP BY RegionID` finishing on thirty two threads
+/// instead of eight burns sixty eight percent more CPU to produce the same wall clock: the pass
+/// probes a table with a slot per distinct pair and it is waiting on memory rather than on
+/// arithmetic, so past the machine's memory level parallelism another thread adds a wake, a join and
+/// a share of the bandwidth and takes nothing off the critical path. Eight threads finish the pass
+/// in 1.858 ms and thirty two in 1.764, for 9.7 ms of CPU against 16.3.
+///
+/// So the second rule is one thread per [`ROWS_PER_EXTRA_THREAD`], which on a million rows asks for
+/// sixteen. Swept over the queries this moves, sixty five thousand is the best or within noise of it
+/// everywhere, and the queries that preferred the old number preferred it because the old number was
+/// the only thing keeping them off one thread, which the first rule now does instead.
+pub(crate) fn finish_degree(input: usize, ceiling: usize) -> usize {
+    let quickly = input.div_ceil(ROWS_PER_PARTITION).min(8);
+    let slowly = input.div_ceil(ROWS_PER_EXTRA_THREAD);
+    quickly.max(slowly).clamp(1, ceiling)
+}
 
 /// How many pieces of work a thread should have to choose from, so that a slow one is absorbed.
 ///
@@ -338,6 +372,7 @@ pub(crate) fn distinct_pairs(
     splits: usize,
     memory: &Memory,
 ) -> Result<Counted> {
+    let reserving = stage::Timing::start(Stage::Reserve);
     let held_rows = partition.rows();
     let pair_capacity = held_rows.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
@@ -406,6 +441,7 @@ pub(crate) fn distinct_pairs(
     let even = held_rows.div_ceil(splits);
     let share = (even + even.isqrt() * 4).min(held_rows);
     let mut parts: Vec<Vec<Grouped>> = (0..splits).map(|_| Vec::with_capacity(share)).collect();
+    reserving.stop(0);
 
     let timing = stage::Timing::start(Stage::Fold);
     for run in &partition.runs {
@@ -441,8 +477,11 @@ pub(crate) fn distinct_pairs(
             }
         }
     }
+    timing.stop(0);
+
     // The rows themselves are not read again, only the distinct pairs, so give the memory back
     // before the group pass rather than at the end of the query.
+    let reserving = stage::Timing::start(Stage::Reserve);
     partition.runs.clear();
     drop(unique);
     drop(unique_validity);
@@ -461,7 +500,7 @@ pub(crate) fn distinct_pairs(
     held.grow(width(
         parts.iter().map(|split| split.capacity() * size_of::<Grouped>()).sum::<usize>(),
     ))?;
-    timing.stop(0);
+    reserving.stop(0);
     Ok(Counted { splits: parts, held })
 }
 

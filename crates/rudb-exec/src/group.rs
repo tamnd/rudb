@@ -37,7 +37,7 @@ use crate::buffer::Buffered;
 use crate::group_distinct;
 use crate::group_mixed;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
-use crate::pairs::together;
+use crate::pairs::{self, together};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -4164,7 +4164,17 @@ impl Sink for Aggregate<'_> {
             let next = AtomicUsize::new(0);
             let slots: Vec<Mutex<Option<Result<Part>>>> =
                 (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
-            let degree = threads.degree().clamp(1, RADIX_PARTITIONS);
+            let input = fixed
+                .partitions
+                .iter()
+                .map(|partition| {
+                    partition
+                        .lock()
+                        .map(|runs| runs.runs.iter().map(|run| run.rows.len()).sum::<usize>())
+                        .map_err(poisoned)
+                })
+                .sum::<Result<usize>>()?;
+            let degree = fixed_degree(input, threads);
             together(threads, degree, &|| {
                 finish_fixed(&next, &slots, fixed, bound, &self.calls, &self.memory);
             })?;
@@ -4789,19 +4799,42 @@ struct Part {
 
 /// How many threads to finish `input` rows of radix partitions on.
 ///
-/// Two bounds and both of them matter. There is no point starting a thread for every partition when
-/// there are only a few thousand rows between all of them, because the wake and the join cost more
-/// than the rows do, and that is what the divisor says. And there is no point asking for more
-/// threads than the query was given, which is what the lease says and what this used to ignore: a
-/// session that set the thread count to one still finished an aggregate on sixteen.
-///
-/// The divisor was sixty five thousand, which on a million rows says sixteen threads whatever the
-/// machine has. That was the same number the scan happened to cut morsels at, so nothing showed,
-/// and now that a pipeline can borrow more threads than its source runs instances on it is what
-/// would hold the finish at half the machine. Sixteen thousand is the same argument at the size a
-/// woken thread is actually worth paying for.
+/// The rule itself is [`pairs::finish_degree`], which the grouped distinct finish shares, because
+/// the two passes are the same shape: a thread takes a partition, probes a table and writes what it
+/// finds. What is local to here is the two bounds it is capped by. There is no point starting more
+/// threads than there are partitions to give them, which is what [`RADIX_PARTITIONS`] says, and
+/// there is no point asking for more than the query was given, which is what the lease says and
+/// what this used to ignore: a session that set the thread count to one still finished an aggregate
+/// on sixteen.
 fn degree_for(input: usize, threads: &Lease<'_>) -> usize {
-    input.div_ceil(16_384).clamp(1, RADIX_PARTITIONS).min(threads.degree())
+    pairs::finish_degree(input, RADIX_PARTITIONS.min(threads.degree()))
+}
+
+/// How many rows of a fixed key partition are worth a thread while the ramp is still climbing.
+///
+/// See [`fixed_degree`].
+const FIXED_ROWS_PER_THREAD: usize = 8_192;
+
+/// How far that ramp climbs before the slower rule takes over. See [`fixed_degree`].
+const FIXED_RAMP: usize = 16;
+
+/// How many threads to finish `input` rows of fixed key partitions on.
+///
+/// The same two rules as [`pairs::finish_degree`] with twice the ramp and twice the ceiling on it,
+/// because this finish is not waiting on the same thing the others are. A distinct finish probes a
+/// table with a slot per distinct pair and spends its time waiting on memory, so a thread past the
+/// machine's memory level parallelism buys nothing. This one folds a partition's records into its
+/// groups and runs the aggregate calls over them, which is arithmetic, and arithmetic keeps scaling
+/// for longer.
+///
+/// Measured on the million row ClickBench file, the two queries that land here finish a hundred and
+/// thirty thousand records. Swept by hand, two threads take 2.718 ms, eight take 1.661, twelve take
+/// 1.593, sixteen take 1.613 and thirty two take 1.722. So the useful window is twelve to sixteen
+/// where the shared rule asks for eight, and it still turns over well before the whole machine.
+fn fixed_degree(input: usize, threads: &Lease<'_>) -> usize {
+    let quickly = input.div_ceil(FIXED_ROWS_PER_THREAD).min(FIXED_RAMP);
+    let slowly = input.div_ceil(pairs::ROWS_PER_EXTRA_THREAD);
+    quickly.max(slowly).clamp(1, RADIX_PARTITIONS.min(threads.degree()))
 }
 
 impl Aggregate<'_> {
