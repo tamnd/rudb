@@ -1436,6 +1436,52 @@ impl Vector {
         Ok(coded.with_validity(self.validity.clone()))
     }
 
+    /// The same values under a wider decimal type that stores them the same way.
+    ///
+    /// A decimal is kept as its unscaled integer, so two decimal types with one scale and one
+    /// storage width describe the same bits, and going from the narrower of them to the wider is a
+    /// relabelling rather than a conversion. The binder writes three of those into
+    /// `l_extendedprice * (1 - l_discount)`, because a product's operands are given the answer's
+    /// width and the answer's width is eighteen while both columns are fifteen, and each one was a
+    /// pass over six million rows that wrote back the bytes it had just read.
+    ///
+    /// A flat run only, and deliberately. The general cast flattens whatever it is given, so a
+    /// dictionary column came out of a width change as a run of values, and a relabelling that kept
+    /// the dictionary would hand the arithmetic above two columns it has to read through a code per
+    /// row instead of two it can read end to end. That was measured and it is the worse of the two:
+    /// on `sum(l_extendedprice * l_discount)` under the filter q6 puts on it, where the rows left
+    /// are few and scattered and the indirection is a cache miss each, keeping the dictionary cost
+    /// half again as much as the flattening it saved. The flat case has no such question, since
+    /// what it hands on is exactly what the pass would have built.
+    ///
+    /// Only widening, because a narrower width is a range every value has to be checked against and
+    /// checking it is the pass this exists to avoid. `None` for anything else, including a narrower
+    /// width, a changed scale, a changed storage width and any form but the flat one.
+    #[must_use]
+    pub fn as_wider_decimal(&self, target: &LogicalType) -> Option<Self> {
+        let (
+            LogicalType::Decimal { width: from, scale: held },
+            LogicalType::Decimal { width: into, scale },
+        ) = (&self.ty, target)
+        else {
+            return None;
+        };
+        if held != scale || from > into || self.ty.decimal_storage() != target.decimal_storage() {
+            return None;
+        }
+        // Nothing in a flat run says what its numbers mean, so the relabelling is the type and
+        // nothing else, and the buffer underneath is shared rather than copied.
+        if !matches!(self.body, Body::Flat(_)) {
+            return None;
+        }
+        Some(Self {
+            ty: target.clone(),
+            len: self.len,
+            validity: self.validity.clone(),
+            body: self.body.clone(),
+        })
+    }
+
     /// The same vector with a different validity.
     #[must_use]
     pub fn with_validity(mut self, validity: Validity) -> Self {
