@@ -1204,6 +1204,12 @@ impl Where<'_> {
 enum Feed {
     /// A count of the rows that are not null, which reads the mask and not the data.
     Counted,
+    /// An exact number per row into a plain running total, with nothing to do to it on the way.
+    ///
+    /// This is [`Self::Whole`] where the state is a sum rather than a mean, which is where the
+    /// scale is carried for. A sum has no use for it, so splitting the two lets the add be the
+    /// whole of the row loop rather than the end of a call that asks what it is adding into.
+    Total,
     /// An exact number per row, at the scale the column holds it at.
     ///
     /// The scale is carried rather than applied. A total of the integers a decimal column stores is
@@ -1225,11 +1231,11 @@ enum Feed {
 fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
     match (&first.state, ty) {
         (State::Counted { .. }, _) => Some(Feed::Counted),
-        (State::Whole { .. }, _) => Some(Feed::Whole { scale: 0 }),
+        (State::Whole { .. }, _) => Some(Feed::Total),
         (State::Scaled { scale, .. }, LogicalType::Decimal { scale: held, .. })
             if held == scale =>
         {
-            Some(Feed::Whole { scale: 0 })
+            Some(Feed::Total)
         }
         (State::Scaled { .. }, _) => None,
         (State::Mean { .. }, ty) if ty.is_integer() => Some(Feed::Whole { scale: 0 }),
@@ -1341,10 +1347,56 @@ fn scatter<M: Fn(usize) -> usize>(
 ) -> Result<bool> {
     match feed {
         Feed::Counted => Ok(true),
+        Feed::Total => total_into(states, into, run, at),
         Feed::Whole { scale } => whole_into(states, into, run, at, scale),
         Feed::Real { scale } => real_into(states, into, run, at, scale),
         Feed::Extreme(least) => extreme_into(states, into, run, at, least),
     }
+}
+
+/// An exact number per row into the plain running total of the group that row belongs to.
+///
+/// This is [`whole_into`] with the state question taken out of the row loop. Every accumulator a
+/// call owns was made by that call, so they are all the same variant, and [`feed_of`] has already
+/// read that variant off the first of them. What is left per row is a load, an add and a store,
+/// where before it was a call that could not be inlined because four other loops share it, and a
+/// match inside that call on a state which is the same state every time round.
+///
+/// A sum of a decimal is declared at the column's own scale, so unlike a mean there is no scale to
+/// carry here and nothing to do to the number between reading it and adding it.
+fn total_into<M: Fn(usize) -> usize>(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    run: &Run<'_>,
+    at: M,
+) -> Result<bool> {
+    macro_rules! each {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match run.data {
+                $(Data::$variant(values) => {
+                    for row in 0..run.rows {
+                        if !run.nulls.is_valid(row) {
+                            continue;
+                        }
+                        let Some(index) = into.index(row) else { continue };
+                        let (State::Whole { total, seen, .. }
+                            | State::Scaled { total, seen, .. }) = &mut states[index].state
+                        else {
+                            return Err(Error::internal("an exact total into another".to_string()));
+                        };
+                        *total = total
+                            .checked_add(i128::from(values[at(row)]))
+                            .ok_or_else(overflowed)?;
+                        *seen = true;
+                    }
+                })+
+                // The same width `whole_into` leaves, for the same reason it leaves it.
+                _ => return Ok(false),
+            }
+        };
+    }
+    rudb_vector::for_each_layout!(exact, each);
+    Ok(true)
 }
 
 /// An exact number per row into the running total of the group that row belongs to.
@@ -1414,6 +1466,29 @@ fn packed_into<M: Fn(usize) -> usize>(
     let base = packed.base();
     match feed {
         Feed::Counted => Ok(true),
+        // The same loop `total_into` is, over a packing rather than a run of values, and the same
+        // reason for it: this is where q01 adds a decimal column read out of a native file.
+        Feed::Total => {
+            if wide {
+                return Ok(false);
+            }
+            for row in 0..rows {
+                if !nulls.is_valid(row) {
+                    continue;
+                }
+                let Some(index) = into.index(row) else { continue };
+                let (State::Whole { total, seen, .. } | State::Scaled { total, seen, .. }) =
+                    &mut states[index].state
+                else {
+                    return Err(Error::internal("an exact total into another".to_string()));
+                };
+                *total = total
+                    .checked_add(base + i128::from(packed.code(at(row))))
+                    .ok_or_else(overflowed)?;
+                *seen = true;
+            }
+            Ok(true)
+        }
         Feed::Whole { scale } => {
             if wide {
                 return Ok(false);
