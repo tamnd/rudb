@@ -7,9 +7,17 @@
 //! exactly the parts with nothing in them.
 //!
 //! The way that goes wrong is not subtle, it is rows quietly missing from an answer, so every test
-//! here asks the same question of a table in a file and of the same table held in memory. Memory
-//! keeps no statistics and rules nothing out, so it reads every row and is the oracle. The file is
-//! allowed to read less and is not allowed to answer differently.
+//! here asks the same question of a table in a file and of the same table held in memory, and the
+//! memory side is the oracle. It was one for free when it was written, because a table in memory
+//! kept no statistics and could not rule anything out. It does keep them now, a zone per chunk and
+//! a zone per row group, and it prunes with them, so being an oracle has to be arranged rather than
+//! assumed: the memory database runs with every optimizer pass turned off, which leaves the filter
+//! above the scan, leaves the scan with no probes to test a part against, and makes it read every
+//! row again. The file is allowed to read less and is not allowed to answer differently.
+//!
+//! Turning off only `filter_pushdown` would be enough today and would stop being enough the first
+//! time a pass learns to answer something out of the statistics, which two of them already do for
+//! queries without a filter. All of them off is the version that stays true.
 //!
 //! The filters are written to leave survivors in different places on purpose: at the front, at the
 //! back, in the middle, scattered, and nowhere at all. A walk that ran one part too far or stopped
@@ -46,6 +54,10 @@ impl Pair {
         let create = format!("CREATE TABLE t AS {select}");
         let memory = Database::new();
         memory.execute(&create).expect("the memory table is created");
+        let off = rudb::optimizers().join(",");
+        memory
+            .execute(&format!("SET disabled_optimizers = '{off}'"))
+            .expect("every pass answers to its name");
         let name = path.to_str().expect("a UTF-8 temporary path");
         // Written by one database and read by another, because the table is only actually read out
         // of the file once the database that wrote it has let go of the rows it still holds.
