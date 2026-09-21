@@ -1077,28 +1077,39 @@ pub fn settle_extremes(
     Ok(())
 }
 
-/// The sweep behind [`settle_extremes`], over the codes wanted out of one dictionary in code order.
+/// The sweep behind [`settle_extremes`], over the codes wanted out of one dictionary.
+///
+/// In the order the dictionary stores its values rather than in code order, because that is the
+/// order a sweep walks and a dictionary read out of a file need not store a value where it names it.
+/// See [`rudb_vector::TextSource::placed`].
 fn settle_swept(
     states: &mut [Accumulator],
     dictionary: &Vector,
     wanted: &[(usize, u32, usize)],
 ) -> Result<()> {
+    let mut wanted = wanted
+        .iter()
+        .map(|&(_, code, slot)| Ok((dictionary.placed_text(code as usize)?, slot)))
+        .collect::<Result<Vec<_>>>()?;
+    wanted.sort_unstable();
     let mut at = 0;
     let mut found: Vec<(usize, Value)> = Vec::new();
     while at < wanted.len() {
-        let first = wanted[at].1 as usize;
+        let first = wanted[at].0;
         let mut cursor = at;
+        let mut place = first;
         found.clear();
-        dictionary.sweep_text(first, dictionary.len(), &mut |index: usize, text: &[u8]| {
-            while cursor < wanted.len() && wanted[cursor].1 as usize == index {
-                found.push((wanted[cursor].2, dictionary.value_of(text)));
+        dictionary.sweep_text(first, dictionary.len(), &mut |_index: usize, text: &[u8]| {
+            while cursor < wanted.len() && wanted[cursor].0 == place {
+                found.push((wanted[cursor].1, dictionary.value_of(text)));
                 cursor += 1;
             }
+            place += 1;
             Ok(())
         })?;
         if cursor <= at {
             return Err(Error::internal(
-                "a dictionary sweep passed the code it began at".to_string(),
+                "a dictionary sweep passed the value it began at".to_string(),
             ));
         }
         for (slot, value) in found.drain(..) {

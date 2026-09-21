@@ -58,7 +58,7 @@ pub use zones::{Stripes, distincts};
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
-const FORMAT: u32 = 22;
+const FORMAT: u32 = 23;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -549,6 +549,10 @@ impl GlobalDictionary {
     /// stripe's codes close together because the data is clustered. This is what puts the values
     /// back in order for anything that needs it, and it is separate from the codes so that getting
     /// it costs a sort of the distinct values at the end rather than a rewrite of every code page.
+    ///
+    /// The payload is written in this order rather than in code order, which is a different thing
+    /// and costs nothing extra, because the encoder reads the values wherever they are. See
+    /// [`encode_payload`].
     ///
     /// The sort compares the first eight bytes as one integer before it compares the values, which
     /// settles almost every pair without touching the payload. Padding with zero on the right is
@@ -1641,9 +1645,9 @@ struct NativeText {
     /// The sorted order turned round, built the first time a reader asks for it.
     ///
     /// Four bytes per value against the four the offsets already hold, so a column that has this is
-    /// carrying half again what it carried before rather than something of a new order. It is built
-    /// only when something asks, which is a grouped min or max over this column and nothing else,
-    /// and that reader was going to read the payload of this column once per row otherwise.
+    /// carrying half again what it carried before rather than something of a new order. Since the
+    /// payload is placed by rank it is what turns a code into a place, so the first value read out
+    /// of a column builds it, and building it reads the order blocks and none of the payload.
     code_ranks: OnceLock<Option<Vec<u32>>>,
     payload: u64,
     /// Where each block of the payload ends in the file, as a byte offset from `payload`. The
@@ -1693,7 +1697,7 @@ const TEXT_SEARCH_MEMO: usize = 64;
 /// The block is the unit the string cascade encodes, the unit a checksum covers, and the unit a
 /// reader has to decode to get at a single value, so it is the one number the payload format turns
 /// on. Blocking by values rather than by bytes is what keeps a value out of two blocks at once: the
-/// block holding a code is `code / TEXT_PAYLOAD_VALUES` and nothing has to be stitched.
+/// block holding a rank is `rank / TEXT_PAYLOAD_VALUES` and nothing has to be stitched.
 ///
 /// A probe on the five ClickBench columns that have a dictionary worth the name, written up on
 /// #347, measured the ratio and the decode speed at 128, 256, 512, 1,024 and 4,096 values. Both get
@@ -1767,6 +1771,75 @@ const TEXT_RANK_BLOCK: usize = 512;
 const RANK_BLOCK_HEADER: usize = size_of::<u64>() + 1;
 
 impl NativeText {
+    /// Where the value with `code` sits in the payload, which is its rank.
+    ///
+    /// The payload is laid out in rank order for the reasons [`encode_payload`] gives, so a reader
+    /// holding a code turns it round here first. The map is the sorted order inverted, built once
+    /// per column by `code_ranks` the first time anything asks, which reads the order blocks and
+    /// nothing of the payload.
+    ///
+    /// A dictionary with no order cannot answer, and the file format has not written one without an
+    /// order since 23. Before that the payload was in code order and this question did not arise.
+    fn placed_at(&self, code: usize) -> Result<usize> {
+        let ranks = self
+            .code_ranks()
+            .ok_or_else(|| invalid("global dictionary payload has no order to be placed by"))?;
+        let rank =
+            *ranks.get(code).ok_or_else(|| invalid("global dictionary code is past its values"))?;
+        Ok(rank as usize)
+    }
+
+    /// The bytes of the value stored at `place`, which is a position in the payload and so a rank.
+    ///
+    /// What [`TextSource::bytes_at`] does once it has turned a code into a place, and the whole of
+    /// what a search does, since a search already holds a rank and has nothing to turn round.
+    fn bytes_at_place(&self, place: usize) -> Result<Option<&[u8]>> {
+        if place >= self.values {
+            return Ok(None);
+        }
+        let (start, end) = self.span_within(place)?;
+        if start == end {
+            return Ok(Some(&[]));
+        }
+        // A block holds a fixed number of values rather than a fixed number of bytes, so the value
+        // is in one block and the offsets already say where in it.
+        let Some(bytes) = self.payload_block(place / TEXT_PAYLOAD_VALUES)? else {
+            return Ok(None);
+        };
+        Ok(bytes.get(start as usize..end as usize))
+    }
+
+    /// The codes of the values stored at `first..last`, read out of the sorted order.
+    ///
+    /// A sweep hands its caller the position of each value and walks the payload, so it needs the
+    /// order the way a search needs it rather than the way a point read needs it. A block at a time
+    /// rather than a rank at a time, for the reason `code_ranks` gives: reading it per rank pays for
+    /// the bounds check, the division and the lock on every one of them.
+    fn codes_at(&self, first: usize, last: usize) -> Result<Vec<u32>> {
+        let mut codes = Vec::with_capacity(last.saturating_sub(first));
+        let mut at = first;
+        while at < last {
+            let block = at / TEXT_RANK_BLOCK;
+            let stop = ((block + 1) * TEXT_RANK_BLOCK).min(last);
+            let (bytes, _) = self.rank_parts(at)?;
+            let held = self.rank_block_len(at);
+            let packed = self.rank_codes(bytes, held)?;
+            let whole = bitpack::unpack_tail(packed, self.code_bits, held)
+                .map_err(|_| invalid("global dictionary rank block is short of codes"))?;
+            let within = whole
+                .get(at - block * TEXT_RANK_BLOCK..stop - block * TEXT_RANK_BLOCK)
+                .ok_or_else(|| invalid("global dictionary rank block is short of codes"))?;
+            for &code in within {
+                let code = u32::try_from(code).ok().filter(|code| (*code as usize) < self.values);
+                codes.push(code.ok_or_else(|| {
+                    invalid("global dictionary order names a code it does not have")
+                })?);
+            }
+            at = stop;
+        }
+        Ok(codes)
+    }
+
     /// One block of the payload, read and decoded the first time anything asks for a value in it.
     ///
     /// The bytes handed back are the values of the block laid end to end, which is what the offsets
@@ -2018,26 +2091,22 @@ impl TextSource for NativeText {
         self.values
     }
 
+    fn placed(&self, index: usize) -> Result<usize> {
+        self.placed_at(index)
+    }
+
     fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
         if index >= self.values {
             return Ok(None);
         }
-        let (start, end) = self.span_within(index)?;
-        if start == end {
-            return Ok(Some(&[]));
-        }
-        // A block holds a fixed number of values rather than a fixed number of bytes, so the value
-        // is in one block and the offsets already say where in it.
-        let block = index / TEXT_PAYLOAD_VALUES;
-        let Some(bytes) = self.payload_block(block)? else { return Ok(None) };
-        Ok(bytes.get(start as usize..end as usize))
+        self.bytes_at_place(self.placed_at(index)?)
     }
 
     fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
         if index >= self.values {
             return Ok(None);
         }
-        let (start, end) = self.span_within(index)?;
+        let (start, end) = self.span_within(self.placed_at(index)?)?;
         Ok(Some((end - start) as usize))
     }
 
@@ -2084,16 +2153,17 @@ impl TextSource for NativeText {
         if ends.len() != last - first {
             return Err(invalid("global dictionary offsets are short"));
         }
+        let codes = self.codes_at(first, last)?;
         let mut start = u64::from(self.start_within(first)?);
         // row at a time: the caller is handed one value after another, and what it does with one is
         // its own business, so there is no shape here for anything but a walk.
-        for (index, &end) in (first..last).zip(&ends) {
+        for (&code, &end) in codes.iter().zip(&ends) {
             let value = usize::try_from(start)
                 .ok()
                 .zip(usize::try_from(end).ok())
                 .and_then(|(from, to)| bytes.get(from..to))
                 .ok_or_else(|| invalid("global dictionary value is past its block"))?;
-            body(index, value)?;
+            body(code as usize, value)?;
             start = end;
         }
         Ok(last)
@@ -2131,10 +2201,11 @@ impl TextSource for NativeText {
         if settled != Ordering::Equal {
             return Ok(settled);
         }
-        let code = self.code_at_rank(rank)?;
+        // The payload is placed by rank, so the probe reads the value where it stands rather than
+        // finding out which code holds it first.
         let bytes = self
-            .bytes_at(code as usize)?
-            .ok_or_else(|| invalid("global dictionary order names a code it does not have"))?;
+            .bytes_at_place(rank)?
+            .ok_or_else(|| invalid("global dictionary order names a rank it does not have"))?;
         Ok(bytes.cmp(wanted))
     }
 
@@ -5055,13 +5126,14 @@ fn encode_global_dictionary(
         return Err(invalid("global dictionary order does not cover its values"));
     }
     let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
-    let payload = encode_payload(&dictionary)?;
+    let placed = placed_offsets(&dictionary, order)?;
+    let payload = encode_payload(&dictionary, order)?;
     if payload.len() != blocks {
         return Err(invalid("global dictionary payload is not the blocks it says it is"));
     }
     let (ranks, rank_ends) = encode_ranks(order, code_width(values))?;
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
-    let offset_bits = offset_width(&dictionary.offsets);
+    let offset_bits = offset_width(&placed);
     let mut index = Vec::with_capacity(
         DICTIONARY_HEADER + offset_bytes(values, offset_bits) + (blocks + rank_blocks) * 16,
     );
@@ -5075,7 +5147,7 @@ fn encode_global_dictionary(
         u32::try_from(blocks).map_err(|_| invalid("global dictionary has too many blocks"))?,
     );
     put_u32(&mut index, offset_bits as u32);
-    encode_offsets(&dictionary.offsets, offset_bits, &mut index)?;
+    encode_offsets(&placed, offset_bits, &mut index)?;
     // Where each block ends, so a reader can find one. The stored blocks are shorter than the
     // decoded ones and by a different amount each, so this is the one thing the offsets above no
     // longer say.
@@ -5110,8 +5182,7 @@ fn encode_global_dictionary(
 ///
 /// Eight blocks is 8,192 values, which is the sample `chooser::Sampled` draws and is that size for
 /// the same reason. They are spread across the dictionary rather than taken off the front, because
-/// a dictionary is in the order values were first seen and the front of it is the first morsel of
-/// the load.
+/// the payload is in value order and the front of it is the short values and the empty string.
 const PAYLOAD_SAMPLE_BLOCKS: usize = 8;
 
 /// The shapes the payload encoder picks between.
@@ -5153,23 +5224,57 @@ fn payload_shapes() -> Vec<chooser::Settled> {
     .collect()
 }
 
-/// The payload as encoded blocks of [`TEXT_PAYLOAD_VALUES`] values each.
+/// Where each value ends inside the payload once the payload is laid out in rank order.
+///
+/// The writer builds a value's bytes where it first meets the value, so what it is holding when the
+/// file is committed is in code order. The file is not. See [`encode_payload`] for why, and note
+/// that this is the only rewriting the reordering costs: the bytes are copied in rank order by the
+/// encoder as it reads them, and the codes in the pages are left exactly as they were written.
+fn placed_offsets(dictionary: &GlobalDictionary, order: &[(u64, u32)]) -> Result<Vec<u32>> {
+    let mut offsets = Vec::with_capacity(order.len() + 1);
+    let mut at = 0_u32;
+    offsets.push(at);
+    for &(_, code) in order {
+        let bytes = dictionary
+            .bytes(code)
+            .ok_or_else(|| invalid("global dictionary order names a code it does not have"))?;
+        at = u32::try_from(bytes.len())
+            .ok()
+            .and_then(|len| at.checked_add(len))
+            .ok_or_else(|| invalid("global dictionary payload exceeds 4 GiB"))?;
+        offsets.push(at);
+    }
+    Ok(offsets)
+}
+
+/// The payload as encoded blocks of [`TEXT_PAYLOAD_VALUES`] values each, in rank order.
+///
+/// Rank order rather than code order, which is the order the writer built the values in. Two things
+/// come of it and they pull the same way. The first is that everything which reads a file backed
+/// dictionary quickly reads it by rank: a binary search for a literal, a top N holding the ten
+/// smallest values of a column, a min or a max, a range filter. All of them used to walk the sorted
+/// order and then scatter across a payload laid out in the order values were first seen, which for
+/// a hundred thousand values in blocks of a thousand meant decoding most of the dictionary to read a
+/// few dozen values out of it. In rank order the values those readers want are next to each other.
+/// The second is that sorting is what front coding wants: neighbouring values now share prefixes,
+/// which is the difference between a shape that has something to look back at and one that does not.
+///
+/// What it costs is a lookup per value read, since a reader holds a code and the payload is placed
+/// by rank, and that is [`NativeText::placed_at`]. It does not cost a rewrite of the code pages,
+/// which is the thing the writer cannot afford, because the codes still mean what they meant.
 ///
 /// Across threads because this is the only part of committing a file that is real work rather than
 /// bookkeeping. The blocks are the same size and cost about the same, so an index each is enough of
 /// a queue and there is nothing to weight the way the numeric synopses are weighted.
-fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
-    let values = dictionary.offsets.len() - 1;
+fn encode_payload(dictionary: &GlobalDictionary, order: &[(u64, u32)]) -> Result<Vec<Vec<u8>>> {
+    let values = order.len();
     let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
     let run = |block: usize| {
         let first = block * TEXT_PAYLOAD_VALUES;
         let last = (first + TEXT_PAYLOAD_VALUES).min(values);
-        (first..last)
-            .map(|value| {
-                let from = dictionary.offsets[value] as usize;
-                let to = dictionary.offsets[value + 1] as usize;
-                &dictionary.payload[from..to]
-            })
+        order[first..last]
+            .iter()
+            .map(|&(_, code)| dictionary.bytes(code).unwrap_or_default())
             .collect::<Vec<_>>()
     };
     // A dictionary small enough to be the sample is small enough to search in full, and searching
@@ -5223,8 +5328,8 @@ fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
 /// Every shape is encoded over the same sample and the smallest wins, which is the exhaustive
 /// search moved up a level: over shapes of a column rather than over candidates of a chunk. The
 /// sample is spread across the dictionary so that the first and last blocks are both in it, because
-/// a dictionary written in first seen order has its common values at the front and its long tail at
-/// the back, and those do not compress alike.
+/// a payload written in value order has the empty string and the short values at the front and the
+/// long tail at the back, and those do not compress alike.
 fn settle_shape<'a>(
     run: &dyn Fn(usize) -> Vec<&'a [u8]>,
     blocks: usize,
@@ -7095,7 +7200,84 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
-        assert_eq!(dictionary.footprint(), after, "a point read of a kept block decodes nothing");
+        // The footprint after the point reads rather than after the sweep, because the first point
+        // read also builds the map from a code to where the payload places it, which is a one off
+        // and is not a block of anything.
+        let settled = dictionary.footprint();
+        let again = (0..dictionary.len())
+            .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(again, read, "a second point read answers the same");
+        assert_eq!(dictionary.footprint(), settled, "a point read of a kept block decodes nothing");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The payload sits in value order however the values arrived, and a code still reads its own
+    /// value.
+    ///
+    /// The two halves of the change in format 23. A reader holding a code has to be turned round
+    /// before it can find the bytes, and a reader walking the payload gets the values in sorted
+    /// order and has to be told which code each one belongs to. The values here arrive backwards, so
+    /// a rank is the opposite of a code and anything that reads one for the other is wrong on every
+    /// value rather than on one of them.
+    #[test]
+    fn a_dictionary_places_its_payload_in_value_order() {
+        let path = path("dictionary-placed");
+        let spellings = (0..2_500)
+            .rev()
+            .map(|index| Value::Varchar(format!("value {index:08}")))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        let read = (0..dictionary.len())
+            .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
+            .collect::<Vec<_>>();
+        let arrived = spellings
+            .iter()
+            .map(|value| match value {
+                Value::Varchar(text) => text.as_bytes().to_vec(),
+                _ => unreachable!("every value is a string"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(read, arrived, "a code still names the value it was handed out for");
+
+        let mut swept: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut at = 0;
+        while at < dictionary.len() {
+            at = dictionary
+                .sweep_text(at, dictionary.len(), &mut |index: usize, text: &[u8]| {
+                    swept.push((index, text.to_vec()));
+                    Ok(())
+                })
+                .expect("a sweep reads");
+        }
+        let mut sorted = arrived.clone();
+        sorted.sort_unstable();
+        let values = swept.iter().map(|(_, text)| text.clone()).collect::<Vec<_>>();
+        assert_eq!(values, sorted, "a sweep walks the payload and the payload is in value order");
+        for (index, text) in &swept {
+            assert_eq!(&read[*index], text, "a sweep says which code it is handing over");
+        }
+        assert_eq!(dictionary.ranks(), Some(spellings.len()), "every value has a rank");
+        for (rank, text) in sorted.iter().enumerate() {
+            let code = dictionary.code_at_rank(rank).expect("a rank names a code");
+            assert_eq!(&read[code as usize], text, "the order and the payload agree");
+        }
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -7241,6 +7423,9 @@ mod tests {
     /// budget of zero. That is the shape of the hundred million row case: `URL` fills the budget
     /// somewhere in the middle of itself and everything past that point is read and dropped, which
     /// costs the decode again and holds none of it.
+    ///
+    /// A `starved` dictionary is opened by hand rather than through the reader, so the dictionary
+    /// the point reads go through below is a second one over the same page.
     #[test]
     fn a_dictionary_at_its_budget_sweeps_without_keeping() {
         let path = path("dictionary-budget");
@@ -7268,19 +7453,28 @@ mod tests {
         let starved = open_global_dictionary(file, page, &LogicalType::Varchar, 0)
             .expect("a dictionary opens whatever it may keep");
 
-        let resting = starved.footprint();
-        let mut swept: Vec<Vec<u8>> = Vec::new();
-        let mut at = 0;
-        while at < starved.len() {
-            at = starved
-                .sweep_text(at, starved.len(), &mut |_index: usize, text: &[u8]| {
-                    swept.push(text.to_vec());
-                    Ok(())
-                })
-                .expect("a sweep reads");
-        }
+        let sweep = || {
+            let mut swept: Vec<Vec<u8>> = Vec::new();
+            let mut at = 0;
+            while at < starved.len() {
+                at = starved
+                    .sweep_text(at, starved.len(), &mut |_index: usize, text: &[u8]| {
+                        swept.push(text.to_vec());
+                        Ok(())
+                    })
+                    .expect("a sweep reads");
+            }
+            swept
+        };
+        // Twice, and the footprint is compared between the two rather than against the dictionary
+        // as it opened. A sweep reads the order to say which value it is handing over, and the
+        // order it reads is kept, so the first sweep grows the footprint by something that is not a
+        // payload block and the second one is the honest measure of what a sweep holds on to.
+        let swept = sweep();
+        let warmed = starved.footprint();
+        assert_eq!(sweep(), swept, "a starved sweep answers the same twice");
         assert_eq!(swept.len(), spellings.len(), "a starved sweep still reads every value");
-        assert_eq!(starved.footprint(), resting, "and keeps no block it decoded");
+        assert_eq!(starved.footprint(), warmed, "and keeps no block it decoded");
 
         let generous = reader.dictionary(0).expect("read").expect("a string column has one");
         let read = (0..generous.len())

@@ -501,7 +501,32 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
         Ok(self.bytes_at(index)?.map(<[u8]>::len))
     }
-    /// Hands `body` the values from `first` up to at most `limit`, and answers where it stopped.
+    /// Where the value at `index` sits in the order this source stores its values in.
+    ///
+    /// A source is free to keep its values in an order that has nothing to do with the positions it
+    /// hands them out at. The one that does is a file backed global dictionary, whose codes are
+    /// handed out as values are first seen, because the writer has to name a value the moment it
+    /// meets it, and whose payload is laid out in sorted order, because everything that reads such a
+    /// dictionary quickly reads it by rank and a reader that scatters across a compressed payload
+    /// decodes a block to get at every value.
+    ///
+    /// What this is for is [`sweep`](Self::sweep), whose range is a range of places rather than of
+    /// positions, so that a caller walking a stretch of values walks a stretch of the payload. The
+    /// default is the identity, which is the truth for every source that keeps its values in the
+    /// order it names them.
+    ///
+    /// The answer is below [`len`](Self::len) for an `index` that is, and each place belongs to one
+    /// index, so this is a permutation and a caller may treat it as one.
+    fn placed(&self, index: usize) -> Result<usize> {
+        Ok(index)
+    }
+    /// Hands `body` the values stored at the places from `first` up to at most `limit`, and answers
+    /// where it stopped.
+    ///
+    /// The range is in places, which is [`placed`](Self::placed), and what `body` is handed is the
+    /// position of the value rather than its place, since a caller keeping something per value keeps
+    /// it under the position it will ask by. The two are the same for every source that does not
+    /// say otherwise.
     ///
     /// The point of it is what it does not do, which is keep what it read.
     /// [`bytes_at`](Self::bytes_at) hands back a borrow, so a source that decodes a block to answer
@@ -2008,9 +2033,12 @@ impl Vector {
     /// caller come back. The answer is one past the last value visited either way, so the loop that
     /// calls this is the same loop whichever form it got.
     ///
-    /// Nulls go the slow way. A source that reads a file holds no validity of its own, so the
-    /// vector's own mask is the only thing that knows, and rather than teach the sweep about it the
-    /// one form that can have both hands over a value at a time through the reader that checks.
+    /// A source that reads a file holds no validity of its own, so the vector's own mask is the
+    /// only thing that knows, and a null position is handed over as no bytes, which is what asking
+    /// for it one at a time used to give.
+    ///
+    /// The range is in places, for the reason [`TextSource::placed`] gives, and every form but the
+    /// external one places a value where it names it.
     ///
     /// # Errors
     ///
@@ -2029,9 +2057,29 @@ impl Vector {
             if matches!(self.validity, Validity::AllValid) {
                 return source.sweep(first, limit, body);
             }
+            let validity = &self.validity;
+            return source.sweep(first, limit, &mut |index, text| {
+                body(index, if validity.is_valid(index) { text } else { &[] })
+            });
         }
         body(first, self.try_bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
+    }
+
+    /// Where the value at `index` sits in the order whatever holds it stores its values in.
+    ///
+    /// See [`TextSource::placed`]. Only a vector reading text out of storage can place a value
+    /// anywhere but where it names it, and this is what a caller of [`Self::sweep_text`] turns a
+    /// position into before it asks for a stretch around it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source raises when it cannot place the value.
+    pub fn placed_text(&self, index: usize) -> Result<usize> {
+        match &self.body {
+            Body::ExternalText { source } => source.placed(index),
+            _ => Ok(index),
+        }
     }
 
     /// Variable length byte count at `index`, preserving storage failures.

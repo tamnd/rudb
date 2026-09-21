@@ -1498,10 +1498,14 @@ impl StableLike {
     /// block over for the length of the call and drops it, so what is left behind is the two bits a
     /// value written here.
     ///
-    /// The answers go into a buffer and are written a word at a time at the end rather than as they
-    /// are decided, because a sweep may hand over less than a group at a time and the buffer is 256
-    /// bytes. Nothing reads a bit before it is written, since a thread that finds the value
-    /// undecided walks it itself.
+    /// The answers go into a buffer and are written at the end rather than as they are decided,
+    /// because a sweep may hand over less than a group at a time. Nothing reads a bit before it is
+    /// written, since a thread that finds the value undecided walks it itself.
+    ///
+    /// The group is a run of the dictionary in the order it stores its values, which for a file
+    /// backed dictionary is not the order of the codes, so the memo slots a group writes are spread
+    /// across it. That is the right way round: the walk is what costs, because it decodes a block,
+    /// and the row loop reads a slot once a row and must not pay a lookup to find it.
     ///
     /// Two threads landing on the same group now decode the same block twice where one used to
     /// decode it and the other wait on the lock behind it. That is the trade and it is a good one:
@@ -1509,16 +1513,15 @@ impl StableLike {
     /// the collision is rare, and what it costs when it happens is one block decoded twice rather
     /// than every block kept for the length of the query.
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
-        let first = code / LIKE_GROUP * LIKE_GROUP;
+        let place = self.dictionary.placed_text(code)?;
+        let first = place / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
-        let mut bits = [0_u64; LIKE_GROUP / MEMO_VALUES];
+        let mut decided: Vec<(usize, bool)> = Vec::with_capacity(last - first);
         let mut at = first;
         while at < last {
             let stopped =
                 self.dictionary.sweep_text(at, last, &mut |index: usize, text: &[u8]| {
-                    let held = like.holds_loan(text, characters)?;
-                    let (word, shift) = Self::slot(index - first);
-                    bits[word] |= (1 | u64::from(held) << 1) << shift;
+                    decided.push((index, like.holds_loan(text, characters)?));
                     Ok(())
                 })?;
             if stopped <= at {
@@ -1526,8 +1529,9 @@ impl StableLike {
             }
             at = stopped;
         }
-        for (step, word) in bits.iter().take((last - first).div_ceil(MEMO_VALUES)).enumerate() {
-            self.word(first / MEMO_VALUES + step)?.fetch_or(*word, Ordering::Release);
+        for (decided, held) in decided {
+            let (index, shift) = Self::slot(decided);
+            self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
         }
         Ok(())
     }
