@@ -2519,6 +2519,9 @@ impl Vector {
         if let Body::Flat(_) = self.body {
             return Ok(self);
         }
+        // flatten: the caller asked for flat, and the form that is already flat took the branch
+        // above, so this is the one case where the copy is what was wanted rather than a shortcut
+        // somebody took instead of reading the column where it lies.
         self.flatten()
     }
 
