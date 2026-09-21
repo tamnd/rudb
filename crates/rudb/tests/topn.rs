@@ -184,6 +184,29 @@ fn a_limit_past_the_end_of_the_file() {
     agree("t ASC NULLS LAST", 5000, 0);
 }
 
+/// An offset past the end of the file, where every row the operator kept is skipped and the answer
+/// is empty. The offset is what decides how many rows are put in order at the close, so an offset
+/// with nothing behind it is the one place that ordering has nothing to work on.
+#[test]
+fn an_offset_past_the_end_of_the_file() {
+    agree("t ASC NULLS LAST", 10, 5000);
+    agree("s ASC NULLS FIRST", 10, 4096);
+    agree("a DESC NULLS LAST, b ASC NULLS LAST", 10, 4090);
+}
+
+/// Ties that no key breaks, at a bound the batched path takes and with an offset over them.
+///
+/// The close puts only the rows the offset asks for in order and leaves the rest where they fell,
+/// so a tie that is broken by the order the rows arrived in has to survive a pass that does not
+/// keep equal rows where it found them. It does, because arrival is unique per row and no two
+/// candidates ever compare equal, but this is the shape that would show it if it did not.
+#[test]
+fn ties_under_an_offset_on_the_batched_path() {
+    agree("flag ASC NULLS LAST", 10, 1000);
+    agree("a DESC NULLS LAST", 10, 2000);
+    agree("d ASC NULLS LAST", 20, 500);
+}
+
 /// A key that is not a column, which the filter reads out of the vector the expression produced the
 /// same way it reads one that is.
 #[test]
