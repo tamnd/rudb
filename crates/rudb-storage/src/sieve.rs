@@ -418,6 +418,29 @@ impl Blocked {
         lanes(hash).iter().all(|&bit| self.words[block + bit / 64] & (1 << (bit % 64)) != 0)
     }
 
+    /// The same answer for a run of hashes at once, which is where a scan's time in here goes.
+    ///
+    /// [`Self::holds`] is one trip to memory and a branch, and a fact table probing a filter built
+    /// over a dimension table's keys does that per row against a filter far too large to sit in the
+    /// cache. Every row is independent of every other, so asking about a run of them lets the core
+    /// have several of those trips outstanding at once instead of waiting out each one in turn, and
+    /// answering into a flag rather than out of the function means the walk does not branch on what
+    /// it finds. The four bits of one hash are all inside one block, so the row costs one line and
+    /// the three loads after the first are already there.
+    ///
+    /// `into` is the caller's buffer and is cleared here.
+    pub fn holds_run(&self, hashes: &[u64], into: &mut Vec<bool>) {
+        into.clear();
+        into.extend(hashes.iter().map(|&hash| {
+            let block = self.block(hash);
+            let mut held = true;
+            for bit in lanes(hash) {
+                held &= self.words[block + bit / 64] & (1 << (bit % 64)) != 0;
+            }
+            held
+        }));
+    }
+
     /// Sets every bit `hash` names.
     pub fn add(&mut self, hash: u64) {
         let block = self.block(hash);
@@ -673,7 +696,7 @@ mod tests {
 
     use rudb_vector::Chunk;
 
-    use super::{BLOCK_WORDS, Counter, Sieve, hash_int};
+    use super::{BLOCK_WORDS, Blocked, Counter, Sieve, hash_int};
     use crate::zone::Zone;
 
     /// The sieve of a one column chunk holding `values`, with a generous budget.
@@ -728,6 +751,33 @@ mod tests {
         let absent = (0..1024_i64).map(|n| i128::from(n.wrapping_mul(982_451_653)) + 1);
         let kept = absent.filter(|number| !sieve.excludes(&int(*number))).count();
         assert!(kept * 20 < 1024, "a filter kept {kept} of 1024 values it never saw");
+    }
+
+    /// The invariant the scan rests on. It asks about a whole chunk at once and everything else in
+    /// the tree asks about one value, and a filter that answered those two differently would drop
+    /// rows that match or keep rows that cannot.
+    #[test]
+    fn a_run_of_hashes_is_answered_the_way_each_of_them_is_answered_alone() {
+        let mut filter = Blocked::sized(512, 4096).expect("a filter with room for those");
+        for n in 0..512_u64 {
+            filter.add(n.wrapping_mul(982_451_653));
+        }
+        // Half of these were put in and half were not, so the run covers both answers rather than
+        // agreeing with itself on one of them.
+        let asked: Vec<u64> =
+            (0..1024_u64).map(|n| n.wrapping_mul(982_451_653).wrapping_add(n % 2)).collect();
+        let mut held = Vec::new();
+        filter.holds_run(&asked, &mut held);
+        assert_eq!(held.len(), asked.len());
+        for (at, &hash) in asked.iter().enumerate() {
+            assert_eq!(held[at], filter.holds(hash), "hash {hash} at {at}");
+        }
+        // And the buffer is the caller's, so a second run over fewer hashes leaves nothing of the
+        // first behind.
+        filter.holds_run(&asked[..3], &mut held);
+        assert_eq!(held.len(), 3);
+        filter.holds_run(&[], &mut held);
+        assert!(held.is_empty());
     }
 
     #[test]
