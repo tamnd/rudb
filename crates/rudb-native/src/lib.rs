@@ -5677,7 +5677,7 @@ mod tests {
 
     use rudb_common::Stat;
     use rudb_common::Value;
-    use rudb_common::bounds::{Frequencies, Op};
+    use rudb_common::bounds::{Frequencies, Op, Zones};
     use rudb_common::stat::Provenance;
 
     use super::*;
@@ -5833,6 +5833,41 @@ mod tests {
                 .expect("integers"),
         ])
         .expect("one column")
+    }
+
+    #[test]
+    fn the_planner_gets_the_null_count_off_the_same_directory_the_bounds_are_in() {
+        // Six rows, two of them null. `IS NULL` used to get the same fifth any unreadable
+        // condition gets, and the number was in the stripe entry next to the bounds all along.
+        let path = path("nulls_for_the_planner");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("a", LogicalType::Integer)])
+                .expect("new file");
+        let rows = Chunk::new(vec![
+            Vector::from_values(
+                LogicalType::Integer,
+                &[
+                    Value::Integer(4),
+                    Value::Null,
+                    Value::Integer(9),
+                    Value::Null,
+                    Value::Integer(1),
+                    Value::Integer(2),
+                ],
+            )
+            .expect("integers"),
+        ])
+        .expect("one column");
+        writer.append(&rows).expect("the only part");
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let stripes = Stripes::new(reader);
+        let column = stripes.column("a").expect("the file has that column");
+        assert_eq!(stripes.nulls(column), Stat::exact(2, Provenance::NullCount));
+        // A column the file does not have. Zero here would be a fact about a column that is not
+        // there, which the planner would then divide by.
+        assert_eq!(stripes.nulls(column + 1), Stat::Unknown);
+        fs::remove_file(&path).expect("clean up");
     }
 
     #[test]

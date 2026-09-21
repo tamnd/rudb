@@ -122,6 +122,26 @@ impl Zones for Footer {
             .then(|| Spread { fraction: (passing / whole).clamp(0.0, 1.0), read })
     }
 
+    fn nulls(&self, column: usize) -> Stat<u64> {
+        let mut total: u64 = 0;
+        for group in &self.metadata.row_groups {
+            // A group that says nothing about the column gives up the whole answer rather than
+            // being left out of the sum. A writer is free to state statistics for a column in one
+            // group and not the next, and summing the ones that did would report a number about
+            // part of the file under the name of all of it.
+            let Some(chunk) = group.columns.iter().find(|chunk| chunk.column == column) else {
+                return Stat::Unknown;
+            };
+            let Some(nulls) = chunk.stats.as_ref().and_then(|stats| stats.nulls) else {
+                return Stat::Unknown;
+            };
+            let Ok(nulls) = u64::try_from(nulls) else { return Stat::Unknown };
+            let Some(sum) = total.checked_add(nulls) else { return Stat::Unknown };
+            total = sum;
+        }
+        Stat::exact(total, Provenance::NullCount)
+    }
+
     fn extreme(&self, column: usize, end: End) -> Stat<Bound> {
         let Some(schema) = self.metadata.schema.get(column) else { return Stat::Unknown };
         let mut folded: Option<Bound> = None;
@@ -303,7 +323,9 @@ mod tests {
     use std::sync::Arc;
 
     use rudb_common::LogicalType;
+    use rudb_common::Stat;
     use rudb_common::bounds::{MICROS, Zones};
+    use rudb_common::stat::Provenance;
 
     use super::{Bound, Footer, Op, Test, read_bound, skips};
     use crate::metadata::{
@@ -448,6 +470,31 @@ mod tests {
             row_groups: groups,
             created_by: None,
         }))
+    }
+
+    /// The same group with its null count set to whatever the caller wants, or to nothing at all.
+    fn nulling(nulls: Option<i64>) -> RowGroup {
+        let mut group = group(Some(1), Some(10));
+        group.columns[0].stats.as_mut().expect("the helper states stats").nulls = nulls;
+        group
+    }
+
+    #[test]
+    fn the_null_count_of_a_column_is_the_groups_summed() {
+        let footer = footer(vec![nulling(Some(3)), nulling(Some(4))]);
+        assert_eq!(footer.nulls(0), Stat::exact(7, Provenance::NullCount));
+        // A column the file does not have. Answering zero here would say a column nothing wrote
+        // has no nulls, which is a fact about a column that is not there.
+        assert_eq!(footer.nulls(1), Stat::Unknown);
+    }
+
+    #[test]
+    fn a_group_that_states_no_null_count_gives_up_the_whole_sum() {
+        // A writer is free to state statistics for a column in one group and not the next. Summing
+        // the ones that did would report a number about part of the file under the name of all of
+        // it, and for `IS NOT NULL` that is a count above the truth.
+        let footer = footer(vec![nulling(Some(3)), nulling(None)]);
+        assert_eq!(footer.nulls(0), Stat::Unknown);
     }
 
     #[test]

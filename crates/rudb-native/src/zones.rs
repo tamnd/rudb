@@ -107,6 +107,15 @@ impl Zones for Stripes {
             .then(|| Spread { fraction: (passing / whole).clamp(0.0, 1.0), read })
     }
 
+    fn nulls(&self, column: usize) -> Stat<u64> {
+        // Every stripe of a native file states its null count, so this is exact or the column is
+        // not there. A reader that cannot answer its own directory fails the scan a moment later
+        // with the same error, and the planner is not the place to raise it.
+        self.reader
+            .null_count(column)
+            .map_or(Stat::Unknown, |nulls| Stat::exact(nulls, Provenance::NullCount))
+    }
+
     fn extreme(&self, column: usize, end: End) -> Stat<Bound> {
         // The reader folds the stripes itself and answers only where every one of them wrote a
         // bound its writer called exact, which is the same promise this has to make. A column whose

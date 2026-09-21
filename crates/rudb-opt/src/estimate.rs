@@ -37,6 +37,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use rudb_common::Value;
 use rudb_common::bounds::{Op, Spread, Test, Zones};
 use rudb_common::stat::{Class, Direction, Provenance, Stat, Use};
 use rudb_plan::{
@@ -300,6 +301,13 @@ pub const DISTINCT: Use = Use::Decide;
 /// wrong picks a worse plan rather than printing a wrong answer. An exact count read to answer a
 /// query would declare [`Use::Answer`] and go through the class rule, and nothing does that yet.
 const COMMON: Use = Use::Decide;
+
+/// How a null count is read, which is the same [`Use::Decide`] and for the same reason as [`COMMON`].
+///
+/// Exact where it exists, used to pick between plans, so a wrong one costs a worse plan and never a
+/// wrong answer. `COUNT(column)` is the read that would want [`Use::Answer`] and it does not ask
+/// here yet.
+const NULLS: Use = Use::Decide;
 
 /// How many rows this node is guessed to produce, where a guess can be made at all.
 ///
@@ -633,6 +641,10 @@ fn ceiling(stat: Stat<u64>) -> Stat<u64> {
 /// The product over the conditions, with each condition answered by the best supplier that can
 /// answer it and by [`KEPT_BY_A_CONDITION`] where none can.
 ///
+/// `IS NULL` and `IS NOT NULL` are not assumptions either. Every store that keeps bounds per part
+/// keeps the null count beside them, so the answer is a count and its complement is the other one.
+/// That is [`missing`], and it is asked first because it is the cheapest of the three.
+///
 /// An equality against a constant on a column the store counted per value is not an assumption at
 /// all. The synopsis says how many rows hold that value, or lists every value and does not hold it,
 /// and either way the answer is a count. That is [`common`], and it is asked first.
@@ -673,9 +685,11 @@ fn kept(
         // The synopsis first, because where it answers it is a count of the rows that pass and the
         // distinct count is a guess about them. Where it does not, nothing has been spent: it is a
         // lookup in a list the store already has parsed.
-        let answer = common(plan, input, conjunct, reads).or_else(|| {
-            values(plan, conjunct, stats, reads).map(|(v, from)| (1.0 / widened(v), from))
-        });
+        let answer = missing(plan, input, conjunct, reads)
+            .or_else(|| common(plan, input, conjunct, reads))
+            .or_else(|| {
+                values(plan, conjunct, stats, reads).map(|(v, from)| (1.0 / widened(v), from))
+            });
         match answer {
             Some((share, from)) => {
                 fraction *= share;
@@ -758,6 +772,77 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
         _ => vec![predicate],
     };
     parts.into_iter().filter(|&part| !walk::constant(plan, part)).take(8).collect()
+}
+
+/// What fraction of a scan's rows `IS NULL` keeps, where the store counted its nulls.
+///
+/// The one filter whose answer a store can simply state. Every store that keeps bounds per part
+/// keeps the null count beside them, and `IS NULL` used to get the same fifth that any condition
+/// nobody could read gets. On a column with no nulls at all that fifth is out by the whole table,
+/// and on a mostly null column it is out the other way.
+///
+/// `IS NOT NULL` is the complement and comes from the same number, which is the reason both are
+/// here rather than only the first. A column the store says has no nulls makes `IS NOT NULL` the
+/// whole table, and that is worth as much as the other direction: it stops a filter that throws
+/// nothing away from being costed as though it threw four fifths away.
+///
+/// Only against a literal null, which is what `IS NULL` and `IS NOT NULL` bind to. `a IS DISTINCT
+/// FROM b` is a comparison of two columns wearing the same operator and the null count says nothing
+/// about it.
+///
+/// `None` where the filter is not straight on a scan, where the store kept no bounds, where it
+/// states no null count for the column, and where it says it has no rows. All of those fall back to
+/// the constant, which is where this was before.
+fn missing(
+    plan: &Plan,
+    input: NodeRef,
+    conjunct: ExprRef,
+    reads: &mut Vec<Stat<u64>>,
+) -> Option<(f64, Provenance)> {
+    let Expr::Compare { op, left, right } = *plan.expr(conjunct) else {
+        return None;
+    };
+    let wants_null = match op {
+        CompareOp::NotDistinctFrom => true,
+        CompareOp::DistinctFrom => false,
+        _ => return None,
+    };
+    let binding = match (plan.expr(left), plan.expr(right)) {
+        (&Expr::Column(binding), &Expr::Constant(value))
+        | (&Expr::Constant(value), &Expr::Column(binding))
+            if matches!(plan.value(value), Value::Null) =>
+        {
+            binding
+        }
+        _ => return None,
+    };
+    let index = bounds::scanned(plan, input)?;
+    // The column has to belong to the scan this filter sits on. A binding naming anything else is
+    // a column from somewhere below, and the store's null counts are not about it.
+    if binding.table != index {
+        return None;
+    }
+    let zones = plan.zones(index)?;
+    let names = match *plan.node(input) {
+        Node::Get { columns, .. } | Node::TableFunction { columns, .. } => plan.field_list(columns),
+        _ => return None,
+    };
+    let name = &names.get(binding.column as usize)?.name;
+    let column = zones.column(name)?;
+    let stat = zones.nulls(column);
+    // Recorded before it is read and recorded when it is unknown, for the reason [`values`] gives.
+    reads.push(stat);
+    let nulls = stat.read(NULLS).copied()?;
+    // The store's own total and not the plan's, so the fraction is two numbers out of one store.
+    // With no tests at all this is every row the store holds, per `Zones::surviving`.
+    let rows = zones.surviving(&[])?;
+    if rows == 0 {
+        return None;
+    }
+    // Saturating because a null count above the row count is a store contradicting itself, and the
+    // honest reading of that is no rows left rather than a fraction below zero.
+    let held = if wants_null { nulls.min(rows) } else { rows.saturating_sub(nulls) };
+    Some((share(held, rows), Provenance::NullCount))
 }
 
 /// What fraction of a scan's rows an equality keeps, where the store counted that value's rows.
@@ -2100,17 +2185,39 @@ mod tests {
         spread: Option<f64>,
         /// Every test it was asked, so a test can check which column the estimator named.
         asked: Mutex<Vec<Test>>,
+        /// What [`Zones::nulls`] answers, whatever column it is asked about.
+        nulls: Stat<u64>,
     }
 
     impl Stub {
         /// A store that answers the ceiling and refuses to interpolate, which is most of these.
         fn new(surviving: Option<u64>) -> Arc<Self> {
-            Arc::new(Self { surviving, spread: None, asked: Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                surviving,
+                spread: None,
+                asked: Mutex::new(Vec::new()),
+                nulls: Stat::Unknown,
+            })
         }
 
         /// A store that interpolates and states no ceiling, which is the range case.
         fn spreading(spread: f64) -> Arc<Self> {
-            Arc::new(Self { surviving: None, spread: Some(spread), asked: Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                surviving: None,
+                spread: Some(spread),
+                asked: Mutex::new(Vec::new()),
+                nulls: Stat::Unknown,
+            })
+        }
+
+        /// A store of `rows` rows that counted `nulls` of them null, which is the null count case.
+        fn counting(rows: u64, nulls: u64) -> Arc<Self> {
+            Arc::new(Self {
+                surviving: Some(rows),
+                spread: None,
+                asked: Mutex::new(Vec::new()),
+                nulls: Stat::exact(nulls, Provenance::NullCount),
+            })
         }
     }
 
@@ -2135,6 +2242,10 @@ mod tests {
 
         fn extreme(&self, _column: usize, _end: End) -> Stat<Bound> {
             Stat::Unknown
+        }
+
+        fn nulls(&self, _column: usize) -> Stat<u64> {
+            self.nulls
         }
     }
 
@@ -2326,6 +2437,51 @@ mod tests {
         // almost every query still takes and it has to be untouched.
         let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
         assert_eq!(stat(&text, &[("t", 1_000_000)]), Stat::estimated(200_000, Provenance::Default));
+    }
+
+    #[test]
+    fn a_null_test_on_a_column_the_store_counted_takes_the_count_over_the_constant() {
+        // A hundred thousand rows with every tenth one null. The constant calls both of these a
+        // fifth of the table, which is out by half in one direction and by four and a half times
+        // in the other, and the store had the number the whole time.
+        let null = format!(
+            "Filter (#0.0::INTEGER IS NOT DISTINCT FROM NULL::INTEGER)::BOOLEAN\n  {}",
+            bounded_scan()
+        );
+        let counted = Stub::counting(100_000, 10_000);
+        assert_eq!(zoned(&null, 100_000, &counted), Stat::estimated(10_000, Provenance::NullCount));
+        // The complement out of the same number, which is why both are here rather than only the
+        // first. A filter that throws a tenth away used to be costed as throwing four fifths away.
+        let present = format!(
+            "Filter (#0.0::INTEGER IS DISTINCT FROM NULL::INTEGER)::BOOLEAN\n  {}",
+            bounded_scan()
+        );
+        assert_eq!(
+            zoned(&present, 100_000, &counted),
+            Stat::estimated(90_000, Provenance::NullCount)
+        );
+    }
+
+    #[test]
+    fn a_store_that_states_no_null_count_gets_the_constant_it_always_got() {
+        let text = format!(
+            "Filter (#0.0::INTEGER IS NOT DISTINCT FROM NULL::INTEGER)::BOOLEAN\n  {}",
+            bounded_scan()
+        );
+        let quiet = Stub::new(Some(100_000));
+        assert_eq!(zoned(&text, 100_000, &quiet), Stat::estimated(20_000, Provenance::Default));
+    }
+
+    #[test]
+    fn a_distinctness_test_between_two_columns_is_not_a_null_test() {
+        // Same operator, and the null count says nothing at all about it. Reading this as a null
+        // test would answer off a column the condition is not asking about.
+        let text = format!(
+            "Filter (#0.0::INTEGER IS DISTINCT FROM #0.1::INTEGER)::BOOLEAN\n  {}",
+            bounded_scan()
+        );
+        let counted = Stub::counting(100_000, 10_000);
+        assert_eq!(zoned(&text, 100_000, &counted), Stat::estimated(20_000, Provenance::Default));
     }
 
     /// A store that counted how many rows hold each value, from a list fixed when it is built.
