@@ -172,13 +172,13 @@ impl Database {
     /// Opens a database by name.
     ///
     /// `:memory:` and the empty string are an in memory database, which are DuckDB's two spellings
-    /// of it. Anything else names a file, and a file needs a storage format, which is #103. It is an
-    /// error here rather than a silent in memory database, because a program that opened a file and
-    /// wrote to it would be told nothing until it looked for its data again.
+    /// of it. Anything else names a file in rudb's own native format, holding every table of the
+    /// database. A name that does not exist yet is a database with nothing in it, and the file is
+    /// written by `CHECKPOINT`.
     ///
     /// # Errors
     ///
-    /// When the name is a file.
+    /// When the file exists and is not a native database this build can read.
     pub fn open(path: &str) -> Result<Self> {
         Self::open_with(path, Config::default())
     }
@@ -187,7 +187,7 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// When the name is a file.
+    /// When the file exists and is not a native database this build can read.
     pub fn open_with(path: &str, config: Config) -> Result<Self> {
         if path.is_empty() || path == MEMORY {
             return Ok(Self::with_config(config));
@@ -195,7 +195,16 @@ impl Database {
         let path = PathBuf::from(path);
         let mut catalog = Catalog::new();
         if path.exists() {
-            catalog.create_native_table(rudb_native::Reader::open(&path)?)?;
+            // The catalog directory names the tables and the loop below decodes each one's own
+            // directory. That is one decode per table rather than one decode of everything, but it
+            // still happens at open, because the catalog this builds holds a reader per table and a
+            // reader is built from a decoded directory. Deferring the decode to the first query
+            // that touches a table is what the two levels are for and is not done here yet.
+            let native = rudb_native::Catalog::open(&path)?;
+            let names = native.names().map(str::to_string).collect::<Vec<_>>();
+            for name in names {
+                catalog.create_native_table(native.table(&name)?)?;
+            }
         }
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
@@ -400,34 +409,54 @@ impl Database {
     }
 }
 
-/// Writes the one-table catalog as a complete native snapshot and publishes it by rename.
-fn persist(path: &Path, catalog: &Catalog) -> Result<()> {
-    let mut tables = catalog.tables();
-    let table =
-        tables.next().ok_or_else(|| Error::not_implemented("a native database with no table"))?;
-    if tables.next().is_some() {
-        return Err(Error::not_implemented("more than one table in a native database file"));
+/// Writes the whole catalog as a complete native snapshot and publishes it by rename.
+///
+/// Every table goes into one file under one generation, so the rename that publishes it publishes
+/// all of them at once and a reader never sees half a checkpoint.
+///
+/// The whole file is rewritten rather than appended to, so a table already backed by the file is
+/// read back out of it and written again. That is not free and it is not what the two header slots
+/// are for, but it is what makes a second table possible at all, and a checkpoint over a catalog
+/// where nothing changed still does nothing.
+///
+/// The tables are rebound to the new file afterwards. Without that the catalog would go on reading
+/// the file the rename replaced, which still answers correctly because its bytes are unchanged and
+/// an open handle keeps them, but which would be kept alive on disk by every checkpoint for as long
+/// as the database is open.
+fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
+    let names = catalog.tables().map(|table| table.name().clone()).collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err(Error::not_implemented("a native database with no table"));
     }
-    if table.rows().is_native() {
+    if catalog.tables().all(|table| table.rows().is_native()) {
         return Ok(());
     }
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     if temporary.exists() {
         std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
     }
-    let mut writer = rudb_native::Writer::create(
-        &temporary,
-        table.name().table.clone(),
-        table.columns().to_vec(),
-    )?;
-    for at in 0..table.rows().chunk_count() {
-        let chunk = table.rows().chunk(at).ok_or_else(|| {
-            Error::not_implemented("checkpointing a table already backed by a native file")
-        })?;
-        writer.append(&chunk)?;
+    let mut writer: Option<rudb_native::Writer> = None;
+    for name in &names {
+        let table = catalog.table(name)?;
+        let fields = table.columns().to_vec();
+        let columns = (0..fields.len()).collect::<Vec<_>>();
+        let mut open = match writer.take() {
+            None => rudb_native::Writer::create(&temporary, name.table.clone(), fields)?,
+            Some(writer) => writer.next(name.table.clone(), fields)?,
+        };
+        for at in 0..table.rows().chunk_count() {
+            open.append(&table.rows().read(at, &columns)?)?;
+        }
+        writer = Some(open);
     }
+    let writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
     writer.finish()?;
     std::fs::rename(&temporary, path).map_err(|error| Error::io(error.to_string()))?;
+    let native = rudb_native::Catalog::open(path)?;
+    for name in &names {
+        let reader = native.table(&name.table)?;
+        catalog.table_mut(name)?.rebind_native(reader)?;
+    }
     Ok(())
 }
 
@@ -814,7 +843,7 @@ impl Shared {
             }
             Bound::Checkpoint => {
                 if let Some(path) = &self.inner.path {
-                    persist(path, &catalog)?;
+                    persist(path, &mut catalog)?;
                 }
                 Ok(QueryResult::empty())
             }
@@ -853,7 +882,13 @@ impl Shared {
                     timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
                 if let Some(path) = &self.inner.path {
                     let target = catalog.table(&insert.name)?;
-                    if target.rows().is_empty() {
+                    // The sink writes a fresh file and renames it over the database, so it is only
+                    // safe while there is nothing in the database to lose. A load into a second
+                    // table takes the in-memory path and reaches the file at the next checkpoint,
+                    // which rewrites the whole file. Appending one table to a committed file is
+                    // what the two header slots are for and is not wired up yet.
+                    let alone = !path.exists() && catalog.tables().count() == 1;
+                    if alone && target.rows().is_empty() {
                         let sink = Arc::new(NativeSink::create(
                             path,
                             target.name().table.clone(),

@@ -31,6 +31,49 @@ fn a_file_name_opens_a_native_database() {
 }
 
 #[test]
+fn several_tables_go_into_one_file_and_come_back_out_of_it() {
+    let path = std::env::temp_dir().join(format!("rudb-api-many-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database.execute("CREATE TABLE a (x INTEGER, s VARCHAR)").expect("creates");
+    database.execute("INSERT INTO a VALUES (1, 'one'), (2, 'two')").expect("inserts");
+    database.execute("CREATE TABLE b (y BIGINT)").expect("creates the second");
+    database.execute("INSERT INTO b VALUES (10), (20), (30)").expect("inserts");
+    database.execute("CHECKPOINT").expect("commits both tables at once");
+    drop(database);
+
+    let reopened = Database::open(&name).expect("the native database reopens");
+    assert_eq!(reopened.value("SELECT sum(x) FROM a").expect("reads"), Value::HugeInt(3));
+    assert_eq!(reopened.value("SELECT sum(y) FROM b").expect("reads"), Value::HugeInt(60));
+    // Across the two, so that this is a database of two tables rather than two databases that
+    // happen to share a file.
+    assert_eq!(
+        reopened
+            .value("SELECT count(*) FROM a JOIN b ON b.y = a.x * 10")
+            .expect("joins across the two"),
+        Value::BigInt(2)
+    );
+    // A third table lands in the same file beside the two that are already committed.
+    reopened.execute("CREATE TABLE c (z INTEGER)").expect("creates the third");
+    reopened.execute("INSERT INTO c VALUES (5)").expect("inserts");
+    reopened.execute("CHECKPOINT").expect("commits three");
+    drop(reopened);
+
+    let again = Database::open(&name).expect("the native database reopens again");
+    assert_eq!(again.value("SELECT sum(z) FROM c").expect("reads"), Value::HugeInt(5));
+    assert_eq!(
+        again.value("SELECT sum(x) FROM a").expect("the first is still there"),
+        Value::HugeInt(3)
+    );
+    // A checkpoint over a catalog where nothing changed does nothing, rather than rewriting the
+    // file or refusing because the tables are already in it.
+    again.execute("CHECKPOINT").expect("a second checkpoint is not an error");
+    assert_eq!(again.value("SELECT sum(y) FROM b").expect("reads"), Value::HugeInt(60));
+    drop(again);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+#[test]
 fn two_connections_are_two_views_of_one_database() {
     let database = Database::new();
     let writer = database.connect();
