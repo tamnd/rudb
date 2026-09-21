@@ -439,6 +439,50 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
     fn extreme(&self, column: usize, end: End) -> Stat<Bound>;
 }
 
+/// A store that counted how many rows hold each value of a column, asked how many hold one value.
+///
+/// Here for the reasons [`Zones`] is here, and the reasons are the same one at bottom: the planner
+/// wants the number, it cannot compute it, the number is in the file, and by the time anything
+/// plans over the file the file is closed. So whatever read it answers the question and the planner
+/// holds the answer behind this rather than holding the synopsis. A synopsis is a list of values
+/// per column and is already parsed and already in memory on the side that read it, and what the
+/// planner wants out of it is one number per equality in the predicate.
+///
+/// What this is for is the assumption it replaces. An equality against a constant is estimated by
+/// dividing the rows by the distinct count, which says every value of the column is equally common.
+/// Almost no column anybody filters on is like that. Where the store counted, there is no need to
+/// assume anything.
+pub trait Frequencies: std::fmt::Debug + Send + Sync {
+    /// Which column of this store's own numbering the column called `name` is.
+    ///
+    /// As [`Zones::column`], for the same reason and with the same answer for a name the store does
+    /// not have.
+    fn column(&self, name: &str) -> Option<usize>;
+
+    /// How many rows the store holds altogether.
+    ///
+    /// Here rather than left to the caller because a count out of the synopsis only means anything
+    /// against the rows the synopsis was taken over, and the caller's row count came from somewhere
+    /// else and may be about a different moment. Two numbers out of one store agree with each other.
+    fn rows(&self) -> u64;
+
+    /// How many rows hold exactly `value` in that column.
+    ///
+    /// [`Class::Exact`] where the synopsis accounts for every row of the column. That is the case
+    /// worth having: a value the synopsis lists holds the rows it says and a value it does not list
+    /// holds none, and both of those are counts rather than guesses. It is also the case that
+    /// happens, because a synopsis is complete exactly when the column has few enough distinct
+    /// values, which is the column an equality filter would otherwise have to guess hardest about.
+    ///
+    /// [`Stat::Unknown`] for a column with no synopsis, for one whose synopsis dropped anything,
+    /// and for a value this cannot compare against what the synopsis holds, which is a constant of
+    /// one domain against a column of another.
+    ///
+    /// [`Class::Exact`]: crate::stat::Class::Exact
+    /// [`Stat`]: crate::Stat
+    fn rows_with(&self, column: usize, value: &Bound) -> Stat<u64>;
+}
+
 /// Whether `column op value` is false for every value between `low` and `high`.
 ///
 /// `low` and `high` are the smallest and the largest value of the stretch being tested, either of

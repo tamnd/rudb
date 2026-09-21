@@ -53,7 +53,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below}
 
 mod zones;
 
-pub use zones::{Stripes, distincts};
+pub use zones::{Common, Stripes, distincts};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
@@ -5675,8 +5675,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rudb_common::Stat;
     use rudb_common::Value;
-    use rudb_common::bounds::Op;
+    use rudb_common::bounds::{Frequencies, Op};
+    use rudb_common::stat::Provenance;
 
     use super::*;
 
@@ -5831,6 +5833,53 @@ mod tests {
                 .expect("integers"),
         ])
         .expect("one column")
+    }
+
+    #[test]
+    fn the_planner_gets_a_row_count_per_value_off_a_complete_synopsis() {
+        // The whole of the frequency half of #1106, end to end over a real file. Six rows, three
+        // of one value and two of another, and a complete synopsis because six rows is well inside
+        // what the writer can account for. The estimate for `id = 4` is three rows rather than a
+        // sixth of the table, and for a value the file does not hold it is none.
+        let path = path("frequencies_for_the_planner");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let rows = Chunk::new(vec![
+            Vector::from_values(
+                LogicalType::Integer,
+                &[
+                    Value::Integer(4),
+                    Value::Integer(4),
+                    Value::Integer(4),
+                    Value::Integer(9),
+                    Value::Integer(9),
+                    Value::Integer(1),
+                ],
+            )
+            .expect("integers"),
+        ])
+        .expect("one column");
+        writer.append(&rows).expect("the only part");
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let common = Common::new(reader);
+        assert_eq!(common.rows(), 6);
+        let column = common.column("id").expect("the file has that column");
+        assert_eq!(common.column("nothing"), None);
+        assert_eq!(
+            common.rows_with(column, &Bound::Int(4)),
+            Stat::exact(3, Provenance::FrequencySynopsis)
+        );
+        // Not in the file, and a synopsis that accounts for all six rows proves it.
+        assert_eq!(
+            common.rows_with(column, &Bound::Int(7)),
+            Stat::exact(0, Provenance::FrequencySynopsis)
+        );
+        // A constant of another domain against an integer column. Nothing in the list compares
+        // with it, so the zero above would be an artefact of the mismatch rather than a fact.
+        assert_eq!(common.rows_with(column, &Bound::Bytes(b"four".to_vec())), Stat::Unknown);
+        fs::remove_file(&path).expect("clean up");
     }
 
     #[test]

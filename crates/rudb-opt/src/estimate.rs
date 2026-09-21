@@ -37,7 +37,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rudb_common::bounds::{Spread, Test, Zones};
+use rudb_common::bounds::{Op, Spread, Test, Zones};
 use rudb_common::stat::{Class, Direction, Provenance, Stat, Use};
 use rudb_plan::{
     ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
@@ -292,6 +292,14 @@ pub const CARDINALITY: Use = Use::Decide;
 /// yet. When it is, the class rule refuses everything but an exact count, which is a file of one row
 /// group or a native table's dictionary, per `spec/stats/05-every-query.md` section 5.1.
 pub const DISTINCT: Use = Use::Decide;
+
+/// How a frequency count is read: to pick between plans, like every other number here.
+///
+/// The same [`Use::Decide`] as [`DISTINCT`] and for the same reason, even though the count itself is
+/// exact where it exists. What it is used for is a filter's estimate, and an estimate that turns out
+/// wrong picks a worse plan rather than printing a wrong answer. An exact count read to answer a
+/// query would declare [`Use::Answer`] and go through the class rule, and nothing does that yet.
+const COMMON: Use = Use::Decide;
 
 /// How many rows this node is guessed to produce, where a guess can be made at all.
 ///
@@ -625,8 +633,13 @@ fn ceiling(stat: Stat<u64>) -> Stat<u64> {
 /// The product over the conditions, with each condition answered by the best supplier that can
 /// answer it and by [`KEPT_BY_A_CONDITION`] where none can.
 ///
-/// An equality against a constant on a column somebody counted keeps one value out of however many
-/// the column holds. That is the uniformity assumption and is the oldest textbook rule there is. One
+/// An equality against a constant on a column the store counted per value is not an assumption at
+/// all. The synopsis says how many rows hold that value, or lists every value and does not hold it,
+/// and either way the answer is a count. That is [`common`], and it is asked first.
+///
+/// An equality against a constant on a column somebody counted the distinct values of keeps one
+/// value out of however many the column holds. That is the uniformity assumption and is the oldest
+/// textbook rule there is, and it is what the line above replaces where it can. One
 /// over the count is not always smaller than the constant and is not meant to be: a column of three
 /// values gives a third, which is above the fifth the constant guessed, and that is the direction
 /// the constant was wrong in for `o_orderstatus`. The rule is to use the number where there is one,
@@ -657,9 +670,15 @@ fn kept(
     let mut source: Option<Provenance> = None;
     let mut pending = Vec::new();
     for conjunct in conjuncts(plan, predicate) {
-        match values(plan, conjunct, stats, reads) {
-            Some((values, from)) => {
-                fraction /= widened(values);
+        // The synopsis first, because where it answers it is a count of the rows that pass and the
+        // distinct count is a guess about them. Where it does not, nothing has been spent: it is a
+        // lookup in a list the store already has parsed.
+        let answer = common(plan, input, conjunct, reads).or_else(|| {
+            values(plan, conjunct, stats, reads).map(|(v, from)| (1.0 / widened(v), from))
+        });
+        match answer {
+            Some((share, from)) => {
+                fraction *= share;
                 counted += 1;
                 source = match source {
                     None => Some(from),
@@ -739,6 +758,54 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
         _ => vec![predicate],
     };
     parts.into_iter().filter(|&part| !walk::constant(plan, part)).take(8).collect()
+}
+
+/// What fraction of a scan's rows an equality keeps, where the store counted that value's rows.
+///
+/// The number the uniformity assumption is guessing at. `o_orderstatus = 'F'` over TPC-H's orders
+/// keeps 729,413 rows of 1,500,000, and a column of three values divided by three calls it 500,000.
+/// A synopsis that lists all three says the first number, and says it as a count rather than as an
+/// estimate, because a complete synopsis accounts for every row of the column.
+///
+/// Only `=` and only against a constant, for the reasons [`values`] is. A range is about order and
+/// the bounds answer it better, `<>` is the complement and wants the rows the synopsis does not
+/// account for as well, and the two distinctness operators are about nulls.
+///
+/// `None` where the scan's store keeps no synopsis, where the column's is incomplete, where the
+/// constant does not compare against what the synopsis holds, and where the store says it has no
+/// rows at all. Every one of those falls through to the distinct count, which is where the estimate
+/// was before this existed.
+fn common(
+    plan: &Plan,
+    input: NodeRef,
+    conjunct: ExprRef,
+    reads: &mut Vec<Stat<u64>>,
+) -> Option<(f64, Provenance)> {
+    let index = bounds::scanned(plan, input)?;
+    let frequencies = plan.frequencies(index)?;
+    let names = match *plan.node(input) {
+        Node::Get { columns, .. } | Node::TableFunction { columns, .. } => plan.field_list(columns),
+        _ => return None,
+    };
+    // One test and an equality. A conjunct is one comparison, so more than one test out of it is a
+    // shape this does not understand and should not be guessing the meaning of.
+    let tests = bounds::of(plan, input, conjunct);
+    let [(position, Op::Equal, value)] = tests.as_slice() else {
+        return None;
+    };
+    let name = &names.get(*position)?.name;
+    let column = frequencies.column(name)?;
+    let rows = frequencies.rows();
+    let stat = frequencies.rows_with(column, value);
+    // Recorded before it is read and recorded when it is unknown, for the reason [`values`] gives:
+    // a read that found nothing is still a read, and the misses are the interesting half of what
+    // `EXPLAIN (STATISTICS)` prints.
+    reads.push(stat);
+    if rows == 0 {
+        return None;
+    }
+    let held = stat.read(COMMON).copied()?;
+    Some((share(held, rows), Provenance::FrequencySynopsis))
 }
 
 /// How many values an equality against a constant picks one of, where anybody counted them.
@@ -1159,6 +1226,17 @@ fn join(
     }
 }
 
+/// What share of `rows` the rows holding one value are, as a fraction nothing can push outside zero
+/// to one.
+///
+/// Clamped because the two numbers come from the same store but not necessarily from the same
+/// moment, and a fraction above one would make a filter grow its input, which is a shape the rest
+/// of the estimator does not expect from a conjunct.
+#[expect(clippy::cast_precision_loss, reason = "a row count is a weight here and not an identity")]
+fn share(counted: u64, rows: u64) -> f64 {
+    (counted as f64 / rows as f64).clamp(0.0, 1.0)
+}
+
 /// A count as a divisor, at least one so that nothing divides by zero or grows.
 #[expect(
     clippy::cast_precision_loss,
@@ -1184,7 +1262,7 @@ fn scale(rows: u64, by: f64) -> u64 {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rudb_common::bounds::{Bound, End, Op, Spread, Test, Zones};
+    use rudb_common::bounds::{Bound, End, Frequencies, Op, Spread, Test, Zones};
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
@@ -2248,5 +2326,103 @@ mod tests {
         // almost every query still takes and it has to be untouched.
         let text = format!("Filter (#0.0::INTEGER < 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
         assert_eq!(stat(&text, &[("t", 1_000_000)]), Stat::estimated(200_000, Provenance::Default));
+    }
+
+    /// A store that counted how many rows hold each value, from a list fixed when it is built.
+    ///
+    /// Numbered the other way round from the scan for the reason [`Stub`] is, and checked the same
+    /// way: a test below reads back which column it was asked about.
+    #[derive(Debug)]
+    struct Counted {
+        /// What [`Frequencies::rows`] answers.
+        rows: u64,
+        /// Per column of this store's own numbering, the counts it holds, and `None` for a column
+        /// whose synopsis is missing or incomplete.
+        held: Vec<Option<Vec<(i128, u64)>>>,
+        /// Every column it was asked about, so a test can check which one the estimator named.
+        asked: Mutex<Vec<usize>>,
+    }
+
+    impl Counted {
+        /// A store of a million and a half rows whose column `a` holds the given counts.
+        fn of(held: Option<Vec<(i128, u64)>>) -> Arc<Self> {
+            Arc::new(Self {
+                rows: 1_500_000,
+                held: vec![None, held],
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl Frequencies for Counted {
+        fn column(&self, name: &str) -> Option<usize> {
+            match name {
+                "b" => Some(0),
+                "a" => Some(1),
+                _ => None,
+            }
+        }
+
+        fn rows(&self) -> u64 {
+            self.rows
+        }
+
+        fn rows_with(&self, column: usize, value: &Bound) -> Stat<u64> {
+            self.asked.lock().expect("no test panics while holding this").push(column);
+            let (Some(Some(list)), Bound::Int(wanted)) = (self.held.get(column), value) else {
+                return Stat::Unknown;
+            };
+            let counted = list.iter().find(|(held, _)| held == wanted).map_or(0, |(_, of)| *of);
+            Stat::exact(counted, Provenance::FrequencySynopsis)
+        }
+    }
+
+    /// The estimate for a plan whose table zero counted its values, and counted its distinct ones.
+    ///
+    /// Both, because the point of the synopsis is which of the two the estimate takes.
+    fn common_stat(text: &str, distinct: u64, held: &Arc<Counted>) -> Stat<u64> {
+        let stats = facts(&[("t", 1_500_000)]);
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        plan.set_frequencies(0, Arc::clone(held) as Arc<dyn Frequencies>);
+        plan.measure_distinct(0, "a", Stat::exact(distinct, Provenance::Dictionary));
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    #[test]
+    fn an_equality_on_a_counted_column_takes_the_count_over_the_uniform_guess() {
+        // TPC-H orders at scale factor 1. `o_orderstatus` holds three values over 1,500,000 rows
+        // and 729,413 of them are `F`, which is not a third of anything. The uniformity assumption
+        // says 500,000 for all three, and the writer counted the real number into the file.
+        let text = format!("Filter (#0.0::INTEGER = 3::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
+        assert_eq!(
+            common_stat(&text, 3, &held),
+            Stat::estimated(729_413, Provenance::FrequencySynopsis)
+        );
+        // And the column it asked about is the store's, not the plan's. Asking about `b` here
+        // would answer off the wrong column's counts, which is a wrong estimate arrived at
+        // confidently.
+        assert_eq!(*held.asked.lock().expect("not poisoned"), vec![1]);
+    }
+
+    #[test]
+    fn a_value_a_complete_synopsis_does_not_list_is_as_close_to_no_rows_as_the_guess_goes() {
+        // The half that is worth more than the counts. A synopsis that accounts for every row
+        // proves no row holds a value it left out, so `= 9` is zero rows rather than a third of
+        // the table. The estimate floors at one for the reason every guess here does: a relation
+        // estimated away is a subtree nobody reads.
+        let text = format!("Filter (#0.0::INTEGER = 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
+        assert_eq!(common_stat(&text, 3, &held).value(), Some(&1));
+    }
+
+    #[test]
+    fn a_column_with_no_synopsis_is_divided_by_its_distinct_count_the_way_it_always_was() {
+        let text = format!("Filter (#0.0::INTEGER = 3::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        assert_eq!(
+            common_stat(&text, 3, &Counted::of(None)),
+            Stat::estimated(500_000, Provenance::Dictionary)
+        );
     }
 }
