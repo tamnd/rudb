@@ -73,3 +73,46 @@ fn a_statement_that_writes_hands_back_nothing_rather_than_a_count() {
     assert_eq!(result.width(), 0);
     assert_eq!(result.chunk_count(), 0);
 }
+
+/// A value printed out of a result carries the session's zone, and only a zoned value looks at it.
+///
+/// The two zoned types are the whole reason [`rudb::QueryResult::value_text`] exists rather than
+/// callers using `Display`, so they are what it has to keep doing. Everything else prints the same
+/// under every zone, and since #1119 it does not ask for the zone at all, which is the part worth
+/// pinning: the offset lookup walks the transition table of the zone and it was happening once per
+/// value of every type, on results with no timestamp anywhere in them.
+#[test]
+fn only_a_zoned_value_is_printed_in_the_session_zone() {
+    let db = Database::new();
+    db.execute("SET TimeZone = 'America/New_York'").expect("an IANA zone");
+    let result = db
+        .query(
+            "SELECT TIMESTAMPTZ '2020-01-01 12:00:00+00' AS z, \
+             TIMETZ '12:00:00+00' AS t, \
+             TIMESTAMP '2020-01-01 12:00:00' AS s, \
+             42 AS n, \
+             'x' AS v",
+        )
+        .expect("runs");
+    assert_eq!(result.text_at(0, 0), "2020-01-01 07:00:00-05");
+    // A time carries no date, so the offset it prints is the one the zone is on today rather than
+    // one the value picks out, and New York is on one of two depending on the month.
+    let time = result.text_at(0, 1);
+    assert!(time == "12:00:00-05" || time == "12:00:00-04", "{time}");
+    assert_eq!(result.text_at(0, 2), "2020-01-01 12:00:00");
+    assert_eq!(result.text_at(0, 3), "42");
+    assert_eq!(result.text_at(0, 4), "x");
+    // The same result under a different zone moves the two zoned values and nothing else.
+    db.execute("SET TimeZone = 'Europe/Berlin'").expect("an IANA zone");
+    let result = db
+        .query(
+            "SELECT TIMESTAMPTZ '2020-01-01 12:00:00+00' AS z, \
+             TIMETZ '12:00:00+00' AS t, \
+             TIMESTAMP '2020-01-01 12:00:00' AS s",
+        )
+        .expect("runs");
+    assert_eq!(result.text_at(0, 0), "2020-01-01 13:00:00+01");
+    let time = result.text_at(0, 1);
+    assert!(time == "12:00:00+01" || time == "12:00:00+02", "{time}");
+    assert_eq!(result.text_at(0, 2), "2020-01-01 12:00:00");
+}

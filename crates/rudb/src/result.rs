@@ -96,11 +96,18 @@ impl QueryResult {
     }
 
     /// A value rendered under the session that produced this result.
+    ///
+    /// Only a zoned value reads the session at all. Everything else renders the same under every
+    /// session, and asking for the offset anyway is a search through that zone's transition table
+    /// for an answer nothing then uses. It used to happen once per value whatever the type was,
+    /// which is why `offset_from_utc_datetime` was 5.82 percent of the profile of a query with no
+    /// timestamp column in it. Per #1119.
     #[must_use]
     pub fn value_text(&self, value: &Value) -> String {
         let instant = match value {
             Value::TimestampTz(micros) => *micros,
-            _ => self.rendered_at,
+            Value::TimeTz(_) => self.rendered_at,
+            other => return other.to_string(),
         };
         value.to_string_at_offset(self.session.offset_seconds_at(instant))
     }
