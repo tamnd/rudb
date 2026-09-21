@@ -502,6 +502,7 @@ impl Exchange {
         // that is worth a second thread is worth the full spread, because the counting pass is
         // skewed by the grouping column in a way the deduplicating pass no longer is.
         let splits = if degree > 1 { used } else { 1 };
+        let probe = std::time::Instant::now();
         let counted = in_parallel(
             threads,
             used,
@@ -516,14 +517,23 @@ impl Exchange {
                 distinct_pairs(&mut partition, splits, memory)
             },
         )?;
+        let dedup = probe.elapsed();
         let merged = in_parallel(threads, splits, degree, "counted the groups of split", |at| {
             count_groups(&counted, at, &self.shape, bound, memory)
         })?;
+        let count = probe.elapsed();
         // The distinct pairs are read for the last time by the pass above, so the room they took
         // goes back here rather than at the end of the query.
         for part in counted {
             drop(part.held);
         }
+        let freed = probe.elapsed();
+        eprintln!(
+            "probe finish input={input} degree={degree} used={used} splits={splits} dedup={:.3} count={:.3} drop={:.3}",
+            dedup.as_secs_f64() * 1e3,
+            (count - dedup).as_secs_f64() * 1e3,
+            (freed - count).as_secs_f64() * 1e3,
+        );
         let mut chunks = Vec::new();
         let mut held = self.held.lock().map_err(poisoned)?;
         held.clear();
