@@ -985,6 +985,18 @@ fn more(morsel: &Morsel) -> Progress {
 /// scan is no longer what limits how much of this machine a query uses, and the next thing to look
 /// at is the operators above it.
 fn instances_for(rows: usize) -> usize {
+    if let Ok(forced) = std::env::var("RUDB_INST") {
+        if let Ok(forced) = forced.parse::<usize>() {
+            return forced.max(1);
+        }
+    }
+    if let Ok(divisor) = std::env::var("RUDB_ROWSINST") {
+        if let Ok(divisor) = divisor.parse::<usize>() {
+            let small = rows.div_ceil(divisor.max(1) * 2 / 5).min(8);
+            let large = rows.div_ceil(divisor.max(1));
+            return small.max(large).max(1);
+        }
+    }
     let small = rows.div_ceil(25_000).min(8);
     let large = rows.div_ceil(62_500);
     small.max(large).max(1)
