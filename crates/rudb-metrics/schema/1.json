@@ -73,6 +73,7 @@
       "slowest_ns": 940000000,
       "slowest_cpu_ns": 912000000,
       "finalize_ns": 31000000,
+      "stagger_ns": 7000000,
       "blocked_ns": {
         "io": 120000000,
         "memory": 0,
@@ -91,6 +92,7 @@
       "slowest_ns": 343000000,
       "slowest_cpu_ns": 180000000,
       "finalize_ns": 0,
+      "stagger_ns": 0,
       "blocked_ns": {
         "io": 0,
         "memory": 0,
