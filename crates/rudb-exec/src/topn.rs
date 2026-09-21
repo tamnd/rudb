@@ -627,7 +627,15 @@ impl Sink for TopN {
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
-        let kept = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
+        let mut kept = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
+        // The one place the answer has to be in order. Everything before this keeps the best rows it
+        // has seen without caring which of them is best, because a row that is thrown away later was
+        // never worth placing among the ones that were not.
+        let mut failure = None;
+        settle(&self.keys, &mut kept, self.offset, self.count, &mut failure);
+        if let Some(error) = failure {
+            return Err(error);
+        }
         let wanted = kept.into_iter().skip(self.offset).take(self.count);
         // The only place a candidate's row is read, which is why a candidate holds codes rather than
         // values: everything that got this far and lost was never read at all.
@@ -646,13 +654,54 @@ fn poisoned<T>(_: T) -> Error {
     Error::internal("a thread panicked while holding the rows a top N is keeping")
 }
 
-/// Orders what is held and keeps the first `bound` of it.
+/// Keeps the best `bound` of what is held, in no particular order.
 ///
 /// Ties are settled by where the rows arrived rather than by the order they were handed over, which
-/// is what makes the trim in `combine` give the same answer whichever thread combined first.
+/// is what makes the trim in `combine` give the same answer whichever thread combined first. That
+/// also makes the ordering a total one, since no two rows arrived in the same place, so the answer
+/// does not depend on the trim being stable and the trim does not have to be a sort.
+///
+/// It used to be one. Ordering what is held answers which of it to keep, but it answers a great deal
+/// more than that, and what is thrown away is most of the work: a partitioning around the `bound`th
+/// best row walks the candidates a couple of times where a sort walks them the logarithm of their
+/// count. On ClickBench 39, where a `LIMIT 10 OFFSET 1000` comes out of an aggregate that has
+/// already cut itself to 1010 rows, that is 1010 comparisons and change against ten thousand.
+///
+/// Nothing downstream wants the order this no longer produces until the very end, where
+/// [`settle`] puts the rows the offset and the count ask for into it and leaves the rest alone.
 fn trim(keys: &[SortKey], kept: &mut Vec<Candidate>, bound: usize, failure: &mut Option<Error>) {
-    kept.sort_by(|left, right| settled(keys, left, right, failure));
+    if kept.len() <= bound {
+        return;
+    }
+    if bound == 0 {
+        kept.clear();
+        return;
+    }
+    kept.select_nth_unstable_by(bound - 1, |left, right| settled(keys, left, right, failure));
     kept.truncate(bound);
+}
+
+/// Puts the rows an offset and a count ask for into order, and throws the rest away.
+///
+/// The rows before the offset are kept where they are rather than sorted, because nobody reads them
+/// and the only thing wanted of them is that they really are the ones that sort first. A partition
+/// around the offset says exactly that and says nothing else, which is the point.
+fn settle(
+    keys: &[SortKey],
+    kept: &mut Vec<Candidate>,
+    offset: usize,
+    count: usize,
+    failure: &mut Option<Error>,
+) {
+    trim(keys, kept, offset.saturating_add(count), failure);
+    if offset >= kept.len() {
+        kept.clear();
+        return;
+    }
+    if offset > 0 {
+        kept.select_nth_unstable_by(offset, |left, right| settled(keys, left, right, failure));
+    }
+    kept[offset..].sort_unstable_by(|left, right| settled(keys, left, right, failure));
 }
 
 /// Reads one row out of the columns and puts it among the candidates, unordered.
