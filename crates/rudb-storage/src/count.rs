@@ -50,9 +50,9 @@
 //! [`Sketch::add_hash`] returns on a comparison for every value above the threshold, which after the
 //! first few thousand rows is nearly all of them.
 //!
-//! The memory is 32 KB a column at the default k, so a hundred and five column table like ClickBench
-//! `hits` holds 3.4 MB of sketch. That is the price of the whole table's statistics and it does not
-//! grow with the rows.
+//! The memory is 128 KB a column at the default k, so a hundred and five column table like
+//! ClickBench `hits` holds 13 MB of sketch. That is the price of the whole table's statistics and
+//! it does not grow with the rows.
 //!
 //! # A column this cannot read says nothing
 //!
@@ -63,7 +63,7 @@
 //! distinct count that is wrong is one it has no defence against at all.
 
 use rudb_common::{LogicalType, Value};
-use rudb_encoding::sketch::{DEFAULT_K, Sketch, hash64};
+use rudb_encoding::sketch::{DEFAULT_K, Sketch, hash64, hash128};
 use rudb_vector::{Chunk, Data, Form, Vector};
 
 /// The distinct count of every column of one table, built as chunks are appended.
@@ -102,15 +102,16 @@ impl Counts {
 
     /// Counts one chunk, one column at a time.
     ///
-    /// A chunk with the wrong number of columns is a chunk the table has already refused, so the
-    /// extra columns of a wider one are ignored rather than checked for again here.
+    /// `MemoryTable::append` refuses a chunk whose columns are not the table's before it gets here,
+    /// so a column this cannot find is a caller that has not done that. It blinds the column rather
+    /// than skipping it, for the same reason a form with no arm does: a sketch that missed a chunk
+    /// counts too few distinct values and says nothing about having done so.
     pub fn add(&mut self, chunk: &Chunk) {
         for (at, column) in self.columns.iter_mut().enumerate() {
             if column.blind {
                 continue;
             }
-            let Ok(vector) = chunk.column(at) else { continue };
-            if !walk(vector, &mut column.sketch) {
+            if !chunk.column(at).is_ok_and(|vector| walk(vector, &mut column.sketch)) {
                 column.blind = true;
                 // The hashes taken so far describe some of the rows and no question is going to be
                 // answered from them, so they are dropped rather than carried.
@@ -425,13 +426,13 @@ pub fn hash_value(value: &Value) -> Option<u64> {
 
 /// A signed value as the sixteen bytes of its 128 bit pattern.
 fn hash_signed(value: i128) -> u64 {
-    hash64(&value.to_le_bytes())
+    hash128(value as u128)
 }
 
 /// An unsigned value the same way, which for every value below 2^127 is the same sixteen bytes a
 /// signed one of the same number gives.
 fn hash_unsigned(value: u128) -> u64 {
-    hash64(&value.to_le_bytes())
+    hash128(value)
 }
 
 /// A float as the bits of the `f64` it widens to, with the two values SQL calls equal folded.

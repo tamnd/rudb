@@ -1315,6 +1315,32 @@ fn create_table(
 mod tests {
     use super::Database;
 
+    /// TEMPORARY: what a load spends on statistics, for the measurement in tamnd/rudb#1089.
+    #[test]
+    #[ignore]
+    fn measure_the_load() {
+        let file = std::env::var("MEASURE").expect("a parquet file in MEASURE");
+        let database = Database::new();
+        let started = std::time::Instant::now();
+        database
+            .execute(&format!("CREATE TABLE t AS SELECT * FROM read_parquet('{file}')"))
+            .expect("the table loads");
+        let wall = started.elapsed();
+        let catalog = database.shared.read();
+        for table in catalog.tables() {
+            if let rudb_catalog::table::Rows::Memory(rows) = table.rows() {
+                println!(
+                    "{file}: {} rows, {} columns, wall {:?}, stats {:.1}ms, counts {:.1}ms",
+                    rows.len(),
+                    rows.width(),
+                    wall,
+                    rows.stats_ns() as f64 / 1e6,
+                    rows.counts_ns() as f64 / 1e6,
+                );
+            }
+        }
+    }
+
     #[test]
     fn two_statements_over_one_catalog_plan_from_the_same_counts() {
         // The counts used to be rebuilt for every statement, which on a catalog of two hundred

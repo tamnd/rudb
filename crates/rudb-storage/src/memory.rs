@@ -58,8 +58,8 @@
 //! The zone maps cannot say how many distinct values a column holds, which is the number every
 //! cardinality estimate in the optimizer is built on, so there is a second thing built on the way in
 //! next to them: one bottom-k sketch a column, over the whole table rather than per chunk, which is
-//! `count.rs`. It is fixed size, so it costs the same 32 KB a column whether the table is a thousand
-//! rows or a billion, and it is exact rather than estimated for any column with fewer distinct
+//! `count.rs`. It is fixed size, so it costs the same 128 KB a column whether the table is a
+//! thousand rows or a billion, and it is exact rather than estimated for any column with fewer distinct
 //! values in it than the sketch has room for. [`MemoryTable::distinct_values`] is the exact half,
 //! which a `COUNT(DISTINCT c)` may be read straight out of, and [`MemoryTable::distinct_estimate`]
 //! is the one the estimator asks.
@@ -135,6 +135,7 @@ pub struct MemoryTable {
     counts: Counts,
     rows: usize,
     stats_ns: u64,
+    counts_ns: u64,
 }
 
 impl MemoryTable {
@@ -153,6 +154,7 @@ impl MemoryTable {
             counts,
             rows: 0,
             stats_ns: 0,
+            counts_ns: 0,
         }
     }
 
@@ -227,7 +229,9 @@ impl MemoryTable {
             Some(open) => open.widen(&zone),
             None => self.open_zone = Some(zone.clone()),
         }
+        let zoned = Instant::now();
         self.counts.add(&chunk);
+        self.counts_ns += zoned.elapsed().as_nanos() as u64;
         self.stats_ns += started.elapsed().as_nanos() as u64;
         self.rows += chunk.len();
         self.zones.push(zone);
@@ -375,6 +379,16 @@ impl MemoryTable {
     #[must_use]
     pub fn stats_ns(&self) -> u64 {
         self.stats_ns
+    }
+
+    /// How much of [`MemoryTable::stats_ns`] went on the distinct counts, in nanoseconds.
+    ///
+    /// The two passes are timed apart because they are priced apart. A zone map is two comparisons
+    /// a value and a distinct count is a hash a value, so one of them is worth several of the other
+    /// and a single number would hide which one a slow load was paying for. See `count.rs`.
+    #[must_use]
+    pub fn counts_ns(&self) -> u64 {
+        self.counts_ns
     }
 
     /// The zone of one chunk, or `None` past the end.
