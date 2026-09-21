@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::bounds::{Bound, Op, scaled_as};
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, PhysicalType, Result, Value};
 use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
@@ -3379,8 +3379,35 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::USmallInt => Ok(10),
         LogicalType::UInteger => Ok(11),
         LogicalType::UBigInt => Ok(12),
+        LogicalType::Decimal { .. } => Ok(13),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
+}
+
+/// The tag of a column type, and the parameters of the ones that have any.
+///
+/// Only `DECIMAL` has parameters today. Width and scale go after the tag rather than into it
+/// because they are what says how wide a value is on disk, and a reader that guessed would read the
+/// wrong number of bytes per row rather than the wrong number of digits.
+fn put_type(out: &mut Vec<u8>, ty: &LogicalType) -> Result<()> {
+    out.push(type_tag(ty)?);
+    if let LogicalType::Decimal { width, scale } = ty {
+        out.push(*width);
+        out.push(*scale);
+    }
+    Ok(())
+}
+
+/// The other half of [`put_type`], reading the parameters the tag says are there.
+fn read_type(cur: &mut Cursor<'_>) -> Result<LogicalType> {
+    let tag = cur.u8()?;
+    if tag == 13 {
+        let width = cur.u8()?;
+        let scale = cur.u8()?;
+        return LogicalType::decimal(width, scale)
+            .map_err(|_| invalid("decimal column width and scale are not a decimal"));
+    }
+    tag_type(tag)
 }
 
 fn tag_type(tag: u8) -> Result<LogicalType> {
@@ -3459,7 +3486,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         let name = field.name.as_bytes();
         put_u16(&mut out, u16::try_from(name.len()).map_err(|_| invalid("column name too long"))?);
         out.extend_from_slice(name);
-        out.push(type_tag(&field.ty)?);
+        put_type(&mut out, &field.ty)?;
         out.push(u8::from(field.not_null));
     }
     for dictionary in &table.dictionaries {
@@ -3627,7 +3654,7 @@ fn encode_catalog(entries: &[Entry]) -> Result<Vec<u8>> {
                 u16::try_from(name.len()).map_err(|_| invalid("column name too long"))?,
             );
             out.extend_from_slice(name);
-            out.push(type_tag(&field.ty)?);
+            put_type(&mut out, &field.ty)?;
             out.push(u8::from(field.not_null));
         }
         put_u64(&mut out, entry.directory.offset);
@@ -3653,7 +3680,7 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Vec<Entry>> {
         let mut fields = Vec::with_capacity(width);
         for _ in 0..width {
             let name = cur.text()?;
-            let ty = tag_type(cur.u8()?)?;
+            let ty = read_type(&mut cur)?;
             let not_null = match cur.u8()? {
                 0 => false,
                 1 => true,
@@ -3757,7 +3784,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     let mut fields = Vec::with_capacity(width);
     for _ in 0..width {
         let name = cur.text()?;
-        let ty = tag_type(cur.u8()?)?;
+        let ty = read_type(&mut cur)?;
         let not_null = match cur.u8()? {
             0 => false,
             1 => true,
@@ -4288,6 +4315,14 @@ fn narrowed(ty: &LogicalType, values: Vec<i64>) -> Result<Data> {
         LogicalType::Integer | LogicalType::Date => Data::Int32(fit::<i32>(&values)?.into()),
         LogicalType::UInteger => Data::UInt32(fit::<u32>(&values)?.into()),
         LogicalType::BigInt | LogicalType::Timestamp => Data::Int64(values.into()),
+        // A decimal is an integer of unscaled units, so the cascade reads back into whichever
+        // integer the declared width says the column is stored as.
+        LogicalType::Decimal { .. } => match ty.physical() {
+            PhysicalType::Int16 => Data::Int16(fit::<i16>(&values)?.into()),
+            PhysicalType::Int32 => Data::Int32(fit::<i32>(&values)?.into()),
+            PhysicalType::Int64 => Data::Int64(values.into()),
+            _ => return Err(invalid("cascade codec belongs to a decimal that is not an integer")),
+        },
         _ => return Err(invalid("cascade codec belongs to a page that is not integers")),
     })
 }
@@ -4300,6 +4335,14 @@ fn plain_width(ty: &LogicalType) -> Option<usize> {
         LogicalType::SmallInt | LogicalType::USmallInt => 2,
         LogicalType::Integer | LogicalType::UInteger | LogicalType::Date => 4,
         LogicalType::BigInt | LogicalType::Timestamp => 8,
+        LogicalType::Decimal { .. } => match ty.physical() {
+            PhysicalType::Int16 => 2,
+            PhysicalType::Int32 => 4,
+            PhysicalType::Int64 => 8,
+            // The widest decimals are stored as `i128`, which the cascade does not widen into, so
+            // they take the plain path and there is nothing here to compare against.
+            _ => return None,
+        },
         _ => return None,
     })
 }
@@ -4496,6 +4539,28 @@ fn encode(
         (LogicalType::Boolean, Data::Bool(values)) => {
             for value in &**values {
                 out.push(u8::from(*value));
+            }
+        }
+        // The unscaled integer and nothing else. Scale is a property of the column and it is in the
+        // directory already, so writing it a value at a time would be paying for it twice.
+        (LogicalType::Decimal { .. }, Data::Int16(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::Decimal { .. }, Data::Int32(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::Decimal { .. }, Data::Int64(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::Decimal { .. }, Data::Int128(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
             }
         }
         (LogicalType::Varchar, Data::Varlen(values)) => {
@@ -5469,6 +5534,54 @@ fn decode(
             }
             Data::Bool(values.iter().map(|value| *value == 1).collect::<Vec<_>>().into())
         }
+        // Whichever integer the declared width says, which is the mapping the rest of the engine
+        // already uses for a decimal in memory.
+        LogicalType::Decimal { .. } => match ty.physical() {
+            PhysicalType::Int16 => {
+                let values =
+                    cur.take(rows.checked_mul(2).ok_or_else(|| invalid("page size overflow"))?)?;
+                Data::Int16(
+                    values
+                        .chunks_exact(2)
+                        .map(|item| i16::from_le_bytes(item.try_into().expect("two bytes")))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )
+            }
+            PhysicalType::Int32 => {
+                let values =
+                    cur.take(rows.checked_mul(4).ok_or_else(|| invalid("page size overflow"))?)?;
+                Data::Int32(
+                    values
+                        .chunks_exact(4)
+                        .map(|item| i32::from_le_bytes(item.try_into().expect("four bytes")))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )
+            }
+            PhysicalType::Int64 => {
+                let values =
+                    cur.take(rows.checked_mul(8).ok_or_else(|| invalid("page size overflow"))?)?;
+                Data::Int64(
+                    values
+                        .chunks_exact(8)
+                        .map(|item| i64::from_le_bytes(item.try_into().expect("eight bytes")))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )
+            }
+            _ => {
+                let values =
+                    cur.take(rows.checked_mul(16).ok_or_else(|| invalid("page size overflow"))?)?;
+                Data::Int128(
+                    values
+                        .chunks_exact(16)
+                        .map(|item| i128::from_le_bytes(item.try_into().expect("sixteen bytes")))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )
+            }
+        },
         LogicalType::Varchar => {
             let offset_bytes = cur
                 .take((rows + 1).checked_mul(4).ok_or_else(|| invalid("offset count overflow"))?)?;
@@ -7408,6 +7521,63 @@ mod tests {
         three_tables(&file);
         let error = Reader::open(&file).expect_err("more than one table");
         assert!(error.message().contains("more than one table"), "{}", error.message());
+        fs::remove_file(file).expect("remove scratch file");
+    }
+
+    /// One column per storage width, because the width is what decides how many bytes a row costs.
+    #[test]
+    fn decimals_of_every_storage_width_round_trip() {
+        let file = path("decimals");
+        let widths = [(4_u8, 2_u8), (9, 2), (18, 4), (38, 6)];
+        let fields = widths
+            .iter()
+            .enumerate()
+            .map(|(index, (width, scale))| {
+                Field::new(
+                    format!("d{index}"),
+                    LogicalType::decimal(*width, *scale).expect("a decimal type"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(&file, "money", fields).expect("new file");
+        let rows: [i128; 3] = [-1234, 0, 999];
+        let columns = widths
+            .iter()
+            .map(|(width, scale)| {
+                let values = rows
+                    .iter()
+                    .map(|unscaled| Value::Decimal {
+                        unscaled: *unscaled,
+                        width: *width,
+                        scale: *scale,
+                    })
+                    .collect::<Vec<_>>();
+                Vector::from_values(
+                    LogicalType::decimal(*width, *scale).expect("a decimal type"),
+                    &values,
+                )
+                .expect("a decimal column")
+            })
+            .collect::<Vec<_>>();
+        writer.append(&Chunk::new(columns).expect("four columns")).expect("a part");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&file).expect("a committed file");
+        for (index, (width, scale)) in widths.iter().enumerate() {
+            assert_eq!(
+                reader.table().fields()[index].ty,
+                LogicalType::decimal(*width, *scale).expect("a decimal type"),
+                "column {index} came back as another type"
+            );
+            let column = reader.read(0, &[index]).expect("the column");
+            for (row, unscaled) in rows.iter().enumerate() {
+                assert_eq!(
+                    column.value_at(row, 0),
+                    Value::Decimal { unscaled: *unscaled, width: *width, scale: *scale },
+                    "column {index} row {row}"
+                );
+            }
+        }
         fs::remove_file(file).expect("remove scratch file");
     }
 
