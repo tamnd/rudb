@@ -2639,9 +2639,22 @@ impl Vector {
                     .collect(),
                 arena: Arc::clone(arena),
             },
-            // Flattening promises a data slice, so the bytes are copied out into an arena of their
-            // own and the shared one is let go of. The total is known before any of it is copied,
-            // the way the flat copy works it out, so the new arena is one allocation.
+            // Flattening promises a data slice, and a flat string column is views over an arena
+            // just as this form is, so when the arena is a page the flatten is the views and
+            // nothing else. The form is given up, which is what was asked for, and not the sharing,
+            // which nobody asked to have given up: a result set of six million strings used to copy
+            // every byte of them out of the pages they were already sitting in.
+            Body::Views { views, arena } if arena.is_shared() => {
+                Body::Flat(Data::Varlen(StringColumn::from_parts(
+                    at.iter()
+                        .map(|&index| views.get(index).copied().unwrap_or_else(StringView::empty))
+                        .collect(),
+                    (**arena).clone(),
+                )))
+            }
+            // The arena is this vector's own, so there is nothing to share and the bytes are copied
+            // out into an arena of their own. The total is known before any of it is copied, the
+            // way the flat copy works it out, so the new arena is one allocation.
             Body::Views { views, arena } => {
                 let mut out = StringColumn::with_capacity(at.len());
                 out.reserve_bytes(
@@ -3251,7 +3264,15 @@ fn run_of(data: &Data, at: usize, end: usize) -> Data {
                 // A view says where its bytes are, so a run of rows is not a run of bytes and this
                 // is the one layout whose cut is still a loop. The total is known before any of it
                 // is copied, so the arena is one allocation.
+                //
+                // Unless the payload is a page, in which case the cut points at the same page the
+                // column does and no byte of it moves. That is the case a scan of a stored column
+                // is in, and it is the whole of why a producer pages its payload: a page cut into
+                // chunk sized pieces used to copy every byte of every long string once per piece.
                 Data::Varlen(values) => {
+                    if let Some(shared) = values.viewing(at..end) {
+                        return Data::Varlen(shared);
+                    }
                     let views = values.views();
                     let mut out = StringColumn::with_capacity(end - at);
                     out.reserve_bytes(
@@ -3292,8 +3313,13 @@ pub(crate) fn copy_of(data: &Data, at: &[usize]) -> Data {
                 })+
                 // The one layout where a gather is a copy of bytes rather than a copy of fixed
                 // width slots, and the reason compaction is a decision rather than a default on a
-                // string column.
+                // string column. A payload that is a page is the exception: the gathered views
+                // point at the page the column already points at, so the gather is sixteen bytes a
+                // row and the bytes stay where the page put them.
                 Data::Varlen(values) => {
+                    if let Some(shared) = values.viewing(at.iter().copied()) {
+                        return Data::Varlen(shared);
+                    }
                     let mut out = StringColumn::with_capacity(at.len());
                     // The bytes are known before any of them are copied, because a view carries its
                     // length and the wanted positions are already in hand, so the arena is one
@@ -4345,6 +4371,67 @@ mod tests {
         );
         // Twice is not two pages.
         assert_eq!(address(&vector.clone().into_pages()), stored);
+    }
+
+    /// A cut, a gather and a flatten of a string column over a page all move views and no bytes.
+    ///
+    /// This is the string half of the paging that `a_vector_over_pages_is_copied_and_cut_without_
+    /// its_values_moving` checks for a fixed width column, and it is worth its own test because a
+    /// string column is two allocations rather than one: the cut that matters is the payload
+    /// staying where it is while the views move.
+    #[test]
+    fn a_string_column_over_a_page_is_cut_and_gathered_without_its_payload_moving() {
+        let long = ["the first of the long strings", "the second one", "and a third long one here"];
+        let mut built = StringColumn::with_capacity(long.len());
+        for text in long {
+            built.push(text);
+        }
+        let vector = Vector::flat(LogicalType::Varchar, Data::Varlen(built.into_page())).unwrap();
+        let payload = |vector: &Vector| match vector.data() {
+            Some(Data::Varlen(column)) => column.arena().as_ptr() as usize,
+            _ => panic!("the layout changed under the test"),
+        };
+        let stored = payload(&vector);
+        let cut = vector.slice(1, 2).unwrap();
+        assert_eq!(payload(&cut), stored, "a cut moved the payload");
+        assert_eq!(cut.text_at(0), Some(long[1]));
+        assert_eq!(cut.text_at(1), Some(long[2]));
+        let gathered = vector.gather(&[2, 0]).unwrap();
+        assert_eq!(payload(&gathered), stored, "a gather moved the payload");
+        assert_eq!(gathered.text_at(0), Some(long[2]));
+        assert_eq!(gathered.text_at(1), Some(long[0]));
+        // And the same column with its own arena still copies, because sharing an owned arena
+        // means cloning every byte of it including the bytes nobody asked for.
+        let mut owned = StringColumn::with_capacity(long.len());
+        for text in long {
+            owned.push(text);
+        }
+        let held = Vector::flat(LogicalType::Varchar, Data::Varlen(owned)).unwrap();
+        let copied = held.slice(1, 2).unwrap();
+        assert_ne!(payload(&copied), payload(&held), "an owned payload was shared");
+        assert_eq!(copied.text_at(0), Some(long[1]));
+    }
+
+    /// A flatten gives up the form and not the sharing. The views form is already views over an
+    /// arena, so flattening one over a page is the views and nothing else, and the flat column
+    /// that comes out reads the same strings out of the same bytes.
+    #[test]
+    fn flattening_string_views_over_a_page_keeps_the_page() {
+        let mut built = StringColumn::with_capacity(2);
+        built.push("a string too long to sit inside a view");
+        built.push("another string that is also too long");
+        let (views, arena) = built.into_page().into_parts();
+        let stored = arena.as_slice().as_ptr() as usize;
+        let vector = Vector::string_views(LogicalType::Varchar, views, Arc::new(arena)).unwrap();
+        assert_eq!(vector.form(), Form::StringView);
+        let flat = vector.flatten().unwrap();
+        assert_eq!(flat.form(), Form::Flat);
+        let Some(Data::Varlen(column)) = flat.data() else {
+            panic!("the layout changed under the test")
+        };
+        assert_eq!(column.arena().as_ptr() as usize, stored, "the flatten moved the payload");
+        assert_eq!(flat.text_at(0), Some("a string too long to sit inside a view"));
+        assert_eq!(flat.text_at(1), Some("another string that is also too long"));
     }
 
     /// Every form that is not flat already shares what is expensive, so this is a no op on them and

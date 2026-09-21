@@ -284,6 +284,45 @@ impl StringColumn {
         Self { views: self.views, arena: self.arena.into_page() }
     }
 
+    /// A column from views that already point into `arena`.
+    ///
+    /// The way back in from [`Self::into_parts`], for the caller that took a column apart to hold
+    /// the payload once and the views many times and now wants a column again. Nothing here checks
+    /// that a view points inside the arena, for the same reason [`Self::bytes`] answers `None`
+    /// rather than panicking when one does not: a view that points nowhere reads as no bytes, which
+    /// is the empty string, and that is a wrong answer rather than an unsound one.
+    #[must_use]
+    pub fn from_parts(views: Vec<StringView>, arena: Buffer<u8>) -> Self {
+        Self { views, arena }
+    }
+
+    /// The values at `at`, over this column's arena rather than over a copy of the bytes.
+    ///
+    /// What a cut, a gather and a flatten of a column whose payload is a page all want. A view says
+    /// where its bytes are, so putting the views in a different order or keeping only some of them
+    /// leaves every one of them pointing at the same bytes it pointed at before, and the answer is
+    /// the same column of strings the copying version builds. Sixteen bytes a row move and the
+    /// payload does not, which is the split [`Self::into_page`] exists to make and is what the
+    /// [`StringView`](crate::vector::Form::StringView) form of a vector already makes for itself.
+    ///
+    /// `None` when the arena is this column's own rather than a page, because then there is no
+    /// sharing to be had: cloning an owned arena copies every byte of it, including the bytes of
+    /// every value the caller did not ask for, and the copying version is both smaller and faster.
+    /// A producer that means its payload to be read many times says so with [`Self::into_page`].
+    ///
+    /// A position this column does not have comes back as the empty string, which is what the
+    /// copying version writes for a position that resolved to nowhere.
+    #[must_use]
+    pub fn viewing(&self, at: impl Iterator<Item = usize>) -> Option<Self> {
+        if !self.arena.is_shared() {
+            return None;
+        }
+        let views = at
+            .map(|index| self.views.get(index).copied().unwrap_or_else(StringView::empty))
+            .collect();
+        Some(Self { views, arena: self.arena.clone() })
+    }
+
     /// How many strings are in the column.
     #[must_use]
     pub fn len(&self) -> usize {
