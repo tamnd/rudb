@@ -1400,11 +1400,15 @@ impl Vector {
     /// numbers however long they are, which is the point of both forms, so the number here is the
     /// form's cost and not the column's width times its length.
     ///
-    /// A dictionary counts its values in full, and two vectors sharing one dictionary each report
-    /// all of it. That over counts, deliberately: working out that two operators are looking at the
-    /// same `Arc` means threading identity through the accounting, and a limit that over counts
-    /// refuses a query that would have fit while a limit that under counts lets one through that
-    /// does not. The first is a worse answer to give and the second is a worse thing to be.
+    /// A part that is behind an `Arc` counts as one holder's share of it, which is
+    /// [`Buffer::footprint`]'s rule for a shared page applied to the other shared parts. A
+    /// dictionary counted in full in every vector sharing it is not a conservative over count, it is
+    /// a number with the chunk count in it: an aggregate that emits nineteen thousand chunks of
+    /// groups out of one stable dictionary reported that dictionary nineteen thousand times and
+    /// refused itself a budget of twenty five gigabytes while the process held one. Dividing by the
+    /// holders makes the sum over everything sharing the part come to about the part, which is what
+    /// the number is supposed to mean, and it errs high rather than low whenever the holders arrive
+    /// one after another, because each of them counts what it sees at the time it asks.
     #[must_use]
     pub fn footprint(&self) -> usize {
         let body = match &self.body {
@@ -1412,35 +1416,30 @@ impl Vector {
             Body::Constant(value) => value.footprint(),
             Body::Sequence { .. } => 0,
             Body::Dictionary { codes, values, .. } => {
-                codes.capacity() * size_of::<u32>() + values.footprint()
+                codes.capacity() * size_of::<u32>() + share(values.footprint(), values)
             }
-            Body::Packed { words, .. } => words.capacity() * size_of::<u64>(),
-            // The arena counts in full in every vector sharing it, for the reason a shared
-            // dictionary does: over counting refuses a query that would have fit and under counting
-            // admits one that does not, and the first is the better way to be wrong.
+            Body::Packed { words, .. } => share(words.capacity() * size_of::<u64>(), words),
             Body::Views { views, arena } => {
-                views.capacity() * size_of::<StringView>() + arena.footprint()
+                views.capacity() * size_of::<StringView>() + share(arena.footprint(), arena)
             }
-            Body::ExternalText { source } => source.footprint(),
-            // The table counts in full in every vector sharing it, the way a shared arena and a
-            // shared dictionary do. It is the largest of the three and the most shared of them, so
-            // this is the one place the over counting is worth saying out loud: a page of a hundred
-            // chunks reports its table a hundred times.
+            Body::ExternalText { source } => share(source.footprint(), source),
             Body::Coded { codes, spans, table } => {
-                codes.capacity() + spans.capacity() * size_of::<(u32, u32)>() + table.footprint()
+                share(codes.capacity(), codes)
+                    + spans.capacity() * size_of::<(u32, u32)>()
+                    + share(table.footprint(), table)
             }
-            Body::Runs { ends, values } => ends.capacity() * size_of::<u32>() + values.footprint(),
-            // The child counts in full in every vector sharing it, the way a shared dictionary and a
-            // shared arena do, and for the same reason.
+            Body::Runs { ends, values } => {
+                ends.capacity() * size_of::<u32>() + share(values.footprint(), values)
+            }
             Body::Nested { entries, child } => {
-                entries.capacity() * size_of::<(u32, u32)>() + child.footprint()
+                entries.capacity() * size_of::<(u32, u32)>() + share(child.footprint(), child)
             }
-            // Every child in full, the way the list child counts. A struct is as wide as its fields
-            // are, so this is the one body whose cost is a sum over children rather than one number,
-            // and a struct of a hundred narrow fields costs what the hundred columns cost.
+            // A struct is as wide as its fields are, so this is the one body whose cost is a sum
+            // over children rather than one number, and a struct of a hundred narrow fields costs
+            // what the hundred columns cost.
             Body::Fields { children } => {
                 children.capacity() * size_of::<Arc<Self>>()
-                    + children.iter().map(|child| child.footprint()).sum::<usize>()
+                    + children.iter().map(|child| share(child.footprint(), child)).sum::<usize>()
             }
         };
         size_of::<Self>() + self.validity.footprint() + body
@@ -2785,6 +2784,16 @@ fn widen<T: Copy + Into<i64>>(run: &[T], len: usize, out: &mut Vec<i64>) -> bool
         }
         None => false,
     }
+}
+
+/// One holder's share of a part that several vectors are reading at the same time.
+///
+/// The rule [`Buffer::footprint`] already uses for a shared page. Everything holding the part asks
+/// this, so what they say between them comes to about what the part costs rather than to the part
+/// times the number of them, and the answer is never zero for a part that costs anything, because a
+/// caller with a reference is at least one holder.
+fn share<T: ?Sized>(bytes: usize, held: &Arc<T>) -> usize {
+    bytes / Arc::strong_count(held).max(1)
 }
 
 /// How many words hold `len` codes of `width` bits.
@@ -4856,6 +4865,31 @@ mod tests {
         assert!(constant.footprint() < 200, "a constant is one value: {}", constant.footprint());
         let sequence = Vector::sequence(0, 1, 1_000_000);
         assert!(sequence.footprint() < 200, "a sequence is two numbers: {}", sequence.footprint());
+    }
+
+    #[test]
+    fn a_dictionary_read_by_many_cuts_is_counted_about_once_between_them() {
+        let strings: Vec<Value> = (0..2000)
+            .map(|at| Value::Varchar(format!("a value well past the inline limit, number {at}")))
+            .collect();
+        let values = Arc::new(Vector::from_values(LogicalType::Varchar, &strings).unwrap());
+        let dictionary = values.footprint();
+        let cuts: Vec<Vector> = (0..500)
+            .map(|_| Vector::stable_dictionary(vec![0; 8], Arc::clone(&values)).unwrap())
+            .collect();
+        let together: usize = cuts.iter().map(Vector::footprint).sum();
+        // Five hundred chunks cut out of one page hold one dictionary, and what they say they hold
+        // has to be about one dictionary. Before this it was five hundred of them, which is a
+        // reading that grows with the answer and refuses a query holding a gigabyte a budget of
+        // twenty five.
+        assert!(
+            together < dictionary * 2,
+            "five hundred cuts are not five hundred dictionaries: {together} against {dictionary}"
+        );
+        assert!(
+            together > dictionary / 2,
+            "the dictionary is still counted: {together} against {dictionary}"
+        );
     }
 
     #[test]
