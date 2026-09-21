@@ -62,11 +62,12 @@ mod tests {
     use rudb_seam::SeamId;
 
     use super::seams_of;
-    use crate::node::Node;
+    use crate::node::{Bound, Node};
 
     #[test]
     fn an_operator_with_one_way_to_do_its_job_sits_on_no_seam() {
-        assert!(seams_of(&Node::Limit { input: 0, count: Some(10), offset: 0 }).is_empty());
+        let limit = Node::Limit { input: 0, count: Bound::Rows(10), offset: Bound::Rows(0) };
+        assert!(seams_of(&limit).is_empty());
         assert!(seams_of(&Node::Dummy).is_empty());
     }
 

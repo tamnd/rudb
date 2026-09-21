@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
-    Arm, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    Arm, Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
     NodeRef, Plan, Slice, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
@@ -321,7 +321,15 @@ fn push(
             let below = push(plan, input, domain, index, keys, outer)?;
             window(plan, below, at_index, partition, order, frame, expressions, keys)
         }
+        // A bound the query reads off its own rows cannot come along. What replaces a limit down
+        // here is a row number per domain value compared against the count, and the count has to
+        // be a number to be written into that comparison.
         Node::Limit { input, count, offset } => {
+            let (count, offset) = match (count, offset) {
+                (Bound::All, Bound::Rows(offset)) => (None, offset),
+                (Bound::Rows(count), Bound::Rows(offset)) => (Some(count), offset),
+                _ => return None,
+            };
             let below = push(plan, input, domain, index, keys, outer)?;
             limited(plan, below, None, count, offset, keys)
         }

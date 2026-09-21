@@ -138,7 +138,11 @@ impl Binder<'_> {
         outer: &Scope,
     ) -> Result<ExprRef> {
         let (node, _, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
-        let node = self.add_node(rudb_plan::Node::Limit { input: node, count: Some(1), offset: 0 });
+        let node = self.add_node(rudb_plan::Node::Limit {
+            input: node,
+            count: rudb_plan::Bound::Rows(1),
+            offset: rudb_plan::Bound::Rows(0),
+        });
         let index = self.fresh_index();
         let marker = self.add_constant(Value::Boolean(true));
         let exprs = self.plan_mut().add_expr_list(&[marker]);

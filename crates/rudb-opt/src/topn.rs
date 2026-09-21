@@ -28,7 +28,7 @@
 //! no rebuild of the path back to the root.
 
 use rudb_common::Result;
-use rudb_plan::{Node, Plan};
+use rudb_plan::{Bound, Node, Plan};
 
 use crate::pass::{Context, Pass, top_down};
 
@@ -50,8 +50,13 @@ impl Pass for TopN {
 /// Rewrites every limit over a sort in `plan` into a top N.
 pub fn fuse(plan: &mut Plan) {
     for node in top_down(plan) {
+        // Both ends have to be numbers here. A top N keeps the smallest `count + offset` rows it
+        // has seen so far and there is no such heap to keep when the number only turns up once the
+        // query is running, so a limit reading its bound off the rows stays a limit over a sort.
         let (input, count, offset) = match *plan.node(node) {
-            Node::Limit { input, count: Some(count), offset } => (input, count, offset),
+            Node::Limit { input, count: Bound::Rows(count), offset: Bound::Rows(offset) } => {
+                (input, count, offset)
+            }
             _ => continue,
         };
         let (below, keys) = match *plan.node(input) {

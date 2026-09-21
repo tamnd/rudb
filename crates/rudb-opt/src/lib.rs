@@ -347,6 +347,7 @@ mod tests {
     use super::*;
 
     use rudb_catalog::Catalog;
+    use rudb_plan::Bound;
 
     /// How wide the plan a text prints is, before anything has run over it.
     fn width(text: &str) -> usize {
@@ -482,7 +483,11 @@ mod tests {
             if !matches!(*plan.node(root), Node::Limit { .. }) {
                 return Ok(());
             }
-            let stacked = plan.add_node(Node::Limit { input: root, count: Some(1), offset: 0 });
+            let stacked = plan.add_node(Node::Limit {
+                input: root,
+                count: Bound::Rows(1),
+                offset: Bound::Rows(0),
+            });
             plan.set_root(stacked);
             Ok(())
         }

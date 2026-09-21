@@ -468,9 +468,14 @@ pub fn rows_stat_into(
         Node::Distinct { input, .. } => guess(of(input), KEPT_BY_A_GROUP_BY),
         Node::Limit { input, count, offset } => {
             let input = of(input);
-            match count {
+            // An offset that is read off the rows while the query runs is a number nobody has
+            // here, so nothing is taken away. That is the safe direction, because every answer in
+            // this arm is an upper bound and subtracting too little keeps it one.
+            let offset = offset.rows().unwrap_or(0);
+            match count.rows() {
                 // `OFFSET` with no `LIMIT` takes rows away and cannot add any, and taking a known
-                // number of rows off a counted one leaves a counted one.
+                // number of rows off a counted one leaves a counted one. A limit read while the
+                // query runs is here too, for the same reason the offset above is.
                 None => input.map(|n| n.saturating_sub(offset)),
                 // A limit is a ceiling even when the input is unknown, which is the one place in
                 // this module where an unknown input still gives an answer. It is an upper bound

@@ -77,6 +77,7 @@ use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
 use crate::percent::LimitPercent;
+use crate::prepared::Prepared;
 use crate::query::Query;
 use crate::register::registries;
 use crate::schema::Schema;
@@ -88,7 +89,7 @@ use crate::source::{
     Dummy, FileScan, Filters, Frequencies, Pushdown, Scan, Series, Summary, Values,
 };
 use crate::strategies::strategies;
-use crate::stream::{Filter, Limit, Project};
+use crate::stream::{Edge, Filter, Limit, Project};
 use crate::topn::TopN;
 use crate::typenames::typenames;
 use crate::window::{Window, Written};
@@ -509,6 +510,19 @@ fn native_frequencies(
         },
     };
     Ok(entries.map(|entries| NativeFrequencies { entries, column: group.column as usize }))
+}
+
+/// One end of a limit, ready to run.
+///
+/// A number the binder worked out comes over as it is. One it could not is an expression over the
+/// limit's own input, because the binder put the value in a column of every row that reaches here,
+/// and it is compiled now so that the first chunk has nothing to do but evaluate it.
+fn edge(plan: &Plan, bound: rudb_plan::Bound, input: &Schema) -> Result<Edge> {
+    Ok(match bound {
+        rudb_plan::Bound::All => Edge::All,
+        rudb_plan::Bound::Rows(rows) => Edge::Rows(rows),
+        rudb_plan::Bound::Read(expr) => Edge::Read(Prepared::one(plan, expr, input)?),
+    })
 }
 
 /// The stored table one node reads straight through, with no filter and nothing else in the way.
@@ -1385,8 +1399,13 @@ impl<'a> Building<'a, '_> {
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
             Node::Limit { input, count, offset } => {
+                // Only a limit that is a pair of numbers here can cap the grouping below it. One
+                // that reads its count off the rows does not have the number yet, and the point of
+                // the cap is to stop the hash table growing before the first row comes out.
                 let max_groups = count
-                    .and_then(|count| count.checked_add(offset))
+                    .rows()
+                    .zip(offset.rows())
+                    .and_then(|(count, offset)| count.checked_add(offset))
                     .and_then(|count| usize::try_from(count).ok());
                 let below = match (plan.node(input).clone(), max_groups) {
                     (
@@ -1407,7 +1426,8 @@ impl<'a> Building<'a, '_> {
                     _ => self.node(input)?,
                 };
                 let schema = below.schema.clone();
-                let limit = Limit::new(count, offset);
+                let limit = Limit::new(edge(plan, count, &schema)?, edge(plan, offset, &schema)?)
+                    .in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "Limit", None);
                 below.then(Arc::new(Watched::new(limit, counters)), schema)
             }

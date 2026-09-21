@@ -8,6 +8,12 @@
 //! is two rows, `LIMIT '3'` is three, `LIMIT 2.5` is three because the conversion rounds, and
 //! `LIMIT DATE '2020-01-01'` is the cast refusing a date rather than a rule of its own.
 //!
+//! An expression that is not settled before the first row is read goes down a second path. A
+//! subquery has to run before there is a value and a call such as `RANDOM()` answers differently
+//! every time it is made, so the binder joins the value in under the limit as a column of every row
+//! and the limit reads it off the first chunk that reaches it. The number is read once and used for
+//! the rest of the query, and the column goes again above the limit.
+//!
 //! A percentage is the same evaluation with a different cast at the end of it and a different node
 //! under it. The value goes to `DOUBLE`, the row count is a share of the input rounded down, and
 //! the offset is applied after the share rather than to it.
@@ -214,17 +220,89 @@ fn a_share_that_is_not_between_nought_and_a_hundred_is_refused() {
     }
 }
 
-/// A subquery is the one shape left over, because the plan node holds a number and not an
-/// expression. The pin answers it by reading the value while the query runs.
+/// A subquery is the shape that cannot be worked out while the query is planned, because it has to
+/// run first. It is read while the query runs instead, which is what the pin does with it.
 #[test]
-fn a_row_count_holding_a_subquery_says_so() {
+fn a_row_count_can_be_a_subquery() {
     let database = database();
-    for sql in [
-        "SELECT i FROM t LIMIT (SELECT 3)",
-        "SELECT i FROM t OFFSET (SELECT 3)",
-        "SELECT i FROM t LIMIT (SELECT 30)%",
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT 3)"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t OFFSET (SELECT 8)"), vec![8, 9]);
+    let sql = "SELECT i FROM t LIMIT (SELECT 3) OFFSET (SELECT 2)";
+    assert_eq!(numbers(&database, sql), vec![2, 3, 4]);
+    let sql = "SELECT i FROM t LIMIT (SELECT count(*) FROM t WHERE i < 4)";
+    assert_eq!(numbers(&database, sql), vec![0, 1, 2, 3]);
+}
+
+/// The column the value is read out of is the query's to see or not, and it is not.
+///
+/// A star is the case that says so, since a star over a limit holding a subquery would otherwise
+/// answer the column the subquery was joined in as well as the columns the table has.
+#[test]
+fn the_column_the_count_is_read_out_of_is_not_a_column_of_the_answer() {
+    let database = database();
+    let sql = "SELECT * FROM t LIMIT (SELECT 2)";
+    let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert_eq!(result.width(), 1, "{sql} answered an extra column");
+    assert_eq!(numbers(&database, sql), vec![0, 1]);
+    assert_eq!(numbers(&database, "VALUES (7), (8), (9) LIMIT (SELECT 2)"), vec![7, 8]);
+    let sql = "SELECT i FROM t UNION ALL SELECT i FROM t LIMIT (SELECT 3)";
+    assert_eq!(numbers(&database, sql), vec![0, 1, 2]);
+}
+
+/// A subquery that answers no row is no limit at all, which is the same rule a written null has.
+#[test]
+fn a_subquery_that_answers_nothing_or_null_leaves_every_row() {
+    let database = database();
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT NULL)").len(), 10);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT i FROM t WHERE false)").len(), 10);
+    assert_eq!(numbers(&database, "SELECT i FROM t OFFSET (SELECT NULL)").len(), 10);
+}
+
+/// The same cast as a row count written out, and so the same failures.
+///
+/// The pin casts this one to `UINT64` rather than to `BIGINT` and so writes three different
+/// messages here from the three it writes for the same values spelled without the subquery. That is
+/// duckdb #9 in our fork rather than something to copy, because a limit that reads differently
+/// depending on which of two paths worked it out is a wrong answer waiting to be found.
+#[test]
+fn a_row_count_read_while_the_query_runs_is_cast_the_way_a_written_one_is() {
+    let database = database();
+    for (sql, expected) in [
+        ("SELECT i FROM t LIMIT (SELECT -1)", "LIMIT/OFFSET cannot be negative"),
+        ("SELECT i FROM t OFFSET (SELECT -1)", "LIMIT/OFFSET cannot be negative"),
+        ("SELECT i FROM t LIMIT (SELECT 'abc')", "Could not convert string 'abc' to INT64"),
+        ("SELECT i FROM t LIMIT (SELECT DATE '2020-01-01')", "(DATE -> BIGINT)"),
     ] {
         let message = refused(&database, sql);
-        assert!(message.contains("holding a subquery"), "{sql}: {message}");
+        assert!(message.contains(expected), "{sql}: {message}");
+    }
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT '3')"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT true)"), vec![0]);
+}
+
+/// A sort under a limit holding a subquery stays a sort, where one under a written count does not.
+///
+/// A top n keeps the smallest count plus offset rows it has seen, and there is no such number to
+/// keep when it only turns up once the query is running. The rows are the same either way, so what
+/// this is pinning is the plan and not the answer, and the pin plans it the same way.
+#[test]
+fn a_row_count_read_while_the_query_runs_does_not_become_a_top_n() {
+    let database = database();
+    let sql = "SELECT i FROM t ORDER BY i DESC LIMIT (SELECT 3)";
+    assert_eq!(numbers(&database, sql), vec![9, 8, 7]);
+    let plan = database.plan(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert!(plan.contains("Sort"), "{sql} planned as {plan}");
+    assert!(!plan.contains("TopN"), "{sql} planned as {plan}");
+}
+
+/// A share written as a subquery is the one shape left over, because the node holds a number.
+#[test]
+fn a_share_holding_a_subquery_says_so() {
+    let database = database();
+    for sql in
+        ["SELECT i FROM t LIMIT (SELECT 30)%", "SELECT i FROM t LIMIT 30 PERCENT OFFSET (SELECT 2)"]
+    {
+        let message = refused(&database, sql);
+        assert!(message.contains("subquery"), "{sql}: {message}");
     }
 }

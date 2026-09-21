@@ -286,7 +286,16 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
                 walk(plan, key.expr, found);
             }
         }
-        Node::Limit { .. } | Node::LimitPercent { .. } => {}
+        // A limit usually reads nothing, and the exception is the one whose count or offset was
+        // written as something the binder could not work out, which reads the number off a column
+        // of its input. That column has to be reported or the pruning below this would take it
+        // away and leave the limit reading a column that is not there.
+        Node::Limit { count, offset, .. } => {
+            for read in [count.read(), offset.read()].into_iter().flatten() {
+                walk(plan, read, found);
+            }
+        }
+        Node::LimitPercent { .. } => {}
         Node::Distinct { on, .. } => list(plan, on, found),
         Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
             list(plan, conditions, found);

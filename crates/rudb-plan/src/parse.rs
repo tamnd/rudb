@@ -17,7 +17,8 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 use crate::expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
 use crate::node::{
-    BuildSide, JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    Bound, BuildSide, JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame,
+    WindowUnit,
 };
 use crate::plan::Plan;
 use crate::{ExprRef, NodeRef, Slice};
@@ -301,9 +302,9 @@ impl Reader<'_> {
                 Ok(Built::unary(move |input| Node::Sort { input, keys }))
             }
             "Limit" => {
-                let count = if c.eat_word("ALL") { None } else { Some(read_count(c)?) };
+                let count = read_bound(plan, c)?;
                 c.expect_word("offset")?;
-                let offset = read_count(c)?;
+                let offset = read_bound(plan, c)?;
                 Ok(Built::unary(move |input| Node::Limit { input, count, offset }))
             }
             "LimitPercent" => {
@@ -436,6 +437,21 @@ fn read_count(c: &mut Cursor<'_>) -> Result<u64> {
         return Err(c.error("expected a row count"));
     }
     c.text[start..c.at].parse().map_err(|_| c.error("that row count does not fit in 64 bits"))
+}
+
+/// One end of a limit, which is `ALL`, a number, or the expression the number is read out of.
+///
+/// Which of the three it is can be told from the first character, because a number starts with a
+/// digit and an expression never does.
+fn read_bound(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Bound> {
+    c.skip_space();
+    if c.eat_word("ALL") {
+        return Ok(Bound::All);
+    }
+    if c.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+        return Ok(Bound::Rows(read_count(c)?));
+    }
+    Ok(Bound::Read(read_expr(plan, c)?))
 }
 
 /// A share of the input, written the way `Display` for a `f64` writes it and ended by a `%`.
