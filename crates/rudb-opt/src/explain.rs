@@ -46,7 +46,9 @@ use std::fmt::Write as _;
 
 use rudb_common::stat::{Class, Classes, Stat, Use};
 use rudb_metrics::{Document, Operator, commas};
-use rudb_plan::{Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, seams_of};
+use rudb_plan::{
+    ColumnBinding, Keys, Node, NodeRef, OperatorRef, PipelineRef, Plan, Shape, keys_of, seams_of,
+};
 use rudb_seam::{Registries, SeamId, Settings};
 
 use crate::estimate::{CARDINALITY, DISTINCT, Facts, rows_stat, rows_stat_into};
@@ -214,7 +216,9 @@ fn printed(
     statistics: Statistics,
 ) -> String {
     let shape = Shape::of(plan);
-    let printing = Printing { plan, facts, shape: &shape, seams, measured, statistics };
+    let keys = keys_of(plan);
+    let printing =
+        Printing { plan, facts, shape: &shape, seams, measured, statistics, keys: &keys };
     let mut out = String::new();
     printing.write_node(plan.root(), 0, false, &mut out);
     write_pipelines(&shape, measured, &mut out);
@@ -270,6 +274,8 @@ struct Printing<'a> {
     seams: Seams<'a>,
     measured: Option<&'a Document>,
     statistics: Statistics,
+    /// What tells each node's rows apart, indexed by node, from `rudb_plan::keys_of`.
+    keys: &'a [Keys],
 }
 
 impl Printing<'_> {
@@ -300,11 +306,15 @@ impl Printing<'_> {
                 .map(|measured| actually(measured, self.shape.operator(node), filtered))
                 .unwrap_or_default()
         };
+        let told = match self.statistics {
+            Statistics::Asked => tells_apart(self.keys.get(node as usize)),
+            Statistics::NotAsked => String::new(),
+        };
         // The estimate goes after the operator rather than in a column of its own, because the tree
         // is indented and a column would have to be wider than the deepest line to line up.
         let _ = writeln!(
             out,
-            "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{marker}{actual}",
+            "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{told}{marker}{actual}",
             "",
             indent = depth * 2
         );
@@ -433,6 +443,46 @@ fn reads(plan: &Plan, facts: &Facts, shape: &Shape) -> Reads {
         }
     }
     reads
+}
+
+/// What tells a node's rows apart, as a bracket on its line.
+///
+/// Printed beside the cardinality because the two answer the same question from opposite ends. The
+/// estimate says roughly how many rows there are and this says what makes any two of them
+/// different, and the second one is the one an enabling rewrite is allowed to read.
+///
+/// Nothing at all when nothing is known, which is most leaves today, because a bracket reading
+/// `[no key]` on every scan of every plan is noise that hides the lines that do say something. The
+/// point of printing this is P1's note that a rewrite which did not fire because an analysis lost a
+/// property two nodes up is invisible otherwise: a reader follows the key up the tree to the node
+/// where it stops, and a column of empty brackets does not help them do that.
+fn tells_apart(keys: Option<&Keys>) -> String {
+    let Some(keys) = keys else { return String::new() };
+    let mut said = Vec::new();
+    if keys.at_most_one_row() {
+        said.push("at most one row".to_owned());
+    } else {
+        let sets: Vec<String> = keys
+            .sets()
+            .iter()
+            .map(|set| set.iter().map(column_name).collect::<Vec<_>>().join(" "))
+            .collect();
+        if !sets.is_empty() {
+            said.push(format!("key {}", among(&sets, "or")));
+        } else if keys.row() {
+            said.push("key the whole row".to_owned());
+        }
+    }
+    let fixed: Vec<String> = keys.constants().map(|column| column_name(&column)).collect();
+    if !fixed.is_empty() {
+        said.push(format!("{} fixed", among(&fixed, "and")));
+    }
+    if said.is_empty() { String::new() } else { format!(" [{}]", said.join(", ")) }
+}
+
+/// A column binding the way the rest of a plan prints one.
+fn column_name(column: &ColumnBinding) -> String {
+    format!("#{}.{}", column.table, column.column)
 }
 
 /// What the planner knew, which is the section `EXPLAIN (STATISTICS)` is asked for.
