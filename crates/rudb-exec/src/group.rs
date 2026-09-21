@@ -1709,6 +1709,19 @@ impl<'a> Aggregate<'a> {
             states[slot * calls + call].counted().expect("a selected COUNT call has a COUNT state")
         };
         let selected = match (self.top_counts, self.having_count) {
+            // A bound that is not below the group count cannot throw a group away, and the loop
+            // below arrives back at every slot in slot order after a whole insertion sort to get
+            // there. Worse than the sort is what naming every slot costs afterwards: a named slot
+            // sends each key column out through a `Value` apiece where an unnamed run goes through
+            // [`Table::column`], which copies the run as it is stored, so a VARCHAR key is an
+            // allocation per group rather than one copy of the block.
+            //
+            // Partitioning is what makes this the ordinary case rather than a corner. The bound is
+            // compared against one partition's groups, so a split by [`RADIX_PARTITIONS`] leaves
+            // each of them holding that many times fewer, and a bound that was well under the group
+            // count before the split is well over it after. ClickBench 39 has 5445 groups under a
+            // bound of 1010 and eighty five of them to a partition.
+            (Some((bound, _)), _) if bound >= groups => None,
             (Some((bound, ranks)), _) => {
                 let mut best = Vec::with_capacity(bound.min(groups));
                 for slot in 0..groups {
@@ -2248,39 +2261,38 @@ impl<'a> Aggregate<'a> {
     /// what N instance tables held and the room that frees may be all that was needed. It also keeps
     /// the ordinary case away from the awkward one: a table that spills before it is handed over has
     /// a file covering every partition, and [`Aggregate::hand_over`] has to drain it row by row.
+    ///
+    /// # A pushed down bound used to raise the line and no longer does
+    ///
+    /// A count descending TopN pushes its bound down here, and the bound is applied when a table is
+    /// finished, so a split applies it once per partition and hands the pipeline above that many
+    /// times as many rows. This asked for [`RADIX_PARTITIONS`] times the bound before it would
+    /// split, which is the group count at which each partition would still hold more groups than
+    /// the bound and the reduction would go back to being worth what it was.
+    ///
+    /// That threshold cost more than it saved. ClickBench 40 groups five columns under a bound of
+    /// 1010, and at ten million rows it has 40,306 groups against a threshold of 64,640, so no
+    /// instance could reach the line at any thread count and the aggregate merged instead of
+    /// splitting. Measured on a 32 thread i9-13900K against a ten million row native table, the
+    /// query ran in 42.2 ms and in 26.1 ms once the threshold went, which is 1.62 times. Nothing
+    /// else in the suite moved: 34, 35, 37, 38 and 39 answer through the encoded count path and
+    /// never reach this decision at all.
+    ///
+    /// Removing the threshold on its own is a wash, 42.2 ms to 40.1. What makes it pay is the
+    /// companion change in [`Aggregate::finishing`], which stops a partition whose groups all fit
+    /// under the bound from naming every slot and sending its keys out through a `Value` apiece.
+    /// Those two together take the aggregate's emit from 17.8 ms of CPU to 1.7, and that is the
+    /// difference. #486 has the rest of the measurement.
+    ///
+    /// The extra rows the pipeline above now gets were priced when a row the TopN rejected still
+    /// built a Vec for its key and a Vec for its whole payload. #1108 made a losing row cost one
+    /// comparison and no allocation, and #1111 and #1123 stopped the TopN decoding strings, so they
+    /// are much cheaper than they were when the threshold was written.
     fn ought_to_partition(&self, table: &Building) -> bool {
         !self.alone
             && self.max_groups.is_none()
             && self.started.load(Ordering::Relaxed) > 1
-            && (table.groups >= self.partition_from() || crowded(&self.memory))
-    }
-
-    /// How large a table has to be before splitting it is worth doing.
-    ///
-    /// [`PARTITION_FROM`] ordinarily, and more than that when a count descending TopN above has
-    /// pushed its bound down here. That bound is applied when a table is finished, and after a split
-    /// there is a table to finish per partition rather than one, so it is applied once per
-    /// [`RADIX_PARTITIONS`] and lets through that many times as many rows. It only stops letting
-    /// through more than it should once each partition would still hold more groups than the bound,
-    /// which is what this asks for.
-    ///
-    /// ClickBench 39 is the query that showed it. It groups five columns down to 5445 groups under a
-    /// bound of 1010, so one table gives the pipeline above 1010 rows and a split gives it all
-    /// 5445, and those rows carry two wide URLs apiece through a project and a top n that run on
-    /// one thread. Partitioning made the aggregate itself scale and handed the difference straight
-    /// back.
-    ///
-    /// The multiplier is [`RADIX_PARTITIONS`] because that is how many tables a split makes, and it
-    /// is worth knowing that the two have moved together once already. #1000 raised the partition
-    /// count from sixteen to sixty four so that a merge could run on more threads, which quadrupled
-    /// this threshold as a side effect and took every aggregate under a bound of a thousand from
-    /// splitting at sixteen thousand groups to splitting at sixty four thousand. #486 has the
-    /// measurement that found it.
-    fn partition_from(&self) -> usize {
-        match self.top_counts {
-            Some((bound, _)) => PARTITION_FROM.max(bound.saturating_mul(self.merged.len())),
-            None => PARTITION_FROM,
-        }
+            && (table.groups >= PARTITION_FROM || crowded(&self.memory))
     }
 
     /// Turns partitioning on for every instance, and puts whatever was already combined where it
@@ -5759,17 +5771,21 @@ mod tests {
         assert_eq!(seen, values);
     }
 
-    /// The same five thousand groups, under a pushed down bound, stay in one table.
+    /// The same five thousand groups, under a pushed down bound, are split all the same.
     ///
     /// The bound is applied when a table is finished, so a split applies it once per partition and
-    /// lets through that many times as many rows as one table would. With five thousand groups
-    /// spread over sixty four partitions not one of them reaches a bound of a thousand, so the
-    /// bound stops doing anything at all and the pipeline above gets every group instead of a
-    /// thousand of them. Splitting is only worth it once a partition would still hold more groups
-    /// than the bound, and that is what the threshold asks, so this table stays whole and the bound
-    /// bites.
+    /// hands the pipeline above more rows than one table would have. That used to be reason enough
+    /// to keep the table whole, and the threshold which did it stopped ClickBench 40 splitting at
+    /// any thread count and cost it 1.62 times. The rows a split hands up are cheap since #1108,
+    /// #1111 and #1123, and the aggregate scaling is worth more than the reduction, so only the
+    /// group count has a say now.
+    ///
+    /// Five thousand groups is over [`PARTITION_FROM`] so this splits, and a bound of a thousand is
+    /// over the seventy eight groups a partition is left holding, so no partition throws anything
+    /// away and the pipeline above gets all five thousand. The TopN up there is what makes that
+    /// right: reducing here is an optimisation and never the thing that gives the answer.
     #[test]
-    fn an_aggregate_under_a_pushed_down_bound_keeps_its_table_in_one_piece() {
+    fn an_aggregate_under_a_pushed_down_bound_is_split_all_the_same() {
         let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
         let (aggregate, out) = aggregate(&plan);
         let aggregate = aggregate.top_counts(1_000, 0);
@@ -5783,15 +5799,15 @@ mod tests {
         aggregate.combine(left).expect("the first instance");
         aggregate.combine(right).expect("the second instance");
         assert!(
-            !aggregate.built.lock().expect("readable").partitioning,
-            "sixty four partitions of eighty groups would let the bound through untouched"
+            aggregate.built.lock().expect("readable").partitioning,
+            "five thousand groups is over the line whatever the bound above says"
         );
         aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(
             answer(&out).len(),
-            1_000,
-            "the bound is applied once and not once per partition"
+            5_000,
+            "a bound over what a partition holds throws nothing away"
         );
     }
 
