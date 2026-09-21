@@ -993,11 +993,17 @@ struct Budget<'a> {
 /// whatever form the scan handed up.
 ///
 /// The difference is not small. `CREATE TABLE t AS SELECT * FROM 'hits.parquet'` over a hundred and
-/// five columns does its reading on every thread in the pool and then flattens the whole answer on
-/// the one thread draining it. The string columns of that file are dictionary encoded, so flattening
-/// them is a copy per row per column, single threaded, at the end of a query that was parallel up to
-/// that point. Measured against duckdb on a nine row group file, that tail is the difference between
-/// getting 1.8 times out of thirty two threads and getting 5.4.
+/// five columns does its reading on every thread in the pool, and the string columns of that file
+/// are dictionary encoded, so flattening them is a copy per row per column. Measured against duckdb
+/// on a nine row group file, keeping the forms is the difference between getting 1.8 times out of
+/// thirty two threads and getting 5.4.
+///
+/// Where the flattening happens matters as much as whether it happens. It is asked for once, before
+/// the query runs, and the root sink does it as it queues each chunk, which is the worker thread
+/// that produced it. It used to be done by the loop that drains the finished queue instead, and that
+/// loop is one thread with every worker already joined: `SELECT` of four columns of six million rows
+/// spent 103ms running and then 225ms flattening, and a single string column spent 68ms running and
+/// then 2452ms in the drain. Per #1124.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Rows {
     /// Going out of the engine, so every column is flattened on the way.
@@ -1106,6 +1112,9 @@ fn run(
     let building = Span::start();
     let query = rudb_exec::build_measured(plan, catalog, cancel, memory, seams, session, &report)?;
     let (built_wall, built_cpu) = building.stop();
+    if going == Rows::ForACaller {
+        query.for_a_caller();
+    }
     let names = query.schema().names();
     let types = query.schema().types();
     let mut held = memory.reservation();
@@ -1126,10 +1135,16 @@ fn run(
             // time, so a dictionary or a constant here would be a form every one of them has to
             // understand to read a row. The decode stops at this line and nothing below it sees a
             // flat column. The other arm is a chunk going into a table, where there is nobody
-            // outside the engine to protect: storage holds the same forms execution does, and this
-            // loop is the one part of a parallel query that runs on a single thread, so a copy made
-            // here is a copy the rest of the pool sits idle through.
-            Rows::ForACaller => chunk.flatten()?,
+            // outside the engine to protect: storage holds the same forms execution does.
+            //
+            // The chunk is flat already, because `for_a_caller` above asked the root to flatten as
+            // it queued and that happened on the worker that produced it. This line is what makes
+            // that an optimisation rather than a promise kept in two places: a chunk that arrives
+            // flat is moved through and a chunk that somehow does not is flattened here, the way
+            // every chunk used to be. It used to be the whole cost of a large result, because this
+            // loop is the one part of a parallel query that runs on a single thread, so the copy
+            // made here was a copy the rest of the pool sat idle through.
+            Rows::ForACaller => chunk.into_flat()?,
             Rows::ForATable => chunk,
         };
         held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX))?;
@@ -1348,5 +1363,30 @@ mod tests {
         };
         assert_eq!(rows(&first), rudb_common::Stat::exact(3, rudb_common::Provenance::RowCount));
         assert_eq!(rows(&after), rudb_common::Stat::exact(4, rudb_common::Provenance::RowCount));
+    }
+
+    /// Every column of a result set is flat, whatever form the operators that made it produced.
+    ///
+    /// The promise a caller outside the engine reads a value at a time relies on. It is kept in the
+    /// root sink now rather than in the loop that drains it, and the reason it is worth a test of
+    /// its own is that the place it is kept moved: a string column of a stored table comes out of
+    /// the scan as views over a shared arena, and a caller that was handed one would be reading a
+    /// form nothing outside this workspace knows about.
+    #[test]
+    fn every_column_of_a_result_reaches_the_caller_flat() {
+        use rudb_vector::Form;
+
+        let database = Database::new();
+        database.execute("CREATE TABLE t (a INTEGER, s VARCHAR)").expect("a table");
+        database
+            .execute("INSERT INTO t VALUES (1, 'a long string that will not fit inline'), (2, 'b')")
+            .expect("two rows");
+        let result = database.query("SELECT a, s, s || 'x' AS j FROM t WHERE a > 0").expect("runs");
+        assert_eq!(result.len(), 2);
+        for chunk in result.chunk_iter() {
+            for (at, column) in chunk.columns().iter().enumerate() {
+                assert_eq!(column.form(), Form::Flat, "column {at} came out encoded");
+            }
+        }
     }
 }
