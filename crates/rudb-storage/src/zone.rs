@@ -128,6 +128,47 @@ impl Range {
     pub fn certain(&self, op: Op, value: &Bound) -> bool {
         self.nulls == 0 && certain(op, value, self.low.as_ref(), self.high.as_ref())
     }
+
+    /// Opens this range far enough to also cover `other`, which is how a coarser level is built.
+    ///
+    /// A row group's range is the ranges of its chunks folded together, and folding is the only way
+    /// to get one: a second pass over the rows would cost the load twice what the zone maps already
+    /// cost it, and the chunks are right there. Everything here is the conservative direction, so a
+    /// folded range rules out a group only when every chunk in it would have been ruled out.
+    ///
+    /// The ends are the smaller of the two and the larger of the two, and either of them being
+    /// unknown makes the folded one unknown, because a range that says nothing about one of its
+    /// chunks says nothing about the group. The exception is a chunk that looked at every row and
+    /// found no value, which is a column of nothing but nulls: it has nothing to say about the ends
+    /// rather than nothing known, and treating those the same would cost a group its ends over one
+    /// empty chunk. That is what `exact` with no `low` means and it is the only way to mean it.
+    ///
+    /// The null counts add. `exact` survives only if both were, since a fold of an exact range and a
+    /// wide one is wide. The totals add and drop to nothing if either was nothing or if they
+    /// overflow, which is where the widest accumulator there is finally has to be checked: a hundred
+    /// and twenty chunks of `BIGINT` rows is where enough of them pile up to matter.
+    pub fn widen(&mut self, other: &Self) {
+        let empty = |range: &Self| range.exact && range.low.is_none() && range.high.is_none();
+        if empty(self) {
+            self.low = other.low.clone();
+            self.high = other.high.clone();
+        } else if !empty(other) {
+            self.low = match (self.low.take(), other.low.clone()) {
+                (Some(mine), Some(theirs)) => Some(mine.smaller(theirs)),
+                _ => None,
+            };
+            self.high = match (self.high.take(), other.high.clone()) {
+                (Some(mine), Some(theirs)) => Some(mine.larger(theirs)),
+                _ => None,
+            };
+        }
+        self.nulls += other.nulls;
+        self.exact &= other.exact;
+        self.sum = match (self.sum, other.sum) {
+            (Some(mine), Some(theirs)) => mine.checked_add(theirs),
+            _ => None,
+        };
+    }
 }
 
 /// The ranges of every column of one chunk.
@@ -165,6 +206,19 @@ impl Zone {
     #[must_use]
     pub fn width(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Opens every column of this zone far enough to also cover `other`.
+    ///
+    /// A column one of the two does not describe is dropped rather than carried, because a zone that
+    /// says nothing about a column keeps its rows, and carrying one side's range for a column the
+    /// other side never looked at would be the one direction that can rule out a row that matches.
+    /// The two widths are the same for every zone of one table, so this is a guard and not a case.
+    pub fn widen(&mut self, other: &Self) {
+        self.columns.truncate(other.columns.len());
+        for (mine, theirs) in self.columns.iter_mut().zip(&other.columns) {
+            mine.widen(theirs);
+        }
     }
 
     /// Whether these probes, taken together, rule the chunk out.
@@ -1009,5 +1063,92 @@ mod tests {
     fn a_date_column_is_left_as_the_plain_integer_it_counts_in() {
         let range = only(LogicalType::Date, &[Value::Date(19_000)]);
         assert_eq!(range.low, Some(Bound::Int(19_000)));
+    }
+
+    #[test]
+    fn folding_two_chunks_gives_the_outer_ends_and_adds_up_everything_that_adds_up() {
+        let mut group = Zone::of(&chunk(&[7, 2, 9]));
+        group.widen(&Zone::of(&chunk(&[40, 50])));
+        let range = group.column(0).expect("one column");
+        assert_eq!(range.low, Some(Bound::Int(2)));
+        assert_eq!(range.high, Some(Bound::Int(50)));
+        assert_eq!(range.nulls, 0);
+        assert!(range.exact, "both chunks walked their rows");
+        assert_eq!(range.sum, Some(108));
+    }
+
+    /// The fold has to agree with the chunks it came from, which is the one thing it must not get
+    /// wrong: a group it rules out is a group whose chunks are never asked.
+    #[test]
+    fn a_fold_rules_out_only_what_both_chunks_would_have_ruled_out() {
+        let left = Zone::of(&chunk(&[10, 20]));
+        let right = Zone::of(&chunk(&[80, 90]));
+        let mut group = left.clone();
+        group.widen(&right);
+        for value in [5, 15, 50, 85, 99] {
+            let probes = [Probe { column: 0, op: Op::Equal, value: Bound::Int(value) }];
+            if group.skips(&probes) {
+                assert!(left.skips(&probes) && right.skips(&probes), "{value} was kept by a chunk");
+            }
+        }
+        // And it does still rule things out, which is the only reason to build it.
+        assert!(group.skips(&[Probe { column: 0, op: Op::Equal, value: Bound::Int(99) }]));
+        assert!(!group.skips(&[Probe { column: 0, op: Op::Equal, value: Bound::Int(50) }]));
+    }
+
+    /// A chunk that looked at every row and found no value has nothing to say about the ends, and
+    /// that is not the same as saying nothing. Treating them the same costs a group its ends over
+    /// one column of nulls, which on a mostly empty column is every group.
+    #[test]
+    fn a_chunk_of_nothing_but_nulls_does_not_take_the_groups_ends_with_it() {
+        let nulls = Vector::from_values(LogicalType::Integer, &[Value::Null, Value::Null])
+            .expect("a column of nulls");
+        let mut group = Zone::of(&chunk(&[10, 20]));
+        group.widen(&Zone::of(&Chunk::new(vec![nulls]).expect("a chunk")));
+        let range = group.column(0).expect("one column");
+        assert_eq!(range.low, Some(Bound::Int(10)));
+        assert_eq!(range.high, Some(Bound::Int(20)));
+        assert_eq!(range.nulls, 2);
+        assert!(group.skips(&[Probe { column: 0, op: Op::Equal, value: Bound::Int(62) }]));
+    }
+
+    /// The other direction. A chunk in a form this cannot read says nothing, and a group holding
+    /// one says nothing either, because the rows it could not see might be the rows that match.
+    ///
+    /// An interval is such a form, which is the first half of this, and the fold is asked about it
+    /// through [`Zone::from_ranges`] rather than through a second chunk, because a column does not
+    /// change type between one chunk and the next and a test should not pretend it does.
+    #[test]
+    fn a_chunk_with_no_ends_at_all_leaves_the_group_with_none() {
+        let held = [Value::Interval { months: 1, days: 0, micros: 0 }];
+        let unreadable = Vector::from_values(LogicalType::Interval, &held).expect("an interval");
+        let silent = Zone::of(&Chunk::new(vec![unreadable]).expect("a chunk"));
+        let range = silent.column(0).expect("one column");
+        assert_eq!(range.low, None, "an interval has no total order anybody agrees on");
+        assert!(!range.exact, "and that is not the same as having looked and found nothing");
+
+        let mut group = Zone::of(&chunk(&[10, 20]));
+        group.widen(&Zone::from_ranges(vec![range.clone()]));
+        let folded = group.column(0).expect("one column");
+        assert_eq!(folded.low, None);
+        assert!(!folded.exact);
+        assert_eq!(folded.sum, None);
+        assert!(!group.skips(&[Probe { column: 0, op: Op::Equal, value: Bound::Int(62) }]));
+    }
+
+    /// One exact chunk and one whose bounds are wider than its rows folds to a wide group, since
+    /// the fold cannot be tighter than the loosest thing in it.
+    #[test]
+    fn a_fold_is_exact_only_when_every_chunk_in_it_was() {
+        let values = vec![Value::Double(1.0), Value::Double(9.0)];
+        let wide = Vector::from_values(LogicalType::Double, &values).expect("a float column");
+        let mut group = Zone::of(&Chunk::new(vec![wide]).expect("a chunk"));
+        let more = vec![Value::Double(4.0)];
+        let second = Vector::from_values(LogicalType::Double, &more).expect("a float column");
+        group.widen(&Zone::of(&Chunk::new(vec![second]).expect("a chunk")));
+        let range = group.column(0).expect("one column");
+        assert!(!range.exact);
+        assert_eq!(range.sum, None);
+        assert_eq!(range.low, Some(Bound::Real(1.0)), "still a bound worth skipping on");
     }
 }

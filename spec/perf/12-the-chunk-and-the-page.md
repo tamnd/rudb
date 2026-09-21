@@ -294,3 +294,52 @@ The fix is not in the storage layer. It is to stop materialising the result: `ru
 ### What this says about the list in section 9
 
 Two of the four items are done and the third, the chunk size, is now the biggest single number left: section 4 measured 8192 as worth about 1.9 times on `sum(v)` and the row groups have removed the reason the chunk had to be small, which was that it was also the unit of storage. It is not removed for free, because 163 groups of 1024 row chunks are 19,532 pipeline calls and at 8192 they would be 2,442, which is most of what the morsel change above is trying to win. The two interact and the morsel change is the cheaper of them, so it goes first.
+
+## 14. The zone map per row group, and the morsel that is one
+
+Written on 21 September 2026, the same day as section 13 and directly on top of it. Section 13 ended by naming what was left of the box: a zone map per group, asked before the chunk zones, and a morsel that covers a run of chunks rather than one. Both are in.
+
+The fold is the part with a decision in it. A group's zone is its chunk zones folded together as the group fills, not a second walk over the rows at the seal, because the chunks are right there and walking twice would cost the load what the zone maps already cost it. Folding is conservative in every direction: the ends open out, the null counts add, an exact range folded with a wide one is wide, and the sums drop to nothing if either side had nothing or if they overflow, which on a hundred and twenty chunks of `BIGINT` is where a `i128` accumulator finally has to be checked rather than assumed. The one case worth naming is a chunk that looked at every row and found no value, which is a column of nothing but nulls. That is not the same as a chunk whose form the walk cannot read, and treating them the same would cost a whole group its ends over one empty chunk, so a range that is exact and has no low end means the first and a range that is not exact and has no low end means the second. Those are the only two ways to have no ends and they have to be told apart.
+
+Above that the change is small because the native file already had the shape. A stripe and a row group are the same thing to a scan, a run of parts written together that can be ruled out together, so the catalog answers `stripe_parts`, `stripe_rows` and `stripe_skips` off the row groups for a table in memory, and `Source::morsels` stopped returning early for a table that is not native. The test there is now on whether the table says how its chunks are grouped, not on what format it is, which is the right test and was the wrong one only because memory used to be the format with no groups.
+
+### What it measured
+
+server2, six cores, twenty million rows, nanoseconds per row, best of four inside a run and the best of three interleaved runs, against the commit before this one. DuckDB is v2.0.0-dev84237 on the same box with the same `threads` setting and out of its own timer.
+
+One thread:
+
+| query | before | after | | DuckDB |
+| --- | ---: | ---: | ---: | ---: |
+| `count(*) WHERE v >= 10` | 0.81 | 0.70 | -14% | 0.90 |
+| `sum(v) WHERE v >= 10` | 2.33 | 2.02 | -13% | 1.85 |
+| `sum(k + v)` | 3.81 | 3.66 | -4% | 3.00 |
+| `count(*) WHERE k = 7` | 0.73 | 0.01 | -98% | 0.15 |
+
+Six threads:
+
+| query | before | after | | DuckDB |
+| --- | ---: | ---: | ---: | ---: |
+| `count(*) WHERE v >= 10` | 0.46 | 0.26 | -44% | 0.45 |
+| `sum(v) WHERE v >= 10` | 0.86 | 0.57 | -35% | 1.00 |
+| `sum(k + v)` | 1.12 | 0.87 | -22% | 1.05 |
+| `count(*) WHERE k = 7` | 0.20 | 0.01 | -95% | 0.15 |
+
+The needle is the row this was built for and it does what section 13 said it would. `count(*) WHERE k = 7` was 14.6 milliseconds at one thread, which over 19,532 chunks is 748 nanoseconds each to decide to read nothing, and it is now 0.3 milliseconds. The 163 group zones rule out 158 of the groups without any of their chunks being looked at, the five that survive have their chunks ruled out by the chunk zones as before, and the scan walks past them inside one morsel instead of returning through the pipeline between each. At six threads it is 4.0 milliseconds down to 0.2. DuckDB answers the same query in 3.0 at either thread count, so this is the first row of the pushdown table where rudb is ahead rather than behind, and it is ahead for the reason section 13 gave: a zone map over 1,024 rows rules out more of this data than one over 122,880 does.
+
+The three queries that read every row were not the point and they moved anyway, more at six threads than at one. That is the morsel and not the zone map. A worker used to be handed one chunk per call into the pipeline and is now handed a run of a hundred and twenty, so the fixed cost of entering and leaving the pipeline is paid 163 times rather than 19,532, and at six threads the handout itself was contended. Two of the four rows now beat DuckDB at six threads and a third is level with it, which is not a claim about either engine so much as a note that the gap section 13 measured as uniformly 1.7 times was partly this.
+
+### The other needle, which did not move
+
+| query, one thread | before | after | DuckDB |
+| --- | ---: | ---: | ---: |
+| `count(*) WHERE k = 7`, prunes | 14.6 ms | 0.3 ms | 3.0 ms |
+| `count(*) WHERE k = 12345678`, does not | 84.5 ms | 88.5 ms | 51.0 ms |
+
+The second row is the one to be careful about, because the first reading of it said four percent slower and a second said twenty four. Neither is a measurement. That query on this box spans 74 to 105 milliseconds run to run for both binaries, the order the binaries are run in moves the answer more than the change does, and `perf stat` over the same work has the branch executing 15.591 billion instructions against 15.848 billion for the commit before it. Fewer instructions and a slower wall clock is the box talking. It is worth writing down because a minimum over repeated runs usually is a good enough filter and here it was not: taking the minimum of a wide distribution and the minimum of a narrow one and subtracting them invents a difference.
+
+The load is unchanged: 0.60 seconds and about 600 MB either way, which is what folding a zone per chunk into a running total costs, which is nothing measurable. It is still the 0.44 seconds and 336 MB of section 13's regression away from where it should be, and that is still waiting on the streaming insert.
+
+### What is left
+
+The chunk size, which is section 9's third item and now the biggest one. The morsel change has taken most of the pipeline call overhead the 8192 chunk was going to win, so the number will be smaller than section 4's 1.9 times, but the rest of that number was the vectorised loops themselves and those are untouched. Then the streaming insert for the load, and then the page pool, so that the 983 KB pages a seal allocates come from somewhere other than the allocator every time.
