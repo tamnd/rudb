@@ -31,6 +31,19 @@
 //! LIMIT 10` over ClickBench that is almost none of them after the first chunk. The rows it hands
 //! back go down the same row at a time path as before, which is what keeps the answer the same.
 //!
+//! # Keeping a row without reading it
+//!
+//! A candidate that is kept is usually beaten later, and on ClickBench 24 an instance keeps about
+//! sixty seven rows to hand ten back. Reading a row out of the chunk is what that costs, and for a
+//! text column read out of a native file it is the most expensive read there is: the dictionary is
+//! compressed in blocks and one value means one block decoded. A wide row pays that per string
+//! column, for a row nobody ends up asking for.
+//!
+//! So a candidate holds a code where the column gave it one, and the value is read in `finalize`,
+//! for the rows that came out on top and no others. See [`Cell`]. The chunk is gone by then and the
+//! dictionary is not, because it belongs to the file rather than to the chunk, and holding it is one
+//! pointer against the string it names.
+//!
 //! The bound moves while the chunk is being walked, since a winner replaces the worst candidate, so
 //! what the pass produces is a superset of the rows that really win. That is the point: it is a
 //! filter and not the decision, and every row it keeps is compared again properly.
@@ -90,13 +103,108 @@ use crate::cutoff::Cutoff;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
-use crate::sort::{Place, compare, rank, settled};
-
-/// One row in the running: the values of its keys, the row itself, and where it arrived.
-type Sortable = crate::sort::Sortable;
+use crate::sort::{Place, compare, rank};
 
 /// Above this bound, moving a sorted candidate array costs more than trimming in batches.
 const SORTED_BOUND: usize = 64;
+
+/// One row in the running: the values of its keys, the row itself, and where it arrived.
+#[derive(Debug)]
+struct Candidate {
+    key: Vec<Value>,
+    values: Vec<Cell>,
+    arrival: crate::sort::Arrival,
+}
+
+/// One column of a candidate row, which is either the value or what it takes to read it later.
+///
+/// A candidate is kept because it beats the worst of the bound held so far, and almost every one of
+/// them is beaten in turn by something that arrives after it. Ten rows come out of an instance and
+/// on ClickBench 24 about sixty seven go in, so most of the rows this holds are read out of the
+/// columns, allocated, and thrown away.
+///
+/// A column read out of a native file arrives as codes over a dictionary the whole query shares, and
+/// a code is four bytes that name the value without reading it. So a candidate coming off such a
+/// column keeps the code, and the value is read in `finalize` for the rows that came out on top.
+/// ClickBench 24 went from 130 million instructions to 87 million on that, a third of the query.
+///
+/// It buys nothing where the same column is also a sort key, since keeping the row is then not what
+/// read the value, and ClickBench 26 pays about seven percent for the bookkeeping. Keys are read a
+/// value at a time and compared as values, and making them codes as well is the change after this
+/// one.
+///
+/// Everything else is read where it is met. A value that is not a code has to be copied out of the
+/// chunk before the chunk goes, and a null is a value like any other here, since the dictionary has
+/// no code for one.
+#[derive(Debug)]
+enum Cell {
+    /// The value, read out of the chunk that carried it.
+    Ready(Value),
+    /// The code that names the value, and the dictionary to read it out of.
+    Coded { dictionary: Arc<Vector>, code: u32 },
+}
+
+impl Cell {
+    /// The cell for one row of one column, keeping the code where the column has one.
+    fn of(column: &Vector, row: usize) -> Result<Self> {
+        if let Some((codes, dictionary)) = column.shared_dictionary_parts() {
+            if column.validity().is_valid(row) {
+                if let Some(code) = codes.get(row) {
+                    return Ok(Self::Coded { dictionary: Arc::clone(dictionary), code: *code });
+                }
+            }
+        }
+        Ok(Self::Ready(column.try_value_at(row)?))
+    }
+
+    /// The value, read now where it was not read when the row was kept.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the dictionary raises when it cannot read the value the code names.
+    fn value(self) -> Result<Value> {
+        match self {
+            Self::Ready(value) => Ok(value),
+            Self::Coded { dictionary, code } => dictionary.try_value_at(code as usize),
+        }
+    }
+
+    /// What this owns away from itself, which for a code is nothing.
+    fn footprint(&self) -> usize {
+        match self {
+            Self::Ready(value) => value.footprint(),
+            Self::Coded { .. } => 0,
+        }
+    }
+}
+
+/// What one candidate row of cells is charged.
+///
+/// The same count [`rows::footprint`] gives a row of values, with a code charged for the four bytes
+/// it is rather than for the value it names. That is the honest number: the value is not there.
+fn charge(values: &[Cell]) -> u64 {
+    let bytes = size_of::<Vec<Cell>>()
+        + values.iter().map(Cell::footprint).sum::<usize>()
+        + size_of_val(values)
+        + usize::try_from(rudb_common::ALLOCATION).unwrap_or(0);
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// Where two candidates sit relative to each other, ties settled by where they arrived.
+///
+/// What [`crate::sort::settled`] does for the sort's own row, which this cannot use because a
+/// candidate holds its row as cells rather than as values.
+fn settled(
+    keys: &[SortKey],
+    left: &Candidate,
+    right: &Candidate,
+    failure: &mut Option<Error>,
+) -> Ordering {
+    match compare(keys, &left.key, &right.key, failure) {
+        Ordering::Equal => left.arrival.cmp(&right.arrival),
+        ordering => ordering,
+    }
+}
 
 /// The first rows of an ordering, without holding the rest.
 #[derive(Debug)]
@@ -114,7 +222,7 @@ pub(crate) struct TopN {
     bound: usize,
     memory: Memory,
     /// What every instance brought, already trimmed to the bound.
-    rows: Mutex<Vec<Sortable>>,
+    rows: Mutex<Vec<Candidate>>,
     /// What those rows are charged, given back once the finished chunks are charged instead.
     charged: Mutex<Vec<Reservation>>,
     /// What the finished chunks are charged, held for as long as they are readable.
@@ -130,7 +238,7 @@ pub(crate) struct TopN {
 /// What one instance of a top N holds while it runs.
 #[derive(Debug)]
 pub(crate) struct Running {
-    kept: Vec<Sortable>,
+    kept: Vec<Candidate>,
     scratch: Scratch,
     charged: Reservation,
     failure: Option<Error>,
@@ -163,9 +271,9 @@ pub(crate) struct Running {
 /// that arrived with its code, so its rank was free at the moment it was kept and searching for it
 /// again is work that was already done.
 ///
-/// It sits next to the candidates rather than in them because `Sortable` is the sort's type and the
-/// sort has no use for a rank. The two are kept in step by the one place that inserts, and anything
-/// that cannot be given a rank turns the whole thing off rather than leaving a hole in it.
+/// It sits next to the candidates rather than in them because it is a fact about the first key only,
+/// where a candidate is a whole row. The two are kept in step by the one place that inserts, and
+/// anything that cannot be given a rank turns the whole thing off rather than leaving a hole in it.
 #[derive(Debug, Default)]
 struct Ranked {
     /// The dictionary the ranks are positions in, `None` until the first candidate says.
@@ -321,7 +429,7 @@ impl TopN {
             trim(&self.keys, kept, self.bound, failure);
             *trimmed = true;
             *cut = (kept.len() == self.bound && self.bound > 0)
-                .then(|| kept[self.bound - 1].0.clone());
+                .then(|| kept[self.bound - 1].key.clone());
             if let Some(reached) = cut.as_ref() {
                 self.reached(reached);
             }
@@ -375,7 +483,7 @@ impl Sink for TopN {
                             beats_rank(&self.keys, &keys, dictionary, rank, rows)
                         });
                     ranked.or_else(|| {
-                        let worst = &local.kept[self.bound - 1].0;
+                        let worst = &local.kept[self.bound - 1].key;
                         worth_looking_at(&self.keys, &keys, worst, rows)
                     })
                 })
@@ -407,7 +515,7 @@ impl Sink for TopN {
             local.place.past(chunk.len());
             recharge(&local.kept, &mut local.charged)?;
             if self.bound > 0 && local.kept.len() == self.bound {
-                self.reached(&local.kept[self.bound - 1].0);
+                self.reached(&local.kept[self.bound - 1].key);
             }
             return Ok(Progress::More);
         }
@@ -469,7 +577,11 @@ impl Sink for TopN {
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let kept = std::mem::take(&mut *self.rows.lock().map_err(poisoned)?);
         let wanted = kept.into_iter().skip(self.offset).take(self.count);
-        let ordered: Vec<Vec<Value>> = wanted.map(|(_, row, _)| row).collect();
+        // The only place a candidate's row is read, which is why a candidate holds codes rather than
+        // values: everything that got this far and lost was never read at all.
+        let ordered: Vec<Vec<Value>> = wanted
+            .map(|candidate| candidate.values.into_iter().map(Cell::value).collect())
+            .collect::<Result<_>>()?;
         let mut held = self.held.lock().map_err(poisoned)?;
         let chunks = rows::chunks(&self.types, &ordered, &mut held)?;
         self.out.fill(chunks)?;
@@ -486,7 +598,7 @@ fn poisoned<T>(_: T) -> Error {
 ///
 /// Ties are settled by where the rows arrived rather than by the order they were handed over, which
 /// is what makes the trim in `combine` give the same answer whichever thread combined first.
-fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut Option<Error>) {
+fn trim(keys: &[SortKey], kept: &mut Vec<Candidate>, bound: usize, failure: &mut Option<Error>) {
     kept.sort_by(|left, right| settled(keys, left, right, failure));
     kept.truncate(bound);
 }
@@ -494,21 +606,22 @@ fn trim(keys: &[SortKey], kept: &mut Vec<Sortable>, bound: usize, failure: &mut 
 /// Reads one row out of the columns and puts it among the candidates, unordered.
 ///
 /// What the batched path does with a row it has decided to keep, and the reason it costs what it
-/// costs: a `Vec` for the key, a `Vec` for the row, and a `Value` per column of each, which for a
-/// string column is a `String`. The answer is what those two together are charged.
+/// costs: a `Vec` for the key, a `Vec` for the row, and a value per column of each. A column that
+/// arrives as codes is kept as a code, see [`Cell`]. The answer is what the two together are
+/// charged.
 fn hold(
     keys: &[Vector],
     chunk: &Chunk,
     row: usize,
     arrival: crate::sort::Arrival,
-    kept: &mut Vec<Sortable>,
+    kept: &mut Vec<Candidate>,
 ) -> Result<u64> {
     let key: Vec<Value> =
         keys.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
-    let values: Vec<Value> =
-        (0..chunk.width()).map(|column| chunk.try_value_at(row, column)).collect::<Result<_>>()?;
-    let taken = rows::footprint(&key) + rows::footprint(&values);
-    kept.push((key, values, arrival));
+    let values: Vec<Cell> =
+        chunk.columns().iter().map(|column| Cell::of(column, row)).collect::<Result<_>>()?;
+    let taken = rows::footprint(&key) + charge(&values);
+    kept.push(Candidate { key, values, arrival });
     Ok(taken)
 }
 
@@ -527,7 +640,7 @@ fn keep(
     }
     let failure = &mut local.failure;
     if local.kept.len() == bound
-        && against(keys, columns, row, &local.kept[bound - 1].0, failure) != Ordering::Less
+        && against(keys, columns, row, &local.kept[bound - 1].key, failure) != Ordering::Less
     {
         return;
     }
@@ -538,8 +651,8 @@ fn keep(
             return;
         }
     };
-    let values: Vec<Value> =
-        match (0..chunk.width()).map(|column| chunk.try_value_at(row, column)).collect() {
+    let values: Vec<Cell> =
+        match chunk.columns().iter().map(|column| Cell::of(column, row)).collect() {
             Ok(values) => values,
             Err(error) => {
                 failure.get_or_insert(error);
@@ -557,9 +670,9 @@ fn keep(
     // reads the morsels it is given in order and each of them from the start, so a row reaching
     // here arrived after everything already held.
     let at = local.kept.partition_point(|candidate| {
-        compare(keys, &candidate.0, &key, failure) != Ordering::Greater
+        compare(keys, &candidate.key, &key, failure) != Ordering::Greater
     });
-    local.kept.insert(at, (key, values, arrival));
+    local.kept.insert(at, Candidate { key, values, arrival });
     local.kept.truncate(bound);
     local.ranked.inserted(at, rank, bound);
 }
@@ -675,9 +788,11 @@ fn still_wanted(key: SortKey, single: bool) -> Comparison {
 /// Released and taken again rather than shrunk, because a reservation gives everything back at once
 /// and has no partial release. Nothing else can be holding the difference at this point, since the
 /// operator is between two reads of its input.
-fn recharge(kept: &[Sortable], scratch: &mut Reservation) -> Result<()> {
-    let footprint =
-        kept.iter().map(|(key, values, _)| rows::footprint(key) + rows::footprint(values)).sum();
+fn recharge(kept: &[Candidate], scratch: &mut Reservation) -> Result<()> {
+    let footprint = kept
+        .iter()
+        .map(|candidate| rows::footprint(&candidate.key) + charge(&candidate.values))
+        .sum();
     scratch.release();
     scratch.grow(footprint)
 }
