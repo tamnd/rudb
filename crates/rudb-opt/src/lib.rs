@@ -121,6 +121,16 @@ pub const RANK: u8 = 11;
 /// because the expressions it leaves in a projection are the ones a `HAVING` should get to run
 /// before, and pushdown is what moves the `HAVING` under them.
 ///
+/// Group key pushdown is after the two passes that turn a mark into a semi join, and that is the
+/// difference between the pass firing on TPC-H q20 and not. It copies the relation that restricts
+/// the outer query so the aggregate underneath builds only the groups that will be read, and the
+/// restriction in q20 is `ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%')`.
+/// Ahead of the mark rewrites that is a filter over a mark join, which is a shape with a column
+/// that exists only to be tested and a copy of which would have to reproduce it; afterwards it is a
+/// semi join, which is a shape that copies. Nothing is given up by waiting, because the copy it
+/// takes is then of a subtree join order has already ordered, and the semi join it inserts is still
+/// in front of the pass that pushes semi joins down.
+///
 /// Top N is last of the passes that rewrite the shape of a plan, because it is the one that fuses
 /// two operators into one rather than moving something around. Everything before it is written
 /// against a sort and a limit, and a pass that had to know about both spellings of the same plan is
@@ -146,10 +156,10 @@ pub static PASSES: [&(dyn Pass + Sync); 19] = [
     &fromkey::AnswersFromTheKey,
     &filter::FilterPushdown,
     &delim::Deliminator,
-    &keys::GroupKeyPushdown,
     &order::JoinOrder,
     &semi::MarkToSemi,
     &semi::DistinctToSemi,
+    &keys::GroupKeyPushdown,
     &semi::SemiPushdown,
     &empty::EmptyResultPullup,
     &extremes::StatisticsPropagation,
