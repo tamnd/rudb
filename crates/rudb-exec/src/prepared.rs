@@ -413,6 +413,24 @@ impl Prepared {
         self.roots.is_empty()
     }
 
+    /// How many of the steps do something to a row.
+    ///
+    /// A column reference and a literal are not among them. A column reference computes nothing at
+    /// all, which is what makes a step that names one free rather than a copy, and a literal is
+    /// materialized once for the whole chunk rather than once a row. What is left is a pass over
+    /// the rows each, so this is roughly what one row costs, counted in the same unit the scan's
+    /// own reading of that row is counted in.
+    ///
+    /// What reads it is the scan, through the weight an operator reports to the pipeline. See
+    /// [`Stream::weight`](rudb_pipeline::Stream::weight).
+    #[must_use]
+    pub fn passes(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| !matches!(step, Step::Column(_) | Step::Constant(_)))
+            .count()
+    }
+
     /// Evaluates every expression over `chunk`, appending one vector each to `out`.
     ///
     /// Appends rather than returns a `Vec`, so a caller in a loop reuses one buffer.

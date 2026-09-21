@@ -41,8 +41,13 @@ pub trait Source: Send + Sync + fmt::Debug {
     /// Most sources have a fixed amount of work and ignore it. A source that can choose how finely
     /// to cut its work needs it, because cutting finer than there are threads to run the pieces
     /// costs the cutting and buys nothing.
-    fn morsels(&self, threads: usize) -> Option<usize> {
-        let _ = threads;
+    ///
+    /// `weight` is what the rest of the pipeline spends on a row, counted the way
+    /// [`Stream::weight`] counts it, with the source's own reading already in it. A source that
+    /// cuts its work by the rows it has needs it, because rows are not what an instance is worth
+    /// and were only ever standing in for it. Ordinary work is 1.
+    fn morsels(&self, threads: usize, weight: usize) -> Option<usize> {
+        let _ = (threads, weight);
         None
     }
 
@@ -93,6 +98,29 @@ pub trait Stream: Send + Sync + fmt::Debug {
     /// answer depends on which thread got there first.
     fn parallel(&self) -> bool {
         true
+    }
+
+    /// How much more than an ordinary operator this one spends on a row.
+    ///
+    /// Zero is ordinary and is what almost everything answers. The scale is the source's own
+    /// reading of a row, so an operator that answers 3 is saying a row costs it about three times
+    /// what reading that row cost, and what the pipeline hands the source is one plus everything
+    /// its operators added.
+    ///
+    /// The source is the only thing that reads it, and it reads it to decide how many instances to
+    /// run. It used to decide on the row count alone, which is the same thing only when every
+    /// query spends the same on a row, and ClickBench is where that stops being true: 39, 40 and
+    /// 42 each prune to about twenty four thousand rows and each ran the whole query on one thread
+    /// of thirty two, while 39's aggregate spends a hundred and eleven nanoseconds on each of them
+    /// grouping five columns with two wide strings among them. Twenty four thousand rows is small
+    /// and twenty four thousand rows of that is not.
+    ///
+    /// It is asked once, before a row has been read, so it is a fact about the shape of the
+    /// operator rather than about its input. An operator whose cost turns on how many groups it
+    /// finds or how many rows survive a filter cannot answer that here and should answer from what
+    /// it does know, which is its columns and its expressions.
+    fn weight(&self) -> usize {
+        0
     }
 
     /// Do whatever this operator needs doing once, before any instance of it runs.
@@ -216,6 +244,16 @@ pub trait Sink: Send + Sync + fmt::Debug {
     fn finalize_degree(&self, ceiling: usize) -> usize {
         let _ = ceiling;
         1
+    }
+
+    /// How much more than an ordinary operator this one spends on a row. See [`Stream::weight`].
+    ///
+    /// This is the end of a pipeline and is usually the expensive part of it, so it is the answer
+    /// that matters most. A hash aggregate hashes a row's key, probes a table with it and compares
+    /// what it lands on, and none of those are the one load and one store an ordinary operator
+    /// spends.
+    fn weight(&self) -> usize {
+        0
     }
 
     /// Do whatever this operator needs doing once, before any instance of it runs.

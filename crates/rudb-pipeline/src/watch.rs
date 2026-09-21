@@ -70,8 +70,8 @@ impl<S: Source> Source for Watched<S> {
         self.inner.morsel()
     }
 
-    fn morsels(&self, threads: usize) -> Option<usize> {
-        self.inner.morsels(threads)
+    fn morsels(&self, threads: usize, weight: usize) -> Option<usize> {
+        self.inner.morsels(threads, weight)
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
@@ -96,6 +96,11 @@ impl<S: Stream> Stream for Watched<S> {
 
     fn parallel(&self) -> bool {
         self.inner.parallel()
+    }
+
+    /// Passed through, for the same reason `finalize_degree` below is.
+    fn weight(&self) -> usize {
+        self.inner.weight()
     }
 
     /// Counted against this operator the way its pushes are, because it is its work.
@@ -153,6 +158,16 @@ impl<K: Sink> Sink for Watched<K> {
 
     fn parallel(&self) -> bool {
         self.inner.parallel()
+    }
+
+    /// Passed through, because the wrapper is not the thing that knows what a row costs.
+    ///
+    /// The same trap as `finalize_degree` below, and it caught the same way. Every operator the
+    /// engine builds is wrapped in one of these, so a weight that stops here is a weight nothing
+    /// ever reads, and the default it falls back to is zero, which says a grouped aggregate over
+    /// five columns costs a row no more than a projection that renames one.
+    fn weight(&self) -> usize {
+        self.inner.weight()
     }
 
     /// Passed through, because the wrapper is not the thing that knows how wide the finish is.
