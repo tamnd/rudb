@@ -1,10 +1,11 @@
 //! The handle everything else hangs off.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rudb_bind::{Bound, Parameters};
-use rudb_catalog::{Catalog, Entry, View};
+use rudb_catalog::{Catalog, Entry, QualifiedName, View};
 use rudb_common::stat::Provenance;
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_metrics::{Document, Report, Span};
@@ -414,22 +415,36 @@ impl Database {
 /// Every table goes into one file under one generation, so the rename that publishes it publishes
 /// all of them at once and a reader never sees half a checkpoint.
 ///
-/// The whole file is rewritten rather than appended to, so a table already backed by the file is
-/// read back out of it and written again. That is not free and it is not what the two header slots
-/// are for, but it is what makes a second table possible at all, and a checkpoint over a catalog
-/// where nothing changed still does nothing.
+/// A table already backed by the file is carried forward by its directory pointer rather than read
+/// back out and written again, which is what the two header slots are for. The tables that changed
+/// go on the end of the file in a new generation, and the slot write that publishes them is what
+/// makes the whole of it atomic. A checkpoint over a catalog where nothing changed still does
+/// nothing.
 ///
-/// The tables are rebound to the new file afterwards. Without that the catalog would go on reading
-/// the file the rename replaced, which still answers correctly because its bytes are unchanged and
-/// an open handle keeps them, but which would be kept alive on disk by every checkpoint for as long
-/// as the database is open.
+/// The rewrite below it is still there for the cases the append cannot answer. Carrying a table
+/// forward means carrying forward what the committed generation says, so a generation that names a
+/// table the catalog no longer has, or does not name one the catalog says is native, is one where
+/// the file and the catalog disagree about which tables exist, and the honest answer is to write
+/// all of them again.
+///
+/// The tables are rebound afterwards. Without that the catalog would go on reading the generation
+/// before this one, which still answers correctly because its bytes are unchanged, but which would
+/// be kept alive by every checkpoint for as long as the database is open.
 fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     let names = catalog.tables().map(|table| table.name().clone()).collect::<Vec<_>>();
     if names.is_empty() {
         return Err(Error::not_implemented("a native database with no table"));
     }
-    if catalog.tables().all(|table| table.rows().is_native()) {
+    // Nothing to write is every table already in the file and the file holding no other. The second
+    // half is what a drop leaves behind: every table that is left is still native, and without
+    // asking the file which tables it names the checkpoint would decide there was nothing to do and
+    // the dropped one would still be there on the next open.
+    let clean = catalog.tables().all(|table| table.rows().is_native());
+    if clean && committed(path)?.is_some_and(|held| held == wanted(&names)) {
         return Ok(());
+    }
+    if appended(path, catalog, &names)? {
+        return rebind(path, catalog, &names);
     }
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     if temporary.exists() {
@@ -452,12 +467,81 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     let writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
     writer.finish()?;
     std::fs::rename(&temporary, path).map_err(|error| Error::io(error.to_string()))?;
+    rebind(path, catalog, &names)
+}
+
+/// Which tables the committed file names, or `None` for a path nothing has been written to yet.
+///
+/// A path that is there but is not a native file this build can read is an error rather than a
+/// `None`, because the caller's other answer is to write the whole file, and writing over something
+/// that might be somebody else's is worse than refusing.
+fn committed(path: &Path) -> Result<Option<BTreeSet<String>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let held = rudb_native::Catalog::open(path)?;
+    Ok(Some(held.names().map(str::to_string).collect()))
+}
+
+/// The same set of names, taken from the catalog instead.
+fn wanted(names: &[QualifiedName]) -> BTreeSet<String> {
+    names.iter().map(|name| name.table.clone()).collect()
+}
+
+/// Points every table at the generation the file now holds.
+fn rebind(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Result<()> {
     let native = rudb_native::Catalog::open(path)?;
-    for name in &names {
+    for name in names {
         let reader = native.table(&name.table)?;
         catalog.table_mut(name)?.rebind_native(reader)?;
     }
     Ok(())
+}
+
+/// Writes the tables that changed into a new generation over the committed file, if it can.
+///
+/// It can when the file exists and names exactly the tables the catalog says are already native.
+/// Then the ones it names are carried forward untouched and the rest are appended, and the cost of
+/// the checkpoint is the size of what changed rather than the size of the database. That is the
+/// difference between loading eight TPC-H tables one statement at a time and loading one of them
+/// eight times over.
+///
+/// It cannot when the file is not there, when nothing in the catalog is native yet, or when the two
+/// disagree about which tables exist, and the caller writes the whole file instead. A file that is
+/// there but is not a native file this build can read is an error either way, so the error from
+/// reading it is returned rather than swallowed into a rewrite that would overwrite it.
+fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Result<bool> {
+    let Some(held) = committed(path)? else { return Ok(false) };
+    if held.is_empty() {
+        return Ok(false);
+    }
+    let native = names
+        .iter()
+        .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_native()))
+        .map(|name| name.table.clone())
+        .collect::<BTreeSet<_>>();
+    if held != native {
+        return Ok(false);
+    }
+    let dirty =
+        names.iter().filter(|name| !native.contains(&name.table)).cloned().collect::<Vec<_>>();
+    let mut writer: Option<rudb_native::Writer> = None;
+    for name in &dirty {
+        let table = catalog.table(name)?;
+        let fields = table.columns().to_vec();
+        let columns = (0..fields.len()).collect::<Vec<_>>();
+        let mut open = match writer.take() {
+            None => rudb_native::Writer::open(path, name.table.clone(), fields)?,
+            Some(writer) => writer.next(name.table.clone(), fields)?,
+        };
+        for at in 0..table.rows().chunk_count() {
+            open.append(&table.rows().read(at, &columns)?)?;
+        }
+        writer = Some(open);
+    }
+    let Some(writer) = writer else { return Ok(false) };
+    writer.finish()?;
+    Ok(true)
 }
 
 /// One pipeline instance's place in the source, and the run of chunks it is holding.

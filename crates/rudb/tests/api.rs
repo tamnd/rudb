@@ -73,6 +73,136 @@ fn several_tables_go_into_one_file_and_come_back_out_of_it() {
     std::fs::remove_file(path).expect("removes the temporary database");
 }
 
+/// A table already in the file is carried forward rather than written again.
+///
+/// The observable part of an append is what it does not do, so this measures it. A table is
+/// committed, and then a one row table is added to a file holding a lot of rows and to a file
+/// holding few. A checkpoint that rewrote the file would take time in proportion to what was
+/// already in it; one that appends takes the same time either way.
+///
+/// The bound is loose on purpose, because a test that pins a ratio on a shared machine is a test
+/// that fails for reasons that are nobody's fault. What a rewrite costs here is two orders of
+/// magnitude, so ten times is a gap a rewrite cannot fit through and scheduling noise cannot open.
+#[test]
+fn a_committed_table_is_carried_forward_and_not_written_again() {
+    fn add_one_row_to_a_file_of(rows: u64) -> std::time::Duration {
+        let path = std::env::temp_dir()
+            .join(format!("rudb-api-append-{rows}-{}.rudb", std::process::id()));
+        let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+        let database = Database::open(&name).expect("a file name starts a native database");
+        database
+            .execute(&format!(
+                "CREATE TABLE big AS SELECT i AS a, i * 2 AS b FROM range(0, {rows}) t(i)"
+            ))
+            .expect("creates");
+        database.execute("CHECKPOINT").expect("commits");
+        database.execute("CREATE TABLE one AS SELECT 1 AS a").expect("creates the second");
+        let start = std::time::Instant::now();
+        database.execute("CHECKPOINT").expect("commits the second");
+        let taken = start.elapsed();
+        // Both are there and both are right, so the cheap checkpoint is an append and not a write
+        // that was skipped.
+        assert_eq!(
+            database.value("SELECT count(*) FROM big").expect("reads"),
+            Value::BigInt(rows as i64)
+        );
+        assert_eq!(database.value("SELECT sum(a) FROM one").expect("reads"), Value::HugeInt(1));
+        drop(database);
+        let reopened = Database::open(&name).expect("the native database reopens");
+        assert_eq!(
+            reopened.value("SELECT count(*) FROM big").expect("reads after reopening"),
+            Value::BigInt(rows as i64)
+        );
+        drop(reopened);
+        std::fs::remove_file(path).expect("removes the temporary database");
+        taken
+    }
+
+    let small = add_one_row_to_a_file_of(1_000);
+    let large = add_one_row_to_a_file_of(2_000_000);
+    assert!(
+        large < small.max(std::time::Duration::from_millis(50)) * 10,
+        "adding one row to a file of two million took {large:?} against {small:?} for a file of a \
+         thousand, which is the whole file being written again"
+    );
+}
+
+/// Several appends in a row, which is what alternating the two header slots is for.
+///
+/// One append writes the slot the committed generation did not use. The next one has to write the
+/// first slot again, and a reader has to keep picking the higher generation rather than the lower
+/// one that is still sitting in the header beside it. Five tables is enough to go round twice.
+#[test]
+fn a_file_takes_one_table_after_another_and_reads_back_every_one() {
+    let path = std::env::temp_dir().join(format!("rudb-api-slots-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    for table in 1..=5 {
+        let database = Database::open(&name).expect("the native database opens");
+        database
+            .execute(&format!(
+                "CREATE TABLE t{table} AS SELECT i AS a, 'row' || i AS s FROM range(0, 100) x(i)"
+            ))
+            .expect("creates");
+        database.execute("CHECKPOINT").expect("commits");
+        drop(database);
+    }
+    let reopened = Database::open(&name).expect("the native database reopens");
+    for table in 1..=5 {
+        assert_eq!(
+            reopened
+                .value(&format!("SELECT count(*) FROM t{table}"))
+                .unwrap_or_else(|error| panic!("t{table} reads back: {error}")),
+            Value::BigInt(100)
+        );
+        // The strings too, because a global dictionary is built per table per generation and a
+        // carried forward table's is the one the generation that wrote it left behind.
+        assert_eq!(
+            reopened
+                .value(&format!("SELECT s FROM t{table} WHERE a = 7"))
+                .expect("the varchar reads back"),
+            Value::Varchar("row7".into())
+        );
+    }
+    drop(reopened);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+/// A dropped table leaves the file, which it can only do by the file being written again.
+///
+/// Every table left after a drop is still committed, so a checkpoint that asked only whether
+/// anything had changed would find nothing and the dropped table would come back at the next open.
+#[test]
+fn a_dropped_table_is_gone_from_the_file_and_the_rest_are_not() {
+    let path = std::env::temp_dir().join(format!("rudb-api-drop-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    for table in ["a", "b", "c"] {
+        database
+            .execute(&format!("CREATE TABLE {table} AS SELECT {} AS x", table.len()))
+            .expect("creates");
+        database.execute("CHECKPOINT").expect("commits");
+    }
+    database.execute("DROP TABLE b").expect("drops");
+    database.execute("CHECKPOINT").expect("commits the drop");
+    drop(database);
+
+    let reopened = Database::open(&name).expect("the native database reopens");
+    assert_eq!(
+        reopened.value("SELECT sum(x) FROM a").expect("the first is there"),
+        Value::HugeInt(1)
+    );
+    assert_eq!(
+        reopened.value("SELECT sum(x) FROM c").expect("the third is there"),
+        Value::HugeInt(1)
+    );
+    assert!(
+        reopened.execute("SELECT * FROM b").is_err(),
+        "the dropped table is not in the file the next process opens"
+    );
+    drop(reopened);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
 #[test]
 fn two_connections_are_two_views_of_one_database() {
     let database = Database::new();
