@@ -6,6 +6,14 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.71
+
+A patch release of one pull request, which is a speed change that turned out to be a correctness change as well. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
+
+`AVG` over a decimal column adds the integers the column stores and divides once at the end, instead of turning every row into a double and dividing that by a hundred before adding it (#1121). A decimal is an integer with the type saying where the point goes, so the exact treatment `AVG` over an integer column already had was always the right one for both. I found it by sampling TPC-H q1 at one thread and seeing a quarter of the query inside the routine that widens a 128 bit integer to a double, which was surprising because nothing in q1 is 128 bits wide. The call is on the running total, on the one row that ends the exact phase, and it ran on all six million rows because a pure call can be run before the compiler knows which side of the branch it wants. q1 goes from 0.4650 to 0.3600 CPU seconds on the native file at SF1, and the 22 query suite from 4.3250 to 4.2050.
+
+Two of q1's answers change, and both changes are improvements. All twelve cells of its three average columns now agree with duckdb to the last digit, where before they drifted, because a per row division rounds a hundred and fifty thousand times per group and those roundings do not cancel. And q1 is repeatable for the first time: a parallel average used to add its partial sums in thread completion order, so every run of every build answered it slightly differently, and an exact integer total does not depend on that order.
+
 ## 0.3.70
 
 A patch release of two pull requests, both of them found by sampling one TPC-H query and both of them the same kind of mistake. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
