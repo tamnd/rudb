@@ -155,6 +155,18 @@ impl<K: Sink> Sink for Watched<K> {
         self.inner.parallel()
     }
 
+    /// Passed through, because the wrapper is not the thing that knows how wide the finish is.
+    ///
+    /// Everything in the engine is wrapped in one of these, so a question that stops here is a
+    /// question that is never asked. This one stopped here, and the default it fell back to is one,
+    /// so every pipeline borrowed as many threads as its source had morsels and finished on those
+    /// however many the sink said it could use. On a thirty two thread machine `COUNT(DISTINCT
+    /// UserID) GROUP BY RegionID` over a million rows cut sixteen morsels and then deduplicated nine
+    /// hundred thousand pairs on sixteen threads with the other half of the machine parked.
+    fn finalize_degree(&self, ceiling: usize) -> usize {
+        self.inner.finalize_degree(ceiling)
+    }
+
     /// Counted against this operator the way its chunks are, because it is its work.
     fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
         let measure = Measure::start(&self.counters);
