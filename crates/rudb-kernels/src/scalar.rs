@@ -1421,6 +1421,15 @@ pub(crate) struct Like {
 /// values rather than a scatter, and it is a whole number of words either way.
 const LIKE_GROUP: usize = 1024;
 
+/// The place of `code`, given the whole map or an empty slice where there is nothing to translate.
+///
+/// See [`rudb_vector::TextSource::places`]. The empty slice is the no map case rather than an
+/// `Option` because this runs once a row and a slice that answers `None` to every question costs a
+/// bounds check, where an `Option` around the loop costs a branch the loop has to carry.
+fn placed(places: &[u32], code: usize) -> usize {
+    places.get(code).map_or(code, |place| *place as usize)
+}
+
 /// A `LIKE` answered once per distinct value, for a dictionary that outlives the chunk.
 ///
 /// The memo used to be a byte a value holding unknown, no or yes, and the row loop probed it at a
@@ -1439,6 +1448,15 @@ const LIKE_GROUP: usize = 1024;
 /// The memo also decides a whole group at a time rather than a value at a time. Deciding a group is
 /// a walk over 1,024 consecutive dictionary values, which is one payload block read in the order it
 /// decodes to rather than a scatter across a gigabyte of them.
+///
+/// It is indexed by where the dictionary places a value rather than by the code that names it, which
+/// for a file backed dictionary are two different orders. A group is then a run of the memo as well
+/// as a run of the payload, so deciding one is thirty two whole word writes rather than a thousand
+/// read modify writes landing on a thousand different lines of a shared array. Indexing it by code
+/// was measured at 1.56 times the cost of this on ClickBench 23, where `URL` has enough values that
+/// every one of those writes is its own line and thirty two threads are fighting over all of them.
+/// What it costs instead is one more load in the row loop, to turn the code into the place, and that
+/// load is into a map of four bytes a value against a memo of two bits.
 ///
 /// A group is only worth deciding whole where the chunk asking is a scan rather than what a
 /// selective filter left behind. A chunk of ten rows that happen to point at ten distant values has
@@ -1464,26 +1482,36 @@ struct StableLike {
 const MEMO_VALUES: usize = 32;
 
 impl StableLike {
-    /// The word `code` lives in and how far into it the pair of bits sits.
-    fn slot(code: usize) -> (usize, usize) {
-        (code / MEMO_VALUES, code % MEMO_VALUES * 2)
+    /// The word `place` lives in and how far into it the pair of bits sits.
+    fn slot(place: usize) -> (usize, usize) {
+        (place / MEMO_VALUES, place % MEMO_VALUES * 2)
     }
 
-    /// Whether `code` matches, or `None` where nothing has decided it yet.
+    /// Whether the value at `place` matches, or `None` where nothing has decided it yet.
     ///
     /// One load for both bits, which is the whole point of packing them together: this runs once a
     /// row over a memo too big to stay in the last level cache, so a second array would be a second
     /// miss for a question the first one already answered.
-    fn peek(&self, code: usize) -> Option<bool> {
-        let (index, shift) = Self::slot(code);
+    fn peek(&self, place: usize) -> Option<bool> {
+        let (index, shift) = Self::slot(place);
         let word = self.state.get(index)?.load(Ordering::Acquire);
         ((word >> shift) & 1 == 1).then(|| (word >> (shift + 1)) & 1 == 1)
     }
 
     /// Decides one value, which is what a chunk too small to be a scan asks for.
-    fn decide_one(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
+    ///
+    /// The value is read by the code that names it, since that is what reading one value takes, and
+    /// the answer is written where the dictionary places it, since that is what the memo is indexed
+    /// by.
+    fn decide_one(
+        &self,
+        code: usize,
+        place: usize,
+        like: &Like,
+        characters: &mut Vec<char>,
+    ) -> Result<()> {
         let held = like.holds_vector(&self.dictionary, code, characters)?;
-        let (index, shift) = Self::slot(code);
+        let (index, shift) = Self::slot(place);
         self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
         Ok(())
     }
@@ -1502,26 +1530,24 @@ impl StableLike {
     /// because a sweep may hand over less than a group at a time. Nothing reads a bit before it is
     /// written, since a thread that finds the value undecided walks it itself.
     ///
-    /// The group is a run of the dictionary in the order it stores its values, which for a file
-    /// backed dictionary is not the order of the codes, so the memo slots a group writes are spread
-    /// across it. That is the right way round: the walk is what costs, because it decodes a block,
-    /// and the row loop reads a slot once a row and must not pay a lookup to find it.
+    /// The group is a run of places, so it is a run of the payload and a run of the memo at the same
+    /// time. The sweep hands the values over in that order and the answers go back as whole words,
+    /// which is thirty two writes for a thousand values.
     ///
     /// Two threads landing on the same group now decode the same block twice where one used to
     /// decode it and the other wait on the lock behind it. That is the trade and it is a good one:
     /// a scan hands each thread its own parts and the dictionary has seventeen thousand blocks, so
     /// the collision is rare, and what it costs when it happens is one block decoded twice rather
     /// than every block kept for the length of the query.
-    fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
-        let place = self.dictionary.placed_text(code)?;
+    fn decide_group(&self, place: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
         let first = place / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
-        let mut decided: Vec<(usize, bool)> = Vec::with_capacity(last - first);
+        let mut decided: Vec<bool> = Vec::with_capacity(last - first);
         let mut at = first;
         while at < last {
             let stopped =
-                self.dictionary.sweep_text(at, last, &mut |index: usize, text: &[u8]| {
-                    decided.push((index, like.holds_loan(text, characters)?));
+                self.dictionary.sweep_text(at, last, &mut |_index: usize, text: &[u8]| {
+                    decided.push(like.holds_loan(text, characters)?);
                     Ok(())
                 })?;
             if stopped <= at {
@@ -1529,9 +1555,14 @@ impl StableLike {
             }
             at = stopped;
         }
-        for (decided, held) in decided {
-            let (index, shift) = Self::slot(decided);
-            self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
+        // A group opens a word, because it is a thousand values and a word holds thirty two, so the
+        // only partial word is the one the end of the dictionary leaves behind.
+        for (word, held) in decided.chunks(MEMO_VALUES).enumerate() {
+            let mut bits = 0;
+            for (within, held) in held.iter().enumerate() {
+                bits |= (1 | u64::from(*held) << 1) << (within * 2);
+            }
+            self.word(first / MEMO_VALUES + word)?.fetch_or(bits, Ordering::Release);
         }
         Ok(())
     }
@@ -1682,20 +1713,25 @@ fn like_stable(
         return like_vector_run(dictionary, codes, like, base, rows, returns);
     }
     let bulk = rows >= LIKE_GROUP;
+    // The map the memo is indexed through, taken once for the chunk rather than a call a row, and
+    // only where it names every value, so that a code the dictionary covers always finds its place.
+    let places =
+        dictionary.places_text().filter(|places| places.len() == dictionary.len()).unwrap_or(&[]);
     let mut out = vec![false; rows];
     let mut characters = Vec::new();
     let validity = over_valid(rows, base, |index| {
         let code = codes[index] as usize;
-        out[index] = match cache.peek(code) {
+        let place = placed(places, code);
+        out[index] = match cache.peek(place) {
             Some(held) => held,
             None => {
                 if bulk {
-                    cache.decide_group(code, like, &mut characters)?;
+                    cache.decide_group(place, like, &mut characters)?;
                 } else {
-                    cache.decide_one(code, like, &mut characters)?;
+                    cache.decide_one(code, place, like, &mut characters)?;
                 }
                 cache
-                    .peek(code)
+                    .peek(place)
                     .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?
             }
         };

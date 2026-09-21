@@ -520,6 +520,18 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     fn placed(&self, index: usize) -> Result<usize> {
         Ok(index)
     }
+    /// Every place at once, in position order, for a caller that needs one per row.
+    ///
+    /// [`placed`](Self::placed) is a call through a trait object, and something that keeps a fact per
+    /// value under its place has to turn a position into a place once a row to read it back. That is
+    /// a call in the row loop, which is the one place that cannot afford one, so a caller that is in
+    /// that position takes the whole map once a chunk and indexes it.
+    ///
+    /// The answer is `None` where the source does not keep such a map, which includes every source
+    /// that places a value where it names it, and the caller then has nothing to translate.
+    fn places(&self) -> Option<&[u32]> {
+        None
+    }
     /// Hands `body` the values stored at the places from `first` up to at most `limit`, and answers
     /// where it stopped.
     ///
@@ -2079,6 +2091,17 @@ impl Vector {
         match &self.body {
             Body::ExternalText { source } => source.placed(index),
             _ => Ok(index),
+        }
+    }
+
+    /// Every place at once, or `None` where the values sit where they are named.
+    ///
+    /// See [`TextSource::places`]. This is for a caller that has to place a value once a row and so
+    /// cannot go through [`Self::placed_text`], which is a call through a trait object.
+    pub fn places_text(&self) -> Option<&[u32]> {
+        match &self.body {
+            Body::ExternalText { source } => source.places(),
+            _ => None,
         }
     }
 

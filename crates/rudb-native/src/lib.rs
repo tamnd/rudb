@@ -2095,6 +2095,10 @@ impl TextSource for NativeText {
         self.placed_at(index)
     }
 
+    fn places(&self) -> Option<&[u32]> {
+        self.code_ranks()
+    }
+
     fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
         if index >= self.values {
             return Ok(None);
