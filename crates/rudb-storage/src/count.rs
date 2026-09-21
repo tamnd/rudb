@@ -668,7 +668,7 @@ mod tests {
             (LogicalType::UBigInt, Value::UBigInt(1)),
             (LogicalType::Double, Value::Double(1.0)),
             (LogicalType::Varchar, Value::Varchar("a".into())),
-            (LogicalType::Blob, Value::Blob(vec![1].into())),
+            (LogicalType::Blob, Value::Blob(vec![1])),
             (LogicalType::Date, Value::Date(1)),
             (LogicalType::Timestamp, Value::Timestamp(1)),
             (LogicalType::Boolean, Value::Boolean(true)),

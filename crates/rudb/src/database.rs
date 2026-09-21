@@ -8,7 +8,6 @@ use rudb_catalog::{Catalog, Entry, View};
 use rudb_common::stat::Provenance;
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_metrics::{Document, Report, Span};
-
 use rudb_parse::ast::Ast;
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_vector::{Chunk, Form, Vector};
