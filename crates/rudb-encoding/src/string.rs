@@ -246,6 +246,17 @@ impl Flat {
         self.bytes
     }
 
+    /// The buffer and the ends that divide it, for a caller building its own layout over them.
+    ///
+    /// [`into_bytes`](Self::into_bytes) is enough for a caller that already knows where the values
+    /// end, which is what a global dictionary's stored offsets are. A caller that does not know has
+    /// only [`iter`](Self::iter), and walking that to build a run of boundaries copies out numbers
+    /// the chunk already holds. This hands both halves over and keeps the one allocation each.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Vec<usize>) {
+        (self.bytes, self.ends)
+    }
+
     fn into_values(self) -> Vec<Vec<u8>> {
         let mut values = Vec::with_capacity(self.len());
         let mut at = 0;
