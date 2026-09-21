@@ -28,7 +28,7 @@ use rudb_pipeline::Lease;
 use crate::key::{mix, spread};
 
 /// How many radix partitions the pairs are spread over.
-pub(crate) const PARTITIONS: usize = 16;
+pub(crate) const PARTITIONS: usize = 256;
 
 /// A pair bucket nobody has written to yet.
 const EMPTY: u32 = u32::MAX;
