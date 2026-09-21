@@ -84,6 +84,7 @@ pub use compare::{
 pub use fallback::Kernel;
 pub use logic::{Connective, combine, is_true};
 pub use membership::{Members, in_set};
+pub use peel::{Found, Lookup};
 pub use prepare::{Held, Recipe};
 pub use scalar::{call, call_prepared, call_values};
 pub use select::{refine as refine_flags, selection};
