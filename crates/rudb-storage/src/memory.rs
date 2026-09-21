@@ -54,6 +54,15 @@
 //! already has rather than by reading twenty million rows, which is what `null_count`,
 //! `exact_extremes` and `exact_sum` are for and what a native file has always done from its
 //! directory. The load already paid for them, and [`MemoryTable::stats_ns`] is what it paid.
+//!
+//! The zone maps cannot say how many distinct values a column holds, which is the number every
+//! cardinality estimate in the optimizer is built on, so there is a second thing built on the way in
+//! next to them: one bottom-k sketch a column, over the whole table rather than per chunk, which is
+//! `count.rs`. It is fixed size, so it costs the same 128 KB a column whether the table is a
+//! thousand rows or a billion, and it is exact rather than estimated for any column with fewer distinct
+//! values in it than the sketch has room for. [`MemoryTable::distinct_values`] is the exact half,
+//! which a `COUNT(DISTINCT c)` may be read straight out of, and [`MemoryTable::distinct_estimate`]
+//! is the one the estimator asks.
 
 use std::time::Instant;
 
@@ -62,6 +71,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::vector::VECTOR_SIZE;
 use rudb_vector::{Chunk, Vector};
 
+use crate::count::Counts;
 use crate::zone::{Probe, Range, Zone};
 
 /// How many rows one row group holds.
@@ -116,14 +126,23 @@ pub struct MemoryTable {
     open_zone: Option<Zone>,
     /// One per chunk, in the same numbering as `slots`.
     zones: Vec<Zone>,
+    /// The distinct count of every column, over the whole table rather than per chunk.
+    ///
+    /// Per table and not per chunk because the question it answers is about the column, and a
+    /// sketch a chunk is a sketch of a thousandth of the column that would have to be unioned with
+    /// every other one to say anything. The sketch is fixed size, so one that sees every row costs
+    /// the same as one that sees a chunk.
+    counts: Counts,
     rows: usize,
     stats_ns: u64,
+    counts_ns: u64,
 }
 
 impl MemoryTable {
     /// An empty table of the given column types.
     #[must_use]
     pub fn new(types: Vec<LogicalType>) -> Self {
+        let counts = Counts::new(types.len());
         Self {
             types,
             groups: Vec::new(),
@@ -132,8 +151,10 @@ impl MemoryTable {
             open_rows: 0,
             open_zone: None,
             zones: Vec::new(),
+            counts,
             rows: 0,
             stats_ns: 0,
+            counts_ns: 0,
         }
     }
 
@@ -208,6 +229,9 @@ impl MemoryTable {
             Some(open) => open.widen(&zone),
             None => self.open_zone = Some(zone.clone()),
         }
+        let zoned = Instant::now();
+        self.counts.add(&chunk);
+        self.counts_ns += zoned.elapsed().as_nanos() as u64;
         self.stats_ns += started.elapsed().as_nanos() as u64;
         self.rows += chunk.len();
         self.zones.push(zone);
@@ -357,10 +381,41 @@ impl MemoryTable {
         self.stats_ns
     }
 
+    /// How much of [`MemoryTable::stats_ns`] went on the distinct counts, in nanoseconds.
+    ///
+    /// The two passes are timed apart because they are priced apart. A zone map is two comparisons
+    /// a value and a distinct count is a hash a value, so one of them is worth several of the other
+    /// and a single number would hide which one a slow load was paying for. See `count.rs`.
+    #[must_use]
+    pub fn counts_ns(&self) -> u64 {
+        self.counts_ns
+    }
+
     /// The zone of one chunk, or `None` past the end.
     #[must_use]
     pub fn zone(&self, index: usize) -> Option<&Zone> {
         self.zones.get(index)
+    }
+
+    /// How many distinct non-null values one column holds, when that number is exact.
+    ///
+    /// Exact means the sketch never filled up, so it is holding every distinct hash there was and
+    /// counting them is counting the column. `None` otherwise, which is a column with at least
+    /// [`rudb_encoding::sketch::DEFAULT_K`] distinct values in it or a column of a type `count.rs`
+    /// has no rule for. This is the one a `COUNT(DISTINCT c)` may be answered out of.
+    #[must_use]
+    pub fn distinct_values(&self, column: usize) -> Option<u64> {
+        self.counts.exact(column)
+    }
+
+    /// The same count, estimated where it is not exact, with a flag saying which it is.
+    ///
+    /// For the estimator, which would rather have a number at one and a half percent than the
+    /// constant it uses when it has nothing. `None` is still `None`: a column this cannot count is
+    /// a column that says so rather than one that guesses.
+    #[must_use]
+    pub fn distinct_estimate(&self, column: usize) -> Option<(u64, bool)> {
+        self.counts.distinct(column)
     }
 
     /// Whether the probes rule out every row of chunk `index`.
@@ -633,6 +688,14 @@ mod tests {
             ])
             .expect("three rows of the table's own types");
         table
+    }
+
+    #[test]
+    fn a_load_reports_what_the_statistics_cost_and_which_half_of_it_was_the_counts() {
+        let table = people();
+        assert!(table.stats_ns() > 0, "three rows took no measurable time at all");
+        assert!(table.counts_ns() > 0, "the sketches took no measurable time at all");
+        assert!(table.counts_ns() <= table.stats_ns(), "a part is larger than the whole");
     }
 
     /// A table of one integer column over several chunks, so the folds have something to fold.

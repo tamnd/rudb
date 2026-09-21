@@ -401,6 +401,7 @@ fn cost(plan: &Plan, at: NodeRef, stats: &Facts) -> Option<(Side, u64, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use rudb_common::stat::Provenance;
     use rudb_plan::Plan;
 
     use crate::estimate::Facts;
@@ -430,7 +431,14 @@ mod tests {
             counts.record("memory", "main", table, rows);
         }
         for (table, column, distinct) in columns {
-            counts.record_distinct("memory", "main", table, column, *distinct);
+            counts.record_distinct(
+                "memory",
+                "main",
+                table,
+                column,
+                *distinct,
+                Provenance::Dictionary,
+            );
         }
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));

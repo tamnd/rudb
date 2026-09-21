@@ -9,10 +9,12 @@
 //! What is here today is [`MemoryTable`], which is the M0 answer to where rows live. The format
 //! itself is M2 work and it replaces the inside of that type rather than the shape of it.
 
+pub mod count;
 pub mod memory;
 pub mod sieve;
 pub mod zone;
 
+pub use count::Counts;
 pub use memory::MemoryTable;
 pub use sieve::{Blocked, Sieve};
 pub use zone::{Probe, Range, Zone};

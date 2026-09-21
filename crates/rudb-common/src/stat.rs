@@ -172,7 +172,12 @@ pub enum Provenance {
     ZoneMap,
     /// A maintained null count. Exact.
     NullCount,
-    /// A distinct-count sketch, outside the regime where it is exact.
+    /// A distinct-count sketch.
+    ///
+    /// Carried by both classes, because a bottom-k sketch that has not filled up is holding every
+    /// hash it was given and the count it gives back is the count. So this arrives as `Exact` for a
+    /// column with few enough distinct values and `Estimated` for one with more, and the class is
+    /// where that difference is written rather than here.
     Sketch,
     /// A frequency synopsis, with or without its certificate discharged.
     FrequencySynopsis,

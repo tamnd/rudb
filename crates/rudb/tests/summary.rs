@@ -10,9 +10,11 @@
 //! `COUNT`, a `MIN`, a `MAX`, a `SUM` and an `AVG` over a whole table out of that, so for those five
 //! this compares two statistics paths against each other and against a number written out in the
 //! test. Where a number is asserted below it is the answer worked out by hand, and that is the
-//! oracle. What memory still reads the rows for is everything that needs a persisted synopsis, which
-//! is the distinct count and the frequencies, and those are the cases where the two sides really do
-//! take different routes to the same answer.
+//! oracle. A distinct count is the same story with one condition on it: a table in memory keeps a
+//! bottom-k sketch per column and answers out of that while the sketch is small enough to be holding
+//! every hash it was given, and reads the rows once it is not. What memory still reads the rows for
+//! unconditionally is the frequencies, which need a persisted synopsis, and that is the case where
+//! the two sides really do take different routes to the same answer.
 //!
 //! The one that matters most is the nullable column. A null row is written as the code for the
 //! empty string, so the dictionary of a nullable column can hold an empty string that no row of it
@@ -415,13 +417,30 @@ fn a_table_in_memory_answers_out_of_its_zone_maps_without_reading_its_rows() {
 }
 
 #[test]
+fn a_table_in_memory_counts_its_distinct_values_while_the_sketch_is_holding_all_of_them() {
+    let pair = Pair::new(
+        "memsketch",
+        "SELECT i % 7 AS n, i AS wide, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 5 END AS m \
+         FROM range(5000) r(i)",
+    );
+    // Seven values in a column of five thousand rows, which is far inside the sketch, so the answer
+    // is the sketch's own length and not an estimate of it.
+    assert!(pair.in_memory("SELECT COUNT(DISTINCT n) FROM t"), "the sketch counted the values");
+    assert_eq!(pair.agree("SELECT COUNT(DISTINCT n) FROM t"), Value::BigInt(7));
+    // The null is not one of the distinct values, in memory the same way it is not in the file.
+    assert!(pair.in_memory("SELECT COUNT(DISTINCT m) FROM t"), "the sketch counted the values");
+    assert_eq!(pair.agree("SELECT COUNT(DISTINCT m) FROM t"), Value::BigInt(5));
+    // And the column with five thousand distinct values in it is past the sketch, so what is left
+    // there is an estimate and an estimate is not something a query result may be read out of. The
+    // rows get counted, and the two sides still agree because agreeing is the point.
+    assert!(!pair.in_memory("SELECT COUNT(DISTINCT wide) FROM t"), "an estimate was read as truth");
+    assert_eq!(pair.agree("SELECT COUNT(DISTINCT wide) FROM t"), Value::BigInt(5000));
+}
+
+#[test]
 fn a_table_in_memory_reads_its_rows_for_what_a_zone_map_does_not_hold() {
     let pair =
         Pair::new("memrows", "SELECT i % 7 AS n, 'v' || (i % 13) AS s FROM range(5000) r(i)");
-    // A distinct count needs every value once and a zone map holds two of them, so this is the case
-    // the file answers and memory does not. Both still say seven.
-    assert!(!pair.in_memory("SELECT COUNT(DISTINCT n) FROM t"), "a zone map counted the values");
-    assert_eq!(pair.agree("SELECT COUNT(DISTINCT n) FROM t"), Value::BigInt(7));
     // A filter puts a node between the aggregate and the table, and what is above a filter is a
     // question about some of the rows rather than about all of them.
     assert!(!pair.in_memory("SELECT COUNT(*) FROM t WHERE n > 1"), "a filter was ignored");

@@ -1751,7 +1751,7 @@ impl<'a> Binder<'a> {
         if let Some(zones) = table.rows().zones() {
             self.plan.set_zones(index, zones);
         }
-        for (column, distinct) in table.rows().distincts() {
+        for (column, distinct) in table.distincts() {
             self.plan.measure_distinct(index, &column, distinct);
         }
         let node = self.add_node(Node::Get {

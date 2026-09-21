@@ -138,7 +138,7 @@ pub enum Key<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
     tables: BTreeMap<(String, String, String), u64>,
-    columns: BTreeMap<(String, String, String, String), u64>,
+    columns: BTreeMap<(String, String, String, String), (u64, Provenance)>,
     generation: u64,
 }
 
@@ -173,8 +173,8 @@ impl Facts {
     ///
     /// What comes back is [`Class::Exact`], because these are counted rather than estimated, and
     /// the provenance says which count it is so that a reader of `EXPLAIN` can tell the two apart.
-    /// A distinct count says [`Provenance::Dictionary`] because that is where it comes from: the
-    /// only tables that answer one are the ones holding a dictionary for the column.
+    /// A distinct count carries the provenance whoever recorded it gave, which is a dictionary for a
+    /// file and a sketch for a table in memory, and both are exact or they would not be here.
     #[must_use]
     pub fn get(&self, key: &Key<'_>) -> Stat<u64> {
         let (found, provenance) = match *key {
@@ -182,7 +182,10 @@ impl Facts {
                 (self.rows_in(catalog, schema, table), Provenance::RowCount)
             }
             Key::Distinct { catalog, schema, table, column } => {
-                (self.distinct_in(catalog, schema, table, column), Provenance::Dictionary)
+                match self.distinct_in(catalog, schema, table, column) {
+                    Some((value, provenance)) => (Some(value), provenance),
+                    None => (None, Provenance::Dictionary),
+                }
             }
         };
         found.map_or(Stat::Unknown, |value| Stat::exact(value, provenance))
@@ -205,6 +208,11 @@ impl Facts {
     ///
     /// By name and not by position, because the position a column has in a scan is whatever is left
     /// after column pruning moved it and the name is not moved by anything.
+    ///
+    /// The provenance rides along because only the caller knows it. Two kinds of table answer this
+    /// now and they count in different ways, and the point of printing a provenance in `EXPLAIN` is
+    /// to say which. Only an exact count belongs here whichever it is: [`Facts::get`] hands back
+    /// what it holds as [`Class::Exact`] and has no way to say anything else.
     pub fn record_distinct(
         &mut self,
         catalog: &str,
@@ -212,15 +220,22 @@ impl Facts {
         table: &str,
         column: &str,
         distinct: u64,
+        provenance: Provenance,
     ) {
         let key = (catalog.to_owned(), schema.to_owned(), table.to_owned(), column.to_owned());
-        self.columns.insert(key, distinct);
+        self.columns.insert(key, (distinct, provenance));
     }
 
     /// How many distinct values that column holds, where anybody counted.
     ///
     /// Private for the same reason [`Facts::rows_in`] is.
-    fn distinct_in(&self, catalog: &str, schema: &str, table: &str, column: &str) -> Option<u64> {
+    fn distinct_in(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Option<(u64, Provenance)> {
         let key = (catalog.to_owned(), schema.to_owned(), table.to_owned(), column.to_owned());
         self.columns.get(&key).copied()
     }
@@ -1199,7 +1214,14 @@ mod tests {
     fn counted(text: &str, tables: &[(&str, u64)], columns: &[(&str, &str, u64)]) -> Option<u64> {
         let mut stats = facts(tables);
         for (table, column, distinct) in columns {
-            stats.record_distinct("memory", "main", table, column, *distinct);
+            stats.record_distinct(
+                "memory",
+                "main",
+                table,
+                column,
+                *distinct,
+                Provenance::Dictionary,
+            );
         }
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
@@ -1214,7 +1236,14 @@ mod tests {
     ) -> Stat<u64> {
         let mut stats = facts(tables);
         for (table, column, distinct) in columns {
-            stats.record_distinct("memory", "main", table, column, *distinct);
+            stats.record_distinct(
+                "memory",
+                "main",
+                table,
+                column,
+                *distinct,
+                Provenance::Dictionary,
+            );
         }
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
@@ -1585,7 +1614,7 @@ mod tests {
     #[test]
     fn a_distinct_count_says_where_it_came_from_and_a_missing_one_says_nothing() {
         let mut stats = Facts::new();
-        stats.record_distinct("memory", "main", "t", "a", 25);
+        stats.record_distinct("memory", "main", "t", "a", 25, Provenance::Dictionary);
         let key = |column| Key::Distinct { catalog: "memory", schema: "main", table: "t", column };
         assert_eq!(stats.get(&key("a")), Stat::exact(25, Provenance::Dictionary));
         assert_eq!(stats.get(&key("b")), Stat::Unknown, "a column nobody counted");
@@ -2083,7 +2112,7 @@ mod tests {
             bounded_scan()
         );
         let mut stats = facts(&[("t", 1_000_000)]);
-        stats.record_distinct("memory", "main", "t", "a", 10);
+        stats.record_distinct("memory", "main", "t", "a", 10, Provenance::Dictionary);
         let mut plan = Plan::parse(&text).expect("parses");
         let zones = Stub::spreading(0.5);
         plan.set_zones(0, Arc::clone(&zones) as Arc<dyn Zones>);
@@ -2116,7 +2145,7 @@ mod tests {
         // anyway, but the order is worth pinning: the count is the better number and goes first.
         let text = format!("Filter (#0.0::INTEGER = 5::INTEGER)::BOOLEAN\n  {}", bounded_scan());
         let mut stats = facts(&[("t", 1_000_000)]);
-        stats.record_distinct("memory", "main", "t", "a", 8);
+        stats.record_distinct("memory", "main", "t", "a", 8, Provenance::Dictionary);
         let mut plan = Plan::parse(&text).expect("parses");
         plan.set_zones(0, Stub::spreading(0.5) as Arc<dyn Zones>);
         assert_eq!(
