@@ -1594,6 +1594,22 @@ impl Vector {
         }
     }
 
+    /// Whether no row in range is null, answered without reading a row.
+    ///
+    /// This is the cheap side of [`Self::is_null_at`] and has to follow it exactly. A dictionary and
+    /// a run keep their nulls in the values they stand for, so both levels have to say they have
+    /// none. Every other form answers from its own mask. A false means only that the cheap answer
+    /// was not available, so a caller that gets one still has to ask row by row.
+    fn never_null(&self) -> bool {
+        if self.validity.has_nulls(self.len) {
+            return false;
+        }
+        match &self.body {
+            Body::Dictionary { values, .. } | Body::Runs { values, .. } => values.never_null(),
+            _ => true,
+        }
+    }
+
     /// Which physical form this vector is in.
     #[must_use]
     pub fn form(&self) -> Form {
@@ -2556,9 +2572,19 @@ impl Vector {
         let rows = at.len();
         if forms_stay {
             if let Body::Dictionary { codes, values, stable: true } = &self.body {
-                let validity = Validity::from_iter(rows, |row| {
-                    at.get(row).is_some_and(|&index| index < self.len && !self.is_null_at(index))
-                });
+                // A gather off a column with no nulls in it is all valid as long as every index it
+                // was handed is in range, and both of those are answered by a word at a time rather
+                // than by asking each row whether it is null. That per row question reads through
+                // the dictionary to the value it stands for, which made it the single line a
+                // filtered scan of a dictionary column spent most of its copy in.
+                let validity = if self.never_null() && at.iter().all(|&index| index < self.len) {
+                    Validity::AllValid
+                } else {
+                    Validity::from_iter(rows, |row| {
+                        at.get(row)
+                            .is_some_and(|&index| index < self.len && !self.is_null_at(index))
+                    })
+                };
                 let gathered =
                     at.iter().map(|&index| codes.get(index).copied().unwrap_or(0)).collect();
                 return Ok(
@@ -5156,6 +5182,38 @@ mod tests {
         assert!(constant.footprint() < 200, "a constant is one value: {}", constant.footprint());
         let sequence = Vector::sequence(0, 1, 1_000_000);
         assert!(sequence.footprint() < 200, "a sequence is two numbers: {}", sequence.footprint());
+    }
+
+    #[test]
+    fn a_gather_off_a_dictionary_answers_the_same_nulls_either_way_round() {
+        let words = [Value::Varchar("north".into()), Value::Null, Value::Varchar("south".into())];
+        let plain: Vec<Value> =
+            ["north", "east", "south"].iter().map(|word| Value::Varchar((*word).into())).collect();
+        let clean = Arc::new(Vector::from_values(LogicalType::Varchar, &plain).unwrap());
+        let dirty = Arc::new(Vector::from_values(LogicalType::Varchar, &words).unwrap());
+        let codes = vec![0, 1, 2, 0, 1, 2];
+        let sources = [
+            Vector::stable_dictionary(codes.clone(), Arc::clone(&clean)).unwrap(),
+            Vector::stable_dictionary(codes.clone(), Arc::clone(&dirty)).unwrap(),
+            Vector::stable_dictionary(codes, Arc::clone(&clean))
+                .unwrap()
+                .with_validity(Validity::from_run(&[true, true, false, true, true, true])),
+        ];
+        // What a gather says about a row has to be what the column it came out of says about the
+        // row it was taken from, whichever of the two ways the nulls are reached: the mask over the
+        // codes, or the value a code stands for. The fast answer is only allowed when neither has
+        // any, and an index past the end is null in both readings.
+        for source in &sources {
+            let picks: Vec<u32> = vec![5, 0, 3, 2, 1, 99, 4];
+            let taken = source.gather(&picks).unwrap();
+            for (row, &pick) in picks.iter().enumerate() {
+                assert_eq!(
+                    taken.is_null_at(row),
+                    source.is_null_at(pick as usize),
+                    "row {row} of a gather of {picks:?}"
+                );
+            }
+        }
     }
 
     #[test]
