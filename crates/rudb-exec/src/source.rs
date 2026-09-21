@@ -615,7 +615,12 @@ impl<'a> Scan<'a> {
         let rows = chunk.len();
         let mut hashes = Vec::new();
         hash(std::slice::from_ref(column), rows, &mut hashes, Across::TwoInputs);
-        let kept = Selection::from_predicate(rows, |row| filter.holds(hashes[row]));
+        // The whole chunk asked at once rather than a row at a time inside the selection, because
+        // the filter is larger than the cache and a row of it is a trip to memory the core can only
+        // overlap with the next row's if nothing in between branches on the answer.
+        let mut held = Vec::new();
+        filter.holds_run(&hashes, &mut held);
+        let kept = Selection::from_predicate(rows, |row| held[row]);
         self.paying.saw(rows, kept.len());
         if kept.len() == rows {
             return Ok(());
@@ -1610,7 +1615,12 @@ impl<'a> FileScan<'a> {
         let rows = chunk.len();
         let mut hashes = Vec::new();
         hash(std::slice::from_ref(column), rows, &mut hashes, Across::TwoInputs);
-        let kept = Selection::from_predicate(rows, |row| filter.holds(hashes[row]));
+        // The whole chunk asked at once rather than a row at a time inside the selection, because
+        // the filter is larger than the cache and a row of it is a trip to memory the core can only
+        // overlap with the next row's if nothing in between branches on the answer.
+        let mut held = Vec::new();
+        filter.holds_run(&hashes, &mut held);
+        let kept = Selection::from_predicate(rows, |row| held[row]);
         self.paying.saw(rows, kept.len());
         if kept.len() == rows {
             return Ok(());
