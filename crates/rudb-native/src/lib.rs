@@ -672,6 +672,25 @@ fn weight(ty: &LogicalType) -> usize {
 /// and cost a sparse fetch, which has to read a page index before it can reach one part.
 pub const STRIPE_PARTS: usize = 64;
 
+/// How many rows the writer wants to see before it decides whether a varchar column gets to keep
+/// its global dictionary.
+///
+/// See [`Writer::encode_column`]. A stripe is up to [`STRIPE_PARTS`] parts, so most tables give it
+/// far more than this and it binds only on a table that is smaller than one stripe. A handful of
+/// rows says nothing about whether a column repeats itself, and the answer that costs nothing when
+/// the sample is that small is the one the writer has always given, which is to keep the dictionary.
+const DICTIONARY_DECIDE_ROWS: usize = 4_096;
+
+/// Out of ten. A varchar column loses its dictionary when more than this many rows in ten of the
+/// first stripe held a value that stripe had not seen before.
+///
+/// See [`Writer::encode_column`]. Nine and not five, because the cost this avoids is real only at
+/// the very top of the range and the properties a dictionary buys are worth keeping everywhere
+/// else. TPC-H l_comment is above it and ClickBench URL, which has tens of millions of distinct
+/// values and is still repetitive enough that a group by on its codes is the cheap way to run one,
+/// is well below.
+const DICTIONARY_DISTINCT_IN_TEN: usize = 9;
+
 /// Bytes one part takes in a stripe's index page: four for the length, eight for the checksum.
 const INDEX_ENTRY: usize = size_of::<u32>() + size_of::<u64>();
 
@@ -875,7 +894,29 @@ impl Writer {
         Ok(())
     }
 
-    /// Encodes one column's parts of a stripe, with the column's dictionary to itself.
+    /// Encodes one column's parts of a stripe, and on the first stripe decides whether the column
+    /// should have a dictionary at all.
+    ///
+    /// Every varchar column starts with one, because the writer cannot know what is in a column
+    /// before it has seen some of it. A global dictionary is the right shape for a column of a few
+    /// dozen values repeated down the table: the pages become small integers, a filter against a
+    /// literal is one search of the sorted order rather than a comparison a row, and a group by is
+    /// on the codes. It is the wrong shape for a column whose values are nearly all different.
+    /// There the codes are as wide as row numbers, nothing is saved on the pages, and handing the
+    /// column out costs a random read of a decoded payload block per row where a column stored as
+    /// its own bytes hands out views over a page and moves nothing. On TPC-H lineitem that is
+    /// l_comment read in 456 ms against 202 ms for the same values in a parquet file.
+    ///
+    /// So the first stripe of a column is the sample and the decision is made once on it. Once,
+    /// rather than per stripe, because the codes of one column have to mean the same thing in every
+    /// page of it, and a column that changed its mind halfway would need its earlier stripes
+    /// rewritten. The first stripe is re-encoded when the answer comes out against the dictionary,
+    /// which is the one stripe that pays for the decision.
+    ///
+    /// The threshold is deliberately near the top. [`DICTIONARY_DISTINCT_IN_TEN`] of the sample has
+    /// to be values never seen before, which is a column with essentially no repeats. Everything
+    /// with real repetition keeps its dictionary and keeps every property that hangs off it, and
+    /// nothing is claimed here about where between the two the crossover really sits.
     ///
     /// Nothing here is shared with another column. The dictionary belongs to this one, the sieve
     /// reads only this one, and the page bytes go in a vector of this one's own. That is why the
@@ -883,6 +924,30 @@ impl Writer {
     /// rather than making it something several threads can grow at once, which is the harder half
     /// of #808 and is still open.
     fn encode_column(
+        index: usize,
+        held: &[PendingChunk],
+        dictionary: &mut Option<GlobalDictionary>,
+    ) -> Result<ColumnStripe> {
+        // Empty means nothing has been written through it yet, so this is the column's first stripe
+        // and the only stripe the decision below is allowed to be made on.
+        let deciding = dictionary.as_ref().is_some_and(|held| held.offsets.len() == 1);
+        let stripe = Self::encode_pages(index, held, dictionary.as_mut())?;
+        if !deciding {
+            return Ok(stripe);
+        }
+        let rows: usize = held.iter().map(|pending| pending.chunk.len()).sum();
+        let distinct = dictionary.as_ref().map_or(0, |held| held.offsets.len() - 1);
+        if rows < DICTIONARY_DECIDE_ROWS
+            || distinct.saturating_mul(10) <= rows.saturating_mul(DICTIONARY_DISTINCT_IN_TEN)
+        {
+            return Ok(stripe);
+        }
+        *dictionary = None;
+        Self::encode_pages(index, held, None)
+    }
+
+    /// One column's parts of a stripe, with whatever dictionary it was given.
+    fn encode_pages(
         index: usize,
         held: &[PendingChunk],
         mut dictionary: Option<&mut GlobalDictionary>,
@@ -946,7 +1011,7 @@ impl Writer {
                 .dictionaries
                 .iter_mut()
                 .enumerate()
-                .map(|(index, dictionary)| Self::encode_column(index, held, dictionary.as_mut()))
+                .map(|(index, dictionary)| Self::encode_column(index, held, dictionary))
                 .collect();
         }
         // The dictionaries are moved out and back rather than borrowed, because a worker that takes
@@ -967,7 +1032,7 @@ impl Writer {
                                 .map_err(|_| Error::internal("a native encode worker panicked"))?
                                 .pop();
                             let Some((index, mut dictionary)) = taken else { break };
-                            let encoded = Self::encode_column(index, held, dictionary.as_mut())?;
+                            let encoded = Self::encode_column(index, held, &mut dictionary)?;
                             mine.push((index, dictionary, encoded));
                         }
                         Ok(mine)
@@ -3582,8 +3647,14 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             put_u64(&mut out, page.offset);
             put_u32(&mut out, page.length);
         }
-        for (field, membership) in table.fields.iter().zip(&stripe.memberships) {
-            if field.ty != LogicalType::Varchar {
+        // A membership index says which of a dictionary's codes a part holds, so a column the writer
+        // decided against giving a dictionary has nothing for it to be about and writes none. Every
+        // file written before that decision existed has a dictionary on every varchar column, so
+        // this reads those files byte for byte the way it always did.
+        for ((field, dictionary), membership) in
+            table.fields.iter().zip(&table.dictionaries).zip(&stripe.memberships)
+        {
+            if field.ty != LogicalType::Varchar || dictionary.is_none() {
                 continue;
             }
             let page =
@@ -3929,7 +4000,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
         }
         let mut memberships = vec![None; width];
         for (column, field) in fields.iter().enumerate() {
-            if field.ty != LogicalType::Varchar {
+            if field.ty != LogicalType::Varchar || dictionaries[column].is_none() {
                 continue;
             }
             let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
@@ -4437,6 +4508,35 @@ fn cascaded(
 /// The result is taken only when it is smaller than the plain form. A cascade is allowed to come
 /// out larger on a part whose codes are genuinely wide, `URL` has about sixty million distinct
 /// values, and there is no reason to pay for the decode when it does.
+/// A varchar page through the string cascade, or `None` when the cascade did not pay.
+///
+/// This is the same encoder the payload blocks of a global dictionary go through, pointed at a page
+/// of the column itself. Until now a varchar page that neither the global dictionary nor the per
+/// page dictionary claimed was written out raw: four bytes of offset a row and then the bytes. That
+/// is the right answer for a page of values that have nothing in common and the wrong one for
+/// nearly everything else, because the cascade front codes a sorted run, finds repeats with its
+/// matcher and packs the lengths, and a page of a thousand values has plenty of all three.
+///
+/// The page dictionary gets first refusal because it is cheaper to read, and it wins on a page whose
+/// values repeat. What is left for this is the page whose values mostly do not, which is exactly the
+/// page that was being written raw.
+///
+/// Taken only when it comes out smaller than the raw form, so a page of incompressible values pays
+/// nothing at read time for having been offered to the cascade.
+fn text_cascaded(flat: &Vector) -> Result<Option<Vec<u8>>> {
+    let mut values: Vec<&[u8]> = Vec::with_capacity(flat.len());
+    let mut payload = 0_usize;
+    for row in 0..flat.len() {
+        let text = flat.text_at(row).unwrap_or("").as_bytes();
+        payload = payload.saturating_add(text.len());
+        values.push(text);
+    }
+    // What codec 0 writes for a varchar page: an offset a row and one more, then the payload.
+    let plain = (flat.len() + 1).saturating_mul(4).saturating_add(payload);
+    let out = string::encode(&values)?;
+    Ok((out.len() < plain).then_some(out))
+}
+
 fn encoded_codes(codes: &[u32]) -> Result<Option<Vec<u8>>> {
     let wide: Vec<i64> = codes.iter().map(|code| i64::from(*code)).collect();
     let coded = integer::encode_with(&wide, &Codes)?;
@@ -4469,6 +4569,12 @@ fn encode(
     } else {
         None
     };
+    let text_cascade =
+        if global_codes.is_none() && dictionary.is_none() && ty == &LogicalType::Varchar {
+            text_cascaded(&flat)?
+        } else {
+            None
+        };
     let packed_vector = if dictionary.is_none() && global_codes.is_none() {
         Some(flat.bit_packed()?)
     } else {
@@ -4495,6 +4601,8 @@ fn encode(
         3
     } else if dictionary.is_some() {
         1
+    } else if text_cascade.is_some() {
+        6
     } else if packed.is_some() {
         2
     } else {
@@ -4534,6 +4642,10 @@ fn encode(
     }
     if let Some(dictionary) = dictionary {
         out.extend_from_slice(&dictionary);
+        return Ok((out, membership));
+    }
+    if let Some(text_cascade) = text_cascade {
+        out.extend_from_slice(&text_cascade);
         return Ok((out, membership));
     }
     if let Some(packed) = packed {
@@ -5489,6 +5601,28 @@ fn decode(
         let highest = codes.iter().copied().max();
         return Ok(Vector::stable_dictionary_validated(codes, dictionary, highest)?
             .with_validity(validity));
+    }
+    if codec == 6 {
+        if ty != &LogicalType::Varchar {
+            return Err(invalid("string cascade codec belongs to a non-string page"));
+        }
+        // As codec 5, the cascade holds the whole tail of the page and says how long it is itself.
+        let (payload, ends) = string::decode_flat(&bytes[cur.at..])?.into_parts();
+        if ends.len() != rows {
+            return Err(invalid("string cascade page holds the wrong number of rows"));
+        }
+        // A page, because this is read once and handed out a chunk at a time, and a cut of a paged
+        // payload moves views rather than bytes.
+        let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
+        let mut start = 0;
+        for end in ends {
+            let len = end
+                .checked_sub(start)
+                .ok_or_else(|| invalid("string cascade value ends before it starts"))?;
+            values.push_in_place(start, len)?;
+            start = end;
+        }
+        return Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity));
     }
     if codec == 5 {
         // The cascade holds the whole tail of the page and says how long it is itself.
@@ -6868,18 +7002,94 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
+    /// A column whose values are all different is written without a dictionary, and one whose
+    /// values repeat keeps it.
+    ///
+    /// The two columns go in the same table and hold the same number of rows, so the only thing
+    /// separating them is how much of the first stripe was a value it had not seen before. Both have
+    /// to read back the values that were written, because the decision is about cost and nothing
+    /// else. The file size is the other half of it: a column written without a dictionary goes
+    /// through the string cascade instead, so dropping the dictionary must not turn into storing the
+    /// column raw.
+    #[test]
+    fn a_column_of_all_different_values_is_written_without_a_dictionary() {
+        let path = path("dictionary-decide");
+        let rows = 20_000;
+        // Long enough that storing it raw would show, and different in every row.
+        let unique =
+            |row: usize| format!("{row:09} a value that appears exactly once in the table");
+        // The same values in the same shape, each one used forty times over.
+        let repeated = |row: usize| unique(row / 40);
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("unique", LogicalType::Varchar),
+                Field::required("repeated", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        for part in (0..rows).step_by(1_000) {
+            let span = part..(part + 1_000).min(rows);
+            let left = span.clone().map(|row| Value::Varchar(unique(row))).collect::<Vec<_>>();
+            let right = span.map(|row| Value::Varchar(repeated(row))).collect::<Vec<_>>();
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, &left).expect("strings"),
+                        Vector::from_values(LogicalType::Varchar, &right).expect("strings"),
+                    ])
+                    .expect("two columns"),
+                )
+                .expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert!(
+            reader.table.dictionaries[0].is_none(),
+            "a column with no repeats has nothing to say twice"
+        );
+        assert!(
+            reader.table.dictionaries[1].is_some(),
+            "a column whose values come round again keeps its dictionary"
+        );
+        let mut first = 0;
+        for part in 0..reader.parts() {
+            let chunk = reader.read(part, &[0, 1]).expect("a part");
+            for row in 0..chunk.len() {
+                assert_eq!(chunk.value_at(row, 0), Value::Varchar(unique(first + row)));
+                assert_eq!(chunk.value_at(row, 1), Value::Varchar(repeated(first + row)));
+            }
+            first += chunk.len();
+        }
+        assert_eq!(first, rows, "every row was read back");
+        let raw = (0..rows).map(|row| unique(row).len()).sum::<usize>();
+        let size = fs::metadata(&path).expect("the file is there").len() as usize;
+        assert!(size < raw, "a column without a dictionary is still encoded: {size} against {raw}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     /// A payload of many blocks reads and checks every block of it.
     ///
     /// The test above has a dictionary of three values, which is one block, so it says nothing
-    /// about a reader finding the right block among many. This one has thirty thousand values,
-    /// which is thirty blocks, and it reads a value out of the first block and a value out of the
-    /// last and then damages the last and asks for it again.
+    /// about a reader finding the right block among many. This one has thirty two thousand values,
+    /// which is thirty two blocks, and it reads a value out of the first block and a value out of
+    /// the last and then damages the last and asks for it again.
+    ///
+    /// Forty thousand rows over those thirty two thousand values, because a column the writer finds
+    /// to be all distinct does not get a dictionary at all and there would be nothing here to test.
+    /// Four rows in five holding a value the stripe has not seen before is a column that keeps one.
+    /// The repeats are put at the front so that the values still arrive in order after them, which
+    /// is what keeps the last part of the table on the last block of the payload.
     #[test]
     fn a_dictionary_over_many_blocks_checks_every_block_of_it() {
         let path = path("dictionary-blocks");
-        let value =
-            |row: usize| format!("{row:07} a value long enough to be worth a payload block");
-        let parts = 30;
+        let value = |row: usize| {
+            let row = row.saturating_sub(8_000);
+            format!("{row:07} a value long enough to be worth a payload block")
+        };
+        let parts = 40;
         let per_part = 1000;
         let mut writer =
             Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
@@ -6928,13 +7138,18 @@ mod tests {
     /// so the first value of a block, the last value of a run and the last value of a block are all
     /// covered several times over. An empty value is in the cycle because a zero length span is the
     /// case the reader short circuits.
+    ///
+    /// Six thousand rows over those 5,000 values, because a column the writer finds to be all
+    /// distinct is written without a dictionary and then there are no packed offsets to be off by
+    /// one in.
     #[test]
     fn values_of_different_lengths_read_back_out_of_packed_offsets() {
         let path = path("dictionary-offsets");
         let value = |row: usize| {
+            let row = row % 5_000;
             if row % 511 == 3 { String::new() } else { "x".repeat(row % 97) + &format!("{row:05}") }
         };
-        let rows = 5_000;
+        let rows = 6_000;
         let mut writer =
             Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
                 .expect("new file");
