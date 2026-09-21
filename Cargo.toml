@@ -27,6 +27,13 @@ chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 chrono-tz = "0.10.4"
 iana-time-zone = "0.1.65"
 memchr = "2.7.6"
+# The one outside crate that is not a library dependency. Only `rudb-cli` names it, only its binary
+# uses it, and spec/18-package-layout.md section 18.5 says why that is allowed. Both features are
+# load bearing and were picked by measurement, see `crates/rudb-cli/src/main.rs`: `v2` because the
+# crate otherwise builds mimalloc 3, which on this workload is twice as slow as mimalloc 2 and holds
+# 80 MB more, and `no_thp` because mimalloc asks the kernel for huge pages on its arenas and on a box
+# with transparent huge pages set to madvise that turns a 0.44 second load into a 0.85 second one.
+mimalloc = { version = "0.1", default-features = false, features = ["v2", "no_thp"] }
 rudb = { version = "=0.3.66", path = "crates/rudb" }
 rudb-arrow = { version = "=0.3.66", path = "crates/rudb-arrow" }
 rudb-bind = { version = "=0.3.66", path = "crates/rudb-bind" }
