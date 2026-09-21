@@ -1244,8 +1244,12 @@ fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
             Some(Feed::Real { scale: decimal_scale(ty) })
         }
         // A number is compared as a number and anything else is compared the way the comparison
-        // kernel says, which a run of `i128` cannot do for a float, a string or a date.
-        (State::Extreme { .. }, ty) if ty.is_integer() => {
+        // kernel says, which a run of `i128` cannot do for a float, a string or a date. A decimal
+        // is here too because every row of one column holds the same scale, so the unscaled
+        // integers order the way the numbers do. That is q02's grouped `min` over `DECIMAL(15, 2)`.
+        (State::Extreme { .. }, ty)
+            if ty.is_integer() || matches!(ty, LogicalType::Decimal { .. }) =>
+        {
             Some(Feed::Extreme(first.kind() == Kind::Min))
         }
         (State::Extreme { .. }, _) => None,
@@ -1344,6 +1348,12 @@ fn scatter<M: Fn(usize) -> usize>(
 }
 
 /// An exact number per row into the running total of the group that row belongs to.
+///
+/// The widths run up to 128 bits because [`fold_whole`] adds with a check per row and raises the
+/// same overflow the row at a time path raises on the same row, so a total that does not fit says
+/// so either way. `UInt128` is the one width left out, since a value above `i128::MAX` has no
+/// exact accumulator here at all. This is where q11's grouped sum over `DECIMAL(34, 2)` and q09's
+/// over `DECIMAL(19, 4)` used to leave, which was most of what was left in the fallback ledger.
 fn whole_into<M: Fn(usize) -> usize>(
     states: &mut [Accumulator],
     into: Where<'_>,
@@ -1363,13 +1373,13 @@ fn whole_into<M: Fn(usize) -> usize>(
                         fold_whole(&mut states[index], i128::from(values[at(row)]), scale)?;
                     }
                 })+
-                // A total of hugeints can overflow inside one group, and then the overflow is the
-                // answer rather than a detail, so both of those go the row at a time way.
+                // A value wider than an `i128` can hold has no exact accumulator here, so it goes
+                // the row at a time way, which reports what it cannot add.
                 _ => return Ok(false),
             }
         };
     }
-    rudb_vector::for_each_layout!(narrow, each);
+    rudb_vector::for_each_layout!(exact, each);
     Ok(true)
 }
 
@@ -1381,9 +1391,9 @@ fn whole_into<M: Fn(usize) -> usize>(
 /// a decimal column out of a native file as a dictionary over a packed run, and with no path for
 /// that shape every row of it built a `Value` on the way into its group.
 ///
-/// The two 128 bit layouts are declined here for the reason [`whole_into`] declines them, which is
-/// that a total of them can overflow inside one group and the overflow is the answer rather than a
-/// detail.
+/// `UInt128` is declined here for the reason [`whole_into`] declines it, which is that a value
+/// above `i128::MAX` has no exact accumulator here at all. A packing never holds one anyway, since
+/// the span a packing is built from is read at the widths that fit an `i128`.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
@@ -1399,8 +1409,8 @@ fn packed_into<M: Fn(usize) -> usize>(
     nulls: &Validity,
     feed: Feed,
 ) -> Result<bool> {
-    let wide =
-        matches!(input.logical_type().physical(), PhysicalType::Int128 | PhysicalType::UInt128);
+    let wide = input.logical_type().physical() == PhysicalType::UInt128;
+    let scale = decimal_scale(input.logical_type());
     let base = packed.base();
     match feed {
         Feed::Counted => Ok(true),
@@ -1447,8 +1457,8 @@ fn packed_into<M: Fn(usize) -> usize>(
                     None => true,
                     Some(current) => {
                         let current: &Value = current.settle()?;
-                        let mark = integral(current).ok_or_else(|| not_narrow(current))?;
-                        if least { number < mark } else { number > mark }
+                        let against = mark(current, scale).ok_or_else(|| not_narrow(current))?;
+                        if least { number < against } else { number > against }
                     }
                 };
                 // The `Value` is built on a win and not per row, exactly as the flat loop builds it.
@@ -1560,6 +1570,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
     at: M,
     least: bool,
 ) -> Result<bool> {
+    let scale = decimal_scale(run.input.logical_type());
     macro_rules! each {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match run.data {
@@ -1581,8 +1592,9 @@ fn extreme_into<M: Fn(usize) -> usize>(
                             None => true,
                             Some(current) => {
                                 let current: &Value = current.settle()?;
-                                let mark = integral(current).ok_or_else(|| not_narrow(current))?;
-                                if least { number < mark } else { number > mark }
+                                let against =
+                                    mark(current, scale).ok_or_else(|| not_narrow(current))?;
+                                if least { number < against } else { number > against }
                             }
                         };
                         // The `Value` is built on a win and not per row, which for a column that
@@ -1598,12 +1610,26 @@ fn extreme_into<M: Fn(usize) -> usize>(
             }
         };
     }
-    rudb_vector::for_each_layout!(narrow, each);
+    rudb_vector::for_each_layout!(exact, each);
     Ok(true)
 }
 
 fn not_narrow(value: &Value) -> Error {
     Error::not_implemented(format!("summing a {}", value.logical_type()))
+}
+
+/// The number a held extreme is compared as against the numbers read out of a column.
+///
+/// A decimal column carries one scale for every row in it, so the unscaled integers of two values
+/// out of the same column order the same way the values themselves do, and comparing those is
+/// comparing the numbers. The scale is passed in rather than taken off the value so that a held
+/// value from somewhere other than this column cannot be compared against it by accident.
+fn mark(value: &Value, scale: u8) -> Option<i128> {
+    match *value {
+        Value::Decimal { unscaled, scale: held, .. } if held == scale => Some(unscaled),
+        Value::Decimal { .. } => None,
+        _ => integral(value),
+    }
 }
 
 /// An exact total as the double a mean divides, which is the one rounding `avg` over whole numbers
@@ -2007,10 +2033,10 @@ fn whole_sum<const DIRECT: bool, M: Fn(usize) -> usize>(
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
                 $(Data::$variant(values) => summed!(@run values),)+
-                // A total of hugeints can overflow inside one vector, and then the overflow is the
-                // answer rather than a detail. The `narrow` group is exactly the widths where it
-                // cannot, so both hugeints are out of it and both go the row at a time way, which is
-                // the way that raises.
+                // A total of hugeints can overflow inside one vector, so that one is counted with
+                // a check per row just below. An unsigned hugeint has no exact accumulator here at
+                // all and goes the row at a time way, which is the way that reports it.
+                Data::Int128(values) => wide_sum::<DIRECT, _>(values.as_slice(), &at, rows, nulls)?,
                 _ => return None,
             }
         };
@@ -2052,6 +2078,35 @@ fn whole_sum<const DIRECT: bool, M: Fn(usize) -> usize>(
         }};
     }
     Some(rudb_vector::for_each_layout!(narrow, summed))
+}
+
+/// The same total for a column of hugeints, which is what a wide decimal is held as.
+///
+/// A vector of 128 bit values can overflow its own total, so this one checks each addition and
+/// hands the vector back when one does. The row at a time path then adds the same rows and raises
+/// on the row that overflows, so where the error comes from does not move. The check costs this
+/// loop the vectorization the narrow ones get, and it is still one pass over a slice against a
+/// `Value` built per row, which is what it replaces. This is q11's ungrouped sum over
+/// `DECIMAL(34, 2)`.
+fn wide_sum<const DIRECT: bool, M: Fn(usize) -> usize>(
+    values: &[i128],
+    at: M,
+    rows: usize,
+    nulls: &Validity,
+) -> Option<i128> {
+    let run = straight::<DIRECT, _>(values, rows);
+    let mut total: i128 = 0;
+    for index in 0..rows {
+        if !nulls.is_valid(index) {
+            continue;
+        }
+        let number = match run {
+            Some(run) => run[index],
+            None => values[at(index)],
+        };
+        total = total.checked_add(number)?;
+    }
+    Some(total)
 }
 
 /// The running total carried through the rows that are not null, in floating point.
@@ -2156,7 +2211,8 @@ fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
                 // A float orders NaN the way the comparison kernel says rather than the way the
                 // hardware does, and a string extreme is a comparison of bytes rather than of
                 // numbers. Both are worth a loop of their own and neither gets a wrong one here.
-                // The two hugeints are out because the seed and the running best are both `i128`.
+                // The unsigned hugeint is out because the seed and the running best are both
+                // `i128` and it holds values that one cannot.
                 _ => return None,
             }
         };
@@ -2223,7 +2279,7 @@ fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
             (held != usize::MAX).then_some(held)
         }};
     }
-    Some(rudb_vector::for_each_layout!(narrow, best))
+    Some(rudb_vector::for_each_layout!(exact, best))
 }
 
 #[cfg(test)]
@@ -2760,8 +2816,8 @@ mod tests {
     ///
     /// A grouped aggregate does not go through [`Accumulator::update_run`] at all, it goes through
     /// the scatter, so a packed column staying off the row at a time path there is a second thing
-    /// to prove. The extremes are over an integer column because a grouped `MIN` over a decimal
-    /// column is not a shape the scatter reads yet, whatever form the column is in.
+    /// to prove. The extremes are over both an integer column and a decimal one, since the scatter
+    /// reads a decimal extreme on the unscaled integers now that one column holds one scale.
     #[test]
     fn a_packed_column_scattered_into_groups_does_not_reach_the_row_at_a_time_path() {
         let ty = LogicalType::decimal(15, 2).expect("a legal decimal");
@@ -2799,6 +2855,10 @@ mod tests {
             ("avg", LogicalType::Double, &over),
             ("min", LogicalType::Integer, &whole),
             ("max", LogicalType::Integer, &whole),
+            ("min", ty.clone(), &packed),
+            ("max", ty.clone(), &packed),
+            ("min", ty.clone(), &over),
+            ("max", ty.clone(), &over),
         ] {
             fallback::reset();
             let mut states = vec![Accumulator::new(name, &returns).expect("known"); 3];
@@ -2827,6 +2887,74 @@ mod tests {
                 );
             }
         }
+        fallback::reset();
+    }
+
+    /// A total of a column held as a hugeint, which is what a decimal wider than eighteen digits
+    /// is, and which both totalling paths used to hand straight to the row at a time loop.
+    ///
+    /// q11 sums a `DECIMAL(34, 2)` column grouped and again ungrouped, and q09 sums a
+    /// `DECIMAL(19, 4)` one grouped. Between them that was most of what was left in the fallback
+    /// ledger of the twenty two TPC-H queries. The overflow case is here because it is the reason
+    /// those paths declined the width in the first place: the answer to a total that does not fit
+    /// is the error, and it has to still be the error.
+    #[test]
+    fn a_wide_decimal_totals_off_the_row_at_a_time_path_and_still_raises_on_overflow() {
+        fallback::reset();
+        let ty = LogicalType::decimal(34, 2).expect("a legal decimal");
+        let sum = LogicalType::decimal(38, 2).expect("a legal decimal");
+        let values: Vec<Value> = (0..40)
+            .map(|row| {
+                if row % 9 == 0 {
+                    Value::Null
+                } else {
+                    // Past what sixty four bits hold, so the column is a hugeint and not a bigint
+                    // that happens to be declared wide.
+                    Value::Decimal {
+                        unscaled: i128::from(row) * 1_000_000_000_000_000_000_000 + 7,
+                        width: 34,
+                        scale: 2,
+                    }
+                }
+            })
+            .collect();
+        let column = Vector::from_values(ty.clone(), &values).expect("a flat wide decimal");
+        for (name, returns) in [
+            ("sum", sum.clone()),
+            ("min", ty.clone()),
+            ("max", ty.clone()),
+            ("avg", LogicalType::Double),
+        ] {
+            agrees(name, &returns, std::slice::from_ref(&column), name);
+        }
+        // The same column into three groups, which is the shape q11 and q09 are in.
+        let slots: Vec<usize> = (0..40).map(|row| row % 3).collect();
+        let mut states = vec![Accumulator::new("sum", &sum).expect("known"); 3];
+        update_scattered(&mut states, &slots, 1, 0, Some(&column), 40).expect("folds them in");
+        for (group, state) in states.iter().enumerate() {
+            let mut one = Accumulator::new("sum", &sum).expect("known");
+            for row in (0..40).filter(|row| slots[*row] == group) {
+                one.update(std::slice::from_ref(&values[row])).expect("folds one in");
+            }
+            assert_eq!(
+                state.clone().finish().expect("finishes"),
+                one.finish().expect("finishes"),
+                "the sum of group {group}"
+            );
+        }
+        assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 0);
+
+        // Two values that cannot be added, ungrouped and then grouped, both of which have to
+        // report rather than wrap.
+        let huge = Value::Decimal { unscaled: i128::MAX - 1, width: 34, scale: 2 };
+        let brims = Vector::from_values(ty.clone(), &[huge.clone(), huge.clone()]).expect("two");
+        let mut ungrouped = Accumulator::new("sum", &sum).expect("known");
+        let raised = ungrouped.update_run(std::slice::from_ref(&brims), 2);
+        assert!(raised.is_err(), "a total that does not fit answered anyway");
+        let mut grouped = vec![Accumulator::new("sum", &sum).expect("known"); 1];
+        let one_group = vec![0_usize; 2];
+        let scattered = update_scattered(&mut grouped, &one_group, 1, 0, Some(&brims), 2);
+        assert!(scattered.is_err(), "a total that does not fit answered anyway");
         fallback::reset();
     }
 
@@ -3205,10 +3333,12 @@ mod tests {
         }
     }
 
-    /// Why the whole sum stops at sixty four bits: at a hundred and twenty eight the total of one
-    /// vector can overflow on its own, and the overflow is the answer rather than a detail.
+    /// Why the whole sum checks every addition at a hundred and twenty eight bits: the total of
+    /// one vector can overflow on its own there, and the overflow is the answer rather than a
+    /// detail. The vector path hands a total that does not fit back rather than reporting it
+    /// itself, so the error comes from the same row at a time loop it always came from.
     #[test]
-    fn a_total_of_hugeints_goes_the_row_at_a_time_way_and_still_overflows() {
+    fn a_total_of_hugeints_that_does_not_fit_goes_the_row_at_a_time_way_and_overflows() {
         fallback::reset();
         let rows = vec![Value::HugeInt(i128::MAX); 2];
         let vector = Vector::from_values(LogicalType::HugeInt, &rows).expect("a vector");
