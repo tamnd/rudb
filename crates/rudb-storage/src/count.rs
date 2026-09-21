@@ -372,6 +372,8 @@ fn value_hash(values: &Vector, at: usize) -> Option<u64> {
 /// For a run length column that carries nulls in the vector above the runs, where a run no longer
 /// says what a row holds.
 fn rows(vector: &Vector, sketch: &mut Sketch) -> bool {
+    // row at a time: a run that the vector above it has nulls in no longer says what a row holds,
+    // so the runs cannot be walked and there is no typed slice under them to walk instead.
     for row in 0..vector.len() {
         if vector.is_null_at(row) {
             continue;
