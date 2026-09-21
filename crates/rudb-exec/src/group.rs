@@ -4164,7 +4164,17 @@ impl Sink for Aggregate<'_> {
             let next = AtomicUsize::new(0);
             let slots: Vec<Mutex<Option<Result<Part>>>> =
                 (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
-            let degree = threads.degree().clamp(1, RADIX_PARTITIONS);
+            let input = fixed
+                .partitions
+                .iter()
+                .map(|partition| {
+                    partition
+                        .lock()
+                        .map(|runs| runs.runs.iter().map(|run| run.rows.len()).sum::<usize>())
+                        .map_err(poisoned)
+                })
+                .sum::<Result<usize>>()?;
+            let degree = degree_for(input, threads);
             together(threads, degree, &|| {
                 finish_fixed(&next, &slots, fixed, bound, &self.calls, &self.memory);
             })?;
