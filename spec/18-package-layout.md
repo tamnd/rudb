@@ -88,6 +88,8 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 **Feature flags are for optional functionality, never for correctness variants.** No feature flag changes a query's answer. A flag that turns off the JIT changes how the answer is computed and not what it is, and document 16.3 proves that.
 
+**Outside crates are the exception and not the default**, on the terms section 18.5 sets out. One of them is the global allocator, which no library in this workspace may set and the shell does.
+
 **Compile time is a tracked metric with a budget.** Ten minutes for a clean release build of the whole workspace, measured in CI, and a change that pushes past it is a change that needs to justify itself. The kernel generator in document 7.3 is the main risk here and its table is the throttle.
 
 ## 18.3 Stability tiers
@@ -115,3 +117,23 @@ The claim in document 00 is that the crate structure lets modern work be adopted
 **A new file format.** A crate alongside `rudb-parquet`, depending only on `rudb-vector`.
 
 **What the tree does not make easy**, and it is worth being honest about it: changing the vector size, changing the physical form set, or changing the string representation. Those are in `rudb-vector` and they touch everything. That is the price of having a wide fast interface at the bottom, it is the right price, and it is exactly why document 00 settles the vector size at 1024 up front rather than leaving it to be discovered.
+
+## 18.5 The zero dependency rule, and the one exception
+
+The rule that the rest of this document keeps referring to, written down here because it was being cited before it was stated.
+
+**The engine does not depend on outside crates for anything it could write.** That is why `rudb-compress` contains a Snappy and a zstd rather than a line in a manifest, why the hash in document `engine/06-hash.md` is a few hundred lines of xxh3 in the workspace, and why `engine/05-scan.md` rules out `io_uring` partly on these grounds. The rule is expensive and document `engine/05-scan.md` says so in as many words. What it buys is a build with a small attack surface, a compile time nobody else controls, and no day where a dependency's major version decides what the engine does next.
+
+The rule is about the engine. It is not about the shell.
+
+**A global allocator is an exception because it is not a library's to choose.** In Rust exactly one crate in a program may set `#[global_allocator]`, and a library that sets one has taken the choice away from every program that embeds it. For `rudb` that is the Rust API, the C API, the Arrow bridge and anything linking any of them, and none of those asked. So the attribute belongs on a binary, the workspace has one binary that ships, and `crates/rudb-cli/src/main.rs` is where it goes. Nothing the engine links picks up a line of it.
+
+**What it is worth.** A bulk load is an allocator benchmark, because the chunks are produced on the worker threads and freed on the one thread draining the query, and glibc returns a block to the arena of the thread that allocated it. Measured on server2 with 20 million rows over two columns, best of five: glibc loads in 0.95 seconds, mimalloc in 0.44, jemalloc in 0.93. Peak resident memory is 336 MB, 336 MB and 344 MB. Scan queries over a table that is already in memory are a wash across all three on one thread and within noise on six, which is the shape to expect, since a scan takes and gives back a chunk's worth on the same thread and every allocator is good at that.
+
+jemalloc is in that measurement because it is what DuckDB ships on Linux and it was the obvious other answer. It recovers two percent of the load and uses the most memory of the three, so it is not the one.
+
+**An allocator has to be measured as configured and not as advertised.** The first build of this was two and a half times slower than the glibc it replaced, and finding out why took longer than wiring it up. Two settings decide it and both are in the workspace manifest. The crate defaults to mimalloc 3, which on this load is twice the time and 80 MB more than mimalloc 2, so the `v2` feature pins the series. mimalloc also asks the kernel for transparent huge pages on the memory it reserves, and on a long running machine whose free memory has fragmented, serving those faults means waiting for compaction: same fault count, four times the system time. The `no_thp` feature turns the request off. Neither of those is a thing the crate's README would have told us, and the general lesson is that a dependency taken for its performance is a dependency whose configuration is part of the engine.
+
+**The cost, stated plainly.** mimalloc is a C library behind `libmimalloc-sys`, so the default build of the shell now wants a C compiler. `cargo build --no-default-features` gives the old build back, and that is the build the numbers above are measured against, so the flag is not decoration.
+
+**This is not a substitute for the page pool.** `crates/rudb-vector/src/buffer.rs` already describes the thing that would make the allocator matter less: a pool the vector sized runs are taken from and given back to, which is the buffer manager arriving from the other direction. An allocator that recycles well hides the cost of churning a few hundred thousand buffers. Not churning them is still better, and the measurement above is the reason to do it rather than a reason not to.
