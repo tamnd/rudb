@@ -492,7 +492,10 @@ impl Exchange {
         // probe into a table of groups usually does not. That is what makes the second half of
         // [`pairs::finish_degree`] matter here, since a pass that is waiting on memory is the one a
         // thread past the machine's memory level parallelism does nothing for.
-        let degree = pairs::finish_degree(input, PARTITIONS.min(threads.degree()));
+        let degree = match std::env::var("RUDB_FINDEG").ok().and_then(|held| held.parse().ok()) {
+            Some(forced) => forced,
+            None => pairs::finish_degree(input, PARTITIONS.min(threads.degree())),
+        };
         // How many of the scattered partitions are worth keeping apart, which the scatter itself
         // could not know. See [`pairs::used`].
         let used = pairs::used(input, degree);
