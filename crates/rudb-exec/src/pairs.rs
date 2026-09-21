@@ -363,8 +363,20 @@ pub(crate) fn distinct_pairs(
     // There is no one run to compact into now, so they are collected here instead, and this is where
     // they are read from for the rest of the pass. It is one record per distinct pair rather than one
     // per row, which is the same bound the compaction had.
-    let mut unique: Vec<Record> = Vec::new();
-    let mut unique_validity: Vec<bool> = Vec::new();
+    //
+    // That bound is also what it is asked for up front. A vector that doubles its way from nothing
+    // to n copies about n on the way, and this pass is bandwidth bound rather than thread bound: on
+    // ClickBench 8 the finishing half does not get any quicker between eight threads and sixteen,
+    // and nine pairs in ten there are new, so the doubling was moving nearly as many bytes as the
+    // loop itself was. Asking once costs no more memory than the doubling reached anyway, since a
+    // vector that has just grown holds up to twice what is in it, and it is given back below as soon
+    // as the real count is known.
+    let mut unique: Vec<Record> = Vec::with_capacity(held_rows);
+    let mut unique_validity: Vec<bool> =
+        if all_valid { Vec::new() } else { Vec::with_capacity(held_rows) };
+    working.grow(width(
+        unique.capacity() * size_of::<Record>() + unique_validity.capacity() * size_of::<bool>(),
+    ))?;
     let timing = stage::Timing::start(Stage::Fold);
     for run in &partition.runs {
         for (source, &row) in run.rows.iter().enumerate() {
@@ -400,9 +412,6 @@ pub(crate) fn distinct_pairs(
     // The rows themselves are not read again, only the distinct pairs, so give the memory back
     // before the group pass rather than at the end of the query.
     partition.runs.clear();
-    working.grow(width(
-        unique.capacity() * size_of::<Record>() + unique_validity.capacity() * size_of::<bool>(),
-    ))?;
     let partition = Run { rows: unique, validity: unique_validity };
 
     // Every distinct pair is one for its group to count, and the group goes to the split its hash
