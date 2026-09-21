@@ -133,7 +133,7 @@ pub use syntax::{
 // `rudb-compat` and `rudb-bench` driving the library through one crate is the point of #110, and a
 // caller who had to reach for `rudb-common` to name the type of a value would not be doing that.
 pub use rudb_common::{Cancel, Error, ErrorCode, Field, LogicalType, Result, Span, Value};
-pub use rudb_vector::Chunk;
+pub use rudb_vector::{Chunk, VECTOR_SIZE};
 
 /// Every optimizer pass, by the name `SET disabled_optimizers` knows it by, in the order they run.
 ///

@@ -74,6 +74,6 @@ A checkpoint writes all dirty pages, writes a new metadata version, writes the a
 
 **MVCC version checking is on the scan path.** A scan of a row group with no versions checks one pointer and proceeds, which is free. A scan of a row group with versions pays per vector. Keeping the common case at one pointer check is the design requirement and it is why versions live outside the encoded data rather than as a per-row visibility column.
 
-**The deletion bitmap is checked per vector** and combined into the validity mask, which is one bitwise operation per 1024 rows when the bitmap is all-live and is the reason a mostly-unmodified table scans at full speed.
+**The deletion bitmap is checked per vector** and combined into the validity mask, which is one bitwise operation per 8192 rows when the bitmap is all-live and is the reason a mostly-unmodified table scans at full speed.
 
 **Bulk-loaded, never-modified data has zero transactional overhead in the scan path.** That is the ClickBench case and it is not an accident that it is the case with no overhead.

@@ -106,9 +106,11 @@ This is answerable only with real users and real queries, which means it is not 
 
 ## Q12: Is the vector size right?
 
-Settled at 1024 in document 00 and it is the decision with the widest blast radius per document 18.4. It is here not because it is open but because it is the one settled decision that would be catastrophically expensive to revisit, and it is worth writing down what would make it wrong: if FastLanes-layout kernels turn out not to be the dominant cost, and if the per-vector overhead of operator dispatch turns out to matter more than the encoding alignment, 2048 would be better.
+It was settled at 1024 in document 00, and this question said what would make that wrong: if FastLanes-layout kernels turn out not to be the dominant cost, and if the per-vector overhead of operator dispatch turns out to matter more than the encoding alignment, a larger size would be better. Both halves of that turned out to be true, and #480 moved it to 8192.
 
-**Measured at M3 by running the interpreted operators at both sizes with decoding forced, which is cheap. Not expected to change and worth checking once.**
+The thing this question did not see is why the answer was wrong, and it is worth writing down because it is a shape that recurs. 1024 was not a bad answer to the question it was asked. It was a single constant answering two unrelated questions, how many values an operator should work on at a time and how many rows one zone map should cover, and the second one wanted a much larger number than the first. #984 separated them by giving a table in memory row groups of its own, and the vector was free the moment it stopped being the storage granularity as well.
+
+**Answered by #480. Measured in document 12 section 15, on twenty million rows in memory and on ClickBench over Parquet.**
 
 ## What is not an open question
 
