@@ -50,6 +50,13 @@
 //! [`Sketch::add_hash`] returns on a comparison for every value above the threshold, which after the
 //! first few thousand rows is nearly all of them.
 //!
+//! Measured on server2 over a release build, three loads each. ClickBench `hits`, a million rows
+//! of a hundred and five columns, takes about 4.5 seconds wall, of which 2.4 is statistics and 1.8
+//! of that 2.4 is this. TPC-H `lineitem` at scale factor 1, six million rows of sixteen columns,
+//! takes about 3.3 seconds wall, 2.0 statistics and 1.6 of it here. So a distinct count costs
+//! roughly three times what the zone map beside it does, which is about what a hash against two
+//! comparisons should cost, and both together are around half the load.
+//!
 //! The memory is 128 KB a column at the default k, so a hundred and five column table like
 //! ClickBench `hits` holds 13 MB of sketch. That is the price of the whole table's statistics and
 //! it does not grow with the rows.

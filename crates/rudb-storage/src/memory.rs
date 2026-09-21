@@ -690,6 +690,14 @@ mod tests {
         table
     }
 
+    #[test]
+    fn a_load_reports_what_the_statistics_cost_and_which_half_of_it_was_the_counts() {
+        let table = people();
+        assert!(table.stats_ns() > 0, "three rows took no measurable time at all");
+        assert!(table.counts_ns() > 0, "the sketches took no measurable time at all");
+        assert!(table.counts_ns() <= table.stats_ns(), "a part is larger than the whole");
+    }
+
     /// A table of one integer column over several chunks, so the folds have something to fold.
     fn counted(rows: usize) -> MemoryTable {
         let mut table = MemoryTable::new(vec![LogicalType::Integer]);
