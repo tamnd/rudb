@@ -932,6 +932,13 @@ where
 /// The translation is one subtraction done once. After it the loop is a shift, a mask and a compare
 /// of two `u64`, which is what the flat loop would have been doing anyway minus the unpacking, so
 /// the form costs nothing on the operation a filter spends most of its time in.
+///
+/// The operator is a match out here and a separate loop under each arm rather than one loop calling
+/// a function it was handed. A function pointer is an indirect call per row, and a loop with one in
+/// it is a loop the compiler will not widen, so the compare that should have been a few rows at a
+/// time was one row at a time with a call in the middle. On a sample of the TPC-H q20 filter, which
+/// is two comparisons of a packed date column over six million rows, this pair of loops was two
+/// thirds of everything the scan did.
 fn packed_against<M>(
     op: Comparison,
     packed: &Packed<'_>,
@@ -954,19 +961,23 @@ where
         };
         return vec![same; len];
     };
-    // The operator is decided before the loop rather than inside it, which is the same reason the
-    // generated loops take it as a function rather than matching per row.
-    let test: fn(u64, u64) -> bool = match op {
-        Comparison::Equal | Comparison::NotDistinctFrom => |found, want| found == want,
-        Comparison::NotEqual | Comparison::DistinctFrom => |found, want| found != want,
-        Comparison::Less => |found, want| found < want,
-        Comparison::LessOrEqual => |found, want| found <= want,
-        Comparison::Greater => |found, want| found > want,
-        Comparison::GreaterOrEqual => |found, want| found >= want,
-    };
-    let mut answers = Vec::with_capacity(len);
-    for row in 0..len {
-        answers.push(test(packed.code(map(row)), code));
+    let mut answers = vec![false; len];
+    /// One pass over the rows with the comparison inlined into it.
+    macro_rules! sweep {
+        ($test:expr) => {{
+            let test = $test;
+            for (row, answer) in answers.iter_mut().enumerate() {
+                *answer = test(packed.code(map(row)), code);
+            }
+        }};
+    }
+    match op {
+        Comparison::Equal | Comparison::NotDistinctFrom => sweep!(|found, want| found == want),
+        Comparison::NotEqual | Comparison::DistinctFrom => sweep!(|found, want| found != want),
+        Comparison::Less => sweep!(|found, want| found < want),
+        Comparison::LessOrEqual => sweep!(|found, want| found <= want),
+        Comparison::Greater => sweep!(|found, want| found > want),
+        Comparison::GreaterOrEqual => sweep!(|found, want| found >= want),
     }
     answers
 }
@@ -1022,23 +1033,29 @@ where
         };
         return Some(vec![same; len]);
     }
-    // The operator is decided before the loop rather than inside it, the same way `packed_against`
-    // decides it and for the same reason.
-    let test: fn(i128, i128) -> bool = match op {
-        Comparison::Equal | Comparison::NotDistinctFrom => |one, other| one == other,
-        Comparison::NotEqual | Comparison::DistinctFrom => |one, other| one != other,
-        Comparison::Less => |one, other| one < other,
-        Comparison::LessOrEqual => |one, other| one <= other,
-        Comparison::Greater => |one, other| one > other,
-        Comparison::GreaterOrEqual => |one, other| one >= other,
-    };
-    let mut answers = Vec::with_capacity(len);
-    for slot in 0..len {
-        let row = map(slot);
-        answers.push(test(
-            low + i128::from(left.code(at_left(row))),
-            other_low + i128::from(right.code(at_right(row))),
-        ));
+    // The operator is a match out here with a loop under each arm, the same way `packed_against`
+    // takes it and for the same reason.
+    let mut answers = vec![false; len];
+    /// One pass over the rows with the comparison inlined into it.
+    macro_rules! sweep {
+        ($test:expr) => {{
+            let test = $test;
+            for (slot, answer) in answers.iter_mut().enumerate() {
+                let row = map(slot);
+                *answer = test(
+                    low + i128::from(left.code(at_left(row))),
+                    other_low + i128::from(right.code(at_right(row))),
+                );
+            }
+        }};
+    }
+    match op {
+        Comparison::Equal | Comparison::NotDistinctFrom => sweep!(|one, other| one == other),
+        Comparison::NotEqual | Comparison::DistinctFrom => sweep!(|one, other| one != other),
+        Comparison::Less => sweep!(|one, other| one < other),
+        Comparison::LessOrEqual => sweep!(|one, other| one <= other),
+        Comparison::Greater => sweep!(|one, other| one > other),
+        Comparison::GreaterOrEqual => sweep!(|one, other| one >= other),
     }
     Some(answers)
 }
