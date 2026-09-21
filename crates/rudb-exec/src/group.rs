@@ -2410,13 +2410,7 @@ impl<'a> Aggregate<'a> {
     /// out to be thirty two, and the bet would be sized against a thread count that never existed.
     /// The number of partitions stands in as a floor instead, because an aggregate worth running on
     /// several threads is one the pipeline gives at least that many.
-    ///
     fn worth_local(&self) -> bool {
-        // String groups retain their payload in every worker's table until the merge.
-        // Sharing radix partitions keeps one copy of each URL key instead.
-        if self.keys.iter().any(|&key| self.plan.expr_type(key) == &LogicalType::Varchar) {
-            return false;
-        }
         let Some(limit) = self.memory.limit() else { return true };
         let instances = self.started.load(Ordering::Relaxed).max(self.merged.len()) as u64;
         self.memory.used().saturating_mul(instances) < limit / 2
