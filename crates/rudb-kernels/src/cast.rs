@@ -161,12 +161,22 @@ fn swept(input: &Vector, target: &LogicalType) -> Option<Vector> {
             }
             // Every code is inside the dictionary because `Vector::dictionary` checks that on the
             // way in, so the gather below indexes without a bound of its own.
-            convert_run(values.data()?, |index| codes[index] as usize, rows, from, into, physical)?
+            let at = |index| codes[index] as usize;
+            match values.data() {
+                Some(data) => convert_run(data, at, rows, from, into, physical)?,
+                // A dictionary whose values are themselves packed, which is what a stored column
+                // of few distinct numbers comes back as and is where every decimal column of
+                // TPC-H arrives. The codes pick a row of the packed run the same way they pick a
+                // row of a flat one.
+                None => from_packed(&values.packed_parts()?, at, rows, from, into, physical)?,
+            }
         }
         // A packed column has no `Data` of its own to read through a mapping, because its values
         // are not in a container of a width any layout names. They are added out here instead and
         // the run that comes out goes through the same two exact source quadrants.
-        Form::BitPacked => from_packed(&input.packed_parts()?, rows, from, into, physical)?,
+        Form::BitPacked => {
+            from_packed(&input.packed_parts()?, identity, rows, from, into, physical)?
+        }
         _ => return None,
     };
     Some(Vector::flat(target.clone(), converted).ok()?.with_validity(nulls_of(input)))
@@ -259,14 +269,18 @@ fn convert_run<M: Fn(usize) -> usize>(
 /// A float is never packed, since packing is a range of integers, so the approximate source
 /// quadrants are `None` rather than a loop that cannot be reached.
 ///
+/// The mapping is a generic parameter for the reason [`exact_run`] gives, and it is what lets a
+/// dictionary over a packed run of values reach this with the codes as the mapping.
+///
 /// On TPC-H this is `1 - l_discount` and `l_extendedprice * (1 - l_discount)`, where the binder
 /// widens a `DECIMAL(15, 2)` column on the way into the arithmetic, which is q01, q06, q14 and q19.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a wide integer past 2^53 losing digits is what a double is, and this is the float path"
 )]
-fn from_packed(
+fn from_packed<M: Fn(usize) -> usize>(
     packed: &rudb_vector::Packed<'_>,
+    at: M,
     rows: usize,
     from: Numeric,
     into: Numeric,
@@ -279,8 +293,8 @@ fn from_packed(
     let mask = u64::MAX >> (u64::BITS - packed.width());
     base.checked_add(i128::from(mask))?;
     let mut run = Vec::with_capacity(rows);
-    for row in 0..rows {
-        run.push(base + i128::from(packed.code(row)));
+    for index in 0..rows {
+        run.push(base + i128::from(packed.code(at(index))));
     }
     match into {
         Numeric::Exact { scale: now, width } => {
@@ -2599,11 +2613,15 @@ mod tests {
                 let flat = Vector::from_values(from.clone(), &values).expect("a flat vector");
                 let codes: Vec<u32> = (0..len).map(|_| rng.below(len as u64) as u32).collect();
                 let dictionary =
-                    Vector::dictionary(codes, flat.clone()).expect("codes are in range");
+                    Vector::dictionary(codes.clone(), flat.clone()).expect("codes are in range");
                 // A float has no range to pack and a narrow column is not worth packing, and both
                 // of those hand the vector back as it was, so this is the flat case a second time
                 // for some of the fifteen types rather than something to assert about.
                 let packed = flat.bit_packed().expect("packs or hands the vector back");
+                // The shape every decimal column of TPC-H arrives in, a dictionary whose values
+                // are packed, which reaches neither the flat arm nor the packed one.
+                let over_packed =
+                    Vector::dictionary(codes.clone(), packed.clone()).expect("codes are in range");
                 for into in &types {
                     // A cast to the type it already is hands the vector straight back, which for a
                     // dictionary means a dictionary, and the loop below always builds a flat one.
@@ -2615,6 +2633,7 @@ mod tests {
                     agrees(&flat, into);
                     agrees(&dictionary, into);
                     agrees(&packed, into);
+                    agrees(&over_packed, into);
                 }
             }
         }
@@ -2670,6 +2689,34 @@ mod tests {
         assert_eq!(fallback::count(Kernel::Cast, Form::BitPacked, Form::BitPacked), 0);
         cast(&input, &LogicalType::Varchar, false).expect("prints");
         assert_eq!(fallback::count(Kernel::Cast, Form::BitPacked, Form::BitPacked), 1);
+        fallback::reset();
+    }
+
+    /// The same column with a dictionary over it, which is what a stored decimal column with few
+    /// distinct values actually comes back as and is the shape every decimal cast in TPC-H takes.
+    #[test]
+    fn a_dictionary_over_a_packed_column_does_not_reach_the_row_at_a_time_path() {
+        fallback::reset();
+        let narrow = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let values: Vec<Value> = (0..11)
+            .map(|row| Value::Decimal { unscaled: row * 100, width: 15, scale: 2 })
+            .collect();
+        let distinct = Vector::from_values(narrow, &values)
+            .expect("a flat decimal")
+            .bit_packed()
+            .expect("a thousand wide range packs");
+        assert_eq!(distinct.form(), Form::BitPacked);
+        let codes: Vec<u32> = (0..6_000).map(|row| (row % 11) as u32).collect();
+        let input = Vector::dictionary(codes, distinct).expect("codes are in range");
+        for target in [
+            LogicalType::decimal(18, 2).expect("a legal decimal"),
+            LogicalType::decimal(38, 4).expect("a legal decimal"),
+            LogicalType::BigInt,
+            LogicalType::Double,
+        ] {
+            agrees(&input, &target);
+        }
+        assert_eq!(fallback::count(Kernel::Cast, Form::Dictionary, Form::Dictionary), 0);
         fallback::reset();
     }
 
