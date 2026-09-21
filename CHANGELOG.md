@@ -8,13 +8,15 @@ The count does not restart at the handover, because a version number cannot go b
 
 ## 0.3.72
 
-A patch release of one pull request, which finishes a change the last one but two started. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
+A patch release of two pull requests, one of which finishes a change the last one but two started. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
 
 A top N keeps a candidate as codes rather than as values since 0.3.69, but its sort key was still a value, and the key is the part that mattered. A row is kept once and rejected many times, so reading the key ran once per row of the input while reading the row ran once per row the operator kept, and reading a string out of a native text column means decoding a compressed dictionary block. A code on its own cannot be compared, because first appearance order says nothing about sort order, but a rank can: the file stores the sorted order of every text column's dictionary, so the rank of a code is where its value sits among all of them and two ranks in one dictionary compare exactly as the two strings do. A candidate's key carries its rank, a row is rejected by looking its own rank up through the codes, and nothing is decoded. #1123.
 
 The measurement is worth writing down because a profile at one thread would have said not to bother. At one thread ClickBench 25 goes from 212.5 million instructions to 196.3 and ClickBench 26 from 86.4 to 80.4, eight and seven percent. At eight threads the same pair is twenty to thirty four percent, because one instance fills its candidates from the first chunk and the vectorized pass then rejects nearly every row before the row loop runs, while sixteen instances each see a sixteenth of the input, each set of candidates is far weaker, and the rows the pass cannot settle are the ones that reach the reject. At thirty two threads, which is the shape the benchmark runs in, ClickBench 25 goes 0.815 ms to 0.698 and ClickBench 26 0.520 to 0.463, with the forty three query suite at 70.3 ms against 71.0 and nothing else moving.
 
 Answers are unchanged across the suite apart from the queries that have no deterministic answer to begin with, which is the same set as always.
+
+The other one is a `WITH` definition that is named more than once. It was put into every place it was named, so a query that names it twice ran it twice, and it is held and read where it is named now. A definition named once is still inlined, a definition written inside a subquery is still inlined however many times it is read because it is allowed to name a column of the query around it, and a name that a later definition writes again is left alone because which of the two a read means is a question about scopes that a count of spellings cannot ask. TPC-H q15 names its definition twice, both copies read six million rows and grouped a million and a half of them, and the second copy threw away everything but one number. q15 goes from 0.1850 to 0.1000 CPU seconds on the native file at SF1 and from 3.11x behind DuckDB on its own format to 1.52x, and the 22 query suite goes 5.5875 to 5.2550. Nothing else in the suite names a definition twice. This is also what DuckDB does, which I checked in v1.5.5 rather than assumed. #1125.
 
 ## 0.3.71
 
