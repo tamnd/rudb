@@ -1256,6 +1256,12 @@ impl<'a> Aggregate<'a> {
             // scatter consumes, and the same slots with a call's `FILTER` folded into them.
             slots: Vec::new(),
             walk: Walk::default(),
+            // The direct map over combinations of codes, and the dictionaries it belongs to. Both
+            // empty until a chunk arrives that it can answer, and kept across the chunks of a row
+            // group, which is the whole point of holding them here.
+            coded_on: Vec::new(),
+            coded_map: Vec::new(),
+            missing: Vec::new(),
             kept: Vec::new(),
             affine_rows: vec![0; calls],
             // The file the rows that do not fit go to, made the first time the budget says the
@@ -1303,6 +1309,9 @@ impl<'a> Aggregate<'a> {
             hashes,
             slots,
             walk,
+            coded_on,
+            coded_map,
+            missing,
             kept,
             affine_rows,
             over,
@@ -1333,7 +1342,44 @@ impl<'a> Aggregate<'a> {
         // The column at a time half of #237. One pass over each key column turns the whole chunk
         // into one hash per row, with the type of the column matched on once rather than once per
         // value, and the row loop below is then a probe with the hash already in hand.
-        if !alone {
+        // The probe, and nothing else. What comes out of it is one slot per row, which is what the
+        // scatter below needs and what the row loop used to consume as it went.
+        slots.clear();
+        slots.resize(*length, if alone { 0 } else { NOWHERE });
+        // The direct map first, because a chunk it answers is a chunk that is never hashed. The
+        // whole key of q1 is two dictionary codes with six combinations between them, so the map is
+        // six slots long and every row after the first six is a multiply add and a load. See
+        // [`Coded`](crate::table::Coded) for why that is the shape a Parquet scan hands over.
+        //
+        // Refused while there is a spill file, because a row that does not fit goes out whole and
+        // the map has nothing to say about where it went.
+        let direct = if alone || over.is_some() {
+            coded_on.clear();
+            None
+        } else {
+            crate::table::coded(keys, *length)
+        };
+        if let Some(codes) = &direct {
+            if !codes.same_as(coded_on) {
+                codes.hold(coded_on);
+                coded_map.clear();
+                coded_map.resize(codes.combos(), NOWHERE);
+            }
+            missing.clear();
+            for (row, slot) in slots.iter_mut().enumerate() {
+                let found = coded_map[codes.at(row)];
+                if found == NOWHERE {
+                    missing.push(row);
+                } else {
+                    *slot = found;
+                }
+            }
+        } else {
+            coded_on.clear();
+        }
+        // Hashed unless the map answered the whole chunk, which is the ordinary case once the first
+        // rows of a row group have been through.
+        if !alone && direct.as_ref().is_none_or(|_| !missing.is_empty()) {
             match prehashed {
                 Some(prehashed) => {
                     hashes.clear();
@@ -1342,17 +1388,45 @@ impl<'a> Aggregate<'a> {
                 None => crate::table::hash(keys, *length, hashes, crate::table::Across::OneInput),
             }
         }
-        // The probe, and nothing else. What comes out of it is one slot per row, which is what the
-        // scatter below needs and what the row loop used to consume as it went.
-        slots.clear();
-        slots.resize(*length, if alone { 0 } else { NOWHERE });
         // A batch at a time, because a probe of a table larger than the cache is three dependent
         // misses on a row and the only way to overlap them is to have several rows in flight at once.
         // What comes back is every row whose key is already a group, filled in, and the rest in row
         // order. Those go one at a time: a key that is not in the table either starts a group or goes
         // out to the spill file, and both of them change what the row after would have found.
+        // The rows the map had nothing for, which are the first row of each combination and no
+        // others. They go through the probe and the insert every row used to go through, and what
+        // comes back is written into the map so that the rest of the row group skips both.
+        if let Some(codes) = &direct {
+            for &row in missing.iter() {
+                let index = codes.at(row);
+                // Two rows of one chunk can be the first two of one combination, and the first of
+                // them filled the map on its way past.
+                if coded_map[index] != NOWHERE {
+                    slots[row] = coded_map[index];
+                    continue;
+                }
+                let bucket = match table.probe(hashes[row], keys, row) {
+                    Probe::Found(slot) => {
+                        slots[row] = slot;
+                        coded_map[index] = slot;
+                        continue;
+                    }
+                    Probe::Vacant(bucket) => bucket,
+                };
+                if self.max_groups.is_some_and(|limit| table.len() >= limit) {
+                    continue;
+                }
+                slots[row] = table.insert(bucket, hashes[row], keys, row)?;
+                coded_map[index] = slots[row];
+                *groups = table.len();
+                self.fresh(states, counts, compact)?;
+                if self.sets {
+                    self.fresh_seen(seen);
+                }
+            }
+        }
         let mut from = 0;
-        while !alone && from < *length {
+        while direct.is_none() && !alone && from < *length {
             let upto = (from + crate::table::BATCH).min(*length);
             table.probe_run(hashes, keys, from, upto, slots, walk);
             from = upto;
@@ -2956,6 +3030,15 @@ pub(crate) struct Building {
     slots: Vec<usize>,
     /// What the batched probe walks with, kept so that a chunk allocates nothing for it.
     walk: Walk,
+    /// The dictionaries `coded_map` was filled against, which is what says it still means anything.
+    ///
+    /// Empty when the last chunk was not one the direct map could answer, so the map is rebuilt
+    /// rather than read. See [`Coded`](crate::table::Coded).
+    coded_on: Vec<Arc<Vector>>,
+    /// One slot per combination of codes, or [`NOWHERE`] where that combination has not been seen.
+    coded_map: Vec<usize>,
+    /// The rows of the last chunk the map had no slot for, in row order.
+    missing: Vec<usize>,
     kept: Vec<usize>,
     affine_rows: Vec<i64>,
     over: Option<Spill>,
@@ -5980,6 +6063,120 @@ mod tests {
         fixed.push(row, some);
         fixed.push(row, FixedRecord::ALL);
         assert_eq!(fixed.validity, vec![some, FixedRecord::ALL]);
+    }
+
+    /// Counts two `VARCHAR` keys over however many chunks are handed over, sorted.
+    ///
+    /// The shape of TPC-H q1's group by, which is the one the direct map over codes was written
+    /// for. Every test below runs the same rows twice, once as dictionaries and once flat, and
+    /// asserts the two answers are the same, because the map is only worth having if it cannot be
+    /// told apart from the probe it replaces.
+    fn two_key_counts(chunks: Vec<Chunk>) -> Vec<Vec<Value>> {
+        let plan = Plan::parse(concat!(
+            "Aggregate #1 groups=[#0.0::VARCHAR, #0.1::VARCHAR] ",
+            "aggregates=[count_star()::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [a::VARCHAR, b::VARCHAR]",
+        ))
+        .expect("a two-key count plan");
+        let schema = Schema::numbered(
+            vec![Field::new("a", LogicalType::Varchar), Field::new("b", LogicalType::Varchar)],
+            0,
+        );
+        let rudb_plan::Node::Aggregate { groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+                .expect("a count aggregate");
+        let mut local = aggregate.local();
+        for chunk in &chunks {
+            aggregate.sink(chunk, &mut local).expect("a chunk of rows");
+        }
+        aggregate.combine(local).expect("the one instance");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{row:?}"));
+        rows
+    }
+
+    /// One column of strings, flat.
+    fn letters(values: &[Option<&str>]) -> Vector {
+        let values: Vec<Value> = values
+            .iter()
+            .map(|value| match value {
+                Some(text) => Value::Varchar((*text).into()),
+                None => Value::Null,
+            })
+            .collect();
+        Vector::from_values(LogicalType::Varchar, &values).expect("a column of strings")
+    }
+
+    /// The same column as codes into a dictionary of its own, which is the form a Parquet scan
+    /// hands a low cardinality string column over in.
+    fn letters_coded(codes: Vec<u32>, values: &[Option<&str>]) -> Vector {
+        Vector::dictionary(codes, letters(values)).expect("a dictionary of those strings")
+    }
+
+    /// The rows of one chunk spelled out both ways, so a test can run the same data through the
+    /// map and through the probe.
+    fn both_ways(
+        codes: &[(u32, u32)],
+        first: &[Option<&str>],
+        second: &[Option<&str>],
+    ) -> (Chunk, Chunk) {
+        let coded = Chunk::new(vec![
+            letters_coded(codes.iter().map(|&(left, _)| left).collect(), first),
+            letters_coded(codes.iter().map(|&(_, right)| right).collect(), second),
+        ])
+        .expect("two aligned columns");
+        let flat = Chunk::new(vec![
+            letters(&codes.iter().map(|&(left, _)| first[left as usize]).collect::<Vec<_>>()),
+            letters(&codes.iter().map(|&(_, right)| second[right as usize]).collect::<Vec<_>>()),
+        ])
+        .expect("two aligned columns");
+        (coded, flat)
+    }
+
+    /// q1's own key, over two chunks that share their dictionaries, which is what the chunks of one
+    /// row group look like. The second chunk is where the map earns its keep: every combination in
+    /// it was seen in the first, so not one of its rows is hashed or compared.
+    #[test]
+    fn a_group_by_over_two_dictionaries_counts_what_the_flat_columns_count() {
+        let flags = [Some("A"), Some("N"), Some("R")];
+        let status = [Some("F"), Some("O")];
+        let (first_coded, first_flat) =
+            both_ways(&[(0, 0), (1, 1), (2, 0), (0, 0)], &flags, &status);
+        let (second_coded, second_flat) = both_ways(&[(1, 1), (1, 0), (2, 0)], &flags, &status);
+        let counted = two_key_counts(vec![first_coded, second_coded]);
+        assert_eq!(counted, two_key_counts(vec![first_flat, second_flat]));
+        assert_eq!(counted.len(), 4, "A/F, N/O, R/F, N/F and nothing else");
+    }
+
+    /// A row group ends and the next one brings its own dictionary, in which the same string has a
+    /// different code. A map kept across that boundary would answer the second row group with the
+    /// first one's groups, which is the answer coming back with the wrong strings in it.
+    #[test]
+    fn a_second_dictionary_does_not_inherit_the_first_one_s_map() {
+        let first = [Some("A"), Some("N")];
+        let second = [Some("N"), Some("A")];
+        let both = [Some("F"), Some("O")];
+        let (first_coded, first_flat) = both_ways(&[(0, 0), (1, 1)], &first, &both);
+        let (second_coded, second_flat) = both_ways(&[(0, 0), (1, 1)], &second, &both);
+        let coded = two_key_counts(vec![first_coded, second_coded]);
+        assert_eq!(coded, two_key_counts(vec![first_flat, second_flat]));
+        assert_eq!(coded.len(), 4, "A/F, N/O, N/F and A/O");
+    }
+
+    /// Nulls, which reach the map two ways: a row whose own bit says it is one, and a row whose
+    /// code points at a value that is one. Both are the same group and the flat columns say so.
+    #[test]
+    fn null_keys_behind_a_dictionary_group_the_way_flat_nulls_do() {
+        let flags = [Some("A"), None];
+        let status = [Some("F"), None];
+        let (coded, flat) = both_ways(&[(0, 0), (1, 0), (1, 1), (0, 1)], &flags, &status);
+        let counted = two_key_counts(vec![coded]);
+        assert_eq!(counted, two_key_counts(vec![flat]));
+        assert_eq!(counted.len(), 4);
     }
 
     /// Runs one chunk through the encoded count scatter and gives back the answer, sorted.

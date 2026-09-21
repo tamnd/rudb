@@ -530,6 +530,155 @@ impl Walk {
     }
 }
 
+/// The most key columns a chunk is read through codes for.
+///
+/// Four, because the product of four dictionaries has passed [`COMBOS`] on every chunk this was
+/// measured on, and because a fixed array of four is one fewer allocation per chunk than a `Vec`.
+const KEYS: usize = 4;
+
+/// The most code combinations the direct map covers.
+///
+/// The bound is about the map rather than about the key. The caller keeps one slot per combination
+/// and clears it when the dictionaries change, so a map of a few thousand entries against a chunk of
+/// a thousand rows is one where building it costs more than the probe it replaces. A map that lives
+/// into the next chunk costs nothing at all, which is the ordinary case, but the first chunk of a
+/// row group still has to pay for one.
+const COMBOS: usize = 2048;
+
+/// One key column of a chunk, read as codes into the dictionary they point at.
+#[derive(Debug, Clone, Copy)]
+struct CodedColumn<'a> {
+    /// This chunk's code per row, already cut to the rows being asked about.
+    codes: &'a [u32],
+    /// The dictionary those codes point into, kept for its identity rather than its values.
+    values: &'a Arc<Vector>,
+    /// What this column's place is multiplied by, which is the spans of the columns before it.
+    stride: usize,
+    /// The place a null row takes, which is one past the last code.
+    nothing: usize,
+    /// Whether any row here can be null at all, asked once for the chunk.
+    nullable: bool,
+    /// The column itself, asked about a row only when there is a null in it to find.
+    ///
+    /// Through the vector rather than through the two validities beside it because a dictionary
+    /// keeps its nulls in the vector it points at, and that vector can be a dictionary in its own
+    /// turn. [`Vector::is_null_at`] is the one answer that follows the whole chain, and it is the
+    /// answer [`Column::push_from`] and [`Column::holds`] decide by, so the place a null row takes
+    /// here has to be decided by it too.
+    column: &'a Vector,
+}
+
+impl CodedColumn<'_> {
+    /// Where this column puts a row in the combined index.
+    fn place(&self, row: usize) -> usize {
+        if self.nullable && self.column.is_null_at(row) {
+            return self.nothing;
+        }
+        self.codes[row] as usize
+    }
+}
+
+/// A chunk whose whole key is a few small codes, so a row's group is an index into a table.
+///
+/// A Parquet reader hands a low cardinality column over as a dictionary, and a group by over two of
+/// those spends its time hashing the bytes each code points at and then comparing those same bytes
+/// against the key the table stored, once per row. Neither question depends on the row. The
+/// dictionary behind `l_returnflag` holds three values and the one behind `l_linestatus` holds two,
+/// so between them there are six answers and TPC-H q1 asks for one of them six million times.
+///
+/// So this turns a row into the index of its combination of codes, and the caller keeps one slot per
+/// combination beside it. A row whose combination has been seen costs a load of each code, a
+/// multiply add and a load from a table of six, and nothing is hashed or compared at all. The rows
+/// that pay the full price are the first of each combination, which is six rows in a scan of six
+/// million, and they pay it through the same probe and insert every other row used to.
+///
+/// The codes are only meaningful against the dictionary they came from, which is why the caller
+/// holds those dictionaries beside the map and throws the map away when a chunk arrives under
+/// different ones. A Parquet dictionary covers a column chunk, so that happens once a row group
+/// rather than once a chunk.
+pub(crate) struct Coded<'a> {
+    columns: [Option<CodedColumn<'a>>; KEYS],
+    combos: usize,
+}
+
+impl<'a> Coded<'a> {
+    /// How many combinations of codes the key can take, which is how long the map has to be.
+    pub(crate) fn combos(&self) -> usize {
+        self.combos
+    }
+
+    /// The index in the map of the key at `row`.
+    pub(crate) fn at(&self, row: usize) -> usize {
+        let mut index = 0;
+        for column in self.columns.iter().flatten() {
+            index += column.place(row) * column.stride;
+        }
+        index
+    }
+
+    /// Whether these are the same dictionaries `held` was filled from, so the map still means what
+    /// it meant.
+    pub(crate) fn same_as(&self, held: &[Arc<Vector>]) -> bool {
+        let mut at = 0;
+        for column in self.columns.iter().flatten() {
+            match held.get(at) {
+                Some(dictionary) if Arc::ptr_eq(dictionary, column.values) => at += 1,
+                _ => return false,
+            }
+        }
+        at == held.len()
+    }
+
+    /// Records which dictionaries the map about to be built belongs to.
+    pub(crate) fn hold(&self, into: &mut Vec<Arc<Vector>>) {
+        into.clear();
+        for column in self.columns.iter().flatten() {
+            into.push(Arc::clone(column.values));
+        }
+    }
+}
+
+/// Reads a chunk's key columns as codes, when every one of them arrives as a small dictionary.
+///
+/// `None` the moment any part of that is not true, which is a key column that is not a dictionary, a
+/// dictionary large enough that the map would cost more than the probe, or a code outside the
+/// dictionary it points into. The last of those is not a shape anything builds, and the pass that
+/// rules it out is a run of `u32` against a constant, which is cheaper than being wrong about it
+/// once: a code out of range would index the map as some other combination and answer a group that
+/// is not the row's own.
+pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
+    if keys.is_empty() || keys.len() > KEYS {
+        return None;
+    }
+    let mut columns = [None; KEYS];
+    let mut combos: usize = 1;
+    for (at, key) in keys.iter().enumerate() {
+        let (codes, values) = key.shared_dictionary_parts()?;
+        let codes = codes.get(..rows)?;
+        let span = values.len().checked_add(1)?;
+        if combos.checked_mul(span)? > COMBOS {
+            return None;
+        }
+        if codes.iter().any(|&code| code as usize >= values.len()) {
+            return None;
+        }
+        columns[at] = Some(CodedColumn {
+            codes,
+            values,
+            stride: combos,
+            nothing: values.len(),
+            // A pass over the dictionary and not over the chunk, which is at most the two thousand
+            // entries `COMBOS` allows and is usually three. What it buys is the row loop below
+            // skipping the null question entirely on the columns that have no null in them.
+            nullable: key.validity().has_nulls(rows)
+                || (0..values.len()).any(|at| values.is_null_at(at)),
+            column: key,
+        });
+        combos *= span;
+    }
+    Some(Coded { columns, combos })
+}
+
 /// One key column in its common physical width.
 ///
 /// ClickBench's keys are `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT` and `VARCHAR`, and half its
@@ -1833,5 +1982,83 @@ mod tests {
             "{} bytes do not include the string",
             table.footprint()
         );
+    }
+    /// A dictionary of three letters, which is the form a Parquet scan hands `l_returnflag` over
+    /// in, with `codes` saying which row takes which.
+    fn coded_letters(codes: Vec<u32>, letters: &[&str]) -> Vector {
+        let values: Vec<Value> = letters.iter().map(|&text| Value::Varchar(text.into())).collect();
+        Vector::dictionary(codes, flat(LogicalType::Varchar, &values))
+            .expect("a dictionary of those letters")
+    }
+
+    /// The pair TPC-H q1 groups by, and the six places their codes take between them.
+    #[test]
+    fn two_small_dictionaries_give_every_row_the_place_its_codes_say() {
+        let flags = coded_letters(vec![0, 1, 2, 0], &["A", "N", "R"]);
+        let status = coded_letters(vec![0, 1, 1, 0], &["F", "O"]);
+        let keys = [flags, status];
+        let coded = coded(&keys, 4).expect("two small dictionaries are read as codes");
+        // Four codes in the first column and three in the second, one of each being the place a
+        // null takes, which is twelve between them.
+        assert_eq!(coded.combos(), 12);
+        assert_eq!(coded.at(0), 0);
+        assert_eq!(coded.at(1), 1 + 4);
+        assert_eq!(coded.at(2), 2 + 4);
+        assert_eq!(coded.at(3), 0);
+    }
+
+    /// Rows that are null take one place between them however they came to be null, because the
+    /// table holds one group for all of them and a place per row would be a group per row.
+    #[test]
+    fn a_null_row_takes_the_place_past_the_last_code() {
+        let inner = flat(LogicalType::Varchar, &[Value::Varchar("A".into()), Value::Null]);
+        let column = Vector::dictionary(vec![0, 1, 0], inner)
+            .expect("a dictionary whose second value is nothing")
+            .with_validity(rudb_vector::Validity::Mask({
+                let mut mask = rudb_vector::Bitmap::all_valid(3);
+                mask.set(2, false);
+                mask
+            }));
+        let keys = [column];
+        let coded = coded(&keys, 3).expect("one small dictionary is read as codes");
+        assert_eq!(coded.combos(), 3);
+        assert_eq!(coded.at(0), 0);
+        // The second row's code points at a null and the third row's own bit says it is one, and
+        // both of them are the same group.
+        assert_eq!(coded.at(1), 2);
+        assert_eq!(coded.at(2), 2);
+    }
+
+    /// Every form that is not a dictionary goes the long way, since there are no codes to read.
+    #[test]
+    fn a_flat_column_is_not_read_as_codes() {
+        let keys = [flat(LogicalType::Integer, &[Value::Integer(1), Value::Integer(2)])];
+        assert!(coded(&keys, 2).is_none());
+    }
+
+    /// And a dictionary large enough that the map would cost more than the probe it replaces.
+    #[test]
+    fn a_dictionary_wider_than_the_map_allows_is_refused() {
+        let values: Vec<Value> = (0..COMBOS as i32).map(Value::Integer).collect();
+        let column = Vector::dictionary(vec![0, 1], flat(LogicalType::Integer, &values))
+            .expect("a dictionary of that many values");
+        let keys = [column];
+        assert!(coded(&keys, 2).is_none());
+    }
+
+    /// The map only means anything against the dictionaries it was filled from, which is what the
+    /// caller throws it away on.
+    #[test]
+    fn a_chunk_under_other_dictionaries_does_not_keep_the_map() {
+        let first = [coded_letters(vec![0, 1], &["A", "N"])];
+        let over_first = coded(&first, 2).expect("codes");
+        let mut held = Vec::new();
+        over_first.hold(&mut held);
+        assert!(over_first.same_as(&held));
+
+        let second = [coded_letters(vec![0, 1], &["A", "N"])];
+        let later = coded(&second, 2).expect("codes");
+        assert!(!later.same_as(&held), "a dictionary built again is not the one the map holds");
+        assert!(coded(&[], 0).is_none(), "no key columns are no codes");
     }
 }
