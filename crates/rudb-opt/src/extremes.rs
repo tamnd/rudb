@@ -247,6 +247,10 @@ mod tests {
                 End::High => self.high.clone(),
             }
         }
+
+        fn nulls(&self, _column: usize) -> Stat<u64> {
+            Stat::Unknown
+        }
     }
 
     /// What the plan a text prints looks like once the pass has run over a scan with those bounds.
