@@ -876,6 +876,13 @@ fn follow(
                 if matches!(distinct, Stat::Known { .. }) {
                     return distinct;
                 }
+                // What the store said about itself, which for a native table is the dictionary for
+                // a string column and the span between the two ends for an integer one. Second to
+                // `ANALYZE`, because `ANALYZE` counted the column and this bounds it.
+                let measured = plan.distinct_measured(index, &field.name);
+                if matches!(measured, Stat::Known { .. }) {
+                    return measured;
+                }
                 if !rows {
                     return Stat::Unknown;
                 }

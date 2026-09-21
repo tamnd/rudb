@@ -1,8 +1,11 @@
 //! A table: a name, some columns, and the rows.
 
-use rudb_common::bounds::Bound;
+use std::sync::Arc;
+
+use rudb_common::bounds::{Bound, Zones};
+use rudb_common::stat::Stat;
 use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_native::{FrequencyOccurrences, Reader as NativeReader};
+use rudb_native::{FrequencyOccurrences, Reader as NativeReader, Stripes};
 use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
 
@@ -415,6 +418,34 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.group_skips(stripe, probes),
             Self::Native(reader) => reader.stripe_skips(stripe, probes),
+        }
+    }
+
+    /// The bounds this store keeps per part of itself, for the planner to ask.
+    ///
+    /// `None` for a table in memory. It has a zone map per chunk and they are as good as the
+    /// stripe bounds a file holds, but a chunk is owned by the table rather than shared behind a
+    /// reference count, so handing them to a plan means copying them once per statement bound.
+    /// The file side has the query that needs this and is where it starts.
+    #[must_use]
+    pub fn zones(&self) -> Option<Arc<dyn Zones>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Native(reader) => Some(Arc::new(Stripes::new(reader.clone()))),
+        }
+    }
+
+    /// How many distinct values each column holds, for the columns this store can say.
+    ///
+    /// Empty for a table in memory, for the same reason [`Rows::zones`] is `None` there.
+    #[must_use]
+    pub fn distincts(&self) -> Vec<(String, Stat<u64>)> {
+        match self {
+            Self::Memory(_) => Vec::new(),
+            // A reader that cannot answer its own directory is a reader that will fail the scan a
+            // moment later with the same error, and the planner is not the place to raise it. An
+            // empty list reads back as a table nobody counted, which is where this started.
+            Self::Native(reader) => rudb_native::distincts(reader).unwrap_or_default(),
         }
     }
 
