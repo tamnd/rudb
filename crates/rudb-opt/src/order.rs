@@ -23,11 +23,21 @@
 //!
 //! The order is chosen greedily. Repeatedly take the pair of parts with a condition between them
 //! that produces the fewest rows, join them, and put the result back, until one part is left. A pair
-//! with a condition between them is scored with [`crate::estimate::matched`], which is the larger of
-//! the two sides and the keyspace reading of the conditions that become testable at that pair,
-//! whichever is bigger. A pair with no condition between them is taken only when no pair in the
-//! region has one, which is the case where a cross product is the only thing left to build, and
-//! `cheapest` is where that rule is and why it is not a tie break.
+//! with a condition between them is scored with [`crate::estimate::matched_sides`], which is the
+//! larger of the two sides and the keyspace reading of the conditions that become testable at that
+//! pair, whichever is bigger, cut down by the fraction the filters under each side kept. A pair with
+//! no condition between them is taken only when no pair in the region has one, which is the case
+//! where a cross product is the only thing left to build, and `cheapest` is where that rule is and
+//! why it is not a tie break.
+//!
+//! Every part carries two numbers for that, the rows it produces and the rows it would produce with
+//! the filters under it taken out, and a pair is scored from both. Containment is a statement about
+//! two whole tables, so scoring a filtered side by containment alone says a join to a fiftieth of
+//! part is the whole of lineitem, and then nothing in the region reduces and the tie breaks on the
+//! smaller input. That is how q9 came to join supplier first, which removes no rows at all, before
+//! the part join, which removes nineteen rows in twenty. The filter is charged once, at the join
+//! that first saw the side it sits under, because what carries up out of a pair is the unfiltered
+//! join and not the answer.
 //!
 //! The order that comes out replaces the one that was there when the sum of the rows its joins
 //! produce is smaller, and never when it builds more cross products than the region already had.
@@ -73,7 +83,7 @@
 use rudb_common::Result;
 use rudb_plan::{BuildSide, ExprRef, JoinKind, Node, NodeRef, Plan};
 
-use crate::estimate::{self, Facts};
+use crate::estimate::{self, Facts, Side};
 use crate::pass::{Context, Pass};
 use crate::tables::{TableSet, Tables, produced};
 use crate::walk;
@@ -107,8 +117,12 @@ struct Part {
     build: usize,
     /// Which table indices those rows carry, which is what says whether a condition can be tested.
     tables: TableSet,
-    /// How many rows it is estimated to produce.
-    rows: u64,
+    /// How many rows it is estimated to produce, and how many it would produce unfiltered.
+    ///
+    /// Both numbers, because the second is what the next pair is scored from. A filter is charged
+    /// once, at the join that first saw the side it sits under, and the unfiltered size is what
+    /// carries up so that no join above charges it again.
+    side: Side,
 }
 
 /// One node of the order the search chose, before any of it is put in the arena.
@@ -208,7 +222,7 @@ fn order(
         parts.push(Part {
             build,
             tables: produced(plan, leaf),
-            rows: estimate::rows(plan, leaf, stats)?,
+            side: estimate::side(plan, leaf, stats)?,
         });
     }
     let mut whole = TableSet::new();
@@ -231,7 +245,7 @@ fn order(
     let mut after = 0u64;
     let mut built = 0usize;
     while parts.len() > 1 {
-        let (left, right, rows) = cheapest(plan, &parts, &pending, stats);
+        let (left, right, side) = cheapest(plan, &parts, &pending, stats);
         let mut union = parts[left].tables.clone();
         union.extend(&parts[right].tables);
         let conditions: Vec<ExprRef> = pending
@@ -245,8 +259,8 @@ fn order(
         let left = parts.remove(left);
         built += usize::from(conditions.is_empty());
         builds.push(Build::Pair { left: left.build, right: right.build, conditions });
-        after = after.saturating_add(rows);
-        parts.push(Part { build: builds.len() - 1, tables: union, rows });
+        after = after.saturating_add(side.rows);
+        parts.push(Part { build: builds.len() - 1, tables: union, side });
     }
     // An order that builds more cross products than the region already had is refused whatever the
     // sum says, because a cross product is worse than a join with a condition on it whatever the two
@@ -307,7 +321,7 @@ fn cheapest(
     parts: &[Part],
     pending: &[(ExprRef, TableSet)],
     stats: &Facts,
-) -> (usize, usize, u64) {
+) -> (usize, usize, Side) {
     let mut best: Option<Pick> = None;
     for left in 0..parts.len() {
         for right in left + 1..parts.len() {
@@ -319,20 +333,24 @@ fn cheapest(
                 .map(|(condition, _)| *condition)
                 .collect();
             let linked = !testable.is_empty();
-            let rows = if linked {
+            let (this, that) = (parts[left].side, parts[right].side);
+            let side = if linked {
                 let keys = estimate::keyspace_of(plan, &testable, stats);
-                estimate::matched(parts[left].rows, parts[right].rows, keys)
+                estimate::matched_sides(this, that, keys)
             } else {
-                parts[left].rows.saturating_mul(parts[right].rows)
+                Side {
+                    rows: this.rows.saturating_mul(that.rows),
+                    base: this.base.saturating_mul(that.base),
+                }
             };
-            let order = (!linked, rows, parts[left].rows.saturating_add(parts[right].rows));
+            let order = (!linked, side.rows, this.rows.saturating_add(that.rows));
             if best.is_none_or(|held| order < held.order) {
-                best = Some(Pick { left, right, rows, order });
+                best = Some(Pick { left, right, side, order });
             }
         }
     }
     let best = best.expect("a region has at least two parts");
-    (best.left, best.right, best.rows)
+    (best.left, best.right, best.side)
 }
 
 /// One pair [`cheapest`] is considering, with what it would cost and where that puts it.
@@ -342,8 +360,8 @@ struct Pick {
     left: usize,
     /// The part on the right, by position.
     right: usize,
-    /// How many rows joining the two is estimated to produce.
-    rows: u64,
+    /// What joining the two is estimated to produce, filtered and unfiltered.
+    side: Side,
     /// What the pairs are sorted by: unconnected last, then the rows, then the two inputs together.
     order: (bool, u64, u64),
 }
@@ -354,26 +372,29 @@ struct Pick {
 /// between their two sides. Scored with the same two rules the search uses rather than with
 /// [`crate::estimate`], because the two have to be the same measure for the comparison to mean
 /// anything, and because this is the measure the greedy step is minimising one pair at a time.
-fn cost(plan: &Plan, at: NodeRef, stats: &Facts) -> Option<(u64, u64, usize)> {
+fn cost(plan: &Plan, at: NodeRef, stats: &Facts) -> Option<(Side, u64, usize)> {
     let (left, right, testable) = match *plan.node(at) {
         Node::CrossProduct { left, right } => (left, right, Vec::new()),
         Node::Join { left, right, kind: JoinKind::Inner, conditions, .. } => {
             (left, right, plan.expr_list(conditions).to_vec())
         }
-        _ => return Some((estimate::rows(plan, at, stats)?, 0, 0)),
+        _ => return Some((estimate::side(plan, at, stats)?, 0, 0)),
     };
     let linked = !testable.is_empty();
     let (left, under_left, crossed_left) = cost(plan, left, stats)?;
     let (right, under_right, crossed_right) = cost(plan, right, stats)?;
-    let rows = if linked {
+    let side = if linked {
         let keys = estimate::keyspace_of(plan, &testable, stats);
-        estimate::matched(left, right, keys)
+        estimate::matched_sides(left, right, keys)
     } else {
-        left.saturating_mul(right)
+        Side {
+            rows: left.rows.saturating_mul(right.rows),
+            base: left.base.saturating_mul(right.base),
+        }
     };
     Some((
-        rows,
-        under_left.saturating_add(under_right).saturating_add(rows),
+        side,
+        under_left.saturating_add(under_right).saturating_add(side.rows),
         crossed_left + crossed_right + usize::from(!linked),
     ))
 }
@@ -621,5 +642,47 @@ mod tests {
                 "      Get memory.main.u AS u #1 [b::BIGINT]\n",
             )
         );
+    }
+
+    #[test]
+    fn the_join_that_removes_rows_runs_before_the_join_that_removes_none() {
+        // TPC-H q9 again, this time about which join goes first rather than about the cross
+        // product. `u` is the supplier side, which every row of `w` matches, and the filtered `v`
+        // is the part side, which a fifth of them match. Reading the filter through the join is
+        // what tells the two apart, because containment alone calls both of them a hundred
+        // thousand rows and then the tie breaks on the smaller input, which is `u`.
+        assert_eq!(
+            ordered(concat!(
+                "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+                "    Get memory.main.u AS u #1 [b::BIGINT]\n",
+                "  Filter (#2.0::BIGINT = 3::BIGINT)::BOOLEAN\n",
+                "    Get memory.main.v AS v #2 [c::BIGINT]\n",
+            )),
+            concat!(
+                "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+                "  Get memory.main.u AS u #1 [b::BIGINT]\n",
+                "  Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+                "    Filter (#2.0::BIGINT = 3::BIGINT)::BOOLEAN\n",
+                "      Get memory.main.v AS v #2 [c::BIGINT]\n",
+            )
+        );
+    }
+
+    #[test]
+    fn with_nothing_filtering_either_side_the_same_region_is_left_as_it_was() {
+        // The same three tables with the filter taken off. Neither join removes anything now, so
+        // there is nothing to prefer and the order the query was written in stands. This is the
+        // half of the previous test that says the new reading is the filter and not the shape.
+        let text = concat!(
+            "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+            "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+            "    Get memory.main.u AS u #1 [b::BIGINT]\n",
+            "  Get memory.main.v AS v #2 [c::BIGINT]\n",
+        );
+        assert_eq!(ordered(text), text);
     }
 }

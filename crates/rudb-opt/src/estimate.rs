@@ -296,6 +296,73 @@ pub fn rows(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<u64> {
     rows_stat(plan, node, stats).read(CARDINALITY).copied()
 }
 
+/// How many rows this node would produce if no filter underneath it threw any away.
+///
+/// The containment assumption a join is estimated by is a statement about two whole tables: every
+/// value on the smaller side turns up on the larger one, so the join is as tall as the larger side.
+/// A filter under one of the sides breaks it, and breaks it in the direction that matters, because
+/// the rows the filter removed are rows the other side no longer matches. So the join is estimated
+/// from what the two sides would be without their filters, which is what this answers, and the
+/// fractions the filters kept are applied to the result. TPC-H q9 is the case: joining six million
+/// lineitem rows to the twenty thousand parts whose name contains a word produces about a fifth of
+/// what joining them to all two hundred thousand parts would, and containment on its own says the
+/// two are the same size and puts the join that removes nothing first.
+///
+/// Only the operators a filter can hide under are walked, which is a filter itself, the ones that
+/// change the width and not the height, the inner joins and the two join kinds that are a filter
+/// written as a join. Everything else is as tall as it is, so it answers with its ordinary estimate
+/// and the walk stops there.
+///
+/// The walk has to agree with itself across the passes that move an operator, because the join
+/// ordering pass reads it and the sequence of passes is required to settle after one run. A semi
+/// join is where that bites. It starts life as a mark join and ends up underneath whatever inner
+/// join it can be pushed below, so the same side is a filtered scan before the semi passes have run
+/// and a semi join over a filtered scan afterwards, and the two have to answer the same or the
+/// ordering pass decides one thing on the first run and another on the second.
+#[must_use]
+pub fn unfiltered(plan: &Plan, node: NodeRef, stats: &Facts) -> Stat<u64> {
+    match *plan.node(node) {
+        // The whole point: the rows it was given rather than the rows it kept.
+        Node::Filter { input, .. } => unfiltered(plan, input, stats),
+        Node::Project { input, .. }
+        | Node::Window { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Fetch { input, .. }
+        | Node::TableFetch { input, .. } => unfiltered(plan, input, stats),
+        // A semi join and an anti join keep some of the rows their left side gave them and add
+        // nothing, which is what a filter does, so the unfiltered side is the one underneath. They
+        // are walked through rather than estimated for the same reason a filter is, and without
+        // this a plan where a semi join has been pushed under one estimates the side at what the
+        // semi join kept and a plan where it has not estimates the same side at the whole table.
+        Node::Join { left, kind: JoinKind::Semi | JoinKind::Anti, .. } => {
+            unfiltered(plan, left, stats)
+        }
+        // A join of two unfiltered sides, which is the containment reading with nothing scaled.
+        Node::Join { left, right, kind: kind @ JoinKind::Inner, conditions, .. } => join(
+            both(unfiltered(plan, left, stats)),
+            both(unfiltered(plan, right, stats)),
+            kind,
+            plan.expr_list(conditions).len(),
+            keyspace(plan, conditions, stats, &mut Vec::new()),
+        ),
+        Node::CrossProduct { left, right } => {
+            unfiltered(plan, left, stats).zip(unfiltered(plan, right, stats), u64::saturating_mul)
+        }
+        _ => rows_stat(plan, node, stats),
+    }
+}
+
+/// A side of a join, as the rows it produces and the rows it would produce unfiltered.
+///
+/// `None` where either is unknown, since a caller that cannot have the first has nothing to score
+/// and a caller that cannot have the second has no fraction to apply.
+#[must_use]
+pub fn side(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<Side> {
+    let rows = *rows_stat(plan, node, stats).read(CARDINALITY)?;
+    let base = *unfiltered(plan, node, stats).read(CARDINALITY)?;
+    Some(Side { rows, base: base.max(rows) })
+}
+
 /// How many rows this node produces, and how much of that is knowledge.
 ///
 /// `Unknown` means nothing downstream of here should pretend to know, which is the answer for a
@@ -432,8 +499,8 @@ pub fn rows_stat_into(
             known => known.map(|n| n.saturating_sub(offset).min(count)),
         },
         Node::Join { left, right, kind, conditions, .. } => join(
-            of(left),
-            of(right),
+            Both { rows: of(left), base: unfiltered(plan, left, stats) },
+            Both { rows: of(right), base: unfiltered(plan, right, stats) },
             kind,
             plan.expr_list(conditions).len(),
             keyspace(plan, conditions, stats, reads),
@@ -932,14 +999,75 @@ pub fn matched(left: u64, right: u64, keys: Option<u64>) -> u64 {
     left.max(right).max(counted)
 }
 
+/// One side of a join, as how many rows it produces and how many it would produce unfiltered.
+///
+/// The two are the same number on a side nothing filters, which is most sides, and then everything
+/// below behaves exactly as [`matched`] alone did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Side {
+    /// The rows the side produces.
+    pub rows: u64,
+    /// The rows it would produce with the filters under it taken out. Never below `rows`.
+    pub base: u64,
+}
+
+impl Side {
+    /// A side nothing under it filters, which is what a caller with no second number to give says.
+    #[must_use]
+    pub const fn whole(rows: u64) -> Self {
+        Self { rows, base: rows }
+    }
+
+    /// What fraction of its rows the filters underneath left, which is one where there are none.
+    fn share(self) -> f64 {
+        (widened(self.rows) / widened(self.base)).min(1.0)
+    }
+}
+
+/// How many rows an equijoin of these two sides produces, and how many it would produce unfiltered.
+///
+/// [`matched`] over what the two sides would be without their filters, times what each filter kept.
+/// Splitting it that way is the only reading of the containment assumption that survives a filter.
+/// Containment says every value of the smaller side turns up on the larger one, which is a claim
+/// about two whole tables, and the rows a filter took off one side are exactly the rows the other
+/// side no longer has a partner for. So the assumption is applied where it holds, between the two
+/// tables as they stand in the catalog, and the filters are applied to what it produced.
+///
+/// The fractions multiply, which assumes the two filters are independent of each other and of the
+/// join, and that is the same assumption everything else in this module already makes.
+///
+/// The `base` that comes back is the unfiltered join and not the answer, so that a caller building
+/// up an order pair by pair can ask the same question of the pair it just made. Scaling an already
+/// scaled number would charge a filter twice, once at the join that first saw it and once at every
+/// join above.
+#[must_use]
+pub fn matched_sides(left: Side, right: Side, keys: Option<u64>) -> Side {
+    let base = matched(left.base, right.base, keys);
+    let rows = scale(base, left.share() * right.share()).max(1).min(base);
+    Side { rows, base }
+}
+
+/// A side as the two numbers [`join`] reads: what it produces and what it would produce unfiltered.
+#[derive(Clone, Copy)]
+struct Both {
+    rows: Stat<u64>,
+    base: Stat<u64>,
+}
+
+/// A side whose second number is its first, which is a side with no filter under it to account for.
+const fn both(stat: Stat<u64>) -> Both {
+    Both { rows: stat, base: stat }
+}
+
 /// The join kinds, each of which is a different question.
 fn join(
-    left: Stat<u64>,
-    right: Stat<u64>,
+    left: Both,
+    right: Both,
     kind: JoinKind,
     conditions: usize,
     keys: Option<u64>,
 ) -> Stat<u64> {
+    let (left, right, bases) = (left.rows, right.rows, (left.base, right.base));
     match kind {
         // Left rows, filtered by whether a match exists. Never more than the left side, and the
         // right side's size does not enter into it.
@@ -970,7 +1098,13 @@ fn join(
                     provenance: from,
                 };
             }
-            let matched = matched(left, right, keys);
+            // The unfiltered size of a side falls back to its filtered one, which makes the
+            // fraction one and leaves the estimate where it was before there were two numbers.
+            let sides = (
+                Side { rows: left, base: bases.0.value().copied().unwrap_or(left).max(left) },
+                Side { rows: right, base: bases.1.value().copied().unwrap_or(right).max(right) },
+            );
+            let matched = matched_sides(sides.0, sides.1, keys).rows;
             let value = match kind {
                 // An outer join emits every row of the preserved side whether it matched or not,
                 // so the estimate cannot fall below that side.
@@ -1017,7 +1151,7 @@ mod tests {
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
-    use super::{Facts, Key, rows, rows_stat};
+    use super::{Facts, Key, Side, matched_sides, rows, rows_stat, unfiltered};
 
     /// A one column scan of the named table, which is what most of these sit on.
     fn scan(table: &str, index: u32) -> String {
@@ -1073,6 +1207,14 @@ mod tests {
         let plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         rows_stat(&plan, plan.root(), &stats)
+    }
+
+    /// What the root would produce with the filters under it taken out.
+    fn whole(text: &str, tables: &[(&str, u64)]) -> Option<u64> {
+        let stats = facts(tables);
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        unfiltered(&plan, plan.root(), &stats).value().copied()
     }
 
     /// A filter of the given predicate over a two column scan of `t`.
@@ -1480,6 +1622,94 @@ mod tests {
         let tables = &[("small", 10), ("big", 1_000)];
         let counts = &[("small", "a", 1_000_000), ("big", "a", 1_000_000)];
         assert_eq!(counted(&text, tables, counts), Some(1_000));
+    }
+
+    /// A scan of `lineitem` joined to a scan of `part` with an equality filter on the part side.
+    fn joined_to_a_filtered_part(filter: bool) -> String {
+        let part = if filter {
+            concat!(
+                "  Filter (#1.0::INTEGER = 3::INTEGER)::BOOLEAN\n",
+                "    Get memory.main.part AS part #1 [a::INTEGER]\n"
+            )
+        } else {
+            "  Get memory.main.part AS part #1 [a::INTEGER]\n"
+        };
+        format!(
+            "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n{}{part}",
+            "  Get memory.main.lineitem AS lineitem #0 [a::INTEGER]\n"
+        )
+    }
+
+    #[test]
+    fn the_unfiltered_size_of_a_node_is_the_rows_the_filters_under_it_were_given() {
+        // The number containment is a statement about, which is the table rather than the part of
+        // it a filter kept. A node with nothing filtering under it reports the same either way.
+        let tables = &[("lineitem", 6_000_000), ("part", 200_000)];
+        let text = joined_to_a_filtered_part(true);
+        assert_eq!(estimate(&text, tables), Some(1_200_000));
+        assert_eq!(whole(&text, tables), Some(6_000_000));
+        let plain = joined_to_a_filtered_part(false);
+        assert_eq!(estimate(&plain, tables), whole(&plain, tables));
+    }
+
+    #[test]
+    fn a_filter_under_one_side_makes_the_join_smaller_than_the_side_it_contains() {
+        // TPC-H q9 written small. The containment floor calls a join to a fiftieth of part the
+        // whole of lineitem, which is what made the ordering pass run this join last instead of
+        // first. A fiftieth of the parts match a fiftieth of the rows.
+        let tables = &[("lineitem", 6_000_000), ("part", 200_000)];
+        assert_eq!(estimate(&joined_to_a_filtered_part(false), tables), Some(6_000_000));
+        assert_eq!(estimate(&joined_to_a_filtered_part(true), tables), Some(1_200_000));
+    }
+
+    #[test]
+    fn a_filter_is_charged_once_however_many_joins_sit_above_it() {
+        // The unfiltered size that comes back from a join is the unfiltered join, so the join
+        // above divides by the same fraction the join below already divided by. Charging it twice
+        // would call this two hundred and forty thousand rows and put a supplier join first again.
+        let text = concat!(
+            "Join INNER on=[(#0.0::INTEGER = #2.0::INTEGER)::BOOLEAN]\n",
+            "  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+            "    Get memory.main.lineitem AS lineitem #0 [a::INTEGER]\n",
+            "    Filter (#1.0::INTEGER = 3::INTEGER)::BOOLEAN\n",
+            "      Get memory.main.part AS part #1 [a::INTEGER]\n",
+            "  Get memory.main.supplier AS supplier #2 [a::INTEGER]\n"
+        );
+        let tables = &[("lineitem", 6_000_000), ("part", 200_000), ("supplier", 10_000)];
+        assert_eq!(estimate(text, tables), Some(1_200_000));
+        assert_eq!(whole(text, tables), Some(6_000_000));
+    }
+
+    #[test]
+    fn a_semi_join_is_walked_through_the_way_a_filter_over_the_same_side_is() {
+        // The two spellings of the same side, one before the semi passes have run over it and one
+        // after. They have to answer the same, because the join ordering pass reads this and the
+        // sequence of passes is required to settle after one run over the plan it produced.
+        let tables = &[("t", 1_000), ("u", 100)];
+        let before = filtered("(#0.0::INTEGER = 3::INTEGER)::BOOLEAN");
+        let after = concat!(
+            "Join SEMI on=[(#1.0::INTEGER = #0.0::INTEGER)::BOOLEAN]\n",
+            "  Filter (#0.0::INTEGER = 3::INTEGER)::BOOLEAN\n",
+            "    Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n",
+            "  Get memory.main.u AS u #1 [a::INTEGER]\n"
+        );
+        assert_eq!(whole(&before, tables), Some(1_000));
+        assert_eq!(whole(after, tables), Some(1_000));
+    }
+
+    #[test]
+    fn a_side_with_nothing_under_it_is_whole_and_the_arithmetic_is_the_containment_reading() {
+        // The two numbers agree on a side nobody filtered, and then the scaled reading is the
+        // unscaled one. This is the case every plan was in before there were two numbers.
+        let sides = matched_sides(Side::whole(1_500_000), Side::whole(150_000), Some(150_000));
+        assert_eq!(sides, Side { rows: 1_500_000, base: 1_500_000 });
+        // A side cut to a tenth takes the join to a tenth, and the base it reports is still the
+        // join of the two whole tables.
+        let cut = Side { rows: 15_000, base: 150_000 };
+        assert_eq!(
+            matched_sides(Side::whole(1_500_000), cut, Some(150_000)),
+            Side { rows: 150_000, base: 1_500_000 }
+        );
     }
 
     #[test]
