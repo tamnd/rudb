@@ -10,7 +10,7 @@
 //! allowed to be as lopsided as it likes, so partitioning the deduplication on the group hands one
 //! thread every pair of the biggest group and no number of threads fixes it, because one group
 //! cannot be split. On the million row ClickBench file one region holds eighteen percent of the
-//! distinct pairs where an even share of sixteen partitions is six and a quarter.
+//! distinct pairs, which is more than a tenth of them however many partitions there are.
 //!
 //! What that costs is that a group's pairs end up in several partitions, so whoever counts them has
 //! to put the group back together. [`Counted`] is the shape that hands over, one list per split of
@@ -28,7 +28,54 @@ use rudb_pipeline::Lease;
 use crate::key::{mix, spread};
 
 /// How many radix partitions the pairs are spread over.
-pub(crate) const PARTITIONS: usize = 16;
+pub(crate) const PARTITIONS: usize = 64;
+
+/// Rows one partition is worth, which is what [`used`] divides by.
+///
+/// The number this wants to be is whatever keeps the table a partition builds inside the cache the
+/// thread building it has to itself. A row costs four bytes of bucket at the half load the table
+/// keeps and sixteen bytes of record, so sixteen thousand rows is a table of about three hundred and
+/// fifty kilobytes, and that is the largest one measured that was still worth having.
+///
+/// It is the same number the finishing passes ask for before they take a second thread, which is
+/// not a coincidence. A partition is one thread's piece of work, so the row count that is worth a
+/// thread is the row count that is worth a partition.
+pub(crate) const ROWS_PER_PARTITION: usize = 16_384;
+
+/// How many pieces of work a thread should have to choose from, so that a slow one is absorbed.
+///
+/// Partitions are dealt off a counter rather than handed out in advance, which only helps when there
+/// are more of them than there are threads. One each and a thread that draws the partition holding a
+/// popular group finishes long after the rest, with nobody able to take any of it.
+const PIECES_PER_THREAD: usize = 4;
+
+/// How many of the [`PARTITIONS`] the pairs were scattered into are worth deduplicating separately.
+///
+/// The scatter has to pick a fan out before it has seen a row, so it picks the largest one any query
+/// wants. That is the wrong number for a small query: a partition costs a table, a reservation and a
+/// vector per split whatever is in it, and a query whose pairs would fit in one partition pays for
+/// sixty four of all of those. Measured on the million row ClickBench file, going from sixteen
+/// partitions to sixty four took eleven percent off `COUNT(DISTINCT UserID)` over every row and put
+/// eight percent back on the same query behind a filter that leaves a tenth of them.
+///
+/// So the finishing pass picks the fan out instead, once it knows how many rows there really are,
+/// and the partitions it does not want are merged into the ones it does. Merging is free because a
+/// partition is the list of runs the instances handed it rather than one run of its own, so several
+/// partitions become one by appending three pointers. The partition index is the top bits of the
+/// pair hash and the table inside probes with the low ones, so merging adjacent partitions is the
+/// same thing as having scattered on fewer top bits to begin with.
+///
+/// Two things want a say and the larger of them wins. The table wants to stay inside the cache, which
+/// asks for a partition per [`ROWS_PER_PARTITION`] rows. The threads want something to take when they
+/// run out, which asks for [`PIECES_PER_THREAD`] partitions each, and it is the one that binds on a
+/// query too small for the first to ask for anything. A query finishing on one thread has nothing to
+/// balance and is left with whatever the cache asked for, which for a small one is a single
+/// partition.
+pub(crate) fn used(rows: usize, degree: usize) -> usize {
+    let cache = rows.div_ceil(ROWS_PER_PARTITION);
+    let balance = if degree > 1 { degree.saturating_mul(PIECES_PER_THREAD) } else { 1 };
+    cache.max(balance).max(1).next_power_of_two().min(PARTITIONS)
+}
 
 /// A pair bucket nobody has written to yet.
 const EMPTY: u32 = u32::MAX;
@@ -86,6 +133,15 @@ impl Run {
     pub(crate) fn footprint(&self) -> usize {
         self.rows.capacity() * size_of::<Record>() + self.validity.capacity() * size_of::<bool>()
     }
+}
+
+/// The scatter partitions one piece of the finishing pass takes, when [`used`] wants fewer of them.
+///
+/// Both counts are powers of two, so every piece covers the same number of them and the whole set is
+/// covered exactly once.
+pub(crate) fn merged(at: usize, used: usize) -> std::ops::Range<usize> {
+    let per = PARTITIONS / used;
+    (at * per)..((at + 1) * per)
 }
 
 /// One radix partition's rows, as the run each instance handed over rather than one flat run.
@@ -368,7 +424,31 @@ fn poisoned<T>(_: T) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Held, Record, Run, distinct_pairs};
+    use super::{Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs, merged, used};
+
+    /// The fan out the finishing pass picks, and that what it drops is merged rather than lost.
+    ///
+    /// Every partition has to end up in exactly one piece of work whatever the row count is, since a
+    /// partition that no piece takes is a set of pairs nobody counts.
+    #[test]
+    fn the_partitions_the_finish_does_not_want_are_merged_into_the_ones_it_does() {
+        assert_eq!(used(0, 1), 1);
+        assert_eq!(used(1, 1), 1);
+        assert_eq!(used(ROWS_PER_PARTITION, 1), 1);
+        assert_eq!(used(ROWS_PER_PARTITION + 1, 1), 2);
+        assert_eq!(used(999_975, 32), PARTITIONS);
+        assert_eq!(used(usize::MAX, 32), PARTITIONS);
+        // A query with threads to keep busy takes more pieces than the table size alone asks for.
+        assert_eq!(used(ROWS_PER_PARTITION, 4), 16);
+        assert_eq!(used(0, 32), PARTITIONS);
+        for rows in [0, 1, 40_000, 999_975, usize::MAX] {
+            for degree in [1, 2, 4, 32] {
+                let taken = used(rows, degree);
+                let covered: Vec<usize> = (0..taken).flat_map(|at| merged(at, taken)).collect();
+                assert_eq!(covered, (0..PARTITIONS).collect::<Vec<_>>(), "{rows} rows, {degree}");
+            }
+        }
+    }
 
     /// A run whose very first row has a null key still says so.
     ///
