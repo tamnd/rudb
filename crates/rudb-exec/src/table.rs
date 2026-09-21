@@ -1326,6 +1326,121 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>, across: 
     }
 }
 
+/// Marks every row of a chunk whose whole key is the key of the row before it.
+///
+/// A group by over a column the rows happen to arrive sorted on asks the table the same question
+/// over and over. Three quarters of the rows of TPC-H's lineitem carry the order key of the row
+/// before them, so a `GROUP BY l_orderkey` over six million rows walks the buckets six million
+/// times to land on a slot it landed on for the row before four times out of five. Whether two
+/// rows that sit next to each other hold the same key is answerable where the rows are, in one
+/// sequential pass per key column, and that is arithmetic against a probe's trip to memory.
+///
+/// What comes back is one flag per row, false at the first row because nothing is before it, and
+/// how many flags were set. False where the keys are in fact equal is allowed, since a caller
+/// probes those rows the way it always did. True where they are not is a wrong answer, which is
+/// why a column in a form with no run to read gives up for the whole chunk rather than for itself.
+///
+/// `least` is how many rows the caller needs marked for the answer to be worth having, and a chunk
+/// that cannot reach it is dropped as soon as that is known rather than after the last key column.
+/// A group by on unsorted rows is the case that has to stay cheap, and it pays one pass over one
+/// column to find out that this is not for it.
+pub(crate) fn repeats(keys: &[Vector], rows: usize, least: usize, same: &mut Vec<bool>) -> usize {
+    same.clear();
+    same.resize(rows, true);
+    if rows == 0 {
+        return 0;
+    }
+    same[0] = false;
+    let mut marked = rows - 1;
+    for column in keys {
+        // The count between columns rather than only after the last, which is a pass over a run of
+        // bytes that are in the first level cache against a pass over a key column that may not be.
+        let read = repeats_in(column, rows, same);
+        marked = same.iter().filter(|&&flag| flag).count();
+        if !read || marked < least {
+            same.clear();
+            same.resize(rows, false);
+            return 0;
+        }
+    }
+    marked
+}
+
+/// Narrows `same` to the rows where this column holds what it held at the row before.
+///
+/// False where the column is in a form with no run of its own to walk, which is the same set of
+/// forms [`fold`] falls through to a value at a time for, and there is no value at a time path
+/// here because a caller that gets nothing is a caller that does what it did before.
+///
+/// Two nulls count as the same key, which is what [`Column::holds`] says a stored null matches, and
+/// a float column answers false throughout rather than comparing, because which of `-0.0` and `0.0`
+/// and which pair of nulls groups together is settled in one place and this is not it.
+fn repeats_in(column: &Vector, rows: usize, same: &mut [bool]) -> bool {
+    let validity = column.validity();
+    let same = &mut same[..rows];
+    /// One pass over a run of fixed width values, each row reading its own place in it.
+    macro_rules! run {
+        ($values:expr) => {{
+            let values = $values.as_slice();
+            if values.len() < rows {
+                return false;
+            }
+            narrow(same, validity, |row| values[row] == values[row - 1]);
+            return true;
+        }};
+    }
+    // A code stands for the value it points at, so equal codes are an equal key whether or not the
+    // run behind them holds the value twice. Unequal codes over an equal value is the other way
+    // round and is allowed: the row is probed.
+    if let Some(packed) = column.packed_parts() {
+        narrow(same, validity, |row| packed.code(row) == packed.code(row - 1));
+        return true;
+    }
+    if let Some(data) = column.data() {
+        match data {
+            Data::Bool(values) => run!(values),
+            Data::Int8(values) => run!(values),
+            Data::Int16(values) => run!(values),
+            Data::Int32(values) => run!(values),
+            Data::Int64(values) => run!(values),
+            Data::Int128(values) => run!(values),
+            Data::UInt8(values) => run!(values),
+            Data::UInt16(values) => run!(values),
+            Data::UInt32(values) => run!(values),
+            Data::UInt64(values) => run!(values),
+            Data::UInt128(values) => run!(values),
+            Data::Varlen(strings) => {
+                narrow(same, validity, |row| strings.bytes(row) == strings.bytes(row - 1));
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    if let Some((at, _)) = column.positions() {
+        if at.len() < rows {
+            return false;
+        }
+        narrow(same, validity, |row| at[row] == at[row - 1]);
+        return true;
+    }
+    false
+}
+
+/// Clears the flag of every row this column says is not what the row before it is.
+///
+/// `equal` compares the values of a row and the one before it and is asked nothing about nulls,
+/// because the rule for those is the same for every type and is written here once: a row repeats
+/// when it and the row before are both nothing, or both something and the same something. That is
+/// what [`Column::holds`] says a stored null matches, so a run of nulls is one group the way the
+/// table would have put them in one.
+fn narrow(same: &mut [bool], validity: &rudb_vector::Validity, equal: impl Fn(usize) -> bool) {
+    for (row, flag) in same.iter_mut().enumerate().skip(1) {
+        *flag = *flag
+            && validity.is_valid(row) == validity.is_valid(row - 1)
+            && (!validity.is_valid(row) || equal(row));
+    }
+}
+
 /// Folds one key column's values into the running hash of every row.
 ///
 /// Every arm here has to produce what the general path at the bottom produces for the same value,
@@ -2216,5 +2331,77 @@ mod tests {
         let later = coded(&second, 2).expect("codes");
         assert!(!later.same_as(&held), "a dictionary built again is not the one the map holds");
         assert!(coded(&[], 0).is_none(), "no key columns are no codes");
+    }
+
+    /// Which rows `repeats` marks, asked with a threshold low enough that nothing is dropped for
+    /// being too short a run.
+    fn marked(keys: &[Vector], rows: usize) -> Vec<bool> {
+        let mut same = Vec::new();
+        let count = repeats(keys, rows, 0, &mut same);
+        assert_eq!(count, same.iter().filter(|&&flag| flag).count(), "the count is what is marked");
+        same
+    }
+
+    #[test]
+    fn a_row_is_marked_when_the_row_before_it_holds_the_same_key() {
+        let column = flat(
+            LogicalType::Integer,
+            &[Value::Integer(7), Value::Integer(7), Value::Integer(8), Value::Integer(7)],
+        );
+        // The first row is never marked, because there is nothing before it to be the same as, and
+        // the last one is not either, since a key that came back is still not the key beside it.
+        assert_eq!(marked(std::slice::from_ref(&column), 4), [false, true, false, false]);
+    }
+
+    #[test]
+    fn a_row_is_marked_only_when_every_key_column_repeats() {
+        let left =
+            flat(LogicalType::Integer, &[Value::Integer(1), Value::Integer(1), Value::Integer(1)]);
+        let right = flat(
+            LogicalType::Varchar,
+            &[Value::Varchar("a".into()), Value::Varchar("a".into()), Value::Varchar("b".into())],
+        );
+        assert_eq!(marked(&[left, right], 3), [false, true, false]);
+    }
+
+    /// The rule the table itself follows, which is that one stored null is the group every null row
+    /// lands in.
+    #[test]
+    fn two_nulls_next_to_each_other_are_the_same_key_and_a_null_beside_a_value_is_not() {
+        let column =
+            flat(LogicalType::Integer, &[Value::Null, Value::Null, Value::Integer(4), Value::Null]);
+        assert_eq!(marked(std::slice::from_ref(&column), 4), [false, true, false, false]);
+    }
+
+    /// A dictionary answers off its codes, and two rows under one code are one key whatever the
+    /// values behind them look like.
+    #[test]
+    fn a_dictionary_is_read_through_its_codes() {
+        let column = coded_letters(vec![0, 0, 1, 1, 0], &["A", "N"]);
+        assert_eq!(marked(std::slice::from_ref(&column), 5), [false, true, false, true, false]);
+    }
+
+    /// Floats are left alone on purpose. Whether `-0.0` groups with `0.0` is settled where the keys
+    /// are compared, and guessing it here would merge two groups that belong apart.
+    #[test]
+    fn a_float_column_gives_up_rather_than_deciding_what_counts_as_equal() {
+        let column = flat(LogicalType::Double, &[Value::Double(1.0), Value::Double(1.0)]);
+        assert_eq!(marked(std::slice::from_ref(&column), 2), [false, false]);
+    }
+
+    /// And a chunk that cannot reach the threshold is dropped whole, so a caller that asked for a
+    /// run path gets nothing rather than a run path over four rows in a thousand.
+    #[test]
+    fn a_chunk_with_too_few_repeats_for_the_caller_is_dropped() {
+        let column = flat(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        let keys = std::slice::from_ref(&column);
+        let mut same = Vec::new();
+        assert_eq!(repeats(keys, 4, 2, &mut same), 0);
+        assert_eq!(same, [false, false, false, false]);
+        assert_eq!(repeats(keys, 4, 1, &mut same), 1);
+        assert_eq!(repeats(&[], 0, 0, &mut same), 0);
     }
 }

@@ -151,6 +151,66 @@ fn a_two_column_key_on_several_threads_adds_up() {
     assert_eq!(counted, Value::HugeInt(i128::from(rows)), "the counts do not add up to the rows");
 }
 
+/// A key the rows arrive sorted on, which the aggregate probes once per run rather than once per
+/// row. Every group here is eight rows that sit next to each other, so almost the whole chunk is a
+/// row copying the slot of the row before it, and a run that copied the wrong slot would show up
+/// as a count in the wrong group rather than as a count going missing.
+#[test]
+fn a_key_the_rows_are_already_sorted_on_adds_up() {
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("SET threads = 4").expect("sets the thread count");
+    connection
+        .execute("CREATE TABLE t AS SELECT i // 8 AS k, i AS v FROM range(0, 200000) AS r(i)")
+        .expect("builds the table");
+    let counted = connection
+        .value("SELECT SUM(c) FROM (SELECT k, COUNT(*) AS c FROM t GROUP BY k)")
+        .expect("counts");
+    assert_eq!(counted, Value::HugeInt(200_000), "the counts do not add up to the rows");
+    let grouped = connection
+        .value("SELECT COUNT(*) FROM (SELECT k FROM t GROUP BY k)")
+        .expect("counts the groups");
+    assert_eq!(grouped, Value::BigInt(25_000), "the number of groups is not the distinct keys");
+    // Every group is eight rows of consecutive numbers, so its total is fixed by its key and a
+    // group that took a row belonging to its neighbour is off by a known amount.
+    let wrong = connection
+        .value(
+            "SELECT COUNT(*) FROM (SELECT k, SUM(v) AS s FROM t GROUP BY k) WHERE s <> k * 64 + 28",
+        )
+        .expect("checks every group's total against what its key says it must be");
+    assert_eq!(wrong, Value::BigInt(0), "a run was folded into the wrong group");
+}
+
+/// The same, with nulls and strings in the key, because a run is only a run when the rows beside
+/// each other are the same key and what counts as the same key is not the same question for every
+/// column. Two nulls are one group, so a run of them is a run.
+#[test]
+fn a_sorted_key_of_strings_and_nulls_adds_up() {
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("SET threads = 4").expect("sets the thread count");
+    connection
+        .execute(
+            "CREATE TABLE t AS SELECT \
+                 CASE WHEN i // 8 % 5 = 0 THEN NULL ELSE 'k' || (i // 8) END AS k, i AS v \
+             FROM range(0, 100000) AS r(i)",
+        )
+        .expect("builds the table");
+    let counted = connection
+        .value("SELECT SUM(c) FROM (SELECT k, COUNT(*) AS c FROM t GROUP BY k)")
+        .expect("counts");
+    assert_eq!(counted, Value::HugeInt(100_000), "the counts do not add up to the rows");
+    // Twelve thousand five hundred keys, one in five of which is spelled as nothing, and all of
+    // those are one group between them.
+    let grouped = connection
+        .value("SELECT COUNT(*) FROM (SELECT k FROM t GROUP BY k)")
+        .expect("counts the groups");
+    assert_eq!(grouped, Value::BigInt(10_001), "the nulls are not one group");
+    let nulls =
+        connection.value("SELECT COUNT(*) FROM t WHERE k IS NULL").expect("counts the null rows");
+    assert_eq!(nulls, Value::BigInt(20_000));
+}
+
 /// The same query asked repeatedly, because which worker ends up in which state is a race and a
 /// test that runs it once can miss. Ten is enough to have caught the lost table every time it was
 /// tried by hand.

@@ -1262,6 +1262,9 @@ impl<'a> Aggregate<'a> {
             coded_on: Vec::new(),
             coded_map: Vec::new(),
             missing: Vec::new(),
+            same: Vec::new(),
+            leaders: Vec::new(),
+            leader_slots: Vec::new(),
             kept: Vec::new(),
             affine_rows: vec![0; calls],
             // The file the rows that do not fit go to, made the first time the budget says the
@@ -1312,6 +1315,9 @@ impl<'a> Aggregate<'a> {
             coded_on,
             coded_map,
             missing,
+            same,
+            leaders,
+            leader_slots,
             kept,
             affine_rows,
             over,
@@ -1425,8 +1431,76 @@ impl<'a> Aggregate<'a> {
                 }
             }
         }
+        // Whether the chunk arrives in runs of one key, and if it does, which rows start one.
+        //
+        // A column the rows happen to be sorted on asks the table for the same group over and over.
+        // Three quarters of lineitem's rows carry the order key of the row before them, so a
+        // `GROUP BY l_orderkey` over it walks the buckets four times for every answer it needs
+        // once. The run pass reads the key columns where they already are, in one sequential pass
+        // each, and what it marks is probed once for the whole run.
+        //
+        // Refused while there is a spill file, because a row whose leader went out to the file
+        // would have to go out too and it is not the leader that carries its columns, and refused
+        // under a group limit, because the row the limit turns away leaves its run nothing to copy.
+        // The direct map already answered its chunk without probing, so there is nothing to save
+        // there either.
+        //
+        // Half of the chunk, because what the run path saves is a probe for every row it marks and
+        // what it costs is one sequential pass per key column plus the list, so a chunk where every
+        // other row repeats is already well ahead and one where fewer do is not worth the risk of
+        // being behind. A chunk that cannot reach it is dropped inside the pass.
+        let runs = if direct.is_none() && !alone && over.is_none() && self.max_groups.is_none() {
+            crate::table::repeats(keys, *length, length.div_ceil(2), same)
+        } else {
+            same.clear();
+            0
+        };
+        let by_run = runs > 0;
+        if by_run {
+            leaders.clear();
+            leaders.extend((0..*length).filter(|&row| !same[row]));
+        }
         let mut from = 0;
-        while direct.is_none() && !alone && from < *length {
+        while by_run && from < leaders.len() {
+            let upto = (from + crate::table::BATCH).min(leaders.len());
+            let batch = &leaders[from..upto];
+            from = upto;
+            leader_slots.clear();
+            leader_slots.resize(batch.len(), NOWHERE);
+            table.probe_these(hashes, keys, batch, leader_slots, walk);
+            // By place in the batch rather than by row, which is how a list is probed and answered.
+            for &place in walk.pending() {
+                let row = batch[place];
+                let bucket = match table.probe(hashes[row], keys, row) {
+                    Probe::Found(slot) => {
+                        leader_slots[place] = slot;
+                        continue;
+                    }
+                    Probe::Vacant(bucket) => bucket,
+                };
+                leader_slots[place] = table.insert(bucket, hashes[row], keys, row)?;
+                *groups = table.len();
+                self.fresh(states, counts, compact)?;
+                if self.sets {
+                    self.fresh_seen(seen);
+                }
+            }
+            for (place, &row) in batch.iter().enumerate() {
+                slots[row] = leader_slots[place];
+            }
+        }
+        if by_run {
+            // Every row that is not a leader holds the key of the row before it, so it is in the
+            // group that row is in. Forwards, because the row before is either a leader that the
+            // loop above filled or a member this loop filled on the way past.
+            for row in 1..*length {
+                if same[row] {
+                    slots[row] = slots[row - 1];
+                }
+            }
+        }
+        let mut from = 0;
+        while !by_run && direct.is_none() && !alone && from < *length {
             let upto = (from + crate::table::BATCH).min(*length);
             table.probe_run(hashes, keys, from, upto, slots, walk);
             from = upto;
@@ -3039,6 +3113,15 @@ pub(crate) struct Building {
     coded_map: Vec<usize>,
     /// The rows of the last chunk the map had no slot for, in row order.
     missing: Vec<usize>,
+    /// One flag per row of the last chunk, true where the row's key is the key of the row before.
+    ///
+    /// See [`repeats`](crate::table::repeats), which fills it, and the run path in
+    /// [`Aggregate::fold`], which is the only thing that reads it.
+    same: Vec<bool>,
+    /// The rows of the last chunk that start a run, in row order, when the run path took the chunk.
+    leaders: Vec<usize>,
+    /// One slot per entry of a batch of `leaders`, which is how the batched probe answers a list.
+    leader_slots: Vec<usize>,
     kept: Vec<usize>,
     affine_rows: Vec<i64>,
     over: Option<Spill>,
