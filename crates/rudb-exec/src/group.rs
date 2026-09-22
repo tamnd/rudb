@@ -4523,19 +4523,60 @@ fn scatter_bigint(partitions: &mut [BigIntDistinctPartition], shift: u32, value:
     partitions[(hash >> shift) as usize].rows.push(value);
 }
 
+/// What a distinct table of this many slots costs, the values and the bit a slot beside them.
+fn distinct_table_bytes(capacity: usize) -> usize {
+    capacity * size_of::<i64>() + capacity.div_ceil(8)
+}
+
+/// Doubles a distinct table and puts everything in it back.
+///
+/// Nothing but the value is stored, so the new place is worked out from the value the same way the
+/// first one was. There is no hash to carry and nothing to compare on the way in, because a table
+/// that is being rebuilt out of a table already holds each value once.
+fn regrow_distinct(slots: &mut Vec<i64>, filled: &mut Vec<u64>) {
+    let capacity = slots.len() * 2;
+    let mask = capacity - 1;
+    let mut next = vec![0_i64; capacity];
+    let mut taken = vec![0_u64; capacity.div_ceil(64)];
+    for (from, &value) in slots.iter().enumerate() {
+        if filled[from / 64] & (1_u64 << (from % 64)) == 0 {
+            continue;
+        }
+        let mut at = spread(mix(0, value as u64)) as usize & mask;
+        while taken[at / 64] & (1_u64 << (at % 64)) != 0 {
+            at = (at + 1) & mask;
+        }
+        taken[at / 64] |= 1_u64 << (at % 64);
+        next[at] = value;
+    }
+    *slots = next;
+    *filled = taken;
+}
+
 /// How many distinct values one radix partition holds, across the runs its instances handed over.
 ///
 /// The table is the values themselves with a bit a slot saying which ones are filled, rather than an
 /// index into the run the way it was when there was one run to index. Nothing is moved into place, so
 /// the runs are only ever read.
+///
+/// It is sized by the distinct values it ends up holding rather than by the values that arrive,
+/// because those are not the same number and on ClickBench they are not close. `COUNT(DISTINCT
+/// UserID)` over `hits` scatters a million and a half values into a partition and keeps two hundred
+/// and seventy thousand of them, so a table sized by what arrives is twelve times larger than the
+/// one that is wanted, and with every partition being built at once that is a gigabyte of tables
+/// that no probe ever hits twice. Doubling from small costs one rehash of what is in the table at
+/// the time, which summed over every doubling is under twice the final contents, and buys a million
+/// and a half probes into something that has a chance of being in cache.
 fn bigint_distinct_partition(partition: &mut BigIntDistinctRuns, memory: &Memory) -> Result<i64> {
     let held: usize = partition.runs.iter().map(Vec::len).sum();
-    let capacity = held.saturating_mul(2).max(64).next_power_of_two();
+    let ceiling = held.saturating_mul(2).max(64).next_power_of_two();
+    let mut capacity = ceiling.min(1024);
     let mut working = memory.reservation();
-    working.grow(width_of(capacity * size_of::<i64>() + capacity.div_ceil(8)))?;
+    working.grow(width_of(distinct_table_bytes(capacity)))?;
     let mut slots = vec![0_i64; capacity];
     let mut filled = vec![0_u64; capacity.div_ceil(64)];
-    let mask = capacity - 1;
+    let mut mask = capacity - 1;
+    let mut limit = capacity / 2;
     let mut unique = 0_usize;
     let timing = stage::Timing::start(Stage::Fold);
     for run in &partition.runs {
@@ -4553,6 +4594,13 @@ fn bigint_distinct_partition(partition: &mut BigIntDistinctRuns, memory: &Memory
                     break;
                 }
                 at = (at + 1) & mask;
+            }
+            if unique >= limit && capacity < ceiling {
+                working.grow(width_of(distinct_table_bytes(capacity)))?;
+                regrow_distinct(&mut slots, &mut filled);
+                capacity *= 2;
+                mask = capacity - 1;
+                limit = capacity / 2;
             }
         }
     }
