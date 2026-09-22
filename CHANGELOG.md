@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.81
+
+A patch release of one pull request. It is the last construct the binder refused by name, which was a limit written as a percentage whose share or offset is a subquery. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
+
+`LIMIT (SELECT 30)% OFFSET (SELECT 2)` works, in #1220. Neither end of a percentage limit has to be a number the query wrote out. A subquery has to run before there is a value, so the value is joined in under the limit as a column of every row the limit sees, read off the first chunk that reaches it and kept for the rest of the query, which is exactly how a plain limit already read a row count it could not work out in advance. The column is one the query never asked for, so the projection over the limit drops it again. Only the `%` sign can hold a subquery, because the grammar will not put the word `PERCENT` after a closing bracket, and that is true of the pinned binary too.
+
+The share goes through the cast to DOUBLE rather than the cast to BIGINT a row count goes through, so `(SELECT true)%` is one percent and not one row, and the cast now lives in `rudb-kernels` next to the row count one so both paths that can settle a share answer the same way. A null share or a subquery that answers no row is no limit at all. The range check moves to where the value turns up, and the two ways of being outside the range have two different sentences on the pin, so they have two here: above a hundred is the out of range sentence a written share gets, and below nought names the value and says a percentage cannot be negative. An input with no rows in it reads neither end, because there is nothing to read the value off and no rows to take a share of, so a share of minus one over an empty input answers nothing rather than raising.
+
+Thirty records covering all of that are pinned against DuckDB in tamnd/rudb-compat#202, which takes that corpus from 52 files to 53.
+
 ## 0.3.80
 
 A patch release of one pull request and one spec. The one pull request is `CREATE TEMPORARY TABLE` and `CREATE TEMPORARY VIEW`, which were two of the three statements the binder refused outright. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
