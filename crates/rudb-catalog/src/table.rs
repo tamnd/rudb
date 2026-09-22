@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value};
 use rudb_native::{Common, FrequencyOccurrences, Reader as NativeReader, Stripes};
 use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
@@ -497,6 +497,13 @@ pub struct Table {
     rows: Rows,
     /// What `duckdb_tables()` reports as `table_oid`, stamped by the catalog when this goes in.
     oid: i64,
+    /// The order the rows are meant to be stored in, if anybody declared one.
+    ///
+    /// Held here and written into the native file at checkpoint, and read back out of the file
+    /// when the table is bound from one. A table in memory keeps the declaration and nothing acts
+    /// on it yet, which is the whole point: the declaration is what a checkpoint needs in order to
+    /// not throw the order away, and the loader that honours it is the next piece.
+    clustering: Option<Clustering>,
 }
 
 impl Table {
@@ -512,7 +519,13 @@ impl Table {
     pub fn new(name: QualifiedName, columns: Vec<Field>) -> Result<Self> {
         duplicate_check(&columns)?;
         let types = columns.iter().map(|column| column.ty.clone()).collect();
-        Ok(Self { name, columns, rows: Rows::Memory(MemoryTable::new(types)), oid: DETACHED })
+        Ok(Self {
+            name,
+            columns,
+            rows: Rows::Memory(MemoryTable::new(types)),
+            oid: DETACHED,
+            clustering: None,
+        })
     }
 
     /// A table whose stripes are read from one committed native file.
@@ -523,7 +536,8 @@ impl Table {
     pub fn native(name: QualifiedName, reader: NativeReader) -> Result<Self> {
         let columns = reader.table().fields().to_vec();
         duplicate_check(&columns)?;
-        Ok(Self { name, columns, rows: Rows::Native(reader), oid: DETACHED })
+        let clustering = reader.table().clustering().cloned();
+        Ok(Self { name, columns, rows: Rows::Native(reader), oid: DETACHED, clustering })
     }
 
     /// The number the catalog tables join on, and [`DETACHED`] for a table not in a catalog.
@@ -565,6 +579,47 @@ impl Table {
     #[must_use]
     pub fn rows(&self) -> &Rows {
         &self.rows
+    }
+
+    /// The order the rows are meant to be stored in, if one was declared.
+    #[must_use]
+    pub fn clustering(&self) -> Option<&Clustering> {
+        self.clustering.as_ref()
+    }
+
+    /// Declares the order the rows are meant to be stored in, or clears the declaration.
+    ///
+    /// Takes effect at the next checkpoint. Nothing reorders the rows that are already here, and
+    /// nothing claims they are in this order: a declaration says what the table is for, and the
+    /// engine keeps its own per fragment ranges for what the table actually is.
+    ///
+    /// # Errors
+    ///
+    /// If the declaration names a column this table does not have, or names one twice.
+    pub fn cluster_by(&mut self, clustering: Option<Clustering>) -> Result<()> {
+        self.clustering = match clustering {
+            None => None,
+            // Rebuilt against this table's columns rather than trusted, since the caller built it
+            // from a name list and a stale one would store a column index off the end.
+            Some(asked) => {
+                Some(Clustering::new(asked.columns().to_vec(), asked.width(), self.columns.len())?)
+            }
+        };
+        Ok(())
+    }
+
+    /// Whether the declaration this table holds is the one its stored file already records.
+    ///
+    /// False for a table in memory, which has nothing stored to agree with. What a checkpoint asks
+    /// before deciding it has nothing to do: a table whose rows are all already in the file still
+    /// needs rewriting if somebody declared an order since it was written, and comparing the table
+    /// names alone would miss that and lose the declaration without a word.
+    #[must_use]
+    pub fn clustering_is_stored(&self) -> bool {
+        match &self.rows {
+            Rows::Memory(_) => false,
+            Rows::Native(reader) => reader.table().clustering() == self.clustering.as_ref(),
+        }
     }
 
     /// How many distinct values each column holds, named, for the columns something can say.
@@ -611,6 +666,7 @@ impl Table {
         if reader.table().fields() != self.columns {
             return Err(Error::internal("a committed native snapshot changed its table schema"));
         }
+        self.clustering = reader.table().clustering().cloned();
         self.rows = Rows::Native(reader);
         Ok(())
     }
@@ -632,6 +688,10 @@ impl Table {
         if reader.table().rows() != self.rows.len() {
             return Err(Error::internal("a committed native snapshot changed its row count"));
         }
+        // The file is the record, so the declaration comes back from it rather than being kept
+        // from before. If the checkpoint did not write what this table asked for, this is where
+        // that shows up, as the declaration going away rather than as a claim nothing backs.
+        self.clustering = reader.table().clustering().cloned();
         self.rows = Rows::Native(reader);
         Ok(())
     }
