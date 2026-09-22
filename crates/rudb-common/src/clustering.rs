@@ -205,9 +205,166 @@ impl Clustering {
     }
 }
 
+/// A declaration as somebody wrote it, before a catalog turned the names into column indexes.
+///
+/// [`Clustering`] holds indexes, which means it cannot be built without the table in hand, and the
+/// text is typed in a session that may name a table this database does not have. So the parse
+/// produces this and whoever has the catalog turns it into the real thing, which is also where the
+/// name errors come from and where they can say which table they are about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    table: String,
+    width: Option<Width>,
+    columns: Vec<String>,
+}
+
+impl Declared {
+    /// The table the declaration is about, as it was written.
+    #[must_use]
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// The width the text named, or `None` when it named none and the column's type decides.
+    #[must_use]
+    pub fn width(&self) -> Option<Width> {
+        self.width
+    }
+
+    /// The columns, outermost first, as they were written.
+    #[must_use]
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+/// Parses the `cluster_by` session setting.
+///
+/// The grammar is a comma separated list of `table(column, column, ...)`, with the leading column
+/// optionally wrapped in the width it is bucketed at: `lineitem(quarter(l_shipdate), l_orderkey)`.
+/// That is what [`Clustering::describe`] prints with the table name put in front of it, so a
+/// declaration read back out of a table can be pasted straight back into the setting.
+///
+/// A leading column with no wrapper around it leaves the width to the column's type, which is
+/// [`Clustering::over`], so `lineitem(l_shipdate, l_orderkey)` gets [`Width::DEFAULT`] and
+/// `orders(o_orderkey)` gets the exact value. Whitespace between tokens is free and a trailing
+/// comma is allowed, for the reason the relationship grammar allows one: a setting long enough to
+/// want a line per table is a setting somebody will edit.
+///
+/// The two tables the stage 0 measurement clusters, in this grammar:
+///
+/// ```text
+/// lineitem(quarter(l_shipdate), l_orderkey, l_linenumber),
+/// orders(quarter(o_orderdate), o_orderkey)
+/// ```
+///
+/// # Errors
+///
+/// If an entry is malformed. Nothing here can say whether a table or a column exists, since there
+/// is no catalog at this layer, so those are the caller's errors and this one's are about shape.
+pub fn parse_clustering(setting: &str) -> Result<Vec<Declared>> {
+    let mut declared = Vec::new();
+    for entry in entries(setting) {
+        declared.push(parse_entry(&entry)?);
+    }
+    Ok(declared)
+}
+
+/// The setting cut at the commas that separate tables, leaving the ones inside a column list.
+///
+/// The one real ambiguity in the grammar, the same one the relationship grammar has: a comma
+/// separates two declarations and also separates two columns of the same one. Depth tells them
+/// apart, and the width wrapper means the depth goes to two rather than one.
+fn entries(setting: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for character in setting.chars() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            // A comma outside every parenthesis ends a declaration. One inside a list belongs to
+            // the list, and a closing parenthesis with nothing open is left for the parse below to
+            // complain about rather than being treated as a separator.
+            ',' if depth == 0 => {
+                entries.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(character);
+    }
+    entries.push(current);
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn parse_entry(entry: &str) -> Result<Declared> {
+    let Some((table, rest)) = entry.split_once('(') else {
+        return Err(malformed(format!("expected `table(column, ...)` and found `{entry}`")));
+    };
+    let Some(inside) = rest.trim_end().strip_suffix(')') else {
+        return Err(malformed(format!("`{entry}` is missing its closing parenthesis")));
+    };
+    let table = table.trim();
+    if table.is_empty() {
+        return Err(malformed(format!("`{entry}` names no table")));
+    }
+    let mut columns = Vec::new();
+    for column in inside.split(',').map(str::trim).filter(|column| !column.is_empty()) {
+        columns.push(column.to_owned());
+    }
+    if columns.is_empty() {
+        return Err(malformed(format!("`{entry}` names no column")));
+    }
+    // The width rides on the leading column and nowhere else, since it is the column the bucketing
+    // is about, so a wrapper anywhere after the first is a declaration nobody can honour.
+    let (width, leading) = split_width(&columns[0])?;
+    for column in &columns[1..] {
+        if column.contains('(') {
+            return Err(malformed(format!(
+                "`{column}` is bucketed and only the leading column of `{table}` can be"
+            )));
+        }
+    }
+    columns[0] = leading;
+    Ok(Declared { table: table.to_owned(), width, columns })
+}
+
+/// A leading column as the width it was wrapped in, if it was wrapped, and the column itself.
+fn split_width(leading: &str) -> Result<(Option<Width>, String)> {
+    let Some((word, rest)) = leading.split_once('(') else {
+        return Ok((None, leading.to_owned()));
+    };
+    let Some(column) = rest.trim_end().strip_suffix(')') else {
+        return Err(malformed(format!("`{leading}` is missing its closing parenthesis")));
+    };
+    let column = column.trim();
+    if column.is_empty() {
+        return Err(malformed(format!("`{leading}` names no column")));
+    }
+    let word = word.trim();
+    let width = [Width::Exact, Width::Month, Width::Quarter, Width::Year]
+        .into_iter()
+        .find(|width| width.to_string().eq_ignore_ascii_case(word))
+        .ok_or_else(|| {
+            malformed(format!(
+                "`{word}` is not a partition width, which is one of exact, month, quarter or year"
+            ))
+        })?;
+    Ok((Some(width), column.to_owned()))
+}
+
+fn malformed(message: impl Into<String>) -> Error {
+    Error::invalid_input(format!("invalid rudb clustering: {}", message.into()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Clustering, Width};
+    use super::{Clustering, Width, parse_clustering};
     use crate::types::{Field, LogicalType};
 
     fn lineitem() -> Vec<Field> {
@@ -270,6 +427,87 @@ mod tests {
             assert_eq!(Width::from_tag(width.tag()), Some(width), "{width}");
         }
         assert_eq!(Width::from_tag(4), None, "a tag from a build that knows more than this one");
+    }
+
+    /// The two tables the stage 0 measurement clusters, written the way the setting takes them.
+    #[test]
+    fn the_two_clustered_tpch_tables_parse_into_two_declarations() {
+        let setting = "lineitem(quarter(l_shipdate), l_orderkey, l_linenumber), \
+                       orders(quarter(o_orderdate), o_orderkey)";
+        let declared = parse_clustering(setting).expect("parse");
+        assert_eq!(declared.len(), 2, "a comma inside a column list is not a separator");
+        assert_eq!(declared[0].table(), "lineitem");
+        assert_eq!(declared[0].width(), Some(Width::Quarter));
+        assert_eq!(declared[0].columns(), ["l_shipdate", "l_orderkey", "l_linenumber"]);
+        assert_eq!(declared[1].table(), "orders");
+        assert_eq!(declared[1].columns(), ["o_orderdate", "o_orderkey"]);
+        // A trailing comma and a line per table, which is how a setting this long gets edited.
+        let spread = "lineitem(month(l_shipdate), l_orderkey),\n  orders(o_orderkey),\n";
+        let declared = parse_clustering(spread).expect("parse");
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].width(), Some(Width::Month));
+        // No wrapper means no width was named, which is not the same as naming the exact value:
+        // the first leaves the width to the column's type and the second overrides it.
+        assert_eq!(declared[1].width(), None);
+        assert_eq!(parse_clustering("t(exact(d))").expect("parse")[0].width(), Some(Width::Exact));
+        assert!(parse_clustering("").expect("parse").is_empty(), "a reset names no table");
+    }
+
+    /// What a declaration reads back as is what the setting takes, so one can be pasted into it.
+    ///
+    /// The three calendar widths round trip. The exact one does not, and that is worth a test of
+    /// its own rather than a carve out in a loop: [`Clustering::describe`] prints no wrapper for
+    /// it, the parse of a bare leading column names no width, and a bare date column then gets the
+    /// quarter. So pasting an exactly sorted date declaration back into the setting gives a
+    /// quarterly one. Whoever wants the exact value back says `exact(...)`, which is why that word
+    /// is in the grammar at all given that no printer produces it.
+    #[test]
+    fn what_a_declaration_describes_itself_as_parses_back_into_the_same_declaration() {
+        let fields = lineitem();
+        let names = fields.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+        let at = |name: &String| names.iter().position(|it| it == name).expect("a column") as u32;
+        for width in [Width::Month, Width::Quarter, Width::Year] {
+            let asked = Clustering::new(vec![2, 0, 1], width, &fields).expect("valid");
+            let written = format!("lineitem({})", asked.describe(&names));
+            let read = parse_clustering(&written).expect("parse");
+            let columns: Vec<u32> = read[0].columns().iter().map(at).collect();
+            let again = Clustering::new(columns, read[0].width().expect("a width"), &fields)
+                .expect("valid");
+            assert_eq!(again, asked, "{written}");
+        }
+        let exact = Clustering::new(vec![2, 0, 1], Width::Exact, &fields).expect("valid");
+        let written = format!("lineitem({})", exact.describe(&names));
+        assert_eq!(written, "lineitem(l_shipdate, l_orderkey, l_linenumber)");
+        let read = parse_clustering(&written).expect("parse");
+        assert_eq!(read[0].width(), None, "a bare date column names no width");
+        let columns: Vec<u32> = read[0].columns().iter().map(at).collect();
+        assert_eq!(
+            Clustering::over(columns, &fields).expect("valid").width(),
+            Width::Quarter,
+            "and a silent date declaration is a quarterly one"
+        );
+    }
+
+    /// The shapes the parse turns away, which are the ones a catalog could never make sense of.
+    #[test]
+    fn a_declaration_that_is_not_a_table_and_a_column_list_is_refused() {
+        for bad in [
+            "lineitem",
+            "lineitem(",
+            "(l_shipdate)",
+            "lineitem()",
+            "lineitem(day(l_shipdate))",
+            "lineitem(l_shipdate, month(l_orderkey))",
+            "lineitem(month())",
+        ] {
+            let complaint = parse_clustering(bad).expect_err(bad).message().to_owned();
+            assert!(complaint.contains("clustering"), "{bad}: {complaint}");
+        }
+        // The one that reads like a mistake and is not: a width word is only a width in front of
+        // the leading column, so a column actually called `year` is still a column.
+        let declared = parse_clustering("t(year)").expect("parse");
+        assert_eq!(declared[0].columns(), ["year"]);
+        assert_eq!(declared[0].width(), None);
     }
 
     #[test]

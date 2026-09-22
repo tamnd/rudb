@@ -40,7 +40,7 @@ pub mod value;
 
 pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;
-pub use clustering::{Clustering, Width};
+pub use clustering::{Clustering, Declared, Width, parse_clustering};
 pub use error::{Error, ErrorCode, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};
