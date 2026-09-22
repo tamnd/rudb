@@ -1518,6 +1518,80 @@ fn a_try_cast_of_a_list_keeps_the_elements_that_went() {
     );
 }
 
+/// Two lists compare the way two words are ordered in a dictionary. Per #467.
+#[test]
+fn a_list_compares_element_by_element_and_then_by_length() {
+    let db = database();
+    let yes = vec![vec![Value::Boolean(true)]];
+    let no = vec![vec![Value::Boolean(false)]];
+    assert_eq!(rows(&db, "SELECT [1, 2] = [1, 2]"), yes);
+    assert_eq!(rows(&db, "SELECT [1, 2] = [1, 3]"), no);
+    assert_eq!(rows(&db, "SELECT [1, 2] < [1, 3]"), yes);
+    assert_eq!(rows(&db, "SELECT ['a'] < ['b']"), yes);
+    // The element of a list of lists is a list, so the rule runs at whatever depth it was written.
+    assert_eq!(rows(&db, "SELECT [[1], [2]] < [[1], [3]]"), yes);
+    // Nothing disagreed before one of them ran out, so the shorter one is the smaller one. A list is
+    // never equal to a longer list that starts with it.
+    assert_eq!(rows(&db, "SELECT [1, 2] < [1, 2, 3]"), yes);
+    assert_eq!(rows(&db, "SELECT [1, 2] = [1, 2, 3]"), no);
+    assert_eq!(rows(&db, "SELECT [] < [1]"), yes);
+    assert_eq!(rows(&db, "SELECT [] = []"), yes);
+}
+
+/// A null inside a list and a list that is null are two different things. Per #467.
+///
+/// Inside a list a null is the largest value there is and equals itself, which is the sort's rule
+/// rather than the comparison's. A list that is null is a null like any other and makes the whole
+/// comparison null. Every row here is the pin's.
+#[test]
+fn a_null_inside_a_list_is_the_largest_element_and_a_null_list_is_still_null() {
+    let db = database();
+    let yes = vec![vec![Value::Boolean(true)]];
+    let no = vec![vec![Value::Boolean(false)]];
+    assert_eq!(rows(&db, "SELECT [1, NULL] = [1, NULL]"), yes);
+    assert_eq!(rows(&db, "SELECT [1, NULL] = [1, 2]"), no);
+    assert_eq!(rows(&db, "SELECT [1, NULL] > [1, 2]"), yes);
+    assert_eq!(rows(&db, "SELECT [NULL] < [1]"), no);
+    assert_eq!(rows(&db, "SELECT [1, 2] IS DISTINCT FROM [1, NULL]"), yes);
+    assert_eq!(rows(&db, "SELECT NULL::INT[] = [1]"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT NULL::INT[] IS NOT DISTINCT FROM NULL::INT[]"), yes);
+}
+
+/// Everything that rides on the order rides on it for lists too. Per #467.
+///
+/// `ORDER BY`, `DISTINCT`, `IN` and `max` all reach the same comparison, so the point of this is
+/// that they reach it rather than that any one of them is interesting on its own.
+#[test]
+fn a_list_sorts_and_groups_and_maxes_like_any_other_value() {
+    let db = database();
+    db.execute("CREATE TABLE ls (x INTEGER[])").unwrap();
+    db.execute("INSERT INTO ls VALUES ([1, NULL]), ([1, 2]), ([NULL]), (NULL), ([])").unwrap();
+    // The null list sorts last because nulls sort last, and `[NULL]` sorts after `[1, NULL]` because
+    // a null element is larger than any element.
+    assert_eq!(
+        rows(&db, "SELECT x FROM ls ORDER BY x"),
+        vec![
+            vec![list(&[])],
+            vec![list(&[1, 2])],
+            vec![Value::List {
+                element: LogicalType::Integer,
+                values: vec![integer(1), Value::Null],
+            }],
+            vec![Value::List { element: LogicalType::Integer, values: vec![Value::Null] }],
+            vec![Value::Null],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT max(x) FROM ls"),
+        vec![vec![Value::List { element: LogicalType::Integer, values: vec![Value::Null] }]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM (SELECT DISTINCT x FROM ls)"),
+        vec![vec![Value::BigInt(5)]]
+    );
+    assert_eq!(rows(&db, "SELECT [1, 2] IN ([1, 2], [3])"), vec![vec![Value::Boolean(true)]]);
+}
+
 /// What the struct vector changes that a query can see today. Per #594.
 ///
 /// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put

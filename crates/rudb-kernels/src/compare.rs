@@ -1605,8 +1605,33 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
             Value::Interval { months: am, days: ad, micros: au },
             Value::Interval { months: bm, days: bd, micros: bu },
         ) => Ok(interval_micros(*am, *ad, *au).cmp(&interval_micros(*bm, *bd, *bu))),
+        (Value::List { values: a, .. }, Value::List { values: b, .. }) => list_order(a, b),
         _ => numeric_order(left, right),
     }
+}
+
+/// Two lists in the order DuckDB puts them in, which is the order two words are in a dictionary.
+///
+/// The first element the two disagree on decides, and if neither ran out of elements before that
+/// happened then the shorter one is the smaller one. So `[] < [1]` and `[1, 2] < [1, 2, 3]`, and a
+/// list is never equal to a longer list that starts with it.
+///
+/// A null element is not an absence here, it is the largest value there is, which is the one place
+/// a comparison inside a list disagrees with the same comparison outside one. `[1, NULL] > [1, 2]`
+/// is true on the pin and `[NULL] < [1]` is false, and two nulls in the same position are equal,
+/// which is what makes `[1, NULL] = [1, NULL]` true while `NULL = NULL` is null. That is
+/// [`order_with_nulls`] with nulls last, so it is the sort's rule and not a second one written here.
+///
+/// A null list, as opposed to a list with a null in it, never reaches this. It is handled by the
+/// caller the way a null of any other type is, which is why `NULL::INT[] = [1]` is null.
+fn list_order(left: &[Value], right: &[Value]) -> Result<Ordering> {
+    for (one, other) in left.iter().zip(right) {
+        let ordering = order_with_nulls(one, other, false)?;
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(left.len().cmp(&right.len()))
 }
 
 /// The order of two numbers, which is the case that has to work across representations.
