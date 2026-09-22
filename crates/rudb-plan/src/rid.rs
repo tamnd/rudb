@@ -567,6 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn a_link_join_carries_its_child_and_never_its_parent() {
+        // The node this whole module is for, and the one join whose streaming side is not a
+        // choice. Section 5.2 scans the child and reads the link beside its columns, so the
+        // child's rows arrive in order and a selection is all that happens to them. The parent's
+        // rows are gathered through the link, and a gathered row carries no row id of its own.
+        //
+        // All four kinds the node admits, because the argument is the same for all four and a
+        // reader would otherwise have to take the module's word for it. An inner join drops the
+        // child rows whose link is the no parent sentinel and a semi or anti join tests it, which
+        // are selections; a left join keeps them and gathers null, which pads the parent side.
+        for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti] {
+            let mut plan = Plan::new();
+            let child = scan(&mut plan, 4);
+            let parent = scan(&mut plan, 5);
+            let conditions = plan.add_expr_list(&[]);
+            let rid = column(&mut plan, 4, 0);
+            let node = plan.add_node(Node::LinkJoin { child, parent, kind, conditions, rid });
+            plan.set_root(node);
+            assert_eq!(carried(&plan), vec![4], "{kind:?} keeps the child and only the child");
+            assert!(!root(&plan).has(5), "{kind:?} gathered the parent");
+        }
+    }
+
+    #[test]
     fn a_row_id_survives_a_stack_of_operators_that_all_preserve_it() {
         // What a TPC-H plan looks like under the join: scan, filter, project. The rewrite of
         // document 06 fires here and nowhere the analysis above says no.
