@@ -5659,6 +5659,70 @@ fn rudb_links_says_what_is_declared_and_what_of_it_is_built() {
 }
 
 #[test]
+fn a_forward_link_takes_the_monotone_form_only_when_every_child_row_has_a_parent_above_the_last() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-graph-forms-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("CREATE TABLE customer (c_custkey INTEGER)").unwrap();
+    db.execute("CREATE TABLE orders (o_custkey INTEGER)").unwrap();
+    db.execute("CREATE TABLE returns (r_custkey INTEGER)").unwrap();
+    db.execute("INSERT INTO customer SELECT i FROM range(1, 4001) AS r(i)").unwrap();
+    // Three orders per customer in customer order, which is the shape the loader gives lineitem
+    // over orders, and the one section 3.4 keeps as a bit vector rather than a packed column.
+    db.execute("INSERT INTO orders SELECT 1 + (i - 1) / 3 FROM range(1, 10001) AS r(i)").unwrap();
+    // The same shape with one row whose key is past the last customer, which refuses the monotone
+    // form because the bit vector has no way to say that a child found nothing.
+    db.execute("INSERT INTO returns SELECT 1 + (i - 1) / 3 FROM range(1, 10001) AS r(i)").unwrap();
+    db.execute("INSERT INTO returns VALUES (9999)").unwrap();
+    db.execute(
+        "SET graph_links = 'orders(o_custkey) -> customer(c_custkey), \
+         returns(r_custkey) -> customer(c_custkey)'",
+    )
+    .unwrap();
+    db.execute("CHECKPOINT").unwrap();
+
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT child_table, cardinality, link, note FROM rudb_links() ORDER BY child_table"
+        ),
+        vec![
+            vec![
+                Value::Varchar("orders".into()),
+                Value::Varchar("exactly one".into()),
+                Value::Varchar("monotone".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::Varchar("returns".into()),
+                Value::Varchar("at most one".into()),
+                Value::Varchar("packed".into()),
+                Value::Varchar("some child rows have no parent, so this is not exactly one".into()),
+            ],
+        ],
+        "one unmatched child row costs the relationship both its form and its totality"
+    );
+    // A form is a representation and not an answer: the join counts the same either way.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey"),
+        vec![vec![Value::BigInt(10000)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM returns r JOIN customer c ON r.r_custkey = c.c_custkey"),
+        vec![vec![Value::BigInt(10000)]]
+    );
+
+    drop(db);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_checkpoint_builds_a_key_map_over_the_parent_of_every_declared_relationship() {
     let path = std::env::temp_dir().join(format!(
         "rudb-graph-checkpoint-{}-{}.rdb",
@@ -5677,17 +5741,23 @@ fn a_checkpoint_builds_a_key_map_over_the_parent_of_every_declared_relationship(
     db.execute(declaration).unwrap();
     db.execute("CHECKPOINT").unwrap();
 
-    let built = rows(&db, "SELECT cardinality, key_map, key_map_bytes > 0, note FROM rudb_links()");
+    let built = rows(
+        &db,
+        "SELECT cardinality, key_map, key_map_bytes > 0, link, link_bytes > 0, note FROM \
+         rudb_links()",
+    );
     assert_eq!(
         built,
         vec![vec![
-            Value::Varchar("at most one".into()),
+            Value::Varchar("exactly one".into()),
             Value::Varchar("identity".into()),
+            Value::Boolean(true),
+            Value::Varchar("packed".into()),
             Value::Boolean(true),
             Value::Null,
         ]],
-        "a distinct ascending key column maps by subtraction and the declaration is now a \
-         measurement"
+        "a distinct ascending key column maps by subtraction, the second pass stored a forward \
+         link beside it, and every child row found a parent through it"
     );
     // The queries the declaration was made for are the ones that have to keep their answers.
     assert_eq!(
