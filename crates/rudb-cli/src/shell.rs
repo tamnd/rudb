@@ -564,6 +564,18 @@ fn off_on(flag: bool) -> &'static str {
 
 /// The `LINE n:` and caret that go under an error message.
 ///
+/// The caret is as wide as the span, which is what DuckDB does and is the reason a span carries a
+/// range rather than a position. A span that runs off the end of the line is cut at the line,
+/// because the block prints one line and a caret longer than the text it sits under points at
+/// nothing. An empty span still gets one caret, since a span between two characters is still a
+/// place and a row of no carets would read as a missing block.
+///
+/// A span that covers the whole statement gets one caret rather than a row of them. The binder
+/// attaches the span of the query it is working on to any error raised underneath it that carried
+/// none of its own, so a span the width of everything is the placeholder for not knowing rather
+/// than a claim that the whole statement is at fault, and underlining every character of it would
+/// print that placeholder as though it were a location.
+///
 /// `None` when the span does not point into the text, which happens for an error raised about a
 /// statement the caller did not hand us, and printing a caret under the wrong thing is worse than
 /// printing none.
@@ -579,7 +591,18 @@ fn pointer(sql: &str, span: Span) -> Option<String> {
     let line = &sql[line_start..line_end];
     let prefix = format!("LINE {number}: ");
     let column = sql[line_start..start].chars().count();
-    Some(format!("{prefix}{line}\n{}^\n", " ".repeat(prefix.chars().count() + column)))
+    let end = (span.end as usize).clamp(start, line_end);
+    let everything = start == 0 && end >= sql.trim_end().len();
+    let width = if everything || !sql.is_char_boundary(end) {
+        1
+    } else {
+        sql[start..end].chars().count().max(1)
+    };
+    Some(format!(
+        "{prefix}{line}\n{}{}\n",
+        " ".repeat(prefix.chars().count() + column),
+        "^".repeat(width)
+    ))
 }
 
 #[cfg(test)]
@@ -616,17 +639,46 @@ mod tests {
     }
 
     #[test]
-    fn the_caret_lands_under_the_span() {
+    fn the_caret_lands_under_the_span_and_is_as_wide_as_it() {
         let sql = "SELECT nosuch";
         let text = pointer(sql, Span::new(7, 13)).expect("a pointer");
-        assert_eq!(text, "LINE 1: SELECT nosuch\n               ^\n");
+        assert_eq!(text, "LINE 1: SELECT nosuch\n               ^^^^^^\n");
     }
 
     #[test]
     fn the_caret_counts_lines() {
         let sql = "SELECT\n  nosuch";
         let text = pointer(sql, Span::new(9, 15)).expect("a pointer");
-        assert_eq!(text, "LINE 2:   nosuch\n          ^\n");
+        assert_eq!(text, "LINE 2:   nosuch\n          ^^^^^^\n");
+    }
+
+    #[test]
+    fn a_span_that_runs_past_the_line_is_cut_at_the_line() {
+        let sql = "SELECT a\nFROM t";
+        let text = pointer(sql, Span::new(7, 15)).expect("a pointer");
+        assert_eq!(text, "LINE 1: SELECT a\n               ^\n");
+    }
+
+    #[test]
+    fn a_span_the_width_of_the_statement_gets_one_caret_because_it_is_a_placeholder() {
+        let sql = "SELECT * FROM tabl";
+        let text = pointer(sql, Span::new(0, 18)).expect("a pointer");
+        assert_eq!(text, "LINE 1: SELECT * FROM tabl\n        ^\n");
+    }
+
+    #[test]
+    fn an_empty_span_still_gets_one_caret() {
+        let sql = "SELECT 1";
+        let text = pointer(sql, Span::new(7, 7)).expect("a pointer");
+        assert_eq!(text, "LINE 1: SELECT 1\n               ^\n");
+    }
+
+    #[test]
+    fn the_caret_counts_characters_and_not_bytes() {
+        let sql = "SELECT 'é', nosuch";
+        let at = sql.find("nosuch").expect("the name is there") as u32;
+        let text = pointer(sql, Span::new(at, at + 6)).expect("a pointer");
+        assert_eq!(text, "LINE 1: SELECT 'é', nosuch\n                    ^^^^^^\n");
     }
 
     #[test]
