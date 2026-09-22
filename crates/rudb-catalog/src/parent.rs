@@ -21,13 +21,33 @@
 //! section 6.4's rule is about the width of the parent's *projection* rather than about the width
 //! of the parent.
 //!
+//! # A stored column does not arrive flat
+//!
+//! It arrives in whatever form the writer chose, which on real data is bit packed for an integer
+//! and dictionary encoded for a low cardinality string, and almost never flat.
+//! [`rudb_vector::concat`] lays flat runs end to end and declines everything else, on the argument
+//! that a caller who gets a `None` has somewhere to put the pieces.
+//!
+//! This caller does not. The `rid` a child row carries names a row of the parent table, and a run
+//! that is still in pieces has no row at that offset, so the pieces have to become one run before
+//! anything can be taken out of them. So a piece that is not flat is flattened here.
+//!
+//! The cost of that is one decode of one column, once per query, and it is worth being explicit
+//! that it is not new work: the hash join this replaces decodes the same values to build its table
+//! over them, and then writes each of them into a tuple as well. What is given up is the encoding's
+//! size in memory, which is why the budget below is measured after the flattening rather than
+//! before it.
+//!
+//! An earlier version of this file did not flatten and passed the `None` on. Every link join over
+//! every table anybody had written with rudb's own writer then failed, and it failed reporting that
+//! it was out of memory, which it was not. The measurement that found it is `cargo xtask sections`.
+//!
 //! # The budget, and what a refusal means
 //!
-//! [`Parent::column`] answers `None` rather than an error when a column would not fit, and `None`
-//! is not a failure. It is the planner's fallback signal: the caller runs the hash join instead and
-//! the query answers the same, which is the invariant of section 3.1 restated one layer up. An
-//! error here would turn a memory limit into a failed query, and the whole of this layer is built
-//! on the rule that the graph path is an accelerator and never the only path.
+//! [`Parent::column`] answers `None` rather than an error when a column would not fit, which is a
+//! memory limit being reached and not a bug. What the caller does with it is the caller's: the link
+//! join operator reports it, on the argument in `LinkJoin::read_parent` that a parent whose
+//! projection will not fit is one whose hash join would not have fit either.
 //!
 //! The budget is counted over what is held rather than estimated before the read, because a column
 //! is compressed in the file and the number that matters is what it costs once it is a vector. A
@@ -38,7 +58,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{LogicalType, Result};
-use rudb_vector::{Vector, concat};
+use rudb_vector::{Form, Vector, concat};
 
 use crate::table::Rows;
 
@@ -107,13 +127,24 @@ impl Parent {
         for part in 0..self.rows.chunk_count() {
             let chunk = self.rows.read(part, &[column])?;
             let piece = chunk.column(0)?;
-            // Checked as the parts arrive rather than at the end, so that a column far past the
-            // budget is abandoned after one part instead of after all of them.
+            // A part with no rows in it contributes no rows to the run and would make `concat`
+            // decline the whole of it, which is a column given up on over a part that says nothing.
+            if piece.is_empty() {
+                continue;
+            }
+            // flatten: the whole point of this type is a run the gather can index by a row id of
+            // the parent table, and a row id has no meaning against a bit packed part that has not
+            // been decoded. See the module doc for why this is a decode the hash join pays as well.
+            let piece = if piece.form() == Form::Flat { piece.clone() } else { piece.flatten()? };
+            // Measured after the flattening, because the number the budget is about is what the
+            // column costs once it is a vector, and checked as the parts arrive rather than at the
+            // end so that a column far past the budget is abandoned after one part instead of all
+            // of them.
             cost = cost.saturating_add(piece.footprint());
             if cost > room {
                 return Ok(None);
             }
-            pieces.push(piece.clone());
+            pieces.push(piece);
         }
         let Some(whole) = concat(ty, &pieces)? else {
             return Ok(None);

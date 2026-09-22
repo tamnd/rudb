@@ -6047,6 +6047,84 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     std::fs::remove_file(&path).ok();
 }
 
+/// The query above joins to the parent and reads no column of it, so the gather never runs.
+///
+/// That is not a contrived shape, it is the shape a foreign key join takes when the parent is only
+/// there to filter, and it is worth having a test of. It is also the reason the link join shipped
+/// unable to read a parent column at all: `Parent` lays the parts of a column end to end with
+/// `rudb_vector::concat`, which declines anything that is not already flat, and a column written by
+/// rudb's own writer is bit packed or dictionary encoded and never flat. So every link join that
+/// actually gathered something failed, reporting that it was out of memory when it had twenty
+/// gigabytes free.
+///
+/// It went unnoticed because the parent here is built by `INSERT` and checkpointed inside one
+/// session, and the sizes above are small enough that what comes back is flat. `cargo xtask
+/// sections` found it on the first run over a TPC-H directory. This is that finding as a test: a
+/// parent column of each of the two forms real data arrives in, gathered, with the answer checked
+/// against the same query with the layer off.
+#[test]
+fn a_link_join_gathers_a_parent_column_that_was_stored_in_a_form_that_is_not_flat() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-graph-gather-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    // `c_grade` is four distinct strings over four thousand rows, which the writer dictionary
+    // encodes, and `c_balance` is a small range of integers, which it bit packs. Those are the two
+    // forms the probe on a real TPC-H file came back with.
+    db.execute("CREATE TABLE customer (c_custkey INTEGER, c_grade VARCHAR, c_balance INTEGER)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER)").unwrap();
+    db.execute(
+        "INSERT INTO customer SELECT i, ['bronze', 'silver', 'gold', 'platinum'][1 + i % 4], \
+         100 + i % 50 FROM range(1, 4001) AS r(i)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO orders SELECT i, 1 + i % 4000 FROM range(1, 10001) AS r(i)").unwrap();
+    db.execute("SET graph_links = 'orders(o_custkey) -> customer(c_custkey)'").unwrap();
+    db.execute("CHECKPOINT").unwrap();
+    db.execute("SET graph_sections = 'on'").unwrap();
+    // Reopened, because the encoding is what the writer chose and a table still holding the chunks
+    // it was inserted as would hand back the flat ones the bug hid behind.
+    drop(db);
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("SET graph_links = 'orders(o_custkey) -> customer(c_custkey)'").unwrap();
+    db.execute("SET graph_sections = 'on'").unwrap();
+
+    let sql = "SELECT c_grade, count(*), sum(c_balance) FROM orders JOIN customer \
+               ON o_custkey = c_custkey GROUP BY c_grade ORDER BY c_grade";
+    let plan = |db: &Database| match db
+        .query(&format!("EXPLAIN {sql}"))
+        .expect("the explain ran")
+        .value_at(0, 1)
+    {
+        Value::Varchar(text) => text,
+        other => panic!("the plan came back as {other:?}"),
+    };
+
+    db.execute("SET graph_sections = 'off'").unwrap();
+    let hashed = rows(&db, sql);
+    assert!(!hashed.is_empty(), "the control answered nothing, so it is not a control");
+
+    db.execute("SET graph_sections = 'on'").unwrap();
+    db.execute("SET graph_cache_bytes = 1").unwrap();
+    assert!(
+        plan(&db).contains("LinkJoin"),
+        "the join was not planned as a link join:\n{}",
+        plan(&db)
+    );
+    // The assertion that would have caught it. Before the fix this was an out of memory error and
+    // not a wrong answer, so a comparison of rows would never have seen it either.
+    assert_eq!(rows(&db, sql), hashed, "gathering a parent column changed the answer");
+
+    drop(db);
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn a_checkpoint_builds_a_key_map_over_the_parent_of_every_declared_relationship() {
     let path = std::env::temp_dir().join(format!(
