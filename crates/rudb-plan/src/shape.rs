@@ -35,7 +35,8 @@
 //! - an aggregate, a window, a sort, a top n and a distinct are sinks, so the node and everything
 //!   under it are a new pipeline that the parent's waits for,
 //! - a join and a set operation are two, the side that is gathered first and the side that reads
-//!   it, with the second waiting for the first and the parent's waiting for the second,
+//!   it, with the second waiting for the first and the parent's waiting for the second, and which
+//!   side a join gathers is the node's own build side rather than always the right one,
 //! - a cross product keeps its left side and itself in the parent's pipeline, because the product
 //!   is produced a chunk at a time and never held, and puts its right side in a new one, because
 //!   that side is kept whole to be replayed,
@@ -59,7 +60,7 @@
 //! Then the children, and for a node with two inputs the side that runs first is walked first, so
 //! the ids go in the order the work happens rather than in the order the tree prints.
 
-use crate::node::Node;
+use crate::node::{BuildSide, Node};
 use crate::plan::Plan;
 use crate::{NodeRef, OperatorRef, PipelineRef};
 
@@ -224,6 +225,29 @@ impl Shape {
         id
     }
 
+    /// A node with two inputs, where `held` has to be finished before `driving` can start a row.
+    fn two(
+        &mut self,
+        plan: &Plan,
+        node: NodeRef,
+        operator: OperatorRef,
+        pipeline: PipelineRef,
+        held: NodeRef,
+        driving: NodeRef,
+    ) {
+        let gathered = self.number(Some(operator));
+        let first = self.fresh();
+        let second = self.fresh();
+        self.waits_on(second, first);
+        self.waits_on(pipeline, second);
+        self.of[node as usize] =
+            Some(Placed { operator, gathered: Some(gathered), pipeline: second });
+        // The gathered side's rows go into the operator that holds them rather than straight into
+        // the join, which is the one place the operator tree has a shape the plan does not.
+        self.walk(plan, held, first, Some(gathered));
+        self.walk(plan, driving, second, Some(operator));
+    }
+
     fn walk(
         &mut self,
         plan: &Plan,
@@ -246,21 +270,18 @@ impl Shape {
                 self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline: below });
                 self.walk(plan, input, below, Some(operator));
             }
-            Node::Join { left, right, .. }
-            | Node::DependentJoin { left, right, .. }
-            | Node::SetOp { left, right, .. } => {
-                let gathered = self.number(Some(operator));
-                let first = self.fresh();
-                let second = self.fresh();
-                self.waits_on(second, first);
-                self.waits_on(pipeline, second);
-                self.of[node as usize] =
-                    Some(Placed { operator, gathered: Some(gathered), pipeline: second });
-                // The gathered side's rows go into the operator that holds them rather than
-                // straight into the join, which is the one place the operator tree has a shape the
-                // plan does not.
-                self.walk(plan, right, first, Some(gathered));
-                self.walk(plan, left, second, Some(operator));
+            // Which side a join holds is the plan's own flag, written by `rudb_opt`'s `sides` pass
+            // from an estimate of how many rows each input produces, and the builder reads that
+            // same flag. Assuming the right side here would put the pipelines and the edges on the
+            // wrong sides of every join the pass turned around, and the edges are the thing a
+            // reader checks an operator's input against.
+            Node::Join { left, right, build, .. } => {
+                let (held, driving) =
+                    if build == BuildSide::Left { (left, right) } else { (right, left) };
+                self.two(plan, node, operator, pipeline, held, driving);
+            }
+            Node::DependentJoin { left, right, .. } | Node::SetOp { left, right, .. } => {
+                self.two(plan, node, operator, pipeline, right, left);
             }
             // The definition is held whole and the body reads it, so the node is the sink of the
             // pipeline that fills it, the same way a sort is the sink of the pipeline under it. The
@@ -373,6 +394,23 @@ mod tests {
         assert_eq!(shape.pipeline(plan.root()), 2, "and the join is its sink");
         assert_eq!(shape.waits_for(2), [1]);
         assert_eq!(shape.waits_for(0), [2]);
+    }
+
+    #[test]
+    fn a_join_told_to_build_on_its_left_runs_that_side_first() {
+        let (plan, shape) = shaped(concat!(
+            "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN] build=left\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER]\n",
+        ));
+        let [left, right] = plan.node(plan.root()).children();
+        let (left, right) = (left.unwrap(), right.unwrap());
+        assert_eq!(shape.pipeline(left), 1, "the side the flag names is the gathered one");
+        assert_eq!(shape.pipeline(right), 2, "so the right side is the one that probes");
+        assert_eq!(shape.pipeline(plan.root()), 2);
+        let gathered = shape.gathered(plan.root()).expect("a join holds a side");
+        assert_eq!(shape.consumer(shape.operator(left)), Some(gathered));
+        assert_eq!(shape.consumer(shape.operator(right)), Some(shape.operator(plan.root())));
     }
 
     #[test]
