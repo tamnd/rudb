@@ -758,8 +758,7 @@ impl GlobalDictionary {
     fn ranked(&self) -> Vec<(u64, u32)> {
         let count = self.offsets.len() - 1;
         let mut codes = (0..count as u32).collect::<Vec<_>>();
-        let mut scratch = vec![0; codes.len()];
-        sort_by_value(&mut codes, &mut scratch, |code| self.bytes(code).unwrap_or_default());
+        sort_by_value(&mut codes, |code| self.bytes(code).unwrap_or_default());
         codes.into_iter().map(|code| (head(self.bytes(code).unwrap_or_default()), code)).collect()
     }
 
@@ -6168,30 +6167,11 @@ struct EncodedDictionary {
     payload: Vec<Vec<u8>>,
 }
 
-/// How few codes a range has to be down to before the sort compares them instead of bucketing them.
+/// Sorts codes into the byte order of the values they name, eight bytes of depth at a time.
 ///
-/// A bucketing pass costs a kilobyte of counters and two reads of every code in the range whatever
-/// the range is, so below some size the counters cost more than the comparisons they save. Thirty
-/// two is where the two meet for values that are long enough to be worth a dictionary, and it is
-/// also small enough that the comparison it falls back to reads a cache line or two.
-const RADIX_SORT_SMALL: usize = 32;
-
-/// Which bucket a value falls in at this depth, with zero meaning the value has ended here.
+/// # What the shape of the data does to a comparison sort
 ///
-/// A value that has run out sorts before every value that continues, which is the same rule the
-/// bytes follow, so the ended bucket goes first and never needs another pass: everything in it is
-/// the same value, and a dictionary holds a value once.
-fn radix_bucket(value: &[u8], depth: usize) -> usize {
-    value.get(depth).map_or(0, |byte| usize::from(*byte) + 1)
-}
-
-/// Sorts codes into the byte order of the values they name, one byte position at a time.
-///
-/// # Why this is not a comparison sort
-///
-/// It was one, and on the columns that matter it was the wrong algorithm by a wide margin. The
-/// reason is in the data. Take the eight million row `hits` and count how many distinct values each
-/// text column has against how many distinct first eight bytes they have between them:
+/// Distinct values against distinct prefixes, on the eight million row `hits`:
 ///
 /// ```text
 ///   distinct   first 8   first 16   first 32   column
@@ -6200,53 +6180,59 @@ fn radix_bucket(value: &[u8], depth: usize) -> usize {
 ///  1,357,764    81,362    348,340    861,579   Title
 /// ```
 ///
-/// Two and a quarter million URLs have fifty distinct first eight bytes, because they all begin
-/// `http://` and then the host, and there are not many hosts. A comparison sort of that does about
-/// twenty one comparisons a value and each one walks the shared prefix before it finds a byte that
-/// differs, so the work is the count times the depth of the agreement, and the agreement is deep.
-/// Widening the comparison does not fix it: thirty two bytes still leaves ninety percent of the
-/// values tied. `Title` is free text and separates at eight bytes, which is why the design looked
-/// right when it was written and why the column it was measured on was the wrong one.
+/// Two and a quarter million URLs have fifty distinct first eight bytes between them, because they
+/// all begin `http://` and then a host and there are not many hosts. So a sort that leads with
+/// those eight bytes settles almost nothing on `URL` and `Referer`, whatever the comment on it used
+/// to say, and almost every pair falls through to a comparison of whole values that agree for most
+/// of their length. `Title` is free text and separates at eight bytes, which is why the design
+/// looked right when it was written.
 ///
-/// Bucketing by one byte at a time never reads a byte twice. A range that agrees on its first
-/// thirty bytes has had those bytes read once each on the way down and is sorted on the thirty
-/// first. Deep agreement, which is what makes the comparison sort slow, is what makes this fast.
+/// # What is done about it
 ///
-/// `scratch` is as long as `codes` and is where a pass lands its codes before they go back, so the
-/// whole sort allocates once for a column rather than once a range.
-fn sort_by_value<'a>(codes: &mut [u32], scratch: &mut [u32], values: impl Fn(u32) -> &'a [u8]) {
+/// Sort on eight bytes of the value at the current depth, held beside the code, and then take each
+/// run that those eight bytes leave tied and sort it again on the next eight. A value is fetched
+/// from the payload once per eight bytes of depth rather than once per comparison, and the sort
+/// itself runs over an array of integers that is in cache rather than over pointers into a payload
+/// that is hundreds of megabytes.
+///
+/// That is the whole trick, and it matters because the payload touch is the expensive part. The
+/// bytes themselves are nearly free once the line is in cache, so reading eight at a time and
+/// throwing away the ones that were not needed beats going back for each one.
+///
+/// # Why the length has to be carried
+///
+/// The eight bytes are padded with zero when the value has fewer than eight left, and a zero byte
+/// can appear in a value, so equal keys do not mean equal bytes. What is true is that a value which
+/// ran out inside the window is a prefix of any other value with the same key, and a prefix sorts
+/// first, so how many of the eight bytes were real is the tie break and nothing further is needed.
+/// A run is only worth another pass when all eight were real, because otherwise the run is one
+/// value: a dictionary holds a value once.
+fn sort_by_value<'a>(codes: &mut [u32], values: impl Fn(u32) -> &'a [u8]) {
     let mut work = vec![(0, codes.len(), 0)];
+    let mut keyed: Vec<(u64, u8, u32)> = Vec::new();
     while let Some((from, to, depth)) = work.pop() {
         let part = &mut codes[from..to];
-        if part.len() <= RADIX_SORT_SMALL {
-            part.sort_unstable_by(|left, right| {
-                values(*left)[depth..].cmp(&values(*right)[depth..])
-            });
-            continue;
+        keyed.clear();
+        keyed.extend(part.iter().map(|&code| {
+            let value = values(code);
+            let rest = value.get(depth..).unwrap_or_default();
+            (head(rest), rest.len().min(8) as u8, code)
+        }));
+        keyed.sort_unstable();
+        for (slot, entry) in part.iter_mut().zip(keyed.iter()) {
+            *slot = entry.2;
         }
-        let mut counts = [0_usize; 257];
-        for &code in part.iter() {
-            counts[radix_bucket(values(code), depth)] += 1;
-        }
-        let mut starts = [0_usize; 258];
-        let mut at = 0;
-        for (start, count) in starts.iter_mut().zip(counts.iter()) {
-            *start = at;
-            at += *count;
-        }
-        starts[257] = at;
-        let mut cursor = starts;
-        let landing = &mut scratch[from..to];
-        for &code in part.iter() {
-            let slot = radix_bucket(values(code), depth);
-            landing[cursor[slot]] = code;
-            cursor[slot] += 1;
-        }
-        part.copy_from_slice(landing);
-        for edges in starts.windows(2).skip(1) {
-            if edges[1] - edges[0] > 1 {
-                work.push((from + edges[0], from + edges[1], depth + 1));
+        let mut start = 0;
+        while start < keyed.len() {
+            let (key, taken, _) = keyed[start];
+            let mut end = start + 1;
+            while end < keyed.len() && keyed[end].0 == key && keyed[end].1 == taken {
+                end += 1;
             }
+            if taken == 8 && end - start > 1 {
+                work.push((from + start, from + end, depth + 8));
+            }
+            start = end;
         }
     }
 }
