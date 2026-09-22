@@ -467,6 +467,7 @@ dependencies = [
  "rudb-common",
  "rudb-encoding",
  "rudb-graph",
+ "rudb-stats",
  "rudb-storage",
  "rudb-vector",
 ]

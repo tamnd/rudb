@@ -356,6 +356,20 @@ impl Tally {
     pub fn values(&self) -> Option<usize> {
         (!self.full).then_some(self.held.len())
     }
+
+    /// The hashes this is still holding, without giving them up.
+    ///
+    /// Not [`Tally::spilled`], which hands them over once and empties itself, because this is for a
+    /// caller that wants a copy while the column goes on being counted. `None` once the column gave
+    /// up, since the sketch has had them since then and is the place to ask.
+    ///
+    /// This exists so that a narrow column can still be written down as a sketch. While a column is
+    /// counted here the sketch beside it is empty, and a writer that persisted that empty sketch
+    /// would store a column of six values as a column of none.
+    #[must_use]
+    pub fn hashes(&self) -> Option<Vec<u64>> {
+        (!self.full).then(|| self.held.iter().map(|(hash, _)| *hash).collect())
+    }
 }
 
 #[cfg(test)]
