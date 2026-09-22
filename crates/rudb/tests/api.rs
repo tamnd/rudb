@@ -169,6 +169,72 @@ fn a_load_beside_a_committed_table_reaches_the_file_without_a_checkpoint() {
     std::fs::remove_file(path).expect("removes the temporary database");
 }
 
+/// `CREATE TABLE AS SELECT` writes the file as it runs, the same as an insert into a fresh table.
+///
+/// It used to run the whole query into a result, move the result into an in-memory table and wait
+/// for a `CHECKPOINT` to reach the file, which meant the statement needed room for the answer twice
+/// over and none of it was charged against the memory limit. Both halves are checked here, the
+/// first table into an empty file and a second one beside a committed table, because those are the
+/// two ways the sink can be reached and the second one goes through the append path.
+#[test]
+fn a_create_table_as_select_reaches_the_file_without_a_checkpoint() {
+    let path = std::env::temp_dir().join(format!("rudb-api-ctas-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let first = Database::open(&name).expect("a file name starts a native database");
+    first
+        .execute("CREATE TABLE a AS SELECT i AS x, 'row' || i AS s FROM range(0, 100) t(i)")
+        .expect("creates and fills");
+    drop(first);
+
+    let second = Database::open(&name).expect("the native database reopens");
+    assert_eq!(
+        second.value("SELECT count(*) FROM a").expect("the first table is in the file"),
+        Value::BigInt(100)
+    );
+    second
+        .execute("CREATE TABLE b AS SELECT i AS y FROM range(0, 50) t(i)")
+        .expect("creates the second beside the first");
+    drop(second);
+
+    let third = Database::open(&name).expect("the native database reopens again");
+    assert_eq!(
+        third.value("SELECT count(*) FROM b").expect("the second table is in the file"),
+        Value::BigInt(50)
+    );
+    assert_eq!(
+        third.value("SELECT s FROM a WHERE x = 7").expect("reads"),
+        Value::Varchar("row7".into())
+    );
+    assert_eq!(
+        third.value("SELECT sum(y) FROM b").expect("the second table reads back"),
+        Value::HugeInt(1225)
+    );
+    drop(third);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+/// A `CREATE TABLE AS SELECT` that fails leaves no table behind.
+///
+/// The entry is made after the query rather than before it, so there is no window where the catalog
+/// names a table the file does not have. The query below binds and then fails the cast at run time,
+/// which is the shape that would have left an empty table behind under the other order.
+#[test]
+fn a_create_table_as_select_that_fails_leaves_no_table() {
+    let path = std::env::temp_dir().join(format!("rudb-api-ctas-err-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database
+        .execute("CREATE TABLE t AS SELECT CAST('x' || i AS INTEGER) AS c FROM range(0, 100) r(i)")
+        .expect_err("x1 is not an integer");
+    database.execute("SELECT count(*) FROM t").expect_err("and the table is not in the catalog");
+    database
+        .execute("CREATE TABLE t AS SELECT i AS x FROM range(0, 10) r(i)")
+        .expect("the name is free");
+    assert_eq!(database.value("SELECT count(*) FROM t").expect("reads"), Value::BigInt(10));
+    drop(database);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
 /// Several appends in a row, which is what alternating the two header slots is for.
 ///
 /// One append writes the slot the committed generation did not use. The next one has to write the
