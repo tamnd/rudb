@@ -165,7 +165,7 @@ impl Database {
         // because that is where they live. Handled here rather than a layer down for the plain
         // reason that a `Settings` cannot see a catalog and this can.
         if crate::settings::is_clustering(name) {
-            return Ok(crate::settings::clustering(&self.shared.read()));
+            return Ok(self.shared.read().clustering());
         }
         self.shared.inner.settings.value(name)
     }

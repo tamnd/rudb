@@ -350,6 +350,17 @@ impl Declared {
     }
 }
 
+/// Whether this name is the one the row order declaration is written under.
+///
+/// Both spellings, because a setting rudb has and DuckDB does not may be reached for under a
+/// prefix by somebody being careful about which engine they are talking to. The caller decides
+/// first that no DuckDB setting is called this, which is what keeps the compatible answer winning
+/// should upstream ever take a setting of either name.
+#[must_use]
+pub fn is_clustering_setting(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cluster_by") || name.eq_ignore_ascii_case("rudb.cluster_by")
+}
+
 /// Parses the `cluster_by` session setting.
 ///
 /// The grammar is a comma separated list of `table(column, column, ...)`, with the leading column

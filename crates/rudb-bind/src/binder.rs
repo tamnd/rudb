@@ -544,13 +544,24 @@ impl<'a> Binder<'a> {
         if as_table {
             return self.bind_describe(ast, query, relation);
         }
-        let Some((_, value)) =
-            self.session.iter().find(|(name, _)| name.eq_ignore_ascii_case(&text))
-        else {
-            return Err(Error::catalog(format!("Setting with name \"{text}\" does not exist")));
+        // A name the session has no answer for is either a setting rudb has and DuckDB does not, in
+        // which case [`Binder::beyond`] reads it, or it is nothing, in which case that says so in
+        // upstream's words. `SHOW` prints and printing is text, so a rule's boolean comes back here
+        // as the word it reads back as rather than as a boolean column.
+        let shown = match self.session.iter().find(|(name, _)| name.eq_ignore_ascii_case(&text)) {
+            Some((_, value)) => value.to_string(),
+            None => match self.beyond(&text)? {
+                Some(Value::Varchar(declared)) => declared,
+                Some(other) => other.to_string(),
+                None => {
+                    return Err(Error::catalog(format!(
+                        "Setting with name \"{text}\" does not exist"
+                    )));
+                }
+            },
         };
         let field = Field::new(text, LogicalType::Varchar);
-        let expr = self.plan.add_constant(Value::Varchar(value.to_string()));
+        let expr = self.plan.add_constant(Value::Varchar(shown));
         let row = self.plan.add_expr_list(&[expr]);
         let rows = self.plan.add_rows(&[row]);
         let columns = self.plan.add_fields(std::slice::from_ref(&field));

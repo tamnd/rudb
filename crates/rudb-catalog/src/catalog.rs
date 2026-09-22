@@ -656,6 +656,29 @@ impl Catalog {
             .flat_map(|schema| schema.tables.iter())
     }
 
+    /// Every row order declaration the catalog holds, in the spelling `SET cluster_by` takes.
+    ///
+    /// The read half of that setting, and the reason nothing about it is kept in the session. A
+    /// file carries the declarations of the tables in it, so a database opened on one has
+    /// declarations that no `SET` in this session made, and a session copy would answer that there
+    /// are none. Built out of the catalog, the answer is the same whichever way the declaration got
+    /// there, and it is empty for a database where nothing is declared.
+    ///
+    /// Here rather than beside the setting because this is where the declarations are, and both the
+    /// Rust reader and the binder folding `current_setting('cluster_by')` need it.
+    #[must_use]
+    pub fn clustering(&self) -> String {
+        self.tables()
+            .filter_map(|table| {
+                let clustering = table.clustering()?;
+                let names =
+                    table.columns().iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+                Some(format!("{}({})", table.name().table, clustering.describe(&names)))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Every view a database file would hold, which is every view a person made in a real database.
     ///
     /// The filter is on the database rather than on the name, unlike [`Catalog::stored_tables`],
