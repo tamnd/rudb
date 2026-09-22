@@ -801,10 +801,13 @@ mod tests {
 
     #[test]
     fn the_document_gets_one_class_per_operator_and_the_number_that_goes_with_it() {
-        // Not equal rather than greater than, so the scan cannot take the filter and the two nodes
-        // stay two operators. The test below is the other case.
+        // An aggregate rather than a filter over a table, because a filter over a table is applied
+        // by the scan whatever its predicate says and the two nodes become one operator. The test
+        // below is that case. This one wants two decisions that came out differently, and an
+        // aggregate over a table is the shortest plan that has them: the table is counted and what
+        // comes out of the grouping is estimated.
         let plan = parsed(concat!(
-            "Filter (#0.0::INTEGER <> 1::INTEGER)::BOOLEAN\n",
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n",
             "  Get memory.main.t AS t #0 [a::INTEGER]\n",
         ));
         let mut facts = Facts::new();

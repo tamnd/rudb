@@ -51,25 +51,24 @@ pub fn of(plan: &Plan, input: rudb_plan::NodeRef, predicate: ExprRef) -> Vec<Tes
     tests
 }
 
-/// The same tests, but only when they are the whole of the predicate.
+/// A filter that a stored table below it applies itself, and what the table gets to know about it.
 ///
-/// [`of`] drops the conjuncts it cannot read, which is right for pruning: a test that is missing
-/// costs a chunk that gets read and never costs a row. It is the wrong answer for a scan that means
-/// to apply the filter rather than only prune with it, because there the conjuncts that were dropped
-/// are the rows that were not thrown away. So this answers `Some` only when every conjunct came
-/// through, and the caller that gets `None` leaves the filter where it was.
-///
-/// Empty is `None` too. A predicate that reads as no tests at all is one this says nothing about,
-/// and a scan handed nothing to apply would be a filter deleted rather than moved.
-#[must_use]
-pub fn all_of(plan: &Plan, input: rudb_plan::NodeRef, predicate: ExprRef) -> Option<Vec<Test>> {
-    let index = scanned(plan, input)?;
-    let mut tests = Vec::new();
-    let whole = every_conjunct(plan, predicate, index, &mut tests);
-    (whole && !tests.is_empty()).then_some(tests)
+/// The predicate is not in here, because the caller is holding the filter node and already has it.
+/// What is in here is the part of it a zone map can answer, and whether that part is the whole
+/// thing. The two are separate questions and the second one is the dangerous one: a zone that passes
+/// every test proves every row passes only when the tests are the whole predicate, so a scan that
+/// reads `whole` as true when it is not waves rows through that the query wanted thrown away.
+#[derive(Debug, Clone)]
+pub struct Moved {
+    /// The conjuncts that read as tests, in the numbering of what the scan produces.
+    ///
+    /// Empty when nothing read, which is a filter the scan applies with no help from the zone maps.
+    pub tests: Vec<Test>,
+    /// Whether `tests` is the whole of the predicate.
+    pub whole: bool,
 }
 
-/// The tests a stored table directly below this filter applies itself, when it applies all of them.
+/// The filter a stored table directly below it can apply itself instead of having one above it.
 ///
 /// Asked of the filter node rather than of a predicate and an input, because two callers ask it and
 /// neither of them should be deciding it. The builder asks so it can move the filter into the scan
@@ -80,15 +79,31 @@ pub fn all_of(plan: &Plan, input: rudb_plan::NodeRef, predicate: ExprRef) -> Opt
 /// The condition written twice is the condition that drifts, and the way that failure shows is output
 /// claiming the work moved when it did not, or the other way about. So it is written here.
 ///
+/// It does not ask whether the predicate reads as tests, only where the filter sits. A filter over a
+/// stored table does the same work in either place, so moving it costs nothing and saves an operator
+/// boundary and a chunk handed across it, and the rows the scan produces are already the rows that
+/// passed. What the tests decide is the extra thing on top, which is whether a chunk can skip the
+/// comparison entirely, and that is what [`Moved::whole`] is for. ClickBench 40 is the case: its
+/// `TraficSourceID IN (-1, 6)` becomes an `OR` and an `OR` reads as no test, and requiring every
+/// conjunct to read left the whole predicate running above the scan for the sake of a shortcut that
+/// would not have fired on it anyway.
+///
 /// Only [`Node::Get`]. A `read_parquet` wants the same thing and reads its rows through a different
 /// loop, so it is its own piece of work rather than a second arm here.
 #[must_use]
-pub fn into_scan(plan: &Plan, filter: rudb_plan::NodeRef) -> Option<Vec<Test>> {
+pub fn into_scan(plan: &Plan, filter: rudb_plan::NodeRef) -> Option<Moved> {
     let Node::Filter { input, predicate } = *plan.node(filter) else { return None };
     if !matches!(*plan.node(input), Node::Get { .. }) {
         return None;
     }
-    all_of(plan, input, predicate)
+    let index = scanned(plan, input)?;
+    let mut tests = Vec::new();
+    // Thrown away rather than kept when the walk stopped early, because a half read predicate is a
+    // list of tests that prove the wrong thing and the only safe use of it is none.
+    if !every_conjunct(plan, predicate, index, &mut tests) {
+        return Some(Moved { tests: Vec::new(), whole: false });
+    }
+    Some(Moved { whole: !tests.is_empty(), tests })
 }
 
 /// The table index of a scan, or `None` for a node that has no bounds to ask about.
