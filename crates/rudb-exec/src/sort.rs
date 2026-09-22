@@ -35,6 +35,16 @@
 //! were strings. The same sort is 54 billion now, and the system time it spends asking the
 //! operating system for memory went from 45.7 seconds to 2.8. See #1210.
 //!
+//! # And where the key is
+//!
+//! In the row, as bytes, whenever the key list allows it. [`crate::normal`] writes every key of a
+//! row into one fixed width buffer in an encoding whose byte order is the sort order, with the
+//! direction and the null placement already folded in, so the comparator is a byte compare and the
+//! row is one flat thing rather than a pointer to a heap allocation per row. The `Vec<Value>` path
+//! is still here and still handles everything, because a string key has no fixed width and a float
+//! key does not order the way its bytes do. Which one a sort takes is decided once, from the types
+//! of the key expressions, and [`Keyed`] is the two of them.
+//!
 //! # The shape a sink has
 //!
 //! [`Sort`] is a [`Sink`], so the rows arrive through `sink`, one instance's rows are handed over
@@ -55,6 +65,7 @@ use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{Assembly, Chunk, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
+use crate::normal::{self, Normal};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
@@ -63,8 +74,9 @@ use crate::schema::Schema;
 ///
 /// The payload is not here. A row is a [`Source`] into the chunks the sink kept, and the columns
 /// are moved once at the end by [`gathered`] rather than carried through the sort as a boxed value
-/// a field. That is the second half of what the note on #63 asks for. The first half, a key that is
-/// one comparable byte string rather than a `Vec<Value>`, is still to do.
+/// a field. That is the second half of what the note on #63 asks for, and [`Normalized`] is the
+/// first half: this arm is what a key list with a string, a float or too many bytes in it falls
+/// back to.
 pub(crate) type Sortable = (Vec<Value>, Arrival, Source);
 
 /// Where a row arrived: the morsel it came from and its place among the rows of that morsel.
@@ -77,13 +89,29 @@ pub(crate) type Arrival = (u64, u64);
 /// Where a row is: the chunk the sink kept it in and its row in that chunk.
 pub(crate) type Source = (u32, u32);
 
+/// One row on its way through a sort with its keys written as bytes rather than held as values.
+///
+/// The same three fields as [`Sortable`] with the first one flattened. Nothing here points at
+/// anything: the key is a fixed array in the row, so the whole vector is one allocation and a
+/// comparison is a byte compare over that array. See [`crate::normal`] for what is in it and which
+/// key lists can have one.
+pub(crate) type Normalized = (Normal, Arrival, Source);
+
 /// What one row costs beside the values of its keys, which [`rows::footprint`] already counts.
 const BESIDE: u64 = (size_of::<Sortable>() - size_of::<Vec<Value>>()) as u64;
+
+/// What one row of the normalized path costs, which is the whole of it since nothing is borrowed.
+const NORMALIZED: u64 = size_of::<Normalized>() as u64;
 
 /// An ordering over the input.
 #[derive(Debug)]
 pub(crate) struct Sort {
     keys: Vec<SortKey>,
+    /// How wide each key writes into a normalized key, when the key list has one.
+    ///
+    /// `None` is the `Value` path, and it is what a string key, a float key or a key list that does
+    /// not fit gets. See [`crate::normal::layout`].
+    widths: Option<Vec<usize>>,
     /// The key expressions, evaluated against the input's schema.
     exprs: Prepared,
     /// The input's types, which are also the output's, since a sort changes no column.
@@ -109,7 +137,88 @@ struct Combined {
     /// The chunks as they arrived, which hold the payload of every row.
     chunks: Vec<Chunk>,
     /// One entry a row, pointing into `chunks`.
-    rows: Vec<Sortable>,
+    rows: Keyed,
+}
+
+/// The rows of a sort, with their keys held whichever way this key list allows.
+///
+/// Two arms and not two operators, because everything either arm does differently is in this file
+/// and everything else about a sort is the same: the same chunks, the same arrivals, the same
+/// assembly at the end. Which arm a sort takes is decided once in [`Sort::new`], off the types of
+/// the key expressions, so an instance never has to ask and the two can never be mixed.
+#[derive(Debug)]
+enum Keyed {
+    /// Keys as bytes, which is the fast path and covers the fixed width types.
+    Normal(Vec<Normalized>),
+    /// Keys as values, which handles every type including the ones with no fixed width.
+    Valued(Vec<Sortable>),
+}
+
+impl Default for Keyed {
+    fn default() -> Self {
+        Self::Valued(Vec::new())
+    }
+}
+
+impl Keyed {
+    /// An empty set of rows of the same arm as this one.
+    fn empty(&self) -> Self {
+        match self {
+            Self::Normal(_) => Self::Normal(Vec::new()),
+            Self::Valued(_) => Self::Valued(Vec::new()),
+        }
+    }
+
+    /// Takes another instance's rows, moving every row's chunk along by `base`.
+    ///
+    /// The chunk an instance's row points at is its chunk among that instance's, so it moves along
+    /// by however many chunks are already here.
+    fn absorb(&mut self, other: Self, base: u32) -> Result<()> {
+        match (self, other) {
+            (Self::Normal(into), Self::Normal(from)) => {
+                into.extend(from.into_iter().map(|(key, arrival, (chunk, row))| {
+                    (key, arrival, (chunk.saturating_add(base), row))
+                }));
+                Ok(())
+            }
+            (Self::Valued(into), Self::Valued(from)) => {
+                into.extend(from.into_iter().map(|(key, arrival, (chunk, row))| {
+                    (key, arrival, (chunk.saturating_add(base), row))
+                }));
+                Ok(())
+            }
+            _ => Err(Error::internal("two instances of one sort holding their keys differently")),
+        }
+    }
+
+    /// Puts the rows in order, keys first and where they arrived settling a tie.
+    ///
+    /// Unstable on the normalized arm and stable on the other, which is the same order either way:
+    /// the arrival is unique per row and it is the last thing compared, so no two rows are ever
+    /// equal and there is nothing for stability to decide.
+    fn sort(&mut self, keys: &[SortKey]) -> Result<()> {
+        match self {
+            Self::Normal(rows) => {
+                rows.sort_unstable_by(|left, right| {
+                    left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                });
+                Ok(())
+            }
+            Self::Valued(rows) => {
+                let mut failure: Option<Error> = None;
+                rows.sort_by(|left, right| settled(keys, left, right, &mut failure));
+                failure.map_or(Ok(()), Err)
+            }
+        }
+    }
+
+    /// Where each row sits, in the order the sort put them.
+    fn sources(&self) -> Box<dyn ExactSizeIterator<Item = Source> + '_> {
+        match self {
+            Self::Normal(rows) => Box::new(rows.iter().map(|row| row.2)),
+            Self::Valued(rows) => Box::new(rows.iter().map(|row| row.2)),
+        }
+    }
 }
 
 /// What one instance of a sort gathers before it combines.
@@ -167,13 +276,18 @@ impl Sort {
     ) -> Result<(Self, Buffered)> {
         let keys = plan.sort_key_list(keys).to_vec();
         let exprs: Vec<_> = keys.iter().map(|key| key.expr).collect();
+        let types: Vec<_> = exprs.iter().map(|&expr| plan.expr_type(expr).clone()).collect();
         let out = Buffered::new();
+        let widths = normal::layout(&types);
+        let rows =
+            if widths.is_some() { Keyed::Normal(Vec::new()) } else { Keyed::Valued(Vec::new()) };
         let sort = Self {
+            widths,
             exprs: Prepared::new(plan, &exprs, input)?,
             keys,
             types: input.types(),
             memory: memory.clone(),
-            gathered: Mutex::new(Combined::default()),
+            gathered: Mutex::new(Combined { chunks: Vec::new(), rows }),
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
             out: out.clone(),
@@ -186,8 +300,13 @@ impl Sink for Sort {
     type Local = Gathered;
 
     fn local(&self) -> Gathered {
+        let rows = if self.widths.is_some() {
+            Keyed::Normal(Vec::new())
+        } else {
+            Keyed::Valued(Vec::new())
+        };
         Gathered {
-            held: Combined::default(),
+            held: Combined { chunks: Vec::new(), rows },
             scratch: self.exprs.scratch(),
             charged: self.memory.reservation(),
             place: Place::default(),
@@ -207,14 +326,36 @@ impl Sink for Sort {
         self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
         let at = u32::try_from(local.held.chunks.len()).map_err(|_| too_many())?;
         let mut taken = u64::try_from(chunk.footprint()).unwrap_or(u64::MAX);
-        // row at a time: the keys, which are still a `Value` a key a row. The payload is not read
-        // here at all, which is the point of `Sortable`.
-        for row in 0..chunk.len() {
-            let key: Vec<Value> =
-                keys.iter().map(|column| column.try_value_at(row)).collect::<Result<_>>()?;
-            taken += rows::footprint(&key) + BESIDE;
-            let row = u32::try_from(row).map_err(|_| too_many())?;
-            local.held.rows.push((key, local.place.of(row as usize), (at, row)));
+        // row at a time: the keys, and nothing else. The payload is not read here at all, which is
+        // the point of `Sortable`.
+        match (&self.widths, &mut local.held.rows) {
+            (Some(widths), Keyed::Normal(rows)) => {
+                for row in 0..chunk.len() {
+                    let mut key: Normal = [0; normal::WIDTH];
+                    let mut written = 0;
+                    for (at, column) in keys.iter().enumerate() {
+                        let wide = *widths.get(at).ok_or_else(mismatched)?;
+                        let value = column.try_value_at(row)?;
+                        normal::write(&mut key, written, wide, &value, self.keys[at])?;
+                        written += wide;
+                    }
+                    taken += NORMALIZED;
+                    let row = u32::try_from(row).map_err(|_| too_many())?;
+                    rows.push((key, local.place.of(row as usize), (at, row)));
+                }
+            }
+            (None, Keyed::Valued(rows)) => {
+                for row in 0..chunk.len() {
+                    let key: Vec<Value> = keys
+                        .iter()
+                        .map(|column| column.try_value_at(row))
+                        .collect::<Result<_>>()?;
+                    taken += rows::footprint(&key) + BESIDE;
+                    let row = u32::try_from(row).map_err(|_| too_many())?;
+                    rows.push((key, local.place.of(row as usize), (at, row)));
+                }
+            }
+            _ => return Err(mismatched()),
         }
         local.held.chunks.push(chunk.clone());
         local.place.past(chunk.len());
@@ -227,30 +368,22 @@ impl Sink for Sort {
         // Appended rather than merged, because the sort has not happened yet. The order the
         // instances combine in does not decide anything, since every row carries where it arrived
         // and the comparison falls back to that when the keys tie.
-        //
-        // The chunk an instance's row points at is its chunk among that instance's, so it moves
-        // along by however many chunks are already here.
         let base = u32::try_from(gathered.chunks.len()).map_err(|_| too_many())?;
-        gathered.rows.extend(
-            local.held.rows.into_iter().map(|(key, arrival, (chunk, row))| {
-                (key, arrival, (chunk.saturating_add(base), row))
-            }),
-        );
+        gathered.rows.absorb(local.held.rows, base)?;
         gathered.chunks.extend(local.held.chunks);
         self.charged.lock().map_err(poisoned)?.push(local.charged);
         Ok(())
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
-        let Combined { chunks, mut rows } =
-            std::mem::take(&mut *self.gathered.lock().map_err(poisoned)?);
-        let mut failure: Option<Error> = None;
-        rows.sort_by(|left, right| settled(&self.keys, left, right, &mut failure));
-        if let Some(error) = failure {
-            return Err(error);
-        }
+        let Combined { chunks, mut rows } = {
+            let mut gathered = self.gathered.lock().map_err(poisoned)?;
+            let empty = Combined { chunks: Vec::new(), rows: gathered.rows.empty() };
+            std::mem::replace(&mut *gathered, empty)
+        };
+        rows.sort(&self.keys)?;
         let mut held = self.held.lock().map_err(poisoned)?;
-        let out = gathered(&self.types, &chunks, &rows, &mut held)?;
+        let out = gathered(&self.types, &chunks, rows.sources(), &mut held)?;
         self.out.fill(out)?;
         // The gathered rows are gone and the chunks are charged instead, so what the instances
         // took is given back here and not before.
@@ -279,7 +412,7 @@ impl Sink for Sort {
 fn gathered(
     types: &[LogicalType],
     chunks: &[Chunk],
-    order: &[Sortable],
+    order: impl ExactSizeIterator<Item = Source>,
     held: &mut Reservation,
 ) -> Result<Vec<Chunk>> {
     let rows = order.len();
@@ -292,7 +425,7 @@ fn gathered(
     // Where each row that arrived lands, kept the way an assembly wants to be handed it, which is
     // one run of positions a chunk.
     let mut at: Vec<Vec<u32>> = chunks.iter().map(|chunk| vec![0; chunk.len()]).collect();
-    for (rank, &(_, _, (chunk, row))) in order.iter().enumerate() {
+    for (rank, (chunk, row)) in order.enumerate() {
         let Some(place) = at.get_mut(chunk as usize).and_then(|run| run.get_mut(row as usize))
         else {
             return Err(Error::internal("a sorted row pointing outside the chunks it came from"));
@@ -330,6 +463,16 @@ fn gathered(
 /// than an index that wrapped and an answer in the wrong order.
 fn too_many() -> Error {
     Error::internal("a sort of more than 4294967295 rows")
+}
+
+/// A sort whose two halves disagree about how its keys are held.
+///
+/// Which way they are held is decided once, in [`Sort::new`], and every instance is built from that
+/// decision, so the only way here is a bug in this file. It is an error rather than a fallback
+/// because falling back means one instance's rows sorted one way and another's the other, which is
+/// not an order.
+fn mismatched() -> Error {
+    Error::internal("a sort holding its keys two ways at once")
 }
 
 /// Where two rows sit relative to each other, with a tie on every key settled by where they arrived.
