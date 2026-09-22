@@ -34,7 +34,7 @@
 //! which costs the rehashing this pass was written to remove and nothing else. A table sized over
 //! the truth holds bucket memory it never fills, and bucket memory is charged against the query's
 //! budget, so a large enough overshoot turns a query that ran into a query that reports being out of
-//! memory. That is worse than a slow query, and it is why [`MOST`] exists.
+//! memory. That is worse than a slow query, and it is why `MOST` exists.
 //!
 //! # What it leaves alone
 //!
