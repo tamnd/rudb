@@ -173,6 +173,9 @@ fn usage() {
         "           percent budget of spec/graph/03-the-file-format.md section 3.7. it writes"
     );
     println!("           to the file, and a map the budget turned away is printed with its size");
+    println!("           a trailing child.column->parent.column builds that relationship's");
+    println!("           forward link after the maps, and prints its form, its bytes and its");
+    println!("           share of the child table, which is the size claim of section 9.1");
     println!(
         "  stats <file.db> <table>...  builds a summary and a sketch for every column of each"
     );

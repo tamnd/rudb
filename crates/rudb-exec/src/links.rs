@@ -17,6 +17,7 @@ use rudb_catalog::{Catalog, Rows, Table};
 use rudb_common::{Result, Session, Value};
 use rudb_functions::link_fields;
 use rudb_graph::{Cardinality, Relationship, Side, parse_links};
+use rudb_native::graph::Edge;
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -48,7 +49,8 @@ pub(crate) fn links(
 /// What one relationship reports.
 fn row(catalog: &Catalog, link: &Relationship) -> Vec<Value> {
     let stored = key_map_of(catalog, &link.parent);
-    let (cardinality, note) = verdict(catalog, link, stored.as_ref());
+    let held = forward_link_of(catalog, link);
+    let (cardinality, note) = verdict(catalog, link, stored.as_ref(), held.as_ref());
     vec![
         text(&link.name()),
         text(&link.child.table),
@@ -60,10 +62,10 @@ fn row(catalog: &Catalog, link: &Relationship) -> Vec<Value> {
         stored
             .as_ref()
             .map_or(Value::Null, |map| Value::BigInt(i64::try_from(map.bytes).unwrap_or(i64::MAX))),
-        // The link columns are what G2 fills. Nothing writes a forward link yet, so a value here
-        // would be a claim about a structure that does not exist.
-        Value::Null,
-        Value::Null,
+        held.as_ref().map_or(Value::Null, |held| text(held.form().label())),
+        held.as_ref().map_or(Value::Null, |held| {
+            Value::BigInt(i64::try_from(held.bytes()).unwrap_or(i64::MAX))
+        }),
         note.map_or(Value::Null, text),
     ]
 }
@@ -91,6 +93,33 @@ fn key_map_of(catalog: &Catalog, parent: &Side) -> Option<Stored> {
     Some(Stored { form: map.form(), bytes: map.bytes(), distinct: map.observed().distinct })
 }
 
+/// The stored forward link of a relationship, when both of its tables are in the same file and the
+/// link in the child's sections was built against the parent this declaration names.
+///
+/// Both sides in one file is not a limitation of the format so much as of what a relationship
+/// across two files would mean: a `rid` is a row's position in a table, and a link is a column of
+/// them, so a link stored in one file that names a parent in another would be resolvable only by a
+/// reader that had both open and had checked that neither had moved since. Nothing declares one
+/// today and this reports nothing for one rather than guessing.
+fn forward_link_of(catalog: &Catalog, link: &Relationship) -> Option<rudb_graph::Link> {
+    let ([child_key], [parent_key]) = (&link.child.columns[..], &link.parent.columns[..]) else {
+        return None;
+    };
+    let child = table_named(catalog, &link.child.table)?;
+    let parent = table_named(catalog, &link.parent.table)?;
+    let (Rows::Native(child_rows), Rows::Native(parent_rows)) = (child.rows(), parent.rows())
+    else {
+        return None;
+    };
+    let edge = Edge {
+        child: child.name().table.clone(),
+        child_column: child.column_index(child_key)?,
+        parent: parent.name().table.clone(),
+        parent_column: parent.column_index(parent_key)?,
+    };
+    rudb_native::graph::stored_link(child_rows, parent_rows, &edge)
+}
+
 /// The first table of that name in any schema of any database.
 ///
 /// A relationship names a table and not a qualified name, because the `graph_links` grammar has no
@@ -115,6 +144,7 @@ fn verdict(
     catalog: &Catalog,
     link: &Relationship,
     stored: Option<&Stored>,
+    held: Option<&rudb_graph::Link>,
 ) -> (&'static str, Option<&'static str>) {
     let Some(stored) = stored else {
         if table_named(catalog, &link.parent.table).is_none() {
@@ -134,8 +164,16 @@ fn verdict(
             Some("the parent key repeats, so this is not a many to one relationship"),
         );
     }
-    // At most one and not exactly one. Exactly one needs the child side observed as well, which is
-    // what the forward link build settles, so claiming it here would be claiming something nothing
-    // has checked.
-    (Cardinality::AtMostOne.label(), None)
+    // At most one until the link is built, because exactly one is a claim about the child side and
+    // the key map only ever saw the parent's. The link is what observes the child: a link whose
+    // every child found a parent is a relationship that is total in the direction the declaration
+    // claims, and one that did not is still at most one and is why the monotone form was refused.
+    match held {
+        Some(held) if held.linked() == held.children() => (Cardinality::ExactlyOne.label(), None),
+        Some(_) => (
+            Cardinality::AtMostOne.label(),
+            Some("some child rows have no parent, so this is not exactly one"),
+        ),
+        None => (Cardinality::AtMostOne.label(), Some("no link is stored")),
+    }
 }

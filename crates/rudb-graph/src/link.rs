@@ -299,7 +299,11 @@ impl Link {
         // form's head is pairs of them, and a payload whose reader has to handle both an aligned
         // and an unaligned case for no reason is a payload with a second code path in it.
         out.extend_from_slice(&[0; 5]);
-        debug_assert_eq!(out.len() - start, HEADER_BYTES, "the forward link header is thirty two bytes");
+        debug_assert_eq!(
+            out.len() - start,
+            HEADER_BYTES,
+            "the forward link header is thirty two bytes"
+        );
         match &self.body {
             Body::Packed { bytes, heads, .. } => {
                 for head in heads {
@@ -340,7 +344,9 @@ impl Link {
         let body = match form {
             Form::Packed => {
                 if width != width_for(parents) {
-                    return Err(malformed("a forward link's width is not the one its parents imply"));
+                    return Err(malformed(
+                        "a forward link's width is not the one its parents imply",
+                    ));
                 }
                 let parts = usize::try_from(children.div_ceil(count(PART_ROWS)))
                     .map_err(|_| malformed("a forward link with more parts than fit in memory"))?;
@@ -349,7 +355,9 @@ impl Link {
                     .map_err(|_| malformed("a forward link longer than fits in memory"))?;
                 let packed = bitpack::tail_len(rows, width);
                 if rest.len() != head + packed {
-                    return Err(malformed("a forward link's body is not the size its header implies"));
+                    return Err(malformed(
+                        "a forward link's body is not the size its header implies",
+                    ));
                 }
                 let mut heads = Vec::with_capacity(parts);
                 for part in 0..parts {
@@ -441,7 +449,9 @@ fn count(rows: usize) -> u64 {
 }
 
 fn number(bytes: &[u8]) -> Result<u64> {
-    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| malformed("a forward link header is torn"))?))
+    Ok(u64::from_le_bytes(
+        bytes.try_into().map_err(|_| malformed("a forward link header is torn"))?,
+    ))
 }
 
 fn malformed(message: impl Into<String>) -> Error {
@@ -577,7 +587,10 @@ mod tests {
         let link = Link::build(&parents_of, PART_ROWS as u64).expect("build");
         assert_eq!(link.form(), Form::Monotone);
         assert_eq!(link.part_bounds(0), Some(Some((0, (PART_ROWS as u64 - 1) / 4))));
-        assert_eq!(link.part_bounds(1), Some(Some((PART_ROWS as u64 / 4, (PART_ROWS as u64 * 2 - 1) / 4))));
+        assert_eq!(
+            link.part_bounds(1),
+            Some(Some((PART_ROWS as u64 / 4, (PART_ROWS as u64 * 2 - 1) / 4)))
+        );
     }
 
     #[test]

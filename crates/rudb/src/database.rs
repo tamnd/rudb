@@ -9,6 +9,7 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, View};
 use rudb_common::stat::Provenance;
 use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_metrics::{Document, Report, Span};
+use rudb_native::graph::Edge;
 use rudb_parse::ast::Ast;
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_vector::{Chunk, Form, Vector};
@@ -624,8 +625,64 @@ fn index(path: &Path, catalog: &mut Catalog, links: &str) -> Result<()> {
     for (name, columns) in &wanted {
         rudb_native::graph::build_key_maps(path, &name.table, columns)?;
     }
-    let names = wanted.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+    // The second pass section 3.8 asks for, and it is a second pass over the file and not only over
+    // the declarations: a link is built by looking a child's keys up in the parent's key map, and
+    // the loop above is what put that map in the file. Doing both in one walk would mean building
+    // a link against a map that is still in memory, which works until the relationship's two tables
+    // arrive in the other order.
+    let edges = edges_of(catalog, &declared);
+    let mut names = wanted.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+    if !edges.is_empty() {
+        rudb_native::graph::build_links(path, &edges)?;
+        for edge in &edges {
+            let Some(name) = catalog
+                .tables()
+                .find(|table| table.name().table == edge.child)
+                .map(|table| table.name().clone())
+            else {
+                continue;
+            };
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
     rebind(path, catalog, &names)
+}
+
+/// The declared relationships whose four names all resolve, as the link builder wants them.
+///
+/// A declaration that names a table or a column that is not there is dropped rather than reported.
+/// `rudb_links()` is where a user finds out, because it reads the declaration and the file side by
+/// side and can say which half is missing; a checkpoint can only refuse to index, and by section
+/// 3.1 refusing to index is not an error.
+fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for link in declared {
+        let ([child], [parent]) = (&link.child.columns[..], &link.parent.columns[..]) else {
+            continue;
+        };
+        let find = |name: &str| {
+            catalog.tables().find(|table| table.name().table.eq_ignore_ascii_case(name))
+        };
+        let (Some(child_table), Some(parent_table)) =
+            (find(&link.child.table), find(&link.parent.table))
+        else {
+            continue;
+        };
+        let (Some(child_column), Some(parent_column)) =
+            (child_table.column_index(child), parent_table.column_index(parent))
+        else {
+            continue;
+        };
+        edges.push(Edge {
+            child: child_table.name().table.clone(),
+            child_column,
+            parent: parent_table.name().table.clone(),
+            parent_column,
+        });
+    }
+    edges
 }
 
 /// Points every table at the generation the file now holds.

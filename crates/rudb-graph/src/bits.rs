@@ -307,8 +307,14 @@ impl BitVector {
             return Err(malformed("a bit vector has bits set past its length"));
         }
         let ones = held.iter().map(|word| u64::from(word.count_ones())).sum();
-        let mut vector =
-            Self { words: held, len, ones, rank, ones_sample: Vec::new(), zeros_sample: Vec::new() };
+        let mut vector = Self {
+            words: held,
+            len,
+            ones,
+            rank,
+            ones_sample: Vec::new(),
+            zeros_sample: Vec::new(),
+        };
         vector.sample();
         Ok(vector)
     }

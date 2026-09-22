@@ -37,7 +37,6 @@ use crate::rid::Rid;
 /// want to move once there is a measurement that says where, and moving it should be a diff.
 pub const DENSE_THRESHOLD: u64 = 8;
 
-
 /// Which of the three physical forms a key map took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Form {
@@ -121,7 +120,6 @@ impl Observed {
         self.distinct
     }
 }
-
 
 /// The three forms, behind one interface.
 #[derive(Debug, Clone)]
