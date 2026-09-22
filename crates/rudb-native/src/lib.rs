@@ -53,6 +53,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below}
 
 pub mod graph;
 pub mod section;
+pub mod stats;
 mod zones;
 
 pub use section::Section;
