@@ -4680,7 +4680,6 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     // clause ignored, which is the rule the front end follows everywhere else.
     let db = scripted(&["CREATE TABLE t (a INTEGER)"]);
     for statement in [
-        "CREATE TEMPORARY TABLE u (a INTEGER)",
         "CREATE TABLE u (a INTEGER PRIMARY KEY)",
         "INSERT INTO t VALUES (1) RETURNING a",
         "INSERT INTO t (a, a) VALUES (1, 2)",
@@ -4690,6 +4689,223 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
         assert!(!message.is_empty(), "{statement} was accepted");
     }
     assert!(db.with_catalog(|catalog| catalog.tables().all(|table| table.name().table != "u")));
+}
+
+/// A temporary table goes in the `temp` database and a bare name finds it before the stored one.
+///
+/// Two tables of one name exist at the same time here, which is the whole of what `temp` is for.
+/// The `CREATE` writes into `memory` because a create that did not say otherwise always does, and
+/// every read after it goes to `temp` because that is the front of the search path, so the two
+/// directions genuinely disagree and the pin disagrees the same way.
+#[test]
+fn a_temporary_table_shadows_a_stored_one_of_the_same_name() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (99)",
+        "CREATE TEMPORARY TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1)",
+    ]);
+    assert_eq!(rows(&db, "SELECT a FROM t"), vec![vec![integer(1)]]);
+    assert_eq!(rows(&db, "SELECT a FROM temp.t"), vec![vec![integer(1)]]);
+    assert_eq!(rows(&db, "SELECT a FROM temp.main.t"), vec![vec![integer(1)]]);
+    assert_eq!(rows(&db, "SELECT a FROM memory.main.t"), vec![vec![integer(99)]]);
+    // Two parts reading as a schema and a table, and `main` is a schema of `temp` before it is a
+    // schema of `memory`, so this one is the temporary table as well.
+    assert_eq!(rows(&db, "SELECT a FROM main.t"), vec![vec![integer(1)]]);
+}
+
+/// The one that is dropped is the one a bare name finds, so dropping twice leaves neither.
+#[test]
+fn a_drop_takes_the_temporary_table_first_and_the_stored_one_after() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER)",
+        "CREATE TEMPORARY TABLE t (a INTEGER)",
+        "DROP TABLE t",
+    ]);
+    assert_eq!(
+        rows(&db, "SELECT database_name FROM duckdb_tables() WHERE table_name = 't'"),
+        vec![vec![text("memory")]]
+    );
+    db.execute("DROP TABLE t").expect("the stored one is still there");
+    assert_eq!(
+        rows(&db, "SELECT database_name FROM duckdb_tables() WHERE table_name = 't'"),
+        Vec::<Vec<Value>>::new()
+    );
+}
+
+/// Everything temporary lands in `temp` whatever way the name was written, and a name that says a
+/// different database is refused in the pin's own words.
+#[test]
+fn a_temporary_name_can_only_say_the_temp_database() {
+    let db = scripted(&["CREATE TABLE stored (a INTEGER)"]);
+    for statement in [
+        "CREATE TEMPORARY TABLE one (a INTEGER)",
+        "CREATE TEMPORARY TABLE temp.two (a INTEGER)",
+        "CREATE TEMPORARY TABLE main.three (a INTEGER)",
+        "CREATE TEMPORARY TABLE temp.main.four (a INTEGER)",
+        "CREATE TEMPORARY VIEW five AS SELECT 1 AS a",
+        "CREATE TEMPORARY VIEW main.six AS SELECT 1 AS a",
+    ] {
+        db.execute(statement).unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'temp'"),
+        vec![vec![Value::BigInt(4)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM duckdb_views() WHERE database_name = 'temp'"),
+        vec![vec![Value::BigInt(2)]]
+    );
+    let outside = "TEMPORARY table names can *only* use the \"temp\" catalog";
+    for statement in [
+        "CREATE TEMPORARY TABLE memory.seven (a INTEGER)",
+        "CREATE TEMPORARY TABLE memory.main.seven (a INTEGER)",
+        "CREATE TEMPORARY TABLE system.main.seven (a INTEGER)",
+        "CREATE TEMPORARY VIEW memory.seven AS SELECT 1 AS a",
+    ] {
+        assert_eq!(refusal(&db, statement), outside, "{statement}");
+    }
+    // A schema in `temp` other than `main` cannot exist, because `CREATE SCHEMA` cannot put one
+    // there, so this reports the schema missing rather than reaching for the `memory` one.
+    assert_eq!(
+        refusal(&db, "CREATE TEMPORARY TABLE nowhere.eight (a INTEGER)"),
+        "Schema with name nowhere does not exist!"
+    );
+}
+
+/// A create that is not temporary still cannot name `temp`, which is the other half of the rule and
+/// a different sentence.
+#[test]
+fn a_create_that_is_not_temporary_cannot_name_the_temp_database() {
+    let db = scripted(&[]);
+    let inside = "Only TEMPORARY table names can use the \"temp\" catalog";
+    assert_eq!(refusal(&db, "CREATE TABLE temp.a (i INTEGER)"), inside);
+    assert_eq!(refusal(&db, "CREATE VIEW temp.b AS SELECT 1"), inside);
+}
+
+/// The catalog tables report a temporary entry as temporary and as not internal.
+///
+/// Those two are the same answer everywhere else and they come apart here: the `temp` database is
+/// the engine's, and the table in it is somebody's. Measured off the pin, which prints exactly this
+/// pair for a temporary table, a temporary view and the columns of both.
+#[test]
+fn a_temporary_entry_is_temporary_and_is_not_internal() {
+    let db = scripted(&[
+        "CREATE TABLE stored (a INTEGER)",
+        "CREATE TEMPORARY TABLE tt (b INTEGER)",
+        "CREATE TEMPORARY VIEW tv AS SELECT 1 AS c",
+    ]);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_name, internal, temporary FROM duckdb_tables() ORDER BY table_name"
+        ),
+        vec![
+            vec![text("stored"), Value::Boolean(false), Value::Boolean(false)],
+            vec![text("tt"), Value::Boolean(false), Value::Boolean(true)],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT internal, temporary FROM duckdb_views() WHERE view_name = 'tv'"),
+        vec![vec![Value::Boolean(false), Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_name, internal FROM duckdb_columns() \
+             WHERE table_name IN ('tt', 'tv') ORDER BY table_name"
+        ),
+        vec![vec![text("tt"), Value::Boolean(false)], vec![text("tv"), Value::Boolean(false)],]
+    );
+    // The database holding them is internal all the same, and so is its schema.
+    assert_eq!(
+        rows(&db, "SELECT internal FROM duckdb_databases() WHERE database_name = 'temp'"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT internal FROM duckdb_schemas() WHERE database_name = 'temp'"),
+        vec![vec![Value::Boolean(true)]]
+    );
+}
+
+/// A temporary table is a `LOCAL TEMPORARY` in `information_schema`, and a temporary view is just a
+/// view, which is the pin's answer to both.
+#[test]
+fn information_schema_calls_a_temporary_table_a_local_temporary() {
+    let db = scripted(&[
+        "CREATE TABLE stored (a INTEGER)",
+        "CREATE TEMPORARY TABLE tt (b INTEGER)",
+        "CREATE TEMPORARY VIEW tv AS SELECT 1 AS c",
+    ]);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT table_catalog, table_name, table_type FROM information_schema.tables \
+             ORDER BY table_name"
+        ),
+        vec![
+            vec![text("memory"), text("stored"), text("BASE TABLE")],
+            vec![text("temp"), text("tt"), text("LOCAL TEMPORARY")],
+            vec![text("temp"), text("tv"), text("VIEW")],
+        ]
+    );
+}
+
+/// The two listings that say what is around report a temporary entry, even though the listing of
+/// databases leaves `temp` out.
+///
+/// Both are the pin's answer and the difference between them is the question being asked. One asks
+/// which databases a name can be written into, where `temp` is not one, and the others ask what is
+/// there to read, where it is.
+#[test]
+fn the_listings_show_a_temporary_entry_beside_a_stored_one() {
+    let db = scripted(&[
+        "CREATE TABLE stored (a INTEGER)",
+        "CREATE TEMPORARY TABLE tt (b INTEGER)",
+        "CREATE TEMPORARY VIEW tv AS SELECT 1 AS c",
+    ]);
+    assert_eq!(
+        rows(&db, "PRAGMA show_tables"),
+        vec![vec![text("stored")], vec![text("tt")], vec![text("tv")],]
+    );
+    assert_eq!(
+        rows(&db, "PRAGMA show_tables_expanded")
+            .into_iter()
+            .map(|row| (row[0].clone(), row[2].clone(), row[5].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (text("memory"), text("stored"), Value::Boolean(false)),
+            (text("temp"), text("tt"), Value::Boolean(true)),
+            (text("temp"), text("tv"), Value::Boolean(true)),
+        ]
+    );
+    assert_eq!(rows(&db, "PRAGMA show_databases"), vec![vec![text("memory")]]);
+}
+
+/// A temporary table built from a query, and a temporary one replaced, neither of which touches the
+/// stored table of the same name.
+#[test]
+fn a_temporary_table_takes_the_clauses_a_stored_one_takes() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER)",
+        "CREATE TEMPORARY TABLE t AS SELECT 7 AS a, 8 AS b",
+    ]);
+    assert_eq!(rows(&db, "SELECT a, b FROM t"), vec![vec![integer(7), integer(8)]]);
+    db.execute("CREATE OR REPLACE TEMPORARY TABLE t (a INTEGER, b INTEGER, c INTEGER)")
+        .expect("replacing the temporary one");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT database_name, column_count FROM duckdb_tables() \
+             WHERE table_name = 't' ORDER BY database_name"
+        ),
+        vec![vec![text("memory"), Value::BigInt(1)], vec![text("temp"), Value::BigInt(3)]]
+    );
+    db.execute("CREATE TEMPORARY TABLE IF NOT EXISTS t (a INTEGER)").expect("already there");
+    assert_eq!(
+        refusal(&db, "CREATE TEMPORARY TABLE t (a INTEGER)"),
+        "Table with name \"t\" already exists!"
+    );
 }
 
 #[test]
@@ -5902,6 +6118,43 @@ fn a_file_backed_insert_streams_into_a_snapshot_that_a_new_process_can_read() {
     assert_eq!(
         rows(&reopened, "SELECT count(*), sum(id), min(name) FROM hits"),
         vec![vec![Value::BigInt(3), Value::HugeInt(6), Value::Varchar("one".into())]]
+    );
+    std::fs::remove_file(path).expect("the temporary native database is removed");
+}
+
+/// A temporary table never reaches the file, so reopening the file does not find one.
+///
+/// This is the part that would be quietly wrong rather than loudly wrong: a checkpoint that wrote
+/// the temporary table would leave a table in the file that nobody created, and it would come back
+/// as a stored table the next time the file was opened.
+#[test]
+fn a_temporary_table_is_not_written_into_a_file_backed_database() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-native-temporary-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the new native database opens");
+    database.execute("CREATE TABLE kept (id INTEGER)").expect("the stored table is made");
+    database.execute("INSERT INTO kept VALUES (1), (2)").expect("the stored rows go in");
+    database
+        .execute("CREATE TEMPORARY TABLE gone (id INTEGER)")
+        .expect("the temporary table is made");
+    database.execute("INSERT INTO gone VALUES (3), (4), (5)").expect("the temporary rows go in");
+    assert_eq!(rows(&database, "SELECT count(*) FROM gone"), vec![vec![Value::BigInt(3)]]);
+    database.execute("CHECKPOINT").expect("the checkpoint writes the stored table only");
+    drop(database);
+
+    let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the committed native database reopens");
+    assert_eq!(rows(&reopened, "SELECT count(*) FROM kept"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(
+        rows(&reopened, "SELECT table_name FROM duckdb_tables() ORDER BY table_name"),
+        vec![vec![text("kept")]]
     );
     std::fs::remove_file(path).expect("the temporary native database is removed");
 }
