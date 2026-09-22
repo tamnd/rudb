@@ -14,7 +14,7 @@ Twenty seven of the 43 queries are a `GROUP BY` with an `ORDER BY` and a `LIMIT`
 
 The largest of them, with what each one reads and what it gives back:
 
-| query | CPU | peak resident | rows scanned | rows returned |
+| query | CPU | `resource.peak_bytes` | rows scanned | rows returned |
 | --- | ---: | ---: | ---: | ---: |
 | Q29 | 20.16 s | 128 MiB | 10,000,000 | 15 |
 | Q23 | 4.72 s | under 1 MiB | 10,000,000 | 10 |
@@ -26,7 +26,9 @@ The largest of them, with what each one reads and what it gives back:
 | Q10 | 1.64 s | 279 MiB | 10,000,000 | 10 |
 | Q9 | 1.34 s | 276 MiB | 10,000,000 | 10 |
 
-The middle column is worth as much as the first. Document 17 records rudb holding 1.46 GiB against DuckDB's 0.44 across a pass of this suite, which is the one axis of the project's target where rudb is behind rather than ahead, and the table above says where that number is made. It is made by hash tables that exist to be thrown away: Q17 builds 406 MiB of groups and emits ten rows.
+The middle column is worth as much as the first. Document 17 records rudb holding 1.46 GiB against DuckDB's 0.44 across a pass of this suite, which is the one axis of the project's target where rudb is behind rather than ahead, and the table above says where part of that number is made. It is made by hash tables that exist to be thrown away: Q17 builds 406 MiB of groups and emits ten rows.
+
+Only part of it, and the middle column is not the process. Document 21 measures the resident set from outside and finds this counter blind to everything an operator does not register: Q23 is the largest memory consumer in the suite at 712 MiB and appears above as "under 1 MiB", Q29 is 643 rather than 128, and the suite's peak exceeds its heaviest query by 774 MiB that no statement is charged for. The hash tables priced below are real and are the part of the memory this counter can see. They are not the larger part, and the argument in this section should be read as applying to the queries it names rather than to the 1.46 GiB.
 
 ## Why the obvious answer does not work
 
@@ -61,11 +63,11 @@ What it does not do is cover the skewed composites. Q17's top pair count of 2,49
 
 ## What this is worth, stated against the target
 
-Q32 and Q33 are 5.24 seconds and 349 MiB, and the uniqueness bound above answers both. Q15, Q17, Q19 and Q31 are 9.93 seconds and 860 MiB, and a query time summary over the composite key is what they need. Together that is 26% of the suite's CPU and the great majority of its peak memory, and document 18's dictionary finding is a further 35% on Q29.
+Q32 and Q33 are 5.24 seconds and 349 MiB, and the uniqueness bound above answers both. Q15, Q17, Q19 and Q31 are 9.93 seconds and 860 MiB, and a query time summary over the composite key is what they need. Together that is 26% of the suite's CPU, and document 18's dictionary finding is a further 35% on Q29. The claim that it is also the great majority of the suite's peak memory was made from the counter above and document 21 withdraws it: those hash tables are about a third of what the process holds.
 
 Sixty one percent of the suite being addressable by two structural changes is the largest identified program this series has, and it still does not reach the target. Both changes working perfectly would take the suite from 57.63 seconds to about 22, which is 2.6 times better than rudb is now. rudb is 2.09 times ahead of DuckDB on the quiet host at benchmark scale, so the product of the two is not ten, and the honest reading of documents 18 and 19 together is that the execution ceiling and the precomputation opportunities both fall short of it by roughly the same factor of two.
 
-The memory axis is the one where this changes the sign rather than the size. rudb holds 1.46 GiB against DuckDB's 0.44 on this suite, which is 3.32 times worse, and the hash tables this document prices are where that is spent. Removing them does not make rudb ten times leaner than DuckDB, but it moves the larger of the two numbers, and it is the only measurement in this series that points at the resource half of the target rather than the time half.
+The memory axis is the one where this changes the sign rather than the size. rudb holds 1.46 GiB against DuckDB's 0.44 on this suite, which is 3.32 times worse, and the hash tables this document prices are part of where that is spent. Removing them does not make rudb ten times leaner than DuckDB, but it moves the larger of the two numbers. Document 21 measures the rest of that gap from outside the process and splits it into retention and working set, so the two documents together are what points at the resource half of the target rather than the time half.
 
 ## What this document does not claim
 
