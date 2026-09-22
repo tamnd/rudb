@@ -64,6 +64,23 @@ pub const SUMMARY: &[u8; 8] = b"RUDBCS1\0";
 /// A column's sketches, per `spec/stats/03-the-file-format.md` section 3.4.
 pub const SKETCHES: &[u8; 8] = b"RUDBSK1\0";
 
+/// The kinds the graph document owns, which share its ten percent of the column bytes.
+pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
+
+/// The kinds the statistics document owns, which share its two percent.
+///
+/// Two lists rather than one because the two budgets are separate, and separate means each counts
+/// only what it owns. A statistics build that counted the key maps as already spent would be a
+/// statistics budget the graph layer eats: a TPC-H SF10 file's key maps are 7.7 MB against a two
+/// percent allowance of 54 MB, so a seventh of the statistics budget would go to sections that have
+/// their own.
+///
+/// A kind in neither list is one a later build wrote, and it counts against neither. There is no
+/// better answer available, since this build cannot know which document invented it, and charging
+/// it to both would make every budget here tighter than the document says by an amount that depends
+/// on what some other build did.
+pub const STATISTICS_KINDS: &[&[u8; 8]] = &[SUMMARY, SKETCHES];
+
 /// One entry in a table's section table.
 ///
 /// The payload is not here. This is the entry that says where the payload is, what it is, and
@@ -172,6 +189,12 @@ impl Section {
     #[must_use]
     pub fn known(&self) -> bool {
         matches!(&self.kind, KEY_MAP | FORWARD_LINK | ADJACENCY | SUMMARY | SKETCHES)
+    }
+
+    /// Whether this section's kind is one of these, which is how a budget finds what it owns.
+    #[must_use]
+    pub fn among(&self, kinds: &[&[u8; 8]]) -> bool {
+        kinds.iter().any(|kind| self.kind == **kind)
     }
 
     /// Whether this section was built against this table generation.
