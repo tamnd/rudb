@@ -55,6 +55,24 @@
 //!
 //! The finished chunks go into a [`Buffered`], which is a separate source rather than something
 //! `finalize` hands back, for the reason [`Sink::finalize`] gives.
+//!
+//! # Giving the input back while the output is being built
+//!
+//! A sort holds the rows that arrived and the rows it is handing out at the same time, and for a
+//! moment near the end it holds both in full. That moment is what a big sort dies at: SF10 lineitem
+//! is around ten gigabytes of payload, so two copies of it is twenty, and the limit on a machine
+//! with 24 GiB lands at 19.1.
+//!
+//! It does not have to hold both. [`gathered`] lays one column at a time, so the input's copy of a
+//! column is finished with the moment that column has been laid, and the input is taken apart into
+//! its columns up front so that each one can be dropped exactly then. What the sort holds is
+//! therefore one payload and one column of headroom rather than two payloads, whichever column it
+//! is on, and the charge against the memory limit comes down as the columns go.
+//!
+//! The rows themselves go before any of that. All [`gathered`] wants from them is where each input
+//! row lands, which is four bytes a row, against the forty eight a row that carries a normalized
+//! key and an arrival. So the order is turned into that and the rows are dropped, which at SF10 is
+//! another three gigabytes that is not held while the assembly runs.
 
 use std::cmp::Ordering;
 use std::sync::Mutex;
@@ -217,6 +235,29 @@ impl Keyed {
         match self {
             Self::Normal(rows) => Box::new(rows.iter().map(|row| row.2)),
             Self::Valued(rows) => Box::new(rows.iter().map(|row| row.2)),
+        }
+    }
+
+    /// How many rows there are.
+    fn len(&self) -> usize {
+        match self {
+            Self::Normal(rows) => rows.len(),
+            Self::Valued(rows) => rows.len(),
+        }
+    }
+
+    /// What these rows were charged when they were taken in, so that dropping them can give it back.
+    ///
+    /// Counted again rather than carried, because the valued arm's rows are not all the same size
+    /// and a running total would have to be threaded through the instance handover as a fourth
+    /// thing that has to stay in step with the other three. One walk over the rows at the end of a
+    /// sort is nothing beside the sort.
+    fn footprint(&self) -> u64 {
+        match self {
+            Self::Normal(rows) => {
+                u64::try_from(rows.len()).unwrap_or(u64::MAX).saturating_mul(NORMALIZED)
+            }
+            Self::Valued(rows) => rows.iter().map(|row| rows::footprint(&row.0) + BESIDE).sum(),
         }
     }
 }
@@ -382,13 +423,58 @@ impl Sink for Sort {
             std::mem::replace(&mut *gathered, empty)
         };
         rows.sort(&self.keys)?;
+        // What the instances took, moved out so that it can be given back a column at a time rather
+        // than all at once when this returns. Dropping what is left of it is what releases the rest.
+        let mut charged = std::mem::take(&mut *self.charged.lock().map_err(poisoned)?);
+        let total = rows.len();
+        if u32::try_from(total).is_err() {
+            return Err(too_many());
+        }
+        let at = places(&chunks, &rows)?;
+        // The rows have said everything they had to say. Holding them through the assembly is
+        // holding a key and an arrival a row for the sake of a number that is already in `at`.
+        let taken = rows.footprint();
+        drop(rows);
+        give(&mut charged, taken);
         let mut held = self.held.lock().map_err(poisoned)?;
-        let out = gathered(&self.types, &chunks, rows.sources(), &mut held)?;
+        let out = gathered(&self.types, chunks, &at, total, &mut held, &mut charged)?;
         self.out.fill(out)?;
-        // The gathered rows are gone and the chunks are charged instead, so what the instances
-        // took is given back here and not before.
-        self.charged.lock().map_err(poisoned)?.clear();
         Ok(())
+    }
+}
+
+/// Where each row that arrived lands, kept the way an [`Assembly`] wants to be handed it.
+///
+/// One run of positions a chunk, indexed by the row's place in that chunk. Every input row reaches
+/// the sort and every one of them is somewhere in the order, so every position is written and the
+/// zero this starts from is never read.
+fn places(chunks: &[Chunk], rows: &Keyed) -> Result<Vec<Vec<u32>>> {
+    let mut at: Vec<Vec<u32>> = chunks.iter().map(|chunk| vec![0; chunk.len()]).collect();
+    for (rank, (chunk, row)) in rows.sources().enumerate() {
+        let Some(place) = at.get_mut(chunk as usize).and_then(|run| run.get_mut(row as usize))
+        else {
+            return Err(Error::internal("a sorted row pointing outside the chunks it came from"));
+        };
+        *place = rank as u32;
+    }
+    Ok(at)
+}
+
+/// Gives `bytes` back across the reservations the instances handed over.
+///
+/// From the last one backwards, which is arbitrary and is fine: they all charge the same budget and
+/// what matters is only that the total comes down. A reservation that has nothing left is dropped,
+/// which is the same as shrinking it to nothing and is one fewer to walk next time.
+fn give(charged: &mut Vec<Reservation>, mut bytes: u64) {
+    while bytes > 0 {
+        let Some(last) = charged.last_mut() else { return };
+        let held = last.bytes();
+        if held > bytes {
+            last.shrink(bytes);
+            return;
+        }
+        bytes -= held;
+        charged.pop();
     }
 }
 
@@ -405,40 +491,48 @@ impl Sink for Sort {
 /// holding one of them at a time is a column of headroom rather than a table of it. The finished
 /// column is then cut into chunk sized windows, which for a page is a window and no copy.
 ///
+/// The chunks come in by value and are taken apart into their columns before anything is laid, so
+/// that the input's copy of a column can be dropped the moment it has been laid and the charge
+/// against the memory limit can come down with it. Held as chunks there is nowhere to put the
+/// column that is finished with, and the sort ends up holding the whole input and the whole output
+/// at once, which is what made a big one die at the allocator rather than get slower.
+///
 /// # Errors
 ///
 /// If a column has no layout an assembly can lay, or if the chunks pass the limit the database was
 /// opened with.
 fn gathered(
     types: &[LogicalType],
-    chunks: &[Chunk],
-    order: impl ExactSizeIterator<Item = Source>,
+    chunks: Vec<Chunk>,
+    at: &[Vec<u32>],
+    rows: usize,
     held: &mut Reservation,
+    charged: &mut Vec<Reservation>,
 ) -> Result<Vec<Chunk>> {
-    let rows = order.len();
     if rows == 0 {
         return Ok(Vec::new());
     }
-    if u32::try_from(rows).is_err() {
-        return Err(too_many());
-    }
-    // Where each row that arrived lands, kept the way an assembly wants to be handed it, which is
-    // one run of positions a chunk.
-    let mut at: Vec<Vec<u32>> = chunks.iter().map(|chunk| vec![0; chunk.len()]).collect();
-    for (rank, (chunk, row)) in order.enumerate() {
-        let Some(place) = at.get_mut(chunk as usize).and_then(|run| run.get_mut(row as usize))
-        else {
-            return Err(Error::internal("a sorted row pointing outside the chunks it came from"));
-        };
-        *place = rank as u32;
+    // Transposed: the pieces of one column of every chunk, so that a column is one thing to drop.
+    let mut pieces: Vec<Vec<Vector>> = vec![Vec::with_capacity(chunks.len()); types.len()];
+    for chunk in chunks {
+        for (position, column) in chunk.into_columns().into_iter().enumerate() {
+            let Some(into) = pieces.get_mut(position) else {
+                return Err(Error::internal("a sorted chunk wider than the schema it came from"));
+            };
+            into.push(column);
+        }
     }
     let blocks = rows.div_ceil(VECTOR_SIZE);
     let mut columns: Vec<Vec<Vector>> = vec![Vec::with_capacity(types.len()); blocks];
     for (position, ty) in types.iter().enumerate() {
         let mut assembly = Assembly::new(ty.clone(), rows)?;
-        for (chunk, places) in chunks.iter().zip(&at) {
-            assembly.place(places, chunk.column(position)?)?;
+        let laid = pieces.get_mut(position).map(std::mem::take).unwrap_or_default();
+        for (piece, places) in laid.iter().zip(at) {
+            assembly.place(places, piece)?;
         }
+        let given = laid.iter().map(Vector::footprint).sum::<usize>();
+        drop(laid);
+        give(charged, u64::try_from(given).unwrap_or(u64::MAX));
         let whole = assembly.finish()?.into_pages();
         for (block, into) in columns.iter_mut().enumerate() {
             let start = block * VECTOR_SIZE;
