@@ -86,6 +86,33 @@ A decimal is now wide only when its width says it is stored in 128 bits, asked i
 
 This is the second bug in two notes that was found by a test over a type rather than by a test over a query, and it is the same lesson: the list of types a loop takes was written from the queries that existed.
 
+## The map behind the filter
+
+The change above left every fixed width key at about 3.4 times behind, which the section above calls one reason rather than five. Here is the one reason.
+
+A group table over a key whose values fit a small range does not need a hash table at all. It can index an array by the value, and the engine already does that, which is why the decimal key with no filter is 0.72 times and ahead of duckdb while the same query behind a filter is 3.66 times and behind it. Same column, same eleven discounts, same map, and one of them gets it.
+
+The reason is the shape a filter leaves. A filter over a native packed column produces a dictionary whose codes are the rows that got through and whose payload is the whole chunk column. That has a dictionary's form, so the direct map read it as one: it took the payload's length as the span, which is the rows of the page rather than the values the column takes, and it keyed the map on the row number. So a group by on eleven discounts built a map of one entry per row of the page, and then rebuilt it for the next chunk, because each filtered chunk points at a payload of its own and a map held by the payload's identity cannot outlive it. Either half of that is enough to lose.
+
+Read through the code to the packed run underneath instead, and the place is the packed code and the span is one past what the width can hold, which is sixteen for those eleven discounts. The map's identity is then the page's base and width, the same as for a packed column nothing filtered, so one map serves the whole page however the filter cuts it.
+
+| group by, filtered | before | after | duckdb | was | now |
+| --- | --- | --- | --- | --- | --- |
+| a decimal key | 2.394 | 0.805 | 0.653 | 3.66x | 1.23x |
+| an integer key | 2.384 | 0.805 | 0.700 | 3.40x | 1.14x |
+| two narrow keys | 3.369 | 1.096 | 0.819 | 4.11x | 1.33x |
+| a decimal key with a sum | 2.744 | 1.151 | 0.778 | 3.52x | 1.47x |
+| a date key | 2.370 | 1.640 | 0.574 | 4.12x | 2.85x |
+| a bigint key | 3.071 | 3.070 | 0.919 | 3.34x | 3.34x |
+| a decimal key, no filter | 0.422 | 0.428 | 0.498 | 0.84x | 0.85x |
+| an integer key, no filter | 0.011 | 0.011 | 0.536 | 0.02x | 0.02x |
+
+Three times less work on a narrow key behind a filter, and the gap against duckdb goes from three and a half times to within a quarter. The date key moves by a third rather than by three times because 2,526 distinct dates need a map of four thousand entries and walking it out costs more than the hash it replaced saves. The bigint key does not move at all because `l_suppkey` is not packed in the file, so there is no width to read it at, and it stays where the previous section left it.
+
+The two rows with no filter are the control. They took the direct map before this and they take the same one now, so the change is the filtered case catching up to them rather than anything new.
+
+On the suite it is worth nothing, measured rather than assumed: 51.935 G before against 51.958 after over all 22 queries, against duckdb's 26.187. No TPC-H query groups on a packed narrow key behind a filter. q01 groups on two strings, q13 and q18 on a key that is not packed. That is a fact about TPC-H and not about the change, and it is why the ladder above exists.
+
 ## What did not work
 
 Two ideas were measured and dropped before the one above. Both looked obviously right.
@@ -96,7 +123,8 @@ Two ideas were measured and dropped before the one above. Both looked obviously 
 
 ## What follows
 
-- An `INTEGER` key behind a filter is 3.33 times behind duckdb and a `BIGINT` key is 3.35. That is now the whole of the remaining gap for every fixed width key, and it is one thing rather than five. The profile of the date key query after this change is `Column::holds` at 21.96 percent, `table::hash` at 16.63, `Vector::signed_at` at 16.42 and `Table::probe_at` at 11.30, which is half the query in the row at a time probe.
+- A key the file did not pack gets none of the second change. `l_suppkey` is stored flat, so there is no width to read it at and it stays at 3.34 times behind. The direct map wants a bound on the values a column takes, and for a flat column the only one to hand is the file's own minimum and maximum, which the committed directory already holds. That is the range half of #1179 and it is what #1201 is for.
+- A key whose domain is wide gets the map and pays for it. The date key builds four thousand entries for 2,526 groups and gains a third where a narrow key gains three times. Where the map stops being worth building against a hash table is a measurement nobody here has taken.
 - That probe is row at a time because the table is small. A group by on 2,526 distinct dates is under the eight thousand bucket threshold that sends a table down the one row path, so the batched compare this change added arms to is never reached on it. The threshold was chosen against cache misses, which a small table does not have, but the batched compare also hoists the type dispatch out of the row loop, which a small table does pay for.
 
   Measured by building the same tree with the threshold set to zero, so that every table takes the batch:
@@ -112,7 +140,7 @@ Two ideas were measured and dropped before the one above. Both looked obviously 
   | q03 | 1.772 | 1.777 | 1.114 |
   | q10 | 2.544 | 2.573 | 1.942 |
 
-  Between 10 and 16 percent on a table of a few thousand groups, and nothing at all on q01, q03 and q10. q01 groups on four rows, which is the shape the threshold was put in for, and it does not move, so the threshold is buying nothing on the query it was written against and costing a sixth on the ones above it. It is not a one line change, because zero is not the answer either and what the threshold should be is a measurement over the whole suite, but it is the largest thing left on a fixed width key.
+  That table was taken before the direct map change above, so its rows are the ones a key that does not reach the map still pays. Between 10 and 16 percent on a table of a few thousand groups, and nothing at all on q01, q03 and q10. q01 groups on four rows, which is the shape the threshold was put in for, and it does not move, so the threshold is buying nothing on the query it was written against and costing a sixth on the ones above it. It is not a one line change, because zero is not the answer either and what the threshold should be is a measurement over the whole suite, but it is the largest thing left on a fixed width key.
 - The cell rewrite of q01 stays refuted until a key column costs what an arithmetic column costs.
 
 ## What this note does not claim
