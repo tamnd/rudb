@@ -82,9 +82,11 @@ Two added calls cost 3.248 G. Group the named lines by what they are doing and 2
 | reading two more columns, per row | 0.447 | 14 percent |
 | starting a group's state, per group per call | 0.447 | 14 percent |
 | the addition itself, per row per call | 0.396 | 12 percent |
-| walking the chunk again for the added call | 0.310 | 10 percent |
-| merging partial tables, per group per call | 0.103 | 3 percent |
+| merging partial tables, per group per call | 0.277 | 9 percent |
+| walking the chunk again for the added call | 0.136 | 4 percent |
 | the key side of the table | -0.032 | 0 percent |
+
+The last two rows were the other way round when this section was first written, at 0.310 and 0.103. `Aggregate::fold_slots` is named like the per chunk fold and it is not one. It is at `crates/rudb-exec/src/group.rs:2034` and it merges one partial table into another, probing for each slot of the incoming table and calling `fresh` and `merge_slot` per group per call, so its 0.174 belongs with the merge. The per chunk fold is `Aggregate::fold` on its own, whose per call loop is at `crates/rudb-exec/src/group.rs:1602`, and walking the chunk again for an added call costs 0.136 rather than 0.310. The two rows sum to the same 0.413 either way, so nothing below this table changes, but which of the two is the larger does change and it is the merge.
 
 Three things in that table are worth saying out loud because they are not what the cycles profile said.
 
@@ -128,7 +130,9 @@ The change is [#1173](https://github.com/tamnd/rudb/issues/1173), the aggregate 
 - the layout is decided at plan time, so the per row work has no tag to read
 - a merge walks two rows rather than probing once per call
 
-What it is worth, from the profile rather than from the ladder. Of the 3.248 G that two added calls cost, the state row addresses starting a group's state at 0.447, walking the chunk again at 0.310 and merging partials at 0.103, which is 0.86 G, and it leaves the addition itself and the column reads alone because those are work the query asked for. It does not address finishing a state into a value, which is the largest single item at 0.479 and wants its own change.
+What it is worth, from the profile rather than from the ladder. Of the 3.248 G that two added calls cost, the state row addresses starting a group's state at 0.447, merging partials at 0.277 and walking the chunk again at 0.136, which is 0.86 G, and it leaves the addition itself and the column reads alone because those are work the query asked for. It does not address finishing a state into a value, which is the largest single item at 0.479 and wants its own change.
+
+That change is [#1263](https://github.com/tamnd/rudb/pull/1263) and it has landed. A grouped aggregate now finishes a whole run of states into a flat vector without a `Value` per group, deciding the output form once per call rather than once per group. Measured with a pair of binaries built from one tree so that they differ only in those files, it is worth 0.33 G a call on this note's 1.5 million group shape, which is what the 0.479 above predicts for two calls. On the 22 TPC-H queries it is worth 0.4 percent and on q01 it is worth nothing, because TPC-H groups on low cardinality keys nearly everywhere and q01's seven calls are over six groups, so a per group per call saving has almost no groups to work on. That gap between the ladder and the suite is the useful part of the result: this note's shape is not TPC-H's shape, and a change sized from this note has to be re-measured on the suite before it is claimed there.
 
 That is a smaller claim than the first version of this note made and it is the one the measurement supports. The reason to do the state row anyway is not its own 0.86 G. It is that the per group cost is 770 instructions against duckdb's 250 and three of the four things that make up that number are consequences of where the state lives.
 
