@@ -293,6 +293,12 @@ impl KeyMap {
     /// before building a link on it.
     pub fn build(keys: &[Option<i128>]) -> Result<Self> {
         let mut observed = observe(keys);
+        // See [`KeyMap::build_from`], which takes the same shortcut for the same reason and is
+        // where the reason is written. The two paths agree on every column or a table's key map
+        // depends on which of them built it.
+        if !observed.distinct {
+            return Ok(Self { body: Body::Identity { base: 0, count: 0 }, observed });
+        }
         Ok(match plan(&observed)? {
             Plan::Empty => Self { body: Body::Identity { base: 0, count: 0 }, observed },
             Plan::Identity { base, count } => {
@@ -336,6 +342,16 @@ impl KeyMap {
             Ok(())
         })?;
         let mut observed = observer.observed;
+        // A column the first scan already saw a repeat in gets no body at all. No form answers a
+        // rid for a key that is in two rows, so every byte spent on one is spent on a map nothing
+        // may use, and the bytes are not small: TPC-H SF10 `lineitem(l_orderkey)` sorts sixty
+        // million keys into three hundred and ninety megabytes before the budget throws all of it
+        // away. This is only reachable where the duplicates are adjacent, which is where the column
+        // arrived in order, and that is the case this is for. A repeat that only the sort can find
+        // is still found by the sort, below.
+        if !observed.distinct {
+            return Ok(Self { body: Body::Identity { base: 0, count: 0 }, observed });
+        }
         Ok(match plan(&observed)? {
             Plan::Empty => Self { body: Body::Identity { base: 0, count: 0 }, observed },
             Plan::Identity { base, count } => {
@@ -1058,6 +1074,20 @@ mod tests {
         let map = KeyMap::build(&column).expect("build");
         assert!(!map.observed().distinct);
         assert!(!map.observed().usable_as_parent(), "a non-unique parent side takes no link");
+    }
+
+    #[test]
+    fn a_column_that_arrives_with_its_repeats_together_is_not_sorted_into_a_map() {
+        // The scan sees the repeat, so nothing is packed. What matters is the bytes: this is
+        // `lineitem(l_orderkey)`, where the form that would have been chosen holds one packed key
+        // and one packed permutation entry per row.
+        let column = keys(&[1, 1, 2, 2, 2, 90_000, 90_000]);
+        let map = KeyMap::build_from(&column[..]).expect("build");
+        assert!(!map.observed().distinct);
+        assert_eq!(map.observed().rows, 7, "the column was still counted");
+        assert_eq!(map.observed().max, Some(90_000));
+        assert_eq!(map.bytes(), KeyMap::build(&keys(&[])).expect("build").bytes());
+        assert_eq!(map.lookup(2).expect("lookup"), None, "and it answers nothing, as it must");
     }
 
     #[test]

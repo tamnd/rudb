@@ -244,6 +244,13 @@ pub fn build_key_maps_within(
     order.sort_by_key(|&at| payloads[at].1.bytes.len());
     let mut keep = vec![false; payloads.len()];
     for at in order {
+        // Before the budget, because this is not a budget decision. A key map over a column whose
+        // key repeats cannot answer a rid for any of its keys, so keeping it would spend the
+        // table's allowance on something no join may read, and the report already says what it
+        // would have cost.
+        if !report[at].distinct {
+            continue;
+        }
         let cost = payloads[at].1.bytes.len() as u64;
         if spent.saturating_add(cost) <= allowance {
             spent += cost;
@@ -445,18 +452,21 @@ mod tests {
 
     #[test]
     fn a_column_with_a_repeat_in_it_is_mapped_and_reported_as_no_parent() {
-        // Section 2.3: a parent side that is not unique is not an error and is not a link. The map
-        // is still built, because what the planner needs is the observation, and the observation is
-        // what says no link may be built here.
+        // Section 2.3: a parent side that is not unique is not an error and is not a link. It is
+        // also not a key map. The repeat here is not next to itself, so only the sort can find it
+        // and the bytes are spent before anybody knows, which is why the report carries what it
+        // cost and the file does not.
         let mut keys = (1..=500_i64).map(Some).collect::<Vec<_>>();
         keys[200] = Some(7);
         let path = table_of("repeat", &keys);
         let built = build_key_maps(&path, "parent", &[0]).expect("build");
         assert!(!built[0].distinct, "a repeat is observed rather than declared away");
+        assert!(!built[0].built, "and a map no rid can be resolved through is not kept");
+        assert!(built[0].bytes > 0, "what it would have cost is still reported");
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
-        let map = key_map(&reader, 0).expect("the map is in the file");
-        assert!(!map.observed().usable_as_parent());
+        assert!(key_map(&reader, 0).is_none(), "nothing was written to read back");
+        assert!(reader.table().sections().is_empty());
 
         fs::remove_file(&path).expect("clean up");
     }

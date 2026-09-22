@@ -22,6 +22,7 @@ mod flatten;
 mod focus;
 mod generate;
 mod grammar;
+mod graph;
 mod io;
 mod kernels;
 mod layers;
@@ -96,6 +97,9 @@ fn main() -> ExitCode {
         // one has its answers written down in the repository that owns them.
         // Where a native file's bytes went, per column, out of the directory alone.
         Some("native") => native::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        // What a key map costs to build and to keep, which is G1's exit measurement. Not under
+        // `native` above, because that one reads a directory and this one writes to the file.
+        Some("graph") => graph::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("conform") => conform::run(&root()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
@@ -161,6 +165,12 @@ fn usage() {
     println!("           what the sample saves in time and what it gives up in size");
     println!("           --sampled makes the thread sweep use the sampled chooser, so that what");
     println!("           the ablation buys can be checked against the cores rather than assumed");
+    println!("  graph <file.db> <table.column>...  builds a key map over each named column and");
+    println!("           prints what it cost to build and what it costs to keep, against the ten");
+    println!(
+        "           percent budget of spec/graph/03-the-file-format.md section 3.7. it writes"
+    );
+    println!("           to the file, and a map the budget turned away is printed with its size");
     println!("  native <file.db>       where a native file's bytes went, per column and per kind");
     println!("           of byte, out of the committed directory alone, so it costs the same on");
     println!("           a 45 GB table as on an empty one. --all prints every column, not 20");
