@@ -228,3 +228,22 @@ fn the_same_aggregate_answers_the_same_way_every_time() {
         assert_eq!(counted, Value::HugeInt(i128::from(rows)), "run {run} lost rows");
     }
 }
+
+/// A key with more distinct values than the direct map used to cover, which is the width the map
+/// grew to so that a Parquet column chunk's dictionary fits inside it.
+///
+/// The arithmetic is what it guards. A map one place per distinct value is one where a wrong place
+/// answers another key's group, and the failure would show as two keys sharing a count rather than
+/// as an error, so the count per group is checked as well as the totals.
+#[test]
+fn a_key_wider_than_the_small_map_still_counts_every_row_once() {
+    let keys = 60_000;
+    let rows = keys * 3;
+    let database = built(rows, keys, 8);
+    adds_up(&database, rows, keys);
+    let connection = database.connect();
+    let uneven = connection
+        .value("SELECT COUNT(*) FROM (SELECT k, COUNT(*) AS c FROM t GROUP BY k) WHERE c <> 3")
+        .expect("counts the groups that did not get three rows");
+    assert_eq!(uneven, Value::BigInt(0), "every key holds exactly three of the rows");
+}
