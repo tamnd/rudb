@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.80
+
+A patch release of one pull request and one spec. The one pull request is `CREATE TEMPORARY TABLE` and `CREATE TEMPORARY VIEW`, which were two of the three statements the binder refused outright. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
+
+`CREATE TEMPORARY TABLE` and `CREATE TEMPORARY VIEW` work, in #1216. A temporary entry goes into the `temp` database and its `main` schema, and every accepted way of writing the name lands in the same place, whether that is a bare name, `temp.t`, `main.t` or `temp.main.t`. Naming a database that is actually attached is refused rather than redirected. Reads put `temp.main` at the front of the search path so a temporary table hides a stored one of the same name, and creates leave it out, so `CREATE TABLE t` after `CREATE TEMPORARY TABLE t` makes a second table rather than an error and both exist at once under the one name. A drop takes the one a bare name finds. The `temp` database is internal and the entries somebody put in it are not, which is the only place in the catalog those two answers come apart, so `duckdb_databases()` and `duckdb_schemas()` say true for the same object that `duckdb_tables()`, `duckdb_views()` and `duckdb_columns()` say false for. `information_schema.tables` calls a temporary table a `LOCAL TEMPORARY` and a temporary view a plain `VIEW`. A checkpoint writes the stored tables only, because a temporary table in the file would come back as an ordinary table nobody created the next time the file was opened.
+
+A temporary entry here lives for the life of the database rather than the life of the connection, which is a divergence from DuckDB and is deliberate. `Connection` carries no state of its own yet, so making `temp` per connection means a catalog view threaded through everything that takes a catalog today. That is #1215.
+
+The spec is the native quadrant replication, three passes per engine, in #1214.
+
 ## 0.3.79
 
 A patch release of six pull requests and one spec. Most of it is the physical order a table is stored in, which now gets sorted into on load rather than only recorded, plus what a table in memory knows about its own columns. One is a window function gap against DuckDB. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
