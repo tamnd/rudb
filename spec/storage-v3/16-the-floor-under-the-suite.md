@@ -64,7 +64,9 @@ The estimator cannot see the difference either. Every one of these filters is es
 
 ## The floor
 
-The eight queries that are 75.5% of the suite, each profiled on the same 10,000,000 row database on the same quiet host. The scan column is the `Get` operator alone and the total is the whole query. Both are CPU summed across threads, which is what `EXPLAIN ANALYZE` reports and what `crates/rudb-metrics/src/counters.rs` accumulates, so the two are in the same units and their ratio is the only thing read off them here. Neither is a wall time and neither is comparable to one.
+**The sentence that stood here said both columns are CPU summed across threads, which is what `EXPLAIN ANALYZE` reports, and that was wrong in the same way for the third time in this series.** `crates/rudb-opt/src/explain.rs` printed `operator.wall_ns` on the operator line, which is elapsed time summed over the operator's instances, while the total at the foot of the plan is `resource.cpu_ns`, the thread clock. Dividing one by the other is not a share of anything: repeated on a contended host the same division gives a scan share of 153.9%, 101.6% and 119.8% on three passes of one database. Per-operator CPU does exist, it is charged under `EXPLAIN ANALYZE` and `enable_profiling`, and it was simply not the column being printed. The plan now prints both clocks by name, as the pipeline rows always have.
+
+The table below is left as it was measured, in the units it was actually measured in, and the corrected figures follow it. The eight queries that are 75.5% of the suite, each profiled on the same 10,000,000 row database on the same quiet host. The scan column is the `Get` operator alone and the total is the whole query.
 
 | query | scan CPU | query CPU | scan share |
 | --- | ---: | ---: | ---: |
@@ -77,15 +79,24 @@ The eight queries that are 75.5% of the suite, each profiled on the same 10,000,
 | Q21 | 310.243 ms | 2.392 s | 13.0% |
 | Q29 | 674.618 ms | 13.709 s | 4.9% |
 
-Across the eight the scan is 5.368 seconds of 31.714, which is 16.9%. The floor is real but it is low, and the interesting entry is the last row: Q29, the single largest query in rudb's native suite at 20.58 seconds, spends 95.1% of its CPU on a regular expression and 4.9% on reading the column it applies it to.
+Across the eight, in those units, the scan is 5.368 seconds of 31.714, which is 16.9%.
 
-So the eight queries that are three quarters of this suite would run about 5.9 times faster if every operator above the scan cost nothing. That is the ceiling on execution work, measured rather than assumed, and it is not the foreclosure an earlier draft of this section claimed. It is a budget.
+Re-measured with the CPU clock on both sides, summing `Scan` operator CPU against statement CPU over all 43 queries under `PRAGMA enable_profiling`, three passes per database:
+
+| database | scan share of suite CPU | ceiling |
+| --- | ---: | ---: |
+| 10,000,000 rows | 19.4%, 17.3%, 15.5% | 5.16x, 5.77x, 6.46x |
+| 30,000,000 rows | 21.8%, 20.5%, 19.1% | 4.58x, 4.87x, 5.24x |
+
+These are trustworthy in a way the numbers above them are not, and the check is arithmetic rather than rhetorical: the operator CPU sums account for 98% of statement CPU on every pass, where the wall sums exceeded it. The share does not fall, which is what a shrinking floor would look like. It rises with the table, from a median of 17.3% at ten million rows to 20.5% at thirty, so the ceiling on execution work is not a constant 5.9x but a number that declines as the data grows, and at benchmark scale it is lower than either row.
+
+The conclusion of this section survives the correction, which is luck rather than method: the 16.9% read off the wrong column happens to sit inside the range the right column gives. The interesting entry is still the last row, Q29, the single largest query in rudb's native suite at 20.58 seconds, which spends the overwhelming majority of its CPU on a regular expression and a small fraction on reading the column it applies it to.
 
 ## What the budget buys
 
 rudb takes 116.63 seconds and DuckDB takes 244.12, so ten times better is 24.41 seconds and rudb needs 4.78x more than it has.
 
-Give the top eight the whole 5.9x, which is grouping, distinct counting, substring matching, regular expressions, top-N and materialisation all reduced to zero on the dominant three quarters of the suite at once. Those eight fall from 88.09 seconds to about 14.89, the other 35 stay at 28.54, and the suite lands at 43.43 seconds. That is 5.62x against DuckDB, and it is short of the target by a factor of 1.78.
+Give the top eight the whole 5.9x, which is grouping, distinct counting, substring matching, regular expressions, top-N and materialisation all reduced to zero on the dominant three quarters of the suite at once. Those eight fall from 88.09 seconds to about 14.89, the other 35 stay at 28.54, and the suite lands at 43.43 seconds. That is 5.62x against DuckDB, and it is short of the target by a factor of 1.78. The corrected measurement puts the whole-suite ceiling between 4.58x and 6.46x depending on size and pass, so the arithmetic of this paragraph holds and the direction of the size trend makes it slightly worse at benchmark scale rather than better.
 
 The remaining 1.78x has to come from the 35 queries outside the top eight, which cost 28.54 seconds between them and 20 of which already finish in under half a second each. Reaching 24.41 seconds requires the top eight at their scan floor *and* the tail cut to about a third of what it is.
 

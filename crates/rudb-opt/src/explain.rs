@@ -369,11 +369,18 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
     } else {
         format!(", {} of {parts} parts skipped", operator.parts_pruned)
     };
-    format!(
-        "  [{} rows{after}, {}{skipped}{memory}{slow}]",
-        operator.rows_out,
-        duration(operator.wall_ns)
-    )
+    // Both clocks, named, because one number here was read as the other three times. The wall
+    // figure is the operator's elapsed time summed over its instances, so on a plan that runs eight
+    // ways it can exceed the whole statement's CPU and is not a share of anything. The CPU figure is
+    // the thread clock, it is only charged under `EXPLAIN ANALYZE` or `enable_profiling`, and it is
+    // the one that divides into the total at the foot of the plan. The pipeline rows below have
+    // printed both since they were written.
+    let spent = if operator.cpu_ns == 0 {
+        duration(operator.wall_ns) + " wall"
+    } else {
+        format!("{} wall, {} cpu", duration(operator.wall_ns), duration(operator.cpu_ns))
+    };
+    format!("  [{} rows{after}, {spent}{skipped}{memory}{slow}]", operator.rows_out)
 }
 
 /// The operator row with this id.
