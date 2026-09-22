@@ -428,6 +428,34 @@ impl StringColumn {
         Ok(self.views.len() - 1)
     }
 
+    /// The same seam for a column whose bytes were never claimed to be text.
+    ///
+    /// What a `BLOB` or a `BIT` page is read through. [`Self::push_in_place`] validates because the
+    /// caller is promising a `&str` later and a column that cannot produce one is a wrong answer.
+    /// A blob promises nothing of the sort: its whole point is that the bytes are bytes, so the
+    /// validation there is not a check that has been skipped, it is a check about a claim nobody
+    /// made. [`Self::get`] answers `None` for a row put in this way and [`Self::bytes`] answers it,
+    /// which is the same split [`Self::push_bytes`] already has.
+    ///
+    /// # Errors
+    ///
+    /// If the range is not inside the arena.
+    pub fn push_bytes_in_place(&mut self, offset: usize, len: usize) -> Result<usize> {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            Error::internal(format!(
+                "a value at {offset} of {len} bytes runs off the end of memory"
+            ))
+        })?;
+        let bytes = self.arena.get(offset..end).ok_or_else(|| {
+            Error::internal(format!(
+                "a value at {offset} of {len} bytes is not inside a {} byte arena",
+                self.arena.len()
+            ))
+        })?;
+        self.views.push(StringView::over(bytes, offset as u64));
+        Ok(self.views.len() - 1)
+    }
+
     /// The bytes the long strings live in.
     ///
     /// For a column over a page this is the page, including whatever of it no view points at. The
