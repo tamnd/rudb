@@ -489,15 +489,20 @@ pub trait Frequencies: std::fmt::Debug + Send + Sync {
 
     /// How many rows hold exactly `value` in that column.
     ///
-    /// [`Class::Exact`] where the synopsis accounts for every row of the column. That is the case
-    /// worth having: a value the synopsis lists holds the rows it says and a value it does not list
-    /// holds none, and both of those are counts rather than guesses. It is also the case that
-    /// happens, because a synopsis is complete exactly when the column has few enough distinct
-    /// values, which is the column an equality filter would otherwise have to guess hardest about.
+    /// [`Class::Exact`] for a value the synopsis lists, whether or not the synopsis lists every
+    /// value. A synopsis keeps a bounded set of candidates and what it ends up holding is the
+    /// leading values of the column, so the values it lists are the ones an equality filter would
+    /// otherwise guess worst about: a column where one value in a million rows holds half of them
+    /// gets that value divided by its distinct count, and the synopsis has the real number.
     ///
-    /// [`Stat::Unknown`] for a column with no synopsis, for one whose synopsis dropped anything,
-    /// and for a value this cannot compare against what the synopsis holds, which is a constant of
-    /// one domain against a column of another.
+    /// [`Class::Exact`] and zero for a value the synopsis does not list, where the synopsis accounts
+    /// for every row of the column. A complete list proves no row holds a value left out of it. A
+    /// synopsis is complete exactly when the column has few enough distinct values, which is again
+    /// the column worth being right about.
+    ///
+    /// [`Stat::Unknown`] for a column with no synopsis, for a value a synopsis that dropped
+    /// something does not list, and for a value this cannot compare against what the synopsis
+    /// holds, which is a constant of one domain against a column of another.
     ///
     /// [`Class::Exact`]: crate::stat::Class::Exact
     /// [`Stat`]: crate::Stat
