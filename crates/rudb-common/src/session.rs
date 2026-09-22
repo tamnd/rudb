@@ -355,6 +355,15 @@ impl Session {
         &self.links
     }
 
+    /// Whether this name is the one the relationship declarations are written under.
+    ///
+    /// Both spellings, for the reason [`crate::clustering::is_clustering_setting`] takes both. The
+    /// caller decides first that no DuckDB setting is called this.
+    #[must_use]
+    pub fn is_links_setting(name: &str) -> bool {
+        name.eq_ignore_ascii_case("graph_links") || name.eq_ignore_ascii_case("graph.links")
+    }
+
     /// Whether the bundled time-zone database knows this name.
     #[must_use]
     pub fn knows_time_zone(name: &str) -> bool {

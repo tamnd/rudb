@@ -889,7 +889,7 @@ fn is_links(name: &str) -> bool {
     if rudb_functions::setting_named(name).is_some() {
         return false;
     }
-    name.eq_ignore_ascii_case("graph_links") || name.eq_ignore_ascii_case("graph.links")
+    Session::is_links_setting(name)
 }
 
 /// Whether this name is the row order declaration setting.
@@ -900,7 +900,7 @@ pub(crate) fn is_clustering(name: &str) -> bool {
     if rudb_functions::setting_named(name).is_some() {
         return false;
     }
-    name.eq_ignore_ascii_case("cluster_by") || name.eq_ignore_ascii_case("rudb.cluster_by")
+    rudb_common::is_clustering_setting(name)
 }
 
 /// Moves the catalog to exactly the declarations `written` names, and no others.
@@ -931,24 +931,6 @@ fn declare(catalog: &mut Catalog, written: &str) -> Result<()> {
         catalog.table_mut(&name)?.cluster_by(Some(clustering))?;
     }
     Ok(())
-}
-
-/// Every declaration the catalog holds, in the spelling [`declare`] takes.
-///
-/// The read half of the setting, and the reason nothing about it is kept in the session. A file
-/// carries the declarations of the tables in it, so a database opened on one has declarations that
-/// no `SET` in this session made, and a session copy would answer that there are none. Built out of
-/// the catalog, the answer is the same whichever way the declaration got there.
-pub(crate) fn clustering(catalog: &Catalog) -> String {
-    catalog
-        .tables()
-        .filter_map(|table| {
-            let names = table.columns().iter().map(|field| field.name.clone()).collect::<Vec<_>>();
-            let clustering = table.clustering()?;
-            Some(format!("{}({})", table.name().table, clustering.describe(&names)))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// One written declaration as the table it names and the clustering over that table's columns.

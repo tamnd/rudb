@@ -10,7 +10,10 @@
 //! comparisons, `IN` becomes a disjunction of equalities, a simple `CASE` becomes a searched one,
 //! and `IS NULL` becomes a null safe comparison against a null.
 
-use rudb_common::{Error, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Value};
+use rudb_common::{
+    Error, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, Value,
+    is_clustering_setting, looks_like_rule, rule_names,
+};
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, NONE};
@@ -791,12 +794,19 @@ impl Binder<'_> {
     /// `typeof(current_setting('memory_limit'))` is VARCHAR. A session with no answer for a name the
     /// catalog knows is a caller that bound without a database behind it, and that is the same
     /// answer as a name nobody has, since neither one can be read.
+    ///
+    /// A name the catalog does not know goes to [`Binder::beyond`], because rudb has settings that
+    /// are not DuckDB's and the catalog is a list of DuckDB's.
     fn setting(&mut self, argument: ExprRef) -> Result<Option<ExprRef>> {
         let Expr::Constant(held) = *self.plan().expr(argument) else { return Ok(None) };
         let Value::Varchar(name) = self.plan().value(held) else { return Ok(None) };
         let name = name.clone();
-        let known = rudb_functions::setting_named(&name)
-            .ok_or_else(|| Error::catalog(rudb_functions::unknown_setting(&name)))?;
+        let Some(known) = rudb_functions::setting_named(&name) else {
+            let value = self
+                .beyond(&name)?
+                .ok_or_else(|| Error::catalog(rudb_functions::unknown_setting(&name)))?;
+            return Ok(Some(self.add_constant(value)));
+        };
         let text = self
             .session
             .get(known.name)
@@ -826,6 +836,52 @@ impl Binder<'_> {
             _ => Value::Varchar(text.to_string()),
         };
         Ok(Some(self.add_constant(value)))
+    }
+
+    /// The value of a setting rudb has and DuckDB does not.
+    ///
+    /// The settings catalog cannot answer for these because it is the list of DuckDB's settings and
+    /// these are not on it, deliberately, so that `duckdb_settings()` does not claim they are.
+    /// `SET` already decides which side of that line a name falls on and this is the reading half
+    /// of the same decision. Without it a session driving the engine through SQL can write one of
+    /// these and then has no way to ask what it says.
+    ///
+    /// Three of the four are here and each is read off something the binder is already holding: the
+    /// row order declarations are on the catalog, the relationship declarations and the rule
+    /// switches are on the session. The seam settings are the fourth and they are not here, because
+    /// the seam names live in a crate below this one that the binder does not depend on and adding
+    /// the dependency to read a string is a bigger decision than this one.
+    ///
+    /// A rule reads back as a boolean and the other two as the text they were written as, which is
+    /// what `Database::setting` answers for all three. A declaration nobody made reads back
+    /// as the empty string rather than as null, because the empty string is what `SET cluster_by =
+    /// ''` leaves behind and a setting that does not round trip is one somebody reports as a bug.
+    ///
+    /// `None` for a name that is not one of these either, which each caller words its own error
+    /// for, because the two of them are two statements and upstream says something different about
+    /// each.
+    ///
+    /// # Errors
+    ///
+    /// For a name that looks like a rule and is not, with the list of rules in it, which is the
+    /// message `SET` gives for the same mistake.
+    pub(crate) fn beyond(&self, name: &str) -> Result<Option<Value>> {
+        if is_clustering_setting(name) {
+            return Ok(Some(Value::Varchar(self.catalog().clustering())));
+        }
+        if Session::is_links_setting(name) {
+            return Ok(Some(Value::Varchar(self.session.links().to_string())));
+        }
+        if let Some(enabled) = self.session.rules().named(name) {
+            return Ok(Some(Value::Boolean(enabled)));
+        }
+        if looks_like_rule(name) {
+            return Err(Error::catalog(format!(
+                "no rule called {name}, the rules are {}",
+                rule_names()
+            )));
+        }
+        Ok(None)
     }
 
     /// The answer type of a `date_part`, which is the one call whose type comes from the value of
