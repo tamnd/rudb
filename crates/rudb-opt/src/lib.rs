@@ -149,6 +149,17 @@ pub const RANK: u8 = 11;
 /// on the next run instead, which is the fixed sequence not settling. Before the rest, because the
 /// subtree it removes is a subtree they would otherwise walk, and because the operators it leaves
 /// next to each other are the pairs limit pushdown and top N are looking for.
+///
+/// Filter pushdown and limit pushdown used to make work for each other, which is worth recording
+/// here because the fix is not in this list. Limit pushdown trades a limit with the projection under
+/// it, so `Filter / Limit / Project` became `Filter / Project / Limit`, and the filter that had
+/// nowhere to go then had a projection to go through, one position after the pass that would have
+/// taken it. Reordering does not help: filter pushdown has to be in front of join order, the mark
+/// rewrites and group key pushdown, all of which read a plan whose predicates have already landed,
+/// and limit pushdown has to be behind the unread materialisation drop for the reason above. Nor
+/// does running either of them twice, because each round the two of them trade moves one more level
+/// of a nested query, so the number of rounds it takes is how deeply the query is nested. What fixes
+/// it is filter pushdown crossing the limits itself, which is described where it does that.
 pub static PASSES: [&(dyn Pass + Sync); 19] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
@@ -518,6 +529,32 @@ mod tests {
         let mut plan = Plan::parse(text).expect("a well formed plan");
         let error = run(&mut plan, &Context::new(), &[&Restless]).expect_err("it never settles");
         assert!(error.message().starts_with("the passes did not settle"), "{}", error.message());
+    }
+
+    /// The pair that made filter pushdown run twice. Limit pushdown trades the limit with the
+    /// projection under it, and the filter that was stuck above the limit then has a projection to
+    /// go through, which is work the one run of filter pushdown was already past. With one run this
+    /// is an `INTERNAL Error: the passes did not settle` on a query anybody could write.
+    #[test]
+    fn a_filter_over_a_subquery_that_ends_in_a_limit_settles() {
+        let text = concat!(
+            "Project #2 [#1.0::INTEGER AS x]\n",
+            "  Filter (#1.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+            "    Limit 4 offset 0\n",
+            "      Project #1 [#0.0::INTEGER AS x]\n",
+            "        Get memory.main.t AS t #0 [x::INTEGER]\n",
+        );
+        assert_eq!(
+            optimized(text),
+            concat!(
+                "Project #2 [#1.0::INTEGER AS x]\n",
+                "  Project #1 [#0.0::INTEGER AS x]\n",
+                "    Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+                "      Limit 4 offset 0\n",
+                "        Get memory.main.t AS t #0 [x::INTEGER]\n",
+            )
+        );
+        assert_eq!(width(text), 1);
     }
 
     /// Folding before pruning, which is the reason the order in [`PASSES`] is the order it is. The
