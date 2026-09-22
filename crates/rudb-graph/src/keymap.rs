@@ -25,6 +25,7 @@
 use rudb_common::{Error, Result};
 use rudb_encoding::bitpack;
 
+use crate::bits::Rank;
 use crate::rid::Rid;
 
 /// How dense a range has to be before the bitmap form beats the sorted form.
@@ -36,14 +37,6 @@ use crate::rid::Rid;
 /// want to move once there is a measurement that says where, and moving it should be a diff.
 pub const DENSE_THRESHOLD: u64 = 8;
 
-/// Bits in one rank superblock.
-const SUPERBLOCK_BITS: usize = 4096;
-
-/// Bits in one rank block.
-const BLOCK_BITS: usize = 512;
-
-/// Blocks in one superblock.
-const BLOCKS_PER_SUPERBLOCK: usize = SUPERBLOCK_BITS / BLOCK_BITS;
 
 /// Which of the three physical forms a key map took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,113 +122,6 @@ impl Observed {
     }
 }
 
-/// A two level rank index over a bitmap.
-///
-/// Superblocks of 4096 bits hold a `u32` cumulative count from the start of the bitmap, and blocks
-/// of 512 bits hold a `u16` count from the start of their superblock. A rank is then two loads and
-/// a `popcount` over at most eight words, which is section 3.3's arithmetic and is the reason the
-/// block size is 512: a `u16` cannot hold a count over a wider superblock than 4096, and eight
-/// words is the most a `popcount` loop should have to do.
-#[derive(Debug, Clone)]
-struct Rank {
-    superblocks: Vec<u32>,
-    blocks: Vec<u16>,
-}
-
-impl Rank {
-    fn build(bits: &[u64]) -> Self {
-        let blocks = bits.len().div_ceil(BLOCK_BITS / 64);
-        let mut index = Self {
-            superblocks: Vec::with_capacity(blocks.div_ceil(BLOCKS_PER_SUPERBLOCK)),
-            blocks: Vec::with_capacity(blocks),
-        };
-        let mut total = 0_u32;
-        let mut within = 0_u16;
-        for block in 0..blocks {
-            if block % BLOCKS_PER_SUPERBLOCK == 0 {
-                index.superblocks.push(total);
-                within = 0;
-            }
-            index.blocks.push(within);
-            let words = block * (BLOCK_BITS / 64);
-            let ones: u32 = bits[words..(words + BLOCK_BITS / 64).min(bits.len())]
-                .iter()
-                .map(|word| word.count_ones())
-                .sum();
-            total += ones;
-            // A superblock holds at most 4096 ones, so this cannot overflow a u16, and the `as` is
-            // guarded by the reset above rather than by hope.
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "a superblock holds at most 4096 bits, which fits a u16"
-            )]
-            let ones = ones as u16;
-            within += ones;
-        }
-        index
-    }
-
-    /// How many bits are set strictly below `at`.
-    fn rank(&self, bits: &[u64], at: usize) -> u64 {
-        let block = at / BLOCK_BITS;
-        let superblock = block / BLOCKS_PER_SUPERBLOCK;
-        let mut count = u64::from(self.superblocks[superblock]) + u64::from(self.blocks[block]);
-        let from = block * (BLOCK_BITS / 64);
-        let word = at / 64;
-        for whole in &bits[from..word] {
-            count += u64::from(whole.count_ones());
-        }
-        let remainder = at % 64;
-        if remainder != 0 {
-            let mask = (1_u64 << remainder) - 1;
-            count += u64::from((bits[word] & mask).count_ones());
-        }
-        count
-    }
-
-    fn bytes(&self) -> usize {
-        self.superblocks.len() * size_of::<u32>() + self.blocks.len() * size_of::<u16>()
-    }
-
-    /// How many blocks and superblocks index a bitmap of this many words.
-    ///
-    /// Derived rather than stored, because both counts are a function of the range the header
-    /// already carries and a stored count is a count that can disagree with the array it describes.
-    fn shape(words: usize) -> (usize, usize) {
-        let blocks = words.div_ceil(BLOCK_BITS / 64);
-        (blocks, blocks.div_ceil(BLOCKS_PER_SUPERBLOCK))
-    }
-
-    fn write(&self, out: &mut Vec<u8>) {
-        for count in &self.superblocks {
-            out.extend_from_slice(&count.to_le_bytes());
-        }
-        for offset in &self.blocks {
-            out.extend_from_slice(&offset.to_le_bytes());
-        }
-    }
-
-    /// Reads an index over a bitmap of `words` words from exactly the bytes it takes.
-    fn read(bytes: &[u8], words: usize) -> Result<Self> {
-        let (blocks, superblocks) = Self::shape(words);
-        let split = superblocks * size_of::<u32>();
-        if bytes.len() != split + blocks * size_of::<u16>() {
-            return Err(malformed(
-                "a dense key map's rank index is not the size its range implies",
-            ));
-        }
-        Ok(Self {
-            superblocks: bytes[..split]
-                .chunks_exact(size_of::<u32>())
-                .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
-                .collect(),
-            blocks: bytes[split..]
-                .chunks_exact(size_of::<u16>())
-                .map(|word| u16::from_le_bytes(word.try_into().expect("two bytes")))
-                .collect(),
-        })
-    }
-}
 
 /// The three forms, behind one interface.
 #[derive(Debug, Clone)]
