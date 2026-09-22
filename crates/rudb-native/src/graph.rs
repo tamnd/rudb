@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_graph::{Form, KeyMap, Keys, NO_PARENT, link, wire};
+use rudb_graph::{Degrees, Form, KeyMap, Keys, NO_PARENT, link, wire};
 use rudb_vector::Chunk;
 
 use crate::section::{self, Attachment};
@@ -357,6 +357,12 @@ pub struct BuiltLink {
     /// The stored column bytes of the child table, which is what section 3.7's budget is a share
     /// of and what the size claim of section 9.1 is measured against.
     pub table_bytes: u64,
+    /// What the build measured of the relationship's shape, or `None` when nothing was built.
+    ///
+    /// These ride along with the link rather than being computed for their own sake, because the
+    /// pass that resolves every child's parent is the pass that counts degrees. They are stored in
+    /// their own section and are what `rudb_links()` reports in its degree columns.
+    pub degrees: Option<Degrees>,
     /// Whether it is in the file.
     pub built: bool,
     /// Why not, when not. `None` when it is.
@@ -442,6 +448,7 @@ fn links_of_one_table(
                     linked: 0,
                     bytes: 0,
                     table_bytes: column_bytes,
+                    degrees: None,
                     built: false,
                     note: Some(note),
                     build: start.elapsed(),
@@ -470,7 +477,18 @@ fn links_of_one_table(
         }
     }
     drop(child);
-    let attachments = report
+    // The degree payloads are held here rather than built inside the loop below, because an
+    // attachment borrows its bytes and a temporary would not outlive the call.
+    let measured = report
+        .iter()
+        .filter(|built| built.built)
+        .filter_map(|built| {
+            let mut bytes = Vec::with_capacity(rudb_graph::degree::BYTES);
+            built.degrees.as_ref()?.write(&mut bytes);
+            Some((built.edge.child_column, bytes))
+        })
+        .collect::<Vec<_>>();
+    let mut attachments = report
         .iter()
         .zip(&payloads)
         .filter(|(built, payload)| built.built && payload.is_some())
@@ -487,6 +505,19 @@ fn links_of_one_table(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // The same id as the link, so that a rebuild replaces both and a reader that wants the shape of
+    // a relationship it can resolve finds them the same way. The degrees are attached only for a
+    // link that was kept: on their own they would describe a relationship the file cannot follow,
+    // which is a planning hint for a plan that is not available.
+    for (column, bytes) in &measured {
+        attachments.push(Attachment {
+            kind: *section::DEGREES,
+            id: u64::try_from(*column).map_err(|_| invalid("column index overflow"))?,
+            flags: 0,
+            header_bytes: 0,
+            bytes,
+        });
+    }
     crate::attach(path, table, &attachments)?;
     Ok(report)
 }
@@ -531,6 +562,15 @@ fn one_link(
         return Err(failed);
     }
     let link = link::Link::build(&parents_of, map.len()).map_err(|error| error.to_string())?;
+    // The parent key is unique, because the check above refused the relationship otherwise. So the
+    // certificate is recorded here rather than discovered: a link only exists over a key map whose
+    // parent side was counted and found distinct.
+    //
+    // Its own pass over the same slice rather than a loop fused into the one above. The cost of
+    // measuring degrees is the scattered increment into a counter per parent and not the sequential
+    // read of the child column, which the build makes twice already, so fusing would save the cheap
+    // half and put a histogram inside a function whose job is to choose a form.
+    let degrees = Degrees::of(&parents_of, map.len(), true);
     let bytes = encode_link(&link, &parent, edge).map_err(|error| error.to_string())?;
     Ok((
         BuiltLink {
@@ -540,6 +580,7 @@ fn one_link(
             linked: link.linked(),
             bytes: bytes.len(),
             table_bytes: 0,
+            degrees: Some(degrees),
             built: false,
             note: None,
             build: Duration::ZERO,
@@ -618,6 +659,26 @@ pub fn stored_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<link:
         return None;
     }
     link::Link::read(&bytes[binding..]).ok()
+}
+
+/// What the build measured of a relationship's shape, when the child table carries it.
+///
+/// There is no binding to check, unlike [`stored_link`], because there is nothing here to resolve
+/// against the parent. Every number is about the child column and the generation stamp is the whole
+/// of what makes one of these current. A caller that wants to know the relationship is still the
+/// one it means asks [`stored_link`] as well, which it is doing anyway if it plans to follow it.
+#[must_use]
+pub fn stored_degrees(child: &Reader, child_column: usize) -> Option<Degrees> {
+    let table = child.table();
+    let id = u64::try_from(child_column).ok()?;
+    let held = table
+        .sections()
+        .iter()
+        .find(|section| section.kind == *section::DEGREES && section.id == id)?;
+    if !held.usable(table.generation()) {
+        return None;
+    }
+    Degrees::read(&child.payload(held).ok()?).ok()
 }
 
 /// What the table's sections of one kind cost, leaving out the ids this build is replacing.
@@ -1089,6 +1150,35 @@ mod tests {
     }
 
     #[test]
+    fn a_built_link_leaves_the_shape_of_the_relationship_beside_it() {
+        // The same clustered shape as the monotone test, so the expected numbers are arithmetic
+        // rather than an observation: four children each of a thousand parents, in order.
+        let foreign = (0..4000_i64).map(|child| Some(child / 4 + 1)).collect::<Vec<_>>();
+        let path = related("degrees", 1000, &foreign);
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert!(report[0].built, "{:?}", report[0].note);
+        let measured = report[0].degrees.as_ref().expect("the build measured it");
+        assert!((measured.mean() - 4.0).abs() < 1e-9);
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let held = stored_degrees(&child, 0).expect("it is in the file");
+        assert_eq!(&held, measured, "what the build measured is what the file holds");
+        assert_eq!(held.parents(), 1000);
+        assert_eq!(held.highest(), 4);
+        assert!(held.total(), "every child found a parent");
+        assert!(held.unique(), "and the parent key is why there is a link at all");
+        // Three thousand nine hundred and ninety nine steps between adjacent children, of which the
+        // nine hundred and ninety nine that cross into the next parent move by one and the rest
+        // stay put. Which is what a clustered foreign key is, expressed as a number.
+        let near = held.locality().expect("something to gather");
+        assert!((near - 999.0 / 3999.0).abs() < 1e-9, "{near}");
+        assert!(stored_degrees(&child, 1).is_none(), "and no other column has one");
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
     fn a_foreign_key_that_matches_nothing_is_a_child_with_no_parent() {
         // Not an error and not a refusal. A foreign key that is not total is legal, and what it
         // costs is the monotone form, because every bit of that vector is already spoken for.
@@ -1173,6 +1263,10 @@ mod tests {
         let child = catalog.table("child").expect("the child");
         let parent = catalog.table("parent").expect("the parent");
         assert!(stored_link(&child, &parent, &edge()).is_none());
+        // Measured before it was refused, and not written, because the shape of a relationship the
+        // file cannot follow describes a plan nobody can make.
+        assert!(report[0].degrees.is_some(), "it was measured");
+        assert!(stored_degrees(&child, 0).is_none(), "and not written");
 
         fs::remove_file(&path).expect("clean up");
     }

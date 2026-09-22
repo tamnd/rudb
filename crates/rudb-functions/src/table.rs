@@ -778,6 +778,18 @@ pub fn strategy_fields() -> Vec<Field> {
 /// reason `rudb_strategies()` lists a seam with no implementations: a structure that is planned and
 /// not built is a commitment, and a table that showed only what exists would make the layer look
 /// finished.
+///
+/// The five degree columns are section 7.2 and 7.4 of spec/stats/07-graph-statistics.md, and they
+/// are five rather than a histogram because a histogram in a cell is something nobody reads. They
+/// are the numbers a reader acts on: the mean says how far a traversal expands, the maximum and the
+/// ninety ninth percentile together say whether that expansion is even, and `gather_locality` says
+/// whether following the link touches cache or memory. `degree_p99` is a bucket's upper bound
+/// rather than an exact percentile, which is what a log bucketed histogram holds.
+///
+/// `parent_unique` and `child_total` are section 7.3's two certificates, which are what license
+/// join elimination, outer to inner and semi join removal. They are null rather than false when
+/// nothing was measured, because an unproven certificate and a disproven one lead a planner to the
+/// same place by different roads and only one of them is a fact about the data.
 #[must_use]
 pub fn link_fields() -> Vec<Field> {
     vec![
@@ -791,6 +803,12 @@ pub fn link_fields() -> Vec<Field> {
         Field::new("key_map_bytes", LogicalType::BigInt),
         Field::new("link", LogicalType::Varchar),
         Field::new("link_bytes", LogicalType::BigInt),
+        Field::new("degree_mean", LogicalType::Double),
+        Field::new("degree_max", LogicalType::BigInt),
+        Field::new("degree_p99", LogicalType::BigInt),
+        Field::new("gather_locality", LogicalType::Double),
+        Field::new("parent_unique", LogicalType::Boolean),
+        Field::new("child_total", LogicalType::Boolean),
         Field::new("note", LogicalType::Varchar),
     ]
 }

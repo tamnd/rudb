@@ -5723,6 +5723,90 @@ fn a_forward_link_takes_the_monotone_form_only_when_every_child_row_has_a_parent
 }
 
 #[test]
+fn rudb_links_says_what_shape_the_relationship_turned_out_to_have() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-graph-degrees-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("CREATE TABLE customer (c_custkey INTEGER)").unwrap();
+    db.execute("CREATE TABLE orders (o_custkey INTEGER)").unwrap();
+    db.execute("CREATE TABLE skewed (s_custkey INTEGER)").unwrap();
+    db.execute("INSERT INTO customer SELECT i FROM range(1, 4001) AS r(i)").unwrap();
+    // Even: two and a half orders per customer, every customer reached.
+    db.execute("INSERT INTO orders SELECT 1 + (i - 1) / 3 FROM range(1, 10001) AS r(i)").unwrap();
+    // Skewed: the same ten thousand children, nine thousand of them on one customer and the rest
+    // one each, so a thousand customers have a child and three thousand have none.
+    db.execute("INSERT INTO skewed SELECT 1 FROM range(1, 9001) AS r(i)").unwrap();
+    db.execute("INSERT INTO skewed SELECT 1 + i FROM range(1, 1001) AS r(i)").unwrap();
+    db.execute(
+        "SET graph_links = 'orders(o_custkey) -> customer(c_custkey), \
+         skewed(s_custkey) -> customer(c_custkey)'",
+    )
+    .unwrap();
+    db.execute("CHECKPOINT").unwrap();
+
+    let held = rows(
+        &db,
+        "SELECT child_table, degree_max, degree_p99, parent_unique, child_total FROM rudb_links() \
+         ORDER BY child_table",
+    );
+    assert_eq!(
+        held,
+        vec![
+            vec![
+                Value::Varchar("orders".into()),
+                Value::BigInt(3),
+                Value::BigInt(3),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ],
+            // The same ten thousand children over the same four thousand parents, and the tail is
+            // three orders of magnitude away. That difference is the whole reason the histogram is
+            // stored rather than just the mean, which is 2.5 for both.
+            vec![
+                Value::Varchar("skewed".into()),
+                Value::BigInt(9000),
+                Value::BigInt(1),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ],
+        ],
+        "the shape of the relationship, not the shape of the declaration"
+    );
+    // A clustered child gathers a short distance and a scattered one a long distance, which is what
+    // the link join decision would otherwise have to guess at plan time. Both of the tables above
+    // are clustered, so this needs a third whose keys walk the parent table in strides.
+    db.execute("CREATE TABLE scattered (x_custkey INTEGER)").unwrap();
+    db.execute("INSERT INTO scattered SELECT 1 + (i * 1237) % 4000 FROM range(1, 10001) AS r(i)")
+        .unwrap();
+    db.execute(
+        "SET graph_links = 'orders(o_custkey) -> customer(c_custkey), \
+         scattered(x_custkey) -> customer(c_custkey)'",
+    )
+    .unwrap();
+    db.execute("CHECKPOINT").unwrap();
+    let locality = rows(
+        &db,
+        "SELECT child_table FROM rudb_links() WHERE gather_locality < 1 ORDER BY child_table",
+    );
+    assert_eq!(
+        locality,
+        vec![vec![Value::Varchar("orders".into())]],
+        "the clustered one gathers inside a cache line and the scattered one does not"
+    );
+    let far = rows(&db, "SELECT child_table FROM rudb_links() WHERE gather_locality > 1000");
+    assert_eq!(far, vec![vec![Value::Varchar("scattered".into())]]);
+
+    drop(db);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_same() {
     let path = std::env::temp_dir().join(format!(
         "rudb-graph-linkjoin-{}-{}.rdb",
