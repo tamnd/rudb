@@ -1068,7 +1068,9 @@ impl<'a> Building<'a, '_> {
         kind: &str,
         detail: Option<&str>,
     ) -> Arc<Counters> {
-        let mut counters = Counters::new(id, pipeline, kind).charging_cpu(profiling(self.session));
+        let mut counters = Counters::new(id, pipeline, kind)
+            .charging_cpu(profiling(self.session))
+            .under(self.consumer(id, also));
         if let Some(detail) = detail {
             counters = counters.detailed(detail);
         }
@@ -1080,6 +1082,22 @@ impl<'a> Building<'a, '_> {
             }
         }
         self.report.watch(counters)
+    }
+
+    /// Which operator's row this one's rows go into, skipping any node it swallowed.
+    ///
+    /// A node folded into another gets no row of its own, so a scan that took a filter into itself
+    /// is the only row either of them has and it produces what the filter would have, to whoever
+    /// was reading the filter. Naming the filter would leave a parent id pointing at nothing, and a
+    /// reader checking an operator's input against what fed it would find a gap where the chain
+    /// should be.
+    fn consumer(&self, id: u32, also: Option<NodeRef>) -> Option<u32> {
+        let swallowed = also.map(|node| self.shape.operator(node));
+        let mut parent = self.shape.consumer(id);
+        while parent.is_some() && parent == swallowed {
+            parent = self.shape.consumer(parent?);
+        }
+        parent
     }
 
     fn aggregate(

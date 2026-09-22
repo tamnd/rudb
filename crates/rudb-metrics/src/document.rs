@@ -196,6 +196,7 @@ impl Document {
                 out.object(|out| {
                     out.count("id", u64::from(operator.id));
                     out.count("pipeline", u64::from(operator.pipeline));
+                    out.maybe_count("parent", operator.parent.map(u64::from));
                     out.words("kind", &operator.kind);
                     out.maybe_words("detail", operator.detail.as_deref());
                     out.count("rows_in", operator.rows_in);
@@ -617,6 +618,19 @@ pub struct Operator {
     pub id: u32,
     /// The pipeline it ran in.
     pub pipeline: u32,
+    /// The operator its rows went into, and nothing for the one that produced the answer.
+    ///
+    /// The only edge in this list. Everything else here is flat with a pipeline id on it, and a
+    /// pipeline is not enough to walk the tree: a pipeline holds several operators in a line and
+    /// says nothing about which of them fed which. Without this a reader can add up the rows a
+    /// query moved and cannot check that any of them add up, since the check is whether an
+    /// operator's input equals what its children produced and there is no other way to know what
+    /// its children were.
+    ///
+    /// It is the operator the rows actually went to rather than the parent in the plan, and those
+    /// differ in one place: a node with two inputs is two operators, and the side that has to
+    /// finish first feeds the operator that holds it, which then feeds the join.
+    pub parent: Option<u32>,
     /// What it is, such as `Scan` or `HashAggregate`.
     pub kind: String,
     /// The part of it worth printing, such as the table or the keys.
@@ -799,6 +813,7 @@ impl Operator {
         Self {
             id,
             pipeline,
+            parent: None,
             kind: kind.to_string(),
             detail: None,
             rows_in: 0,
@@ -904,6 +919,7 @@ mod tests {
         metrics.pipelines.extend([scan, top]);
 
         let mut read = Operator::new(3, 0, "Scan");
+        read.parent = Some(5);
         read.detail = Some("hits".to_string());
         read.rows_out = 99_997_497;
         read.estimated_rows = Some(99_997_497);
@@ -919,6 +935,7 @@ mod tests {
         read.stages.add(Spent::of(Stage::Dictionary, 9_000_000, 1_400_000));
         read.stages.add(Spent::of(Stage::Assemble, 22_000_000, 0));
         let mut group = Operator::new(5, 0, "HashAggregate");
+        group.parent = Some(6);
         group.detail = Some("ClientIP".to_string());
         group.rows_in = 99_997_497;
         group.rows_out = 41_983_110;
@@ -936,10 +953,11 @@ mod tests {
             is_reference: false,
         });
         let mut probe = Operator::new(6, 0, "Probe");
+        probe.parent = Some(7);
         probe.detail = Some("hits.ClientIP = banned.ClientIP".to_string());
-        probe.rows_in = 99_997_497;
+        probe.rows_in = 41_983_110;
         probe.rows_out = 41_983_110;
-        probe.estimated_rows = Some(99_997_497);
+        probe.estimated_rows = Some(41_983_110);
         probe.estimate_class = Some(Class::Estimated);
         probe.estimate_provenance = Some(Provenance::Default);
         probe.wall_ns = 210_000_000;
