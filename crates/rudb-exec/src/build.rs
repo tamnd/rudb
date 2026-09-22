@@ -1585,6 +1585,16 @@ impl<'a> Building<'a, '_> {
             Some(limit) => aggregate.limit_groups(limit),
             None => aggregate,
         };
+        // Never more room than the cap a pushed down limit already put on the groups. A table that
+        // is going to stop at ten groups and took room for a million would be holding it for groups
+        // the operator above is about to refuse to open.
+        let aggregate = match self.plan.presized(index) {
+            Some(groups) => aggregate.presize(match bound.max_groups {
+                Some(limit) => groups.min(u64::try_from(limit).unwrap_or(u64::MAX)),
+                None => groups,
+            }),
+            None => aggregate,
+        };
         let aggregate = match bound.top_counts {
             Some((bound, call)) => aggregate.top_counts(bound, call),
             None => aggregate,

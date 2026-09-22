@@ -799,7 +799,7 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
 /// question than the one being answered. Either of them drops the whole grouping back to the
 /// constant rather than being left out of the product, because a key nobody can read is a key that
 /// can multiply the groups by any number at all.
-fn keyed(plan: &Plan, keys: &[ExprRef]) -> Option<Vec<ColumnBinding>> {
+pub(crate) fn keyed(plan: &Plan, keys: &[ExprRef]) -> Option<Vec<ColumnBinding>> {
     keys.iter()
         .map(|&key| match *plan.expr(key) {
             Expr::Column(binding) => Some(binding),
@@ -1316,7 +1316,7 @@ fn distinct(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Stat<u64> {
 }
 
 /// [`distinct`] restricted to columns somebody actually counted.
-fn stated(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Stat<u64> {
+pub(crate) fn stated(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Stat<u64> {
     follow(plan, binding, stats, Missing::Nothing, 16)
 }
 
