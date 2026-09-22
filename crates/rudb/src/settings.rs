@@ -125,6 +125,19 @@ pub(crate) struct Settings {
     /// never mentions one of these behaves as it did before any of them existed, and the graph
     /// sections start off because they are a new path rather than a better estimate.
     rules: RwLock<Rules>,
+    /// The relationships `SET graph_links` declared, as they were written.
+    ///
+    /// The third exception, and the one with the most to say for itself. Section 2.5 of
+    /// spec/graph/02-the-data-model.md gives three ways a relationship can be declared, and this is
+    /// the second, which is the one TPC-H needs: the tables arrive from Parquet, Parquet has no
+    /// foreign keys, so there is no constraint for the first path to read and nothing yet for the
+    /// third to have inferred. It is not a DuckDB setting and so is not in the settings catalog,
+    /// for the reason the seams and the rules are not.
+    ///
+    /// Kept as the text for the reason the disabled passes are: the text is what `RESET` compares
+    /// against and what a read of the setting has to return, and it was parsed once when it was
+    /// set, so nothing downstream has a parse that can fail.
+    links: RwLock<String>,
 }
 
 impl Settings {
@@ -159,6 +172,7 @@ impl Settings {
             carried: RwLock::new(BTreeMap::new()),
             seams: RwLock::new(rudb_seam::Settings::new()),
             rules: RwLock::new(Rules::new()),
+            links: RwLock::new(String::new()),
         }
     }
 
@@ -182,6 +196,11 @@ impl Settings {
     /// would be a lock held for the length of the query. This one is two bytes.
     pub(crate) fn rules(&self) -> Rules {
         *self.rules.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// The relationships declared so far, as they were written.
+    pub(crate) fn links(&self) -> String {
+        self.links.read().unwrap_or_else(|held| held.into_inner()).clone()
     }
 
     /// The configuration as the statements have left it.
@@ -239,6 +258,15 @@ impl Settings {
                 .write()
                 .unwrap_or_else(|held| held.into_inner())
                 .set(name, text.trim());
+        }
+        if is_links(name) {
+            // Validated here and nowhere else. A declaration that does not parse is a mistake in a
+            // statement somebody just typed, so it is refused where they can see it rather than
+            // carried to a checkpoint that quietly builds nothing.
+            let written = value.map_or_else(String::new, text_of);
+            rudb_graph::parse_links(&written)?;
+            *self.links.write().unwrap_or_else(|held| held.into_inner()) = written;
+            return Ok(());
         }
         if is_rule(name) {
             // `RESET stats.presize` puts the rule back where a fresh database has it, which is on
@@ -561,6 +589,9 @@ impl Settings {
                 Error::catalog(format!("no seam called {name}, see rudb_strategies() for the list"))
             });
         }
+        if is_links(name) {
+            return Ok(self.links());
+        }
         if is_rule(name) {
             return self.rules().named(name).map(|enabled| enabled.to_string()).ok_or_else(|| {
                 Error::catalog(format!("no rule called {name}, the rules are {}", rule_names()))
@@ -741,6 +772,7 @@ impl Settings {
         });
         session.set_warnings_as_errors(warnings_as_errors);
         session.set_rules(self.rules());
+        session.set_links(self.links());
         for entry in SETTINGS {
             if entry.behaviour != Behaviour::Honoured {
                 session.set(entry.name, self.carried(entry));
@@ -829,6 +861,17 @@ fn is_seam(name: &str) -> bool {
         return false;
     }
     name.starts_with(SEAM_PREFIX) || rudb_seam::seam_named(name).is_some()
+}
+
+/// Whether this name is the relationship declaration setting.
+///
+/// The same shape as [`is_seam`] and for the same reason: a DuckDB setting of this name, should one
+/// ever exist, wins.
+fn is_links(name: &str) -> bool {
+    if rudb_functions::setting_named(name).is_some() {
+        return false;
+    }
+    name.eq_ignore_ascii_case("graph_links") || name.eq_ignore_ascii_case("graph.links")
 }
 
 /// Whether this name is one of the rule switches rather than a setting DuckDB has.

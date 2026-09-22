@@ -30,6 +30,7 @@ pub struct Session {
     time_zone: Tz,
     semantics: Semantics,
     rules: Rules,
+    links: String,
 }
 
 /// The meaning-changing session choices consumed while a query is bound.
@@ -219,6 +220,7 @@ impl Default for Session {
             time_zone: chrono_tz::UTC,
             semantics: Semantics::default(),
             rules: Rules::new(),
+            links: String::new(),
         }
     }
 }
@@ -336,6 +338,21 @@ impl Session {
     #[must_use]
     pub fn rules(&self) -> Rules {
         self.rules
+    }
+
+    /// Records the relationships `SET graph_links` declared, as they were written.
+    pub fn set_links(&mut self, links: impl Into<String>) {
+        self.links = links.into();
+    }
+
+    /// The relationships declared for this session, as they were written, empty for none.
+    ///
+    /// The text and not the parsed form, because the parser is in `rudb-graph` and a session is
+    /// read by ranks below that one. Whoever needs a relationship is above it and parses this
+    /// itself, and the text is what `SET` already validated, so the parse there cannot fail.
+    #[must_use]
+    pub fn links(&self) -> &str {
+        &self.links
     }
 
     /// Whether the bundled time-zone database knows this name.

@@ -573,6 +573,53 @@ fn wanted(names: &[QualifiedName]) -> BTreeSet<String> {
     names.iter().map(|name| name.table.clone()).collect()
 }
 
+/// Builds a key map over the parent column of every declared relationship.
+///
+/// A second pass, after the tables are in the file and not before, because a key map is derived
+/// from a column and the column has to be readable to be derived from. Section 3.8 of
+/// spec/graph/03-the-file-format.md is where that is a rule rather than a convenience: a load that
+/// inserts parent and child in one statement cannot know the parent's row ids while it is still
+/// writing them.
+///
+/// Nothing here refuses anything. Section 3.1 says deleting every graph section changes no answer,
+/// which cuts both ways: a relationship naming a table that is not here, or a column no form can
+/// map, is passed over rather than made into an error, because the query it was declared for will
+/// run either way and only the time is different. What did and did not get built is `rudb_links()`.
+fn index(path: &Path, catalog: &mut Catalog, links: &str) -> Result<()> {
+    let declared = rudb_graph::parse_links(links).unwrap_or_default();
+    if declared.is_empty() {
+        return Ok(());
+    }
+    // A list and not a map, because a qualified name does not order and the count here is the
+    // count of declared relationships. One entry per parent table, because section 3.7's budget is
+    // a table's budget and a table whose maps are built one column at a time would spend it twice.
+    let mut wanted: Vec<(QualifiedName, Vec<usize>)> = Vec::new();
+    for link in &declared {
+        let [column] = &link.parent.columns[..] else { continue };
+        let Some(table) = catalog
+            .tables()
+            .find(|table| table.name().table.eq_ignore_ascii_case(&link.parent.table))
+        else {
+            continue;
+        };
+        let Some(at) = table.column_index(column) else { continue };
+        let name = table.name().clone();
+        match wanted.iter_mut().find(|(held, _)| held == &name) {
+            Some((_, columns)) if columns.contains(&at) => {}
+            Some((_, columns)) => columns.push(at),
+            None => wanted.push((name, vec![at])),
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    for (name, columns) in &wanted {
+        rudb_native::graph::build_key_maps(path, &name.table, columns)?;
+    }
+    let names = wanted.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+    rebind(path, catalog, &names)
+}
+
 /// Points every table at the generation the file now holds.
 fn rebind(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Result<()> {
     let native = rudb_native::Catalog::open(path)?;
@@ -1085,6 +1132,7 @@ impl Shared {
                 // succeeding and writing nothing. It is not an error there and it is not one here.
                 if let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) {
                     persist(path, &mut catalog)?;
+                    index(path, &mut catalog, &self.inner.settings.links())?;
                 }
                 Ok(QueryResult::empty())
             }

@@ -52,6 +52,7 @@ rudb-encoding = { version = "=0.4.0", path = "crates/rudb-encoding" }
 rudb-exec = { version = "=0.4.0", path = "crates/rudb-exec" }
 rudb-extension = { version = "=0.4.0", path = "crates/rudb-extension" }
 rudb-functions = { version = "=0.4.0", path = "crates/rudb-functions" }
+rudb-graph = { version = "=0.4.0", path = "crates/rudb-graph" }
 rudb-iceberg = { version = "=0.4.0", path = "crates/rudb-iceberg" }
 rudb-io = { version = "=0.4.0", path = "crates/rudb-io" }
 rudb-ir = { version = "=0.4.0", path = "crates/rudb-ir" }
