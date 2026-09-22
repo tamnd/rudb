@@ -932,7 +932,7 @@ impl Writer {
         self.table.clustering = Some(Clustering::new(
             clustering.columns().to_vec(),
             clustering.width(),
-            self.table.fields.len(),
+            &self.table.fields,
         )?);
         Ok(self)
     }
@@ -4397,13 +4397,13 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
         let bucket =
             Width::from_tag(cur.u8()?).ok_or_else(|| invalid("clustering width tag differs"))?;
         let count = cur.u16()? as usize;
-        let mut columns = Vec::with_capacity(count.min(width));
+        let mut columns = Vec::with_capacity(count.min(fields.len()));
         for _ in 0..count {
             columns.push(u32::from(cur.u16()?));
         }
         // Through the constructor and not built by hand, so that a file claiming a column the
         // table does not have is caught at open rather than at the first scan that trusted it.
-        Some(Clustering::new(columns, bucket, width).map_err(|_| {
+        Some(Clustering::new(columns, bucket, &fields).map_err(|_| {
             invalid("stored clustering declaration does not match the table it is on")
         })?)
     };
@@ -8326,8 +8326,7 @@ mod tests {
             Field::new("shipdate", LogicalType::Date),
         ];
         let plain = vec![Field::new("a", LogicalType::Integer)];
-        let stage_zero =
-            Clustering::new(vec![2, 0, 1], Width::Month, shipped.len()).expect("valid");
+        let stage_zero = Clustering::new(vec![2, 0, 1], Width::Month, &shipped).expect("valid");
 
         let mut writer = Writer::create(&path, "lineitem", shipped)
             .expect("new file")
@@ -8388,7 +8387,9 @@ mod tests {
         let path = path("clustered-bad");
         let writer = Writer::create(&path, "items", vec![Field::new("a", LogicalType::Integer)])
             .expect("new file");
-        let wrong = Clustering::new(vec![3], Width::Exact, 4).expect("valid against four columns");
+        let four =
+            (0..4).map(|at| Field::new(format!("c{at}"), LogicalType::Integer)).collect::<Vec<_>>();
+        let wrong = Clustering::new(vec![3], Width::Exact, &four).expect("valid against four");
         assert!(writer.declare(wrong).is_err(), "the table has one column, not four");
         fs::remove_file(&path).ok();
     }

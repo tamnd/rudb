@@ -19,6 +19,7 @@
 use std::fmt;
 
 use crate::error::{Error, Result};
+use crate::types::{Field, LogicalType};
 
 /// How coarsely the leading column is bucketed before the columns after it break the tie.
 ///
@@ -98,19 +99,24 @@ pub struct Clustering {
 }
 
 impl Clustering {
-    /// A declaration over `columns` of a table that has `width_of_table` columns.
+    /// A declaration over `columns` of a table whose columns are `fields`.
     ///
     /// # Errors
     ///
     /// If the list is empty, names a column the table does not have, or names one twice. All three
     /// are declarations that could be stored and could never be satisfied, and the only place they
     /// can be caught is before they go in.
-    pub fn new(columns: Vec<u32>, width: Width, width_of_table: usize) -> Result<Self> {
+    ///
+    /// And if a width other than [`Width::Exact`] lands on a column that is not a date or a
+    /// timestamp. The width is a calendar bucket and there is no calendar in an integer, so the
+    /// loader would have nothing to sort by. Checked here rather than at the load, because a
+    /// declaration is stored once and read every time the table is written.
+    pub fn new(columns: Vec<u32>, width: Width, fields: &[Field]) -> Result<Self> {
         if columns.is_empty() {
             return Err(Error::invalid_input("a clustering declaration names no column"));
         }
         for (at, &column) in columns.iter().enumerate() {
-            if column as usize >= width_of_table {
+            if column as usize >= fields.len() {
                 return Err(Error::invalid_input(
                     "a clustering declaration names a column the table does not have",
                 ));
@@ -120,6 +126,16 @@ impl Clustering {
                     "a clustering declaration names the same column twice",
                 ));
             }
+        }
+        let leading = &fields[columns[0] as usize];
+        if width != Width::Exact
+            && !matches!(leading.ty, LogicalType::Date | LogicalType::Timestamp)
+        {
+            return Err(Error::invalid_input(format!(
+                "a clustering declaration buckets {} by {width}, which only a date or a timestamp \
+                 has",
+                leading.name
+            )));
         }
         Ok(Self { columns, width })
     }
@@ -159,13 +175,40 @@ impl Clustering {
 #[cfg(test)]
 mod tests {
     use super::{Clustering, Width};
+    use crate::types::{Field, LogicalType};
+
+    fn lineitem() -> Vec<Field> {
+        vec![
+            Field::new("l_orderkey", LogicalType::BigInt),
+            Field::new("l_linenumber", LogicalType::Integer),
+            Field::new("l_shipdate", LogicalType::Date),
+        ]
+    }
 
     #[test]
     fn a_declaration_that_could_never_be_satisfied_is_refused() {
-        assert!(Clustering::new(Vec::new(), Width::Exact, 3).is_err(), "no column at all");
-        assert!(Clustering::new(vec![3], Width::Exact, 3).is_err(), "past the end of the table");
-        assert!(Clustering::new(vec![0, 1, 0], Width::Exact, 3).is_err(), "the same column twice");
-        assert!(Clustering::new(vec![2, 0], Width::Month, 3).is_ok());
+        let fields = lineitem();
+        assert!(Clustering::new(Vec::new(), Width::Exact, &fields).is_err(), "no column at all");
+        assert!(Clustering::new(vec![3], Width::Exact, &fields).is_err(), "past the end");
+        assert!(Clustering::new(vec![0, 1, 0], Width::Exact, &fields).is_err(), "twice");
+        assert!(Clustering::new(vec![2, 0], Width::Month, &fields).is_ok());
+    }
+
+    #[test]
+    fn a_calendar_bucket_on_a_column_with_no_calendar_in_it_is_refused() {
+        // There is no month of an order key, so a loader handed this would have nothing to sort
+        // by. The plain width is fine on the same column, which is what makes this worth checking
+        // rather than refusing every leading column that is not a date.
+        let fields = lineitem();
+        let complaint = Clustering::new(vec![0, 2], Width::Month, &fields)
+            .expect_err("a bigint has no months")
+            .to_string();
+        assert!(complaint.contains("l_orderkey"), "{complaint}");
+        assert!(complaint.contains("MONTH"), "{complaint}");
+        assert!(
+            Clustering::new(vec![0, 2], Width::Exact, &fields).is_ok(),
+            "no bucket, no problem"
+        );
     }
 
     #[test]
@@ -180,10 +223,11 @@ mod tests {
     fn a_declaration_reads_back_the_way_it_was_written() {
         // The one thing this string is for is that somebody can check the layout is what they
         // asked for without reading a column index against a schema by hand.
-        let names = ["l_orderkey", "l_linenumber", "l_shipdate"].map(str::to_string).to_vec();
-        let stage_zero = Clustering::new(vec![2, 0, 1], Width::Month, 3).expect("valid");
+        let fields = lineitem();
+        let names = fields.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+        let stage_zero = Clustering::new(vec![2, 0, 1], Width::Month, &fields).expect("valid");
         assert_eq!(stage_zero.describe(&names), "month(l_shipdate), l_orderkey, l_linenumber");
-        let plain = Clustering::new(vec![0], Width::Exact, 3).expect("valid");
+        let plain = Clustering::new(vec![0], Width::Exact, &fields).expect("valid");
         assert_eq!(plain.describe(&names), "l_orderkey");
     }
 }
