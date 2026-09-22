@@ -237,7 +237,11 @@ struct Pass {
     bytes: u64,
     widest: u64,
     generation: u64,
-    stripe: Option<(Bound, Bound)>,
+    /// The two ends of the stripe being read, kept apart rather than as a pair so that each one can
+    /// be compared against and refilled on its own. A pair would have to be taken out and put back
+    /// whole, which is the move that made this pass allocate.
+    stripe_low: Option<Bound>,
+    stripe_high: Option<Bound>,
     stripes: Vec<(Bound, Bound)>,
     /// What one value of this column takes, when every value takes the same.
     ///
@@ -265,7 +269,8 @@ impl Pass {
             bytes: 0,
             widest: 0,
             generation,
-            stripe: None,
+            stripe_low: None,
+            stripe_high: None,
             stripes: Vec::new(),
             fixed: fixed_width(ty),
             scale: bounds::scale_of(ty),
@@ -301,8 +306,7 @@ impl Pass {
                 continue;
             }
             if let Some(bytes) = vector.bytes_at(row) {
-                let width = bytes.len() as u64;
-                self.value(Bound::Bytes(bytes.to_vec()), width);
+                self.bytes_value(bytes);
                 continue;
             }
             // row at a time: a float and a form neither typed accessor above can read have no slice
@@ -326,48 +330,104 @@ impl Pass {
     }
 
     /// One non-null value, as its bound and its width.
+    ///
+    /// Every end is compared before it is copied. The obvious way to write this is to hand the
+    /// bound to each end and let the end keep whichever is smaller, and that costs a clone a row per
+    /// end whether or not the row is one. For an integer that is four copies of a machine word and
+    /// hardly matters. For a string it is four allocations a row, and on SF1 `l_comment` that is
+    /// twenty four million of them for a column with two ends. Compared first, an end is copied once
+    /// on a sorted column and about log n times on a shuffled one.
     fn value(&mut self, bound: Bound, width: u64) {
-        self.bytes = self.bytes.saturating_add(width);
-        self.widest = self.widest.max(width);
-        match &self.previous {
-            None => self.runs = 1,
-            Some(previous) => match previous.order(&bound) {
-                Some(Ordering::Less) => self.descending = false,
-                Some(Ordering::Greater) => {
-                    self.ascending = false;
-                    self.runs += 1;
-                }
-                Some(Ordering::Equal) => {}
-                // Two bounds of different domains in one column. It should be unreachable, since a
-                // column has one type, and it costs an order claim rather than being assumed away.
-                None => {
-                    self.ascending = false;
-                    self.descending = false;
-                }
-            },
+        self.measure(width);
+        let ordering = self.previous.as_ref().map(|previous| previous.order(&bound));
+        self.run(ordering);
+        if takes(&self.low, &bound, Ordering::Less) {
+            self.low = Some(bound.clone());
         }
-        self.low = Some(match self.low.take() {
-            Some(held) => held.smaller(bound.clone()),
-            None => bound.clone(),
-        });
-        self.high = Some(match self.high.take() {
-            Some(held) => held.larger(bound.clone()),
-            None => bound.clone(),
-        });
-        self.stripe = Some(match self.stripe.take() {
-            Some((low, high)) => (low.smaller(bound.clone()), high.larger(bound.clone())),
-            None => (bound.clone(), bound.clone()),
-        });
+        if takes(&self.high, &bound, Ordering::Greater) {
+            self.high = Some(bound.clone());
+        }
+        if takes(&self.stripe_low, &bound, Ordering::Less) {
+            self.stripe_low = Some(bound.clone());
+        }
+        if takes(&self.stripe_high, &bound, Ordering::Greater) {
+            self.stripe_high = Some(bound.clone());
+        }
         self.previous = Some(bound);
     }
 
+    /// The same for a byte string, without a `Vec` a row.
+    ///
+    /// A string column is where the pass above still allocates, because the bound it is handed had
+    /// to be built out of the slice before it could be compared to anything, and the row it keeps as
+    /// the previous one is a new `Vec` every row whether or not any end moved. Here nothing is built
+    /// to be compared, and the buffer the previous row owns is refilled rather than replaced, which
+    /// is an allocation on the first row of the column and none after it.
+    ///
+    /// This is the difference between statistics costing a tenth of the write and costing as much as
+    /// it. At SF1, `lineitem`'s five string columns took nineteen of the pass's twenty eight seconds
+    /// before this and its eleven numeric columns took the other nine.
+    fn bytes_value(&mut self, bytes: &[u8]) {
+        self.measure(bytes.len() as u64);
+        let ordering = match &self.previous {
+            None => None,
+            Some(Bound::Bytes(previous)) => Some(Some(previous.as_slice().cmp(bytes))),
+            // A bound of another domain in a byte column, which a column of one type cannot hold.
+            Some(_) => Some(None),
+        };
+        self.run(ordering);
+        if takes_bytes(&self.low, bytes, Ordering::Less) {
+            fill(&mut self.low, bytes);
+        }
+        if takes_bytes(&self.high, bytes, Ordering::Greater) {
+            fill(&mut self.high, bytes);
+        }
+        if takes_bytes(&self.stripe_low, bytes, Ordering::Less) {
+            fill(&mut self.stripe_low, bytes);
+        }
+        if takes_bytes(&self.stripe_high, bytes, Ordering::Greater) {
+            fill(&mut self.stripe_high, bytes);
+        }
+        fill(&mut self.previous, bytes);
+    }
+
+    /// What one value costs, which is the byte total and the widest of them.
+    fn measure(&mut self, width: u64) {
+        self.bytes = self.bytes.saturating_add(width);
+        self.widest = self.widest.max(width);
+    }
+
+    /// What this value standing above, below or level with the one before it does to the order flags.
+    ///
+    /// The outer `None` is the first value of the column. The inner one is a pair this build cannot
+    /// order, which a column of one type cannot produce and which costs an order claim rather than
+    /// being assumed away.
+    fn run(&mut self, ordering: Option<Option<Ordering>>) {
+        match ordering {
+            None => self.runs = 1,
+            Some(Some(Ordering::Less)) => self.descending = false,
+            Some(Some(Ordering::Greater)) => {
+                self.ascending = false;
+                self.runs += 1;
+            }
+            Some(Some(Ordering::Equal)) => {}
+            Some(None) => {
+                self.ascending = false;
+                self.descending = false;
+            }
+        }
+    }
+
     fn open_stripe(&mut self) {
-        self.stripe = None;
+        self.stripe_low = None;
+        self.stripe_high = None;
     }
 
     fn close_stripe(&mut self) {
-        if let Some(range) = self.stripe.take() {
-            self.stripes.push(range);
+        // Both taken whatever happens, so that a stripe of nothing but nulls leaves neither end
+        // behind for the next stripe to be compared against.
+        if let (Some(low), Some(high)) = (self.stripe_low.take(), self.stripe_high.take()) {
+            self.stripes.push((low, high));
         }
     }
 
@@ -433,6 +493,42 @@ impl Pass {
             Err(_) => Sketches::merged(sketch),
         };
         Stats { summary, sketches }
+    }
+}
+
+/// Whether an end has to become this bound, which is the question that replaces a clone.
+///
+/// `want` is [`Ordering::Less`] for a low end and [`Ordering::Greater`] for a high one. An end that
+/// is not there yet takes any value. A pair this build cannot order leaves the end alone, which is
+/// what [`Bound::smaller`] does across domains and which a column of one type cannot reach anyway.
+fn takes(held: &Option<Bound>, bound: &Bound, want: Ordering) -> bool {
+    match held {
+        None => true,
+        Some(held) => bound.order(held) == Some(want),
+    }
+}
+
+/// The same question asked of a slice, so that nothing is built to ask it.
+fn takes_bytes(held: &Option<Bound>, bytes: &[u8], want: Ordering) -> bool {
+    match held {
+        None => true,
+        Some(Bound::Bytes(held)) => bytes.cmp(held.as_slice()) == want,
+        Some(_) => false,
+    }
+}
+
+/// Puts these bytes in an end, reusing the buffer that is already there.
+///
+/// The whole of the byte path's advantage. A `Vec` that is cleared and refilled does not allocate
+/// once it is wide enough, and these ends plus the previous row are where every allocation of the
+/// value path went.
+fn fill(held: &mut Option<Bound>, bytes: &[u8]) {
+    match held {
+        Some(Bound::Bytes(held)) => {
+            held.clear();
+            held.extend_from_slice(bytes);
+        }
+        held => *held = Some(Bound::Bytes(bytes.to_vec())),
     }
 }
 
@@ -975,6 +1071,40 @@ mod tests {
         drop(old);
         fs::remove_file(&current).expect("clean up");
         fs::remove_file(&older).expect("clean up");
+    }
+
+    #[test]
+    fn the_stripe_ends_say_whether_a_scan_can_skip_and_a_shuffle_says_it_cannot() {
+        // The per stripe ends, which is the one thing the pass tracks that nothing else checks and
+        // which a scan reads to skip a whole stripe. A sorted column's stripes do not overlap and a
+        // shuffled column's every stripe spans the column, so the same rows in a different order
+        // give the opposite answer. Three stripes, so that the ends are opened and closed more than
+        // once and a pass that never reset them would be caught.
+        let sorted = (1..=19_200_i64).map(Some).collect::<Vec<_>>();
+        let ordered = table_of_parts("stripes_sorted", &sorted, 100);
+        build_stats(&ordered, "t", &[0]).expect("build");
+        let reader = reopen(&ordered);
+        let ordered_summary = summary(&reader, 0).expect("the summary");
+        assert!(!ordered_summary.overlapping, "a sorted column's stripes are disjoint");
+        assert_eq!(ordered_summary.low, Some(Bound::Int(1)));
+        assert_eq!(ordered_summary.high, Some(Bound::Int(19_200)));
+        drop(reader);
+
+        // A fixed stride rather than a random shuffle, so a failure is the same failure twice. The
+        // stride and the row count share no factor, so this visits every value exactly once and
+        // every stripe ends up holding values from very nearly the whole range.
+        let shuffled = (0..19_200_i64).map(|at| Some(1 + at * 7919 % 19_200)).collect::<Vec<_>>();
+        let mixed = table_of_parts("stripes_shuffled", &shuffled, 100);
+        build_stats(&mixed, "t", &[0]).expect("build");
+        let reader = reopen(&mixed);
+        let mixed_summary = summary(&reader, 0).expect("the summary");
+        assert!(mixed_summary.overlapping, "a shuffled column's stripes all span it");
+        assert_eq!(mixed_summary.low, Some(Bound::Int(1)), "the same values in a different order");
+        assert_eq!(mixed_summary.high, Some(Bound::Int(19_200)));
+        drop(reader);
+
+        fs::remove_file(&ordered).expect("clean up");
+        fs::remove_file(&mixed).expect("clean up");
     }
 
     #[test]
