@@ -37,7 +37,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rudb_common::bounds::{Bound, Spread, Test, Zones};
+use rudb_common::bounds::{Bound, Frequencies, Spread, Test, Zones};
 use rudb_common::stat::{Class, Direction, Provenance, Stat, Use};
 use rudb_common::{Field, Value};
 use rudb_plan::{
@@ -693,7 +693,7 @@ fn kept(
         // distinct count is a guess about them. Where it does not, nothing has been spent: it is a
         // lookup in a list the store already has parsed.
         let answer = missing(plan, input, conjunct, reads)
-            .or_else(|| common(plan, input, conjunct, reads))
+            .or_else(|| common(plan, input, conjunct, stats, reads))
             .or_else(|| {
                 values(plan, conjunct, stats, reads).map(|(v, from)| (1.0 / widened(v), from))
             });
@@ -1069,14 +1069,19 @@ fn missing(
 /// and anything else is a disjunction this has no arithmetic for. Two branches naming the same value
 /// would double count, and the sum is capped at the rows for that reason rather than checked for it.
 ///
-/// `None` where the scan's store keeps no synopsis, where the column's is incomplete, where the
-/// constant does not compare against what the synopsis holds, and where the store says it has no
-/// rows at all. Every one of those falls through to the distinct count, which is where the estimate
-/// was before this existed.
+/// A value the synopsis does not list, where the synopsis left something out, is answered from the
+/// remainder rather than given up on. See [`unlisted`], which is what makes the two halves of a
+/// prefix worth more together than either alone.
+///
+/// `None` where the scan's store keeps no synopsis, where the constant does not compare against what
+/// the synopsis holds, where the remainder needs a distinct count nobody stated, and where the store
+/// says it has no rows at all. Every one of those falls through to the distinct count, which is where
+/// the estimate was before this existed.
 fn common(
     plan: &Plan,
     input: NodeRef,
     conjunct: ExprRef,
+    stats: &Facts,
     reads: &mut Vec<Stat<u64>>,
 ) -> Option<(f64, Provenance)> {
     let index = bounds::scanned(plan, input)?;
@@ -1086,6 +1091,9 @@ fn common(
     if rows == 0 {
         return None;
     }
+    // Set by the first value answered out of the remainder rather than out of the list, because that
+    // answer is two stores put together and the provenance printed for it should say so.
+    let mut blended = false;
     // One read of the synopsis per value asked about, recorded whether it answered or not for the
     // reason [`values`] gives: the misses are the interesting half of what `EXPLAIN (STATISTICS)`
     // prints.
@@ -1093,7 +1101,13 @@ fn common(
         let column = frequencies.column(&fields.get(position)?.name)?;
         let stat = frequencies.rows_with(column, value);
         reads.push(stat);
-        stat.read(COMMON).copied()
+        if let Some(count) = stat.read(COMMON).copied() {
+            return Some(count);
+        }
+        let binding = ColumnBinding { table: index, column: u32::try_from(position).ok()? };
+        let held = unlisted(plan, frequencies, column, binding, stats, reads)?;
+        blended = true;
+        Some(held)
     };
     let held = match *plan.expr(conjunct) {
         Expr::Conjunction { op: ConjunctionOp::Or, children } => {
@@ -1136,7 +1150,60 @@ fn common(
             }
         }
     };
-    Some((share(held, rows), Provenance::FrequencySynopsis))
+    let from = if blended { Provenance::Propagation } else { Provenance::FrequencySynopsis };
+    Some((share(held, rows), from))
+}
+
+/// How many rows hold a value the synopsis lists nowhere, where it lists only the leading values.
+///
+/// The remainder half of a prefix, and the last piece of the synopsis worth reading. The list holds
+/// the values that take the most rows and says exactly how many, so subtracting them leaves the rows
+/// of the tail, and subtracting the values it listed from the column's distinct count leaves how many
+/// values those rows are shared between. One divided by the other is the uniformity assumption asked
+/// of the tail alone, which is the part of the column it was ever true of.
+///
+/// The difference is the whole of what a prefix is for. A column with one value in half a million of
+/// its million rows and a long tail behind it never gets a complete synopsis. Dividing the million
+/// rows by the thousand values calls every tail value a thousand rows, and the tail really holds five
+/// hundred thousand rows over nine hundred and ninety nine values, which is five hundred.
+///
+/// Capped at the bound the writer recorded, which is a real ceiling rather than a second guess: the
+/// heavy hitter pass proved no value it dropped holds more rows than that. Floored at one because a
+/// value being asked about is a value, and a division that rounds to nothing would say a row that
+/// exists does not.
+///
+/// Only an exact distinct count divides. Where the number of values is a ceiling rather than a count,
+/// which is what a native file's integer column gets out of the span between its two ends, the
+/// division is over more values than the column has and comes out under the truth by that factor. A
+/// native column of a thousand values between 1 and 1999 gets 1999 from the span, and its tail of
+/// 4,890 rows divided by the 1,487 values that ceiling leaves is three rows where the answer is ten.
+/// So without a count the answer is the writer's bound on its own, which is where the tail sits when
+/// the tail is flat, and is the direction that over-counts rather than under-counts a filter.
+///
+/// `None` only where the store has no remainder to spread, which is a complete list or no synopsis at
+/// all. A distinct count below what the synopsis listed is two reads of one column contradicting each
+/// other, and that falls back to the bound rather than to arithmetic on the disagreement.
+fn unlisted(
+    plan: &Plan,
+    frequencies: &Arc<dyn Frequencies>,
+    column: usize,
+    binding: ColumnBinding,
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> Option<u64> {
+    let remainder = frequencies.remainder(column)?;
+    // Recorded before it is read and recorded when it is unknown, for the reason [`values`] gives.
+    let stat = stated(plan, binding, stats);
+    reads.push(stat);
+    let counted = match stat {
+        Stat::Known { value, class: Class::Exact, .. } => Some(value),
+        _ => None,
+    };
+    let divided = counted
+        .and_then(|values| values.checked_sub(remainder.listed))
+        .filter(|&rest| rest > 0)
+        .map(|rest| remainder.rows / rest);
+    Some(divided.unwrap_or(remainder.most).clamp(1, remainder.most.max(1)))
 }
 
 /// How many values an equality against a constant picks one of, where anybody counted them.
@@ -1593,7 +1660,7 @@ fn scale(rows: u64, by: f64) -> u64 {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use rudb_common::bounds::{Bound, End, Frequencies, Op, Spread, Test, Zones};
+    use rudb_common::bounds::{Bound, End, Frequencies, Op, Remainder, Spread, Test, Zones};
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
@@ -2839,6 +2906,8 @@ mod tests {
         /// Per column of this store's own numbering, the counts it holds, and `None` for a column
         /// whose synopsis is missing or incomplete.
         held: Vec<Option<Vec<(i128, u64)>>>,
+        /// What the synopsis of column `a` left out, and `None` for one that left nothing out.
+        tail: Option<Remainder>,
         /// Every column it was asked about, so a test can check which one the estimator named.
         asked: Mutex<Vec<usize>>,
     }
@@ -2849,6 +2918,17 @@ mod tests {
             Arc::new(Self {
                 rows: 1_500_000,
                 held: vec![None, held],
+                tail: None,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A store whose column `a` lists the given counts and left the given remainder out.
+        fn prefixed(held: Vec<(i128, u64)>, tail: Remainder) -> Arc<Self> {
+            Arc::new(Self {
+                rows: 1_500_000,
+                held: vec![None, Some(held)],
+                tail: Some(tail),
                 asked: Mutex::new(Vec::new()),
             })
         }
@@ -2872,8 +2952,17 @@ mod tests {
             let (Some(Some(list)), Bound::Int(wanted)) = (self.held.get(column), value) else {
                 return Stat::Unknown;
             };
-            let counted = list.iter().find(|(held, _)| held == wanted).map_or(0, |(_, of)| *of);
-            Stat::exact(counted, Provenance::FrequencySynopsis)
+            match list.iter().find(|(held, _)| held == wanted) {
+                Some((_, of)) => Stat::exact(*of, Provenance::FrequencySynopsis),
+                // A list that left something out says nothing about a value outside it, which is
+                // what the remainder is for. A complete one says no rows hold it.
+                None if self.tail.is_some() => Stat::Unknown,
+                None => Stat::exact(0, Provenance::FrequencySynopsis),
+            }
+        }
+
+        fn remainder(&self, column: usize) -> Option<Remainder> {
+            self.tail.filter(|_| column == 1)
         }
     }
 
@@ -2915,6 +3004,118 @@ mod tests {
         let text = format!("Filter (#0.0::INTEGER = 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
         let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
         assert_eq!(common_stat(&text, 3, &held).value(), Some(&1));
+    }
+
+    /// The counts of a column whose synopsis holds two values and dropped a thousand more.
+    ///
+    /// Three quarters of a million rows on one value and two hundred thousand on another, leaving
+    /// 550,000 rows spread over the thousand values the writer could not keep.
+    fn dropped(most: u64) -> Arc<Counted> {
+        let held = vec![(3, 750_000), (4, 200_000)];
+        Counted::prefixed(held, Remainder { rows: 550_000, listed: 2, most })
+    }
+
+    #[test]
+    fn a_value_an_incomplete_synopsis_left_out_is_the_tail_spread_over_the_values_in_it() {
+        // The shape a prefix is for, and the shape the uniformity assumption is worst at. One value
+        // holds half the table, so dividing the rows by the distinct count calls every other value
+        // 1,497 rows. The synopsis holds the two big ones exactly, which leaves 550,000 rows over
+        // the thousand values it dropped, so a value out of that thousand is 550 rows.
+        let text = format!("Filter {}\n  {}", equals(0, 9), bounded_scan());
+        assert_eq!(
+            common_stat(&text, 1002, &dropped(5_000)),
+            Stat::estimated(550, Provenance::Propagation)
+        );
+    }
+
+    #[test]
+    fn the_bound_the_writer_recorded_caps_what_the_tail_is_spread_into() {
+        // The pass proved no value it dropped holds more than a hundred rows, so a tail that divides
+        // out to 550 is a hundred. The bound is a fact about the rows and the division is a guess
+        // about them, and where the two disagree the fact wins.
+        let text = format!("Filter {}\n  {}", equals(0, 9), bounded_scan());
+        assert_eq!(common_stat(&text, 1002, &dropped(100)).value(), Some(&100));
+    }
+
+    #[test]
+    fn a_tail_too_small_to_divide_is_still_one_row_rather_than_none() {
+        // Five rows over a thousand values rounds to nothing, and nothing is the one answer that
+        // cannot be right: the value is in the column's distinct count, so some row holds it.
+        let text = format!("Filter {}\n  {}", equals(0, 9), bounded_scan());
+        let held = Counted::prefixed(
+            vec![(3, 750_000), (4, 749_995)],
+            Remainder { rows: 5, listed: 2, most: 10 },
+        );
+        assert_eq!(common_stat(&text, 1002, &held).value(), Some(&1));
+    }
+
+    #[test]
+    fn a_value_an_incomplete_synopsis_does_list_is_still_the_count_it_listed() {
+        // The other half, unchanged by any of this. A prefix's counts are exact because the writer
+        // recounts what survived its pass, so a listed value needs no remainder and the provenance
+        // says one store rather than two.
+        let text = format!("Filter {}\n  {}", equals(0, 3), bounded_scan());
+        assert_eq!(
+            common_stat(&text, 1002, &dropped(5_000)),
+            Stat::estimated(750_000, Provenance::FrequencySynopsis)
+        );
+    }
+
+    #[test]
+    fn an_in_list_over_a_prefix_adds_the_counts_it_has_to_the_tail_it_guesses() {
+        // `a IN (3, 9)` where the synopsis lists 3 and dropped 9. Each branch is answered by
+        // whichever half of the synopsis can answer it and the two are summed as they always were.
+        // 750,550 of 1,500,000 rows, a row short of it once the sum has been through a fraction and
+        // back, because a filter's answer is carried as the share of its input that it keeps.
+        let text = one_of(0, &[3, 9]);
+        assert_eq!(
+            common_stat(&text, 1002, &dropped(5_000)),
+            Stat::estimated(750_549, Provenance::Propagation)
+        );
+    }
+
+    #[test]
+    fn a_distinct_count_below_what_the_synopsis_listed_falls_back_to_the_bound() {
+        // Two reads of one column contradicting each other. The synopsis lists two values and the
+        // catalog says the column holds two, which leaves nowhere for the 550,000 rows the synopsis
+        // did not account for. Spreading them over no values is a division by zero, so the answer is
+        // the bound the pass proved, which is a fact about the rows rather than arithmetic on a
+        // disagreement between two readers.
+        let text = format!("Filter {}\n  {}", equals(0, 9), bounded_scan());
+        assert_eq!(
+            common_stat(&text, 2, &dropped(5_000)),
+            Stat::estimated(5_000, Provenance::Propagation)
+        );
+    }
+
+    /// The same as [`common_stat`] where what anybody knows about the values is a ceiling.
+    fn ceilinged(text: &str, distinct: u64, held: &Arc<Counted>) -> Stat<u64> {
+        let stats = facts(&[("t", 1_500_000)]);
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        plan.set_frequencies(0, Arc::clone(held) as Arc<dyn Frequencies>);
+        plan.measure_distinct(
+            0,
+            "a",
+            Stat::certified(distinct, 1.0, Direction::AtMost, Provenance::ZoneMap),
+        );
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    #[test]
+    fn a_ceiling_on_the_values_is_not_a_count_and_does_not_divide_the_tail() {
+        // What a native file's integer column gets: the span between its two ends, which is a
+        // ceiling and not a count. Dividing by it divides by more values than the column has and
+        // lands under the truth by exactly that factor, so the bound answers instead. A thousand
+        // values inside a span of ten thousand is a tenth, and a tail estimated at a tenth of its
+        // size is a filter the planner thinks is ten times more selective than it is.
+        let text = format!("Filter {}\n  {}", equals(0, 9), bounded_scan());
+        assert_eq!(
+            ceilinged(&text, 10_002, &dropped(5_000)),
+            Stat::estimated(5_000, Provenance::Propagation)
+        );
+        // And an exact count of the same column does divide, which is the pair this rests on.
+        assert_eq!(common_stat(&text, 1002, &dropped(5_000)).value(), Some(&550));
     }
 
     /// The same as [`common_stat`] for a table that also kept bounds, and so also a null count.
