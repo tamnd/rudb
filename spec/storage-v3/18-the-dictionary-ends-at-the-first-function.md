@@ -105,6 +105,8 @@ So the ceiling is not a matter of how well the aggregate, the filter and the sca
 
 What the dictionary finding is worth is the largest single item measured so far inside the execution budget, on the query that is a third of the suite. It is worth doing on those grounds. It is not worth presenting as progress toward ten.
 
+Document 19 takes the other half of that sentence, which is what the scans are being asked for. Twenty seven of the 43 queries read 164,385,251 rows to return 267, and they are 86% of the suite's CPU, so the work the ceiling above protects is mostly work no answer required.
+
 ## What this document does not claim
 
 It claims nothing from wall time, and it should not be read as claiming precision from CPU time either. The load average on this host ran between 24 and 27 on eight cores while the last table was taken, and CPU time is not immune to that: threads sharing a core retire fewer instructions per cycle, so contention inflates CPU as well as wall, and the same probe measured 7.17 seconds in one run and 4.48 in another. Every conclusion here rests on a ratio between two measurements taken next to each other, and the ratios it rests on are twelvefold and sixteenfold rather than tens of percent.
