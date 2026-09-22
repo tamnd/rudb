@@ -99,6 +99,7 @@ mod lateral;
 mod links;
 mod lookup;
 mod metadata;
+mod normal;
 mod ordering;
 mod pairs;
 mod percent;
