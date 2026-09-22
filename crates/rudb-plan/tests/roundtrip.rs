@@ -138,8 +138,19 @@ fn a_complete_window_contract_survives_the_round_trip() {
     );
     let args = plan.add_expr_list(&[value]);
     let sum = plan.intern("sum");
+    // The call's own order, which is a different run of keys from the window's and prints in a
+    // different place, so a reader that mixed the two up would fail here rather than quietly.
+    let inside =
+        plan.add_sort_keys(&[SortKey { expr: group, descending: false, nulls_first: true }]);
     let expression = plan.add_expr(
-        Expr::Window { name: sum, args, distinct: true, filter: Some(filter), ignore_nulls: true },
+        Expr::Window {
+            name: sum,
+            args,
+            distinct: true,
+            filter: Some(filter),
+            ignore_nulls: true,
+            order: inside,
+        },
         LogicalType::HugeInt,
     );
     let expressions = plan.add_expr_list(&[expression]);
@@ -148,7 +159,7 @@ fn a_complete_window_contract_survives_the_round_trip() {
     plan.set_root(window);
 
     let expected = "\
-Window #1 partition=[#0.0::INTEGER] order=[#0.1::BIGINT DESC NULLS LAST] frame=GROUPS 1::INTEGER PRECEDING TO 2::INTEGER FOLLOWING EXCLUDE TIES expressions=[sum(DISTINCT #0.1::BIGINT FILTER (#0.1::BIGINT > 0::BIGINT)::BOOLEAN IGNORE NULLS)::HUGEINT]\n  Get memory.main.events AS events #0 [group_id::INTEGER, value::BIGINT]\n";
+Window #1 partition=[#0.0::INTEGER] order=[#0.1::BIGINT DESC NULLS LAST] frame=GROUPS 1::INTEGER PRECEDING TO 2::INTEGER FOLLOWING EXCLUDE TIES expressions=[sum(DISTINCT #0.1::BIGINT ORDER [#0.0::INTEGER ASC NULLS FIRST] FILTER (#0.1::BIGINT > 0::BIGINT)::BOOLEAN IGNORE NULLS)::HUGEINT]\n  Get memory.main.events AS events #0 [group_id::INTEGER, value::BIGINT]\n";
     assert_eq!(round_trips(&plan), expected);
     reads_back(concat!(
         "Window #1 partition=[] order=[] frame=RANGE UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING EXCLUDE NO OTHERS expressions=[row_number()::BIGINT]\n",

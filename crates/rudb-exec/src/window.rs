@@ -153,6 +153,15 @@ struct Call {
     args: usize,
     /// Where its `FILTER` predicate landed, when it has one.
     filter_at: Option<usize>,
+    /// Where the keys of the `ORDER BY` written inside its brackets start among the gathered
+    /// values. They sit in a run, in the order they were written, the way the arguments do.
+    order_at: usize,
+    /// Those keys, which is empty for almost every call.
+    ///
+    /// Only the direction and the null placement are read off them. The expressions were gathered
+    /// like the arguments were, so the values are already on the row by the time this is used, and
+    /// the expressions in here are the plan's own and are not looked at again.
+    order: Vec<SortKey>,
     /// Whether duplicate argument tuples are collapsed before aggregating.
     distinct: bool,
     /// Whether an argument that is null is passed over.
@@ -165,6 +174,61 @@ struct Call {
 /// by a single prepared array in one pass over the chunk and cutting them apart per row would
 /// allocate four vectors where one does.
 type Windowed = (Vec<Value>, Vec<Value>, Arrival);
+
+/// The rows of a frame in the order one call reads them.
+///
+/// Two shapes rather than one vector, so that the call that wrote no order of its own walks the
+/// range it was given and allocates nothing, which is nearly every call there is.
+enum Visiting {
+    /// The frame as the partition lays it out.
+    Straight(std::ops::Range<usize>),
+    /// The same rows, in the order the call's own keys put them.
+    Sorted(std::vec::IntoIter<usize>),
+}
+
+impl Iterator for Visiting {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::Straight(frame) => frame.next(),
+            Self::Sorted(sorted) => sorted.next(),
+        }
+    }
+}
+
+/// What order one call reads the rows of its frame in.
+///
+/// An `ORDER BY` written inside a call's brackets is not the window's own ordering. The one in the
+/// `OVER` lays the partition out and decides which rows are in the frame at all, and this one
+/// decides what order the call sees them in once they are, which is why
+/// `first_value(v ORDER BY v DESC)` is the largest `v` in the frame rather than the first row of
+/// it. So the frame is the same rows either way and only the walk over them changes.
+///
+/// Rows that tie on every key stay in the order the frame had them, which is what a stable sort
+/// gives and is the only order there is anything to say about.
+///
+/// `EXCLUDE` and `FILTER` are not applied here. They drop rows rather than move them, and dropping
+/// before the sort leaves the same rows in the same order as dropping after it, so the walk that
+/// follows goes on doing it.
+fn reading(call: &Call, rows: &[Windowed], frame: std::ops::Range<usize>) -> Result<Visiting> {
+    if call.order.is_empty() {
+        return Ok(Visiting::Straight(frame));
+    }
+    let at = call.order_at;
+    let keys = call.order.len();
+    let mut held: Vec<usize> = frame.collect();
+    let mut failure: Option<Error> = None;
+    held.sort_by(|&left, &right| {
+        let left = &rows[left].0[at..at + keys];
+        let right = &rows[right].0[at..at + keys];
+        compare(&call.order, left, right, &mut failure)
+    });
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(Visiting::Sorted(held.into_iter())),
+    }
+}
 
 /// Where a frame's two ends were gathered, for the ends that were written as a distance.
 #[derive(Debug, Clone, Copy)]
@@ -291,7 +355,8 @@ impl Window {
 
         let mut calls = Vec::new();
         for &expr in plan.expr_list(expressions) {
-            let Expr::Window { name, args, distinct, filter, ignore_nulls } = plan.expr(expr)
+            let Expr::Window { name, args, distinct, filter, ignore_nulls, order: inner } =
+                plan.expr(expr)
             else {
                 return Err(Error::internal("a window node listing an expression that is not one"));
             };
@@ -302,6 +367,12 @@ impl Window {
                 gathered.push(predicate);
                 gathered.len() - 1
             });
+            // The keys written inside the brackets are gathered off the row like the arguments are,
+            // because that is what they are: they are read per row and sorting the frame by them is
+            // a matter of looking at values that are already there.
+            let inner = plan.sort_key_list(*inner).to_vec();
+            let order_at = gathered.len();
+            gathered.extend(inner.iter().map(|key| key.expr));
             let written = plan.string(*name);
             calls.push(Call {
                 reads: Reads::of(written),
@@ -310,6 +381,8 @@ impl Window {
                 args_at,
                 args: arguments.len(),
                 filter_at,
+                order_at,
+                order: inner,
                 distinct: *distinct,
                 ignore_nulls: *ignore_nulls,
             });
@@ -834,7 +907,7 @@ impl Window {
         }
         let mut accumulator = Accumulator::new(&call.name, &call.returns)?;
         let mut seen: Vec<Vec<Value>> = Vec::new();
-        for row in frame {
+        for row in reading(call, rows, frame)? {
             if self.excluded(peers, at, row) {
                 continue;
             }
@@ -898,7 +971,7 @@ impl Window {
         };
         let mut seen = 0_usize;
         let mut last = Value::Null;
-        for row in frame {
+        for row in reading(call, rows, frame)? {
             if self.excluded(peers, at, row) {
                 continue;
             }

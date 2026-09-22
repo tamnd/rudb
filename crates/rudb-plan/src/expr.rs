@@ -117,6 +117,14 @@ pub enum Expr {
         filter: Option<ExprRef>,
         /// Whether null arguments are skipped by functions that support the modifier.
         ignore_nulls: bool,
+        /// The order the call reads the rows of its frame in, into the sort key pool, empty when
+        /// the call wrote no `ORDER BY` inside its brackets.
+        ///
+        /// This is not the window's own ordering. The one in the `OVER` lays the partition out and
+        /// decides which rows are in the frame at all, and this one decides what order the call
+        /// sees them in once they are, which is why `first_value(v ORDER BY v DESC)` is the largest
+        /// `v` in the frame and not the first row of it.
+        order: Slice,
     },
     /// A searched `CASE`.
     ///

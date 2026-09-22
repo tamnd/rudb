@@ -292,12 +292,23 @@ impl Plan {
                     include(arg);
                 }
             }
-            Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+            Expr::Aggregate { args, filter, .. } => {
                 for &arg in self.expr_list(args) {
                     include(arg);
                 }
                 if let Some(filter) = filter {
                     include(filter);
+                }
+            }
+            Expr::Window { args, filter, order, .. } => {
+                for &arg in self.expr_list(args) {
+                    include(arg);
+                }
+                if let Some(filter) = filter {
+                    include(filter);
+                }
+                for key in self.sort_key_list(order) {
+                    include(key.expr);
                 }
             }
             Expr::Case { arms, otherwise } => {
@@ -552,12 +563,26 @@ impl Plan {
                     self.read_columns(child, found);
                 }
             }
-            Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+            Expr::Aggregate { args, filter, .. } => {
                 for &arg in self.expr_list(args) {
                     self.read_columns(arg, found);
                 }
                 if let Some(inner) = filter {
                     self.read_columns(inner, found);
+                }
+            }
+            // The keys a window call reads its frame in are operands like the arguments are, so a
+            // caller that walks the children and does not reach them goes on to prune a column the
+            // call still needs.
+            Expr::Window { args, filter, order, .. } => {
+                for &arg in self.expr_list(args) {
+                    self.read_columns(arg, found);
+                }
+                if let Some(inner) = filter {
+                    self.read_columns(inner, found);
+                }
+                for key in self.sort_key_list(order) {
+                    self.read_columns(key.expr, found);
                 }
             }
             Expr::Case { arms, otherwise } => {
@@ -698,6 +723,15 @@ impl Plan {
                     backwards(filter)?;
                     if *self.expr_type(filter) != LogicalType::Boolean {
                         return fail("has a FILTER that is not BOOLEAN");
+                    }
+                }
+                if let Expr::Window { order, .. } = *self.expr(reference) {
+                    let end = order.start as usize + order.len as usize;
+                    if end > self.sort_keys.len() {
+                        return fail("names an argument order run that is not in the pool");
+                    }
+                    for key in self.sort_key_list(order) {
+                        backwards(key.expr)?;
                     }
                 }
             }
@@ -938,10 +972,15 @@ impl Plan {
         // rather than an error.
         for (expr, aggregate_allowed, window_allowed) in self.top_level_exprs(node) {
             if window_allowed {
-                if let Expr::Window { args, filter, .. } = *self.expr(expr) {
-                    let nested = self.expr_list(args).iter().chain(filter.iter()).any(|&child| {
-                        self.reaches_a_window(child) || self.reaches_an_aggregate(child)
-                    });
+                if let Expr::Window { args, filter, order, .. } = *self.expr(expr) {
+                    let keys: Vec<ExprRef> =
+                        self.sort_key_list(order).iter().map(|key| key.expr).collect();
+                    let nested =
+                        self.expr_list(args).iter().chain(filter.iter()).chain(keys.iter()).any(
+                            |&child| {
+                                self.reaches_a_window(child) || self.reaches_an_aggregate(child)
+                            },
+                        );
                     if nested {
                         return fail("has a window or aggregate inside a window function");
                     }
@@ -1042,9 +1081,13 @@ impl Plan {
     fn reaches_an_aggregate(&self, reference: ExprRef) -> bool {
         match *self.expr(reference) {
             Expr::Aggregate { .. } => true,
-            Expr::Window { args, filter, .. } => {
+            Expr::Window { args, filter, order, .. } => {
                 self.expr_list(args).iter().any(|&child| self.reaches_an_aggregate(child))
                     || filter.is_some_and(|child| self.reaches_an_aggregate(child))
+                    || self
+                        .sort_key_list(order)
+                        .iter()
+                        .any(|key| self.reaches_an_aggregate(key.expr))
             }
             Expr::Column(_) | Expr::Constant(_) => false,
             Expr::Cast { input, .. } => self.reaches_an_aggregate(input),
@@ -1315,6 +1358,7 @@ mod tests {
                 distinct: false,
                 filter: None,
                 ignore_nulls: false,
+                order: Slice::EMPTY,
             },
             LogicalType::BigInt,
         );

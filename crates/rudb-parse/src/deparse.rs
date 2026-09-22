@@ -70,7 +70,7 @@
 use crate::ast::{
     Ast, BinaryOp, CaseArm, CreateViewRef, Distinct, Expr, ExprRef, JoinKind, LiteralKind, Nulls,
     Order, OrderItem, Quantifier, QueryBody, QueryRef, SelectRef, SetOp, Slice, Source, SourceRef,
-    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowUnit,
+    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowUnit,
 };
 use crate::matcher::NONE;
 use crate::tokenize::quoted;
@@ -354,9 +354,7 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Unary { op, operand } => unary(ast, op, operand),
         Expr::Binary { op, left, right } => binary(ast, op, left, right),
         Expr::Function { name, args, distinct, filter } => call(ast, name, args, distinct, filter),
-        Expr::Window { name, args, distinct, filter, ignore_nulls, spec } => {
-            window(ast, name, args, distinct, filter, ignore_nulls, spec)
-        }
+        held @ Expr::Window { .. } => window(ast, held),
         Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
             format!("{word}({} AS {})", expr(ast, operand), typename(ast.string(ty)))
@@ -672,16 +670,24 @@ fn filtered(ast: &Ast, filter: ExprRef) -> String {
 /// is why `sum(x) OVER (ORDER BY x RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` comes back
 /// as `sum(x) OVER (ORDER BY x)`. A single bound is printed as the pair it stands for, so
 /// `ROWS UNBOUNDED PRECEDING` comes back as `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
-fn window(
-    ast: &Ast,
-    name: Slice,
-    args: Slice,
-    distinct: bool,
-    filter: ExprRef,
-    ignore_nulls: bool,
-    spec: WindowRef,
-) -> String {
+///
+/// The whole expression is taken rather than its parts, because there are eight of them now and a
+/// call with eight arguments is one the reader has to count along to read.
+fn window(ast: &Ast, held: Expr) -> String {
+    let Expr::Window { name, args, distinct, filter, ignore_nulls, order: sorted, spec } = held
+    else {
+        return String::new();
+    };
     let word = if distinct { "DISTINCT " } else { "" };
+    // The `ORDER BY` inside the brackets goes back where it was written, after the arguments and
+    // before `IGNORE NULLS`, which is the order the grammar has them in.
+    let sorted = if sorted.is_empty() {
+        String::new()
+    } else {
+        let items: Vec<String> =
+            ast.order_list(sorted).iter().map(|item| order(ast, item)).collect();
+        format!(" ORDER BY {}", items.join(", "))
+    };
     // `RESPECT NULLS` is the default and upstream drops it, so only the other one is written.
     let nulls = if ignore_nulls { " IGNORE NULLS" } else { "" };
     let written = parts(ast, name);
@@ -693,8 +699,11 @@ fn window(
         && matches!(ast.expr(list[0]), Expr::Star { qualifier, replacements }
             if qualifier.is_empty() && replacements.is_empty());
     let inner = if bare { String::new() } else { exprs(ast, args) };
-    let call =
-        format!("{}({word}{inner}{nulls}){}", operator(ast, name, &written), filtered(ast, filter));
+    let call = format!(
+        "{}({word}{inner}{sorted}{nulls}){}",
+        operator(ast, name, &written),
+        filtered(ast, filter)
+    );
     let held = ast.window(spec);
     let mut inside: Vec<String> = Vec::new();
     if !held.partition.is_empty() {

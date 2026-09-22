@@ -744,6 +744,10 @@ pub enum Expr {
         /// Whether the call said `IGNORE NULLS`. `RESPECT NULLS` is the default and is not kept,
         /// because the reference binary drops it: a view written with it comes back without it.
         ignore_nulls: bool,
+        /// The `ORDER BY` written inside the brackets, as a run of [`OrderItem`], empty when there
+        /// was none. This is the order the call reads the rows of its frame in, and it has nothing
+        /// to do with the `ORDER BY` in the `OVER`, which lays the partition out.
+        order: Slice,
         /// The window itself, into `Ast::windows`.
         spec: WindowRef,
     },
