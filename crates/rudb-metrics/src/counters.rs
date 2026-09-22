@@ -38,6 +38,10 @@ pub struct Counters {
     bytes_read: AtomicU64,
     bytes_decoded: AtomicU64,
     bytes_spilled: AtomicU64,
+    /// Parts of the table read, and parts the statistics ruled out. See
+    /// [`Operator::parts_pruned`](crate::Operator::parts_pruned) for why the second one is here.
+    parts_read: AtomicU64,
+    parts_pruned: AtomicU64,
     reserved: AtomicU64,
     high_water: AtomicU64,
     /// One counter per [`Cause`], in the order [`Cause::ALL`] lists them.
@@ -69,6 +73,8 @@ impl Counters {
             rows_out: AtomicU64::new(0),
             wall_ns: AtomicU64::new(0),
             cpu_ns: AtomicU64::new(0),
+            parts_read: AtomicU64::new(0),
+            parts_pruned: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             bytes_decoded: AtomicU64::new(0),
             bytes_spilled: AtomicU64::new(0),
@@ -154,6 +160,16 @@ impl Counters {
         self.bytes_read.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// One part of the table read rather than ruled out.
+    pub fn part_read(&self) {
+        self.parts_read.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One part the statistics ruled out, so nothing in it was read.
+    pub fn part_pruned(&self) {
+        self.parts_pruned.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Bytes turned from a stored form into vectors.
     pub fn decoded(&self, bytes: u64) {
         self.bytes_decoded.fetch_add(bytes, Ordering::Relaxed);
@@ -223,6 +239,8 @@ impl Counters {
         operator.bytes_read = self.bytes_read.load(Ordering::Relaxed);
         operator.bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
         operator.bytes_spilled = self.bytes_spilled.load(Ordering::Relaxed);
+        operator.parts_read = self.parts_read.load(Ordering::Relaxed);
+        operator.parts_pruned = self.parts_pruned.load(Ordering::Relaxed);
         for cause in Cause::ALL {
             let seen = self.fallbacks[cause.slot()].load(Ordering::Relaxed);
             operator.fallbacks.add(Tally::of(cause, seen));

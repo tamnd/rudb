@@ -214,6 +214,12 @@ impl Document {
                     out.count("bytes_read", operator.bytes_read);
                     out.count("bytes_decoded", operator.bytes_decoded);
                     out.count("bytes_spilled", operator.bytes_spilled);
+                    // Only a scan has parts, and a row of two zeroes under a hash join is two more
+                    // keys a reader has to look at to find out they say nothing.
+                    if operator.parts_read != 0 || operator.parts_pruned != 0 {
+                        out.count("parts_read", operator.parts_read);
+                        out.count("parts_pruned", operator.parts_pruned);
+                    }
                     out.key("fallbacks");
                     out.object(|out| {
                         out.count("total", operator.fallbacks.total());
@@ -625,6 +631,19 @@ pub struct Operator {
     pub bytes_decoded: u64,
     /// Bytes it spilled.
     pub bytes_spilled: u64,
+    /// Parts of the table it read, for an operator that reads one.
+    ///
+    /// A part is whatever the storage prunes at, which is a chunk of 1024 rows for a table in
+    /// memory and a part of a stripe for a native file. Zero for everything that is not a scan.
+    pub parts_read: u64,
+    /// Parts the statistics ruled out, so they were never read, decoded or filtered.
+    ///
+    /// This is the number that says whether the physical order of the table is doing any work.
+    /// A predicate on a column the rows are not ordered by prunes nothing, however selective it
+    /// is, and the only way to tell that apart from a predicate nothing matches is to count what
+    /// was skipped. `spec/perf/` and the TPC-H work both turn on this number and it was private
+    /// to the scan until now.
+    pub parts_pruned: u64,
     /// How many times something inside it took a path written to be correct rather than fast.
     ///
     /// This is the one number in the row that is a work list rather than a measurement. Every count
@@ -691,6 +710,8 @@ impl Operator {
             bytes_read: 0,
             bytes_decoded: 0,
             bytes_spilled: 0,
+            parts_read: 0,
+            parts_pruned: 0,
             fallbacks: Tally::none(),
             stages: Spent::none(),
             memory: Memory::default(),

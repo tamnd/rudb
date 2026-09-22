@@ -284,6 +284,12 @@ pub(crate) struct Scan<'a> {
     skipped: AtomicUsize,
     /// Whether the runtime filter has been earning the hash it costs.
     paying: Paying,
+    /// The operator row this scan reports its part counts to, when it is being measured.
+    ///
+    /// The scan has counted its own skips since the walk was written and nobody outside could see
+    /// them. They are the number that says whether the physical order of the table is doing any
+    /// work, so they go on the operator row.
+    counters: Option<Arc<Counters>>,
 }
 
 /// How many rows go through the runtime filter before it has to justify itself.
@@ -549,6 +555,7 @@ impl<'a> Scan<'a> {
             waved: AtomicUsize::new(0),
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
+            counters: None,
             paying: Paying::default(),
         })
     }
@@ -731,6 +738,25 @@ impl<'a> Scan<'a> {
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    /// Connects this scan's part counts to the operator row that owns it.
+    pub(crate) fn watched(mut self, counters: Arc<Counters>) -> Self {
+        self.counters = Some(counters);
+        self
+    }
+
+    /// The parts no morsel covers, which are the ones ruled out before any worker started.
+    ///
+    /// Counted here and not in [`Source::read`] because a part outside every run is never visited,
+    /// so the walk has no chance to see it. Between this and the walk, every part of the table is
+    /// counted exactly once, which is the invariant the test at the bottom of this file checks.
+    fn unreached(&self, runs: &[Range<usize>]) {
+        let Some(counters) = self.counters.as_ref() else { return };
+        let covered: usize = runs.iter().map(|run| run.end.saturating_sub(run.start)).sum();
+        for _ in 0..self.table.rows().chunk_count().saturating_sub(covered) {
+            counters.part_pruned();
+        }
+    }
 }
 
 /// What one stripe has left in it after the statistics have been asked.
@@ -881,6 +907,7 @@ impl Source for Scan<'_> {
             // reading its own page again, and it costs a page per worker per column.
             self.table.rows().keep_stripes(instances.saturating_mul(2));
             let runs = runs_of(&live, instances, |at| self.table.rows().chunk_len(at).unwrap_or(0));
+            self.unreached(&runs);
             let _ = self.spread.set(Spread { handout: Handout::new(runs.len()), runs });
         }
         Some(instances)
@@ -915,7 +942,13 @@ impl Source for Scan<'_> {
                 break at;
             }
             self.skipped.fetch_add(1, Ordering::Relaxed);
+            if let Some(counters) = &self.counters {
+                counters.part_pruned();
+            }
         };
+        if let Some(counters) = &self.counters {
+            counters.part_read();
+        }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
@@ -1710,6 +1743,9 @@ impl<'a> FileScan<'a> {
                 cutting.group += 1;
                 cutting.row = cutting.row.saturating_add(group.rows);
                 cutting.skipped = cutting.skipped.saturating_add(1);
+                if let Some(counters) = &self.counters {
+                    counters.part_pruned();
+                }
             }
         }
         let piece = match cutting.reader.as_ref() {
@@ -1717,6 +1753,13 @@ impl<'a> FileScan<'a> {
                 let at = cutting.group;
                 let rows = group_rows(reader, at);
                 let piece = next_piece(rows, cutting.part, cutting.cut);
+                // Once per row group and not once per piece, so that the two counts on the
+                // operator row are both in row groups and a reader can add them up.
+                if piece.start == 0 {
+                    if let Some(counters) = &self.counters {
+                        counters.part_read();
+                    }
+                }
                 let split = reader.split_rows(at, piece.clone())?;
                 if piece.end >= rows {
                     cutting.group += 1;
@@ -2100,11 +2143,13 @@ impl Source for Values {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use rudb_catalog::{QualifiedName, Table};
     use rudb_common::{Field, LogicalType, Value};
     use rudb_functions::TableFunction;
+    use rudb_metrics::Counters;
     use rudb_pipeline::{Progress, Source};
     use rudb_plan::{ColumnBinding, Node, Plan};
     use rudb_storage::Blocked;
@@ -2603,6 +2648,7 @@ mod tests {
             waved: AtomicUsize::new(0),
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
+            counters: None,
             paying: Paying::default(),
         }
     }
@@ -2681,6 +2727,31 @@ mod tests {
         assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5 - cutoff);
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 2, "the first two hold nothing wanted");
         assert_eq!(scan.waved.load(Ordering::Relaxed), 2, "the last two are all of them wanted");
+    }
+
+    /// Every part of the table is counted exactly once, as read or as ruled out.
+    ///
+    /// The invariant matters because the two numbers go on the operator row as "n of m parts
+    /// skipped", and an m that is not the table is a sentence that reads as true and is not. There
+    /// are two places a part can be ruled out, the walk in [`Source::read`] and the runs
+    /// [`Source::morsels`] hands out, and the easy mistake is to count one of them.
+    #[test]
+    fn the_two_part_counts_add_up_to_the_table() {
+        let table = counted(VECTOR_SIZE * 5);
+        let cutoff = VECTOR_SIZE * 2 + VECTOR_SIZE / 2;
+        let (_plan, mut scan) =
+            applying(&table, &format!("(#0.0::INTEGER >= {cutoff}::INTEGER)::BOOLEAN"));
+        let counters = Arc::new(Counters::new(0, 0, "Scan"));
+        scan = scan.watched(Arc::clone(&counters));
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5 - cutoff);
+        let operator = counters.snapshot();
+        assert_eq!(operator.parts_pruned, 2, "the first two hold nothing wanted");
+        assert_eq!(
+            operator.parts_read + operator.parts_pruned,
+            table.rows().chunk_count() as u64,
+            "every part is counted once and only once"
+        );
     }
 
     /// The filter is really applied and not only decided about.
