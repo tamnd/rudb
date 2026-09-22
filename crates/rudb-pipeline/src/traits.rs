@@ -65,6 +65,19 @@ pub trait Source: Send + Sync + fmt::Debug {
     ///
     /// Whatever reading, decoding or casting reports, carrying the message the user sees.
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress>;
+
+    /// How much more than reading a row this source does to one. See [`Stream::weight`].
+    ///
+    /// Zero is a source that only reads, which is what a source usually is, and the pipeline counts
+    /// its reading as the 1 that everything else is measured against. This is for the source that
+    /// took work off an operator above it: a table scan applying a filter that would otherwise be a
+    /// [`Stream`] is doing that stream's work, and if it does not say so then moving the filter down
+    /// makes the pipeline look cheaper than it was and the source cuts fewer instances than it needs.
+    /// ClickBench 40 is the case, and it went from eight instances to six the moment its filter
+    /// moved, which cost more than the move saved.
+    fn weight(&self) -> usize {
+        0
+    }
 }
 
 /// Transforms chunks in place. No state that outlives one pipeline instance.
