@@ -283,48 +283,75 @@ impl KeyMap {
     /// before building a link on it.
     pub fn build(keys: &[Option<i128>]) -> Result<Self> {
         let mut observed = observe(keys);
-        // A column with no keys in it at all is an identity map over nothing. It is worth having
-        // rather than refusing, because an empty parent table is a legal table and a join against
-        // it returns no rows rather than failing.
-        if observed.rows == 0 {
-            return Ok(Self { body: Body::Identity { base: 0, count: 0 }, observed });
-        }
-        let (Some(min), Some(max)) = (observed.min, observed.max) else {
-            // A non-zero row count guarantees both, so this is unreachable. It is an error rather
-            // than an `expect` because a key map that panicked on its own bookkeeping would take
-            // down a query that section 3.1 promises can always be answered without it.
-            return Err(malformed("a column with keys in it reported no minimum"));
-        };
-        let range = range_of(min, max)?;
+        Ok(match plan(&observed)? {
+            Plan::Empty => Self { body: Body::Identity { base: 0, count: 0 }, observed },
+            Plan::Identity { base, count } => {
+                Self { body: Body::Identity { base, count }, observed }
+            }
+            Plan::Dense { base, range } => Self { body: dense(keys, base, range)?, observed },
+            Plan::Sorted { base } => {
+                // The sorted form sorts, so it is the one place distinctness can be settled for a
+                // column that did not arrive in order. `observe` can only see an adjacent
+                // duplicate; this sees every duplicate, and the answer replaces the guess.
+                let (body, distinct) = sorted(keys, base, observed.rows)?;
+                observed.distinct = distinct;
+                Self { body, observed }
+            }
+        })
+    }
 
-        // Both of the cheap forms answer with a *count of keys below the value*, and both are
-        // correct only where that count is the `rid`. It is the `rid` when the column is ascending
-        // and holds no nulls, and it is not otherwise: a null earlier in the column, or a value out
-        // of order, shifts every row after it. Getting this wrong would not fail, it would resolve
-        // every key to a neighbour of the right row, which is the one failure mode section 3.1 does
-        // not catch for free. So the guard is shared and stated once.
-        let positional = observed.distinct && observed.sorted && observed.nulls == 0;
-
-        if positional && range == observed.rows {
-            // Identity needs more than positional: it needs the values to be exactly the
-            // positions, which on a distinct ascending column is the range equalling the row count.
-            // The check is subtraction rather than a walk because the walk already happened in
-            // `observe`.
-            return Ok(Self { body: Body::Identity { base: min, count: observed.rows }, observed });
-        }
-
-        // The bitmap is over the value range, so a range that does not fit a `usize` cannot be one
-        // however dense it is.
-        if positional && usize::try_from(range).is_ok() && range / observed.rows < DENSE_THRESHOLD {
-            return Ok(Self { body: dense(keys, min, range)?, observed });
-        }
-
-        // The sorted form sorts, so it is the one place distinctness can be settled for a column
-        // that did not arrive in order. `observe` can only see an adjacent duplicate; this sees
-        // every duplicate, and the answer replaces the guess.
-        let (body, distinct) = sorted(keys, min, observed.rows)?;
-        observed.distinct = distinct;
-        Ok(Self { body, observed })
+    /// Builds the cheapest correct form by reading the column rather than by holding it.
+    ///
+    /// The same build as [`KeyMap::build`] and the same decision, taken from a source that can be
+    /// scanned twice instead of from a slice that is already in memory. That difference is the
+    /// whole reason this exists. A parent key column at TPC-H SF10 is fifteen million rows of
+    /// `orders`, and a `Vec<Option<i128>>` of those is four hundred and eighty megabytes held for
+    /// the length of a build that does not need a single one of them twice. At SF100 it is four and
+    /// a half gigabytes, which is not a slow build, it is a build that does not happen.
+    ///
+    /// So the first scan observes and nothing else, and what the second scan does depends on what
+    /// the first one found. The identity form, which is the form every TPC-H parent key takes,
+    /// needs no second scan at all: the four observed facts are the whole map. The dense form fills
+    /// a bitmap sized from the range, which is bounded by the table rather than by the scan. Only
+    /// the sorted form has to hold the column, because sorting is what it is, and it says so here
+    /// rather than surprising a caller with it.
+    ///
+    /// # Errors
+    ///
+    /// If the scan fails, or for any of the reasons [`KeyMap::build`] fails.
+    pub fn build_from<K: Keys + ?Sized>(keys: &K) -> Result<Self> {
+        let mut observer = Observer::new();
+        keys.scan(&mut |key| {
+            observer.push(key);
+            Ok(())
+        })?;
+        let mut observed = observer.observed;
+        Ok(match plan(&observed)? {
+            Plan::Empty => Self { body: Body::Identity { base: 0, count: 0 }, observed },
+            Plan::Identity { base, count } => {
+                Self { body: Body::Identity { base, count }, observed }
+            }
+            Plan::Dense { base, range } => {
+                let mut bits = DenseBits::new(base, range);
+                keys.scan(&mut |key| match key {
+                    Some(key) => bits.push(key),
+                    None => Ok(()),
+                })?;
+                Self { body: bits.finish(), observed }
+            }
+            Plan::Sorted { base } => {
+                let mut held = Vec::with_capacity(
+                    usize::try_from(observed.rows + observed.nulls).unwrap_or_default(),
+                );
+                keys.scan(&mut |key| {
+                    held.push(key);
+                    Ok(())
+                })?;
+                let (body, distinct) = sorted(&held, base, observed.rows)?;
+                observed.distinct = distinct;
+                Self { body, observed }
+            }
+        })
     }
 
     /// Which form this map took.
@@ -583,35 +610,142 @@ impl KeyMap {
     }
 }
 
-/// One pass over the column, recording the four facts section 3.3 says the build records.
-fn observe(keys: &[Option<i128>]) -> Observed {
-    let mut observed =
-        Observed { rows: 0, nulls: 0, distinct: true, sorted: true, min: None, max: None };
-    let mut previous: Option<i128> = None;
+/// A parent key column that can be read more than once, in `rid` order.
+///
+/// The build wants two passes over a column it does not want to hold, so this is what it reads
+/// instead of a slice: something that can be asked to produce the column again. A file can do that
+/// for the price of a read, and the second read is against pages the first one just warmed.
+///
+/// Values arrive as `Option<i128>`, with `None` for a null. A string key arrives as its dictionary
+/// code rather than as text, per section 2.2, which is why one integer signature covers every key
+/// type rudb has.
+pub trait Keys {
+    /// Calls `each` once per row of the column, in `rid` order.
+    ///
+    /// # Errors
+    ///
+    /// If the column cannot be read, or if `each` fails, which stops the scan rather than
+    /// continuing past a value that could not be used.
+    fn scan(&self, each: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()>;
+}
+
+impl Keys for [Option<i128>] {
+    fn scan(&self, each: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()> {
+        for key in self {
+            each(*key)?;
+        }
+        Ok(())
+    }
+}
+
+/// Which form the build chose, decided once and carried out twice.
+///
+/// Separating the decision from the filling is what lets [`KeyMap::build`] and
+/// [`KeyMap::build_from`] be the same build. A second copy of these three conditions is a second
+/// place for the positional guard below to be got wrong.
+enum Plan {
+    Empty,
+    Identity { base: i128, count: u64 },
+    Dense { base: i128, range: u64 },
+    Sorted { base: i128 },
+}
+
+/// Picks the cheapest form that is correct for what the column turned out to hold.
+fn plan(observed: &Observed) -> Result<Plan> {
+    // A column with no keys in it at all is an identity map over nothing. It is worth having rather
+    // than refusing, because an empty parent table is a legal table and a join against it returns
+    // no rows rather than failing.
+    if observed.rows == 0 {
+        return Ok(Plan::Empty);
+    }
+    let (Some(min), Some(max)) = (observed.min, observed.max) else {
+        // A non-zero row count guarantees both, so this is unreachable. It is an error rather than
+        // an `expect` because a key map that panicked on its own bookkeeping would take down a
+        // query that section 3.1 promises can always be answered without it.
+        return Err(malformed("a column with keys in it reported no minimum"));
+    };
+    let range = range_of(min, max)?;
+
+    // Both of the cheap forms answer with a *count of keys below the value*, and both are correct
+    // only where that count is the `rid`. It is the `rid` when the column is ascending and holds no
+    // nulls, and it is not otherwise: a null earlier in the column, or a value out of order, shifts
+    // every row after it. Getting this wrong would not fail, it would resolve every key to a
+    // neighbour of the right row, which is the one failure mode section 3.1 does not catch for
+    // free. So the guard is shared and stated once.
+    let positional = observed.distinct && observed.sorted && observed.nulls == 0;
+
+    if positional && range == observed.rows {
+        // Identity needs more than positional: it needs the values to be exactly the positions,
+        // which on a distinct ascending column is the range equalling the row count. The check is
+        // subtraction rather than a walk because the walk already happened in the observation.
+        return Ok(Plan::Identity { base: min, count: observed.rows });
+    }
+
+    // The bitmap is over the value range, so a range that does not fit a `usize` cannot be one
+    // however dense it is.
+    if positional && usize::try_from(range).is_ok() && range / observed.rows < DENSE_THRESHOLD {
+        return Ok(Plan::Dense { base: min, range });
+    }
+
+    Ok(Plan::Sorted { base: min })
+}
+
+/// The four facts section 3.3 says the build records, accumulated one value at a time.
+///
+/// One value at a time rather than one column at a time so that the pass can be driven by a scan
+/// of a file as easily as by a slice. See [`KeyMap::build_from`] for why that matters.
+struct Observer {
+    observed: Observed,
+    previous: Option<i128>,
+}
+
+impl Observer {
+    fn new() -> Self {
+        Self {
+            observed: Observed {
+                rows: 0,
+                nulls: 0,
+                distinct: true,
+                sorted: true,
+                min: None,
+                max: None,
+            },
+            previous: None,
+        }
+    }
+
     // Distinctness on a column that is not sorted cannot be settled in one pass without a set, so
-    // this pass settles it for the sorted case and leaves the unsorted case to the sort that the
-    // sorted form does anyway. That is why `distinct` is fixed up in `sorted` below rather than
-    // being final here, and it is worth the awkwardness: the common case on real keys is ascending,
-    // and a hash set over fifteen million rows to discover what adjacency already proves is the
-    // build cost this avoids.
-    for key in keys {
-        let Some(key) = *key else {
-            observed.nulls += 1;
-            continue;
+    // this settles it for the sorted case and leaves the unsorted case to the sort that the sorted
+    // form does anyway. That is why `distinct` is fixed up in `sorted` below rather than being
+    // final here, and it is worth the awkwardness: the common case on real keys is ascending, and a
+    // hash set over fifteen million rows to discover what adjacency already proves is the build
+    // cost this avoids.
+    fn push(&mut self, key: Option<i128>) {
+        let Some(key) = key else {
+            self.observed.nulls += 1;
+            return;
         };
-        observed.rows += 1;
-        observed.min = Some(observed.min.map_or(key, |held| held.min(key)));
-        observed.max = Some(observed.max.map_or(key, |held| held.max(key)));
-        if let Some(previous) = previous {
+        self.observed.rows += 1;
+        self.observed.min = Some(self.observed.min.map_or(key, |held| held.min(key)));
+        self.observed.max = Some(self.observed.max.map_or(key, |held| held.max(key)));
+        if let Some(previous) = self.previous {
             if key < previous {
-                observed.sorted = false;
+                self.observed.sorted = false;
             } else if key == previous {
-                observed.distinct = false;
+                self.observed.distinct = false;
             }
         }
-        previous = Some(key);
+        self.previous = Some(key);
     }
-    observed
+}
+
+/// One pass over the column, recording the four facts section 3.3 says the build records.
+fn observe(keys: &[Option<i128>]) -> Observed {
+    let mut observer = Observer::new();
+    for key in keys {
+        observer.push(*key);
+    }
+    observer.observed
 }
 
 /// How many distinct values lie between `min` and `max` inclusive.
@@ -644,35 +778,56 @@ fn offset_of(key: i128, base: i128) -> Result<u64> {
         .map_err(|_| malformed("a key is below the base or further from it than a u64 holds"))
 }
 
-/// Builds the bitmap form.
+/// Builds the bitmap form one key at a time.
 ///
 /// The caller guarantees the column is distinct, ascending and null free, which is what makes a
 /// rank equal to a `rid`. The assertion restates it where the correctness depends on it rather than
 /// where the decision was made.
-fn dense(keys: &[Option<i128>], base: i128, range: u64) -> Result<Body> {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the caller checked the range fits a usize"
-    )]
-    let range_usize = range as usize;
-    let mut bits = vec![0_u64; range_usize.div_ceil(64)];
-    let mut previous: Option<i128> = None;
-    for key in keys.iter().flatten() {
+struct DenseBits {
+    base: i128,
+    range: u64,
+    bits: Vec<u64>,
+    previous: Option<i128>,
+}
+
+impl DenseBits {
+    fn new(base: i128, range: u64) -> Self {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the caller checked the range fits a usize"
+        )]
+        let range_usize = range as usize;
+        Self { base, range, bits: vec![0_u64; range_usize.div_ceil(64)], previous: None }
+    }
+
+    fn push(&mut self, key: i128) -> Result<()> {
         debug_assert!(
-            previous.is_none_or(|held| *key > held),
+            self.previous.is_none_or(|held| key > held),
             "the bitmap form needs a distinct ascending column, because a rank is a count of keys below a value and that is a rid only there"
         );
-        previous = Some(*key);
-        let offset = offset_of(*key, base)?;
+        self.previous = Some(key);
+        let offset = offset_of(key, self.base)?;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the caller checked the range fits a usize and the offset is inside it"
         )]
         let at = offset as usize;
-        bits[at / 64] |= 1 << (at % 64);
+        self.bits[at / 64] |= 1 << (at % 64);
+        Ok(())
     }
-    let rank = Rank::build(&bits);
-    Ok(Body::Dense { base, range, bits, rank })
+
+    fn finish(self) -> Body {
+        let rank = Rank::build(&self.bits);
+        Body::Dense { base: self.base, range: self.range, bits: self.bits, rank }
+    }
+}
+
+fn dense(keys: &[Option<i128>], base: i128, range: u64) -> Result<Body> {
+    let mut bits = DenseBits::new(base, range);
+    for key in keys.iter().flatten() {
+        bits.push(*key)?;
+    }
+    Ok(bits.finish())
 }
 
 /// Builds the general form, and settles distinctness on the way.
@@ -965,5 +1120,89 @@ mod tests {
             bytes < bitmap * 5 / 4,
             "the map took {bytes} bytes, more than a quarter over the bitmap's {bitmap}"
         );
+    }
+
+    /// A column that counts how many times it was read, so a test can say what a build cost.
+    struct Counted {
+        column: Vec<Option<i128>>,
+        scans: std::cell::Cell<usize>,
+    }
+
+    impl Keys for Counted {
+        fn scan(&self, each: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()> {
+            self.scans.set(self.scans.get() + 1);
+            self.column.scan(each)
+        }
+    }
+
+    #[test]
+    fn a_build_from_a_scan_is_the_same_map_as_a_build_from_a_slice() {
+        // The two builds have to agree on every column, because the streaming one is not a second
+        // implementation, it is the same decision carried out against a source that is read twice.
+        // If these ever disagree, a table's key map depends on which path built it.
+        let columns: Vec<Vec<Option<i128>>> = vec![
+            Vec::new(),
+            keys(&[]),
+            keys(&(1..=1000).collect::<Vec<i128>>()),
+            keys(&(0..500).map(|value| value * 4).collect::<Vec<i128>>()),
+            keys(&[100, 3, 40, 7, 9000]),
+            keys(&[5, 5, 9]),
+            vec![Some(10), None, Some(20), None, Some(30)],
+            vec![None, None],
+        ];
+        for column in &columns {
+            let held = KeyMap::build(column).expect("build from a slice");
+            let read = KeyMap::build_from(&column[..]).expect("build from a scan");
+            assert_eq!(read.form(), held.form(), "{column:?}");
+            assert_eq!(read.observed(), held.observed(), "{column:?}");
+            assert_eq!(read.len(), held.len(), "{column:?}");
+            assert_eq!(read.bytes(), held.bytes(), "{column:?}");
+            // A column with a repeat in it has no one right row for its key, which is exactly why
+            // section 2.3 refuses to build a link on one. So the round trip is checked where the
+            // question has an answer.
+            if read.observed().usable_as_parent() {
+                resolves(column, &read);
+            }
+        }
+    }
+
+    #[test]
+    fn the_identity_form_is_built_without_reading_the_column_twice() {
+        // The reason `build_from` exists. Every TPC-H parent key takes the identity form, and the
+        // identity form is two numbers, so a build of one has no business holding fifteen million
+        // values or reading them a second time.
+        let identity =
+            Counted { column: keys(&(1..=1000).collect::<Vec<i128>>()), scans: 0.into() };
+        assert_eq!(KeyMap::build_from(&identity).expect("build").form(), Form::Identity);
+        assert_eq!(
+            identity.scans.get(),
+            1,
+            "the identity form is the observation and nothing more"
+        );
+
+        // The other two forms have something to fill, so they read it again, and once is the number
+        // that matters: a form that scanned per value would be a build nobody could afford.
+        let dense = Counted {
+            column: keys(&(0..500).map(|v| v * 4).collect::<Vec<i128>>()),
+            scans: 0.into(),
+        };
+        assert_eq!(KeyMap::build_from(&dense).expect("build").form(), Form::Dense);
+        assert_eq!(dense.scans.get(), 2);
+
+        let sorted = Counted { column: keys(&[100, 3, 40, 7, 9000]), scans: 0.into() };
+        assert_eq!(KeyMap::build_from(&sorted).expect("build").form(), Form::Sorted);
+        assert_eq!(sorted.scans.get(), 2);
+    }
+
+    #[test]
+    fn a_scan_that_fails_stops_the_build_rather_than_half_finishing_it() {
+        struct Broken;
+        impl Keys for Broken {
+            fn scan(&self, _: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()> {
+                Err(malformed("the column could not be read"))
+            }
+        }
+        let error = KeyMap::build_from(&Broken).expect_err("a build over an unreadable column");
+        assert!(error.to_string().contains("could not be read"), "{error}");
     }
 }

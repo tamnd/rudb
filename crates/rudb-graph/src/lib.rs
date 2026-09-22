@@ -35,7 +35,7 @@ pub mod rel;
 pub mod rid;
 pub mod wire;
 
-pub use keymap::{DENSE_THRESHOLD, Form, KeyMap, Observed};
+pub use keymap::{DENSE_THRESHOLD, Form, KeyMap, Keys, Observed};
 pub use rel::{Cardinality, Relationship, Side, parse_links};
 pub use rid::{NO_PARENT, PART_ROWS, Place, Places, Rid, STRIPE_PARTS};
 pub use wire::Payload;
