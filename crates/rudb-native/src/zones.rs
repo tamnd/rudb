@@ -47,9 +47,9 @@
 use std::cmp::Ordering;
 
 use rudb_common::Result;
-use rudb_common::Stat;
-use rudb_common::bounds::{Bound, End, Frequencies, Spread, Test, Zones, kept};
+use rudb_common::bounds::{Bound, End, Frequencies, Remainder, Spread, Test, Zones, kept};
 use rudb_common::stat::{Direction, Provenance};
+use rudb_common::{Stat, Value};
 use rudb_storage::Probe;
 
 use crate::Reader;
@@ -250,6 +250,34 @@ impl Frequencies for Common {
         } else {
             Stat::Unknown
         }
+    }
+
+    fn remainder(&self, column: usize) -> Option<Remainder> {
+        let Ok(Some(prefix)) = self.reader.frequency_prefix(column) else {
+            return None;
+        };
+        // A complete list has nothing outside it, and saying so as a remainder of no rows over no
+        // values would hand the caller a division it has to special case. `rows_with` answers that
+        // column outright.
+        if prefix.omitted_max == 0 {
+            return None;
+        }
+        let mut held: u64 = 0;
+        let mut listed: u64 = 0;
+        for (value, count) in &prefix.entries {
+            held = held.saturating_add(*count);
+            // The null entry's rows come out of the pool and the null itself is not one of the
+            // values, because the counts this is subtracted from do not count it as one. A null in
+            // the list is also the common case rather than an edge: a column with nulls in it usually
+            // has more of them than of anything else.
+            if !matches!(value, Value::Null) {
+                listed += 1;
+            }
+        }
+        // Saturating because two reads of one table disagreeing about its rows is not a reason to
+        // report a tail larger than the column.
+        let rows = Frequencies::rows(self).saturating_sub(held);
+        Some(Remainder { rows, listed, most: prefix.omitted_max })
     }
 }
 

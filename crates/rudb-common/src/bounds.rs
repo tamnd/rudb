@@ -507,6 +507,40 @@ pub trait Frequencies: std::fmt::Debug + Send + Sync {
     /// [`Class::Exact`]: crate::stat::Class::Exact
     /// [`Stat`]: crate::Stat
     fn rows_with(&self, column: usize, value: &Bound) -> Stat<u64>;
+
+    /// The rows and the values one column's synopsis does not account for.
+    ///
+    /// The other half of a prefix. [`rows_with`] answers the values the synopsis lists and gives up
+    /// on the rest, and what is left to say about the rest is where they are: how many rows the
+    /// listed values did not take, and how many values those rows are shared between.
+    ///
+    /// `None` for a column with no synopsis and for one whose synopsis lists every row. A complete
+    /// list has no remainder, and [`rows_with`] already answers a value outside it exactly.
+    ///
+    /// [`rows_with`]: Self::rows_with
+    fn remainder(&self, column: usize) -> Option<Remainder>;
+}
+
+/// What a frequency synopsis left out of one column, for the caller that has to guess at it.
+///
+/// What [`Frequencies::remainder`] answers. A synopsis usually ends up holding the leading values of
+/// a column and a bound on everything it dropped, and the values it holds are the ones dividing the
+/// rows by the distinct count is furthest wrong about. Taking them out leaves the rest of the rows
+/// over the rest of the values, which is the same uniformity assumption asked only of the part of the
+/// column it is still plausible for. On a column with one value in half its rows that is the
+/// difference between a tail value estimated at half the rows and one estimated at its own size.
+///
+/// `listed` counts values rather than entries, so a null the synopsis holds is not one of them. A
+/// distinct count is a count of values and a null is not a value, and the two numbers are subtracted
+/// from each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Remainder {
+    /// How many rows hold a value the synopsis does not list.
+    pub rows: u64,
+    /// How many values the synopsis does list, counting a null as no value.
+    pub listed: u64,
+    /// How many rows the commonest value it left out can hold, which the writer recorded.
+    pub most: u64,
 }
 
 /// Whether `column op value` is false for every value between `low` and `high`.
