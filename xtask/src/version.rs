@@ -83,11 +83,12 @@ pub(crate) fn set(root: &Path, wanted: Option<&str>) -> Result<(), String> {
 /// built. That is the worst place for it to fail, because a tag cannot be moved once it is out, and
 /// it is what happened to 0.2.1.
 ///
-/// Rewritten here rather than by shelling out to `cargo update`, because this workspace has no
-/// external dependencies at all, so every entry in the lock file is one of ours and every one of
-/// them moves together. The count is checked against the tree for the same reason the pins are: a
-/// lock file that had picked up an outside crate would come out one short and say so, rather than
-/// being quietly half rewritten.
+/// Rewritten here rather than by shelling out to `cargo update`, because the entries that move are
+/// exactly the workspace's own and they are easy to pick out: every crate of ours carries the one
+/// version the workspace shares, so renaming that version renames all of them and leaves the
+/// outside crates, which carry versions of their own, untouched. The count is checked against the
+/// tree for the same reason the pins are: a lock file this missed a crate of ours in comes out
+/// short and says so, rather than being quietly half rewritten.
 fn lock(root: &Path, current: &str, wanted: &str, crates: usize) -> Result<usize, String> {
     let path = root.join("Cargo.lock");
     let text =
