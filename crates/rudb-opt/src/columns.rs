@@ -335,10 +335,19 @@ fn walk(plan: &Plan, expr: ExprRef, found: &mut Found) {
         }
         Expr::Conjunction { children, .. } => list(plan, children, found),
         Expr::Function { args, .. } => list(plan, args, found),
-        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+        Expr::Aggregate { args, filter, .. } => {
             list(plan, args, found);
             if let Some(filter) = filter {
                 walk(plan, filter, found);
+            }
+        }
+        Expr::Window { args, filter, order, .. } => {
+            list(plan, args, found);
+            if let Some(filter) = filter {
+                walk(plan, filter, found);
+            }
+            for key in plan.sort_key_list(order).to_vec() {
+                walk(plan, key.expr, found);
             }
         }
         Expr::Case { arms, otherwise } => {

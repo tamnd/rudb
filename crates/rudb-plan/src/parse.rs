@@ -645,31 +645,38 @@ fn read_window(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<ExprRef> {
     let name = plan.intern(&name);
     let distinct = c.eat_keyword_before_argument("DISTINCT");
     let mut args = Vec::new();
+    let mut order = Slice::EMPTY;
     let mut filter = None;
     let mut ignore_nulls = false;
     if !c.eat_space_then(")") {
-        let mut filtered = c.eat_keyword_before_argument("FILTER");
-        let mut ignoring = c.eat_keyword_before_argument("IGNORE");
+        // The three modifiers all come after the arguments and all of them are optional, so seeing
+        // one of their words first is what says there are no arguments at all. They are taken in
+        // the order the printer writes them, and each of the three is looked for once.
+        let mut ordered = c.eat_keyword_before_argument("ORDER");
+        let mut filtered = !ordered && c.eat_keyword_before_argument("FILTER");
+        let mut ignoring = !ordered && !filtered && c.eat_keyword_before_argument("IGNORE");
         if ignoring {
             c.expect_word("NULLS")?;
         }
-        if !filtered && !ignoring {
+        if !ordered && !filtered && !ignoring {
             loop {
                 args.push(read_expr(plan, c)?);
                 if !c.eat_space_then(",") {
                     break;
                 }
             }
+            ordered = c.eat_keyword_before_argument("ORDER");
+        }
+        if ordered {
+            order = read_sort_keys(plan, c)?;
+        }
+        if !filtered && !ignoring {
             filtered = c.eat_keyword_before_argument("FILTER");
-            if filtered {
-                filter = Some(read_expr(plan, c)?);
-            }
-            ignoring = c.eat_keyword_before_argument("IGNORE");
-            if ignoring {
-                c.expect_word("NULLS")?;
-            }
-        } else if filtered {
+        }
+        if filtered {
             filter = Some(read_expr(plan, c)?);
+        }
+        if !ignoring {
             ignoring = c.eat_keyword_before_argument("IGNORE");
             if ignoring {
                 c.expect_word("NULLS")?;
@@ -680,7 +687,7 @@ fn read_window(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<ExprRef> {
     }
     let args = plan.add_expr_list(&args);
     let ty = read_annotation(c)?;
-    Ok(plan.add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls }, ty))
+    Ok(plan.add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls, order }, ty))
 }
 
 fn read_window_frame(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<WindowFrame> {

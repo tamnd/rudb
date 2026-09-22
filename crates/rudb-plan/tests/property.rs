@@ -555,7 +555,8 @@ impl Generator {
         };
         let ignore_nulls = self.random.chance(3);
         let ty = self.ty(0);
-        self.plan.add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls }, ty)
+        let order = Slice::EMPTY;
+        self.plan.add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls, order }, ty)
     }
 
     fn exprs(&mut self, count: usize, depth: usize) -> Slice {

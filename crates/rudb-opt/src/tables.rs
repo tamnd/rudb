@@ -131,12 +131,23 @@ impl Tables {
                     set.extend(&self.of(plan, child));
                 }
             }
-            Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+            Expr::Aggregate { args, filter, .. } => {
                 for arg in plan.expr_list(args).to_vec() {
                     set.extend(&self.of(plan, arg));
                 }
                 if let Some(inner) = filter {
                     set.extend(&self.of(plan, inner));
+                }
+            }
+            Expr::Window { args, filter, order, .. } => {
+                for arg in plan.expr_list(args).to_vec() {
+                    set.extend(&self.of(plan, arg));
+                }
+                if let Some(inner) = filter {
+                    set.extend(&self.of(plan, inner));
+                }
+                for key in plan.sort_key_list(order).to_vec() {
+                    set.extend(&self.of(plan, key.expr));
                 }
             }
             Expr::Case { arms, otherwise } => {

@@ -992,3 +992,149 @@ fn a_decimal_that_would_not_fit_its_own_width_is_null_rather_than_too_wide() {
         ]
     );
 }
+
+/// The whole partition as a frame, written out once because every test below it wants the same
+/// words and they are longer than the call they follow.
+const WHOLE: &str = "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING";
+
+#[test]
+fn an_order_inside_the_brackets_is_the_order_the_call_reads_the_frame_in() {
+    // Not the window's own ordering. The one in the `OVER` lays the partition out and the one in
+    // here decides what order the call sees the rows of its frame in once it is laid out, which is
+    // why this is the largest `i` in the frame and not the first row of it.
+    assert_eq!(
+        answered(&format!("first_value(i ORDER BY i DESC) OVER (ORDER BY i {WHOLE})")),
+        ints(&[Some(4); 6])
+    );
+    assert_eq!(
+        answered(&format!("last_value(i ORDER BY i DESC) OVER (ORDER BY i {WHOLE})")),
+        ints(&[None; 6])
+    );
+    assert_eq!(
+        answered(&format!("nth_value(i, 2 ORDER BY i DESC) OVER (ORDER BY i {WHOLE})")),
+        ints(&[Some(3); 6])
+    );
+}
+
+#[test]
+fn the_nulls_go_where_the_clause_puts_them_and_ignore_nulls_still_passes_over_them() {
+    // These three count rows and not values, so a null that sorts to the front is the answer. The
+    // last one is the pair of clauses together, and they do different things: the placement moves
+    // the null to the front and `IGNORE NULLS` then passes over it, which is the only reading under
+    // which both clauses are still doing something.
+    assert_eq!(
+        answered(&format!("first_value(i ORDER BY i DESC NULLS FIRST) OVER (ORDER BY i {WHOLE})")),
+        ints(&[None; 6])
+    );
+    let call = "first_value(i ORDER BY i DESC NULLS FIRST IGNORE NULLS)";
+    assert_eq!(answered(&format!("{call} OVER (ORDER BY i {WHOLE})")), ints(&[Some(4); 6]));
+}
+
+#[test]
+fn the_sort_is_within_the_frame_and_not_within_the_partition() {
+    // A frame narrower than the partition sorts what is in the frame and nothing else, so the first
+    // row answers 2 rather than 4. Getting this wrong by sorting the partition once and reading the
+    // frame off the sorted order gives 4 all the way down, which is what the first test above
+    // expects, so the narrow frame is the one that tells the two apart.
+    assert_eq!(
+        answered(
+            "first_value(i ORDER BY i DESC) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"
+        ),
+        ints(&[Some(2), Some(2), Some(3), Some(4), Some(4), Some(4)])
+    );
+}
+
+#[test]
+fn exclude_drops_its_row_before_the_inner_order_runs() {
+    // The fifth row is the one holding 4, which is the largest in the partition, and with itself
+    // excluded it answers the next one down. Sorting first and excluding afterwards would leave it
+    // answering 4, so this is the record that says which way round the two go.
+    assert_eq!(
+        answered(&format!(
+            "first_value(i ORDER BY i DESC) OVER (ORDER BY i {WHOLE} EXCLUDE CURRENT ROW)"
+        )),
+        ints(&[Some(4), Some(4), Some(4), Some(4), Some(3), Some(4)])
+    );
+}
+
+#[test]
+fn the_inner_order_reaches_no_further_than_the_partition_does() {
+    assert_eq!(
+        answered(&format!(
+            "first_value(i ORDER BY i DESC) OVER (PARTITION BY j ORDER BY i {WHOLE})"
+        )),
+        ints(&[Some(2), Some(2), Some(2), Some(4), Some(4), Some(4)])
+    );
+}
+
+#[test]
+fn an_aggregate_used_as_a_window_takes_the_clause_too() {
+    // Addition does not care what order it is done in, so nothing in the answer moves. The point is
+    // that the query is accepted and still answers, because refusing the clause on an aggregate
+    // would take out every ordered `sum` and `count` written over a window.
+    assert_eq!(
+        answered(
+            "sum(i ORDER BY i DESC) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+        ),
+        totals(&[1, 3, 5, 8, 12, 12])
+    );
+}
+
+#[test]
+fn two_calls_over_the_same_window_are_told_apart_by_their_inner_order() {
+    // The two share a partition, an order and a frame, and the pass over the window is free to
+    // answer them together when they are the same call. They are not the same call, and a
+    // comparison that looked at everything except the keys inside the brackets would say they were
+    // and give both rows the same column twice.
+    let database = built();
+    let sql = format!(
+        "SELECT first_value(i) OVER (ORDER BY i {WHOLE}), \
+         first_value(i ORDER BY i DESC) OVER (ORDER BY i {WHOLE}) FROM t ORDER BY i, j"
+    );
+    assert_eq!(column(&database, &sql, 0), ints(&[Some(1); 6]));
+    assert_eq!(column(&database, &sql, 1), ints(&[Some(4); 6]));
+}
+
+#[test]
+fn a_key_inside_the_brackets_does_not_have_to_be_a_column_the_call_returns() {
+    // Two keys running in different directions, over a column that is neither the argument nor the
+    // window's own order key. A column pruning pass that walks a window call's arguments and stops
+    // there drops `j` before this ever reaches the window, so the query fails to bind rather than
+    // answering wrongly, which is the failure this is here to catch.
+    let database = built();
+    let sql = format!(
+        "SELECT first_value(j ORDER BY j DESC, i) OVER (ORDER BY i {WHOLE}) FROM t ORDER BY i, j"
+    );
+    assert_eq!(column(&database, &sql, 0), vec![Value::Varchar("b".into()); 6]);
+}
+
+#[test]
+fn the_window_functions_that_do_not_read_the_frame_say_so_rather_than_guessing() {
+    // `lead`, `lag`, `fill` and the rankings read something other than the frame, so an order over
+    // the frame is a question they have no obvious answer to. The pinned binary has one and it is
+    // not the ordinary reading of the words, so these are turned down until that is worked through.
+    // Per #1204.
+    let database = built();
+    let connection = database.connect();
+    let sql = "SELECT lead(i ORDER BY i DESC) OVER (ORDER BY i) FROM t";
+    let error = connection.query(sql).expect_err("lead has no reading of this yet");
+    assert!(error.to_string().contains("ORDER BY inside the arguments"), "{error}");
+}
+
+#[test]
+fn exclude_under_an_inner_order_is_refused_in_the_pinned_binarys_own_words() {
+    // Upstream refuses `EXCLUDE` on these three only once an inner order is present, which is not
+    // an accident of where the check sits. Without the inner order `lead` never looks at the frame,
+    // so what the frame drops cannot matter; with it the frame is suddenly the thing being read.
+    // The wording is upstream's, doubled quotes and all, because a corpus record matches on it.
+    let database = built();
+    let connection = database.connect();
+    let sql = format!(
+        "SELECT lead(i ORDER BY i DESC) OVER (ORDER BY i {WHOLE} EXCLUDE CURRENT ROW) FROM t"
+    );
+    let error = connection.query(&sql).expect_err("upstream refuses this one");
+    assert!(
+        error.to_string().contains("EXCLUDE is not supported for the window function"),
+        "{error}"
+    );
+}

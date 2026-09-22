@@ -2442,9 +2442,26 @@ impl<'a> Transform<'a> {
         // `FunctionExpressionArgumentList <- DistinctOrAll? FunctionArgumentList? OrderByClause?
         // IgnoreOrRespectNulls?`, so a call with no arguments still has both wrappers.
         let list = self.first(self.nth(node, 1));
-        if self.find(list, "OrderByClause") != NONE {
-            return self.unsupported(self.find(list, "OrderByClause"));
+        // An `ORDER BY` written inside the brackets is the order the call reads its rows in, which
+        // is a different thing from the `ORDER BY` in an `OVER` and is written in a different place.
+        // A call without an `OVER` is an aggregate and this is the ordered aggregate form, which is
+        // still a gap, so the clause is only kept for a window call and the rest say so. Per #1203.
+        let inside = self.find(list, "OrderByClause");
+        if inside != NONE && over == NONE {
+            return self.unsupported(inside);
         }
+        let inner = if inside == NONE {
+            Slice { start: 0, len: 0 }
+        } else {
+            // `ORDER BY ALL` names the call's own arguments rather than a list of keys, and what the
+            // reference binary does with it in here is not the ordinary reading of the words, so it
+            // is turned down rather than guessed at.
+            let (items, all) = self.order_by(inside)?;
+            if all {
+                return self.unsupported(inside);
+            }
+            self.order_slice(items)
+        };
         // Either word is a window modifier and nothing else carries one, so an ordinary call that
         // writes one is turned down here, in the sentence the pin turns it down with.
         let nulls = self.find(list, "IgnoreOrRespectNulls");
@@ -2475,6 +2492,7 @@ impl<'a> Transform<'a> {
                 distinct,
                 filter,
                 ignore_nulls,
+                order: inner,
                 spec,
             }));
         }
@@ -3483,6 +3501,14 @@ mod tests {
         fn shown_filter(ast: &Ast, filter: ExprRef) -> String {
             if filter == NONE { String::new() } else { format!(" FILTER [{}]", show(ast, filter)) }
         }
+        /// A run of sort keys, which a window call has two of and in two different places.
+        fn keys(ast: &Ast, slice: Slice) -> String {
+            ast.order_list(slice)
+                .iter()
+                .map(|item| format!("{} {:?} {:?}", show(ast, item.expr), item.order, item.nulls))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
         let list = |slice: Slice| {
             ast.expr_list(slice).iter().map(|&item| show(ast, item)).collect::<Vec<_>>().join(", ")
         };
@@ -3525,26 +3551,21 @@ mod tests {
                 let filter = shown_filter(ast, filter);
                 format!("{}({distinct}{}){filter}", ast.name_text(name), list(args))
             }
-            Expr::Window { name, args, distinct, filter, ignore_nulls, spec } => {
+            Expr::Window { name, args, distinct, filter, ignore_nulls, order: inner, spec } => {
                 let distinct = if distinct { "DISTINCT " } else { "" };
                 let filter = shown_filter(ast, filter);
                 let nulls = if ignore_nulls { " IGNORE NULLS" } else { "" };
+                let inner = keys(ast, inner);
+                let inner = if inner.is_empty() { inner } else { format!(" ORDER BY {inner}") };
                 let held = ast.window(spec);
-                let order = ast
-                    .order_list(held.order)
-                    .iter()
-                    .map(|item| {
-                        format!("{} {:?} {:?}", show(ast, item.expr), item.order, item.nulls)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let order = keys(ast, held.order);
                 let bound = |end: WindowBound| match end {
                     WindowBound::Preceding(offset) => format!("Preceding({})", show(ast, offset)),
                     WindowBound::Following(offset) => format!("Following({})", show(ast, offset)),
                     other => format!("{other:?}"),
                 };
                 format!(
-                    "{}({distinct}{}{nulls}){filter} OVER [{}] [{order}] [{:?} {} {} {:?}]",
+                    "{}({distinct}{}{inner}{nulls}){filter} OVER [{}] [{order}] [{:?} {} {} {:?}]",
                     ast.name_text(name),
                     list(args),
                     list(held.partition),

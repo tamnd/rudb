@@ -334,22 +334,35 @@ fn write_form<W: Write>(plan: &Plan, out: &mut W, expr: ExprRef) -> fmt::Result 
             }
             out.write_char(')')
         }
-        Expr::Window { name, args, distinct, filter, ignore_nulls } => {
+        Expr::Window { name, args, distinct, filter, ignore_nulls, order } => {
             write_function_name(out, plan.string(name))?;
             out.write_char('(')?;
             if distinct {
                 out.write_str("DISTINCT ")?;
             }
             write_arguments_of(plan, out, args)?;
+            // Each of the three modifiers takes a space in front of it only when something was
+            // written before it, so a call with nothing but one of them has no gap after the
+            // bracket. The order they go in is the order the reader below takes them in.
+            let mut written = !plan.expr_list(args).is_empty();
+            if !order.is_empty() {
+                if written {
+                    out.write_char(' ')?;
+                }
+                out.write_str("ORDER ")?;
+                write_sort_keys(plan, out, order)?;
+                written = true;
+            }
             if let Some(filter) = filter {
-                if !plan.expr_list(args).is_empty() {
+                if written {
                     out.write_char(' ')?;
                 }
                 out.write_str("FILTER ")?;
                 write_expr(plan, out, filter)?;
+                written = true;
             }
             if ignore_nulls {
-                if !plan.expr_list(args).is_empty() || filter.is_some() {
+                if written {
                     out.write_char(' ')?;
                 }
                 out.write_str("IGNORE NULLS")?;
