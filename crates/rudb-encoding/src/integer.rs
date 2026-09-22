@@ -56,6 +56,17 @@ use crate::bitpack::{self, VALUES};
 /// fourth level has never once been the smallest candidate in anything measured so far.
 const MAX_DEPTH: u8 = 3;
 
+/// How many values a run writes at once, whatever the run is.
+///
+/// A run length decode used to write a value at a time for the length of the run, which reads well
+/// and is the wrong shape for the data: a clustered join key runs two or three long, so the loop
+/// spent its time mispredicting its own exit and the branch cost more than the stores did. Writing
+/// a fixed eight and then moving on by the run's real length has no exit to predict, and whatever
+/// of the eight was surplus is overwritten by the run that follows, because every run writes at
+/// least its own length. Eight because it is two vector stores on every machine this runs on and
+/// longer than nearly every run in a column worth run length encoding at all.
+const RUN: usize = 8;
+
 /// What a chunk is encoded as. The discriminant is the tag byte in the serialized form and is part
 /// of the format, so the numbers are written down rather than left to the compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,13 +550,27 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
             if run_values.len() != run_lengths.len() {
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
-            let mut values = Vec::with_capacity(count);
+            // Room for one run past the end, so the write below never has to ask how much of its
+            // fixed width landed inside the chunk.
+            let mut values = vec![0; count + RUN];
+            let mut at = 0usize;
             for (value, length) in run_values.into_iter().zip(run_lengths) {
                 let length = usize::try_from(length)
                     .map_err(|_| Error::internal("a negative RLE run length"))?;
-                values.extend(std::iter::repeat_n(value, length));
+                let end = at
+                    .checked_add(length)
+                    .filter(|end| *end <= count)
+                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
+                let short =
+                    if length <= RUN { values[at..].first_chunk_mut::<RUN>() } else { None };
+                match short {
+                    Some(window) => window.fill(value),
+                    None => values[at..end].fill(value),
+                }
+                at = end;
             }
-            check_count(values.len(), count)?;
+            check_count(at, count)?;
+            values.truncate(count);
             Ok(values)
         }
         Kind::Dict => {
@@ -1326,6 +1351,43 @@ mod tests {
         bytes.extend_from_slice(&encode(&[-4]).unwrap());
         let error = decode(&bytes).unwrap_err();
         assert!(error.message().contains("negative"), "{error}");
+    }
+
+    /// A run that ends past the chunk it is in is an error and not a write past the end.
+    #[test]
+    fn a_run_that_runs_past_its_chunk_is_an_error() {
+        // The decode writes a fixed eight values per run and moves on by the run's own length, so
+        // the buffer carries eight values of slack and a run that claims more rows than the chunk
+        // holds would be the one way to reach past it. It is refused before the write rather than
+        // caught by the count afterwards.
+        let mut bytes = vec![Kind::Rle.tag()];
+        put_u32(&mut bytes, 4);
+        bytes.extend_from_slice(&encode(&[7]).unwrap());
+        bytes.extend_from_slice(&encode(&[9]).unwrap());
+        let error = decode(&bytes).unwrap_err();
+        assert!(error.message().contains("past its chunk"), "{error}");
+    }
+
+    /// Runs of every length around the eight that a run is written in, in one chunk.
+    #[test]
+    fn runs_shorter_and_longer_than_the_width_they_are_written_in_all_come_back() {
+        // A run of one, several shorter than eight, one of exactly eight and two longer, with the
+        // shortest run last so that the surplus of the write before it has nothing after it to be
+        // overwritten by. The values differ from each other, because a surplus that was left in
+        // place would be invisible against a neighbour holding the same value.
+        let lengths = [1, 3, 7, 8, 9, 40, 2, 1];
+        let mut values = Vec::new();
+        for (at, length) in lengths.iter().enumerate() {
+            let value = i64::try_from(at).expect("eight runs") * 1000 - 3;
+            values.extend(std::iter::repeat_n(value, *length));
+        }
+        let bytes = encode(&values).expect("encodes");
+        assert_eq!(decode(&bytes).expect("decodes"), values, "runs around the write width");
+        // And the same rows a run at a time, which is the run length encoder's worst case and the
+        // shape a column with no runs in it decodes as.
+        let singles: Vec<i64> = (0..300).map(|index| index * 7 % 11).collect();
+        let bytes = encode(&singles).expect("encodes");
+        assert_eq!(decode(&bytes).expect("decodes"), singles, "no run longer than one");
     }
 
     #[test]
