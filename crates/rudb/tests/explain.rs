@@ -148,18 +148,19 @@ fn explain_analyze_runs_the_query_and_prints_what_each_operator_actually_did() {
     assert!(text.contains("[applied by the scan below]"), "{text}");
 }
 
-/// A filter that stayed where it was still reports what it did.
+/// A filter no zone map can read goes into the scan all the same, and the output says so.
 ///
-/// `a % 2 = 0` is not a column against a constant, so no scan can apply it and the operator is
-/// built. The scan hands up every row it read and the filter throws half of them away, which is the
-/// two numbers this output is for.
+/// `a % 2 = 0` is not a column against a constant, so nothing about it can rule a chunk out, and
+/// that used to keep it above the scan. Where the comparison runs and whether a chunk can be
+/// skipped are two questions and only the second one needs the predicate to read as a test. So the
+/// comparison happens in the scan, on every chunk, which is what it would have done up there, and
+/// one operator and the chunk handed across to it are gone.
 #[test]
-fn explain_analyze_measures_a_filter_that_no_scan_could_take() {
+fn explain_analyze_measures_a_filter_no_zone_map_could_read() {
     let database = with_rows(1000);
     let text = explained(&database, "EXPLAIN ANALYZE SELECT a FROM t WHERE a % 2 = 0");
-    assert!(!text.contains("[applied by the scan below]"), "{text}");
-    assert!(text.contains("[1000 rows, "), "the scan read all of them: {text}");
-    assert!(text.contains("[500 rows, "), "the filter kept half: {text}");
+    assert!(text.contains("[applied by the scan below]"), "{text}");
+    assert!(text.contains("[500 rows after the filter above, "), "the scan kept half: {text}");
 }
 
 #[test]

@@ -5406,61 +5406,77 @@ fn operator<'a>(metrics: &'a rudb_metrics::Document, kind: &str) -> &'a rudb_met
         .unwrap_or_else(|| panic!("a {kind} in {:?}", metrics.operators))
 }
 
-/// The three operators of a small query and what each of them reported.
+/// The operators of a small query and what each of them reported.
 ///
-/// The predicate is written `x + 0 > 1` rather than `x > 1` so that a filter operator exists to
-/// report anything at all. A comparison of a column against a constant is applied by the scan
-/// itself now, and this test is about the metrics document rather than about where the comparison
-/// runs, so it asks for the shape it means to measure.
+/// There is no filter operator in here to read, and there is no way to write one over a stored
+/// table any more: a filter sitting directly on a `Get` is applied by the scan and gets no operator
+/// of its own, whatever its predicate is. So the scan is both halves of this, and the rows flowing
+/// from one operator to the next are read off the projection above it instead.
 #[test]
 fn a_query_reports_what_every_operator_in_it_did() {
     let db = database();
-    let result = db.query("SELECT x FROM t WHERE x + 0 > 1").unwrap();
+    let sql = "SELECT x FROM t WHERE x > 1";
+    let result = db.query(sql).unwrap();
     let metrics = result.metrics().expect("a query that ran has metrics");
-    assert_eq!(metrics.query.sql, "SELECT x FROM t WHERE x + 0 > 1");
+    assert_eq!(metrics.query.sql, sql);
     let scan = operator(metrics, "Scan");
-    let filter = operator(metrics, "Filter");
+    let project = operator(metrics, "Project");
     assert_eq!(scan.detail.as_deref(), Some("t"), "a scan says what it read");
-    assert_eq!(scan.rows_out, 4, "the table has four rows and the scan produced them");
-    assert_eq!(filter.rows_in, 4, "what the scan produced is what the filter was handed");
-    assert_eq!(filter.rows_out, 2, "two rows are over one");
-    assert_eq!(filter.pipeline, scan.pipeline, "nothing here breaks a pipeline");
+    assert_eq!(scan.rows_out, 2, "two of the four rows are over one and the scan is the filter");
+    assert_eq!(project.rows_in, 2, "what the scan produced is what the one above it was handed");
+    assert_eq!(project.rows_out, 2, "a projection keeps every row it is given");
+    assert_eq!(project.pipeline, scan.pipeline, "nothing here breaks a pipeline");
     assert!(metrics.timing.execute_ns > 0, "running it took longer than nothing");
     assert!(
         metrics.operators.iter().all(|operator| operator.reference_impl),
         "everything at tier 0 is the reference implementation and the document says so"
     );
-    let filter = operator(metrics, "Filter");
-    assert_eq!(filter.implementations.len(), 1, "a filter sits on one registered seam");
-    assert_eq!(filter.implementations[0].seam, "chunk.compaction");
-    assert_eq!(filter.implementations[0].name, "never");
+    assert_eq!(scan.implementations.len(), 1, "the filter it took in sits on one registered seam");
+    assert_eq!(scan.implementations[0].seam, "chunk.compaction");
+    assert_eq!(scan.implementations[0].name, "never");
 }
 
+/// Pinning a seam under an operator takes the reference marker off that operator and no other.
+///
+/// What the flag was supposed to do all along and could not, because it was set to true on every
+/// operator whatever had run. It is read off the scan because the scan is what applies the filter
+/// the compaction seam belongs to, and the seams of a filter that moved down have to move down with
+/// it: the scan's row is then the only row in the document, and a seam reported nowhere is a seam
+/// nobody can tell ran. Reading the document back to check a pinned compaction strategy answered no
+/// on every query whose filter moved into the scan, which is most of ClickBench.
 #[test]
 fn an_operator_that_was_pinned_off_the_reference_stops_being_marked_as_one() {
-    // What the flag was supposed to do all along and could not, because it was set to true on
-    // every operator whatever had run. The seam is pinned to something that is not the reference,
-    // so the filter's row has to say so and every other row has to be unaffected.
     let db = database();
     db.execute("SET seam_chunk_compaction = 'learned-gain'").unwrap();
-    let result = db.query("SELECT x FROM t WHERE x + 0 > 1").unwrap();
+    let result = db.query("SELECT x FROM t WHERE x > 1").unwrap();
     let metrics = result.metrics().expect("a query that ran has metrics");
-    let filter = operator(metrics, "Filter");
-    assert!(!filter.reference_impl, "{:?}", filter.implementations);
-    assert_eq!(filter.implementations[0].name, "learned-gain");
-    assert!(operator(metrics, "Scan").reference_impl, "a scan sits on no registered seam");
+    let scan = operator(metrics, "Scan");
+    assert!(!scan.reference_impl, "{:?}", scan.implementations);
+    assert_eq!(scan.implementations[0].seam, "chunk.compaction");
+    assert_eq!(scan.implementations[0].name, "learned-gain");
+    assert!(
+        operator(metrics, "Project").reference_impl,
+        "a projection sits on no registered seam, and pinning one under the scan is not about it"
+    );
 }
 
+/// The ids of a query with nothing pushed anywhere, which is where they run consecutively.
+///
+/// A query with a filter over a stored table leaves a gap instead, because the filter node keeps
+/// the number the plan gave it and never gets an operator. That is the test below this one. This
+/// one is about the promise the numbering makes on its own, so it asks for a plan where every node
+/// became an operator. It groups rather than counting the lot, because an ungrouped count is
+/// answered out of the stored summary and there is then no scan in the query to number.
 #[test]
 fn every_operator_has_its_own_id_and_a_parent_is_numbered_before_its_children() {
     let db = database();
-    let result = db.query("SELECT count(*) FROM t WHERE x + 0 > 1").unwrap();
+    let result = db.query("SELECT count(*) FROM t GROUP BY x").unwrap();
     let metrics = result.metrics().expect("a query that ran has metrics");
     let ids: Vec<u32> = metrics.operators.iter().map(|operator| operator.id).collect();
     assert_eq!(ids, (0..u32::try_from(ids.len()).unwrap()).collect::<Vec<_>>());
     let scan = operator(metrics, "Scan");
-    let filter = operator(metrics, "Filter");
-    assert!(filter.id < scan.id, "the filter is above the scan, so it is numbered first");
+    let aggregate = operator(metrics, "Aggregate");
+    assert!(aggregate.id < scan.id, "the aggregate is above the scan, so it is numbered first");
 }
 
 /// A filter the scan applied itself has no row in the document, and leaves its number unused.
