@@ -113,6 +113,6 @@ It does not claim the change is worthless, only that it is worth nothing here. T
 
 It does not claim the map is free. It is a megabyte per thread, it is not charged against the memory budget, and it is cleared once per dictionary per thread.
 
-It does not say what to do instead. The grouping is a probe and a byte comparison over flat strings, seven rows in eight, and nothing in this document makes that faster. What it establishes is that the next attempt has to.
+It does not say what to do instead. The grouping is a probe and a byte comparison over flat strings, seven rows in eight, and nothing in this document makes that faster. What it establishes is that the next attempt has to, and document 25 measures what that attempt can be worth before anybody makes it.
 
 The profile is from a host at load average 24, and the kernel share in it is the part most likely to be inflated by that. The shares of one symbol against another inside the process are what the argument uses, and the 21.5% the probe and the comparison hold between them is the number this document stands on.
