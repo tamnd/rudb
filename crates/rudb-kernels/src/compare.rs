@@ -765,6 +765,19 @@ where
         if let (Some(one), Some(other)) = (packing(left), packing(right)) {
             return packings_against_each_other(op, &one, &other, len, map);
         }
+        // A bit packed column against a flat one, which is the pair a clustered table hands the
+        // filter. Inside a narrow partition a date column takes few enough distinct values to pack
+        // and the column beside it does not, so the better encoding the clustering buys is what
+        // used to send the comparison to the row at a time path. Both sides are read where they
+        // are, the packed one as its base plus its code and the flat one as the number it already
+        // is. On TPC-H this is `l_commitdate < l_receiptdate` on the clustered file, which is q4
+        // and q21.
+        if let (Some(one), Some(other)) = (packing(left), &other) {
+            return packing_against_run(op, &one, other, len, map);
+        }
+        if let (Some(one), Some(other)) = (&one, packing(right)) {
+            return packing_against_run(op.swapped(), &other, one, len, map);
+        }
     }
     if let (Some(one), Some(value)) = (&one, right.constant_value()) {
         let column = readied(held, left.logical_type(), value)?;
@@ -1137,6 +1150,125 @@ where
             map,
         ),
     }
+}
+
+/// A packed run against a run of whole numbers, with the four ways to index the pair resolved here.
+///
+/// The answer is for `packed op run`, so a caller with the flat side on the left hands the swapped
+/// operator rather than a second loop. It is the same arrangement [`packings_against_each_other`]
+/// has and it is here for the same reason: the mapping is picked once out here so that the loop
+/// underneath is monomorphized on it rather than calling through a pointer per row.
+fn packing_against_run<M>(
+    op: Comparison,
+    packed: &Packing<'_>,
+    run: &Through<'_>,
+    len: usize,
+    map: M,
+) -> Option<Vec<bool>>
+where
+    M: Fn(usize) -> usize + Copy,
+{
+    match (packed, run) {
+        (Packing::Straight(one), Through::Direct(other)) => {
+            packed_against_flat(op, one, identity, other, identity, len, map)
+        }
+        (Packing::Straight(one), Through::Coded(codes, other)) => {
+            packed_against_flat(op, one, identity, other, |row| codes[row] as usize, len, map)
+        }
+        (Packing::Coded(codes, one), Through::Direct(other)) => {
+            packed_against_flat(op, one, |row| codes[row] as usize, other, identity, len, map)
+        }
+        (Packing::Coded(codes, one), Through::Coded(others, other)) => packed_against_flat(
+            op,
+            one,
+            |row| codes[row] as usize,
+            other,
+            |row| others[row] as usize,
+            len,
+            map,
+        ),
+    }
+}
+
+/// A bit packed column against a flat one, with neither side turned into the other.
+///
+/// The packed side is its base plus its code and the flat side is the number it already holds, so
+/// the loop is an add, a widen and a compare, and nothing is unpacked into a vector of its own. The
+/// row at a time path underneath this was building a [`Value`] for both sides of every row.
+///
+/// `None` for a layout whose values do not all fit in an `i128`, and for a packed side whose base
+/// plus width does not fit either, which is the question [`ceiling_of`] asks. The loop adds without
+/// asking so the asking happens once out here, the same way [`packed_against_packed`] does it.
+///
+/// This is the pair a clustered table produces. Sorting lineitem by month of `l_shipdate` leaves
+/// `l_commitdate` with about a hundred distinct values inside a partition, which packs, while
+/// `l_receiptdate` arrives flat, and `l_commitdate < l_receiptdate` is q4, q12 and q21.
+fn packed_against_flat<L, R, M>(
+    op: Comparison,
+    packed: &Packed<'_>,
+    at_packed: L,
+    flat: &Data,
+    at_flat: R,
+    len: usize,
+    map: M,
+) -> Option<Vec<bool>>
+where
+    L: Fn(usize) -> usize,
+    R: Fn(usize) -> usize,
+    M: Fn(usize) -> usize + Copy,
+{
+    ceiling_of(packed)?;
+    let base = packed.base();
+    macro_rules! layouts {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match flat {
+                $(
+                    Data::$variant(run) => Some(numbers_compared(op, len, |slot| {
+                        let row = map(slot);
+                        (
+                            base + i128::from(packed.code(at_packed(row))),
+                            i128::from(run[at_flat(row)]),
+                        )
+                    })),
+                )+
+                // A layout with no whole number in it, which is every string, float and interval
+                // column, plus `UBIGINT`'s wider sibling whose largest value has no `i128`.
+                _ => None,
+            }
+        };
+    }
+    rudb_vector::for_each_layout!(exact, layouts)
+}
+
+/// One pass over the rows with the comparison inlined into it, over a pair of numbers a row.
+///
+/// The operator is a match out here and a separate loop under each arm rather than one loop calling
+/// a function it was handed, for the reason [`packed_against`] gives: a function pointer is an
+/// indirect call per row and a loop with one in it is a loop the compiler will not widen.
+fn numbers_compared<P>(op: Comparison, len: usize, pair: P) -> Vec<bool>
+where
+    P: Fn(usize) -> (i128, i128),
+{
+    let mut answers = vec![false; len];
+    /// One pass over the rows with `$test` as the body.
+    macro_rules! sweep {
+        ($test:expr) => {{
+            let test = $test;
+            for (slot, answer) in answers.iter_mut().enumerate() {
+                let (one, other) = pair(slot);
+                *answer = test(one, other);
+            }
+        }};
+    }
+    match op {
+        Comparison::Equal | Comparison::NotDistinctFrom => sweep!(|one, other| one == other),
+        Comparison::NotEqual | Comparison::DistinctFrom => sweep!(|one, other| one != other),
+        Comparison::Less => sweep!(|one, other| one < other),
+        Comparison::LessOrEqual => sweep!(|one, other| one <= other),
+        Comparison::Greater => sweep!(|one, other| one > other),
+        Comparison::GreaterOrEqual => sweep!(|one, other| one >= other),
+    }
+    answers
 }
 
 /// The largest value a packed vector can hold, or `None` if that number does not exist.
@@ -2479,6 +2611,53 @@ mod tests {
         let total = EVERY.iter().filter(|op| op.is_total()).count();
         assert_eq!(
             fallback::count(Kernel::Compare, Form::Dictionary, Form::Dictionary) - before,
+            total as u64,
+            "only the two total comparisons fall through"
+        );
+    }
+
+    /// A bit packed column against a flat one, which is the pair a clustered table hands the filter.
+    ///
+    /// Sorting lineitem by month of `l_shipdate` leaves `l_commitdate` with few enough distinct
+    /// values inside a partition to pack, while `l_receiptdate` arrives flat, so the better encoding
+    /// the clustering buys was what turned `l_commitdate < l_receiptdate` into a `Value` a side a
+    /// row. All four ways the two sides can be indexed are here, because a stored date column comes
+    /// back as a dictionary over a packed run about as often as it comes back as a packed run on its
+    /// own.
+    #[test]
+    fn a_packed_column_against_a_flat_one_answers_what_the_oracle_answers() {
+        let before = fallback::count(Kernel::Compare, Form::BitPacked, Form::Flat);
+        let dates = |start: i32, step: i32, nulls: usize| {
+            Vector::flat(
+                LogicalType::Date,
+                Data::Int32((0..64).map(|row| start + row * step).collect::<Vec<i32>>().into()),
+            )
+            .expect("dates are an i32 layout")
+            .with_validity(Validity::from_iter(64, |row| row % nulls != 0))
+        };
+        let codes =
+            |seed: usize| -> Vec<u32> { (0..64).map(|row| ((row * seed) % 64) as u32).collect() };
+        let packed = dates(9_000, 3, 5).bit_packed().expect("packs");
+        let flat = dates(9_040, 2, 7);
+        let over_packed = Vector::dictionary(codes(7), packed.clone()).expect("codes are in range");
+        let over_flat = Vector::dictionary(codes(11), flat.clone()).expect("codes are in range");
+        assert_eq!(packed.form(), Form::BitPacked);
+        assert_eq!(flat.form(), Form::Flat);
+        // The ranges overlap, which is what makes the comparison a pass over the rows rather than
+        // arithmetic on four numbers, and this test wants the pass.
+        assert!(packed.packed_parts().expect("packed").base() < 9_040 + 63 * 2);
+        for op in EVERY {
+            agrees(op, &packed, &flat);
+            agrees(op, &flat, &packed);
+            agrees(op, &packed, &over_flat);
+            agrees(op, &over_packed, &flat);
+            agrees(op, &over_packed, &over_flat);
+        }
+        // Only the two total comparisons are left to count themselves, the same way they are for a
+        // pair of packed columns, and of the five pairs above only the first is packed against flat.
+        let total = EVERY.iter().filter(|op| op.is_total()).count();
+        assert_eq!(
+            fallback::count(Kernel::Compare, Form::BitPacked, Form::Flat) - before,
             total as u64,
             "only the two total comparisons fall through"
         );
