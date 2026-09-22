@@ -58,6 +58,6 @@ pub use selection::Selection;
 pub use string::{INLINE_LIMIT, StringColumn, StringView};
 pub use validity::{Bitmap, Live, Validity};
 pub use vector::{
-    Coded, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, MapParts, PACKED_WIDTH_MAX,
+    Coded, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, MapParts, NO_ROW, PACKED_WIDTH_MAX,
     PACKING_PAYS_AT, Packed, TextSource, VECTOR_SIZE, Vector, search_below,
 };
