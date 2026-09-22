@@ -311,6 +311,41 @@ fn a_dropped_table_is_gone_from_the_file_and_the_rest_are_not() {
     std::fs::remove_file(path).expect("removes the temporary database");
 }
 
+/// The last table can go too, and what is left is a database with nothing in it.
+///
+/// A file that has to hold at least one table is a file that cannot record the drop, and what that
+/// looked like was an error out of the checkpoint and the table still there at the next open, which
+/// is a statement that succeeded being undone by the write that was supposed to publish it. DuckDB
+/// drops it, keeps the file and opens it again as a database with no tables, and this is that.
+#[test]
+fn the_last_table_can_be_dropped_and_the_file_says_so() {
+    let path = std::env::temp_dir().join(format!("rudb-api-last-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database.execute("CREATE TABLE t AS SELECT 1 AS x").expect("creates");
+    database.execute("CHECKPOINT").expect("commits");
+    database.execute("DROP TABLE t").expect("drops the only table");
+    database.execute("CHECKPOINT").expect("commits a database with nothing in it");
+    database.execute("CHECKPOINT").expect("and a second one has nothing to do");
+    drop(database);
+
+    assert!(path.exists(), "the file is still there, the way DuckDB leaves it");
+    let reopened = Database::open(&name).expect("a database with no tables opens");
+    assert!(
+        reopened.execute("SELECT * FROM t").is_err(),
+        "the dropped table does not come back at the next open"
+    );
+    // And it is a database rather than a headstone, so the next table goes into it as usual.
+    reopened.execute("CREATE TABLE u AS SELECT 2 AS x").expect("creates");
+    reopened.execute("CHECKPOINT").expect("commits");
+    drop(reopened);
+
+    let again = Database::open(&name).expect("the native database reopens");
+    assert_eq!(again.value("SELECT sum(x) FROM u").expect("the new table"), Value::HugeInt(2));
+    drop(again);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
 #[test]
 fn two_connections_are_two_views_of_one_database() {
     let database = Database::new();
