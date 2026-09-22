@@ -348,7 +348,13 @@ pub(crate) struct Counted {
 /// The hash rides along because the two sides want it once each, to pick the split the group belongs
 /// in and then to find the group inside that split, and working it out again on the other side would
 /// be the same arithmetic on the same number.
-#[derive(Debug, Clone, Copy)]
+///
+/// Comparing two of these is what a probe into a split's group table does on every pair it is
+/// handed, and it compares all three fields because the hash is what rules a bucket out cheaply and
+/// the other two are what prove it in. Deriving that rather than writing it out at each probe is
+/// worth a load: the table is a `Vec`, so a probe that names the record three times indexes it three
+/// times, and three bounds checks and three loads of the same twelve bytes become one of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Grouped {
     pub(crate) group: i32,
     pub(crate) group_hash: u32,
