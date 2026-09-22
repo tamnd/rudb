@@ -431,7 +431,7 @@ impl Database {
 /// before this one, which still answers correctly because its bytes are unchanged, but which would
 /// be kept alive by every checkpoint for as long as the database is open.
 fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
-    let names = catalog.tables().map(|table| table.name().clone()).collect::<Vec<_>>();
+    let names = catalog.stored_tables().map(|table| table.name().clone()).collect::<Vec<_>>();
     if names.is_empty() {
         return Err(Error::not_implemented("a native database with no table"));
     }
@@ -442,8 +442,9 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     // Every table already in the file, and every declaration in the file already the one the
     // catalog holds. The second half is what stops a `CLUSTER BY` on a table that was checkpointed
     // before the declaration existed from being decided as nothing to do and quietly lost.
-    let clean =
-        catalog.tables().all(|table| table.rows().is_native() && table.clustering_is_stored());
+    let clean = catalog
+        .stored_tables()
+        .all(|table| table.rows().is_native() && table.clustering_is_stored());
     if clean && committed(path)?.is_some_and(|held| held == wanted(&names)) {
         return Ok(());
     }
@@ -572,9 +573,9 @@ fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<
     if held.contains(&target.table) {
         return Ok(false);
     }
-    let others = catalog.tables().filter(|table| table.name() != target).count();
+    let others = catalog.stored_tables().filter(|table| table.name() != target).count();
     let native = catalog
-        .tables()
+        .stored_tables()
         .filter(|table| table.name() != target && table.rows().is_native())
         .map(|table| table.name().table.clone())
         .collect::<BTreeSet<_>>();
@@ -1015,9 +1016,11 @@ impl Shared {
                 // SELECT * FROM t` reads the table it is about to replace, so neither can have the
                 // entry made before the query runs. Making it afterwards is also what leaves no
                 // table behind when the query fails.
-                if let Some(path) = &self.inner.path {
+                // A temporary table never reaches the file, so it never takes this path however
+                // well it fits the shape otherwise.
+                if let Some(path) = self.inner.path.as_ref().filter(|_| !create.name.temporary()) {
                     let fresh = create.source.is_some() && catalog.table(&create.name).is_err();
-                    let alone = fresh && !path.exists() && catalog.tables().count() == 0;
+                    let alone = fresh && !path.exists() && catalog.stored_tables().count() == 0;
                     if fresh && (alone || appendable(path, &catalog, &create.name)?) {
                         let plan = create.source.as_mut().expect("a source, asked for above");
                         rudb_opt::optimize_with(plan, &context)?;
@@ -1077,7 +1080,9 @@ impl Shared {
                 // output forever or depend on how the scan holds its chunks.
                 let ((), optimize_ns) =
                     timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
-                if let Some(path) = &self.inner.path {
+                // Same as the create above: rows going into a temporary table are rows the file
+                // never sees.
+                if let Some(path) = self.inner.path.as_ref().filter(|_| !insert.name.temporary()) {
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
                     // the way, which is the difference between loading a table and having to fit
@@ -1090,7 +1095,7 @@ impl Shared {
                     //
                     // Asked in this order because the second question opens the file's catalog and
                     // the first two are a `stat` and a count.
-                    let alone = !path.exists() && catalog.tables().count() == 1;
+                    let alone = !path.exists() && catalog.stored_tables().count() == 1;
                     let empty = target.rows().is_empty();
                     if empty && (alone || appendable(path, &catalog, &insert.name)?) {
                         let table = target.name().table.clone();

@@ -41,6 +41,16 @@ impl QualifiedName {
         Self { catalog: catalog.into(), schema: schema.into(), table: table.into() }
     }
 
+    /// Whether the object this names is a temporary one.
+    ///
+    /// Which is the same question as whether it sits in the `temp` database, because that database
+    /// is the only place `CREATE TEMPORARY` puts anything and nothing else puts anything there.
+    /// Asking the name rather than carrying a flag on the table means the two cannot drift.
+    #[must_use]
+    pub fn temporary(&self) -> bool {
+        same_name(&self.catalog, crate::system::TEMP_CATALOG)
+    }
+
     /// Whether this names the same object as `other`, under the identifier rule.
     #[must_use]
     pub fn same_as(&self, other: &Self) -> bool {

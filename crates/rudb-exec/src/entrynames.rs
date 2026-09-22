@@ -25,16 +25,19 @@
 //! empty because `ATTACH` takes none. The day there is a file behind a database these columns say
 //! something.
 //!
-//! `internal` is read off the database an entry is in rather than being a constant. A session has
-//! three of them, `memory` to create in and `system` and `temp` that the engine owns, so the column
-//! separates what somebody wrote from what rudb shipped with, which is the difference a client asks
-//! about when it lists what is in a database. See `rudb_catalog::system` for what is in `system`.
+//! `internal` says whether the engine made the entry rather than a person. A session has three
+//! databases, `memory` to create in and `system` and `temp` that the engine owns, and for two of
+//! them the answer is the database's own: nothing in `memory` is internal and everything in
+//! `system` is. `temp` is the third and it is the one that comes apart, because the database is the
+//! engine's and every table in it was written by somebody, so an entry there is not internal even
+//! though the database and its schema are. The pin answers the same way and `entry_internal` below
+//! is where that is said once. See `rudb_catalog::system` for what is in `system`.
 //!
 //! `sql`, `parent_schema` and `parent_schema_oid` are null on every schema row. Upstream's are null
 //! too on everything it returns from a fresh session, because a schema created by `CREATE SCHEMA`
 //! has no stored text and nothing nests schemas.
 
-use rudb_catalog::{Catalog, Database, Schema, Table};
+use rudb_catalog::{Catalog, Database, Schema, TEMP_CATALOG, Table};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
     DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields,
@@ -133,11 +136,11 @@ pub(crate) fn tablenames(
             Value::BigInt(table.oid()),
             Value::Null,
             empty(),
-            Value::Boolean(database.internal()),
-            // Neither of these can be true yet. `CREATE TEMP TABLE` is not a statement rudb takes
-            // and a primary key is not a constraint it stores, so both are a constant rather than a
-            // fact read off the entry, and both stop being one the day the DDL grows the clause.
-            Value::Boolean(false),
+            Value::Boolean(entry_internal(database)),
+            Value::Boolean(table.name().temporary()),
+            // A primary key is not a constraint rudb stores, so this one is still a constant rather
+            // than a fact read off the entry, and it stops being one the day the DDL grows the
+            // clause.
             Value::Boolean(false),
             Value::BigInt(i64::try_from(table.rows().len()).unwrap_or(i64::MAX)),
             Value::BigInt(count),
@@ -161,9 +164,10 @@ pub(crate) fn tablenames(
 /// at the first read. That is the pin's answer as well, measured on a fresh session and again after
 /// reading one of them.
 ///
-/// `internal` and `temporary` are both read off the database the view is in. Upstream sets both on
-/// everything in `system`, which reads oddly for `temporary` on a view that is not in `temp`, and it
-/// is what the pin prints for all 47 of them.
+/// `temporary` is read off the database the view is in, which is true for `temp` where it means
+/// what it says and true for `system` where it reads oddly, and the pin prints true for all 47 of
+/// those. `internal` is the same question asked of the entry rather than of the database, so a
+/// temporary view is not internal and a shipped one is.
 ///
 /// # Errors
 ///
@@ -188,7 +192,7 @@ pub(crate) fn viewnames(
                     Value::BigInt(view.oid()),
                     Value::Null,
                     empty(),
-                    Value::Boolean(database.internal()),
+                    Value::Boolean(entry_internal(database)),
                     Value::Boolean(database.internal()),
                     if columns.is_empty() {
                         Value::Null
@@ -254,6 +258,14 @@ pub(crate) fn columnnames(
     Metadata::new("duckdb_columns", &column_fields(), &rows, plan, index, columns)
 }
 
+/// Whether an entry in this database is one the engine made rather than one somebody wrote.
+///
+/// Not the same question as whether the database is internal, and `temp` is the whole of the
+/// difference. See the note at the top of this file.
+fn entry_internal(database: &Database) -> bool {
+    database.internal() && !database.name().eq_ignore_ascii_case(TEMP_CATALOG)
+}
+
 /// One row of `duckdb_columns()`, which is the same twenty one columns for a table and for a view.
 #[expect(clippy::too_many_arguments, reason = "a row of a twenty one column table")]
 fn column_row(
@@ -278,7 +290,7 @@ fn column_row(
         // One based, which is the pin's answer and not the position in the vector.
         Value::Integer(i32::try_from(at + 1).unwrap_or(i32::MAX)),
         Value::Null,
-        Value::Boolean(database.internal()),
+        Value::Boolean(entry_internal(database)),
         Value::Null,
         Value::Boolean(nullable),
         text(&ty.to_string()),
@@ -301,10 +313,12 @@ fn column_row(
 /// Sorted by name, and views sit among the tables rather than after them, which is the pin's answer
 /// and the only sensible one for a list whose whole purpose is to say what a name will find.
 ///
-/// The search path is the default schema of the default database, plus `temp` on the pin. rudb has
-/// neither `CREATE SCHEMA` nor a temporary table yet, so the path is one schema and this walks it
-/// directly. The day either lands this is the function that has to grow a real search path rather
-/// than a lookup of one name.
+/// The search path is `temp.main` and then the default schema of the default database, which is
+/// the front of the path `Catalog::candidates` walks and the two schemas of it that can hold
+/// anything a person wrote. The pin lists both here too, so a temporary table shows up in this list
+/// beside a stored one and the writer sees the name that a bare `SELECT` is going to find. The day
+/// `CREATE SCHEMA` lands this is the function that has to grow a real search path rather than a
+/// lookup of two names.
 ///
 /// # Errors
 ///
@@ -317,7 +331,9 @@ pub(crate) fn showtables(
 ) -> Result<Metadata> {
     let mut names = Vec::new();
     for database in catalog.databases() {
-        if !database.name().eq_ignore_ascii_case(catalog.default_catalog()) {
+        let reachable = database.name().eq_ignore_ascii_case(catalog.default_catalog())
+            || database.name().eq_ignore_ascii_case(TEMP_CATALOG);
+        if !reachable {
             continue;
         }
         for schema in database.schemas() {
@@ -365,9 +381,9 @@ pub(crate) fn showdatabases(
 /// where a table's shape is reported without a join, and the types are written the way the type
 /// prints rather than the way it was declared.
 ///
-/// `temporary` is false on every row, because `CREATE TEMPORARY TABLE` is not a statement rudb takes
-/// yet and the pin only puts true there for an entry in its `temp` database. The day that statement
-/// lands this column is read off the database the entry is in rather than being a constant.
+/// `temporary` is read off the database the entry is in. `temp` is listed here even though
+/// `PRAGMA show_databases` leaves it out, which is the pin's answer to both and is the difference
+/// between asking which databases a name can be written into and asking what is in them.
 ///
 /// # Errors
 ///
@@ -380,7 +396,7 @@ pub(crate) fn showtablesexpanded(
 ) -> Result<Metadata> {
     let mut rows = Vec::new();
     for database in catalog.databases() {
-        if database.internal() {
+        if entry_internal(database) {
             continue;
         }
         for schema in database.schemas() {
@@ -424,7 +440,7 @@ fn expanded_row(
         text(name),
         names_of(columns.iter().map(|field| field.name.clone())),
         names_of(columns.iter().map(|field| field.ty.to_string())),
-        Value::Boolean(false),
+        Value::Boolean(database.internal()),
     ]
 }
 
