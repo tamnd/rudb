@@ -280,7 +280,11 @@ pub fn build_key_maps_within(
     Ok(report)
 }
 
-/// What the table's existing sections cost, leaving out the key maps this build is replacing.
+/// What the table's existing graph sections cost, leaving out the key maps this build is replacing.
+///
+/// Graph sections only. The statistics layer has its own two percent per `spec/stats` section 3.8,
+/// and a budget that counted the other layer's sections would be a budget the other layer eats,
+/// which is the thing the two shares being separate numbers exists to prevent.
 ///
 /// Reading the extent tables is what this costs, which is one small read per section and not a read
 /// of a payload. A section whose extent table does not checksum is counted as nothing, because it
@@ -288,6 +292,9 @@ pub fn build_key_maps_within(
 fn held_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
     let mut total = 0;
     for held in reader.table().sections() {
+        if !held.among(section::GRAPH_KINDS) {
+            continue;
+        }
         let replaced = held.kind == *section::KEY_MAP
             && replacing.iter().any(|&column| u64::try_from(column) == Ok(held.id));
         if replaced || !held.usable(reader.table().generation()) {
@@ -591,6 +598,31 @@ mod tests {
             "the third code is the third row"
         );
 
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn the_statistics_sections_do_not_count_against_the_graph_budget() {
+        // The two shares are ten percent and two percent of the same column bytes, and separate
+        // means each counts only what it owns. A graph build that counted summaries would be a
+        // graph budget the statistics layer eats, and a table would lose key maps for a reason
+        // that has nothing to do with key maps. The kind lists in `section` are what keeps the two
+        // apart, and this is the direction of that which lives in this file.
+        let keys = (1..=3000_i64).map(Some).collect::<Vec<_>>();
+        let path = table_of("apart", &keys);
+        crate::stats::build_stats(&path, "parent", &[0]).expect("summaries first");
+
+        let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
+        let statistics = reader
+            .table()
+            .sections()
+            .iter()
+            .filter(|held| held.among(section::STATISTICS_KINDS))
+            .count();
+        assert_eq!(statistics, 2, "a summary and a sketch are in the file");
+        assert_eq!(held_bytes(&reader, &[0]).expect("held"), 0, "and neither is the graph's");
+
+        drop(reader);
         fs::remove_file(&path).expect("clean up");
     }
 
