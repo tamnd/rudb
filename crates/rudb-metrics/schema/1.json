@@ -105,6 +105,7 @@
     {
       "id": 3,
       "pipeline": 0,
+      "parent": 5,
       "kind": "Scan",
       "detail": "hits",
       "rows_in": 0,
@@ -151,6 +152,7 @@
     {
       "id": 5,
       "pipeline": 0,
+      "parent": 6,
       "kind": "HashAggregate",
       "detail": "ClientIP",
       "rows_in": 99997497,
@@ -184,11 +186,12 @@
     {
       "id": 6,
       "pipeline": 0,
+      "parent": 7,
       "kind": "Probe",
       "detail": "hits.ClientIP = banned.ClientIP",
-      "rows_in": 99997497,
+      "rows_in": 41983110,
       "rows_out": 41983110,
-      "estimated_rows": 99997497,
+      "estimated_rows": 41983110,
       "estimate_class": "estimated",
       "estimate_provenance": "default",
       "wall_ns": 210000000,
@@ -219,6 +222,7 @@
     {
       "id": 7,
       "pipeline": 1,
+      "parent": null,
       "kind": "Sort",
       "detail": null,
       "rows_in": 41983110,

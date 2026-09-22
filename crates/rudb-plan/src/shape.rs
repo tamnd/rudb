@@ -73,6 +73,11 @@ pub struct Shape {
     waits: Vec<Vec<PipelineRef>>,
     /// How many operators there are.
     operators: OperatorRef,
+    /// Per operator, the operator its rows go to, or none for the one that produces the answer.
+    ///
+    /// Indexed by operator id, which is why it is filled where the ids are handed out rather than
+    /// by a second walk. See [`Shape::consumer`] for what a reader does with it.
+    consumes: Vec<Option<OperatorRef>>,
     /// The pipeline each materialisation currently being walked over is filled by.
     ///
     /// A stack rather than a map, because a materialised `WITH` inside another one is a `WITH`
@@ -97,9 +102,10 @@ impl Shape {
             of: vec![None; plan.node_count()],
             waits: vec![Vec::new()],
             operators: 0,
+            consumes: Vec::new(),
             holding: Vec::new(),
         };
-        shape.walk(plan, plan.root(), ROOT);
+        shape.walk(plan, plan.root(), ROOT, None);
         shape
     }
 
@@ -144,6 +150,22 @@ impl Shape {
     #[must_use]
     pub fn gathered(&self, node: NodeRef) -> Option<OperatorRef> {
         self.placed(node).gathered
+    }
+
+    /// The operator this one's rows go into, or none for the operator that produces the answer.
+    ///
+    /// Keyed by operator rather than by node because the operator tree is not quite the plan tree:
+    /// a node with two inputs is two operators, and the side that is gathered feeds the one that
+    /// holds it rather than the join above it. A reader of a metrics document that wants to check
+    /// an operator's input against what its children produced needs the edges the way the rows
+    /// actually moved, which is this.
+    ///
+    /// # Panics
+    ///
+    /// If there is no such operator.
+    #[must_use]
+    pub fn consumer(&self, operator: OperatorRef) -> Option<OperatorRef> {
+        self.consumes[operator as usize]
     }
 
     /// The pipeline this node runs in.
@@ -194,15 +216,22 @@ impl Shape {
         self.waits[pipeline as usize].push(on);
     }
 
-    /// The next operator id.
-    fn number(&mut self) -> OperatorRef {
+    /// The next operator id, and the operator its rows go to.
+    fn number(&mut self, into: Option<OperatorRef>) -> OperatorRef {
         let id = self.operators;
         self.operators += 1;
+        self.consumes.push(into);
         id
     }
 
-    fn walk(&mut self, plan: &Plan, node: NodeRef, pipeline: PipelineRef) {
-        let operator = self.number();
+    fn walk(
+        &mut self,
+        plan: &Plan,
+        node: NodeRef,
+        pipeline: PipelineRef,
+        into: Option<OperatorRef>,
+    ) {
+        let operator = self.number(into);
         match *plan.node(node) {
             Node::Aggregate { input, .. }
             | Node::Window { input, .. }
@@ -215,20 +244,23 @@ impl Shape {
                 let below = self.fresh();
                 self.waits_on(pipeline, below);
                 self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline: below });
-                self.walk(plan, input, below);
+                self.walk(plan, input, below, Some(operator));
             }
             Node::Join { left, right, .. }
             | Node::DependentJoin { left, right, .. }
             | Node::SetOp { left, right, .. } => {
-                let gathered = self.number();
+                let gathered = self.number(Some(operator));
                 let first = self.fresh();
                 let second = self.fresh();
                 self.waits_on(second, first);
                 self.waits_on(pipeline, second);
                 self.of[node as usize] =
                     Some(Placed { operator, gathered: Some(gathered), pipeline: second });
-                self.walk(plan, right, first);
-                self.walk(plan, left, second);
+                // The gathered side's rows go into the operator that holds them rather than
+                // straight into the join, which is the one place the operator tree has a shape the
+                // plan does not.
+                self.walk(plan, right, first, Some(gathered));
+                self.walk(plan, left, second, Some(operator));
             }
             // The definition is held whole and the body reads it, so the node is the sink of the
             // pipeline that fills it, the same way a sort is the sink of the pipeline under it. The
@@ -241,12 +273,19 @@ impl Shape {
             // name nowhere waits for nothing, which is the shape of a materialisation the optimizer
             // is about to drop.
             Node::MaterializedCte { definition, body, cte, .. } => {
+                // Its rows go nowhere. It is filled by its definition and read back by the scans
+                // of its name, so nothing above it ever sees a row of it, and naming the node it
+                // hangs under would claim rows that the body produced and this never handed on.
+                // That makes it a second operator with nothing above it, which is what it is.
+                self.consumes[operator as usize] = None;
                 let filling = self.fresh();
                 self.of[node as usize] =
                     Some(Placed { operator, gathered: None, pipeline: filling });
-                self.walk(plan, definition, filling);
+                self.walk(plan, definition, filling, Some(operator));
                 self.holding.push((cte, filling));
-                self.walk(plan, body, pipeline);
+                // The body produces the answer a chunk at a time and the node it hangs under never
+                // sees those rows, so what consumes them is whatever consumes this node.
+                self.walk(plan, body, pipeline, into);
                 self.holding.pop();
             }
             Node::CteScan { cte, .. } => {
@@ -260,18 +299,18 @@ impl Shape {
                 }
             }
             Node::CrossProduct { left, right } => {
-                let gathered = self.number();
+                let gathered = self.number(Some(operator));
                 let aside = self.fresh();
                 self.waits_on(pipeline, aside);
                 self.of[node as usize] =
                     Some(Placed { operator, gathered: Some(gathered), pipeline });
-                self.walk(plan, right, aside);
-                self.walk(plan, left, pipeline);
+                self.walk(plan, right, aside, Some(gathered));
+                self.walk(plan, left, pipeline, Some(operator));
             }
             ref other => {
                 self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline });
                 for child in other.children().into_iter().flatten() {
-                    self.walk(plan, child, pipeline);
+                    self.walk(plan, child, pipeline, Some(operator));
                 }
             }
         }
@@ -441,5 +480,50 @@ mod tests {
         assert_eq!(shape.operator(right.unwrap()), 2, "the side that has to finish first");
         assert_eq!(shape.operator(left.unwrap()), 3);
         assert_eq!(shape.operators(), 4);
+    }
+
+    #[test]
+    fn every_operator_but_the_one_that_answers_names_what_its_rows_go_into() {
+        let (_, shape) = shaped(concat!(
+            "Sort [#0.0::INTEGER ASC NULLS LAST]\n",
+            "  Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n",
+            "    Get memory.main.t AS t #0 [a::INTEGER]\n",
+        ));
+        assert_eq!(shape.consumer(0), None, "the sort is what the answer is read from");
+        assert_eq!(shape.consumer(1), Some(0));
+        assert_eq!(shape.consumer(2), Some(1));
+    }
+
+    /// The one place the operator tree is a different shape than the plan. The gathered side feeds
+    /// the operator that holds it, and that one feeds the join, so a check that read the plan tree
+    /// instead would compare the join's input against rows it never saw.
+    #[test]
+    fn the_gathered_side_feeds_the_operator_that_holds_it_rather_than_the_join() {
+        let (_, shape) = shaped(concat!(
+            "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+            "  Get memory.main.l AS l #0 [a::INTEGER]\n",
+            "  Get memory.main.r AS r #1 [a::INTEGER]\n",
+        ));
+        assert_eq!(shape.consumer(0), None, "the join produces the answer");
+        assert_eq!(shape.consumer(1), Some(0), "the gather hands the held side to the join");
+        assert_eq!(shape.consumer(2), Some(1), "the side that finishes first is what it holds");
+        assert_eq!(shape.consumer(3), Some(0), "the driving side goes straight into the join");
+    }
+
+    /// A materialisation is filled by its definition and read back by the scans of its name, so no
+    /// row of it is ever handed upwards and it is an operator with nothing above it. Its body is
+    /// what streams into whatever the whole thing hangs under.
+    #[test]
+    fn a_materialisation_is_fed_by_its_definition_and_its_body_streams_past_it() {
+        let (_, shape) = shaped(concat!(
+            "Project #2 [#3.0::INTEGER AS a]\n",
+            "  MaterializedCte c @0 [a::INTEGER]\n",
+            "    Get memory.main.t AS t #0 [a::INTEGER]\n",
+            "    CteScan c @0 #1 [a::INTEGER]\n",
+        ));
+        assert_eq!(shape.consumer(0), None);
+        assert_eq!(shape.consumer(1), None, "the materialisation hands nothing upwards");
+        assert_eq!(shape.consumer(2), Some(1), "the definition is what fills it");
+        assert_eq!(shape.consumer(3), Some(0), "and the body produces into the project");
     }
 }
