@@ -27,6 +27,7 @@ use std::sync::{Arc, OnceLock};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_vector::{Data, Form, Validity, Vector};
 
+use crate::fallback::{self, Kernel};
 use crate::peel::{Found, Peel, search};
 use crate::shape::{first, identity, nulls_of, single};
 
@@ -250,12 +251,26 @@ pub fn in_set(input: &Vector, members: &Members, returns: &LogicalType) -> Resul
             let Some((codes, values)) = input.positions() else {
                 return row_at_a_time(input, members, &base, rows, returns);
             };
-            let Some(data) = values.data().filter(|_| codes.len() >= rows) else {
+            if codes.len() < rows {
                 return row_at_a_time(input, members, &base, rows, returns);
-            };
+            }
             let at = move |index: usize| codes[index] as usize;
-            look(data, at, members, &base, rows, returns)
+            match (values.data(), values.packed_parts()) {
+                (Some(data), _) => look(data, at, members, &base, rows, returns),
+                // A dictionary whose distinct values are themselves packed, which is the pair of
+                // forms a narrow column written to a file arrives in.
+                (None, Some(packed)) => packed_look(&packed, at, members, &base, rows, returns),
+                (None, None) => row_at_a_time(input, members, &base, rows, returns),
+            }
         }
+        // Whole numbers in as many bits as the column's range needs, which is the form every narrow
+        // integer column of ClickBench is in. Without this arm the walk below reads a value a row
+        // out of a packed run, and reading one of those allocates twice, so a two entry `IN` over
+        // `TraficSourceID` cost more than the four comparisons of the rest of query 40 put together.
+        Form::BitPacked => match input.packed_parts() {
+            Some(packed) => packed_look(&packed, identity, members, &base, rows, returns),
+            None => row_at_a_time(input, members, &base, rows, returns),
+        },
         Form::Constant => {
             let Some(value) = input.constant_value() else {
                 return row_at_a_time(input, members, &base, rows, returns);
@@ -325,6 +340,31 @@ fn look<A: Fn(usize) -> usize>(
     }
 }
 
+/// The same lookup over a packed run, whose value is its base plus its code.
+///
+/// Separate from [`look`] rather than a layout inside it because a packed run has no flat layout to
+/// match on: the value is computed from the bits rather than read out of an array. The index mapping
+/// is generic for the same reason it is there, so a dictionary that points into a packed run of
+/// distinct values comes through here with its codes instead of falling to the row at a time walk.
+fn packed_look<A: Fn(usize) -> usize>(
+    packed: &rudb_vector::Packed<'_>,
+    at: A,
+    members: &Members,
+    base: &Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Vector> {
+    match &members.held {
+        Held::Whole(set) => answer(rows, base, members, returns, |index| {
+            set.contains(&(packed.base() + i128::from(packed.code(at(index)))))
+        }),
+        // A run of packed integers against a list of strings, which the binder does not produce
+        // because it casts both sides to one type first. No row matches, which is what the row at a
+        // time walk answers for the same pairing, so the two paths agree rather than one erroring.
+        Held::Text(_) => answer(rows, base, members, returns, |_| false),
+    }
+}
+
 /// Whether the set holds the value at `index`, for any integer narrower than the key.
 fn holds<T: Copy>(set: &HashSet<i128>, values: &[T], index: usize) -> bool
 where
@@ -359,9 +399,16 @@ fn answer(
 
 /// The path for a form or a layout with no loop above, which reads a value per row.
 ///
-/// It counts itself nowhere, because there is nothing here for the fallback table to tell anybody:
-/// `Members::of` decides what folds, so a column that reaches this is one the fold should not have
-/// happened for, and the answer to that is a line in `Members::of` rather than a number in a report.
+/// It used to count itself nowhere, on the reasoning that a column reaching here is one
+/// `Members::of` should not have folded, so the fix would be a line there rather than a number in a
+/// report. That was wrong, and it is worth writing down why rather than quietly deleting it. Every
+/// narrow integer column of ClickBench is bit packed and this kernel had no arm for that form, so
+/// the fold was right and the dispatch below it was not. Nothing said so: the fallback table is the
+/// one place anybody looks for a kernel reading a value at a time, and this kernel was not in it, so
+/// query 40 spent most of its scan here for as long as the file has existed.
+///
+/// Both forms are the input's, since the list is a set rather than a vector and there is no second
+/// form to report. The same shape as the select kernel, which reports on one vector too.
 fn row_at_a_time(
     input: &Vector,
     members: &Members,
@@ -369,6 +416,7 @@ fn row_at_a_time(
     rows: usize,
     returns: &LogicalType,
 ) -> Result<Vector> {
+    fallback::record(Kernel::Membership, input.form(), input.form());
     let held: Vec<Value> =
         (0..rows).map(|index| input.try_value_at(index)).collect::<Result<_>>()?;
     answer(rows, base, members, returns, |index| match (&members.held, &held[index]) {
@@ -385,9 +433,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as Memory};
 
     use rudb_common::{LogicalType, Value};
-    use rudb_vector::Vector;
+    use rudb_vector::{Form, Vector};
 
-    use super::{Members, in_set};
+    use super::{Kernel, Members, fallback, in_set};
 
     /// What the kernel answers for each row, as the values a caller would read back.
     fn over(input: &Vector, list: &[Value], negated: bool) -> Vec<Value> {
@@ -449,6 +497,42 @@ mod tests {
             over(&text, &list, false),
             [Value::Boolean(true), Value::Null, Value::Boolean(false), Value::Boolean(true)]
         );
+    }
+
+    /// A packed run, on its own and under a dictionary, which is how a narrow integer column reads.
+    ///
+    /// The form ClickBench `TraficSourceID` is in, and the one this kernel used to have no arm for.
+    /// Falling through to the row at a time walk read a value a row out of the bits, and reading one
+    /// of those allocates twice, so query 40's two entry `IN` cost more than the four comparisons
+    /// beside it put together. The answers are checked against the same list over the same numbers
+    /// written flat, since what the fast arm must not do is answer differently from the slow one.
+    #[test]
+    fn a_packed_column_is_read_out_of_its_bits_rather_than_a_value_at_a_time() {
+        let values: Vec<Value> = (0..40)
+            .map(|row| if row % 9 == 0 { Value::Null } else { Value::Integer(row % 12 - 1) })
+            .collect();
+        let flat = Vector::from_values(LogicalType::Integer, &values).expect("forty integers");
+        let packed = flat.clone().bit_packed().expect("a range of twelve packs");
+        assert_eq!(packed.form(), Form::BitPacked);
+        let list = [Value::Integer(-1), Value::Integer(6)];
+        assert_eq!(over(&packed, &list, false), over(&flat, &list, false));
+        assert_eq!(over(&packed, &list, true), over(&flat, &list, true));
+
+        // And the pair of forms together, which is what a dictionary over a narrow column is. The
+        // codes point at the packed run, so the mapping has to reach the bits rather than stopping
+        // at a flat layout that is not there.
+        let codes: Vec<u32> = (0..24).map(|row| (row * 7) % 40).collect();
+        let over_packed = Vector::dictionary(codes.clone(), packed).expect("codes are in range");
+        let over_flat = Vector::dictionary(codes, flat).expect("codes are in range");
+        assert_eq!(over_packed.form(), Form::Dictionary);
+        assert_eq!(over(&over_packed, &list, false), over(&over_flat, &list, false));
+
+        // And that neither of them reached the row at a time walk, which is the part that matters.
+        // Answering the same is necessary and not sufficient: the walk answers the same too, and it
+        // is the thing being got rid of. The counter is thread local under test, so these are this
+        // test's own calls and nobody else's.
+        assert_eq!(fallback::count(Kernel::Membership, Form::BitPacked, Form::BitPacked), 0);
+        assert_eq!(fallback::count(Kernel::Membership, Form::Dictionary, Form::Dictionary), 0);
     }
 
     #[test]

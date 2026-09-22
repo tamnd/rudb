@@ -48,10 +48,12 @@ pub enum Cause {
     Aggregate,
     /// Turning a vector of flags into the rows it keeps read a value at a time.
     Select,
+    /// An `IN` list read a value at a time.
+    Membership,
 }
 
 /// How many causes there are, which is how wide a [`Tally`] is.
-const KINDS: usize = 7;
+const KINDS: usize = 8;
 
 impl Cause {
     /// Every cause, in the order a tally prints them.
@@ -63,6 +65,7 @@ impl Cause {
         Self::Cast,
         Self::Aggregate,
         Self::Select,
+        Self::Membership,
     ];
 
     /// The name in the document and in the report.
@@ -76,6 +79,7 @@ impl Cause {
             Self::Cast => "cast",
             Self::Aggregate => "aggregate",
             Self::Select => "select",
+            Self::Membership => "membership",
         }
     }
 
@@ -94,6 +98,7 @@ impl Cause {
             Self::Cast => 4,
             Self::Aggregate => 5,
             Self::Select => 6,
+            Self::Membership => 7,
         }
     }
 }

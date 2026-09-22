@@ -45,12 +45,21 @@ pub enum Kernel {
     Aggregate,
     /// Turning a vector of flags into the rows it keeps, in `select`.
     Select,
+    /// The `IN` lists, in `membership`.
+    Membership,
 }
 
 impl Kernel {
     /// Every kernel that reports, in the order the table prints them.
-    const ALL: [Self; 6] =
-        [Self::Compare, Self::Scalar, Self::Logic, Self::Cast, Self::Aggregate, Self::Select];
+    const ALL: [Self; 7] = [
+        Self::Compare,
+        Self::Scalar,
+        Self::Logic,
+        Self::Cast,
+        Self::Aggregate,
+        Self::Select,
+        Self::Membership,
+    ];
 
     /// The name used in the report.
     #[must_use]
@@ -62,6 +71,7 @@ impl Kernel {
             Self::Cast => "cast",
             Self::Aggregate => "aggregate",
             Self::Select => "select",
+            Self::Membership => "membership",
         }
     }
 
@@ -73,6 +83,7 @@ impl Kernel {
             Self::Cast => 3,
             Self::Aggregate => 4,
             Self::Select => 5,
+            Self::Membership => 6,
         }
     }
 
@@ -90,6 +101,7 @@ impl Kernel {
             Self::Cast => Cause::Cast,
             Self::Aggregate => Cause::Aggregate,
             Self::Select => Cause::Select,
+            Self::Membership => Cause::Membership,
         }
     }
 }
