@@ -70,6 +70,19 @@ impl Pair {
         got
     }
 
+    /// Every row of an answer with more than one of them, checked against the memory table's.
+    ///
+    /// The same contract [`Pair::agree`] has for a single value. A shortcut that reads groups out of
+    /// a directory is allowed to be faster than reading them out of the rows and is not allowed to
+    /// list different ones.
+    fn listing(&self, query: &str) -> Vec<Vec<Value>> {
+        let wanted =
+            self.memory.query(query).expect("the memory table answers").rows().collect::<Vec<_>>();
+        let got = self.file.query(query).expect("the file answers").rows().collect::<Vec<_>>();
+        assert_eq!(got, wanted, "the file and memory disagree about {query}");
+        got
+    }
+
     /// Whether the file answered this without reading any rows.
     ///
     /// Read off the operator the aggregate became rather than off the plan text, because the plan
@@ -309,6 +322,80 @@ fn a_grouped_count_over_a_complete_synopsis_is_read_out_of_it_filter_and_all() {
     assert!(
         !pair.grouped("SELECT wide, COUNT(*) FROM t GROUP BY wide"),
         "a partial list was grouped out of"
+    );
+}
+
+/// A column whose leading values are heavy and all of whose other values are held by one row.
+///
+/// Row `i` is heavy when `i % 20` is below the thousand-row block it sits in, so value `hk` is held
+/// by fifty rows of each block above the kth and its count is `50 * (19 - k)`: nine hundred and
+/// fifty down to fifty, nineteen values, no two of them tied. The other ten thousand five hundred
+/// rows each get a value of their own.
+///
+/// So there are ten thousand five hundred and nineteen distinct values, the synopsis can hold five
+/// hundred and twelve of them and can never be complete, and every value it drops is held by a
+/// single row. That is the shape half of ClickBench has, and until the boundary proof it was the
+/// shape that fell all the way back to reading every row. The counts are made distinct so that one
+/// ordering key settles the answer, because a second one turns the bound off before any of this is
+/// reached.
+const SKEWED: &str = "SELECT CASE WHEN i % 20 * 1000 < i - i % 1000 THEN 'h' || CAST(i % 20 AS VARCHAR) \
+     ELSE 'c' || CAST(i AS VARCHAR) END AS s FROM range(20000) r(i)";
+
+#[test]
+fn a_filtered_top_count_is_read_out_of_a_synopsis_that_is_only_a_prefix() {
+    let pair = Pair::new("prefixtop", SKEWED);
+    // No complete list and there never will be one, so without a bound there is nothing to prove.
+    assert!(
+        !pair.grouped("SELECT s, COUNT(*) FROM t WHERE s <> 'h0' GROUP BY s ORDER BY 2 DESC"),
+        "a prefix was grouped out of without a bound to prove it against"
+    );
+    // With a bound the prefix is enough. The filter takes out the heaviest value, the fifth of the
+    // survivors holds seven hundred rows, and no value the synopsis dropped holds more than one.
+    let query = "SELECT s, COUNT(*) FROM t WHERE s <> 'h0' GROUP BY s ORDER BY 2 DESC LIMIT 5";
+    assert!(pair.grouped(query), "the rows were read for an answer the directory held");
+    // Checked against the rows, which is the only thing that makes the shortcut worth taking.
+    let found = pair.listing(query);
+    let wanted = [("h1", 900), ("h2", 850), ("h3", 800), ("h4", 750), ("h5", 700)];
+    assert_eq!(found.len(), wanted.len(), "the limit is the answer's length");
+    // row at a time: five rows of a hand written answer, checked one against the other so a failure
+    // names the row it is about rather than printing two lists and leaving the reader to diff them.
+    for (row, (value, count)) in found.iter().zip(wanted) {
+        assert_eq!(
+            row[0],
+            Value::Varchar(value.into()),
+            "the filtered value is gone and these lead"
+        );
+        assert_eq!(row[1], Value::BigInt(count), "the count is the one the arithmetic above gives");
+    }
+}
+
+#[test]
+fn a_top_count_with_no_skew_to_prove_it_with_goes_back_to_the_rows() {
+    // A thousand values of ten rows each. The synopsis keeps five hundred and twelve of them and
+    // bounds the rest at ten, and the fifth entry holds ten as well, so the boundary does not beat
+    // the bound and there is no proof to be had. A shortcut that fired here would be guessing.
+    let flat = "SELECT CAST(i % 1000 AS VARCHAR) AS s FROM range(10000) r(i)";
+    let pair = Pair::new("prefixflat", flat);
+    let query = "SELECT s, COUNT(*) FROM t WHERE s <> '1' GROUP BY s ORDER BY 2 DESC LIMIT 5";
+    assert!(!pair.grouped(query), "a boundary that ties the bound was called proven");
+    let found = pair.file.query(query).expect("the file answers").rows().collect::<Vec<_>>();
+    assert_eq!(found.len(), 5, "the rows still answer it");
+    for row in &found {
+        assert_eq!(row[1], Value::BigInt(10), "every value holds ten rows");
+        assert_ne!(row[0], Value::Varchar("1".into()), "the filtered value is not in the answer");
+    }
+}
+
+#[test]
+fn a_filtered_top_count_over_a_prefix_still_refuses_to_count_the_rows_it_keeps() {
+    // The proof covers which groups lead and by how much. It says nothing about how many rows the
+    // filter keeps in total, because the values the synopsis dropped are rows this list never saw,
+    // so the count of them is still a question for the rows.
+    let pair = Pair::new("prefixrows", SKEWED);
+    assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s <> 'h0'"), Value::BigInt(19050));
+    assert!(
+        !pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'h0'"),
+        "a prefix was added up as though it were the whole column"
     );
 }
 
