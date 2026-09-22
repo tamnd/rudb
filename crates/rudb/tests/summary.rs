@@ -399,6 +399,41 @@ fn a_filtered_top_count_over_a_prefix_still_refuses_to_count_the_rows_it_keeps()
     );
 }
 
+/// The integer twin of [`SKEWED`], with the same counts.
+///
+/// Value `k` for `k` under twenty is held by `50 * (19 - k)` rows and every other row gets a value
+/// of its own above a thousand, so the two ranges cannot collide and the counts are all distinct.
+const SKEWED_NUMBERS: &str = "SELECT CASE WHEN i % 20 * 1000 < i - i % 1000 THEN i % 20 \
+     ELSE 1000 + i END AS n FROM range(20000) r(i)";
+
+#[test]
+fn keys_written_as_several_that_are_really_one_column_are_still_read_out_of_the_synopsis() {
+    // ClickBench asks for the same grouping three ways. `GROUP BY URL` is one key, `GROUP BY 1, URL`
+    // adds a constant, and `GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3` adds three
+    // differences, and all three put every row in the same group as the others do. A constant is
+    // the same for every row and subtracting a constant is injective, so neither splits a group nor
+    // merges two, which is what the synopsis needs to still be talking about this query's groups.
+    let words = Pair::new("foldconst", SKEWED);
+    let plain = "SELECT s, COUNT(*) AS c FROM t GROUP BY s ORDER BY c DESC LIMIT 5";
+    let constant = "SELECT 1, s, COUNT(*) AS c FROM t GROUP BY 1, s ORDER BY c DESC LIMIT 5";
+    assert!(words.grouped(plain), "one key was not read out of the directory");
+    assert!(words.grouped(constant), "a constant beside the key sent a provable query to the rows");
+    let found = words.listing(constant);
+    assert_eq!(found.len(), 5, "the limit is the answer's length");
+    assert_eq!(found[0][1], Value::Varchar("h0".into()), "the heaviest value leads");
+    assert_eq!(found[0][2], Value::BigInt(950), "with the count the arithmetic above gives");
+    assert_eq!(found[4][2], Value::BigInt(750), "and the fifth is the boundary the proof used");
+
+    let numbers = Pair::new("folddiff", SKEWED_NUMBERS);
+    let differences = "SELECT n, n - 1, n - 2, COUNT(*) AS c FROM t GROUP BY n, n - 1, n - 2 ORDER BY c DESC LIMIT 5";
+    assert!(numbers.grouped(differences), "differences of the key sent the query to the rows");
+    let found = numbers.listing(differences);
+    assert_eq!(found.len(), 5, "the limit is the answer's length");
+    assert_eq!(found[0][0], Value::BigInt(0), "the heaviest value leads");
+    assert_eq!(found[0][1], Value::BigInt(-1), "and the difference is computed off it");
+    assert_eq!(found[0][3], Value::BigInt(950), "with the count the arithmetic above gives");
+}
+
 #[test]
 fn a_grouped_count_over_a_complete_synopsis_keeps_the_null_group_the_rows_would() {
     let pair = Pair::new(
