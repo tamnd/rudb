@@ -262,6 +262,18 @@ impl Bitmap {
         Self { words: vec![0; len.div_ceil(64)] }
     }
 
+    /// The words themselves, for a loop that would rather read them than ask per row.
+    ///
+    /// [`Self::get`] is written for one row: it reaches through the `Vec`, bounds checks the word
+    /// and then tests the bit. A loop over a whole chunk pays all three per row for the first two
+    /// of which nothing changes, so a kernel that walks every row takes the slice once and indexes
+    /// it. What a caller has to remember is the part `get` handles and this does not, which is that
+    /// a row past `words.len() * 64` is not there and reads as invalid.
+    #[must_use]
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
     /// Whether the value at `index` is valid. Past the end reads as invalid.
     #[must_use]
     pub fn get(&self, index: usize) -> bool {
