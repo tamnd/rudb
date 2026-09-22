@@ -85,6 +85,12 @@ impl<S: Source> Source for Watched<S> {
         }
         progress
     }
+
+    /// Passed through, because the wrapper is not the thing that knows what a row costs. The same
+    /// trap as the two `weight` methods below, and caught the same way.
+    fn weight(&self) -> usize {
+        self.inner.weight()
+    }
 }
 
 impl<S: Stream> Stream for Watched<S> {

@@ -352,11 +352,11 @@ fn onto(columns: &[Option<usize>], tests: Vec<(usize, Op, Bound)>) -> Vec<Probe>
 /// on that. A filter above the scan has the predicate and not the zone, so it compares every row of
 /// every chunk whatever the statistics already proved.
 ///
-/// It is offered rather than pushed, because only some predicates can go. See
-/// [`rudb_opt::bounds::all_of`]: every conjunct has to read as a comparison of one of this scan's
-/// columns against a constant, and one that does not leaves the whole filter where it was. A residual
-/// split, where the readable conjuncts go down and the rest stay above, would be worth more and needs
-/// the plan rewritten rather than read, which is a pass in `rudb-opt` and not a branch here.
+/// It is offered rather than pushed, because only a filter sitting directly on a stored table can
+/// go. See [`rudb_opt::bounds::into_scan`]. Whether the predicate reads as tests is a separate
+/// question and decides only whether the middle answer above is available: a predicate with an `OR`
+/// in it still moves down, it just gets compared on every chunk the pruning left alive, which is
+/// what it would have done above the scan anyway.
 #[derive(Debug)]
 pub(crate) struct Pushdown {
     /// The filter node this came from, which is still in the plan and is what the compaction gain
@@ -365,6 +365,8 @@ pub(crate) struct Pushdown {
     pub(crate) predicate: ExprRef,
     /// The conjuncts, read as tests, in the numbering of what the scan produces.
     pub(crate) tests: Vec<(usize, Op, Bound)>,
+    /// Whether those tests are the whole predicate, which is what makes the zone shortcut sound.
+    pub(crate) whole: bool,
 }
 
 /// Everything the builder hands a scan that narrows what it reads.
@@ -395,8 +397,8 @@ struct Pushed {
     predicate: Prepared,
     compaction: &'static dyn Compaction,
     passes: u32,
-    /// The same conjuncts as probes, or `None` when one of them could not be moved onto the table's
-    /// numbering.
+    /// The same conjuncts as probes, or `None` when they are not the whole predicate or one of them
+    /// could not be moved onto the table's numbering.
     ///
     /// `None` rather than a shorter list, because a list with one conjunct missing from it would
     /// prove the rows pass a filter that is not the one being applied, and [`Zone::certain`] over an
@@ -448,13 +450,14 @@ impl Pushed {
         let types = schema.types();
         let context = Context::new(SeamId::ChunkCompaction, seams).with_types(&types);
         let compaction = compaction().choose(&context)?.strategy();
+        let whole = pushdown.whole;
         let wanted = pushdown.tests.len();
         let probes = onto(columns, pushdown.tests);
         Ok(Self {
             predicate: Prepared::one(plan, pushdown.predicate, schema)?.in_session(session),
             compaction,
             passes: later_passes(plan, pushdown.node),
-            probes: (probes.len() == wanted).then_some(probes),
+            probes: (whole && probes.len() == wanted).then_some(probes),
             spare: Mutex::new(Vec::new()),
         })
     }
@@ -971,6 +974,16 @@ impl Source for Scan<'_> {
         self.apply(at, out)?;
         self.sift(out)?;
         Ok(more(morsel))
+    }
+
+    /// A pass over the rows for every step of the filter this scan took off the operator above it.
+    ///
+    /// Counted exactly the way [`crate::stream::Filter`] counts it, because it is that operator's
+    /// work and the pipeline has to arrive at the same number whichever side of the scan boundary
+    /// it is being done on. Zero for a scan with nothing pushed into it, which is a scan that only
+    /// reads, and reading is the 1 the pipeline already counts.
+    fn weight(&self) -> usize {
+        self.pushed.as_ref().map_or(0, |pushed| pushed.predicate.passes())
     }
 }
 
@@ -2681,10 +2694,12 @@ mod tests {
         let Node::Get { index, columns, .. } = *plan.node(input) else {
             panic!("under a get");
         };
-        let tests = rudb_opt::bounds::all_of(&plan, input, predicate)
-            .expect("every conjunct reads as a test");
-        let pushdown = Pushdown { node: plan.root(), predicate, tests: tests.clone() };
-        let filters = Filters { pruning: tests, pushed: Some(pushdown), ..Filters::default() };
+        let moved =
+            rudb_opt::bounds::into_scan(&plan, plan.root()).expect("a filter over a stored table");
+        let pruning = rudb_opt::bounds::of(&plan, input, predicate);
+        let pushdown =
+            Pushdown { node: plan.root(), predicate, tests: moved.tests, whole: moved.whole };
+        let filters = Filters { pruning, pushed: Some(pushdown), ..Filters::default() };
         let scan = Scan::new(
             &plan,
             table,
@@ -2762,6 +2777,34 @@ mod tests {
 
         assert_eq!(counted_rows(&scan), 10);
         assert_eq!(scan.waved.load(Ordering::Relaxed), 0);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 0);
+    }
+
+    /// A predicate the zone maps cannot read still moves into the scan, and still answers.
+    ///
+    /// The `OR` is what ClickBench 40 writes as `TraficSourceID IN (-1, 6)`, and it reads as no test
+    /// at all, because a conjunct under an `OR` says nothing about the row when it is false. That
+    /// used to keep the whole filter above the scan. It does not any more: the comparison runs here,
+    /// on every chunk, which is exactly what it would have done up there, and one operator and the
+    /// chunk handed across to it are gone.
+    ///
+    /// Both counters staying at zero is the part worth pinning. Nothing may be waved through, since
+    /// there is no test that proves anything about a row, and an empty test list read as a proof is
+    /// the one way this arrangement returns rows the query asked to be rid of.
+    #[test]
+    fn a_filter_with_an_or_in_it_moves_into_the_scan_and_no_chunk_is_waved_through() {
+        let table = counted(VECTOR_SIZE * 5);
+        let high = VECTOR_SIZE * 5 - 10;
+        let (_plan, scan) = applying(
+            &table,
+            &format!(
+                "((#0.0::INTEGER < 10::INTEGER)::BOOLEAN \
+                 OR (#0.0::INTEGER >= {high}::INTEGER)::BOOLEAN)::BOOLEAN"
+            ),
+        );
+
+        assert_eq!(counted_rows(&scan), 20, "the ten at each end");
+        assert_eq!(scan.waved.load(Ordering::Relaxed), 0, "and nothing was proved about a chunk");
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 0);
     }
 

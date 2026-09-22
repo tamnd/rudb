@@ -129,10 +129,17 @@ impl<'a> Pipeline<'a> {
     /// [`Stream::weight`](crate::Stream::weight). The source is the only caller, and it is the
     /// caller because the source is what decides how many instances to run and the row count it
     /// used to decide on was only ever standing in for the work behind those rows.
+    ///
+    /// The source is asked as well as counted, because a source that took an operator's work off it
+    /// is doing work this would otherwise have counted twice over or not at all. See
+    /// [`Source::weight`](crate::Source::weight).
     #[must_use]
     pub fn weight(&self) -> usize {
         let streams = self.streams.iter().map(|stream| stream.row_weight()).sum::<usize>();
-        1_usize.saturating_add(streams).saturating_add(self.sink.row_weight())
+        1_usize
+            .saturating_add(self.source.weight())
+            .saturating_add(streams)
+            .saturating_add(self.sink.row_weight())
     }
 
     /// How many threads to borrow for this pipeline, which is not always how many instances to run.

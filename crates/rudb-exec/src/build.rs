@@ -1335,10 +1335,11 @@ impl<'a> Building<'a, '_> {
                 // Which filters can go is not decided here, because `EXPLAIN` has to say the same
                 // thing about the same plan and a second copy of the condition is a second chance
                 // to answer it differently.
-                self.pushing = rudb_opt::bounds::into_scan(plan, reference).map(|tests| Pushdown {
+                self.pushing = rudb_opt::bounds::into_scan(plan, reference).map(|moved| Pushdown {
                     node: reference,
                     predicate,
-                    tests,
+                    tests: moved.tests,
+                    whole: moved.whole,
                 });
                 // Whether there was an offer at all, held here because afterwards the field says
                 // only whether there is one now. Gone can mean taken or it can mean never made, and
