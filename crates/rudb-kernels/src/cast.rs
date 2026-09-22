@@ -697,6 +697,31 @@ pub fn row_count(value: &Value, clause: &str) -> Result<u64> {
     u64::try_from(count).map_err(|_| Error::binder("LIMIT/OFFSET cannot be negative"))
 }
 
+/// The share a `LIMIT` written as a percentage names, as a `DOUBLE`.
+///
+/// The other kind of limit and the same shape as [`row_count`], with a different type at the end of
+/// it. The value is cast rather than having to be a double already, so `LIMIT '30'%` is thirty
+/// percent and `LIMIT true%` is one percent, which is what the pin answers, and it lives here for
+/// the same reason the row count does: the binder reaches it when it can work the share out and the
+/// limit operator reaches it when the share has to be read off the rows.
+///
+/// Whether the share is inside nought to a hundred is the caller's question and not this one's,
+/// because the two callers say different things about a share below nought and the pin says
+/// different things too.
+///
+/// # Errors
+///
+/// If the value does not cast to `DOUBLE`.
+pub fn percentage(value: &Value) -> Result<f64> {
+    let Value::Double(percent) = cast_value(value, &LogicalType::Double, false)? else {
+        return Err(Error::binder(format!(
+            "LIMIT takes a percentage, not a value of type {}",
+            value.logical_type()
+        )));
+    };
+    Ok(percent)
+}
+
 /// Whether `TRY_CAST` turns this failure into a null.
 ///
 /// Invalid input is here for the two range failures a written interval has, which upstream throws

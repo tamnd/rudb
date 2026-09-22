@@ -17,7 +17,7 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 use crate::expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
 use crate::node::{
-    Bound, BuildSide, JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame,
+    Bound, BuildSide, JoinKind, Node, SetOpKind, Share, WindowBound, WindowExclude, WindowFrame,
     WindowUnit,
 };
 use crate::plan::Plan;
@@ -308,9 +308,9 @@ impl Reader<'_> {
                 Ok(Built::unary(move |input| Node::Limit { input, count, offset }))
             }
             "LimitPercent" => {
-                let percent = read_percent(c)?;
+                let percent = read_share(plan, c)?;
                 c.expect_word("offset")?;
-                let offset = read_count(c)?;
+                let offset = read_bound(plan, c)?;
                 Ok(Built::unary(move |input| Node::LimitPercent { input, percent, offset }))
             }
             "TopN" => {
@@ -454,11 +454,26 @@ fn read_bound(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Bound> {
     Ok(Bound::Read(read_expr(plan, c)?))
 }
 
-/// A share of the input, written the way `Display` for a `f64` writes it and ended by a `%`.
+/// A share of the input, which is a number or an expression, and either way ends in a `%`.
+///
+/// Which one it is can be told from the first character the same way a bound's can, because a
+/// number starts with a digit or a minus sign and a printed expression never does.
+fn read_share(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Share> {
+    c.skip_space();
+    if c.peek().is_some_and(|ch| ch.is_ascii_digit() || ch == '-') {
+        return Ok(Share::Percent(read_percent(c)?));
+    }
+    let expr = read_expr(plan, c)?;
+    c.expect("%")?;
+    Ok(Share::Read(expr))
+}
+
+/// A share written out, the way `Display` for a `f64` writes it and ended by a `%`.
 ///
 /// Anything outside nought to a hundred is refused here as well as in the binder, because a plan
 /// that was typed rather than bound goes through this and a share of two hundred percent has no
-/// meaning further down.
+/// meaning further down. A share read off a column gets the same check where the value turns up,
+/// which is the executor rather than here.
 fn read_percent(c: &mut Cursor<'_>) -> Result<f64> {
     c.skip_space();
     let start = c.at;

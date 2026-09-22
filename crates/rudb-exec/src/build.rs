@@ -76,7 +76,7 @@ use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
-use crate::percent::LimitPercent;
+use crate::percent::{LimitPercent, Portion};
 use crate::prepared::Prepared;
 use crate::query::Query;
 use crate::register::registries;
@@ -526,6 +526,14 @@ fn edge(plan: &Plan, bound: rudb_plan::Bound, input: &Schema) -> Result<Edge> {
         rudb_plan::Bound::All => Edge::All,
         rudb_plan::Bound::Rows(rows) => Edge::Rows(rows),
         rudb_plan::Bound::Read(expr) => Edge::Read(Prepared::one(plan, expr, input)?),
+    })
+}
+
+/// The share of a limit written as a percentage, ready to run, and the same rule as [`edge`].
+fn portion(plan: &Plan, share: rudb_plan::Share, input: &Schema) -> Result<Portion> {
+    Ok(match share {
+        rudb_plan::Share::Percent(percent) => Portion::Percent(percent),
+        rudb_plan::Share::Read(expr) => Portion::Read(Prepared::one(plan, expr, input)?),
     })
 }
 
@@ -1490,7 +1498,12 @@ impl<'a> Building<'a, '_> {
                 // back out of the buffer the finish fills.
                 let below = self.node(input)?;
                 let schema = below.schema.clone();
-                let (limit, out) = LimitPercent::new(percent, offset, memory);
+                let (limit, out) = LimitPercent::new(
+                    portion(plan, percent, &schema)?,
+                    edge(plan, offset, &schema)?,
+                    memory,
+                    self.session,
+                );
                 let counters = self.watch(reference, id, pipeline, "LimitPercent", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(limit, counters)));

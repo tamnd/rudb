@@ -71,7 +71,7 @@ mod unique;
 
 pub use expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
 pub use node::{
-    Bound, BuildSide, JoinKind, Node, SetOpKind, WindowBound, WindowExclude, WindowFrame,
+    Bound, BuildSide, JoinKind, Node, SetOpKind, Share, WindowBound, WindowExclude, WindowFrame,
     WindowUnit,
 };
 pub use plan::Plan;

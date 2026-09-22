@@ -13,6 +13,20 @@
 //! than to the share. `LIMIT 30 PERCENT OFFSET 2` over ten rows is three rows starting at the
 //! third, so it is rows two, three and four, and not the three rows after the first three.
 //!
+//! Neither end has to be a number the query wrote. `LIMIT (SELECT 30)% OFFSET (SELECT 2)` holds two
+//! values that are settled while the query runs, so each arrives as a column of the input and is
+//! read off the first row that got here. That is the same rule and the same [`Edge`] a plain limit
+//! uses for its offset, and a [`Portion`] for the share, which differs only in being a fraction
+//! rather than a row count. Read once rather than per chunk, because a volatile call would otherwise
+//! answer a different share every chunk.
+//!
+//! A share read that way is checked here rather than in the binder, because here is where the value
+//! turns up, and the two ways of being outside the range get two different sentences. A share above
+//! a hundred is out of range, which is the same sentence a share written out gets in the binder. A
+//! negative one says that a percentage cannot be negative and names the value, which is a sentence
+//! nothing else says. Both of those are read off the pin, which splits them the same way and at the
+//! same point in the query.
+//!
 //! # One instance
 //!
 //! [`Sink::parallel`] is false here for the reason it is false on the plain limit. Which rows a
@@ -23,17 +37,29 @@
 
 use std::sync::Mutex;
 
-use rudb_common::{Error, Memory, Reservation, Result};
+use rudb_common::{Error, Memory, Reservation, Result, Session};
+use rudb_kernels::percentage;
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_vector::{Chunk, Selection};
 
 use crate::buffer::Buffered;
+use crate::prepared::{Prepared, Scratch};
+use crate::stream::Edge;
+
+/// The share while the query runs, which is the [`Edge`] of a plain limit with a fraction in it.
+#[derive(Debug)]
+pub(crate) enum Portion {
+    /// A share the binder worked out, already checked to be between nought and a hundred.
+    Percent(f64),
+    /// An expression over the input, holding the share in every row.
+    Read(Prepared),
+}
 
 /// A share of the input, held until there is an input to take a share of.
 #[derive(Debug)]
 pub(crate) struct LimitPercent {
-    percent: f64,
-    offset: u64,
+    percent: Portion,
+    offset: Edge,
     memory: Memory,
     /// Every chunk that arrived, in the order it arrived.
     chunks: Mutex<Vec<Chunk>>,
@@ -51,13 +77,58 @@ pub(crate) struct Gathered {
     charged: Reservation,
 }
 
+impl Portion {
+    /// Working space sized for this share, which is nothing at all unless it is read off the rows.
+    fn scratch(&self) -> Scratch {
+        match self {
+            Self::Read(prepared) => prepared.scratch(),
+            Self::Percent(_) => Scratch::default(),
+        }
+    }
+
+    /// The share this asks for, reading the chunk when that is where the value is.
+    ///
+    /// `None` is every row, which is what a null share answers on the pin, the same way a null row
+    /// count is every row. The range is checked here for a share that had to be read, because here
+    /// is the first point anybody has the value. See the module documentation for the two
+    /// sentences.
+    fn share(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<Option<f64>> {
+        let prepared = match self {
+            Self::Percent(percent) => return Ok(Some(*percent)),
+            Self::Read(prepared) => prepared,
+        };
+        let value = prepared.evaluate_one(chunk, scratch)?.value_at(0);
+        if value.is_null() {
+            return Ok(None);
+        }
+        let percent = percentage(&value)?;
+        if percent < 0.0 {
+            return Err(Error::binder(format!("Percentage value({percent:.6}) can't be negative")));
+        }
+        if percent > 100.0 || percent.is_nan() {
+            return Err(Error::out_of_range(
+                "Limit percent out of range, should be between 0% and 100%",
+            ));
+        }
+        Ok(Some(percent))
+    }
+}
+
 impl LimitPercent {
     /// The sink the input ends in, and the source the kept rows come out of.
-    pub(crate) fn new(percent: f64, offset: u64, memory: &Memory) -> (Self, Buffered) {
+    pub(crate) fn new(
+        percent: Portion,
+        offset: Edge,
+        memory: &Memory,
+        session: &Session,
+    ) -> (Self, Buffered) {
         let out = Buffered::new();
         let limit = Self {
-            percent,
-            offset,
+            percent: match percent {
+                Portion::Read(prepared) => Portion::Read(prepared.in_session(session)),
+                settled => settled,
+            },
+            offset: offset.in_session(session),
             memory: memory.clone(),
             chunks: Mutex::new(Vec::new()),
             charged: Mutex::new(Vec::new()),
@@ -69,10 +140,44 @@ impl LimitPercent {
 
     /// How many rows a share of `rows` rows comes to, rounded down.
     ///
-    /// The percentage was checked to be between nought and a hundred while the query was bound, so
-    /// the share is never more than the input and the conversion back cannot saturate.
-    fn taken(&self, rows: u64) -> u64 {
-        (self.percent / 100.0 * rows as f64) as u64
+    /// The percentage is between nought and a hundred by the time it gets here, checked by the
+    /// binder or by [`Portion::share`], so the share is never more than the input and the
+    /// conversion back cannot saturate. No share at all is every row, which is what a null one is.
+    fn taken(&self, share: Option<f64>, rows: u64) -> u64 {
+        match share {
+            Some(percent) => (percent / 100.0 * rows as f64) as u64,
+            None => rows,
+        }
+    }
+
+    /// How many rows the offset asks to skip, reading `first` when that is where the number is.
+    ///
+    /// The first chunk that arrived carries it, the same as it does for a plain limit, and every
+    /// row of it carries the same value because the query that produced it was joined in as a
+    /// single row. A null offset is nought, the way a null offset on a plain limit is.
+    fn skipped(&self, first: Option<&Chunk>) -> Result<u64> {
+        if let Edge::Rows(rows) = self.offset {
+            return Ok(rows);
+        }
+        let Some(first) = first else {
+            return Ok(0);
+        };
+        let mut scratch = self.offset.scratch();
+        Ok(self.offset.rows(first, &mut scratch, "OFFSET")?.unwrap_or(0))
+    }
+
+    /// The share to take, reading `first` when that is where the value is.
+    ///
+    /// The same rule as the offset one line up and the same chunk. No rows at all is nothing to
+    /// read it off and no rows to take a share of either, so the answer does not depend on the
+    /// value and the pin does not read it there: an empty input with a share of minus one answers
+    /// nothing rather than raising the error a row would have raised.
+    fn share(&self, first: Option<&Chunk>) -> Result<Option<f64>> {
+        let Some(first) = first else {
+            return Ok(Some(0.0));
+        };
+        let mut scratch = self.percent.scratch();
+        self.percent.share(first, &mut scratch)
     }
 }
 
@@ -103,8 +208,10 @@ impl Sink for LimitPercent {
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
         let gathered = std::mem::take(&mut *self.chunks.lock().map_err(poisoned)?);
         let rows: u64 = gathered.iter().map(|chunk| chunk.len() as u64).sum();
-        let from = self.offset;
-        let to = from.saturating_add(self.taken(rows));
+        let first = gathered.iter().find(|chunk| !chunk.is_empty());
+        let from = self.skipped(first)?;
+        let share = self.share(first)?;
+        let to = from.saturating_add(self.taken(share, rows));
         let kept = window(gathered, from, to)?;
         let mut held = self.held.lock().map_err(poisoned)?;
         held.grow(kept.iter().map(|chunk| chunk.footprint() as u64).sum())?;

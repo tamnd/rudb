@@ -456,12 +456,9 @@ fn identifiers_match_without_regard_to_case_and_keep_the_case_they_were_created_
 
 #[test]
 fn what_is_not_bound_yet_says_what_was_written_rather_than_producing_a_wrong_plan() {
-    for query in
-        ["SELECT counter ** 2 FROM hits", "SELECT url FROM hits LIMIT 10 PERCENT OFFSET (SELECT 3)"]
-    {
-        let message = failure(query);
-        assert!(!message.is_empty(), "{query} should say what it cannot do");
-    }
+    let query = "SELECT counter ** 2 FROM hits";
+    let message = failure(query);
+    assert!(!message.is_empty(), "{query} should say what it cannot do");
 }
 
 /// A row count the binder cannot work out is joined in under the limit and read off a column.
@@ -489,6 +486,20 @@ fn a_percentage_limit_binds_to_a_node_of_its_own() {
         failure("SELECT url FROM hits LIMIT 101 PERCENT"),
         "Limit percent out of range, should be between 0% and 100%"
     );
+}
+
+/// Both ends of a share can be read off a column, the same as a row count the binder cannot settle.
+///
+/// The share is joined in first and the offset second, so they arrive as two columns and the
+/// projection over the top drops both of them again.
+#[test]
+fn a_share_and_an_offset_the_binder_cannot_work_out_are_read_off_a_column() {
+    let text = plan("SELECT url FROM hits LIMIT 10 PERCENT OFFSET (SELECT 3)");
+    assert!(text.contains("LimitPercent 10% offset #2.0::INTEGER"), "{text}");
+    assert!(text.starts_with("Project #3 [#1.0::VARCHAR AS url]"), "{text}");
+    let text = plan("SELECT url FROM hits LIMIT (SELECT 10)% OFFSET (SELECT 3)");
+    assert!(text.contains("LimitPercent #2.0::INTEGER% offset #3.0::INTEGER"), "{text}");
+    assert!(text.starts_with("Project #4 [#1.0::VARCHAR AS url]"), "{text}");
 }
 
 /// `DESCRIBE` is answered while it is bound, so what comes out is a `VALUES` and nothing else.

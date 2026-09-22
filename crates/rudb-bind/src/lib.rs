@@ -14,7 +14,7 @@
 //! [`Bound`], which is a plan for a query and a resolved catalog operation for `CREATE TABLE`,
 //! `DROP TABLE` and `INSERT`. DDL is not a plan node, for the reason `statement.rs` gives.
 //!
-//! What it does not do yet is an `OFFSET` holding a subquery beside a `LIMIT` written as a percentage, and every statement outside the implemented set. Each gap is an error naming what was written rather than a silently wrong plan, which is the rule the whole front end follows.
+//! What it does not do yet is every statement outside the implemented set. Each gap is an error naming what was written rather than a silently wrong plan, which is the rule the whole front end follows.
 
 #![forbid(unsafe_code)]
 

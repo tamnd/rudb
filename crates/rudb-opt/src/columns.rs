@@ -295,7 +295,13 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
                 walk(plan, read, found);
             }
         }
-        Node::LimitPercent { .. } => {}
+        // And the same for a share of the input, where both the share and the offset can be
+        // written that way.
+        Node::LimitPercent { percent, offset, .. } => {
+            for read in [percent.read(), offset.read()].into_iter().flatten() {
+                walk(plan, read, found);
+            }
+        }
         Node::Distinct { on, .. } => list(plan, on, found),
         Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
             list(plan, conditions, found);

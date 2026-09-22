@@ -930,7 +930,16 @@ impl Plan {
                     return fail("skips ALL rows, which is not an offset");
                 }
             }
-            Node::LimitPercent { .. } => {}
+            Node::LimitPercent { percent, offset, .. } => {
+                for expr in percent.read().into_iter().chain(offset.read()) {
+                    self.checked_expr(expr, reference)?;
+                }
+                // Same rule as the plain limit above. A share that skipped every row would answer
+                // nothing and say nothing about why.
+                if offset == Bound::All {
+                    return fail("skips ALL rows, which is not an offset");
+                }
+            }
             Node::Distinct { on, .. } => {
                 self.checked_expr_list(on, reference)?;
             }
@@ -1025,12 +1034,14 @@ impl Plan {
             | Node::CrossProduct { .. }
             | Node::MaterializedCte { .. }
             | Node::CteScan { .. }
-            | Node::SetOp { .. }
-            | Node::LimitPercent { .. } => Vec::new(),
-            // The two ends of a limit hold an expression only when the query wrote something the
+            | Node::SetOp { .. } => Vec::new(),
+            // The ends of a limit hold an expression only when the query wrote something the
             // binder could not work out, which is a column read off the row the limit is given.
             Node::Limit { count, offset, .. } => {
                 plain(&[count.read(), offset.read()].into_iter().flatten().collect::<Vec<_>>())
+            }
+            Node::LimitPercent { percent, offset, .. } => {
+                plain(&[percent.read(), offset.read()].into_iter().flatten().collect::<Vec<_>>())
             }
             Node::Values { rows, .. } => {
                 self.row_list(rows).iter().flat_map(|row| plain(self.expr_list(*row))).collect()
