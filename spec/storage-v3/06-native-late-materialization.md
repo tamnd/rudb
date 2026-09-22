@@ -26,3 +26,5 @@ The rewrite keeps the existing late-materialization limits:
 ## Evidence
 
 On 1 million ClickBench rows, native Query 24 fell from 76.3 ms to 20.5 ms. DuckDB native took 43.0 ms. rudb CPU time fell from 1.03 seconds to 169 ms and peak RSS fell from 79.3 MiB to 33.3 MiB.
+
+**That 2.1x win is a 2.26x loss at benchmark scale**, and Q25 through Q27 are worse; document 13 has the measurement and document 14 argues that the eligibility rule above is the reason. The rule was written for `SELECT *`, so requiring eight deferred columns excludes every top-N query in the suite except Q24. The quantity that should be bounded is the number of values materialized, `|F| * R + |P| * K`, and for a query that projects one string column and orders by another that is `R` keys and `K` strings regardless of how few columns were deferred.

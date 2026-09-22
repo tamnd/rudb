@@ -17,6 +17,9 @@ The ClickBench evidence at 100k rows is:
 | Q34 | 16.00 ms | 1.56 ms |
 | Q35 | 19.00 ms | 1.52 ms |
 
+**That evidence does not hold at benchmark scale.** At 100,000,000 rows rudb loses Q34 by 2.72x and
+Q35 by 3.85x; document 13 has the measurement. The reversal is not an argument against stable codes, whose reasoning above stands on its own. It means this document has never been tested at the size that decides it, and the tenfold win quoted here must not be cited as though it had been.
+
 ## Dictionary page
 
 The version 7 dictionary page contains:
