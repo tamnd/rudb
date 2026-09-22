@@ -873,7 +873,9 @@ impl GlobalDictionary {
     /// Encodes whatever is still raw, which is the part block at the end of the load and, for a
     /// column too small to have settled a shape, every block it has.
     fn finish_blocks(&mut self) -> Result<()> {
-        if !self.filling.is_empty() {
+        // Asked of the values rather than of the bytes, because a block of empty strings has values
+        // in it and no bytes, and a column of nulls is exactly that.
+        if self.ends.len() % TEXT_PAYLOAD_VALUES != 0 {
             self.seal();
         }
         for (at, bytes) in std::mem::take(&mut self.waiting) {
