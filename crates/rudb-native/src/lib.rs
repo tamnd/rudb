@@ -682,6 +682,12 @@ struct GlobalDictionary {
     payload: Vec<u8>,
     counts: Vec<u64>,
     nulls: u64,
+    /// The payload blocks that were already complete during the load, encoded, in block order.
+    blocks: Vec<Vec<u8>>,
+    /// The shape the blocks encoded so far were encoded with.
+    shape: Option<chooser::Settled>,
+    /// How many blocks were complete when that shape was settled.
+    settled: usize,
 }
 
 impl GlobalDictionary {
@@ -693,7 +699,65 @@ impl GlobalDictionary {
             payload: Vec::new(),
             counts: Vec::new(),
             nulls: 0,
+            blocks: Vec::new(),
+            shape: None,
+            settled: 0,
         }
+    }
+
+    /// One payload block's values, borrowed out of the payload.
+    fn block_values(&self, block: usize) -> Vec<&[u8]> {
+        let values = self.offsets.len() - 1;
+        let first = block * TEXT_PAYLOAD_VALUES;
+        let last = (first + TEXT_PAYLOAD_VALUES).min(values);
+        (first..last)
+            .map(|value| {
+                let from = self.offsets[value] as usize;
+                let to = self.offsets[value + 1] as usize;
+                &self.payload[from..to]
+            })
+            .collect()
+    }
+
+    /// Encodes every payload block that has filled up since the last call.
+    ///
+    /// A block holds codes `k * TEXT_PAYLOAD_VALUES` to the next multiple, codes are handed out in
+    /// first seen order and a value's bytes never move once written, so block `k` is final the
+    /// moment code `(k + 1) * TEXT_PAYLOAD_VALUES` is handed out. That happens during the scan.
+    /// Nothing about a block depends on the sort, on the last stripe or on any other column, so
+    /// holding all of this work until `close` leaves it queued behind a phase that does not need
+    /// it, on one thread, while the readers of the source file are done and the cores are free.
+    /// Doing it here rides on the per column worker that already owns this dictionary exclusively,
+    /// so it needs no locking and it runs across columns for free.
+    ///
+    /// The shape is settled from the blocks that exist rather than from the whole column, and it is
+    /// settled again each time the column grows fourfold. That is legal because every block records
+    /// the encoding it used, so the reader never assumed one shape per column, and it is arguably
+    /// better than one shape: a dictionary in first seen order has its common values at the front
+    /// and its long tail at the back, and a shape chosen for the front does not have to be the
+    /// shape the back is written with.
+    fn encode_ready(&mut self) -> Result<()> {
+        let complete = (self.offsets.len() - 1) / TEXT_PAYLOAD_VALUES;
+        // Under the sample there is nothing to settle a shape from, and a column that stays this
+        // small is cheap enough that `close` can do the whole thing.
+        if complete <= PAYLOAD_SAMPLE_BLOCKS || complete <= self.blocks.len() {
+            return Ok(());
+        }
+        if self.shape.is_none() || complete >= self.settled.saturating_mul(4) {
+            let shape = settle_shape(&|block| self.block_values(block), complete)?;
+            self.shape = Some(shape);
+            self.settled = complete;
+        }
+        let mut made = Vec::with_capacity(complete - self.blocks.len());
+        for block in self.blocks.len()..complete {
+            let values = self.block_values(block);
+            made.push(match &self.shape {
+                Some(shape) => string::encode_with(&values, shape)?,
+                None => string::encode(&values)?,
+            });
+        }
+        self.blocks.extend(made);
+        Ok(())
     }
 
     fn bytes(&self, code: u32) -> Option<&[u8]> {
@@ -1323,17 +1387,31 @@ impl Writer {
         let deciding = dictionary.as_ref().is_some_and(|held| held.offsets.len() == 1);
         let stripe = Self::encode_pages(index, held, dictionary.as_mut())?;
         if !deciding {
-            return Ok(stripe);
+            return Self::with_ready_blocks(stripe, dictionary);
         }
         let rows: usize = held.iter().map(|pending| pending.chunk.len()).sum();
         let distinct = dictionary.as_ref().map_or(0, |held| held.offsets.len() - 1);
         if rows < DICTIONARY_DECIDE_ROWS
             || distinct.saturating_mul(10) <= rows.saturating_mul(DICTIONARY_DISTINCT_IN_TEN)
         {
-            return Ok(stripe);
+            return Self::with_ready_blocks(stripe, dictionary);
         }
         *dictionary = None;
         Self::encode_pages(index, held, None)
+    }
+
+    /// Encodes whatever the stripe just completed, once the dictionary is known to be kept.
+    ///
+    /// After the decision rather than before it, because the decision can throw the dictionary away
+    /// and a first stripe large enough to fill blocks is exactly the kind that gets thrown away.
+    fn with_ready_blocks(
+        stripe: ColumnStripe,
+        dictionary: &mut Option<GlobalDictionary>,
+    ) -> Result<ColumnStripe> {
+        if let Some(held) = dictionary.as_mut() {
+            held.encode_ready()?;
+        }
+        Ok(stripe)
     }
 
     /// One column's parts of a stripe, with whatever dictionary it was given.
@@ -6316,7 +6394,7 @@ fn rankings(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<(u64, u
 }
 
 fn encode_global_dictionary(
-    dictionary: GlobalDictionary,
+    mut dictionary: GlobalDictionary,
     order: &[(u64, u32)],
 ) -> Result<EncodedDictionary> {
     let values = dictionary.offsets.len() - 1;
@@ -6324,7 +6402,7 @@ fn encode_global_dictionary(
         return Err(invalid("global dictionary order does not cover its values"));
     }
     let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
-    let payload = encode_payload(&dictionary)?;
+    let payload = encode_payload(&mut dictionary)?;
     if payload.len() != blocks {
         return Err(invalid("global dictionary payload is not the blocks it says it is"));
     }
@@ -6424,26 +6502,29 @@ fn payload_shapes() -> Vec<chooser::Settled> {
 
 /// The payload as encoded blocks of [`TEXT_PAYLOAD_VALUES`] values each.
 ///
+/// Most of these are already encoded: [`GlobalDictionary::encode_ready`] takes each block as the
+/// load fills it, so what is left here is the last block, the one that was still filling when the
+/// insert ended. A column that never grew past the sample arrives with nothing done and is encoded
+/// in full, which is the path this function had before and the path the tests take.
+///
 /// Across threads because this is the only part of committing a file that is real work rather than
 /// bookkeeping. The blocks are the same size and cost about the same, so an index each is enough of
 /// a queue and there is nothing to weight the way the numeric synopses are weighted.
-fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
+fn encode_payload(dictionary: &mut GlobalDictionary) -> Result<Vec<Vec<u8>>> {
+    dictionary.encode_ready()?;
+    let mut payload = std::mem::take(&mut dictionary.blocks);
+    let settled = dictionary.shape.clone();
+    let dictionary = &*dictionary;
     let values = dictionary.offsets.len() - 1;
     let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
-    let run = |block: usize| {
-        let first = block * TEXT_PAYLOAD_VALUES;
-        let last = (first + TEXT_PAYLOAD_VALUES).min(values);
-        (first..last)
-            .map(|value| {
-                let from = dictionary.offsets[value] as usize;
-                let to = dictionary.offsets[value + 1] as usize;
-                &dictionary.payload[from..to]
-            })
-            .collect::<Vec<_>>()
-    };
+    let done = payload.len();
+    let run = |block: usize| dictionary.block_values(block);
     // A dictionary small enough to be the sample is small enough to search in full, and searching
     // it costs less than deciding not to.
-    let shape = (blocks > PAYLOAD_SAMPLE_BLOCKS).then(|| settle_shape(&run, blocks)).transpose()?;
+    let shape = match settled {
+        Some(shape) => Some(shape),
+        None => (blocks > PAYLOAD_SAMPLE_BLOCKS).then(|| settle_shape(&run, blocks)).transpose()?,
+    };
     let one = |block: usize| match &shape {
         Some(shape) => string::encode_with(&run(block), shape),
         None => string::encode(&run(block)),
@@ -6451,11 +6532,14 @@ fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(MAX_FREQUENCY_WORKERS)
-        .min(blocks);
+        .min(blocks - done);
     if workers <= 1 {
-        return (0..blocks).map(one).collect();
+        for block in done..blocks {
+            payload.push(one(block)?);
+        }
+        return Ok(payload);
     }
-    let next = AtomicUsize::new(0);
+    let next = AtomicUsize::new(done);
     let pieces = std::thread::scope(|scope| {
         (0..workers)
             .map(|_| {
@@ -6478,7 +6562,7 @@ fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
             })
             .collect::<Result<Vec<_>>>()
     })?;
-    let mut payload = vec![Vec::new(); blocks];
+    payload.resize(blocks, Vec::new());
     for piece in pieces {
         for (block, bytes) in piece {
             payload[block] = bytes;
