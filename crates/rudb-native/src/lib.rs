@@ -62,7 +62,7 @@ pub use zones::{Common, Stripes, distincts};
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
-const FORMAT: u32 = 24;
+const FORMAT: u32 = 25;
 
 /// Formats this build can open.
 ///
@@ -72,15 +72,17 @@ const FORMAT: u32 = 24;
 /// as a table with an empty section table, which is exactly what section 3.1 says a table with no
 /// graph sections is.
 ///
-/// Both of the older two are readable for the same reason. What took the format from 22 to 23 was
-/// tags for fourteen more column types, and a file written before that has none of them in it, so
-/// nothing in an older file is a tag this build cannot read. What takes it from 23 to 24 is the
-/// section table, which a file written before it simply does not have.
+/// All three of the older ones are readable for the same reason. What took the format from 22 to 23
+/// was tags for fourteen more column types, and a file written before that has none of them in it,
+/// so nothing in an older file is a tag this build cannot read. What took it from 23 to 24 is the
+/// section table, which a file written before it simply does not have. What takes it from 24 to 25
+/// is the view section on the end of the catalog, which an older file does not have either, and a
+/// catalog that ends where the tables end reads as a catalog with no views in it.
 ///
-/// This is not a general compatibility promise. Three formats are readable because there was a
+/// This is not a general compatibility promise. Four formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
 /// carrying.
-const READABLE: &[u32] = &[22, 23, FORMAT];
+const READABLE: &[u32] = &[22, 23, 24, FORMAT];
 
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
@@ -517,6 +519,32 @@ struct Entry {
     directory: Page,
 }
 
+/// One view's line in the catalog directory.
+///
+/// A view has no pages, so unlike a table it is entirely here and there is no second level under it.
+/// What it is made of is text: the body the binder binds again at every reference, and the whole
+/// statement written back out, which is what `duckdb_views()` reports and nothing else reads.
+///
+/// The columns are a cache and they are written down anyway, which is worth saying out loud because
+/// a cache in a file looks like a mistake. It is what the pin does. Create a view on a file, open
+/// the file again in another process, and `duckdb_views()` answers `column_count` and `is_bound`
+/// true without anything having bound the body, so the list survived the write. Not writing it
+/// would answer null and false there, and the only way back would be to bind every view at open,
+/// which is the thing the cache exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewEntry {
+    /// The view's own name, without the schema, the way a table entry holds its name.
+    pub name: String,
+    /// The query the view stands for, as the text that was written.
+    pub sql: String,
+    /// The whole `CREATE VIEW` written back out.
+    pub statement: String,
+    /// The column names the statement gave, which rename a prefix of what the body produces.
+    pub aliases: Vec<String>,
+    /// The columns the last bind of the body produced.
+    pub columns: Vec<Field>,
+}
+
 /// Where one column's bytes went, taken from the directory rather than by reading pages.
 #[derive(Debug, Clone)]
 pub struct ColumnLayout {
@@ -775,6 +803,11 @@ pub struct Writer {
     pending: Vec<PendingChunk>,
     /// The tables already closed in this generation, in the order they were written.
     closed: Vec<Entry>,
+    /// The views the next commit writes down, which [`Writer::with_views`] sets.
+    ///
+    /// Carried forward from the committed generation by [`Writer::open`], so a writer that was only
+    /// opened to append a table does not have to know about views to avoid dropping them.
+    views: Vec<ViewEntry>,
 }
 
 /// A chunk that has arrived and is waiting for the rest of its stripe.
@@ -909,7 +942,7 @@ impl Writer {
         let name = name.into();
         let path = path.as_ref();
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
-        let mut closed = decode_catalog(&bytes, size)?;
+        let (mut closed, views) = decode_catalog(&bytes, size)?;
         // A table already in the file under this name is only in the way if it holds rows. One that
         // holds none has no pages for this generation to carry and no reader that could lose
         // anything, so the table being started here takes its place in the catalog rather than
@@ -961,6 +994,7 @@ impl Writer {
             next_order: 0,
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed,
+            views,
         })
     }
 
@@ -1007,6 +1041,7 @@ impl Writer {
             next_order: 0,
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed: Vec::new(),
+            views: Vec::new(),
         })
     }
 
@@ -1024,17 +1059,21 @@ impl Writer {
     /// that is going to have a table added to it later is [`Writer::open`], which reads what this
     /// wrote the same way it reads any other generation.
     ///
+    /// It takes the views anyway, because a database with no table can still have views in it. A
+    /// view over `range` or over another view names no table, so dropping the last table out of a
+    /// database does not have to leave the catalog with nothing worth writing down.
+    ///
     /// # Errors
     ///
     /// If the file exists or the path cannot be written.
-    pub fn empty(path: impl AsRef<Path>) -> Result<()> {
+    pub fn empty(path: impl AsRef<Path>, views: &[ViewEntry]) -> Result<()> {
         let file =
             OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
         write_at(&file, 0, &header)?;
-        let catalog = encode_catalog(&[])?;
+        let catalog = encode_catalog(&[], views)?;
         write_at(&file, HEADER, &catalog)?;
         // The same two syncs in the same order as [`Writer::finish`], and for the same reason. The
         // catalog is on the disk before the slot names it, so a file this is interrupted in the
@@ -1070,13 +1109,14 @@ impl Writer {
         if self.closed.iter().chain(std::iter::once(&entry)).any(|held| held.name == name) {
             return Err(invalid("two tables in one native file have the same name"));
         }
-        let Self { file, at, generation, mut closed, .. } = self;
+        let Self { file, at, generation, mut closed, views, .. } = self;
         closed.push(entry);
         Ok(Self {
             file,
             at,
             generation,
             closed,
+            views,
             dictionaries: fields
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
@@ -1097,6 +1137,21 @@ impl Writer {
             next_order: 0,
             pending: Vec::with_capacity(STRIPE_PARTS),
         })
+    }
+
+    /// Sets the views the next commit writes down, replacing whatever was carried forward.
+    ///
+    /// It replaces rather than adds because the caller has the whole catalog in front of it and the
+    /// writer does not. A view that was dropped is a view that is not in the list any more, and
+    /// there is no other way for the writer to hear about that, since nothing else it is told about
+    /// mentions views at all.
+    ///
+    /// A writer that is never told anything writes back the views it read at [`Writer::open`], so a
+    /// checkpoint that only had a table to append does not quietly drop them.
+    #[must_use]
+    pub fn with_views(mut self, views: Vec<ViewEntry>) -> Self {
+        self.views = views;
+        self
     }
 
     /// Records the order this table's rows are meant to be stored in.
@@ -1828,7 +1883,7 @@ impl Writer {
         let entry = self.close()?;
         let mut tables = std::mem::take(&mut self.closed);
         tables.push(entry);
-        let catalog = encode_catalog(&tables)?;
+        let catalog = encode_catalog(&tables, &self.views)?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -1851,6 +1906,48 @@ impl Writer {
         write_at(&self.file, slot_offset(self.generation), &slot.bytes())?;
         self.file.sync_all().map_err(io)?;
         Ok(self.table)
+    }
+
+    /// Commits a generation that changes the views and leaves every table exactly where it is.
+    ///
+    /// There was no way to do this before views existed, because everything that could change the
+    /// catalog also wrote a table, so the only way to say something new about a file was to go
+    /// through a table. A view is the first thing that can change on its own. Without this, adding
+    /// a view to a database with eight tables in it would rewrite all eight, since the append path
+    /// needs a table to append and the fallback is the whole file.
+    ///
+    /// It is the same commit as [`Writer::finish`] with nothing appended before it. The table
+    /// entries are carried forward by directory pointer the way an append carries them, the new
+    /// catalog goes on the end, and the slot write at the end is what publishes it.
+    ///
+    /// # Errors
+    ///
+    /// If the file has no valid committed directory, is not this build's format, or cannot be
+    /// written.
+    pub fn restate(path: impl AsRef<Path>, views: &[ViewEntry]) -> Result<()> {
+        let path = path.as_ref();
+        let (_, size, slot, bytes, _) = slot_bytes(path)?;
+        let (closed, _) = decode_catalog(&bytes, size)?;
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("native file generation overflow"))?;
+        let catalog = encode_catalog(&closed, views)?;
+        if catalog.len() > MAX_DIRECTORY {
+            return Err(invalid("catalog exceeds the configured bound"));
+        }
+        let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
+        write_at(&file, size, &catalog)?;
+        file.sync_all().map_err(io)?;
+        let slot = Slot {
+            offset: size,
+            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+            generation,
+            hash: checksum(&catalog),
+        };
+        write_at(&file, slot_offset(generation), &slot.bytes())?;
+        file.sync_all().map_err(io)?;
+        Ok(())
     }
 }
 
@@ -1942,7 +2039,7 @@ pub fn attach(
 ) -> Result<Table> {
     let path = path.as_ref();
     let (_, size, slot, bytes, _) = slot_bytes(path)?;
-    let mut entries = decode_catalog(&bytes, size)?;
+    let (mut entries, views) = decode_catalog(&bytes, size)?;
     let at = entries
         .iter()
         .position(|entry| entry.name == table)
@@ -1987,7 +2084,9 @@ pub fn attach(
         length: u32::try_from(encoded.len()).map_err(|_| invalid("directory length overflow"))?,
         hash: checksum(&encoded),
     };
-    let catalog = encode_catalog(&entries)?;
+    // The views the file already had, written back unchanged. Attaching a section to a table says
+    // nothing about a view and must not drop one.
+    let catalog = encode_catalog(&entries, &views)?;
     if catalog.len() > MAX_DIRECTORY {
         return Err(invalid("catalog exceeds the configured bound"));
     }
@@ -2872,6 +2971,8 @@ pub struct Catalog {
     file: Arc<File>,
     size: u64,
     entries: Arc<Vec<Entry>>,
+    /// The views the file holds, whole, since a view has no second level to read later.
+    views: Arc<Vec<ViewEntry>>,
     opening: Opening,
 }
 
@@ -2883,8 +2984,14 @@ impl Catalog {
     /// If the file has no valid committed catalog or a catalog pointer is out of bounds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let (file, size, _, bytes, opening) = slot_bytes(path)?;
-        let entries = decode_catalog(&bytes, size)?;
-        Ok(Self { file: Arc::new(file), size, entries: Arc::new(entries), opening })
+        let (entries, views) = decode_catalog(&bytes, size)?;
+        Ok(Self {
+            file: Arc::new(file),
+            size,
+            entries: Arc::new(entries),
+            views: Arc::new(views),
+            opening,
+        })
     }
 
     /// The tables in the file, in the order they were written.
@@ -2900,6 +3007,15 @@ impl Catalog {
     /// generation would have to carry, so the count has to come out of the catalog beside the name.
     pub fn rows(&self) -> impl ExactSizeIterator<Item = (&str, usize)> {
         self.entries.iter().map(|entry| (entry.name.as_str(), entry.rows))
+    }
+
+    /// The views in the file, in the order they were written.
+    ///
+    /// Whole, unlike [`Catalog::names`], which hands back names and makes the caller ask for a table
+    /// by one. A view is a few strings and a column list and it was all read at open, so there is
+    /// nothing left to go and fetch and no reason to make the caller ask twice.
+    pub fn views(&self) -> impl ExactSizeIterator<Item = &ViewEntry> {
+        self.views.iter()
     }
 
     /// How many tables the file holds.
@@ -4495,7 +4611,10 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
 /// This is what a footer slot points at. Each entry carries its own checksum over its table
 /// directory, so a table whose directory is torn is found when that table is first touched rather
 /// than being trusted because the catalog around it checksummed.
-fn encode_catalog(entries: &[Entry]) -> Result<Vec<u8>> {
+///
+/// The views go after the tables and are whole here, since a view is text and a column list and has
+/// no pages for a second level to point at.
+fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
     let mut out = CATALOG.to_vec();
     put_u32(&mut out, u32::try_from(entries.len()).map_err(|_| invalid("too many tables"))?);
     for entry in entries {
@@ -4521,12 +4640,54 @@ fn encode_catalog(entries: &[Entry]) -> Result<Vec<u8>> {
         put_u32(&mut out, entry.directory.length);
         put_u64(&mut out, entry.directory.hash);
     }
+    put_u32(&mut out, u32::try_from(views.len()).map_err(|_| invalid("too many views"))?);
+    for view in views {
+        let name = view.name.as_bytes();
+        put_u16(&mut out, u16::try_from(name.len()).map_err(|_| invalid("view name too long"))?);
+        out.extend_from_slice(name);
+        put_long_text(&mut out, &view.sql, "view body")?;
+        put_long_text(&mut out, &view.statement, "view statement")?;
+        put_u16(
+            &mut out,
+            u16::try_from(view.aliases.len()).map_err(|_| invalid("too many aliases"))?,
+        );
+        for alias in &view.aliases {
+            let alias = alias.as_bytes();
+            put_u16(
+                &mut out,
+                u16::try_from(alias.len()).map_err(|_| invalid("alias name too long"))?,
+            );
+            out.extend_from_slice(alias);
+        }
+        put_u16(
+            &mut out,
+            u16::try_from(view.columns.len()).map_err(|_| invalid("too many columns"))?,
+        );
+        for field in &view.columns {
+            let name = field.name.as_bytes();
+            put_u16(
+                &mut out,
+                u16::try_from(name.len()).map_err(|_| invalid("column name too long"))?,
+            );
+            out.extend_from_slice(name);
+            put_type(&mut out, &field.ty)?;
+            out.push(u8::from(field.not_null));
+        }
+    }
     Ok(out)
+}
+
+/// A length and that many bytes, for text that is allowed to be longer than a name.
+fn put_long_text(out: &mut Vec<u8>, text: &str, what: &str) -> Result<()> {
+    let bytes = text.as_bytes();
+    put_u32(out, u32::try_from(bytes.len()).map_err(|_| invalid(&format!("{what} too long")))?);
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// Reads the catalog directory back, checking every span against the file before anything is
 /// allocated for it.
-fn decode_catalog(bytes: &[u8], size: u64) -> Result<Vec<Entry>> {
+fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>)> {
     let mut cur = Cursor { bytes, at: 0 };
     if cur.take(8)? != CATALOG {
         return Err(invalid("catalog magic differs"));
@@ -4565,7 +4726,45 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Vec<Entry>> {
         }
         entries.push(Entry { name, fields, rows, directory });
     }
-    Ok(entries)
+    // A catalog that ends where the tables end is a catalog with no views in it, which is every
+    // file written before format 25. That is why the count is allowed to be missing rather than
+    // read as a zero that has to be there: an older file has nothing after the last table entry at
+    // all, and [`READABLE`] says those files still open.
+    let count = if cur.done() { 0 } else { cur.u32()? as usize };
+    let mut views: Vec<ViewEntry> = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let name = cur.text()?;
+        let sql = cur.long_text()?;
+        let statement = cur.long_text()?;
+        let width = cur.u16()? as usize;
+        let mut aliases = Vec::with_capacity(width);
+        for _ in 0..width {
+            aliases.push(cur.text()?);
+        }
+        let width = cur.u16()? as usize;
+        let mut columns = Vec::with_capacity(width);
+        for _ in 0..width {
+            let name = cur.text()?;
+            let ty = read_type(&mut cur)?;
+            let not_null = match cur.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid("nullability flag differs")),
+            };
+            columns.push(Field { name, ty, not_null });
+        }
+        // The same rule the tables above get, and for the same reason. Two entries under one name
+        // is a catalog nothing can answer a lookup from, and finding that out here is better than
+        // finding it out from whichever of the two a search happened to reach first.
+        if views.iter().any(|held| held.name == name) {
+            return Err(invalid("two views in the catalog have the same name"));
+        }
+        if entries.iter().any(|held| held.name == name) {
+            return Err(invalid("a table and a view in the catalog have the same name"));
+        }
+        views.push(ViewEntry { name, sql, statement, aliases, columns });
+    }
+    Ok((entries, views))
 }
 
 struct Cursor<'a> {
@@ -4618,6 +4817,21 @@ impl<'a> Cursor<'a> {
     fn text(&mut self) -> Result<String> {
         let len = self.u16()? as usize;
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| invalid("name is not UTF-8"))
+    }
+    /// Whether everything has been read, which is how a section that an older file does not have at
+    /// all is told from one that is there and empty.
+    fn done(&self) -> bool {
+        self.at >= self.bytes.len()
+    }
+    /// The same, for text that is a query rather than a name.
+    ///
+    /// A name fits in sixteen bits of length and a view body does not have to. Nobody writes a 64
+    /// kilobyte identifier by accident and people do write generated queries that long, and a view
+    /// that could not be written down because its body was too big would be a limit invented here
+    /// rather than one anything else in the engine has.
+    fn long_text(&mut self) -> Result<String> {
+        let len = self.u32()? as usize;
+        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| invalid("text is not UTF-8"))
     }
 }
 
@@ -7584,7 +7798,7 @@ mod tests {
     #[test]
     fn a_file_holding_no_table_commits_and_opens_and_a_table_can_be_added_to_it() {
         let path = path("empty");
-        Writer::empty(&path).expect("a file with nothing in it");
+        Writer::empty(&path, &[]).expect("a file with nothing in it");
         let catalog = Catalog::open(&path).expect("the empty file opens");
         assert_eq!(catalog.len(), 0);
         assert!(catalog.is_empty());
@@ -7632,6 +7846,100 @@ mod tests {
         let error = Writer::open(&path, "items", field()).expect_err("a name with rows is taken");
         assert!(error.to_string().contains("same name"), "{error}");
         fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A view, with everything about it that a reopened catalog has to be able to answer from.
+    fn sample_view(name: &str) -> ViewEntry {
+        ViewEntry {
+            name: name.to_string(),
+            sql: "SELECT id FROM items WHERE id > 0".to_string(),
+            statement: format!("CREATE VIEW {name} AS SELECT id FROM items WHERE (id > 0);"),
+            aliases: vec!["n".to_string()],
+            columns: vec![Field::new("n", LogicalType::Integer)],
+        }
+    }
+
+    #[test]
+    fn a_view_written_into_the_catalog_comes_back_whole() {
+        let path = path("views");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.with_views(vec![sample_view("v")]).finish().expect("commit");
+        let catalog = Catalog::open(&path).expect("reopen");
+        assert_eq!(catalog.views().cloned().collect::<Vec<_>>(), vec![sample_view("v")]);
+        // The tables are still there and are still read the same way, so the section on the end did
+        // not move anything in front of it.
+        assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items"]);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A writer opened to append a table says nothing about views and must not lose them.
+    #[test]
+    fn appending_a_table_carries_the_views_forward() {
+        let path = path("viewscarry");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.with_views(vec![sample_view("v")]).finish().expect("commit");
+        let mut writer =
+            Writer::open(&path, "other", vec![Field::required("id", LogicalType::Integer)])
+                .expect("a second table");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let catalog = Catalog::open(&path).expect("reopen");
+        assert_eq!(catalog.views().count(), 1);
+        assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items", "other"]);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// The whole point of [`Writer::restate`]: the views change and the pages do not move.
+    #[test]
+    fn restating_the_views_leaves_every_table_where_it_was() {
+        let path = path("restate");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let before = fs::metadata(&path).expect("the file is there").len();
+        Writer::restate(&path, &[sample_view("v"), sample_view("w")]).expect("two views");
+        let catalog = Catalog::open(&path).expect("reopen");
+        assert_eq!(catalog.views().count(), 2);
+        assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items"]);
+        // A catalog on the end and nothing else, so what it grew by is the size of a catalog rather
+        // than the size of the table.
+        let after = fs::metadata(&path).expect("the file is there").len();
+        assert!(after > before, "a generation was written");
+        assert!(after - before < before, "the table was not written again");
+        // The rows are still readable through the new generation, which is the part that would go
+        // wrong if the catalog carried the wrong directory pointers forward.
+        let reader = Catalog::open(&path).expect("reopen").table("items").expect("the table");
+        assert_eq!(reader.table().rows, 3);
+        // And a restate over a restate keeps working, because each one reads the slot that
+        // checksummed rather than the highest number in the header.
+        Writer::restate(&path, &[]).expect("no views at all");
+        assert_eq!(Catalog::open(&path).expect("reopen").views().count(), 0);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// Two entries under one name is a catalog no lookup can answer, whichever two they are.
+    #[test]
+    fn a_view_named_after_a_table_is_refused_when_the_catalog_is_read() {
+        let bytes = encode_catalog(
+            &[Entry {
+                name: "items".to_string(),
+                fields: vec![Field::required("id", LogicalType::Integer)],
+                rows: 1,
+                directory: Page { offset: HEADER, length: 8, hash: 0 },
+            }],
+            &[sample_view("items")],
+        )
+        .expect("it encodes, because encoding does not look");
+        let error = decode_catalog(&bytes, HEADER + 8).expect_err("and decoding does");
+        assert!(error.to_string().contains("same name"), "{error}");
     }
 
     #[test]

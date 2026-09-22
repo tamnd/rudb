@@ -255,3 +255,151 @@ fn a_view_over_a_parquet_file_runs_the_published_benchmark_sql_unmodified() {
     assert_eq!(result.value_at(0, 1), Value::BigInt(10_000));
     assert_eq!(result.value_at(0, 2), Value::Double(699.5));
 }
+
+/// A file holding a database the statements were run against, and the path it is at.
+///
+/// Opened, written to and dropped, so what comes back is a committed file and not a handle. Every
+/// test below reopens it, because the question all of them ask is what the file says rather than
+/// what the session that wrote it remembered.
+fn written(tag: &str, statements: &[&str]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("rudb-view-{tag}-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let database =
+        Database::open(path.to_str().expect("a UTF-8 temporary path")).expect("a native database");
+    for sql in statements {
+        database.execute(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    drop(database);
+    path
+}
+
+/// The database in a file that was already written, opened again.
+fn reopened(path: &std::path::Path) -> Database {
+    Database::open(path.to_str().expect("a UTF-8 temporary path")).expect("the file opens")
+}
+
+#[test]
+fn a_view_is_still_there_when_the_file_is_opened_again() {
+    let path = written(
+        "plain",
+        &[
+            "CREATE TABLE t (x INTEGER)",
+            "INSERT INTO t VALUES (1), (2), (-3)",
+            "CREATE VIEW v AS SELECT x FROM t WHERE x > 0",
+        ],
+    );
+    let database = reopened(&path);
+    assert_eq!(
+        database.value("SELECT count(*) FROM v").expect("the view is there"),
+        Value::BigInt(2)
+    );
+    // The column list came out of the file rather than out of a bind, so it is the answer before
+    // anything in this process has looked at the body. That is the pin's answer after an open too.
+    let bound = database
+        .query("SELECT column_count, is_bound FROM duckdb_views() WHERE view_name = 'v'")
+        .expect("the catalog table");
+    assert_eq!(bound.value_at(0, 0), Value::BigInt(1));
+    assert_eq!(bound.value_at(0, 1), Value::Boolean(true));
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_alias_list_and_the_written_statement_survive_the_file_too() {
+    let path = written(
+        "aliases",
+        &[
+            "CREATE TABLE t (x INTEGER, s VARCHAR)",
+            "INSERT INTO t VALUES (1, 'one')",
+            "CREATE VIEW v (a) AS SELECT x, s FROM t",
+        ],
+    );
+    let database = reopened(&path);
+    let result = database.query("SELECT a, s FROM v").expect("a renames the first column only");
+    assert_eq!(result.value_at(0, 0), Value::Integer(1));
+    assert_eq!(result.value_at(0, 1), Value::Varchar("one".to_string()));
+    assert_eq!(
+        database.value("SELECT sql FROM duckdb_views() WHERE view_name = 'v'").expect("the sql"),
+        Value::Varchar("CREATE VIEW v (a) AS SELECT x, s FROM t;".to_string())
+    );
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_dropped_view_does_not_come_back_out_of_the_file() {
+    let path = written("dropped", &["CREATE VIEW v AS SELECT 1 AS x"]);
+    let database = reopened(&path);
+    database.execute("DROP VIEW v").expect("it is there to drop");
+    drop(database);
+    let database = reopened(&path);
+    assert_eq!(
+        database.value("SELECT count(*) FROM duckdb_views() WHERE NOT internal").expect("a count"),
+        Value::BigInt(0)
+    );
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A database with no table in it is still a database and a view is a reason to have one.
+#[test]
+fn a_view_over_no_table_at_all_is_written_and_read_back() {
+    let path = written("tableless", &["CREATE VIEW v AS SELECT 42 AS answer"]);
+    let database = reopened(&path);
+    assert_eq!(database.value("SELECT answer FROM v").expect("the view"), Value::Integer(42));
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A temporary view goes when the session does, the same way a temporary table does.
+#[test]
+fn a_temporary_view_is_not_written_to_the_file() {
+    let path = written(
+        "temporary",
+        &["CREATE VIEW kept AS SELECT 1 AS x", "CREATE TEMPORARY VIEW gone AS SELECT 2 AS x"],
+    );
+    let database = reopened(&path);
+    let names = database
+        .query("SELECT view_name FROM duckdb_views() WHERE NOT internal ORDER BY view_name")
+        .expect("the catalog table");
+    assert_eq!(names.len(), 1);
+    assert_eq!(names.value_at(0, 0), Value::Varchar("kept".to_string()));
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The views the engine ships with are in every catalog already, so a file must not name them.
+#[test]
+fn the_internal_views_are_not_written_into_the_file() {
+    let path = written("internal", &["CREATE VIEW v AS SELECT 1 AS x"]);
+    let database = reopened(&path);
+    // One of each, and no doubles. A file that had written the engine's own would show them twice
+    // here, once from the file and once from the catalog every session starts with.
+    let doubled = database
+        .value("SELECT count(*) FROM (SELECT view_name FROM duckdb_views() GROUP BY view_name HAVING count(*) > 1)")
+        .expect("a count of names that appear twice");
+    assert_eq!(doubled, Value::BigInt(0));
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A view made against a database whose tables are already committed reaches the file too.
+///
+/// The checkpoint this takes writes a new catalog over the same pages rather than the whole file
+/// again, which is asserted where it can be seen, in `rudb_native`'s
+/// `restating_the_views_leaves_every_table_where_it_was`. What is worth asserting from out here is
+/// that the path is taken at all and that the table is still readable through the generation it
+/// commits, since carrying the wrong directory pointers forward is how that would go wrong.
+#[test]
+fn a_view_made_over_a_table_already_in_the_file_is_written_too() {
+    let path = written("restate", &["CREATE TABLE t AS SELECT range AS x FROM range(50000)"]);
+    let database = reopened(&path);
+    database.execute("CREATE VIEW v AS SELECT count(*) FROM t").expect("a view");
+    drop(database);
+    let database = reopened(&path);
+    assert_eq!(database.value("SELECT * FROM v").expect("the view"), Value::BigInt(50_000));
+    assert_eq!(database.value("SELECT count(*) FROM t").expect("the table"), Value::BigInt(50_000));
+    assert_eq!(database.value("SELECT max(x) FROM t").expect("the pages"), Value::BigInt(49_999));
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}
