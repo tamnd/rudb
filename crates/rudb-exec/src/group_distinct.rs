@@ -653,11 +653,13 @@ fn count_groups(
                     break;
                 }
                 let slot = slot as usize;
-                if groups[slot].group_hash == pair.group_hash
-                    && groups[slot].group == pair.group
-                    && groups[slot].valid == pair.valid
-                {
-                    counts[slot] = counts[slot]
+                // One index into each vector rather than three and two. The comparison used to name
+                // `groups[slot]` once a field and the count named `counts[slot]` on both sides of
+                // its own assignment, and each of those is a bounds check and a load that the one
+                // before it already paid for. See [`Grouped`].
+                if groups[slot] == *pair {
+                    let count = &mut counts[slot];
+                    *count = count
                         .checked_add(1)
                         .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
                     break;
@@ -852,11 +854,9 @@ fn added_up(parts: Vec<Partial>, shape: &Shape, bound: usize, memory: &Memory) -
                     break;
                 }
                 let slot = slot as usize;
-                if groups[slot].group_hash == pair.group_hash
-                    && groups[slot].group == pair.group
-                    && groups[slot].valid == pair.valid
-                {
-                    counts[slot] = counts[slot]
+                if groups[slot] == *pair {
+                    let count = &mut counts[slot];
+                    *count = count
                         .checked_add(by)
                         .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
                     break;
