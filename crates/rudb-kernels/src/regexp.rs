@@ -15,6 +15,15 @@
 //! row rather than once per distinct value, which is the obvious next thing to do here and is worth
 //! a number before it is worth writing: the column this is measured on, `Referer`, has enough
 //! distinct values that the dictionary form may never appear on it.
+//!
+//! The number is 2,719,020 distinct in 8,682,923 rows at ClickBench scale, so running the machine
+//! per entry is 3.19 times less matching, which on its own reads as a modest win and is why this
+//! was left alone. That reading is too low, because most of the leverage is not in this file. An
+//! output that carries the codes instead of the strings hands the operator above an integer key,
+//! and `GROUP BY` on that column costs 0.28 seconds against 4.5 for the same grouping done on the
+//! strings this currently returns. Measured in `spec/storage-v3/18`, where query 29 is 35% of the
+//! suite. What that asks for is not local to `regexp_replace`: it is that a function which is
+//! constant on a dictionary entry should be allowed to say so, and return a dictionary.
 
 use std::borrow::Cow;
 

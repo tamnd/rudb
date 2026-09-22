@@ -6,6 +6,8 @@ A committed native snapshot may store an exact leading frequency list for a scal
 
 This is query metadata, not an approximate answer. If the proof does not hold, execution scans the column and uses the ordinary aggregate.
 
+**The list is per column and the queries that need it group by several.** Document 19 measures the 27 ClickBench queries of this shape, which are 86% of the suite's CPU, and finds that all but two group by two or three columns, so the decision above applies to the two smallest of them. It also supplies the step that fixes the largest: the rows sharing a composite value are a subset of the rows sharing any one of its column values, so the count of a composite group is at most the minimum over its columns of that column's count, and a bound this synopsis already stores therefore bounds every composite group containing that column. `WatchID` has a maximum frequency of 1 in ten million rows, which certifies that every group of `WatchID, ClientIP` holds exactly one row and lets Q33 answer `ORDER BY COUNT(*) DESC LIMIT 10` from any ten distinct keys instead of from a ten million entry hash table costing 308 MiB. A planner reading this synopsis should take that minimum. Document 19 also records what this cannot reach, which is a skewed composite such as `UserID, SearchPhrase` where the bound is tight and still does not say which pair attains it.
+
 ## Why this belongs in storage
 
 The writer has information that a later query should not reconstruct. It sees stable string codes, validity, and every encoded numeric page. Rebuilding a high cardinality hash table for each query throws that information away.
