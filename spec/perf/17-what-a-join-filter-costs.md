@@ -47,8 +47,31 @@ The share of q21 the filter takes, sampled three times a binary rather than once
 - `Scan::sift` allocates two vectors per chunk, one for the hashes and one for the flags, and then reads the flags back through a bounds checked index to build the selection. That is small against 56 instructions a row but it is not nothing.
 - Ten bits a value and four lanes is about one percent false positives. Whether that is the right point is a measurement nobody here has taken, and it trades directly against the bytes the filter costs and against how much of it stays in cache while a fact table goes past it.
 
+## The other symbol
+
+`table::hash` is the nine to ten percent under the filter on every query in the table above, and it is the largest single symbol across the whole suite. Two things were tried on it and the interesting result is which one paid.
+
+**Taking the per row null question out.** A key column arrives with a validity that says either that a row is null or that nothing in the column is. The second is most columns, and the passes over a column were still asking a row at a time, which is a validity read, a branch, an `Option` and a bounds check per row to say what the column said once. Asking the column once and walking two runs side by side when the answer is no removes all four.
+
+It is worth 1.4 percent on a group by on an unfiltered `BIGINT` key, 2.551 G against 2.515. It is worth nothing anywhere else, and the reason is the same shape note 16 ends on. A filter over a column hands on a dictionary whose codes are the rows that got through, so behind a filter a column is never flat, and the pass this speeds up is not the pass that runs. TPC-H filters almost everything it groups or joins on.
+
+That is worth writing down on its own. Every fast path in the engine that begins by asking whether a column is a flat run is dead on a filtered column, and a filtered column is what most of a query works on. #1316 fixed one such path in the group table's direct map. This is the second one found and it will not be the last.
+
+**Folding the spread into the last column's pass.** The hash mixes each key column into a running word and then walks the whole run again to spread the entropy from the high bits back into the low ones, because every table here buckets on the low bits. That second walk is a load, five operations and a store a row, and it only has to happen once at the end, so it belongs in the last column's pass rather than in a pass of its own.
+
+| | before | after | duckdb |
+| --- | --- | --- | --- |
+| TPC-H SF1, all 22 queries | 53.793 | 53.415 | 26.377 |
+| q17 | 1.959 | 1.883 | 1.020 |
+| q02 | 0.567 | 0.552 | 0.404 |
+| q08 | 1.509 | 1.473 | 1.213 |
+| q18 | 8.515 | 8.347 | 2.141 |
+| q05 | 2.912 | 2.866 | 1.225 |
+
+Sixteen of the twenty two came down and the suite came down by 0.70 percent, both changes together. Measured against the same before binary in an earlier run, the first change on its own is 0.15 percent, so nearly all of this is the second one. The queries that move are the join heavy ones, which is where the hash is called most, and the group by ladder above does not move at all, because a group by on a narrow key takes the direct map and hashes nothing.
+
+The suite total in this pair is 53.8 G against the 52.1 in the pair above it. Main moved underneath between the two runs and q18 is 2 G of the difference on its own. Only the before and after of one pair are comparable to each other, which is why every table in these notes is one pair.
+
 ## What this note does not claim
 
-The suite moved by less than one percent and no single query moved by more than four. This is not a change that reaches the goal, it is a change that makes the top symbol of the two largest queries ten percent cheaper and writes down what the rest of that symbol is made of. The next thing on this list is the format change, and that one has a number worth having.
-
-`table::hash` is the other nine to ten percent on every query in the table above and it is untouched here. It is the largest single symbol across the whole suite and it is the next thing to take apart.
+The suite moved by less than one percent on each of the two changes and no single query moved by more than four. Neither of these reaches the goal. What they do is make the two symbols at the top of the profile measurably cheaper and leave behind an exact account of what the rest of them is, which is the format change for the filter and, for the hash, the fact that its fast paths are looking for a shape that a filtered query does not produce.
