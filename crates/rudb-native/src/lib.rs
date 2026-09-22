@@ -1919,7 +1919,7 @@ fn write_section(
 ///
 /// If the file has no valid committed directory, is an older format than this build writes, holds
 /// no table of that name, names a section whose payload cannot be written, or would end up naming
-/// more sections than [`MAX_SECTIONS`].
+/// more sections than the format allows.
 pub fn attach(
     path: impl AsRef<Path>,
     table: &str,
