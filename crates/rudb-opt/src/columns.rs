@@ -306,6 +306,13 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
         Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
             list(plan, conditions, found);
         }
+        // The row id is read by the operator itself rather than by anything above it, so a walk
+        // that stopped at the conditions would find nobody reading the column the gather is
+        // indexed by and would take it back off the scan.
+        Node::LinkJoin { conditions, rid, .. } => {
+            list(plan, conditions, found);
+            walk(plan, rid, found);
+        }
     }
 }
 

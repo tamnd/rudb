@@ -148,6 +148,15 @@ pub(crate) struct Settings {
     /// against and what a read of the setting has to return, and it was parsed once when it was
     /// set, so nothing downstream has a parse that can fail.
     links: RwLock<String>,
+    /// The two numbers the link join rule of `spec/graph/06-the-optimizer.md` section 6.4 is
+    /// decided by.
+    ///
+    /// Settings for the reason that section asks for them to be: neither one can be read off the
+    /// machine the query is running on. The first is how much of a parent has to fit for its hash
+    /// table to stay in the last level cache, which is a property of the processor, and the second
+    /// is the projected width at which the build stops paying for itself, which is a crossover a
+    /// measurement moves. Both start where `rudb_opt` has them.
+    sizes: RwLock<rudb_opt::link::Sizes>,
 }
 
 impl Settings {
@@ -183,6 +192,7 @@ impl Settings {
             seams: RwLock::new(rudb_seam::Settings::new()),
             rules: RwLock::new(Rules::new()),
             links: RwLock::new(String::new()),
+            sizes: RwLock::new(rudb_opt::link::Sizes::default()),
         }
     }
 
@@ -211,6 +221,11 @@ impl Settings {
     /// The relationships declared so far, as they were written.
     pub(crate) fn links(&self) -> String {
         self.links.read().unwrap_or_else(|held| held.into_inner()).clone()
+    }
+
+    /// The two link join numbers as the statements have left them.
+    pub(crate) fn sizes(&self) -> rudb_opt::link::Sizes {
+        *self.sizes.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The configuration as the statements have left it.
@@ -285,6 +300,20 @@ impl Settings {
             // the session would be a second answer that goes stale the moment a file is opened.
             // [`clustering`] is the read, and it builds the text back out of the catalog.
             return declare(catalog, &value.map_or_else(String::new, text_of));
+        }
+        if let Some(which) = graph_size(name) {
+            let mut sizes = self.sizes.write().unwrap_or_else(|held| held.into_inner());
+            let default = rudb_opt::link::Sizes::default();
+            match (which, value) {
+                (Size::Cache, None) => sizes.cache_bytes = default.cache_bytes,
+                (Size::Cache, Some(value)) => sizes.cache_bytes = size_of(value, name)?,
+                (Size::Narrow, None) => sizes.narrow_bytes = default.narrow_bytes,
+                (Size::Narrow, Some(value)) => {
+                    sizes.narrow_bytes = usize::try_from(size_of(value, name)?)
+                        .map_err(|_| Error::invalid_input(format!("{name} is too large")))?;
+                }
+            }
+            return Ok(());
         }
         if is_rule(name) {
             // `RESET stats.presize` puts the rule back where a fresh database has it, which is on
@@ -609,6 +638,13 @@ impl Settings {
         }
         if is_links(name) {
             return Ok(self.links());
+        }
+        if let Some(which) = graph_size(name) {
+            let sizes = self.sizes();
+            return Ok(match which {
+                Size::Cache => human(sizes.cache_bytes),
+                Size::Narrow => sizes.narrow_bytes.to_string(),
+            });
         }
         if is_rule(name) {
             return self.rules().named(name).map(|enabled| enabled.to_string()).ok_or_else(|| {
@@ -961,6 +997,55 @@ fn resolved(catalog: &Catalog, declared: &Declared) -> Result<(QualifiedName, Cl
 /// A written table name cut at its dots, so a schema in front of it reaches the right table.
 fn parts(table: &str) -> Vec<&str> {
     table.split('.').map(str::trim).collect()
+}
+
+/// Which of the two link join numbers a name is, if it is either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Size {
+    /// How much of the parent has to fit for its hash table to stay cache resident.
+    Cache,
+    /// How wide the parent's projection may be before a hash join is worth its build.
+    Narrow,
+}
+
+/// Whether this name is one of the two link join numbers.
+///
+/// The same shape as [`is_links`] and for the same reason. Both spellings of each, with a dot and
+/// with an underscore, because that is what the seams and the relationship declaration both take.
+fn graph_size(name: &str) -> Option<Size> {
+    if rudb_functions::setting_named(name).is_some() {
+        return None;
+    }
+    let named = |dotted: &str, under: &str| {
+        name.eq_ignore_ascii_case(dotted) || name.eq_ignore_ascii_case(under)
+    };
+    if named("graph.cache_bytes", "graph_cache_bytes") {
+        return Some(Size::Cache);
+    }
+    if named("graph.narrow_bytes", "graph_narrow_bytes") {
+        return Some(Size::Narrow);
+    }
+    None
+}
+
+/// A byte count a value names, in either of the two ways somebody writes one.
+///
+/// `8MB` goes through the same parser `memory_limit` uses, so a unit means here what it means
+/// there. A plain number is a count of bytes, which is the spelling a test writes and the one a
+/// number with no unit can only mean.
+///
+/// # Errors
+///
+/// For text that is neither, and for a negative number.
+fn size_of(value: &Value, name: &str) -> Result<u64> {
+    if let Value::Varchar(text) = value {
+        if text.contains(|character: char| character.is_ascii_alphabetic()) {
+            return parse_size(text.trim());
+        }
+    }
+    let count = integer_of(value, "UBIGINT")?;
+    u64::try_from(count)
+        .map_err(|_| Error::invalid_input(format!("{name} cannot be {count}, it is a byte count")))
 }
 
 /// Whether this name is one of the rule switches rather than a setting DuckDB has.

@@ -80,6 +80,27 @@ impl Rows {
         }
     }
 
+    /// The file behind a table whose rows are all in it, for whoever wants a stored section.
+    ///
+    /// `None` for a table in memory, which has no file, and `None` for a grown one, which has a
+    /// file and rows that are not in it. A grown table is the case that matters here: a forward
+    /// link covers the rows that were in the file when the checkpoint built it, and a row appended
+    /// since has no entry in it at all. Answering with the reader would hand out a link that is
+    /// correct about a prefix of the table and silent about the rest, and silence reads as *no
+    /// parent*, which is a wrong answer rather than a missing one. Refusing here is what makes the
+    /// caller fall back to the shape that reads the column.
+    ///
+    /// The generation stamp in the file catches the other half of the same problem, which is a
+    /// table rewritten since the section was built. Both checks are the section 3.1 rule that a
+    /// graph section changes the time and never the answer.
+    #[must_use]
+    pub fn stored(&self) -> Option<&NativeReader> {
+        match self {
+            Self::Native(reader) => Some(reader),
+            Self::Memory(_) | Self::Grown(..) => None,
+        }
+    }
+
     /// How many stripes the committed file contributes, which the row groups are numbered after.
     ///
     /// The parts have the same split and are counted inline, because the reader is already in hand

@@ -550,6 +550,14 @@ pub fn rows_stat_into(
             plan.expr_list(conditions).len(),
             keyspace(plan, conditions, stats, reads),
         ),
+        // The one join in the engine whose shape is known before any number is. A forward link
+        // answers at most one parent per child row, so the child's count is the answer rather than
+        // a number to take a constant fraction of: a left join emits exactly the child's rows, and
+        // inner, semi and anti emit the ones whose link is not the no parent sentinel, which is a
+        // subset of them. Nothing here guesses a selectivity, and an estimate that does not have to
+        // guess is most of why section 6.4 prefers this shape where it can have it.
+        Node::LinkJoin { child, kind: JoinKind::Left, .. } => of(child),
+        Node::LinkJoin { child, .. } => ceiling(of(child)),
         // The right cardinality is a function of each left row until decorrelation, so treating it
         // as one independently measured input would be a made-up estimate.
         Node::DependentJoin { .. } => Stat::Unknown,

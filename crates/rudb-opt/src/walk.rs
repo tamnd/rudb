@@ -78,6 +78,7 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
         | Node::TableFetch { input, .. }
         | Node::Distinct { input, .. } => *input = children[0],
         Node::Join { left, right, .. }
+        | Node::LinkJoin { child: left, parent: right, .. }
         | Node::DependentJoin { left, right, .. }
         | Node::CrossProduct { left, right }
         | Node::SetOp { left, right, .. } => {
@@ -185,7 +186,22 @@ pub(crate) fn outputs(plan: &Plan, at: NodeRef) -> Option<Vec<(ColumnBinding, Lo
             found.extend(outputs(plan, right)?);
             Some(found)
         }
-        Node::Join { .. } => None,
+        // The same two answers as the join above, for the same reason. Inner and left hand on
+        // the child's columns with the parent's gathered beside them, in that order, which is the
+        // order the two inputs are named in. Semi and anti never read the parent at all, so there
+        // is no pair of sides to put end to end and the honest answer is that this shape does not
+        // fit.
+        Node::LinkJoin {
+            child: left,
+            parent: right,
+            kind: JoinKind::Inner | JoinKind::Left,
+            ..
+        } => {
+            let mut found = outputs(plan, left)?;
+            found.extend(outputs(plan, right)?);
+            Some(found)
+        }
+        Node::Join { .. } | Node::LinkJoin { .. } => None,
     }
 }
 
