@@ -7,9 +7,9 @@
 //! not: a key map only ever asks how many keys are below this one, and a monotone link asks where
 //! the nth one is.
 //!
-//! [`Rank`] is unchanged by the move, including its serialized bytes, so a file written before it
-//! reads the same after. [`BitVector`] is the new part: it owns a bitmap, a [`Rank`] over it, and
-//! the sampling that makes select a bounded search rather than a scan.
+//! The rank index is unchanged by the move, including its serialized bytes, so a file written
+//! before it reads the same after. [`BitVector`] is the new part: it owns a bitmap, a rank index
+//! over it, and the sampling that makes select a bounded search rather than a scan.
 //!
 //! # What select costs and why it is not stored
 //!
