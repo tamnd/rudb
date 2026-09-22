@@ -65,6 +65,7 @@ mod node;
 mod parse;
 mod plan;
 mod print;
+mod rid;
 mod seams;
 mod shape;
 mod unique;
@@ -75,6 +76,7 @@ pub use node::{
     WindowUnit,
 };
 pub use plan::Plan;
+pub use rid::{Carried, rids_of};
 pub use seams::seams_of;
 pub use shape::{ROOT, Shape};
 pub use unique::{Keys, keys_of};

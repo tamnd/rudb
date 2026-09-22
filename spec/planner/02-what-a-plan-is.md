@@ -60,6 +60,16 @@ A fourth that is worth having and is cheaper than it sounds:
 
 **Null rejecting.** Whether the expression is guaranteed to be false or null when a given input column is null. `x > 5` is null rejecting on `x`; `x IS NULL` is not; `coalesce(x, 0) > 5` is not. This is the analysis that turns an outer join into an inner join when a predicate above it rejects the padded rows, which is one of the highest-value rewrites in the set on TPC-DS and is a wrong answer if the analysis is wrong in the permissive direction. Default to not null rejecting for anything not proven, which is always safe.
 
+## Row identity, which is a property of a node and not of an expression
+
+The four above are analyses of an expression. There is a fifth that is an analysis of a node, and it arrives from `spec/graph/05-the-plan-and-the-executor.md` section 5.1, which names this document as where it gets written down beside the others.
+
+**Row identity.** For each output of a node, whether that output's rows are still rows of some base table, identified by the `index` that `Node::table_index` hands out. A scan knows. A filter over a scan knows, because a filter removes rows and renumbers nothing. A projection knows. A join's output knows for the side it streams and not for the side it gathers, an aggregate's output knows nothing because its rows are groups rather than rows, and a sort's output knows only if it carried the identity through as a column, which today it does not. `crates/rudb-plan/src/rid.rs` is the pass, `Carried` is the answer for one node, and `rids_of` returns one per node in the arena.
+
+It lives in `rudb-plan` and not in `rudb-opt` for the reason `unique.rs` already lives here: the `match` over `Node` in this crate does not compile when a variant appears, so whoever adds an operator has to answer whether its output is still a row of a table. The answer is allowed to be no. Every wrong answer this analysis can produce is a row id used after the operator that invalidated it, and the consequence is not a slow query but a wrong one, so the default for anything not proven is that the identity is gone, exactly as null rejecting defaults to false.
+
+The consumer is the graph layer. A link join reads a parent column by row id rather than by hash, and it may only do that when the probe side's rows are still the child table's rows. Without this analysis that precondition is checked nowhere, which is why the analysis lands before the operator that needs it rather than with it.
+
 ## Statistics live beside the plan, not in it
 
 A tempting design is to annotate each node with its estimated cardinality. Resist it, for a reason that is specific to this codebase: the plan has a textual form that round-trips, that form is what every test is written against, and a cardinality estimate is a number that changes when the cost model changes. Putting estimates in the plan means every plan test churns whenever the estimator is touched.
@@ -81,5 +91,7 @@ Four representations, not three, with the physical plan arriving in document 10 
 The one structural change required is a node with more than one consumer, needed before common subplan elimination, and it should land on its own because it changes the printer, the parser, the validator and every walk.
 
 Four analyses: elementwise, constant, table set and null rejecting. Build all four before the first pass, cache the table set, and default null rejecting to false.
+
+A fifth analysis over nodes rather than expressions: row identity, which says for each output whether its rows are still a base table's rows. It defaults to no for the same reason null rejecting defaults to false, and it is exhaustive over `Node` so that a new operator cannot be added without answering.
 
 Cardinality estimates go in a side table keyed by `NodeRef`, not in the plan, because the plan's textual form is what every test is written against and it should not churn when the cost model does.
