@@ -188,6 +188,16 @@ enum Shape {
     /// argument has to be a type arithmetic can reach is the binder's rather than this table's,
     /// since it is the sort key and not just the argument that has to satisfy it.
     AsGiven,
+    /// Every argument promotes to one type and the result is a list of that type. `list_value`.
+    ///
+    /// The one shape whose result is not a type any of the arguments had, which is why it cannot be
+    /// [`Shape::Promoted`] with a wrapper bolted on at the call site. A list literal is a call to
+    /// this by the time the binder is done with it, so the rule that decides what `[a, b]` holds is
+    /// the rule that decides what `list_value(a, b)` holds, written once.
+    ///
+    /// No arguments at all is `"NULL"[]`, which is the pin's answer for `[]` and is a list whose
+    /// element type is the untyped null rather than a guess at what somebody meant to put in it.
+    Listed,
     /// No arguments at all and a fixed result. `now()` and `current_schema()`.
     ///
     /// The session context functions, which are the ones whose answer comes from the connection
@@ -599,6 +609,17 @@ const TABLE: &[Entry] = &[
         shape: Shape::Sliced,
         numeric_only: false,
     },
+    // Building a list. `[a, b]` is `list_value(a, b)` by the time the binder is done with it, which
+    // is what DuckDB's own transformer writes as well, so this is the row behind the bracket as much
+    // as behind the written name. `list_pack` is the same function under another name and is an
+    // alias below, which is what the pin's `alias_of` column says about it.
+    Entry {
+        name: "list_value",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(0),
+        shape: Shape::Listed,
+        numeric_only: false,
+    },
     // The type of an expression, as a string. Nothing is cast and nothing runs: the binder folds
     // this to the name of the type it just decided, so the argument is only ever looked at and the
     // executor never sees the call.
@@ -912,6 +933,10 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let common = promote_all(name, arguments)?;
             let returns = accumulator(&common);
             (vec![common; arguments.len()], returns)
+        }
+        Shape::Listed => {
+            let element = list_element(arguments)?;
+            (vec![element.clone(); arguments.len()], LogicalType::list(element))
         }
         Shape::Extracted => {
             let target = &arguments[0];
@@ -1399,6 +1424,28 @@ fn promote_all(name: &str, arguments: &[LogicalType]) -> Result<LogicalType> {
     Ok(common)
 }
 
+/// What the elements of a list written out in a query meet at.
+///
+/// Promotion is the same rule [`promote_all`] uses and the two differences are both about the
+/// untyped null. A list of nothing but nulls stays a list of the null type, because `typeof([NULL])`
+/// on the pin is `"NULL"[]` rather than `INTEGER[]`, and a list of no items at all is the same thing
+/// for the same reason. Everywhere else an untyped null has to land on a type the executor can hold
+/// a vector of, and here the vector is the list rather than the element.
+///
+/// The message is the one the binder printed for a list that would not reconcile before a list was a
+/// call, so the bracket and the written name say the same sentence. It is not the pin's sentence:
+/// the pin reports a template type it could not deduce and names the literal types it inferred along
+/// the way, which needs a notion of a literal type that rudb does not have. See #1338.
+fn list_element(arguments: &[LogicalType]) -> Result<LogicalType> {
+    let mut element = LogicalType::Null;
+    for ty in arguments {
+        element = element.promote(ty).ok_or_else(|| {
+            Error::binder(format!("Cannot mix values of type {element} and type {ty} in a list"))
+        })?;
+    }
+    Ok(element)
+}
+
 fn find(name: &str) -> Option<&'static Entry> {
     let name = canonical(name);
     TABLE.iter().find(|entry| entry.name.eq_ignore_ascii_case(name))
@@ -1478,10 +1525,16 @@ impl Arity {
     ///
     /// An open end is `concat` and friends, which take any number, and the row for one says so in
     /// `varargs` rather than by having a row per count up to some number nobody picked.
+    ///
+    /// An open end that starts at nothing is two rows rather than one, which is the pin's row set
+    /// for `list_value` and is not an exception to the rule above. A row of no arguments names no
+    /// type, so it cannot say what the result is made of, and the second row is where the type
+    /// variable is introduced. `concat` starts at one and needs no such row.
     fn every_count(self) -> Vec<usize> {
         match self {
             Self::Exactly(count) => vec![count],
             Self::Between(least, Some(most)) => (least..=most).collect(),
+            Self::Between(0, None) => vec![0, 1],
             Self::Between(least, None) => vec![least],
             Self::OneOf(counts) => counts.to_vec(),
         }
@@ -1519,6 +1572,12 @@ const SAME: &str = "T";
 /// An argument that is not constrained and is not tied to the others, or a result that the
 /// arguments decide in a way no name can say.
 const ANY: &str = "ANY";
+
+/// A list of the type variable, which is what a list constructor gives back.
+const SAME_LIST: &str = "T[]";
+
+/// A list of the untyped null, which is what a list constructor with nothing in it gives back.
+const NULL_LIST: &str = "\"NULL\"[]";
 
 impl Shape {
     /// What the arguments and the result are declared to be, at this argument count.
@@ -1581,6 +1640,10 @@ impl Shape {
             // One overload with an `ANY` return, which is the pin's row for it. The name decides
             // the type and a name is not something a signature can hold.
             Self::Setting => (all(Fixed::Varchar.name()), ANY),
+            // A list of what the arguments meet at, and a list of the null type when there are no
+            // arguments to meet. Both rows are the pin's, which carries the two of them for this
+            // name and nothing in between.
+            Self::Listed => (all(SAME), if count == 0 { NULL_LIST } else { SAME_LIST }),
             // No arguments, so `all` is empty whatever it is handed and only the result is named.
             Self::Constant(fixed) => (Vec::new(), fixed.name()),
         }
@@ -1629,6 +1692,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("list_extract", "array_extract"),
     ("list_element", "array_extract"),
     ("list_slice", "array_slice"),
+    ("list_pack", "list_value"),
     ("rank_dense", "dense_rank"),
 ];
 
