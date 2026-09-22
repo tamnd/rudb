@@ -212,15 +212,47 @@ fn an_ungrouped_aggregate_over_an_empty_table_still_produces_a_row() {
     assert_eq!(rows[0], vec![Value::BigInt(0), Value::Null]);
 }
 
+/// `count(x)` and not `count(*)`, because `x` is never null here so the two count the same rows and
+/// only one of them makes the aggregate do the work. A lone `count(*)` over a grouping column is read
+/// out of the table's frequency synopsis and never reaches the hash table this is about. The test
+/// below that does read it out of the synopsis is
+/// [`a_grouping_over_a_table_in_memory_is_answered_from_its_own_counts`].
 #[test]
 fn a_grouped_aggregate_counts_and_sums_within_each_group() {
     let rows = run(&format!(
-        "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n  {SCAN}"
+        "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count(#0.0::INTEGER)::BIGINT]\n  {SCAN}"
     ));
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec![integer(3), Value::BigInt(1)]);
     assert_eq!(rows[1], vec![integer(1), Value::BigInt(2)]);
     assert_eq!(rows[2], vec![integer(2), Value::BigInt(1)]);
+}
+
+/// A grouping a table can answer from what it counted as the rows arrived does not read the rows.
+///
+/// The counts are the table's own and they are exact, the null is a group of its own with the rows
+/// the zone maps counted for it, and the groups come back most common first because that is the order
+/// the synopsis holds them in. Every column of `t` is narrow enough for this, which is what makes the
+/// two tests above have to ask for something else.
+#[test]
+fn a_grouping_over_a_table_in_memory_is_answered_from_its_own_counts() {
+    let rows = run(&format!(
+        "Aggregate #1 groups=[#0.1::VARCHAR] aggregates=[count_star()::BIGINT]\n  {SCAN}"
+    ));
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![text("a"), Value::BigInt(2)]);
+    assert_eq!(rows[1], vec![text("c"), Value::BigInt(1)]);
+    assert_eq!(rows[2], vec![Value::Null, Value::BigInt(1)]);
+    // And the whole table is accounted for, which is the property that makes a complete list an
+    // answer rather than an estimate.
+    let counted: i64 = rows
+        .iter()
+        .map(|row| match row[1] {
+            Value::BigInt(rows) => rows,
+            ref other => panic!("{other:?}"),
+        })
+        .sum();
+    assert_eq!(counted, 4);
 }
 
 /// `count(s)` counts the rows where `s` is not null and `count(*)` counts them all, and the row
@@ -234,10 +266,13 @@ fn count_of_a_column_skips_nulls_and_count_star_does_not() {
 }
 
 /// Two nulls are one group. If the key compared with `=` then this would be two groups of one.
+///
+/// `count(x)` rather than `count(*)` for the reason above: `x` is never null so the counts are the
+/// same ones, and it is the hash table's grouping of the null that this is about.
 #[test]
 fn nulls_group_together() {
     let rows = run(&format!(
-        "Aggregate #1 groups=[#0.1::VARCHAR] aggregates=[count_star()::BIGINT]\n  {SCAN}"
+        "Aggregate #1 groups=[#0.1::VARCHAR] aggregates=[count(#0.0::INTEGER)::BIGINT]\n  {SCAN}"
     ));
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec![text("a"), Value::BigInt(2)]);
@@ -511,10 +546,12 @@ fn a_plan_with_no_breaker_in_it_is_one_pipeline() {
 
 #[test]
 fn every_pipeline_breaker_cuts_the_plan_in_two() {
-    // The scan into the aggregate, then the groups into the sort, then the sorted rows out.
+    // The scan into the aggregate, then the groups into the sort, then the sorted rows out. The
+    // aggregate counts a column rather than the rows, because a lone count_star() over a grouping
+    // column is read out of the table's frequency synopsis and then there is no scan to cut off.
     let text = format!(
         "Sort [#1.0::INTEGER ASC NULLS LAST]\n  Aggregate #1 groups=[#0.0::INTEGER] \
-         aggregates=[count_star()::BIGINT]\n    {SCAN}"
+         aggregates=[count(#0.0::INTEGER)::BIGINT]\n    {SCAN}"
     );
     assert_eq!(pipelines(&text), 3);
 }
@@ -778,7 +815,10 @@ fn a_budget_too_small_for_one_group_says_so_rather_than_running_forever() {
     // The other end of the same change. Spilling turns a budget that is merely too small into more
     // passes, and there is a budget too small for even that, and the thing it must not do is loop
     // handing the same rows from one pass to the next.
-    let catalog = crowd(64);
+    //
+    // More groups than the table's frequency tally keeps, so that the grouping has to be run. A
+    // narrower column is answered from the counts the table already has and never asks for a byte.
+    let catalog = crowd(i32::try_from(rudb_storage::TALLY_VALUES).expect("512 fits") + 1);
     let plan = Plan::parse(
         "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n  \
          Get memory.main.crowd AS crowd #0 [x::INTEGER, s::VARCHAR]\n",

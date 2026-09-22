@@ -418,6 +418,41 @@ impl MemoryTable {
         self.counts.distinct(column)
     }
 
+    /// Every value of one column with the exact number of rows holding it, most common first.
+    ///
+    /// `None` for a column with more distinct values than `tally.rs` counts, which is where the
+    /// argument for the cap and for the list being whole or absent is. A list that is here is every
+    /// value the column holds and every row is under one of them, so what does not appear in it holds
+    /// no rows at all, and that is what makes it an answer rather than an estimate.
+    ///
+    /// The null is in the list when there is one, counted as a value of its own the way a `GROUP BY`
+    /// makes it a group of its own, and it comes from the zone maps rather than from the tally. That
+    /// is the one number the two halves of the statistics pass have to be put together for.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table.
+    pub fn frequencies(&self, column: usize) -> Result<Option<Vec<(Value, u64)>>> {
+        let Some(mut held) = self.counts.frequencies(column) else { return Ok(None) };
+        let nulls = self.null_count(column)? as u64;
+        if nulls > 0 {
+            // Put where its count belongs rather than on the end, because the list is read as most
+            // common first and a column of mostly nulls has the null as its commonest value.
+            let at = held.iter().position(|(_, rows)| *rows < nulls).unwrap_or(held.len());
+            held.insert(at, (Value::Null, nulls));
+        }
+        Ok(Some(held))
+    }
+
+    /// How many distinct values one column's frequency list holds, without building it.
+    ///
+    /// For a caller deciding whether the list is worth copying. The null is not counted, so this is
+    /// one short of [`MemoryTable::frequencies`] for a column that has one.
+    #[must_use]
+    pub fn frequency_values(&self, column: usize) -> Option<usize> {
+        self.counts.frequency_values(column)
+    }
+
     /// Whether the probes rule out every row of chunk `index`.
     ///
     /// A chunk with no zone is a chunk that is read, because saying nothing about a chunk has to
