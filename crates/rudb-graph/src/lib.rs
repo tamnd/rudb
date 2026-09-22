@@ -31,6 +31,7 @@
 //! neither can be missed when it is gone.
 
 pub mod bits;
+pub mod degree;
 pub mod keymap;
 pub mod link;
 pub mod rel;
@@ -38,6 +39,7 @@ pub mod rid;
 pub mod wire;
 
 pub use bits::BitVector;
+pub use degree::{BUCKETS, Degrees};
 pub use keymap::{DENSE_THRESHOLD, Form, KeyMap, Keys, Observed};
 pub use link::{Bounds, Link};
 pub use rel::{Cardinality, Relationship, Side, parse_links};
