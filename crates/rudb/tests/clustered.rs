@@ -170,23 +170,33 @@ fn the_rows_are_bucketed_by_the_declared_width_rather_than_sorted_on_the_column(
     let _ = std::fs::remove_file(path);
 }
 
-/// A declaration that names no width buckets by the quarter, end to end and out of the file.
+/// A declaration that names no width buckets by the quarter when nothing can be counted.
 ///
 /// The width is the one thing about the layout that is a number rather than a shape, and
 /// `14-the-partition-width.md` measured all four of them on SF1 in one sitting: 0.917 of the
 /// unsorted file's instructions at a month against 0.898 at a quarter, because a narrow bucket
-/// costs key locality and delta width and stops buying pruning above a quarter. So the width a
-/// silent declaration gets is a quarter, and this asserts it the way the width is visible from
-/// outside rather than by reading the constant back.
+/// costs key locality and delta width and stops buying pruning above a quarter. A silent
+/// declaration now leaves the bucket to the row count, and the fallback when there is no row count
+/// to read is that measured quarter.
 ///
-/// What makes it visible is the second key. Bucketed by quarter, `l_orderkey` runs in order across
-/// a whole quarter. At the month this file used to default to, the same three months are three
-/// runs of keys with a reset at each boundary, so the assertion below fails on a monthly default
-/// and passes on a quarterly one.
+/// This load is the fallback case and it is the one worth pinning here. The rows come from a
+/// generated series, which has no zones on it, so the loader has nothing to count and takes the
+/// default. The rule itself is unit tested where the arithmetic is, because reaching the case where
+/// it picks a month would mean loading tens of millions of rows in a test.
+///
+/// What makes the width visible from outside is the second key. Bucketed by quarter, `l_orderkey`
+/// runs in order across a whole quarter. At the month this file used to default to, the same three
+/// months are three runs of keys with a reset at each boundary, so the assertion below fails on a
+/// monthly default and passes on a quarterly one.
 #[test]
 fn a_declaration_that_names_no_width_buckets_by_the_quarter() {
     let asked = Clustering::over(vec![2, 0, 1], &fields()).expect("a date leads the declaration");
-    assert_eq!(asked.width(), Width::Quarter, "the width the suite measured at 0.898");
+    assert_eq!(asked.width(), Width::Auto, "nobody named a width, so the rows get to");
+    assert_eq!(
+        asked.fitted(0, 0).width(),
+        Width::Quarter,
+        "and with no rows to count it is the width the suite measured at 0.898"
+    );
     let (database, path) = loaded("silent", Some(asked));
 
     let quarter =
@@ -202,6 +212,94 @@ fn a_declaration_that_names_no_width_buckets_by_the_quarter() {
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
         "the keys should run in order across the whole quarter, which they do not at a month"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A silent declaration loaded from a source that can be counted takes the width the rows ask for.
+///
+/// The test above is the fallback and this is the rule. The only difference between the two loads
+/// is where the rows come from: a generated series has no ranges written down anywhere, so the
+/// loader has nothing to count and takes the measured default, and a table that has been
+/// checkpointed carries a row count and a low and a high per column in its directory, which is what
+/// the rule divides.
+///
+/// The rows here are deliberately dense rather than many. Two hundred and fifty thousand of them
+/// land inside a single month's worth of days, so a monthly partition holds all of them and clears
+/// the target, while the same rows off a source with nothing written down take the measured
+/// default and get a quarter. The days straddle the first of February, which is what makes the two
+/// answers tell apart: at a month the rows come back as January then February, and at a quarter
+/// they are one bucket sorted by key with the dates scattered through it.
+#[test]
+fn a_silent_declaration_loaded_from_a_countable_source_takes_the_width_the_rows_ask_for() {
+    /// Two hundred and fifty thousand rows across twenty nine days, from 1995-01-17 to 1995-02-14.
+    ///
+    /// Same shape as [`ROWS`] and the same reason for the stride, just squeezed into a month. 7919
+    /// is prime to both 30 and 250000, so the dates visit every day in the range and the keys are a
+    /// permutation, and neither arrives anywhere near sorted.
+    const DENSE: &str = "SELECT ((r * 7919) % 250000)::BIGINT AS l_orderkey, \
+                         (r % 7 + 1)::INTEGER AS l_linenumber, \
+                         (DATE '1995-01-17' + ((r * 7919) % 30)::INTEGER)::DATE AS l_shipdate \
+                         FROM range(250000) AS s(r)";
+    /// 1995-02-01 in days since the epoch, which is where a monthly partition breaks these rows.
+    const FEBRUARY: i32 = 9162;
+
+    let path =
+        std::env::temp_dir().join(format!("rudb-clustered-fitted-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let database = Database::open(name).expect("a file name starts a native database");
+    database.execute("SET threads = 1").expect("sets the thread count");
+
+    // The source, checkpointed so that its directory holds the count and the ranges. Without the
+    // checkpoint the rows are still in memory, there is nothing written down to read, and this test
+    // would quietly become a second copy of the one above it.
+    database.execute(&format!("CREATE TABLE source {SHAPE}")).expect("creates");
+    database.execute(&format!("INSERT INTO source {DENSE}")).expect("loads the source");
+    database.execute("CHECKPOINT").expect("writes the source down");
+
+    database.execute(&format!("CREATE TABLE lineitem {SHAPE}")).expect("creates");
+    database
+        .execute("SET cluster_by = 'lineitem(l_shipdate, l_orderkey, l_linenumber)'")
+        .expect("declares the order and leaves the width to the rows");
+    database.execute("INSERT INTO lineitem SELECT * FROM source").expect("loads");
+    database.execute("CHECKPOINT").expect("commits");
+
+    let got = rows(&database, "SELECT l_shipdate, l_orderkey FROM lineitem");
+    assert_eq!(got.len(), 250_000, "every row should have arrived");
+    let laid_out: Vec<(i32, i64)> = got
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Date(day), Value::BigInt(key)) => (*day, *key),
+            other => panic!("the columns came back as {other:?}"),
+        })
+        .collect();
+
+    // January first and then February, with no January row after a February one. A quarter puts all
+    // twenty nine days in one bucket and sorts the lot by key, which interleaves the two months
+    // through the whole table, so this is the assertion that says which width the loader picked.
+    let split = laid_out.iter().position(|&(day, _)| day >= FEBRUARY).expect("February is in here");
+    assert!(split > 0, "January is in here too");
+    assert!(
+        laid_out[split..].iter().all(|&(day, _)| day >= FEBRUARY),
+        "once February starts no January row should follow, which is what a quarter would do"
+    );
+
+    // And inside each month the keys run in order, because that is what the partition is for: the
+    // date decides the bucket and the key decides the order within it.
+    for month in [&laid_out[..split], &laid_out[split..]] {
+        assert!(
+            month.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+            "the keys should run in order inside a partition"
+        );
+    }
+
+    // And the declaration on the table still says the width is the rows' to pick, because it is a
+    // standing instruction rather than an answer. The next load gets to decide again.
+    assert_eq!(
+        database.setting("cluster_by").expect("a setting"),
+        "lineitem(auto(l_shipdate), l_orderkey, l_linenumber)"
     );
 
     let _ = std::fs::remove_file(path);

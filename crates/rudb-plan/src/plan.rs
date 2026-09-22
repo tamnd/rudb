@@ -204,6 +204,24 @@ impl Plan {
         self.zones.len()
     }
 
+    /// The bounds of the one table that has any, where exactly one does.
+    ///
+    /// For a caller that has a column name and no index to look it up by. The binder picking a
+    /// partition width for a load is the one, and it is worth a method rather than a walk of the
+    /// plan because the column bindings it holds point at the projection over the scan rather than
+    /// at the scan, and following them back through a projection is a job for the optimizer.
+    ///
+    /// `None` for a plan with no bounds anywhere and for a plan with two, both of which mean the
+    /// same thing to a caller that only has a name: there is no single store the name belongs to.
+    /// A load reads one table or one file, so the case this answers is the case it is for, and a
+    /// load that reads two gets the answer a load that reads none does.
+    #[must_use]
+    pub fn sole_zones(&self) -> Option<&Arc<dyn Zones>> {
+        let mut found = self.zones.values();
+        let only = found.next()?;
+        found.next().is_none().then_some(only)
+    }
+
     /// Records what the table bound at `index` counted about how common each of its values is.
     ///
     /// Called only for a store that keeps a frequency synopsis, which today is a native table. A
