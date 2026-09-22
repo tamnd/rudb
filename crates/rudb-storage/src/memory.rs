@@ -444,6 +444,33 @@ impl MemoryTable {
         Ok(Some(held))
     }
 
+    /// The smallest and the largest value of one string column, from the values its tally holds.
+    ///
+    /// Strings only, because they are the one type whose ends the zone maps can fail to give
+    /// exactly. A string column that arrives as a dictionary narrower than its chunk gets ends read
+    /// off the dictionary, which is a superset of what the rows point at, so
+    /// [`MemoryTable::exact_extremes`] refuses it and a `MIN` over it walks every row. Numbers go
+    /// through a gather that reads only the codes the rows use, so their ends are already exact.
+    ///
+    /// A null in the column is no obstacle here, unlike on the file side, where the placeholder a
+    /// null is written as sorts ahead of every real value. Nothing null ever reaches the tally.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the table.
+    pub fn text_extremes(&self, column: usize) -> Result<Option<(Value, Value)>> {
+        let Some(ty) = self.types.get(column) else {
+            return Err(Error::internal(format!(
+                "column {column} of a table that has {}",
+                self.types.len()
+            )));
+        };
+        if !matches!(ty, LogicalType::Varchar | LogicalType::Blob) {
+            return Ok(None);
+        }
+        Ok(self.counts.extremes(column))
+    }
+
     /// How many distinct values one column's frequency list holds, without building it.
     ///
     /// For a caller deciding whether the list is worth copying. The null is not counted, so this is
@@ -723,6 +750,41 @@ mod tests {
             ])
             .expect("three rows of the table's own types");
         table
+    }
+
+    /// The case the zone maps are not allowed to answer. Four values behind five rows, so
+    /// `zone::stringy` reads the dictionary rather than the rows and gets ends that are wider than
+    /// the column: nothing points at "quince". The tally has only what the rows hold.
+    #[test]
+    fn the_ends_of_a_dictionary_string_column_come_from_the_tally_and_not_from_the_zones() {
+        let values: Vec<Value> = ["kiwi", "apple", "pear", "quince"]
+            .iter()
+            .map(|held| Value::Varchar((*held).to_string()))
+            .collect();
+        let inner = Vector::from_values(LogicalType::Varchar, &values).expect("a dictionary");
+        let vector = Vector::dictionary(vec![1, 2, 1, 2, 1], inner).expect("five rows");
+        let mut table = MemoryTable::new(vec![LogicalType::Varchar]);
+        table.append(Chunk::new(vec![vector]).expect("a chunk")).expect("the table's own type");
+        assert_eq!(table.exact_extremes(0).expect("the only column"), None, "wider than the rows");
+        assert_eq!(
+            table.text_extremes(0).expect("the only column"),
+            Some((Value::Varchar("apple".into()), Value::Varchar("pear".into()))),
+            "not kiwi and not quince, which are in the dictionary and in no row"
+        );
+    }
+
+    #[test]
+    fn a_column_that_is_not_a_string_has_no_text_ends_and_a_missing_one_is_an_error() {
+        // A number's zone maps are exact already, because a coded one is gathered through its codes
+        // rather than read off its values, so there is nothing here for this to add.
+        let table = people();
+        assert_eq!(table.text_extremes(0).expect("the integer column"), None);
+        assert_eq!(
+            table.text_extremes(1).expect("the string column"),
+            Some((Value::Varchar("ada".into()), Value::Varchar("grace".into()))),
+            "the null between them is not an end and is not counted as one"
+        );
+        assert!(table.text_extremes(2).is_err());
     }
 
     #[test]
