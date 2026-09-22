@@ -7,7 +7,7 @@ use rudb_common::bounds::{Frequencies, Zones};
 use rudb_common::{Error, Field, LogicalType, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
-use crate::node::{Bound, JoinKind, Node};
+use crate::node::{Bound, JoinKind, Node, WindowBound};
 use crate::{ExprRef, NodeRef, Slice, StrRef, ValueRef};
 
 /// A bound logical plan.
@@ -615,6 +615,100 @@ impl Plan {
         }
     }
 
+    /// Calls `found` for every column one node reads, not counting the nodes under it.
+    ///
+    /// The node on its own rather than the subtree, because a caller asking where a column is read
+    /// wants one node at a time and the walk down is its own business. [`Self::subtree_columns`] is
+    /// the walk down for a caller that wants the whole of one.
+    ///
+    /// This lives here for the same reason [`Self::read_columns`] does: two crates ask it, and a
+    /// `Node` variant added and forgotten about should be a compile error in one file instead of
+    /// two.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn node_columns(&self, at: NodeRef, found: &mut impl FnMut(ExprRef, ColumnBinding)) {
+        match *self.node(at) {
+            Node::Get { .. }
+            | Node::Dummy
+            | Node::CteScan { .. }
+            | Node::MaterializedCte { .. }
+            | Node::CrossProduct { .. }
+            | Node::SetOp { .. }
+            | Node::Limit { .. }
+            | Node::LimitPercent { .. } => {}
+            Node::Values { rows, .. } => {
+                for &row in self.row_list(rows) {
+                    self.each_column(row, found);
+                }
+            }
+            Node::TableFunction { args, settings, .. }
+            | Node::LateralFunction { args, settings, .. } => {
+                self.each_column(args, found);
+                self.each_column(settings, found);
+            }
+            Node::Filter { predicate, .. } => self.read_columns(predicate, found),
+            Node::Project { exprs, .. } => self.each_column(exprs, found),
+            Node::Aggregate { groups, aggregates, .. } => {
+                self.each_column(groups, found);
+                self.each_column(aggregates, found);
+            }
+            Node::Window { partition, order, frame, expressions, .. } => {
+                self.each_column(partition, found);
+                for key in self.sort_key_list(order) {
+                    self.read_columns(key.expr, found);
+                }
+                for bound in [frame.start, frame.end] {
+                    if let WindowBound::Preceding(offset) | WindowBound::Following(offset) = bound {
+                        self.read_columns(offset, found);
+                    }
+                }
+                self.each_column(expressions, found);
+            }
+            Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
+                for key in self.sort_key_list(keys) {
+                    self.read_columns(key.expr, found);
+                }
+            }
+            Node::Fetch { args, row, .. } => {
+                self.each_column(args, found);
+                self.read_columns(row, found);
+            }
+            Node::TableFetch { row, .. } => self.read_columns(row, found),
+            Node::Distinct { on, .. } => self.each_column(on, found),
+            Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
+                self.each_column(conditions, found);
+            }
+        }
+    }
+
+    /// Calls `found` for every column read anywhere in the subtree rooted at `at`.
+    ///
+    /// A caller rewriting what one operator's rows mean has to reach every reference underneath it,
+    /// and reaching them by looping over the arena would reach the ones above it too, since the
+    /// arena holds one plan and not one subtree.
+    ///
+    /// A `CteScan` is a leaf here. What it reads is somewhere else in the plan and a caller that
+    /// followed it would be rewriting a definition this subtree does not own.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn subtree_columns(&self, at: NodeRef, found: &mut impl FnMut(ExprRef, ColumnBinding)) {
+        self.node_columns(at, found);
+        for child in self.node(at).children().into_iter().flatten() {
+            self.subtree_columns(child, found);
+        }
+    }
+
+    /// The column walk over a run of expressions.
+    fn each_column(&self, slice: Slice, found: &mut impl FnMut(ExprRef, ColumnBinding)) {
+        for &expr in self.expr_list(slice) {
+            self.read_columns(expr, found);
+        }
+    }
+
     /// The node at `reference`, to be rewritten in place.
     ///
     /// # Panics
@@ -898,17 +992,16 @@ impl Plan {
                 }
                 for bound in [frame.start, frame.end] {
                     match bound {
-                        crate::WindowBound::Preceding(offset)
-                        | crate::WindowBound::Following(offset) => {
+                        WindowBound::Preceding(offset) | WindowBound::Following(offset) => {
                             self.checked_expr(offset, reference)?;
                         }
-                        crate::WindowBound::UnboundedPreceding
-                        | crate::WindowBound::CurrentRow
-                        | crate::WindowBound::UnboundedFollowing => {}
+                        WindowBound::UnboundedPreceding
+                        | WindowBound::CurrentRow
+                        | WindowBound::UnboundedFollowing => {}
                     }
                 }
-                if matches!(frame.start, crate::WindowBound::UnboundedFollowing)
-                    || matches!(frame.end, crate::WindowBound::UnboundedPreceding)
+                if matches!(frame.start, WindowBound::UnboundedFollowing)
+                    || matches!(frame.end, WindowBound::UnboundedPreceding)
                 {
                     return fail("has an impossible frame boundary");
                 }
@@ -1084,9 +1177,7 @@ impl Plan {
                 let mut all = plain(self.expr_list(partition));
                 all.extend(self.sort_key_list(order).iter().map(|key| (key.expr, false, false)));
                 for bound in [frame.start, frame.end] {
-                    if let crate::WindowBound::Preceding(offset)
-                    | crate::WindowBound::Following(offset) = bound
-                    {
+                    if let WindowBound::Preceding(offset) | WindowBound::Following(offset) = bound {
                         all.push((offset, false, false));
                     }
                 }

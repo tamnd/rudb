@@ -1029,10 +1029,11 @@ impl<'a> Binder<'a> {
     /// aggregates upward, so the projection could not read the column even if the rule let it
     /// through. That is both halves of #1027.
     ///
-    /// A correlated one still goes underneath, because what it correlates to is a column of the
-    /// rows going into the grouping and there is nothing above the grouping to read. So does one
-    /// written inside an aggregate call, since that is read once per row going into the aggregate
-    /// and lifting it over would put it where the aggregate that reads it cannot.
+    /// A correlated one goes over the grouping too when what it correlates to is a column the block
+    /// groups by, which is [`Self::lift_correlated`], and stays underneath when it is not. One
+    /// written inside an aggregate call stays underneath whatever it correlates to, since that is
+    /// read once per row going into the aggregate and lifting it over would put it where the
+    /// aggregate that reads it cannot.
     ///
     /// `before` is what [`Self::scalar_subqueries`] held before the clause was bound, so only the
     /// queries that clause wrote are considered.
@@ -1046,8 +1047,10 @@ impl<'a> Binder<'a> {
             return Ok(());
         }
         let mut lifted = Vec::new();
-        for pending in self.scalar_subqueries.split_off(before) {
-            if pending.dependent || pending.inside_aggregate {
+        for mut pending in self.scalar_subqueries.split_off(before) {
+            let stays = pending.inside_aggregate
+                || (pending.dependent && !self.lift_correlated(&mut pending));
+            if stays {
                 self.scalar_subqueries.push(pending);
             } else {
                 self.joined_above.push(pending.index);
@@ -1068,6 +1071,46 @@ impl<'a> Binder<'a> {
         }
         above.append(&mut lifted);
         Ok(())
+    }
+
+    /// Moves one correlated query over this block's grouping, if the grouping lets it.
+    ///
+    /// It does when every outer column the query reads is a column this block groups by. That value
+    /// is the group's own column above the aggregate, the same value read from a different operator,
+    /// so the query can be joined against the groups instead of against the rows going into them,
+    /// and what the query answers per group is what it answered per row of a group since every row
+    /// of a group agreed on it. The rewrite is the references inside the query's body, which were
+    /// bound against the table underneath and have to read the aggregate's output instead.
+    ///
+    /// A correlation on a column that is neither grouped nor aggregated is a different question with
+    /// a different answer and there is nothing above the grouping that holds it, so that query stays
+    /// where it is and [`Self::over_aggregate`] reports it as the missing `GROUP BY` it is. That is
+    /// #1032.
+    ///
+    /// The query stays a dependent join either way. What changed is which operator the outer rows
+    /// come from, not that there are any.
+    fn lift_correlated(&mut self, pending: &mut PendingSubquery) -> bool {
+        let Some(index) = self.aggregation.as_ref().map(|aggregation| aggregation.index) else {
+            return false;
+        };
+        let mut moved = Vec::with_capacity(pending.reads.len());
+        for read in &pending.reads {
+            let Some(at) = self.group_of(*read) else {
+                return false;
+            };
+            moved.push((*read, ColumnBinding::new(index, at as u32)));
+        }
+        let mut rewrites = Vec::new();
+        self.plan.subtree_columns(pending.node, &mut |reference, binding| {
+            if let Some(&(_, to)) = moved.iter().find(|(from, _)| *from == binding) {
+                rewrites.push((reference, to));
+            }
+        });
+        for (reference, to) in rewrites {
+            self.plan.rebind(reference, to);
+        }
+        pending.reads = moved.into_iter().map(|(_, to)| to).collect();
+        true
     }
 
     fn bind_targets(
@@ -3068,9 +3111,26 @@ impl<'a> Binder<'a> {
         })
     }
 
-    /// Whether a column is the result of a query this block wrote and has not joined in yet.
-    fn is_pending_subquery(&self, binding: ColumnBinding) -> bool {
-        self.scalar_subqueries.iter().any(|pending| pending.index == binding.table)
+    /// Which of this block's groups is exactly that column, if one of them is.
+    ///
+    /// Exactly the column and not an expression over it, because the caller is looking for the same
+    /// value read from the aggregate instead of from the table underneath it, and `GROUP BY k + 1`
+    /// carries the sum and not the column.
+    fn group_of(&self, read: ColumnBinding) -> Option<usize> {
+        self.aggregation.as_ref()?.groups.iter().position(
+            |group| matches!(*self.plan.expr(*group), Expr::Column(binding) if binding == read),
+        )
+    }
+
+    /// The outer column a query still waiting under this grouping correlates to and the grouping
+    /// does not carry upward, which is the column an error should name.
+    ///
+    /// `None` when the binding is not one of those queries, which is every ordinary case of a
+    /// column read without a group.
+    fn ungrouped_correlation(&self, binding: ColumnBinding) -> Option<ColumnBinding> {
+        let pending =
+            self.scalar_subqueries.iter().find(|pending| pending.index == binding.table)?;
+        pending.reads.iter().copied().find(|read| self.group_of(*read).is_none())
     }
 
     /// Whether a column is the result of a window this block is building.
@@ -3137,18 +3197,16 @@ impl<'a> Binder<'a> {
             // that resolved past it is not one of those. That is #995.
             Expr::Column(binding) if self.is_correlation(binding) => Ok(expr),
             // A query this block wrote that is still waiting to be joined in underneath the
-            // grouping, which is a correlated one, since an uncorrelated one was lifted over the
-            // grouping by [`Self::lift_over_aggregate`] and is not here. It has to stay underneath,
-            // because what it correlates to is a column of the rows going into the aggregate, and
-            // underneath is where the aggregate cannot carry its column upward. That is a thing
-            // this engine cannot plan rather than a GROUP BY the query is missing, and it is worth
-            // saying so, because the column belongs to no table anybody wrote and the sentence
-            // below could not name it. That is #1032.
-            Expr::Column(binding) if self.is_pending_subquery(binding) => Err(Error::binder(
-                "a correlated subquery over a grouped query is not supported here yet",
-            )),
+            // grouping lands here as well, and the column the complaint should name is the one that
+            // query correlates to rather than the column the query produces, which belongs to no
+            // table anybody wrote. An uncorrelated query and a correlated one whose correlation is
+            // grouped were both moved over the grouping by [`Self::lift_over_aggregate`] and are
+            // not here, so what is left correlates to something this block neither grouped nor
+            // aggregated, and that is an ordinary missing GROUP BY however far inside a query it
+            // was written. That is #1032.
             Expr::Column(binding) => {
-                let name = self.name_of(binding, scope);
+                let read = self.ungrouped_correlation(binding).unwrap_or(binding);
+                let name = self.name_of(read, scope);
                 Err(Error::binder(format!(
                     "column {name} must appear in the GROUP BY clause or must be part of an aggregate function"
                 )))
