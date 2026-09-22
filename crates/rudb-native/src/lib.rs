@@ -866,6 +866,47 @@ impl Writer {
         })
     }
 
+    /// Creates a new file that holds no table at all, committed and ready to open.
+    ///
+    /// A database somebody dropped the last table out of is still a database, and until this there
+    /// was no way to write one down. Every other way into this file goes through a table, because
+    /// [`Writer::create`] takes the first one and [`Writer::finish`] commits the one it is on, so a
+    /// catalog with nothing in it could be read and not written. The format already allowed it: the
+    /// catalog is a count and that many entries, and a count of nought encodes and decodes the same
+    /// way every other count does, which is why nothing here is a version change.
+    ///
+    /// It hands back nothing rather than a writer, because a writer with no table is a writer with
+    /// nothing to append to. A file that is going to hold a table is [`Writer::create`], and one
+    /// that is going to have a table added to it later is [`Writer::open`], which reads what this
+    /// wrote the same way it reads any other generation.
+    ///
+    /// # Errors
+    ///
+    /// If the file exists or the path cannot be written.
+    pub fn empty(path: impl AsRef<Path>) -> Result<()> {
+        let file =
+            OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
+        let mut header = [0; HEADER as usize];
+        header[..8].copy_from_slice(MAGIC);
+        header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
+        write_at(&file, 0, &header)?;
+        let catalog = encode_catalog(&[])?;
+        write_at(&file, HEADER, &catalog)?;
+        // The same two syncs in the same order as [`Writer::finish`], and for the same reason. The
+        // catalog is on the disk before the slot names it, so a file this is interrupted in the
+        // middle of is a header with no valid slot rather than a slot pointing at nothing.
+        file.sync_all().map_err(io)?;
+        let slot = Slot {
+            offset: HEADER,
+            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+            generation: 1,
+            hash: checksum(&catalog),
+        };
+        write_at(&file, slot_offset(1), &slot.bytes())?;
+        file.sync_all().map_err(io)?;
+        Ok(())
+    }
+
     /// Closes the table this writer is on and starts another one in the same file.
     ///
     /// Nothing is published here. The closed table's directory is written so that the bytes are on
@@ -2559,7 +2600,8 @@ impl Catalog {
         self.entries.len()
     }
 
-    /// Whether the file holds no table at all, which a committed file never does.
+    /// Whether the file holds no table at all, which is what [`Writer::empty`] writes and what a
+    /// database somebody dropped the last table out of comes back as.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -6356,6 +6398,27 @@ mod tests {
         let remainder = common.remainder(column).expect("the list is a prefix");
         assert_eq!(remainder, Remainder { rows: 890, listed: 512, most: 10 });
         assert_eq!(remainder.rows / (601 - remainder.listed), 10);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A file with no table in it is a file, and opening it says so rather than failing.
+    #[test]
+    fn a_file_holding_no_table_commits_and_opens_and_a_table_can_be_added_to_it() {
+        let path = path("empty");
+        Writer::empty(&path).expect("a file with nothing in it");
+        let catalog = Catalog::open(&path).expect("the empty file opens");
+        assert_eq!(catalog.len(), 0);
+        assert!(catalog.is_empty());
+        assert_eq!(catalog.names().count(), 0);
+        // The next generation goes over the top of it the way it goes over any other, which is what
+        // says this is a committed file and not a special case somebody has to know about.
+        let mut writer =
+            Writer::open(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("a table goes into the empty file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let catalog = Catalog::open(&path).expect("the file opens again");
+        assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items"]);
         fs::remove_file(&path).expect("clean up");
     }
 
