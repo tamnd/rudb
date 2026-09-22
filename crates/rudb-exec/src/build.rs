@@ -44,9 +44,10 @@
 
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, QualifiedName, Table};
-use rudb_common::{Cancel, Error, Field, Memory, Result, Session, Value};
+use rudb_catalog::{Catalog, Parent, QualifiedName, Table};
+use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_functions::TableFunction;
+use rudb_graph::Link;
 use rudb_kernels::Accumulator;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
@@ -76,6 +77,7 @@ use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
+use crate::linkjoin::LinkJoin;
 use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
 use crate::prepared::Prepared;
@@ -563,6 +565,46 @@ fn whole_table<'a>(
     Ok(Some((table, index, columns)))
 }
 
+/// The stored table one node under `node` reads, found by the table index its columns are bound to.
+///
+/// A link join's child is a scan and may be a scan under a filter, because a row id survives a
+/// filter as the selection is applied to the sequence that carries it. So the search is down the
+/// tree rather than at the top of it, and what it matches on is the index the join's own condition
+/// named, which is the only thing that says which scan is the one the link is indexed by.
+fn scanned<'a>(
+    plan: &Plan,
+    catalog: &'a Catalog,
+    node: NodeRef,
+    index: u32,
+) -> Result<Option<(&'a Table, Slice)>> {
+    if let Some((table, found, columns)) = whole_table(plan, catalog, node)? {
+        if found == index {
+            return Ok(Some((table, columns)));
+        }
+    }
+    for child in plan.node(node).children().into_iter().flatten() {
+        if let Some(found) = scanned(plan, catalog, child, index)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// The two columns one equality holds equal, when that is what the conditions are.
+///
+/// Anything else is `None`, including one equality between a column and something computed, because
+/// a link is indexed by a column and an expression over one is not that column.
+fn equated_pair(plan: &Plan, conditions: Slice) -> Option<[ColumnBinding; 2]> {
+    let [condition] = plan.expr_list(conditions) else { return None };
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(*condition) else {
+        return None;
+    };
+    match (plan.expr(left), plan.expr(right)) {
+        (&Expr::Column(left), &Expr::Column(right)) => Some([left, right]),
+        _ => None,
+    }
+}
+
 /// Which column of the stored table a binding into `index` names, by name rather than by position.
 fn stored_column(
     plan: &Plan,
@@ -972,6 +1014,16 @@ struct Building<'a, 'b> {
     held: Vec<Held>,
 }
 
+/// What a link join reads out of the catalog, gathered before either input is built.
+struct Linked {
+    link: Arc<Link>,
+    parent: Arc<Parent>,
+    /// The stored position and the type of each parent column the join projects, in output order.
+    projected: Vec<(usize, LogicalType)>,
+    /// Those same columns as the schema the bindings above this join resolve against.
+    parent_schema: Schema,
+}
+
 /// A materialised `WITH` that has been built, for the reads of it under the body being walked.
 struct Held {
     /// The number the plan pairs a read with what it reads by.
@@ -1196,6 +1248,104 @@ impl<'a> Building<'a, '_> {
         let reading = Arc::clone(&counters);
         self.close(below, pipeline, Arc::new(Watched::new(aggregate, counters)));
         Ok(Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline))
+    }
+
+    /// Everything a link join needs out of the catalog, or the reason it cannot be built.
+    ///
+    /// The edge is derived here rather than carried in the plan, and the derivation is the reason
+    /// `Plan::check` insists on exactly one equality. That equality names two columns, each of them
+    /// a binding into a table index, and a table index reaches the `Get` that introduced it, and a
+    /// `Get` names a stored table whose columns have positions. So the four fields of the
+    /// [`rudb_native::graph::Edge`] a stored link is looked up by are read out of the plan rather
+    /// than written into it, and there is no second spelling of the relationship that could
+    /// disagree with the first.
+    ///
+    /// Every failure here is internal, because the rule that wrote the node is the one that checked
+    /// all of this. The checks stay anyway: what they defend against is a link written against a
+    /// table that has since been rewritten, and section 3.1 says a graph section may only change
+    /// the time.
+    fn linked(
+        &self,
+        reference: NodeRef,
+        child: NodeRef,
+        parent: NodeRef,
+        conditions: Slice,
+    ) -> Result<Linked> {
+        let (plan, catalog) = (self.plan, self.catalog);
+        let refuse =
+            |why: &str| Error::internal(format!("a link join over {why}, which cannot be read"));
+        let Some((parent_table, parent_index, parent_columns)) =
+            whole_table(plan, catalog, parent)?
+        else {
+            return Err(refuse("a parent that is not a stored table"));
+        };
+        let [first, second] = equated_pair(plan, conditions)
+            .ok_or_else(|| refuse("something other than one equality between two columns"))?;
+        // Either way round is the same edge, since an equality has no sides.
+        let (child_key, parent_key) =
+            match (first.table == parent_index, second.table == parent_index) {
+                (false, true) => (first, second),
+                (true, false) => (second, first),
+                _ => return Err(refuse("an equality that does not read both of its inputs")),
+            };
+        let Some((child_table, child_columns)) = scanned(plan, catalog, child, child_key.table)?
+        else {
+            return Err(refuse("a child that is not a stored table"));
+        };
+        let (Some(child_rows), Some(parent_rows)) =
+            (child_table.rows().stored(), parent_table.rows().stored())
+        else {
+            return Err(refuse("a table that is not one committed file"));
+        };
+        let edge = rudb_native::graph::Edge {
+            child: child_table.name().table.clone(),
+            child_column: stored_column(
+                plan,
+                child_table,
+                child_key.table,
+                child_columns,
+                child_key,
+            )
+            .ok_or_else(|| refuse("a child key that is not a stored column"))?,
+            parent: parent_table.name().table.clone(),
+            parent_column: stored_column(
+                plan,
+                parent_table,
+                parent_index,
+                parent_columns,
+                parent_key,
+            )
+            .ok_or_else(|| refuse("a parent key that is not a stored column"))?,
+        };
+        let link = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)
+            .ok_or_else(|| refuse("a relationship the child's file has no link for"))?;
+        // A semi or an anti join reads no column of the parent, which is not a special case here so
+        // much as the reason those two are nearly free: the list below is empty, so the operator
+        // holds nothing, reads nothing, and its output is the child's columns as they arrived.
+        let reads = !matches!(
+            *plan.node(reference),
+            Node::LinkJoin { kind: JoinKind::Semi | JoinKind::Anti, .. }
+        );
+        let fields = if reads { plan.field_list(parent_columns).to_vec() } else { Vec::new() };
+        let mut projected = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let at = parent_table
+                .column_index(&field.name)
+                .ok_or_else(|| refuse("a parent column the stored table does not have"))?;
+            projected.push((at, field.ty.clone()));
+        }
+        // What is left of the query's budget, since the columns are held for as long as anything
+        // above can still read through them. A parent that will not fit in it is reported by the
+        // operator rather than here, for the reason on `LinkJoin::read_parent`.
+        let budget = self.memory.limit().map_or(usize::MAX, |limit| {
+            usize::try_from(limit.saturating_sub(self.memory.used())).unwrap_or(usize::MAX)
+        });
+        Ok(Linked {
+            link: Arc::new(link),
+            parent: Arc::new(Parent::new(parent_table.rows().clone(), budget)),
+            projected,
+            parent_schema: Schema::numbered(fields, parent_index),
+        })
     }
 
     /// The segment a node produces, closing any pipeline that ends underneath it.
@@ -1614,12 +1764,29 @@ impl<'a> Building<'a, '_> {
                 self.close(below, pipeline, Arc::new(Watched::new(distinct, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
-            // The operator is the second half of G3 and is not written yet, so a plan holding one
-            // of these is a plan nothing in the tree can produce. Refused here rather than left to
-            // a catch all, so that the arm has to be replaced when the operator lands instead of
-            // quietly answering as something else.
-            Node::LinkJoin { .. } => {
-                return Err(Error::internal("a link join reached the builder without an operator"));
+            // One pipeline rather than two, which is the whole of what this node buys. The parent
+            // is not walked into at all: it is read column by column out of the catalog, and what
+            // the child's rows carry away from it is a row id per row and a pointer per column.
+            Node::LinkJoin { child, parent, kind, conditions, rid } => {
+                let found = self.linked(reference, child, parent, conditions)?;
+                let below = self.node(child)?;
+                let operator = LinkJoin::new(
+                    plan,
+                    kind,
+                    found.link,
+                    found.parent,
+                    found.projected,
+                    rid,
+                    &below.schema,
+                    &found.parent_schema,
+                    self.seams,
+                    memory,
+                    self.cancel.clone(),
+                )?
+                .in_session(self.session);
+                let schema = operator.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "LinkJoin", None);
+                below.then(Arc::new(Watched::new(operator, counters)), schema)
             }
             Node::Join { left, right, kind, conditions, build } => {
                 // One side runs first, because no row of the other one can be answered until every
