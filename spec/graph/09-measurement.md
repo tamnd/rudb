@@ -67,3 +67,31 @@ A time that includes the benefit of a section must report the cost of building t
 A run with sections must state which sections existed, by name, from `rudb_links()`. "rudb with the graph layer" is not a description of a configuration.
 
 A per-query ratio against DuckDB must be reported for both the sections-on and the sections-off configuration. The floor from `../02-the-goal.md` applies to both, because a user whose data has no declared keys gets the second one.
+
+## 9.9 What has been measured
+
+One subsection per claim that has a number against it. A claim with no number here has not been measured, which is a different state from measured and passing, and the difference is the whole point of writing the claims down first.
+
+### C1, the links fit. Measured at SF10, projected to SF100, and it holds because the budget turns two links away
+
+Reproduced with `cargo xtask graph`, which is the build and not a simulation of it, over a native TPC-H SF10 file loaded from the reference Parquet. Eight key maps and then nine relationships, which is every primary to foreign key edge in the schema that a single column expresses.
+
+| relationship | children | form | bytes | share of child table | kept |
+| --- | ---: | --- | ---: | ---: | --- |
+| `lineitem -> orders` | 59,986,052 | monotone | 9,739,468 | 0.57% | yes |
+| `lineitem -> part` | 59,986,052 | packed | 158,400,739 | 9.28% | no, over budget |
+| `lineitem -> supplier` | 59,986,052 | packed | 128,407,713 | 7.52% | yes |
+| `orders -> customer` | 15,000,000 | packed | 39,609,440 | 9.26% | no, over budget |
+| `partsupp -> part` | 8,000,000 | monotone | 1,298,888 | 0.36% | yes |
+| `partsupp -> supplier` | 8,000,000 | packed | 17,125,064 | 4.73% | yes |
+| `customer -> nation` | 1,500,000 | packed | 960,996 | 0.93% | yes |
+| `supplier -> nation` | 100,000 | packed | 64,124 | 0.98% | yes |
+| `nation -> region` | 25 | packed | 82 | 2.86% | yes |
+
+Every child row found a parent in all nine, so every one of them is *exactly one* and not merely *at most one*. The two relationships C1 names, `lineitem -> orders` and `partsupp -> part`, are the two that came back monotone, and between them they cost 11.0 MB against the 2.66 GB of column bytes in the file, which is 0.42 percent. Key maps cost 7,793,220 bytes more, almost all of it the dense map over `o_orderkey`. Graph sections in the file total 165,389,555 bytes against 2,659,368,507 column bytes, which is 6.22 percent.
+
+The number that matters more is the one underneath it. Had nothing been turned away the total would have been 13.66 percent, so C1 is not a claim the design satisfies by being small, it is a claim the budget of document 03 section 3.7 enforces by refusing two links. `lineitem -> part` is the one section 9.5 predicted would be the expensive one and it is, at 158 MB for one column of one table. `orders -> customer` fits under ten percent on its own and does not fit beside the dense key map already on `orders`, which is the budget behaving as specified: it is a share of a table, not of a section.
+
+Projected to SF100 by scaling row counts and recomputing each packed width from the parent's row count, holding the measured 3.91 percent rank and select overhead of the monotone form: 1.898 GB of graph sections against 26.60 GB of column bytes, which is 7.14 percent, with the same two relationships monotone and the same two turned away. The projection puts `lineitem -> part` at 1.88 GB, which is the figure document 03 section 3.4 arrived at independently, so the two agree.
+
+C1 is therefore met at SF10 on a real file and met in projection at SF100, and the SF100 run itself is owed on a machine with the disk for it. What the projection cannot settle is build time at scale: the nine links took 3.11 seconds in total at SF10, and whether that stays linear is a measurement and not an argument.

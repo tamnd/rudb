@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_graph::{Form, KeyMap, Keys, wire};
+use rudb_graph::{Form, KeyMap, Keys, NO_PARENT, link, wire};
 use rudb_vector::Chunk;
 
 use crate::section::{self, Attachment};
@@ -290,20 +290,7 @@ pub fn build_key_maps_within(
 /// of a payload. A section whose extent table does not checksum is counted as nothing, because it
 /// is a section that is already not there.
 fn held_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
-    let mut total = 0;
-    for held in reader.table().sections() {
-        if !held.among(section::GRAPH_KINDS) {
-            continue;
-        }
-        let replaced = held.kind == *section::KEY_MAP
-            && replacing.iter().any(|&column| u64::try_from(column) == Ok(held.id));
-        if replaced || !held.usable(reader.table().generation()) {
-            continue;
-        }
-        let Ok(extents) = reader.extents(held) else { continue };
-        total += extents.iter().map(|extent| u64::from(extent.length)).sum::<u64>();
-    }
-    Ok(total)
+    held_bytes_except(reader, *section::KEY_MAP, replacing)
 }
 
 /// The key map this table carries for a column, when it carries one this build can use.
@@ -334,6 +321,321 @@ pub fn key_map(reader: &Reader, column: usize) -> Option<KeyMap> {
         return None;
     }
     Some(map)
+}
+
+/// One relationship, with both sides resolved to a table and a column of it.
+///
+/// Names and not [`rudb_graph::Relationship`], because by the time a build runs the caller has
+/// already turned a declaration's column names into positions against the catalog, and doing it
+/// again here would be a second place for the two to disagree.
+#[derive(Debug, Clone)]
+pub struct Edge {
+    /// The many side, which is where the link is stored.
+    pub child: String,
+    /// Which column of it holds the key.
+    pub child_column: usize,
+    /// The one side, which is where the key map is.
+    pub parent: String,
+    /// Which column of it holds the key.
+    pub parent_column: usize,
+}
+
+/// What building one forward link cost and what it bought.
+#[derive(Debug, Clone)]
+pub struct BuiltLink {
+    /// The relationship this is a link for.
+    pub edge: Edge,
+    /// Which form section 3.4's measurement chose, or `None` when nothing was built.
+    pub form: Option<link::Form>,
+    /// Rows in the child table.
+    pub children: u64,
+    /// Children that found a parent. Below `children` means the foreign key is not total, which is
+    /// legal and is also what keeps the relationship out of the monotone form.
+    pub linked: u64,
+    /// What the link takes in the file, header included, or would have taken when it was not kept.
+    pub bytes: usize,
+    /// The stored column bytes of the child table, which is what section 3.7's budget is a share
+    /// of and what the size claim of section 9.1 is measured against.
+    pub table_bytes: u64,
+    /// Whether it is in the file.
+    pub built: bool,
+    /// Why not, when not. `None` when it is.
+    pub note: Option<String>,
+    /// How long the build took, the reading of the child column included.
+    pub build: Duration,
+}
+
+/// Builds a forward link for each relationship and attaches each child table's in one commit.
+///
+/// The parent's key map has to be in the file already. Section 3.8 is explicit that this is a
+/// second pass at checkpoint time for exactly that reason, so a missing key map here is a note on
+/// the report rather than an error: the relationship is one the file does not accelerate, and by
+/// section 3.1 that changes no answer.
+///
+/// # Errors
+///
+/// If the file cannot be opened, a child key column cannot be read, or the attach fails.
+pub fn build_links(path: &Path, edges: &[Edge]) -> Result<Vec<BuiltLink>> {
+    build_links_within(path, edges, BUDGET_SHARE)
+}
+
+/// The same, against a budget of `share` percent of each child table's stored column bytes.
+///
+/// One commit per child table, for the reason [`build_key_maps`] commits once: a checkpoint that
+/// published a generation per section would be a chance to be interrupted per section.
+///
+/// The budget is where a link differs from a key map. Section 3.7 orders by expected value, child
+/// rows over section bytes, and for a link both numbers are in hand: the child rows are the rows
+/// the link would skip a hash table for. So this sorts by rows over bytes descending, which admits
+/// the monotone links first on any TPC-H sized file, because they are the ones with the most rows
+/// behind the fewest bytes.
+///
+/// # Errors
+///
+/// If the file cannot be opened, a child key column cannot be read, or the attach fails.
+pub fn build_links_within(path: &Path, edges: &[Edge], share: u64) -> Result<Vec<BuiltLink>> {
+    let mut tables: Vec<&str> = Vec::new();
+    for edge in edges {
+        if !tables.iter().any(|held| *held == edge.child) {
+            tables.push(&edge.child);
+        }
+    }
+    let mut report = Vec::with_capacity(edges.len());
+    for table in tables {
+        let mine = edges.iter().filter(|edge| edge.child == table).cloned().collect::<Vec<Edge>>();
+        report.extend(links_of_one_table(path, table, &mine, share)?);
+    }
+    Ok(report)
+}
+
+/// Every link stored in one child table, built and admitted and attached together.
+fn links_of_one_table(
+    path: &Path,
+    table: &str,
+    edges: &[Edge],
+    share: u64,
+) -> Result<Vec<BuiltLink>> {
+    let catalog = Catalog::open(path)?;
+    let child = catalog.table(table)?;
+    let column_bytes = child.layout().columns_total();
+    let allowance = (column_bytes.saturating_mul(share) / 100).max(BUDGET_FLOOR);
+    let replacing = edges.iter().map(|edge| edge.child_column).collect::<Vec<usize>>();
+    let mut spent = held_bytes_except(&child, *section::FORWARD_LINK, &replacing)?;
+    let mut report = Vec::with_capacity(edges.len());
+    let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let start = Instant::now();
+        match one_link(&catalog, &child, edge) {
+            Ok((built, bytes)) => {
+                report.push(BuiltLink {
+                    build: start.elapsed(),
+                    table_bytes: column_bytes,
+                    ..built
+                });
+                payloads.push(Some(bytes));
+            }
+            Err(note) => {
+                report.push(BuiltLink {
+                    edge: edge.clone(),
+                    form: None,
+                    children: child.table().rows() as u64,
+                    linked: 0,
+                    bytes: 0,
+                    table_bytes: column_bytes,
+                    built: false,
+                    note: Some(note),
+                    build: start.elapsed(),
+                });
+                payloads.push(None);
+            }
+        }
+    }
+    let mut order = (0..report.len()).filter(|at| payloads[*at].is_some()).collect::<Vec<_>>();
+    // Most rows per byte first. A link over no rows is worth nothing per byte and sorts last
+    // rather than dividing by zero.
+    order.sort_by(|left, right| {
+        let value = |at: &usize| -> f64 {
+            let bytes = report[*at].bytes.max(1);
+            report[*at].children as f64 / bytes as f64
+        };
+        value(right).partial_cmp(&value(left)).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for at in order {
+        let cost = report[at].bytes as u64;
+        if spent.saturating_add(cost) <= allowance {
+            spent += cost;
+            report[at].built = true;
+        } else {
+            report[at].note = Some(format!("over the budget of {allowance} bytes"));
+        }
+    }
+    drop(child);
+    let attachments = report
+        .iter()
+        .zip(&payloads)
+        .filter(|(built, payload)| built.built && payload.is_some())
+        .map(|(built, payload)| {
+            let bytes = payload.as_ref().expect("filtered to the built");
+            Ok(Attachment {
+                kind: *section::FORWARD_LINK,
+                id: u64::try_from(built.edge.child_column)
+                    .map_err(|_| invalid("column index overflow"))?,
+                flags: built.form.map_or(0, |form| u32::from(form.tag())),
+                header_bytes: u32::try_from(binding_bytes(&built.edge.parent))
+                    .map_err(|_| invalid("a parent name longer than a section header"))?,
+                bytes,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::attach(path, table, &attachments)?;
+    Ok(report)
+}
+
+/// Builds one link, or says in one sentence why there is not one.
+///
+/// The error type is a `String` and not an [`rudb_common::Error`] on purpose. Every reason a link
+/// cannot be built here is a reason to not have one, which section 3.1 says is a slower query and
+/// not a failed one, so the caller's response is the same for all of them and a message is what it
+/// needs. A genuine I/O failure still arrives as an error, through the `?` on the scan.
+fn one_link(
+    catalog: &Catalog,
+    child: &Reader,
+    edge: &Edge,
+) -> std::result::Result<(BuiltLink, Vec<u8>), String> {
+    let parent =
+        catalog.table(&edge.parent).map_err(|_| format!("no table named {}", edge.parent))?;
+    let map = key_map(&parent, edge.parent_column)
+        .ok_or_else(|| format!("no key map is stored for {}", edge.parent))?;
+    if !map.observed().usable_as_parent() {
+        return Err(format!("the key of {} is not unique", edge.parent));
+    }
+    let keys = KeyColumn::new(child, edge.child_column).map_err(|error| error.to_string())?;
+    let mut parents_of = Vec::with_capacity(child.table().rows());
+    let mut failed = None;
+    keys.scan(&mut |key| {
+        let parent = match key {
+            None => NO_PARENT,
+            Some(key) => match map.lookup(key) {
+                Ok(found) => found.unwrap_or(NO_PARENT),
+                Err(error) => {
+                    failed = Some(error.to_string());
+                    NO_PARENT
+                }
+            },
+        };
+        parents_of.push(parent);
+        Ok(())
+    })
+    .map_err(|error| error.to_string())?;
+    if let Some(failed) = failed {
+        return Err(failed);
+    }
+    let link = link::Link::build(&parents_of, map.len()).map_err(|error| error.to_string())?;
+    let bytes = encode_link(&link, &parent, edge).map_err(|error| error.to_string())?;
+    Ok((
+        BuiltLink {
+            edge: edge.clone(),
+            form: Some(link.form()),
+            children: link.children(),
+            linked: link.linked(),
+            bytes: bytes.len(),
+            table_bytes: 0,
+            built: false,
+            note: None,
+            build: Duration::ZERO,
+        },
+        bytes,
+    ))
+}
+
+/// Bytes of binding in front of a link's payload: which parent table, column and generation.
+///
+/// Eight for the generation, four for the column, four for the name's length, then the name padded
+/// out to eight so that the link's own header lands on a boundary.
+fn binding_bytes(parent: &str) -> usize {
+    16 + parent.len().div_ceil(8) * 8
+}
+
+/// The payload: the binding, then the link.
+///
+/// The binding is here and not in `rudb-graph`'s [`link::Link`], because a table name and a
+/// generation are file concepts and that crate is not allowed to know what a file is. It exists
+/// because the section's own id says only which child column the link is for, and a link resolved
+/// against the wrong parent is the one failure in this layer that is a wrong answer rather than a
+/// slow one. Section 3.1's staleness rule is *ignore, do not repair*, and this is what gives
+/// [`stored_link`] something to check before it believes a payload.
+fn encode_link(link: &link::Link, parent: &Reader, edge: &Edge) -> Result<Vec<u8>> {
+    let name = edge.parent.as_bytes();
+    let mut bytes = Vec::with_capacity(binding_bytes(&edge.parent) + link.bytes());
+    bytes.extend_from_slice(&parent.table().generation().to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(edge.parent_column)
+            .map_err(|_| invalid("column index overflow"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(name.len())
+            .map_err(|_| invalid("a parent name longer than a u32"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(name);
+    bytes.resize(binding_bytes(&edge.parent), 0);
+    link.write(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The forward link this child table carries for a column, when it carries one this build can use
+/// and the parent it was built against is still the parent being asked about.
+///
+/// `None` for every reason there might not be one, for the reason [`key_map`] answers the same way.
+/// The extra check here is the binding: a link whose stored parent name, column or generation is
+/// not the one the caller is asking for is a link built against a table that has since been
+/// rewritten, and resolving through it would produce a plausible wrong row rather than an error.
+#[must_use]
+pub fn stored_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<link::Link> {
+    let table = child.table();
+    let id = u64::try_from(edge.child_column).ok()?;
+    let held = table
+        .sections()
+        .iter()
+        .find(|section| section.kind == *section::FORWARD_LINK && section.id == id)?;
+    if !held.usable(table.generation()) {
+        return None;
+    }
+    let bytes = child.payload(held).ok()?;
+    let binding = binding_bytes(&edge.parent);
+    if bytes.len() < binding {
+        return None;
+    }
+    let generation = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let column = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let length = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    if generation != parent.table().generation()
+        || column as usize != edge.parent_column
+        || length != edge.parent.len()
+        || &bytes[16..16 + length] != edge.parent.as_bytes()
+    {
+        return None;
+    }
+    link::Link::read(&bytes[binding..]).ok()
+}
+
+/// What the table's sections of one kind cost, leaving out the ids this build is replacing.
+fn held_bytes_except(reader: &Reader, kind: [u8; 8], replacing: &[usize]) -> Result<u64> {
+    let mut total = 0;
+    for held in reader.table().sections() {
+        if !held.among(section::GRAPH_KINDS) {
+            continue;
+        }
+        let replaced =
+            held.kind == kind && replacing.iter().any(|&id| u64::try_from(id) == Ok(held.id));
+        if replaced || !held.usable(reader.table().generation()) {
+            continue;
+        }
+        let Ok(extents) = reader.extents(held) else { continue };
+        total += extents.iter().map(|extent| u64::from(extent.length)).sum::<u64>();
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -698,6 +1000,199 @@ mod tests {
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
         assert!(key_map(&reader, 0).is_some());
         assert!(key_map(&reader, 1).is_none());
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A parent table of `parents` sequential keys and a child table of these foreign keys, with
+    /// the parent's key map already built, which is the state section 3.8 says a link build starts
+    /// from.
+    fn related(label: &str, parents: i64, foreign: &[Option<i64>]) -> PathBuf {
+        let path = table_of(label, &(1..=parents).map(Some).collect::<Vec<_>>());
+        let mut writer = Writer::open(&path, "child", vec![Field::new("fk", LogicalType::BigInt)])
+            .expect("a second table");
+        for part in foreign.chunks(1000) {
+            let values =
+                part.iter().map(|key| key.map_or(Value::Null, Value::BigInt)).collect::<Vec<_>>();
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).expect("keys")])
+                    .expect("one column");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+        build_key_maps(&path, "parent", &[0]).expect("the parent's key map");
+        path
+    }
+
+    fn edge() -> Edge {
+        Edge { child: "child".into(), child_column: 0, parent: "parent".into(), parent_column: 0 }
+    }
+
+    /// Reads the link back out of the file and checks every child against the key it was built
+    /// from, which is the only assertion that catches a link that is off by a row.
+    fn links(path: &PathBuf, foreign: &[Option<i64>]) -> link::Link {
+        let catalog = Catalog::open(path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let parent = catalog.table("parent").expect("the parent");
+        let link = stored_link(&child, &parent, &edge()).expect("the link is in the file");
+        let map = key_map(&parent, 0).expect("the parent's key map");
+        for (rid, key) in foreign.iter().enumerate() {
+            let want = key.and_then(|key| map.lookup(i128::from(key)).expect("lookup"));
+            assert_eq!(link.forward(rid as Rid), want, "child {rid}");
+        }
+        link
+    }
+
+    #[test]
+    fn a_clustered_foreign_key_takes_the_monotone_form_and_answers_both_directions() {
+        // The shape `lineitem` has against `orders`, which is the relationship section 3.4's
+        // arithmetic is about. Four children each of a thousand parents, in order.
+        let foreign = (0..4000_i64).map(|child| Some(child / 4 + 1)).collect::<Vec<_>>();
+        let path = related("monotone", 1000, &foreign);
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert_eq!(report.len(), 1);
+        assert!(report[0].built, "{:?}", report[0].note);
+        assert_eq!(report[0].form, Some(link::Form::Monotone));
+        assert_eq!(report[0].children, 4000);
+        assert_eq!(report[0].linked, 4000);
+
+        let link = links(&path, &foreign);
+        assert_eq!(link.form(), link::Form::Monotone);
+        assert_eq!(link.backward(0), Some(0..4), "the first parent's four children");
+        assert_eq!(link.backward(999), Some(3996..4000));
+        assert_eq!(link.backward(1000), None, "past the last parent");
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn an_unclustered_foreign_key_takes_the_packed_form_and_still_resolves() {
+        let foreign = (0..3000_i64).map(|child| Some((child * 7) % 1000 + 1)).collect::<Vec<_>>();
+        let path = related("packed", 1000, &foreign);
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert!(report[0].built, "{:?}", report[0].note);
+        assert_eq!(report[0].form, Some(link::Form::Packed));
+
+        let link = links(&path, &foreign);
+        assert_eq!(link.backward(0), None, "the packed form answers one direction");
+        // Ten bits a child, a min and a max per part, and the header. The check is that it is a rid
+        // per child and not a byte per child, because a link stored as a u64 array would also pass
+        // every assertion above it.
+        assert!(link.bytes() < 3000 * 2 + 3 * 16, "{} bytes is not bit-packed", link.bytes());
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_foreign_key_that_matches_nothing_is_a_child_with_no_parent() {
+        // Not an error and not a refusal. A foreign key that is not total is legal, and what it
+        // costs is the monotone form, because every bit of that vector is already spoken for.
+        let foreign = vec![Some(1), Some(2), None, Some(9999), Some(3)];
+        let path = related("orphans", 10, &foreign);
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert!(report[0].built, "{:?}", report[0].note);
+        assert_eq!(report[0].form, Some(link::Form::Packed));
+        assert_eq!(report[0].children, 5);
+        assert_eq!(report[0].linked, 3, "the null and the key that matches nothing are not links");
+
+        let link = links(&path, &foreign);
+        assert_eq!(link.forward(2), None, "a null is not a link");
+        assert_eq!(link.forward(3), None, "a key that matches nothing is not a link");
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_parent_with_no_key_map_is_a_relationship_with_no_link_rather_than_an_error() {
+        // Section 3.8's ordering is the reason: the key map has to exist first, and a checkpoint
+        // that has not built one yet is a normal state rather than a broken one.
+        let path = table_of("unmapped", &(1..=100_i64).map(Some).collect::<Vec<_>>());
+        let mut writer = Writer::open(&path, "child", vec![Field::new("fk", LogicalType::BigInt)])
+            .expect("a second table");
+        let values = (1..=100_i64).map(Value::BigInt).collect::<Vec<_>>();
+        writer
+            .append(
+                &Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).expect("keys")])
+                    .expect("one column"),
+            )
+            .expect("a part");
+        writer.finish().expect("commit");
+
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert!(!report[0].built);
+        assert_eq!(report[0].note.as_deref(), Some("no key map is stored for parent"));
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let parent = catalog.table("parent").expect("the parent");
+        assert!(stored_link(&child, &parent, &edge()).is_none());
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_link_asked_for_against_the_wrong_parent_is_not_handed_over() {
+        // The binding check. The section's own id says which child column the link is for and
+        // nothing about which table it points into, so a caller that asked with a different parent
+        // would otherwise be handed rids of a table it never named.
+        let foreign = (0..500_i64).map(|child| Some(child / 5 + 1)).collect::<Vec<_>>();
+        let path = related("binding", 100, &foreign);
+        build_links(&path, &[edge()]).expect("build");
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let parent = catalog.table("parent").expect("the parent");
+        assert!(stored_link(&child, &parent, &edge()).is_some());
+        let wrong = Edge { parent: "child".into(), ..edge() };
+        assert!(stored_link(&child, &parent, &wrong).is_none(), "a different parent name");
+        let wrong = Edge { parent_column: 1, ..edge() };
+        assert!(stored_link(&child, &parent, &wrong).is_none(), "a different parent column");
+        let wrong = Edge { child_column: 1, ..edge() };
+        assert!(stored_link(&child, &parent, &wrong).is_none(), "a different child column");
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_link_that_does_not_fit_the_budget_is_reported_rather_than_stored() {
+        // Zero percent, which the floor lifts to sixty four kilobytes, against a packed link over
+        // sixty thousand children at ten bits each, which is seventy five.
+        let foreign = (0..60_000_i64).map(|child| Some((child * 7) % 1000 + 1)).collect::<Vec<_>>();
+        let path = related("budget", 1000, &foreign);
+        let report = build_links_within(&path, &[edge()], 0).expect("build");
+        assert!(!report[0].built);
+        assert!(report[0].bytes > 0, "the report says what a larger budget would buy");
+        assert!(report[0].note.as_deref().unwrap_or_default().contains("budget"), "{report:?}");
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let parent = catalog.table("parent").expect("the parent");
+        assert!(stored_link(&child, &parent, &edge()).is_none());
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_parent_whose_key_repeats_gets_no_link_at_all() {
+        // Section 2.3's verification, which is the one check in this layer that is about
+        // correctness rather than speed: a link over a non-unique parent resolves to one of the
+        // rows that held the key, and which one is an accident of the build.
+        let path = table_of("repeats", &[Some(1), Some(1), Some(2)]);
+        let mut writer = Writer::open(&path, "child", vec![Field::new("fk", LogicalType::BigInt)])
+            .expect("a second table");
+        let values = [Value::BigInt(1), Value::BigInt(2)];
+        writer
+            .append(
+                &Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &values).expect("keys")])
+                    .expect("one column"),
+            )
+            .expect("a part");
+        writer.finish().expect("commit");
+        build_key_maps(&path, "parent", &[0]).expect("the parent's key map");
+
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert!(!report[0].built);
+        assert_eq!(report[0].note.as_deref(), Some("no key map is stored for parent"));
 
         fs::remove_file(&path).expect("clean up");
     }
