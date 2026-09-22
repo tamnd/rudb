@@ -334,6 +334,51 @@ fn a_sort_breaks_ties_with_the_next_key() {
     assert_eq!(rows[2], vec![integer(2), text("c")]);
 }
 
+/// A sort whose input is more than one chunk, which is where the payload stops being where the
+/// keys are.
+///
+/// The rows are held as the chunks they arrived in and every column is moved once at the end by a
+/// position per row, so what can go wrong is a row landing beside another row's columns. Four
+/// chunks of input, each key twice, and a string that spells its own key, so a row that came apart
+/// shows up as a number next to the wrong string rather than as a count that is off by one.
+#[test]
+fn a_sort_over_several_chunks_keeps_each_row_together() {
+    let groups = i32::try_from(VECTOR_SIZE * 4).expect("a small number");
+    let catalog = crowd(groups);
+    const CROWD: &str = "Get memory.main.crowd AS crowd #0 [x::INTEGER, s::VARCHAR]";
+    let sorted = |direction, threads| {
+        let plan =
+            Plan::parse(&format!("Sort [#0.0::INTEGER {direction} NULLS LAST]\n  {CROWD}\n"))
+                .expect("a well formed plan");
+        let query =
+            build_with(&plan, &catalog, &Cancel::new(), &Memory::unlimited(), &Settings::new())
+                .expect("the query builds");
+        let chunks = query.collect(&Cancel::new(), &Pool::new(threads)).expect("the sort runs");
+        rows_of(&chunks)
+    };
+
+    let rows = sorted("ASC", 1);
+    assert_eq!(rows.len(), groups as usize * 2, "two rows a key, over four chunks of them");
+    // row at a time: the assertion is that each row is still itself, which is a statement about a
+    // row and has to be checked as one.
+    for (at, row) in rows.iter().enumerate() {
+        let Value::Integer(key) = row[0] else { panic!("the key came back as {:?}", row[0]) };
+        assert_eq!(key, at as i32 / 2, "the keys should run up two at a time");
+        assert_eq!(row[1], text(&format!("key number {key}")), "row {at} came apart");
+    }
+
+    // The same rows the other way up, because an ascending sort of a table appended in order asks
+    // for a permutation that is close to the identity and a descending one does not.
+    let mut down = sorted("DESC", 1);
+    down.reverse();
+    assert_eq!(down, rows, "the same rows, read from the other end");
+
+    // On four threads the chunks come from four instances, and each instance numbers its own
+    // chunks from zero. If they are not renumbered as they are handed over, a row reads a column
+    // out of some other instance's chunk and the answer is quietly rearranged rather than short.
+    assert_eq!(sorted("ASC", 4), rows, "four threads answer what one thread answers");
+}
+
 /// The same rows a sort with a limit over it produces, which is the whole promise of the operator.
 #[test]
 fn a_top_n_is_a_sort_with_a_limit_over_it() {
