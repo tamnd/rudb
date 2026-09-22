@@ -18,6 +18,7 @@ The goal has not changed. rudb is meant to be ten times faster than DuckDB and t
 10. [`10-what-the-encoder-costs.md`](10-what-the-encoder-costs.md) is `cargo xtask encode`, the per candidate split of the encoder's seconds, and its thread scaling.
 11. [`11-how-duckdb-reads-parquet.md`](11-how-duckdb-reads-parquet.md) is `cargo xtask parquet`, both engines over the same file, the two root causes it separates, and the six item work list that follows.
 12. [`12-the-chunk-and-the-page.md`](12-the-chunk-and-the-page.md) is what a chunk costs before it holds any data, why the in memory table cannot hand one out without copying it, and the four changes that follow from those two numbers.
+13. [`13-what-tpch-costs-in-instructions.md`](13-what-tpch-costs-in-instructions.md) is the first TPC-H note and the first one measured in instructions retired rather than seconds. It says rudb does 2.2 times the work DuckDB does on SF1, that most of the engine is already past ten times, that all of the gap is in one operator, and that closing it entirely still leaves the goal out of reach, so it separates the work that reaches parity from the one idea that reaches ten times.
 
 [`../storage-v2/`](../storage-v2/) is the format these notes keep arriving at, designed from the queries rather than from the file, with the size target worked out against the real `hits.parquet` instead of assumed.
 
@@ -37,3 +38,9 @@ We are not losing because of any one slow loop. We are losing because of four th
 The first is F4, the second is F2, the third is F5, and the fourth is F2 again. F1 owns the kernels underneath all of them and is worth about 10 percent on its own.
 
 The order that follows from the measurement is F5 before F4 before F2, because a parallel driver over an aggregate that refuses a second instance buys nothing, and because the compact group key is both the thing F4 needs to merge and the thing the memory target needs. That is a change from the order the milestones were written in, and it is the whole point of these notes.
+
+## The short version on TPC-H, added 22 September 2026
+
+Note 13 is the same exercise on the other benchmark and it lands somewhere different. Measured in instructions retired rather than seconds, rudb does 2.2 times the work DuckDB does on TPC-H SF1. Most of the engine is already past ten times: the process floor is 19 times cheaper, an ungrouped sum beats DuckDB, and `count`, `min` and `max` are answered out of the committed directory without reading the page at all. Every bit of the 2.2 times is in the grouped aggregate, and it is there twice over, once per aggregate call because the state is a tagged enum in a side vector rather than a row in the table, and once per row because the partition copies the input instead of the table.
+
+The number that decides what to do is this. Ten times DuckDB on the suite means 2.39 G of instructions against the 52.98 G rudb spends today, so the engine has to do twenty two times less work. Closing the whole aggregate gap is worth 2.2 of that. The rest has to come from not touching the rows, which means deciding the group at load time rather than at query time, and that is the same thesis [`../engine-v2/13-encoded-execution.md`](../engine-v2/13-encoded-execution.md) argues from the layout side.
