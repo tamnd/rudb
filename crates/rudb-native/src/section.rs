@@ -177,6 +177,32 @@ impl Section {
     }
 }
 
+/// One section to be written into a file, handed to [`crate::attach`].
+///
+/// The payload is bytes and the format keeps it that way. Which of the three key map forms is in
+/// `flags`, and what the first `header_bytes` bytes mean, are questions `rudb-graph` answers and
+/// this crate never asks, which is what makes the first of section 3.2's three rules true rather
+/// than intended: a mechanism that had to understand a payload could not carry one it had never
+/// heard of.
+#[derive(Debug, Clone, Copy)]
+pub struct Attachment<'a> {
+    /// Which kind of structure this is, usually one of [`KEY_MAP`], [`FORWARD_LINK`],
+    /// [`ADJACENCY`].
+    pub kind: [u8; 8],
+    /// Which structure of that kind. An attachment replaces any section already in the table with
+    /// the same kind and id, which is what makes rebuilding a key map a write rather than a
+    /// question about what to do with the old one.
+    pub id: u64,
+    /// Kind-specific flags, copied into the entry and not interpreted.
+    pub flags: u32,
+    /// How many bytes at the front of `bytes` are the kind's own header.
+    pub header_bytes: u32,
+    /// The payload. Empty is legal and is how section 3.7 records a relationship that did not fit
+    /// the budget: an entry with no extents, its size reported by `rudb_links()`, and nothing in
+    /// the file to read.
+    pub bytes: &'a [u8],
+}
+
 /// Where one extent of a section's payload lives.
 ///
 /// Each carries its own checksum, which is the second of section 3.2's three rules: an extent is
@@ -294,8 +320,14 @@ pub fn decode_extents(bytes: &[u8]) -> Result<Vec<Extent>> {
 /// Which extent holds a given logical element, by binary search over the table.
 ///
 /// Returns the index into `extents` and the element's offset within that extent's elements, or
-/// `None` when the element is past the end. `None` rather than an error because a stale link may
-/// name an element that no longer exists, and section 3.1 wants staleness ignored.
+/// `None` when there are no extents at all, which is the not-built entry of section 3.7.
+///
+/// It does not bound the element from above, because an extent table cannot: the last extent's
+/// length is in bytes and only the caller knows how many elements a byte holds. So an element past
+/// the end answers with an offset past the end of the last extent, and the caller checks that
+/// against the count it already has. `None` rather than an error for the empty case because a
+/// stale link may name a structure that is no longer there, and section 3.1 wants staleness
+/// ignored.
 #[must_use]
 pub fn locate(extents: &[Extent], element: u64) -> Option<(usize, u64)> {
     let at = extents.partition_point(|extent| extent.first <= element);

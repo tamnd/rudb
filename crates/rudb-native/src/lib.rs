@@ -420,6 +420,20 @@ pub struct Table {
     /// whatever order the rows came in, so a table loaded sorted prunes and the same table after a
     /// checkpoint that did not know to keep the order quietly stops pruning and nothing says why.
     clustering: Option<Clustering>,
+    /// The file generation of the commit that last wrote this table's column pages.
+    ///
+    /// This is what spec/graph/03-the-file-format.md section 3.2 calls the table generation, and
+    /// the definition is deliberately about the pages rather than about the directory. A graph
+    /// section is a restatement of a column in terms of row ids, so what invalidates one is the
+    /// rows being renumbered, and nothing else. Adding a second table to the file, or attaching a
+    /// section to this one, commits a new file generation without touching a single row of this
+    /// table, and a definition that moved with those would declare every section in the file stale
+    /// for no reason.
+    ///
+    /// Zero on a table written before format 23, where nothing recorded it. Real generations start
+    /// at one, so zero can never match a section's stamp, and a table from format 22 has no
+    /// sections for it to match anyway.
+    generation: u64,
     /// The graph sections this table carries, per spec/graph/03-the-file-format.md section 3.2.
     ///
     /// Empty for every table written before the section table existed, and empty is not a
@@ -458,6 +472,15 @@ impl Table {
     #[must_use]
     pub fn clustering(&self) -> Option<&Clustering> {
         self.clustering.as_ref()
+    }
+
+    /// The generation every section of this table is judged against.
+    ///
+    /// See the field. A caller deciding whether to read a section asks [`Section::usable`] with
+    /// this.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Every graph section this table names, including the kinds this build does not know.
@@ -914,6 +937,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 clustering: None,
+                generation,
                 sections: Vec::new(),
             },
             generation,
@@ -959,6 +983,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 clustering: None,
+                generation: 1,
                 sections: Vec::new(),
             },
             generation: 1,
@@ -1049,6 +1074,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 clustering: None,
+                generation,
                 sections: Vec::new(),
             },
             order: Vec::new(),
@@ -1810,6 +1836,158 @@ impl Writer {
         self.file.sync_all().map_err(io)?;
         Ok(self.table)
     }
+}
+
+/// Appends one run of bytes at `at` and moves it past them, answering where they went.
+///
+/// The append half of [`attach`], which cannot use [`Writer::put`] because it is not writing a
+/// table. Every byte a section costs goes through here, so the offsets in an extent table come
+/// from one place.
+fn append(file: &File, at: &mut u64, bytes: &[u8]) -> Result<u64> {
+    let offset = *at;
+    write_at(file, offset, bytes)?;
+    *at =
+        at.checked_add(bytes.len() as u64).ok_or_else(|| invalid("native file length overflow"))?;
+    Ok(offset)
+}
+
+/// Writes one attachment's payload as extents and returns the entry that names it.
+///
+/// The split is by bytes, and the `first` of each extent is therefore a byte count. A section kind
+/// whose extents should break on a row boundary instead will want to hand its extents over already
+/// split; nothing needs that yet, and guessing at the shape of it now would be guessing.
+fn write_section(
+    file: &File,
+    at: &mut u64,
+    one: &section::Attachment<'_>,
+    generation: u64,
+) -> Result<Section> {
+    if one.header_bytes as usize > one.bytes.len() {
+        return Err(invalid("a section's header is longer than its payload"));
+    }
+    let mut extents = Vec::new();
+    let mut first = 0_u64;
+    for chunk in one.bytes.chunks(section::MAX_EXTENT as usize) {
+        let offset = append(file, at, chunk)?;
+        extents.push(section::Extent {
+            offset,
+            length: u32::try_from(chunk.len()).map_err(|_| invalid("extent length overflow"))?,
+            hash: checksum(chunk),
+            first,
+        });
+        first += chunk.len() as u64;
+    }
+    let mut table = Vec::with_capacity(extents.len() * section::EXTENT_BYTES);
+    section::encode_extents(&extents, &mut table)?;
+    // A payload of nothing is a section of no extents and no extent table, and its `extent_page`
+    // is zero rather than the end of the file. Section 3.7 wants that entry to exist: it is how a
+    // relationship that did not fit the budget is recorded as not built rather than forgotten.
+    let extent_page = if table.is_empty() { 0 } else { append(file, at, &table)? };
+    Ok(Section {
+        kind: one.kind,
+        id: one.id,
+        generation,
+        extents: u32::try_from(extents.len()).map_err(|_| invalid("too many extents"))?,
+        extent_page,
+        extent_bytes: u32::try_from(table.len()).map_err(|_| invalid("extent table overflow"))?,
+        hash: checksum(&table),
+        flags: one.flags,
+        header_bytes: one.header_bytes,
+    })
+}
+
+/// Attaches graph sections to a table already committed in a file, without rewriting a page.
+///
+/// This is the second pass spec/graph/03-the-file-format.md section 3.8 asks for. A key map has to
+/// exist before the link that uses it can be built, and it is built by reading the key column back,
+/// so the structures of a table cannot be written during the load that wrote the table. They are
+/// written afterwards, by this, and the file in between the two is a correct file that answers
+/// every query more slowly.
+///
+/// Nothing is overwritten. The payloads, the extent tables, the new directory for this table and
+/// the new catalog all go on the end of the file past the committed generation, and the last write
+/// is the header slot, exactly as [`Writer::finish`] does it. So a crash anywhere in here leaves
+/// the generation before it intact, and leaves unreferenced trailing bytes that the next commit
+/// writes past.
+///
+/// An attachment replaces any section of the same kind and id, and every other section is carried
+/// through untouched, including one whose kind this build does not know. The table's own generation
+/// is carried through too, because attaching a section moves no row: see [`Table::generation`].
+///
+/// # Errors
+///
+/// If the file has no valid committed directory, is an older format than this build writes, holds
+/// no table of that name, names a section whose payload cannot be written, or would end up naming
+/// more sections than [`MAX_SECTIONS`].
+pub fn attach(
+    path: impl AsRef<Path>,
+    table: &str,
+    attachments: &[section::Attachment<'_>],
+) -> Result<Table> {
+    let path = path.as_ref();
+    let (_, size, slot, bytes, _) = slot_bytes(path)?;
+    let mut entries = decode_catalog(&bytes, size)?;
+    let at = entries
+        .iter()
+        .position(|entry| entry.name == table)
+        .ok_or_else(|| invalid(&format!("the file holds no table called {table}")))?;
+    let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
+    let mut version = [0; 4];
+    read_at(&file, 8, &mut version)?;
+    let version = u32::from_le_bytes(version);
+    // Readable is not the same as writable. A format 22 file has no section table, and giving its
+    // directory one without moving the number in its header would leave a file that claims to be
+    // format 22 and is not, which is worse than refusing. Rewriting it with this build is the
+    // answer, and the format is at 0.3.x, so nobody has one of these that this project did not
+    // just make.
+    if version != FORMAT {
+        return Err(invalid(&format!(
+            "the file is format {version} and a graph section needs format {FORMAT}, so it has \
+             to be written again"
+        )));
+    }
+    let mut directory = vec![0; entries[at].directory.length as usize];
+    read_at(&file, entries[at].directory.offset, &mut directory)?;
+    if checksum(&directory) != entries[at].directory.hash {
+        return Err(invalid(&format!("the directory of table {table} does not checksum")));
+    }
+    let mut held = decode_directory(&directory, size)?;
+    let mut cursor = size;
+    for one in attachments {
+        let written = write_section(&file, &mut cursor, one, held.generation)?;
+        held.sections.retain(|old| !(old.kind == one.kind && old.id == one.id));
+        held.sections.push(written);
+    }
+    if held.sections.len() > MAX_SECTIONS {
+        return Err(invalid("the table would name more sections than the bound allows"));
+    }
+    let encoded = encode_directory(&held)?;
+    if encoded.len() > MAX_DIRECTORY {
+        return Err(invalid("directory exceeds the configured bound"));
+    }
+    let offset = append(&file, &mut cursor, &encoded)?;
+    entries[at].directory = Page {
+        offset,
+        length: u32::try_from(encoded.len()).map_err(|_| invalid("directory length overflow"))?,
+        hash: checksum(&encoded),
+    };
+    let catalog = encode_catalog(&entries)?;
+    if catalog.len() > MAX_DIRECTORY {
+        return Err(invalid("catalog exceeds the configured bound"));
+    }
+    let offset = append(&file, &mut cursor, &catalog)?;
+    file.sync_all().map_err(io)?;
+    let generation =
+        slot.generation.checked_add(1).ok_or_else(|| invalid("native file generation overflow"))?;
+    let committed = Slot {
+        offset,
+        length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+        generation,
+        hash: checksum(&catalog),
+    };
+    write_at(&file, slot_offset(generation), &committed.bytes())?;
+    file.sync_all().map_err(io)?;
+    Ok(held)
 }
 
 /// Reads committed native column pages without holding the table in memory.
@@ -3405,6 +3583,77 @@ impl Reader {
         Ok(Some(dictionary))
     }
 
+    /// Reads one section's extent table and checks it against the entry that names it.
+    ///
+    /// # Errors
+    ///
+    /// If the entry points outside the file, the table does not checksum, or it does not decode as
+    /// a run of extents in element order.
+    pub fn extents(&self, of: &Section) -> Result<Vec<section::Extent>> {
+        if of.extent_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let mut bytes = vec![0; of.extent_bytes as usize];
+        read_at(&self.file, of.extent_page, &mut bytes)?;
+        if checksum(&bytes) != of.hash {
+            return Err(invalid("a section's extent table does not checksum"));
+        }
+        let extents = section::decode_extents(&bytes)?;
+        if extents.len() != of.extents as usize {
+            return Err(invalid("a section's extent table is not the length the entry says"));
+        }
+        Ok(extents)
+    }
+
+    /// Reads and verifies one extent of a section.
+    ///
+    /// This is what section 3.2's second rule is for. A reduction that needs one extent of a two
+    /// gigabyte forward link reads and checksums that extent and nothing else, which is the whole
+    /// difference between a structure that works at SF100 and issue #745.
+    ///
+    /// # Errors
+    ///
+    /// If the extent points outside the file, or its bytes do not checksum.
+    pub fn extent(&self, of: &section::Extent) -> Result<Vec<u8>> {
+        let end = of
+            .offset
+            .checked_add(u64::from(of.length))
+            .ok_or_else(|| invalid("an extent overflows the file"))?;
+        if of.offset < HEADER || end > self.size {
+            return Err(invalid("an extent is outside the file"));
+        }
+        let mut bytes = vec![0; of.length as usize];
+        read_at(&self.file, of.offset, &mut bytes)?;
+        if checksum(&bytes) != of.hash {
+            return Err(invalid("an extent does not checksum"));
+        }
+        Ok(bytes)
+    }
+
+    /// Reads a whole section's payload, every extent of it, in order.
+    ///
+    /// For a structure that is resident anyway, which a key map is. Anything large enough that the
+    /// split matters should be walking [`Reader::extents`] and taking the one it needs.
+    ///
+    /// # Errors
+    ///
+    /// If the extent table or any extent fails its check.
+    pub fn payload(&self, of: &Section) -> Result<Vec<u8>> {
+        let extents = self.extents(of)?;
+        let mut bytes =
+            Vec::with_capacity(sum(extents.iter().map(|one| u64::from(one.length))) as usize);
+        for one in &extents {
+            if one.first != bytes.len() as u64 {
+                return Err(invalid("a section's extents do not join up"));
+            }
+            bytes.extend_from_slice(&self.extent(one)?);
+        }
+        if of.header_bytes as usize > bytes.len() {
+            return Err(invalid("a section's header is longer than its payload"));
+        }
+        Ok(bytes)
+    }
+
     /// Reads only the named columns from one part.
     ///
     /// The whole stripe page each column lives in is read and kept, because a scan asks for the
@@ -4204,6 +4453,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
     // is written even when it is empty, so that a file written by this build always says which
     // sections it has rather than leaving a reader to infer it from where the bytes ran out.
     out.extend_from_slice(SECTIONS);
+    put_u64(&mut out, table.generation);
     put_u16(
         &mut out,
         u16::try_from(table.sections.len()).map_err(|_| invalid("too many sections"))?,
@@ -4650,6 +4900,9 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     let mut clustering = None;
     let mut sections = Vec::new();
     let mut seen_sections = false;
+    // Zero until a section table says otherwise, which is what a format 22 table gets and what
+    // makes every section stamp fail to match on one, because real generations start at one.
+    let mut generation = 0;
     while cur.at != bytes.len() {
         let mut tag = [0u8; 8];
         tag.copy_from_slice(cur.take(8)?);
@@ -4674,6 +4927,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                 return Err(invalid("directory names two section tables"));
             }
             seen_sections = true;
+            generation = cur.u64()?;
             let count = cur.u16()? as usize;
             if count > MAX_SECTIONS {
                 return Err(invalid("section count exceeds its bound"));
@@ -4714,6 +4968,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
         distincts,
         frequencies,
         clustering,
+        generation,
         sections,
     })
 }
@@ -6800,6 +7055,7 @@ mod tests {
             distincts: vec![None],
             frequencies: vec![None],
             clustering: None,
+            generation: 1,
             sections,
         }
     }
@@ -6840,9 +7096,11 @@ mod tests {
         // build's directory with the trailing section block cut off, so cutting it off is the
         // honest way to make one: no fixture to go stale, and no separate encoder to drift.
         let directory = encode_directory(&bare_table(Vec::new())).expect("directory");
-        let older = &directory[..directory.len() - (SECTIONS.len() + size_of::<u16>())];
+        let block = SECTIONS.len() + size_of::<u64>() + size_of::<u16>();
+        let older = &directory[..directory.len() - block];
         let decoded = decode_directory(older, 1 << 20).expect("a directory from before sections");
         assert!(decoded.sections().is_empty());
+        assert_eq!(decoded.generation(), 0, "a format 22 table recorded no generation");
         assert_eq!(decoded.name(), "linked");
         assert_eq!(decoded.fields().len(), 1, "everything before the block still decodes");
     }
@@ -6948,6 +7206,325 @@ mod tests {
         // Not an allocation of sixty five thousand entries off a torn count: either the bound
         // refuses it or the bytes run out, and both are errors rather than a read past the end.
         assert!(decode_directory(&torn, 1 << 20).is_err());
+    }
+
+    /// A committed one column file of `rows` integers, for the attach tests.
+    fn linked_file(label: &str, rows: i32) -> PathBuf {
+        let path = path(label);
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let values = (0..rows).map(Value::Integer).collect::<Vec<_>>();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::Integer, &values).expect("integers")])
+                .expect("one column");
+        writer.append(&chunk).expect("the only part");
+        writer.finish().expect("commit");
+        path
+    }
+
+    fn a_key_map_payload() -> Vec<u8> {
+        // Shaped like one without being one: this crate never reads a payload, so what matters here
+        // is that every byte comes back and that the header the entry measures is at the front.
+        (0..512_u32).flat_map(u32::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn a_section_attached_to_a_committed_file_reads_back_byte_for_byte() {
+        let path = linked_file("attach", 64);
+        let payload = a_key_map_payload();
+        let table = attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::KEY_MAP,
+                id: 0,
+                flags: 2,
+                header_bytes: 40,
+                bytes: &payload,
+            }],
+        )
+        .expect("attach a key map");
+        assert_eq!(table.sections().len(), 1);
+
+        let reader = Reader::open(&path).expect("reopen after the attach");
+        let held = reader.table().sections();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].kind, *section::KEY_MAP);
+        assert_eq!(held[0].flags, 2, "the form a reader must not have to guess");
+        assert_eq!(held[0].header_bytes, 40);
+        // The generation is the one the pages were written at, not the one the attach committed at.
+        // Attaching a section moved no row, so a section written by it is current, and a second
+        // table added to this file later would not make it stale.
+        assert_eq!(held[0].generation, 1);
+        assert!(held[0].usable(reader.table().generation()));
+        assert_eq!(reader.payload(&held[0]).expect("read the payload"), payload);
+        assert_eq!(reader.extents(&held[0]).expect("extent table").len(), 1);
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn attaching_a_section_answers_every_row_exactly_as_before() {
+        // Section 3.1 end to end, and the reason the whole layer is safe to build incrementally. A
+        // file with a section in it and the same file without one have to agree row for row, so the
+        // comparison is made against the answers taken before the attach rather than against a
+        // constant somebody typed.
+        let path = linked_file("attach_changes_nothing", 300);
+        let before = Reader::open(&path).expect("open before");
+        let rows = before.table().rows();
+        let first = before.read(0, &[0]).expect("read before");
+        let values = (0..rows).map(|at| first.value_at(at, 0)).collect::<Vec<_>>();
+        let layout = before.layout().columns_total();
+        drop(before);
+
+        let payload = a_key_map_payload();
+        attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::KEY_MAP,
+                id: 0,
+                flags: 0,
+                header_bytes: 0,
+                bytes: &payload,
+            }],
+        )
+        .expect("attach");
+
+        let after = Reader::open(&path).expect("open after");
+        assert_eq!(after.table().rows(), rows);
+        let read = after.read(0, &[0]).expect("read after");
+        for (at, value) in values.iter().enumerate() {
+            assert_eq!(&read.value_at(at, 0), value, "row {at} moved");
+        }
+        assert_eq!(
+            after.layout().columns_total(),
+            layout,
+            "an attach appends and does not rewrite a column page"
+        );
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_rebuilt_section_replaces_the_one_it_supersedes() {
+        // Rebuilding a key map has to be a write and not a question. If an attach added rather than
+        // replaced, a table rebuilt a few times would name several maps for one column and a reader
+        // would have to pick, which is a decision with no right answer in it.
+        let path = linked_file("attach_twice", 32);
+        let one = a_key_map_payload();
+        let two = vec![7_u8; 1024];
+        let entry = |bytes| section::Attachment {
+            kind: *section::KEY_MAP,
+            id: 4,
+            flags: 1,
+            header_bytes: 0,
+            bytes,
+        };
+        attach(&path, "items", &[entry(&one)]).expect("first build");
+        attach(&path, "items", &[entry(&two)]).expect("rebuild");
+
+        let reader = Reader::open(&path).expect("reopen");
+        let held = reader.table().sections();
+        assert_eq!(held.len(), 1, "one map per column and not one per build");
+        assert_eq!(reader.payload(&held[0]).expect("payload"), two);
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn an_attach_carries_through_a_kind_it_does_not_know() {
+        // The first of section 3.2's three rules, at the point where it is easiest to break: a build
+        // that rewrites a directory has to carry an entry it has no name for, or opening a file with
+        // an older binary and attaching one section quietly deletes the work of a newer one.
+        let path = linked_file("attach_unknown", 16);
+        let payload = vec![3_u8; 96];
+        attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *b"RUDBZZ9\0",
+                id: 1,
+                flags: 0,
+                header_bytes: 0,
+                bytes: &payload,
+            }],
+        )
+        .expect("a kind this build does not know still writes");
+        let key_map = a_key_map_payload();
+        attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::KEY_MAP,
+                id: 0,
+                flags: 0,
+                header_bytes: 0,
+                bytes: &key_map,
+            }],
+        )
+        .expect("attach beside it");
+
+        let reader = Reader::open(&path).expect("reopen");
+        let held = reader.table().sections();
+        assert_eq!(held.len(), 2, "the unfamiliar entry survived a directory rewrite");
+        let unknown = held.iter().find(|one| !one.known()).expect("the unfamiliar one");
+        assert_eq!(reader.payload(unknown).expect("its bytes are still there"), payload);
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_payload_of_nothing_is_a_relationship_recorded_as_not_built() {
+        let path = linked_file("attach_not_built", 8);
+        attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::FORWARD_LINK,
+                id: 2,
+                flags: 0,
+                header_bytes: 0,
+                bytes: &[],
+            }],
+        )
+        .expect("record a link that did not fit the budget");
+
+        let reader = Reader::open(&path).expect("reopen");
+        let held = reader.table().sections();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].extents, 0);
+        assert_eq!(held[0].extent_page, 0, "an entry that names no bytes points at none");
+        assert!(reader.extents(&held[0]).expect("no extent table").is_empty());
+        assert!(reader.payload(&held[0]).expect("no payload").is_empty());
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_payload_past_one_extent_is_split_and_joined_back() {
+        // Issue #745's rule, exercised rather than argued. One byte past the bound is the smallest
+        // payload that has to be two extents, and it is the case a split written for the common
+        // size gets wrong.
+        let path = linked_file("attach_two_extents", 8);
+        let payload = vec![0x5a_u8; section::MAX_EXTENT as usize + 1];
+        attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::KEY_MAP,
+                id: 0,
+                flags: 0,
+                header_bytes: 0,
+                bytes: &payload,
+            }],
+        )
+        .expect("attach a payload past the bound");
+
+        let reader = Reader::open(&path).expect("reopen");
+        let held = reader.table().sections();
+        let extents = reader.extents(&held[0]).expect("extent table");
+        assert_eq!(extents.len(), 2, "one byte past the bound is two extents");
+        assert_eq!(extents[0].length, section::MAX_EXTENT);
+        assert_eq!(extents[1].length, 1);
+        assert_eq!(extents[1].first, u64::from(section::MAX_EXTENT));
+        // And the extent the caller wants is readable on its own, which is the point of the split.
+        assert_eq!(reader.extent(&extents[1]).expect("the last extent"), vec![0x5a]);
+        assert_eq!(reader.payload(&held[0]).expect("the whole payload").len(), payload.len());
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_torn_extent_is_refused_rather_than_decoded() {
+        let path = linked_file("attach_torn", 8);
+        let payload = a_key_map_payload();
+        attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::KEY_MAP,
+                id: 0,
+                flags: 0,
+                header_bytes: 0,
+                bytes: &payload,
+            }],
+        )
+        .expect("attach");
+
+        let reader = Reader::open(&path).expect("reopen");
+        let extent = reader.extents(&reader.table().sections()[0]).expect("extent table")[0];
+        let file = OpenOptions::new().write(true).open(&path).expect("reopen to corrupt");
+        write_at(&file, extent.offset + 7, &[0xff]).expect("flip a byte of the payload");
+        drop(file);
+
+        let reader = Reader::open(&path).expect("the table still opens");
+        let error = reader
+            .payload(&reader.table().sections()[0])
+            .expect_err("a corrupt payload is not handed out");
+        assert!(error.to_string().contains("checksum"), "{error}");
+        // And the table is still readable, which is section 3.1: a section that cannot be trusted
+        // costs the query its shortcut and nothing else.
+        assert_eq!(reader.read(0, &[0]).expect("the column is untouched").width(), 1);
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn attaching_to_a_file_of_the_previous_format_is_refused_rather_than_done() {
+        // Readable is not writable. A format 22 directory has no section block, and adding one
+        // without moving the number in the header would leave a file claiming a format it is not.
+        let path = linked_file("attach_old_format", 8);
+        let file = OpenOptions::new().write(true).open(&path).expect("reopen to patch");
+        write_at(&file, 8, &22_u32.to_le_bytes()).expect("stamp the older format");
+        drop(file);
+
+        let payload = a_key_map_payload();
+        let error = attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::KEY_MAP,
+                id: 0,
+                flags: 0,
+                header_bytes: 0,
+                bytes: &payload,
+            }],
+        )
+        .expect_err("format 22 cannot gain a section");
+        assert!(error.to_string().contains("format 22"), "{error}");
+        assert!(Reader::open(&path).expect("and the file is untouched").table().rows() == 8);
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_section_header_longer_than_its_payload_is_refused_at_the_write() {
+        let path = linked_file("attach_bad_header", 8);
+        let error = attach(
+            &path,
+            "items",
+            &[section::Attachment {
+                kind: *section::KEY_MAP,
+                id: 0,
+                flags: 0,
+                header_bytes: 40,
+                bytes: &[1, 2, 3],
+            }],
+        )
+        .expect_err("a writer's bug stops at the write");
+        assert!(error.to_string().contains("header is longer"), "{error}");
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn attaching_to_a_name_the_file_does_not_hold_says_so() {
+        let path = linked_file("attach_wrong_name", 8);
+        let error = attach(&path, "orders", &[]).expect_err("no such table");
+        assert!(error.to_string().contains("orders"), "{error}");
+        fs::remove_file(&path).expect("clean up");
     }
 
     #[test]
@@ -8854,6 +9431,7 @@ mod tests {
             distincts: vec![None],
             frequencies: vec![None],
             clustering: None,
+            generation: 1,
             sections: Vec::new(),
         };
         let directory = encode_directory(&table).expect("directory");
