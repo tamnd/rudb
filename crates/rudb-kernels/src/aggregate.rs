@@ -55,7 +55,7 @@
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
-use rudb_vector::{Data, Form, Validity, Vector};
+use rudb_vector::{Data, Form, Live, Validity, Vector};
 
 use crate::compare::order;
 use crate::fallback::{self, Kernel};
@@ -950,7 +950,7 @@ pub fn update_scattered(
     };
     let feed = feed_of(first, input.logical_type());
     if let Some(feed) = feed {
-        if spread(states, into, input, rows, &nulls, feed)? {
+        if spread(states, into, input, rows, nulls.live(), feed)? {
             return Ok(());
         }
     }
@@ -1268,14 +1268,14 @@ fn spread(
     into: Where<'_>,
     input: &Vector,
     rows: usize,
-    nulls: &Validity,
+    nulls: Live<'_>,
     feed: Feed,
 ) -> Result<bool> {
     // Both counts are answered by the mask on its own, whatever the form and whatever the type, so
     // they come back before there is any question of which loop to run.
     if matches!(feed, Feed::Counted) {
         for row in 0..rows {
-            if !nulls.is_valid(row) {
+            if !nulls.at(row) {
                 continue;
             }
             let Some(index) = into.index(row) else { continue };
@@ -1335,7 +1335,7 @@ struct Run<'r> {
     input: &'r Vector,
     data: &'r Data,
     rows: usize,
-    nulls: &'r Validity,
+    nulls: Live<'r>,
 }
 
 fn scatter<M: Fn(usize) -> usize>(
@@ -1374,7 +1374,7 @@ fn total_into<M: Fn(usize) -> usize>(
                 $(Data::$variant(values) => {
                     let values = values.as_slice();
                     for row in 0..run.rows {
-                        if !run.nulls.is_valid(row) {
+                        if !run.nulls.at(row) {
                             continue;
                         }
                         let Some(index) = into.index(row) else { continue };
@@ -1422,7 +1422,7 @@ fn mean_into<M: Fn(usize) -> usize>(
                 $(Data::$variant(values) => {
                     let values = values.as_slice();
                     for row in 0..run.rows {
-                        if !run.nulls.is_valid(row) {
+                        if !run.nulls.at(row) {
                             continue;
                         }
                         let Some(index) = into.index(row) else { continue };
@@ -1473,7 +1473,7 @@ fn packed_into<M: Fn(usize) -> usize>(
     packed: &rudb_vector::Packed<'_>,
     at: M,
     rows: usize,
-    nulls: &Validity,
+    nulls: Live<'_>,
     feed: Feed,
 ) -> Result<bool> {
     let wide = input.logical_type().physical() == PhysicalType::UInt128;
@@ -1488,7 +1488,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                 return Ok(false);
             }
             for row in 0..rows {
-                if !nulls.is_valid(row) {
+                if !nulls.at(row) {
                     continue;
                 }
                 let Some(index) = into.index(row) else { continue };
@@ -1510,7 +1510,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                 return Ok(false);
             }
             for row in 0..rows {
-                if !nulls.is_valid(row) {
+                if !nulls.at(row) {
                     continue;
                 }
                 let Some(index) = into.index(row) else { continue };
@@ -1532,7 +1532,7 @@ fn packed_into<M: Fn(usize) -> usize>(
             let factor = pow10(scale) as f64;
             let scaled = scale != 0;
             for row in 0..rows {
-                if !nulls.is_valid(row) {
+                if !nulls.at(row) {
                     continue;
                 }
                 let Some(index) = into.index(row) else { continue };
@@ -1546,7 +1546,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                 return Ok(false);
             }
             for row in 0..rows {
-                if !nulls.is_valid(row) {
+                if !nulls.at(row) {
                     continue;
                 }
                 let Some(index) = into.index(row) else { continue };
@@ -1613,7 +1613,7 @@ fn real_into<M: Fn(usize) -> usize>(
             let values = $values.as_slice();
             let convert = $convert;
             for row in 0..run.rows {
-                if !run.nulls.is_valid(row) {
+                if !run.nulls.at(row) {
                     continue;
                 }
                 let Some(index) = into.index(row) else { continue };
@@ -1665,7 +1665,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                     // The `Value` below is built on a win rather than on a row, which is the part
                     // that makes this loop worth having over the one it replaced.
                     for row in 0..run.rows {
-                        if !run.nulls.is_valid(row) {
+                        if !run.nulls.at(row) {
                             continue;
                         }
                         let Some(index) = into.index(row) else { continue };
