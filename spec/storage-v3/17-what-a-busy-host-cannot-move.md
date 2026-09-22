@@ -2,7 +2,7 @@
 
 ## Why this document exists
 
-Documents 13 through 16 all reason from wall and CPU times taken on one shared host, and document 15 says plainly that no per query wall time from that machine means anything to two significant figures. This document reports the quantities that machine cannot move: counts of page faults, peak resident bytes, file bytes, and whether a query returned an answer at all. It exists because four of those turned up results the timing documents did not predict, one of them invalidates a comparison, and one of them is a configuration change worth making.
+Documents 13 through 16 all reason from wall and CPU times taken on one shared host, and document 15 says plainly that no per query wall time from that machine means anything to two significant figures. This document reports the quantities that machine cannot move: counts of page faults, peak resident bytes, file bytes, and whether a query returned an answer at all. It exists because four of those turned up results the timing documents did not predict, one of them says a suite total in this series may be counting 35 queries as 43, and one of them is a configuration change worth making.
 
 Everything below was measured on the same host at 10,000,000 and 30,000,000 rows, against a rudb built at `d41b8a24` whose `--print-config` reports `execution-tiers: interpreted`, and whose every query warns that all of its operators ran a reference implementation with no alternative registered to choose from. That is the slow path the project keeps for differential testing, and it is the path all of documents 13 through 16 measured too.
 
@@ -61,15 +61,16 @@ Document 15 reports rudb's 100,000,000 row load peaking at 17.58 GiB and conclud
 
 Document 15 records a DuckDB load killed partway through that left an empty table which then answered all 43 queries in 12.52 seconds without erroring once, and it added a gate: the harness refuses to measure a database that does not hold the expected row count. That gate is necessary and it is not sufficient.
 
-Loading ClickBench into DuckDB without the type conversion the published setup performs leaves `EventDate` as `UINT16` and `EventTime` as `BIGINT`. The table then holds exactly the right number of rows, and `SUM(UserID)` and `SUM(LENGTH(URL))` agree with rudb's copy to the digit, so a row count gate and a checksum gate both pass. Eight of the 43 queries nonetheless fail:
+Loading the published `hits.parquet` with a plain `SELECT *`, without the type conversion the ClickBench setup performs, leaves `EventDate` as `UINT16` holding a day number and `EventTime` as `BIGINT` holding epoch seconds. Both engines then hold exactly the right number of rows, and their `COUNT(*)`, `SUM(UserID)` and `SUM(LENGTH(URL))` agree to the digit, so a row count gate and a checksum gate both pass on both copies. Eight of the 43 queries nonetheless fail, on both engines, with the same two errors:
 
 | queries | error |
 | --- | --- |
-| Q19 | `Binder Error: No function matches the given name and argument types 'date_part(STRING_LITERAL, BIGINT)'` |
-| Q37 to Q42 | `Conversion Error: Could not convert string '2013-07-01' to UINT16` |
-| Q43 | `Binder Error: No function matches the given name and argument types 'date_trunc(STRING_LITERAL, BIGINT)'` |
+| Q19 | `Binder Error: No function matches the given name and argument types 'date_part(VARCHAR, BIGINT)'` |
+| Q37 to Q43 | `Conversion Error: Could not convert string '2013-07-01' to UINT16` |
 
-Each of them returns in about a tenth of a second, so a suite total computed this way is 35 queries of work reported as 43. rudb answers all 43 against its own copy, because its loader maps the date column to `DATE`, which is why the divergence does not show up as a wrong answer on either side. It shows up only as eight queries that one engine never ran.
+The failing set is identical across the two engines, which is a compatibility result in rudb's favour and is why the omission is invisible in a ratio: both totals lose the same eight queries and each of them returns in about a tenth of a second. It is not invisible in the totals themselves, which are 35 queries of work carrying a 43 query label.
+
+This document first recorded that section as a DuckDB-only failure, on the strength of a grep for `^error` that a line reading `Conversion Error:` does not match. rudb fails the same eight. The claim was checked only because it had already been written down, which is the argument for writing measurements down in a form specific enough to be checkable.
 
 The gate this suggests is not another property of the data. It is that every query in the suite must be recorded as having returned, per query, per engine, per pass, and that a pass missing any of them is not a pass. That is cheap, it is exact, and it is the only one of the three gates that would have caught all three of the failures this series has now hit.
 
