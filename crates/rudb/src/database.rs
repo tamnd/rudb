@@ -951,6 +951,11 @@ impl Shared {
             let provenance = match table.rows() {
                 rudb_catalog::table::Rows::Memory(_) => Provenance::Sketch,
                 rudb_catalog::table::Rows::Native(_) => Provenance::Dictionary,
+                // A table with rows in memory beside the file answers no distinct count at all, so
+                // the loop below leaves every one of its columns out and this is never read. It is
+                // the sketch rather than the dictionary because the rows nobody has counted are the
+                // ones in memory.
+                rudb_catalog::table::Rows::Grown(_, _) => Provenance::Sketch,
             };
             for (at, column) in table.columns().iter().enumerate() {
                 // A table that cannot answer leaves the column out, which is a column of a native

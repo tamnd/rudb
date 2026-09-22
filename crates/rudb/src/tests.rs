@@ -3298,6 +3298,70 @@ fn the_size_pragma_reports_the_attached_database_and_the_live_memory_budget() {
     assert_eq!(after[0], rows(&db, "SELECT current_setting('memory_limit')").remove(0)[0]);
 }
 
+/// The storage pragma answers in the pin's sixteen columns, and says nothing about rows that have
+/// not been written down.
+///
+/// Both halves matter. The width is the contract a client reads, so it is spelled out here rather
+/// than taken from the builder the implementation uses, which would agree with itself whatever it
+/// said. The empty answer is the honest one for a table living in memory: the encoder has not run
+/// on those rows and will not until a checkpoint, so there is no encoding to report and a row
+/// claiming the chunk is stored plain would be a lie. What a real file says is in
+/// `tests/storage.rs`, which needs a file to say it.
+#[test]
+fn the_storage_pragma_answers_in_sixteen_columns_and_leaves_unwritten_rows_out() {
+    let db = database();
+    let result = db.query("SELECT * FROM pragma_storage_info('t')").expect("the pragma ran");
+    assert_eq!(
+        result.names(),
+        [
+            "row_group_id",
+            "column_name",
+            "column_id",
+            "column_path",
+            "segment_id",
+            "segment_type",
+            "start",
+            "count",
+            "compression",
+            "stats",
+            "has_updates",
+            "persistent",
+            "block_id",
+            "block_offset",
+            "segment_info",
+            "additional_block_ids",
+        ]
+    );
+    assert_eq!(
+        result.types(),
+        [
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Boolean,
+            LogicalType::Boolean,
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::list(LogicalType::BigInt),
+        ]
+    );
+    assert_eq!(result.len(), 0, "nothing is on disk here, so nothing is stored in any form");
+    // The name goes through the catalog like any other, so a table that is not there says what the
+    // catalog says and not something of this function's own.
+    assert_eq!(
+        failure(&db, "SELECT * FROM pragma_storage_info('nope')"),
+        "Table with name nope does not exist!"
+    );
+}
+
 /// `PRAGMA name` is the call it stands for, so the statement form answers what the function does.
 #[test]
 fn the_pragma_statement_answers_what_the_function_of_that_name_answers() {
@@ -5772,6 +5836,180 @@ fn a_join_no_lookup_answers_says_so_in_the_profile() {
     assert!(
         !metrics.operators.iter().any(|operator| operator.kind == "Probe"),
         "a range condition is not a lookup"
+    );
+}
+
+/// The one edge in the document. Without it a reader can add up what a query moved and cannot
+/// check that any of it adds up, because the check is an operator's input against what fed it.
+#[test]
+fn every_operator_but_the_one_that_answers_names_what_consumed_its_rows() {
+    let db = database();
+    let result = db.query("SELECT sum(x) FROM (SELECT x FROM t WHERE x > 1) ORDER BY 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let roots: Vec<u32> = metrics
+        .operators
+        .iter()
+        .filter(|operator| operator.parent.is_none())
+        .map(|operator| operator.id)
+        .collect();
+    assert_eq!(roots, vec![0], "one operator produces the answer and it is the first one");
+    for operator in &metrics.operators {
+        let Some(parent) = operator.parent else { continue };
+        let parent = metrics
+            .operators
+            .iter()
+            .find(|other| other.id == parent)
+            .expect("a parent is an operator in the same document");
+        assert!(parent.id < operator.id, "a parent is numbered before everything under it");
+    }
+}
+
+/// A parent id pointing at an operator with no row is worse than no parent id, because a reader
+/// walking up the chain stops there and reports a gap it cannot tell from a missing measurement.
+/// A node folded into another is what puts a hole in the numbering, so the shapes below are the
+/// ones where that happens: a filter taken into a scan, a join, a set operation, a materialised
+/// `WITH` and a window.
+#[test]
+fn no_operator_hangs_under_a_row_that_is_not_there() {
+    let db = database();
+    for sql in [
+        "SELECT x FROM t WHERE x > 1",
+        "SELECT sum(x) FROM t WHERE x > 1 GROUP BY s ORDER BY 1",
+        "SELECT t.x FROM t JOIN t AS u ON t.x = u.x WHERE t.x > 1",
+        "SELECT t.x FROM t LEFT JOIN t AS u ON t.x = u.x",
+        "SELECT x FROM t WHERE x IN (SELECT x FROM t WHERE x > 1)",
+        "SELECT x FROM t UNION SELECT x FROM t",
+        "WITH c AS MATERIALIZED (SELECT x FROM t WHERE x > 1) SELECT x FROM c ORDER BY 1",
+        "SELECT x, count(*) OVER (PARTITION BY s) FROM t",
+        "SELECT x FROM t ORDER BY 1 LIMIT 2",
+        "SELECT a.x FROM t AS a, t AS b WHERE a.x > b.x",
+    ] {
+        let result = db.query(sql).unwrap_or_else(|error| panic!("{sql} did not run: {error}"));
+        let metrics = result.metrics().expect("a query that ran has metrics");
+        // A materialisation is filled and read back rather than handed upwards, so it is an
+        // operator with nothing above it and a query holding one has two.
+        let held = metrics.operators.iter().filter(|one| one.kind.contains("CTE")).count();
+        let roots = metrics.operators.iter().filter(|one| one.parent.is_none()).count();
+        assert_eq!(roots, 1 + held, "{sql} has one operator the answer is read from");
+        for one in &metrics.operators {
+            let Some(parent) = one.parent else { continue };
+            assert!(
+                metrics.operators.iter().any(|other| other.id == parent),
+                "{sql}: operator {} hangs under {parent}, which has no row",
+                one.id
+            );
+        }
+    }
+}
+
+/// The check the harness runs, run here so that a shape which stops adding up is a failing test
+/// rather than a suite that refuses to publish a number weeks later.
+///
+/// Every row an operator was handed came out of the operators under it, so the two counts are the
+/// same rows counted at the two ends of one handover and there is no tolerance on it. The shapes
+/// that have broken it are the two the operator tree is not the plan tree in: a join whose build
+/// side the optimizer turned around, and a cross product, which is called again with what is left of
+/// its own output and would otherwise count that as input.
+#[test]
+fn what_an_operator_was_handed_is_what_the_operators_under_it_produced() {
+    let db = database();
+    for sql in [
+        "SELECT x FROM t WHERE x > 1",
+        "SELECT sum(x) FROM t WHERE x > 1 GROUP BY s ORDER BY 1",
+        "SELECT t.x FROM t JOIN t AS u ON t.x = u.x WHERE t.x > 1",
+        "SELECT t.x FROM t LEFT JOIN t AS u ON t.x = u.x",
+        "SELECT t.x FROM t JOIN t AS u ON t.x > u.x AND t.x < u.x + 5",
+        "SELECT x FROM t WHERE x IN (SELECT x FROM t WHERE x > 1)",
+        "SELECT x FROM t UNION SELECT x FROM t",
+        "WITH c AS MATERIALIZED (SELECT x FROM t WHERE x > 1) SELECT x FROM c ORDER BY 1",
+        "SELECT x, count(*) OVER (PARTITION BY s) FROM t",
+        "SELECT a.x FROM t AS a, t AS b WHERE a.x > b.x",
+    ] {
+        let result = db.query(sql).unwrap_or_else(|error| panic!("{sql} did not run: {error}"));
+        let metrics = result.metrics().expect("a query that ran has metrics");
+        for one in &metrics.operators {
+            let below: u64 = metrics
+                .operators
+                .iter()
+                .filter(|other| other.parent == Some(one.id))
+                .map(|other| other.rows_out)
+                .sum();
+            if !metrics.operators.iter().any(|other| other.parent == Some(one.id)) {
+                continue;
+            }
+            assert_eq!(
+                one.rows_in, below,
+                "{sql}: operator {} ({}) was handed {} rows and the operators under it made {below}",
+                one.id, one.kind, one.rows_in
+            );
+        }
+    }
+}
+
+/// The gathered side feeds the operator that holds it, which is the one place the operator tree is
+/// a different shape than the plan. A reader that walked the plan instead would compare the join's
+/// input against rows the join never saw.
+#[test]
+fn the_side_a_join_gathers_hangs_under_the_operator_that_holds_it() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x = u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let gather = operator(metrics, "Gather");
+    let probe = operator(metrics, "Probe");
+    assert_eq!(gather.parent, Some(probe.id), "the held side is handed to the join");
+    let held = metrics
+        .operators
+        .iter()
+        .find(|other| other.parent == Some(gather.id))
+        .expect("something fills the gather");
+    assert_eq!(held.rows_out, gather.rows_in, "and what it produced is what the gather took");
+}
+
+/// A join is the one operator with two inputs and one row in the document, so its own row counts
+/// the driving side alone. Without this the gathered side, which is the half of the query most of
+/// the memory and most of the surprises are in, is not in the document at all.
+#[test]
+fn a_join_says_what_it_built_and_what_it_chose() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x = u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let joined = operator(metrics, "Probe").joined.clone().expect("a join reports what it did");
+    assert_eq!(joined.algorithm, rudb_metrics::Algorithm::Hash);
+    assert_eq!(joined.build_rows, 4, "the whole gathered side went into the table");
+    assert!(joined.build_bytes > 0, "a table that holds four rows cost something to hold them");
+    let declined = &joined.declined;
+    assert_eq!(declined.len(), 1, "the nested loop was the only other answer");
+    assert_eq!(declined[0].algorithm, rudb_metrics::Algorithm::Loop);
+    assert!(declined[0].reason.contains("equality"), "{}", declined[0].reason);
+}
+
+/// The reason is the point of recording it. A nested loop over two sides is the two multiplied, and
+/// the fix is nearly always a condition the binder could not find an equality in, which is a thing
+/// somebody reading a slow query has to be told rather than left to guess from the time.
+#[test]
+fn a_join_with_no_lookup_says_why_it_had_to_walk_every_pair() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x < u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let joined = operator(metrics, "Join").joined.clone().expect("a join reports what it did");
+    assert_eq!(joined.algorithm, rudb_metrics::Algorithm::Loop);
+    assert_eq!(joined.build_rows, 4, "the gathered side is walked once per driving row");
+    assert_eq!(joined.declined.len(), 1, "the table was the only other answer");
+    assert_eq!(joined.declined[0].algorithm, rudb_metrics::Algorithm::Hash);
+    assert!(joined.declined[0].reason.contains("no conjunct"), "{}", joined.declined[0].reason);
+}
+
+/// Everything that is not a join leaves the key out rather than writing a null into it, because the
+/// rest of the plan is most of the plan and a reader filtering for joins should not have to know
+/// which of the null shaped rows are one.
+#[test]
+fn an_operator_that_is_not_a_join_has_no_join_record() {
+    let db = database();
+    let result = db.query("SELECT sum(x) FROM t WHERE x > 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert!(
+        metrics.operators.iter().all(|operator| operator.joined.is_none()),
+        "no operator in this query has two inputs"
     );
 }
 

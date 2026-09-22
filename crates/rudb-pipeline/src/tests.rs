@@ -766,6 +766,29 @@ fn a_watched_pipeline_counts_the_rows_and_the_time_at_every_operator() {
     assert!(kept.wall_ns > 0, "filtering them took longer than nothing");
 }
 
+/// The chunk an operator is called back with holds what is left of its own output, so counting it
+/// would charge the operator a share of its answer as input. A cross product is the one that does
+/// this in the engine, and a reader checking an operator against what fed it would find every one of
+/// them handed rows nobody below produced.
+#[test]
+fn a_stream_asked_again_is_not_charged_for_the_chunk_it_is_resumed_with() {
+    let scan = Arc::new(Counters::new(0, 0, "Counting"));
+    let repeats = Arc::new(Counters::new(1, 0, "Repeating"));
+    let source = Arc::new(Watched::new(Counting::new((1..=10).collect(), 4, 4), Arc::clone(&scan)));
+    let stream = Arc::new(Watched::new(Repeating { copies: 3 }, Arc::clone(&repeats)));
+    let sink = Arc::new(Total::default());
+    let built = Pipeline::new(PipelineId(0), source, sink as Arc<dyn DynSink>)
+        .then(stream as Arc<dyn DynStream>);
+
+    run_serial(&built, &Cancel::new()).expect("the pipeline runs");
+
+    let read = scan.snapshot();
+    let repeated = repeats.snapshot();
+    assert_eq!(read.rows_out, 10);
+    assert_eq!(repeated.rows_in, 10, "ten rows were handed to it, and it was called thirty times");
+    assert_eq!(repeated.rows_out, 30, "three copies of each of them");
+}
+
 #[test]
 fn an_operator_is_prepared_once_before_anything_is_pushed_at_it() {
     let ready = Arc::new(Preparing::default());

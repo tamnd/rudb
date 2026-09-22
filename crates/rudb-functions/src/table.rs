@@ -115,6 +115,8 @@ pub enum TableFunction {
     PragmaTableInfo,
     /// `pragma_show(name)`, the same columns again in the six `DESCRIBE` answers with.
     PragmaShow,
+    /// `pragma_storage_info(name)`, what every stored part of every column of one table is.
+    PragmaStorageInfo,
     /// `pragma_version()`, the version of the engine answering, in three columns.
     PragmaVersion,
     /// `pragma_platform()`, the operating system and processor this build was made for.
@@ -164,6 +166,7 @@ impl TableFunction {
             Self::DuckdbGrammarExtensions => "duckdb_grammar_extensions",
             Self::PragmaTableInfo => "pragma_table_info",
             Self::PragmaShow => "pragma_show",
+            Self::PragmaStorageInfo => "pragma_storage_info",
             Self::PragmaVersion => "pragma_version",
             Self::PragmaPlatform => "pragma_platform",
             Self::PragmaUserAgent => "pragma_user_agent",
@@ -198,6 +201,20 @@ impl TableFunction {
     /// rudb has storage to describe.
     #[must_use]
     pub const fn takes_a_name(self) -> bool {
+        matches!(self, Self::PragmaTableInfo | Self::PragmaShow | Self::PragmaStorageInfo)
+    }
+
+    /// Whether the answer is settled while the call is bound rather than while the query runs.
+    ///
+    /// The two column describing pragmas are, because the columns of a table are known by the time
+    /// its name has resolved, so the rows are constants from there on and the call comes out as a
+    /// `VALUES`. `pragma_storage_info` is not, because its rows are read off the file and there are
+    /// as many of them as the table has parts times columns, which at SF1 is six thousand for
+    /// lineitem alone. Folding that into the plan would put six thousand rows of constants through
+    /// every pass the optimizer has, to produce a table the executor can hand back a chunk at a
+    /// time.
+    #[must_use]
+    pub const fn answered_when_bound(self) -> bool {
         matches!(self, Self::PragmaTableInfo | Self::PragmaShow)
     }
 
@@ -311,6 +328,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("pragma_show") {
             return Some(Self::PragmaShow);
+        }
+        if name.eq_ignore_ascii_case("pragma_storage_info") {
+            return Some(Self::PragmaStorageInfo);
         }
         if name.eq_ignore_ascii_case("pragma_version") {
             return Some(Self::PragmaVersion);
@@ -527,6 +547,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbGrammarExtensions
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
+        | TableFunction::PragmaStorageInfo
         | TableFunction::PragmaVersion
         | TableFunction::PragmaPlatform
         | TableFunction::PragmaUserAgent
@@ -567,7 +588,8 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::PragmaTableInfo
-        | TableFunction::PragmaShow => None,
+        | TableFunction::PragmaShow
+        | TableFunction::PragmaStorageInfo => None,
     }
 }
 
@@ -575,6 +597,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
 fn name_columns(function: TableFunction) -> Vec<Field> {
     match function {
         TableFunction::PragmaShow => describe_fields(),
+        TableFunction::PragmaStorageInfo => storage_info_fields(),
         _ => table_info_fields(),
     }
 }
@@ -613,6 +636,46 @@ pub fn describe_fields() -> Vec<Field> {
         .iter()
         .map(|name| Field::new(*name, LogicalType::Varchar))
         .collect()
+}
+
+/// The columns `pragma_storage_info()` produces, which is DuckDB's sixteen.
+///
+/// The names, the order and the types are the pin's, measured against 1.5.5 rather than read off
+/// the documentation, down to `additional_block_ids` being a list of bigints on a table that has
+/// nothing to put in it.
+///
+/// What each one means here is the interesting part, because the words are DuckDB's and the
+/// storage is ours. A row group is a stripe and a segment is a part, which is the same split under
+/// both names: the unit a file is written in and the unit a scan reads. `compression` is what the
+/// encoder chose for that part, spelled the way `rudb-encoding` spells a cascade, so it reads
+/// `DICT(PACKED, PACKED)` rather than one of DuckDB's single words. `block_id` is where in the file
+/// the column page holding the part starts, because a page is what a read actually moves, and
+/// `block_offset` is where the part sits inside it. `segment_info` carries the stored size of the
+/// part, which is the one number in the row nothing else says.
+///
+/// `has_updates` is false and `persistent` is true on everything, and both will mean something the
+/// day a native table has a delta region to report. They are here rather than left out because the
+/// width of a result is part of the result.
+#[must_use]
+pub fn storage_info_fields() -> Vec<Field> {
+    vec![
+        Field::new("row_group_id", LogicalType::BigInt),
+        Field::new("column_name", LogicalType::Varchar),
+        Field::new("column_id", LogicalType::BigInt),
+        Field::new("column_path", LogicalType::Varchar),
+        Field::new("segment_id", LogicalType::BigInt),
+        Field::new("segment_type", LogicalType::Varchar),
+        Field::new("start", LogicalType::BigInt),
+        Field::new("count", LogicalType::BigInt),
+        Field::new("compression", LogicalType::Varchar),
+        Field::new("stats", LogicalType::Varchar),
+        Field::new("has_updates", LogicalType::Boolean),
+        Field::new("persistent", LogicalType::Boolean),
+        Field::new("block_id", LogicalType::BigInt),
+        Field::new("block_offset", LogicalType::BigInt),
+        Field::new("segment_info", LogicalType::Varchar),
+        Field::new("additional_block_ids", LogicalType::list(LogicalType::BigInt)),
+    ]
 }
 
 /// The columns `pragma_version()` produces.

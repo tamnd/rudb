@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value};
-use rudb_native::{Common, FrequencyOccurrences, Reader as NativeReader, Stripes};
+use rudb_native::{Common, FrequencyOccurrences, Reader as NativeReader, StoredPart, Stripes};
 use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
 
@@ -44,9 +44,53 @@ pub enum Rows {
     Memory(MemoryTable),
     /// Immutable stripes read by projected column from one file.
     Native(NativeReader),
+    /// A committed file with rows appended since, which the next checkpoint folds back into one.
+    ///
+    /// A table stops being one of the two other kinds the moment somebody inserts into it after it
+    /// has been written down, which is every table on the second run of a session. The file is
+    /// still the file and the rows that arrived since are a table in memory, so the parts of the
+    /// two are laid end to end, the file's first, and everything that reads a part by number reads
+    /// whichever of them that number lands in.
+    ///
+    /// What it gives up is the statistics. A file answers most of them exactly out of what its
+    /// writer stored and the rows in memory are not in there, so the ones that cannot be combined
+    /// without reading the column say nothing at all rather than saying the file's answer as if it
+    /// were the table's. The two that add up, which are the null count and the integer sum, are
+    /// added up. This is also why a checkpoint rewrites the file rather than carrying the table
+    /// forward: [`Rows::is_native`] is false here, so the table is one the file and the catalog
+    /// disagree about and the honest answer is to write it again.
+    Grown(NativeReader, MemoryTable),
 }
 
 impl Rows {
+    /// The rows to append to, turning a committed file into one that has rows in memory beside it.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice. The branch that would report one is the committed file that was replaced
+    /// on the line above, which the compiler cannot see is gone.
+    pub fn to_append(&mut self) -> Result<&mut MemoryTable> {
+        if let Self::Native(reader) = self {
+            let types = reader.table().fields().iter().map(|field| field.ty.clone()).collect();
+            *self = Self::Grown(reader.clone(), MemoryTable::new(types));
+        }
+        match self {
+            Self::Memory(rows) | Self::Grown(_, rows) => Ok(rows),
+            Self::Native(_) => Err(Error::internal("a committed table took no append buffer")),
+        }
+    }
+
+    /// How many stripes the committed file contributes, which the row groups are numbered after.
+    ///
+    /// The parts have the same split and are counted inline, because the reader is already in hand
+    /// at every one of those and this one is asked where it is not.
+    fn stripes_in_file(&self) -> usize {
+        match self {
+            Self::Memory(_) => 0,
+            Self::Native(reader) | Self::Grown(reader, _) => reader.stripe_parts().len(),
+        }
+    }
+
     /// Exact leading value frequencies, most common first.
     ///
     /// A file proves a count descending prefix out of its stored synopsis. A table in memory has no
@@ -57,6 +101,9 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.frequencies(column),
             Self::Native(reader) => reader.top_frequencies(column, top),
+            // A count descending prefix of the file is not one of the table, because a value the
+            // rows in memory hold a hundred of can be anywhere in the file's list or absent from it.
+            Self::Grown(_, _) => Ok(None),
         }
     }
 
@@ -69,6 +116,8 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.frequencies(column),
             Self::Native(reader) => reader.exact_frequencies(column),
+            // Exact means every value with its row count, and neither half has the other's rows.
+            Self::Grown(_, _) => Ok(None),
         }
     }
 
@@ -88,6 +137,9 @@ impl Rows {
         match self {
             Self::Memory(rows) => Ok(rows.distinct_values(column)),
             Self::Native(reader) => reader.distinct_values(column),
+            // Two exact counts do not add up, because a value in both halves is one value and the
+            // sum says two, and this answer is read as the result of a `COUNT(DISTINCT c)`.
+            Self::Grown(_, _) => Ok(None),
         }
     }
 
@@ -99,6 +151,12 @@ impl Rows {
         match self {
             Self::Memory(rows) => Ok(Some(rows.null_count(column)? as u64)),
             Self::Native(reader) => reader.null_count(column).map(Some),
+            // Nulls do add up, because a null row is a row and both halves counted every one of
+            // theirs, so this one stays exact rather than going quiet like the rest.
+            Self::Grown(reader, rows) => {
+                let held = reader.null_count(column)?;
+                Ok(Some(held.saturating_add(rows.null_count(column)? as u64)))
+            }
         }
     }
 
@@ -114,6 +172,10 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.text_extremes(column),
             Self::Native(reader) => reader.text_extremes(column),
+            // Widening one half's pair with the other's would mean ordering two values, and a
+            // value here is not ordered, which is what the kernels are for. Both ends of a string
+            // column are a read of the column away, so saying nothing costs the caller that.
+            Self::Grown(_, _) => Ok(None),
         }
     }
 
@@ -123,6 +185,9 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.exact_extremes(column),
             Self::Native(reader) => reader.exact_extremes(column),
+            // The same as the pair above, and this one is asked of every column rather than of the
+            // string ones, so it is the one worth folding in when a bound learns how to widen.
+            Self::Grown(_, _) => Ok(None),
         }
     }
 
@@ -132,6 +197,16 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.exact_sum(column),
             Self::Native(reader) => reader.exact_sum(column),
+            // A sum and a row count both add, so the pair adds, and an answer needs both halves
+            // because a sum over some of the rows is not a sum over the table.
+            Self::Grown(reader, rows) => {
+                match (reader.exact_sum(column)?, rows.exact_sum(column)?) {
+                    (Some((held, counted)), Some((added, more))) => Ok(held
+                        .checked_add(added)
+                        .map(|total| (total, counted.saturating_add(more)))),
+                    _ => Ok(None),
+                }
+            }
         }
     }
 
@@ -149,6 +224,9 @@ impl Rows {
         match self {
             Self::Memory(_) => Ok(None),
             Self::Native(reader) => reader.frequency_occurrences(column),
+            // The ordinals a candidate set covers are ordinals of the file, and the table's rows
+            // are no longer numbered the way the file numbers them once there are more of them.
+            Self::Grown(_, _) => Ok(None),
         }
     }
 
@@ -163,6 +241,14 @@ impl Rows {
                     return Err(Error::internal("row ordinal names a missing part"));
                 }
                 reader.part_rows(at)
+            }
+            Self::Grown(reader, rows) => {
+                if at < reader.parts() {
+                    reader.part_rows(at)
+                } else {
+                    rows.chunk_len(at - reader.parts())
+                        .ok_or_else(|| Error::internal("row ordinal names a missing chunk"))?
+                }
             }
         })
     }
@@ -333,7 +419,7 @@ impl Rows {
     pub fn types(&self) -> Vec<LogicalType> {
         match self {
             Self::Memory(rows) => rows.types().to_vec(),
-            Self::Native(reader) => {
+            Self::Native(reader) | Self::Grown(reader, _) => {
                 reader.table().fields().iter().map(|field| field.ty.clone()).collect()
             }
         }
@@ -345,6 +431,7 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.len(),
             Self::Native(reader) => reader.table().rows(),
+            Self::Grown(reader, rows) => reader.table().rows().saturating_add(rows.len()),
         }
     }
 
@@ -354,7 +441,10 @@ impl Rows {
         self.len() == 0
     }
 
-    /// Whether these rows already come from a committed native snapshot.
+    /// Whether these rows are all already in a committed native snapshot.
+    ///
+    /// False for a table that has rows in memory beside the file, which is what makes a checkpoint
+    /// write that table again rather than carry the file's generation forward and lose them.
     #[must_use]
     pub fn is_native(&self) -> bool {
         matches!(self, Self::Native(_))
@@ -366,6 +456,7 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.chunk_count(),
             Self::Native(reader) => reader.parts(),
+            Self::Grown(reader, rows) => reader.parts().saturating_add(rows.chunk_count()),
         }
     }
 
@@ -380,6 +471,18 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.group_parts(),
             Self::Native(reader) => reader.stripe_parts(),
+            // The file's stripes and then the row groups of what arrived since, moved up by the
+            // parts in front of them so that a range here still names parts [`Self::read`] takes.
+            Self::Grown(reader, rows) => {
+                let parts = reader.parts();
+                let mut stripes = reader.stripe_parts();
+                stripes.extend(
+                    rows.group_parts()
+                        .into_iter()
+                        .map(|group| group.start + parts..group.end + parts),
+                );
+                stripes
+            }
         }
     }
 
@@ -392,6 +495,14 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.group_rows(stripe),
             Self::Native(reader) => reader.stripe_rows(stripe),
+            Self::Grown(reader, rows) => {
+                let held = self.stripes_in_file();
+                if stripe < held {
+                    reader.stripe_rows(stripe)
+                } else {
+                    rows.group_rows(stripe - held)
+                }
+            }
         }
     }
 
@@ -401,7 +512,7 @@ impl Rows {
     pub fn keep_stripes(&self, stripes: usize) {
         match self {
             Self::Memory(_) => {}
-            Self::Native(reader) => reader.keep_stripes(stripes),
+            Self::Native(reader) | Self::Grown(reader, _) => reader.keep_stripes(stripes),
         }
     }
 
@@ -410,6 +521,13 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.read(at, columns),
             Self::Native(reader) => reader.read(at, columns),
+            Self::Grown(reader, rows) => {
+                if at < reader.parts() {
+                    reader.read(at, columns)
+                } else {
+                    rows.read(at - reader.parts(), columns)
+                }
+            }
         }
     }
 
@@ -419,6 +537,13 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.skips(at, probes),
             Self::Native(reader) => reader.skips(at, probes),
+            Self::Grown(reader, rows) => {
+                if at < reader.parts() {
+                    reader.skips(at, probes)
+                } else {
+                    rows.skips(at - reader.parts(), probes)
+                }
+            }
         }
     }
 
@@ -431,6 +556,13 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.certain(at, probes),
             Self::Native(reader) => reader.certain(at, probes),
+            Self::Grown(reader, rows) => {
+                if at < reader.parts() {
+                    reader.certain(at, probes)
+                } else {
+                    rows.certain(at - reader.parts(), probes)
+                }
+            }
         }
     }
 
@@ -445,6 +577,14 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.group_skips(stripe, probes),
             Self::Native(reader) => reader.stripe_skips(stripe, probes),
+            Self::Grown(reader, rows) => {
+                let held = self.stripes_in_file();
+                if stripe < held {
+                    reader.stripe_skips(stripe, probes)
+                } else {
+                    rows.group_skips(stripe - held, probes)
+                }
+            }
         }
     }
 
@@ -459,6 +599,9 @@ impl Rows {
         match self {
             Self::Memory(_) => None,
             Self::Native(reader) => Some(Arc::new(Stripes::new(reader.clone()))),
+            // The file's stripes are not the table's stripes any more, and a bound that covers some
+            // of the rows is not a bound, so the planner is told nothing rather than told half.
+            Self::Grown(_, _) => None,
         }
     }
 
@@ -472,6 +615,7 @@ impl Rows {
         match self {
             Self::Memory(_) => None,
             Self::Native(reader) => Some(Arc::new(Common::new(reader.clone()))),
+            Self::Grown(_, _) => None,
         }
     }
 
@@ -483,7 +627,7 @@ impl Rows {
     #[must_use]
     pub fn distincts(&self) -> Vec<(String, Stat<u64>)> {
         match self {
-            Self::Memory(_) => Vec::new(),
+            Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
             // A reader that cannot answer its own directory is a reader that will fail the scan a
             // moment later with the same error, and the planner is not the place to raise it. An
             // empty list reads back as a table nobody counted, which is where this started.
@@ -502,6 +646,9 @@ impl Rows {
         match self {
             Self::Memory(rows) => rows.chunk(at),
             Self::Native(_) => None,
+            Self::Grown(reader, rows) => {
+                at.checked_sub(reader.parts()).and_then(|at| rows.chunk(at))
+            }
         }
     }
 }
@@ -602,6 +749,24 @@ impl Table {
         &self.rows
     }
 
+    /// What every stored part of one column is encoded as, which is what `pragma_storage_info`
+    /// reports.
+    ///
+    /// Empty for a table with no file behind it, and for the memory half of a table that has both.
+    /// A chunk that has not been written yet has no encoding to report, because the encoder has not
+    /// run on it and will not until a checkpoint, so the honest answer is no rows rather than a row
+    /// claiming the chunk is stored plain.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema, or a page the reader has to open is invalid.
+    pub fn stored(&self, column: usize) -> Result<Vec<StoredPart>> {
+        match &self.rows {
+            Rows::Memory(_) => Ok(Vec::new()),
+            Rows::Native(reader) | Rows::Grown(reader, _) => reader.stored(column),
+        }
+    }
+
     /// How many rows hold each value of each column, named, for the planner to ask.
     ///
     /// Here rather than on [`Rows`] for the reason [`Table::distincts`] is: half of it needs the
@@ -653,7 +818,9 @@ impl Table {
     #[must_use]
     pub fn clustering_is_stored(&self) -> bool {
         match &self.rows {
-            Rows::Memory(_) => false,
+            // A table with rows in memory has rows the file does not, so the file is going to be
+            // written again whatever the declaration says, and answering false here says so once.
+            Rows::Memory(_) | Rows::Grown(_, _) => false,
             Rows::Native(reader) => reader.table().clustering() == self.clustering.as_ref(),
         }
     }
@@ -738,14 +905,15 @@ impl Table {
     /// through it. A caller that already knows what it is holding, such as the loader that built
     /// the chunk out of a file the table was declared from, can take this one.
     ///
+    /// A table read out of a committed file grows an append buffer here, and what comes back is
+    /// that buffer rather than the whole table. Rows that were already in the file are not in it
+    /// and are not meant to be: reading the table is [`Table::rows`], which puts the two together.
+    ///
     /// # Panics
     ///
-    /// If called for an immutable table opened from a committed native file.
+    /// Never. The branch that would is the committed file that has just been given a buffer.
     pub fn rows_mut(&mut self) -> &mut MemoryTable {
-        match &mut self.rows {
-            Rows::Memory(rows) => rows,
-            Rows::Native(_) => panic!("a committed native table is immutable"),
-        }
+        self.rows.to_append().expect("a table that was just given somewhere to append to")
     }
 
     /// Adds a chunk, refusing a null in a column that said it would not have one.
@@ -757,10 +925,7 @@ impl Table {
     /// program that catches one by its text is a program rudb has to not surprise.
     pub fn append(&mut self, chunk: Chunk) -> Result<()> {
         self.refuse_nulls(&chunk)?;
-        match &mut self.rows {
-            Rows::Memory(rows) => rows.append(chunk),
-            Rows::Native(_) => Err(Error::not_implemented("appending to a committed native table")),
-        }
+        self.rows.to_append()?.append(chunk)
     }
 
     /// Adds rows of single values, refusing a null in a column that said it would not have one.
@@ -777,10 +942,7 @@ impl Table {
                 }
             }
         }
-        match &mut self.rows {
-            Rows::Memory(held) => held.append_rows(rows),
-            Rows::Native(_) => Err(Error::not_implemented("appending to a committed native table")),
-        }
+        self.rows.to_append()?.append_rows(rows)
     }
 
     /// Checks a chunk against the `NOT NULL` columns before any of it is kept.

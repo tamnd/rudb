@@ -114,6 +114,7 @@ mod signed;
 mod sort;
 mod source;
 mod spill;
+mod storagenames;
 mod strategies;
 mod stream;
 mod table;

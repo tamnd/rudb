@@ -58,7 +58,7 @@ pub use zones::{Common, Stripes, distincts};
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
-const FORMAT: u32 = 22;
+const FORMAT: u32 = 23;
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
@@ -521,6 +521,42 @@ impl Layout {
     }
 }
 
+/// How one part of one column is stored, which is one row of `pragma_storage_info`.
+///
+/// Everything here is read off the file rather than worked out from the schema, because the whole
+/// question this answers is what the encoder chose, and the encoder chooses per part. Two files
+/// holding the same rows in a different order give different answers and that difference is the
+/// reason to ask.
+///
+/// The encoding costs a read of the column's page, so this is not free the way [`Layout`] is. It is
+/// one read per column per stripe rather than one per part, because a part is a few kilobytes out
+/// of a page that is a quarter of a megabyte.
+#[derive(Debug, Clone)]
+pub struct StoredPart {
+    /// Which stripe the part belongs to.
+    pub stripe: usize,
+    /// Which part of that stripe it is, counting from zero inside the stripe.
+    pub part: usize,
+    /// The table wide row number the part starts at.
+    pub row: usize,
+    /// How many rows it holds.
+    pub rows: usize,
+    /// What the encoder made of it, as a line of text like `DICT(PACKED, PACKED)`.
+    pub encoding: String,
+    /// The stored bytes of the part, which is what it costs in the file.
+    pub bytes: u64,
+    /// Where in the file the column page holding this part starts.
+    pub page: u64,
+    /// Where in that page the part starts.
+    pub offset: u64,
+    /// The smallest value the part holds, when the stored ranges say.
+    pub low: Option<Value>,
+    /// The largest, same.
+    pub high: Option<Value>,
+    /// How many of its rows are null, when the stored ranges say.
+    pub nulls: Option<usize>,
+}
+
 /// Appends pages and commits a new directory for one table.
 #[derive(Debug)]
 struct GlobalDictionary {
@@ -696,10 +732,20 @@ struct ColumnStripe {
 /// a column nobody else can help with.
 fn weight(ty: &LogicalType) -> usize {
     match ty {
-        LogicalType::Varchar | LogicalType::Blob => 64,
+        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit => 64,
+        LogicalType::HugeInt
+        | LogicalType::UHugeInt
+        | LogicalType::Uuid
+        | LogicalType::Interval => 16,
         LogicalType::BigInt
         | LogicalType::UBigInt
         | LogicalType::Timestamp
+        | LogicalType::Time
+        | LogicalType::TimeTz
+        | LogicalType::TimestampTz
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs
         | LogicalType::Double
         | LogicalType::Decimal { .. } => 8,
         LogicalType::Integer | LogicalType::UInteger | LogicalType::Date | LogicalType::Float => 4,
@@ -2813,6 +2859,63 @@ impl Reader {
         }
     }
 
+    /// What every part of one column is stored as, which is what `pragma_storage_info` reports.
+    ///
+    /// Unlike [`Self::layout`] this reads the data, because the encoder's choice is in the page and
+    /// nowhere else. The directory says how many bytes a column took and says nothing about what
+    /// shape they are in, and the shape is the question worth asking: the same rows in a different
+    /// order come back bit packed on one file and plain on another, and that is the difference a
+    /// clustered load makes to a scan.
+    ///
+    /// One read per stripe rather than one per part. A part is a few kilobytes out of a page that
+    /// is a quarter of a megabyte, so asking part by part would read the same page sixty four
+    /// times. Nothing is put in the page cache, because a caller asking what a file looks like is
+    /// not about to scan it and evicting the pages a real query wants would be a poor trade.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema, or a page, index section or checksum is invalid.
+    pub fn stored(&self, column: usize) -> Result<Vec<StoredPart>> {
+        let field = self
+            .table
+            .fields
+            .get(column)
+            .ok_or_else(|| invalid("stored column index out of range"))?;
+        let mut stored = Vec::with_capacity(self.places.len());
+        let mut row = 0;
+        for (at, stripe) in self.table.stripes.iter().enumerate() {
+            let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
+            let index = read_index(&self.file, stripe, column)?;
+            let mut bytes = vec![0; page.length as usize];
+            read_at(&self.file, page.offset, &mut bytes)?;
+            let ranges = self.stripe_part_ranges(at, column);
+            for (part, &rows) in stripe.parts.iter().enumerate() {
+                let span = *index.get(part).ok_or_else(|| invalid("part index out of range"))?;
+                let held = part_bytes(&bytes, span)?;
+                let range = ranges.and_then(|held| held.get(part));
+                stored.push(StoredPart {
+                    stripe: at,
+                    part,
+                    row,
+                    rows: rows as usize,
+                    encoding: page_encoding(&field.ty, rows as usize, held),
+                    bytes: span.length as u64,
+                    page: page.offset,
+                    offset: span.start as u64,
+                    low: range
+                        .and_then(|range| range.low.clone())
+                        .and_then(|bound| bound.into_value(&field.ty)),
+                    high: range
+                        .and_then(|range| range.high.clone())
+                        .and_then(|bound| bound.into_value(&field.ty)),
+                    nulls: range.map(|range| range.nulls),
+                });
+                row += rows as usize;
+            }
+        }
+        Ok(stored)
+    }
+
     /// How many parts the table has, which is how many chunks a scan of it reads.
     #[must_use]
     pub fn parts(&self) -> usize {
@@ -3718,6 +3821,12 @@ fn read_at(file: &File, offset: u64, bytes: &mut [u8]) -> Result<()> {
     file.read_exact(bytes).map_err(io)
 }
 
+/// What a column type is called in the directory.
+///
+/// A tag is a number in a file somebody else wrote, so a tag that has been used is used forever and
+/// the only thing that may happen to this list is that it grows. 1 to 13 are the tags the format
+/// had when it could store thirteen types, and 14 to 27 are the rest, in the order they were added
+/// rather than in an order that means anything.
 fn type_tag(ty: &LogicalType) -> Result<u8> {
     match ty {
         LogicalType::SmallInt => Ok(1),
@@ -3733,6 +3842,20 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::UInteger => Ok(11),
         LogicalType::UBigInt => Ok(12),
         LogicalType::Decimal { .. } => Ok(13),
+        LogicalType::Float => Ok(14),
+        LogicalType::Double => Ok(15),
+        LogicalType::HugeInt => Ok(16),
+        LogicalType::UHugeInt => Ok(17),
+        LogicalType::Time => Ok(18),
+        LogicalType::TimeTz => Ok(19),
+        LogicalType::TimestampTz => Ok(20),
+        LogicalType::Interval => Ok(21),
+        LogicalType::Uuid => Ok(22),
+        LogicalType::Blob => Ok(23),
+        LogicalType::Bit => Ok(24),
+        LogicalType::TimestampS => Ok(25),
+        LogicalType::TimestampMs => Ok(26),
+        LogicalType::TimestampNs => Ok(27),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
 }
@@ -3777,6 +3900,20 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         10 => Ok(LogicalType::USmallInt),
         11 => Ok(LogicalType::UInteger),
         12 => Ok(LogicalType::UBigInt),
+        14 => Ok(LogicalType::Float),
+        15 => Ok(LogicalType::Double),
+        16 => Ok(LogicalType::HugeInt),
+        17 => Ok(LogicalType::UHugeInt),
+        18 => Ok(LogicalType::Time),
+        19 => Ok(LogicalType::TimeTz),
+        20 => Ok(LogicalType::TimestampTz),
+        21 => Ok(LogicalType::Interval),
+        22 => Ok(LogicalType::Uuid),
+        23 => Ok(LogicalType::Blob),
+        24 => Ok(LogicalType::Bit),
+        25 => Ok(LogicalType::TimestampS),
+        26 => Ok(LogicalType::TimestampMs),
+        27 => Ok(LogicalType::TimestampNs),
         _ => Err(invalid("column type tag is unknown")),
     }
 }
@@ -4709,7 +4846,14 @@ fn narrowed(ty: &LogicalType, values: Vec<i64>) -> Result<Data> {
         LogicalType::USmallInt => Data::UInt16(fit::<u16>(&values)?.into()),
         LogicalType::Integer | LogicalType::Date => Data::Int32(fit::<i32>(&values)?.into()),
         LogicalType::UInteger => Data::UInt32(fit::<u32>(&values)?.into()),
-        LogicalType::BigInt | LogicalType::Timestamp => Data::Int64(values.into()),
+        LogicalType::BigInt
+        | LogicalType::Timestamp
+        | LogicalType::Time
+        | LogicalType::TimeTz
+        | LogicalType::TimestampTz
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs => Data::Int64(values.into()),
         // A decimal is an integer of unscaled units, so the cascade reads back into whichever
         // integer the declared width says the column is stored as.
         LogicalType::Decimal { .. } => match ty.physical() {
@@ -4729,7 +4873,14 @@ fn plain_width(ty: &LogicalType) -> Option<usize> {
         LogicalType::TinyInt | LogicalType::UTinyInt => 1,
         LogicalType::SmallInt | LogicalType::USmallInt => 2,
         LogicalType::Integer | LogicalType::UInteger | LogicalType::Date => 4,
-        LogicalType::BigInt | LogicalType::Timestamp => 8,
+        LogicalType::BigInt
+        | LogicalType::Timestamp
+        | LogicalType::Time
+        | LogicalType::TimeTz
+        | LogicalType::TimestampTz
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs => 8,
         LogicalType::Decimal { .. } => match ty.physical() {
             PhysicalType::Int16 => 2,
             PhysicalType::Int32 => 4,
@@ -4980,9 +5131,53 @@ fn encode(
                 out.extend_from_slice(&value.to_le_bytes());
             }
         }
-        (LogicalType::BigInt | LogicalType::Timestamp, Data::Int64(values)) => {
+        (
+            LogicalType::BigInt
+            | LogicalType::Timestamp
+            | LogicalType::Time
+            | LogicalType::TimeTz
+            | LogicalType::TimestampTz
+            | LogicalType::TimestampS
+            | LogicalType::TimestampMs
+            | LogicalType::TimestampNs,
+            Data::Int64(values),
+        ) => {
             for value in &**values {
                 out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        // A hugeint and a uuid are both the 128 bit lane, and a uuid's bits are the ones the rest of
+        // the engine already carries it in, so nothing about the value changes on the way down.
+        (LogicalType::HugeInt | LogicalType::Uuid, Data::Int128(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::UHugeInt, Data::UInt128(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        // Plainly, in the IEEE bytes. The integer encodings do not apply to a float and none of the
+        // float codecs is worth having before somebody has measured a corpus of them.
+        (LogicalType::Float, Data::Float32(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (LogicalType::Double, Data::Float64(values)) => {
+            for value in &**values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        // Three counts and not one number. Months, days and microseconds stay apart on disk because
+        // they are apart in the value: a month is not a fixed number of days and a day is not a
+        // fixed number of microseconds, which is the whole reason the type has three fields.
+        (LogicalType::Interval, Data::Interval(values)) => {
+            for (months, days, micros) in &**values {
+                out.extend_from_slice(&months.to_le_bytes());
+                out.extend_from_slice(&days.to_le_bytes());
+                out.extend_from_slice(&micros.to_le_bytes());
             }
         }
         (LogicalType::Boolean, Data::Bool(values)) => {
@@ -5012,7 +5207,11 @@ fn encode(
                 out.extend_from_slice(&value.to_le_bytes());
             }
         }
-        (LogicalType::Varchar, Data::Varlen(values)) => {
+        // A blob and a bit string go down the way a varchar does, because the layout is the same
+        // one: an offset a value and then the bytes. What is not the same is that nothing here may
+        // read the payload as text, which is why this arm asks the column for bytes rather than for
+        // a string, and why the codecs above that do read text are all asked of a varchar by name.
+        (LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit, Data::Varlen(values)) => {
             let mut bytes = Vec::new();
             put_u32(&mut out, 0);
             for row in 0..vector.len() {
@@ -5784,6 +5983,48 @@ fn open_global_dictionary(
     )
 }
 
+/// What a stored page is, without decoding a value out of it.
+///
+/// Two layers, and both of them belong in the answer. The codec byte at the front of every page is
+/// the format's own choice, and it is what says whether the column came back as codes into a table
+/// wide dictionary, as a bit packed page, as an encoding cascade or as the bytes themselves. Under
+/// the cascade codecs there is a second choice the encoder made per chunk, and that is what
+/// [`integer::describe`] and [`string::describe`] already write out as `DICT(PACKED, PACKED)`.
+///
+/// This mirrors the tags [`decode`] reads and has to be kept beside it. A page whose header this
+/// cannot walk comes back as text rather than as an error, because a caller asking what a file
+/// looks like is usually asking because something is wrong with it, and a report that stops at the
+/// first bad page is a report that says nothing about the other nine hundred.
+fn page_encoding(ty: &LogicalType, rows: usize, bytes: &[u8]) -> String {
+    /// The page header is the codec, the validity tag and, for a page that stores a mask, the mask.
+    fn cascade_at(rows: usize, bytes: &[u8]) -> Result<(u8, usize)> {
+        let mut cur = Cursor { bytes, at: 0 };
+        let codec = cur.u8()?;
+        if cur.u8()? == 2 {
+            cur.take(rows.div_ceil(8))?;
+        }
+        Ok((codec, cur.at))
+    }
+    let Ok((codec, at)) = cascade_at(rows, bytes) else {
+        return "UNREADABLE".to_string();
+    };
+    let tail = &bytes[at..];
+    let described = |described: Result<String>| described.unwrap_or_else(|_| "UNREADABLE".into());
+    match codec {
+        0 => match ty {
+            LogicalType::Varchar | LogicalType::Blob => "PLAIN".to_string(),
+            _ => "FIXED".to_string(),
+        },
+        1 => "DICT(PLAIN)".to_string(),
+        2 => "FOR+BITPACK".to_string(),
+        3 => "TABLE DICT".to_string(),
+        4 => format!("TABLE DICT({})", described(integer::describe(tail))),
+        5 => described(integer::describe(tail)),
+        6 => described(string::describe(tail)),
+        other => format!("CODEC {other}"),
+    }
+}
+
 fn decode(
     ty: &LogicalType,
     rows: usize,
@@ -5992,13 +6233,81 @@ fn decode(
                     .into(),
             )
         }
-        LogicalType::BigInt | LogicalType::Timestamp => {
+        LogicalType::BigInt
+        | LogicalType::Timestamp
+        | LogicalType::Time
+        | LogicalType::TimeTz
+        | LogicalType::TimestampTz
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs => {
             let values =
                 cur.take(rows.checked_mul(8).ok_or_else(|| invalid("page size overflow"))?)?;
             Data::Int64(
                 values
                     .chunks_exact(8)
                     .map(|item| i64::from_le_bytes(item.try_into().expect("eight bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::HugeInt | LogicalType::Uuid => {
+            let values =
+                cur.take(rows.checked_mul(16).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::Int128(
+                values
+                    .chunks_exact(16)
+                    .map(|item| i128::from_le_bytes(item.try_into().expect("sixteen bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::UHugeInt => {
+            let values =
+                cur.take(rows.checked_mul(16).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::UInt128(
+                values
+                    .chunks_exact(16)
+                    .map(|item| u128::from_le_bytes(item.try_into().expect("sixteen bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::Float => {
+            let values =
+                cur.take(rows.checked_mul(4).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::Float32(
+                values
+                    .chunks_exact(4)
+                    .map(|item| f32::from_le_bytes(item.try_into().expect("four bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::Double => {
+            let values =
+                cur.take(rows.checked_mul(8).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::Float64(
+                values
+                    .chunks_exact(8)
+                    .map(|item| f64::from_le_bytes(item.try_into().expect("eight bytes")))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        }
+        LogicalType::Interval => {
+            let values =
+                cur.take(rows.checked_mul(16).ok_or_else(|| invalid("page size overflow"))?)?;
+            Data::Interval(
+                values
+                    .chunks_exact(16)
+                    .map(|item| {
+                        (
+                            i32::from_le_bytes(item[..4].try_into().expect("four bytes")),
+                            i32::from_le_bytes(item[4..8].try_into().expect("four bytes")),
+                            i64::from_le_bytes(item[8..].try_into().expect("eight bytes")),
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .into(),
             )
@@ -6058,7 +6367,7 @@ fn decode(
                 )
             }
         },
-        LogicalType::Varchar => {
+        LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit => {
             let offset_bytes = cur
                 .take((rows + 1).checked_mul(4).ok_or_else(|| invalid("offset count overflow"))?)?;
             let offsets = offset_bytes
@@ -6075,9 +6384,19 @@ fn decode(
             // A page for the reason the dictionary payload above is one: the page is read once and
             // handed out a chunk at a time, and a cut of a paged payload moves views rather than
             // bytes.
+            //
+            // A varchar is checked for text on the way in and a blob and a bit string are not,
+            // because the second pair never claimed to hold any. Reading them through the checking
+            // seam would refuse a column for holding exactly what it was told to hold.
             let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
+            let text = ty == &LogicalType::Varchar;
             for pair in offsets.windows(2) {
-                values.push_in_place(pair[0] as usize, (pair[1] - pair[0]) as usize)?;
+                let (at, len) = (pair[0] as usize, (pair[1] - pair[0]) as usize);
+                if text {
+                    values.push_in_place(at, len)?;
+                } else {
+                    values.push_bytes_in_place(at, len)?;
+                }
             }
             Data::Varlen(values)
         }
@@ -6808,6 +7127,95 @@ mod tests {
         assert_eq!(low, Bound::Bytes(vec![u8::MAX; PART_BOUND_BYTES]));
     }
 
+    /// What a column is stored as, asked of two files holding the same rows in a different order.
+    ///
+    /// This is the question the report exists to answer and it is the one the directory cannot. The
+    /// two files have the same rows, the same schema and the same number of parts, and the column
+    /// comes out four times smaller in one of them, because ascending keys delta encode to a few
+    /// bits a row and shuffled ones do not. Nothing about the file's shape says so. The page header
+    /// says so, and reading it is what this does.
+    ///
+    /// It is q18 on TPC-H in miniature: clustering lineitem by ship date leaves `l_orderkey`
+    /// ascending inside a partition but sparse, its deltas go from six bits to twelve, and the scan
+    /// pays for the wider ones.
+    #[test]
+    fn what_a_column_is_stored_as_follows_the_order_the_rows_were_written_in() {
+        let parts = 4;
+        let per_part = 1024;
+        let rows = parts * per_part;
+        let written = |name: &str, keys: &[i64]| {
+            let path = path(name);
+            let fields = vec![Field::required("key", LogicalType::BigInt)];
+            let mut writer = Writer::create(&path, "keys", fields).expect("new file");
+            for part in 0..parts {
+                let values: Vec<Value> = keys[part * per_part..(part + 1) * per_part]
+                    .iter()
+                    .map(|key| Value::BigInt(*key))
+                    .collect();
+                let chunk = Chunk::new(vec![
+                    Vector::from_values(LogicalType::BigInt, &values).expect("numbers"),
+                ])
+                .expect("one column");
+                writer.append(&chunk).expect("one part");
+            }
+            writer.finish().expect("commit");
+            path
+        };
+        // Ascending with a small irregular step, which is what a key column in arrival order looks
+        // like: an order has one to seven line items, so the key repeats and then moves on by one.
+        let climbing = |step: &dyn Fn(usize) -> i64| {
+            let mut key = 0;
+            (0..rows)
+                .map(|row| {
+                    key += step(row);
+                    key
+                })
+                .collect::<Vec<i64>>()
+        };
+        let ascending = climbing(&|row| (row % 3) as i64);
+        // The same rows in the same direction over a range a thousand times wider, which is what a
+        // partition of a clustered table holds: still ascending, and far enough apart that the
+        // deltas no longer fit in a handful of bits.
+        let sparse = climbing(&|row| ((row * 2_654_435_761) % 4096) as i64);
+        let near_path = written("stored-near", &ascending);
+        let far_path = written("stored-far", &sparse);
+
+        let one = Reader::open(&near_path).expect("reopen from disk");
+        let other = Reader::open(&far_path).expect("reopen from disk");
+        let near = one.stored(0).expect("the column is stored");
+        let far = other.stored(0).expect("the column is stored");
+        assert_eq!(near.len(), parts, "one row per part");
+        assert_eq!(far.len(), parts);
+        // The bytes are the same bytes the directory totals, which is the check that this is
+        // reading the pages the file really holds rather than some other pages.
+        let total = |stored: &[StoredPart]| stored.iter().map(|part| part.bytes).sum::<u64>();
+        assert_eq!(total(&near), one.layout().columns[0].pages);
+        assert_eq!(total(&far), other.layout().columns[0].pages);
+        assert!(
+            total(&near) * 2 < total(&far),
+            "the sparse keys cost more, {} against {}",
+            total(&far),
+            total(&near)
+        );
+        // Every part accounted for, in order, with the row it starts at following the one before.
+        for (at, part) in near.iter().enumerate() {
+            assert_eq!(part.part, at);
+            assert_eq!(part.row, at * per_part);
+            assert_eq!(part.rows, per_part);
+            let held = &ascending[at * per_part..(at + 1) * per_part];
+            assert_eq!(part.low, Some(Value::BigInt(held[0])));
+            assert_eq!(part.high, Some(Value::BigInt(held[per_part - 1])));
+            assert_eq!(part.nulls, Some(0));
+        }
+        // And the encoding is a line of text that names what the encoder chose, which is the whole
+        // point. Both are a cascade over deltas and the widths inside them are what differ.
+        assert!(near[0].encoding.contains("DELTA"), "{}", near[0].encoding);
+        assert!(far[0].encoding.contains("DELTA"), "{}", far[0].encoding);
+        assert_ne!(near[0].encoding, far[0].encoding);
+        fs::remove_file(near_path).expect("remove scratch file");
+        fs::remove_file(far_path).expect("remove scratch file");
+    }
+
     /// A sieve bigger than the part it indexes is not written, and one smaller than it still is.
     ///
     /// Both columns hold values spread over the whole of `BIGINT`, so neither gets a bitmap and both
@@ -7233,6 +7641,132 @@ mod tests {
         for (at, (ty, values)) in columns.iter().enumerate() {
             assert_eq!(read.value_at(0, at), values[0], "the low end of {ty}");
             assert_eq!(read.value_at(1, at), values[1], "the high end of {ty}");
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The rest of the fixed width types, and the byte strings, written and read back.
+    ///
+    /// The extremes again, and for a float that means more than the ends of the range. Negative
+    /// zero and a NaN are the two values that go through an encoder unnoticed and come back
+    /// different, so they are here on purpose, and the NaN is compared by its bits rather than by
+    /// `==`, which a NaN fails against itself.
+    ///
+    /// A blob is here beside them because it is the same round trip asked of bytes that are not
+    /// text. The value in it is not UTF-8, so a path that reads a payload as a string on the way
+    /// past turns this test red rather than turning a user's column into nulls.
+    #[test]
+    fn every_other_type_the_format_knows_round_trips_through_a_page() {
+        let path = path("other-types");
+        let columns = [
+            (LogicalType::Float, vec![Value::Float(f32::MIN), Value::Float(-0.0)]),
+            (LogicalType::Double, vec![Value::Double(f64::MIN), Value::Double(f64::MAX)]),
+            (LogicalType::HugeInt, vec![Value::HugeInt(i128::MIN), Value::HugeInt(i128::MAX)]),
+            (LogicalType::UHugeInt, vec![Value::UHugeInt(0), Value::UHugeInt(u128::MAX)]),
+            (LogicalType::Time, vec![Value::Time(0), Value::Time(86_399_999_999)]),
+            (LogicalType::TimeTz, vec![Value::TimeTz(-50_400_000_000), Value::TimeTz(0)]),
+            (
+                LogicalType::TimestampTz,
+                vec![Value::TimestampTz(i64::MIN + 1), Value::TimestampTz(i64::MAX)],
+            ),
+            (
+                LogicalType::Interval,
+                vec![
+                    Value::Interval { months: i32::MIN, days: i32::MAX, micros: i64::MIN },
+                    Value::Interval { months: 13, days: -1, micros: 1 },
+                ],
+            ),
+            (
+                LogicalType::Blob,
+                vec![Value::Blob(vec![0, 0xff, 0x80, 0xfe]), Value::Blob(Vec::new())],
+            ),
+        ];
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(at, (ty, _))| Field::required(format!("c{at}"), ty.clone()))
+            .collect::<Vec<_>>();
+        let vectors = columns
+            .iter()
+            .map(|(ty, values)| Vector::from_values(ty.clone(), values).expect("a vector"))
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(&path, "others", fields).expect("new file");
+        writer.append(&Chunk::new(vectors).expect("matching rows")).expect("one stripe");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let wanted = (0..columns.len()).collect::<Vec<_>>();
+        let read = reader.read(0, &wanted).expect("every column");
+        assert_eq!(read.len(), 2);
+        for (at, (ty, values)) in columns.iter().enumerate() {
+            assert_eq!(read.value_at(0, at), values[0], "the low end of {ty}");
+            assert_eq!(read.value_at(1, at), values[1], "the high end of {ty}");
+        }
+        // A float keeps its sign through a zero, which `==` says nothing about because negative
+        // zero and zero compare equal.
+        let Value::Float(zero) = read.value_at(1, 0) else { panic!("a float stays a float") };
+        assert!(zero.is_sign_negative(), "a negative zero came back as {zero}");
+
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A NaN is still a NaN after a trip through a page.
+    ///
+    /// Apart from the other floats because it cannot be asserted the same way. A NaN is not equal
+    /// to itself, so a comparison against the value that was written passes for every NaN and for
+    /// nothing else, which is the one assertion that would not catch a page that lost it.
+    #[test]
+    fn a_nan_survives_being_written_down() {
+        let path = path("nan");
+        let nan = Vector::from_values(LogicalType::Double, &[Value::Double(f64::NAN)])
+            .expect("a NaN vector");
+        let mut writer =
+            Writer::create(&path, "nan", vec![Field::required("d", LogicalType::Double)])
+                .expect("new file");
+        writer.append(&Chunk::new(vec![nan]).expect("one column")).expect("one stripe");
+        writer.finish().expect("commit");
+        let read = Reader::open(&path).expect("reopen").read(0, &[0]).expect("the column");
+        let Value::Double(back) = read.value_at(0, 0) else { panic!("a double stays a double") };
+        assert!(back.is_nan(), "a NaN came back as {back}");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A uuid and a bit string, which have no `Value` arm of their own and are checked as bits.
+    ///
+    /// A uuid is the 128 bit lane and a bit string is bytes, and neither of them reads back as
+    /// anything in `Value` today, so asking for a value here would compare two nulls and pass
+    /// whatever the file held. The data underneath is what the storage promise is about, so that is
+    /// what this reads.
+    #[test]
+    fn a_uuid_and_a_bit_string_come_back_as_the_bits_that_went_in() {
+        let path = path("uuid-and-bit");
+        let uuids = vec![0_i128, i128::MIN, -1];
+        let mut bits = StringColumn::new();
+        for value in [&b"\x02\xff"[..], &b""[..], &b"\x00\x01\x02\x03\x04\x05"[..]] {
+            bits.push_bytes(value);
+        }
+        let expected = bits.clone();
+        let fields =
+            vec![Field::required("u", LogicalType::Uuid), Field::required("b", LogicalType::Bit)];
+        let vectors = vec![
+            Vector::flat(LogicalType::Uuid, Data::Int128(uuids.clone().into())).expect("uuids"),
+            Vector::flat(LogicalType::Bit, Data::Varlen(bits)).expect("bit strings"),
+        ];
+        let mut writer = Writer::create(&path, "ids", fields).expect("new file");
+        writer.append(&Chunk::new(vectors).expect("matching rows")).expect("one stripe");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let read = reader.read(0, &[0, 1]).expect("both columns").flatten().expect("flat");
+        let Some(Data::Int128(back)) = read.column(0).expect("the uuids").data() else {
+            panic!("a uuid column is the 128 bit lane")
+        };
+        assert_eq!(back.as_slice(), uuids.as_slice());
+        let Some(Data::Varlen(back)) = read.column(1).expect("the bits").data() else {
+            panic!("a bit column is bytes")
+        };
+        for row in 0..expected.len() {
+            assert_eq!(back.bytes(row), expected.bytes(row), "row {row} of the bit column");
         }
         fs::remove_file(path).expect("remove scratch file");
     }

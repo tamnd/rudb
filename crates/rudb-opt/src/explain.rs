@@ -359,6 +359,15 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
         }
     };
     let after = if filtered { " after the filter above" } else { "" };
+    // A join has two inputs and one line, so its rows are the driving side alone and the line says
+    // nothing about the side the whole shape of the query turns on. Only a join has this, and a
+    // join that ran the nested loop is the one thing a reader of a slow plan wants to see first.
+    let joined = match &operator.joined {
+        None => String::new(),
+        Some(joined) => {
+            format!(", {} over {} build rows", joined.algorithm.name(), joined.build_rows)
+        }
+    };
     // A scan that pruned nothing says nothing, because a reader who sees "0 of 5861 parts skipped"
     // on every scan of every query stops reading the clause. A scan that pruned something is the
     // whole reason this number is on the line, since a predicate that prunes and a predicate that
@@ -380,7 +389,7 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
     } else {
         format!("{} wall, {} cpu", duration(operator.wall_ns), duration(operator.cpu_ns))
     };
-    format!("  [{} rows{after}, {spent}{skipped}{memory}{slow}]", operator.rows_out)
+    format!("  [{} rows{after}, {spent}{joined}{skipped}{memory}{slow}]", operator.rows_out)
 }
 
 /// The operator row with this id.

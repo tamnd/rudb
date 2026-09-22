@@ -88,6 +88,7 @@ use crate::sort::Sort;
 use crate::source::{
     Dummy, FileScan, Filters, Frequencies, Pushdown, Scan, Series, Summary, Values,
 };
+use crate::storagenames::storage_info;
 use crate::strategies::strategies;
 use crate::stream::{Edge, Filter, Limit, Project};
 use crate::topn::TopN;
@@ -998,6 +999,33 @@ fn profiling(session: &Session) -> bool {
     session.get("enable_profiling").is_some_and(|format| format != rudb_functions::UNSET)
 }
 
+/// The one table name a pragma was called with.
+///
+/// The binder folds the two column describing pragmas into a `VALUES` while it binds them, so their
+/// name never reaches here. `pragma_storage_info` is the one that does, because its rows are read
+/// off the file and there are as many of them as the table has parts times columns, which is not
+/// something to fold into a plan.
+///
+/// A name that is not a constant is refused rather than evaluated, which is the same answer the
+/// binder gives the other two and for the same missing piece: there is no constant folding in front
+/// of this, so `pragma_storage_info('l' || 'ineitem')` is an expression at this point and not a
+/// name.
+fn pragma_name(plan: &Plan, args: Slice) -> Result<String> {
+    let [argument] = plan.expr_list(args) else {
+        return Err(Error::internal("a pragma that resolved to more than one name"));
+    };
+    let Expr::Constant(reference) = *plan.expr(*argument) else {
+        return Err(Error::not_implemented(
+            "pragma_storage_info() given a name that is not a constant",
+        ));
+    };
+    match plan.value(reference) {
+        Value::Varchar(name) => Ok(name.clone()),
+        Value::Null => Ok("NULL".to_string()),
+        other => Err(Error::internal(format!("a pragma name bound as VARCHAR arrived as {other}"))),
+    }
+}
+
 impl<'a> Building<'a, '_> {
     /// The id of the operator holding the side of this node that has to finish first.
     ///
@@ -1068,7 +1096,9 @@ impl<'a> Building<'a, '_> {
         kind: &str,
         detail: Option<&str>,
     ) -> Arc<Counters> {
-        let mut counters = Counters::new(id, pipeline, kind).charging_cpu(profiling(self.session));
+        let mut counters = Counters::new(id, pipeline, kind)
+            .charging_cpu(profiling(self.session))
+            .under(self.consumer(id, also));
         if let Some(detail) = detail {
             counters = counters.detailed(detail);
         }
@@ -1080,6 +1110,22 @@ impl<'a> Building<'a, '_> {
             }
         }
         self.report.watch(counters)
+    }
+
+    /// Which operator's row this one's rows go into, skipping any node it swallowed.
+    ///
+    /// A node folded into another gets no row of its own, so a scan that took a filter into itself
+    /// is the only row either of them has and it produces what the filter would have, to whoever
+    /// was reading the filter. Naming the filter would leave a parent id pointing at nothing, and a
+    /// reader checking an operator's input against what fed it would find a gap where the chain
+    /// should be.
+    fn consumer(&self, id: u32, also: Option<NodeRef>) -> Option<u32> {
+        let swallowed = also.map(|node| self.shape.operator(node));
+        let mut parent = self.shape.consumer(id);
+        while parent.is_some() && parent == swallowed {
+            parent = self.shape.consumer(parent?);
+        }
+        parent
     }
 
     fn aggregate(
@@ -1242,6 +1288,19 @@ impl<'a> Building<'a, '_> {
                         .watched(counters.clone());
                         let schema = scan.schema().clone();
                         Segment::new(Arc::new(Watched::new(scan, counters)), schema)
+                    }
+                    Some(TableFunction::PragmaStorageInfo) => {
+                        let written = pragma_name(plan, args)?;
+                        let table = storage_info(self.catalog, &written, plan, index, columns)?;
+                        let schema = table.schema().clone();
+                        let counters = self.watch(
+                            reference,
+                            id,
+                            pipeline,
+                            "Metadata",
+                            Some(TableFunction::PragmaStorageInfo.name()),
+                        );
+                        Segment::new(Arc::new(Watched::new(table, counters)), schema)
                     }
                     Some(
                         function @ (TableFunction::RudbStrategies
@@ -1669,6 +1728,7 @@ impl<'a> Building<'a, '_> {
                     let schema = mark.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Mark", None);
                     let reading = Arc::clone(&counters);
+                    let mark = mark.watched(Arc::clone(&counters));
                     left.after.push(gathering);
                     self.close(left, pipeline, Arc::new(Watched::new(mark, counters)));
                     let reader = Arc::new(Watched::new(out, reading));
@@ -1687,6 +1747,7 @@ impl<'a> Building<'a, '_> {
                     // plan line above it already says which outer join this is and what a reader
                     // of a profile wants to know here is which of the two operators ran.
                     let counters = self.watch(reference, id, pipeline, "Pad", None);
+                    let pad = pad.watched(Arc::clone(&counters));
                     left.after.push(gathering);
                     return Ok(left.then(Arc::new(Watched::new(pad, counters)), schema));
                 }
@@ -1697,6 +1758,7 @@ impl<'a> Building<'a, '_> {
                     arm(probe.sideways());
                     let schema = probe.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Probe", None);
+                    let probe = probe.watched(Arc::clone(&counters));
                     left.after.push(gathering);
                     return Ok(left.then(Arc::new(Watched::new(probe, counters)), schema));
                 }
@@ -1706,6 +1768,7 @@ impl<'a> Building<'a, '_> {
                 let schema = join.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Join", None);
                 let reading = Arc::clone(&counters);
+                let join = join.watched(Arc::clone(&counters));
                 left.after.push(gathering);
                 self.close(left, pipeline, Arc::new(Watched::new(join, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
