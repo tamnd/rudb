@@ -602,7 +602,7 @@ impl Table {
             // Rebuilt against this table's columns rather than trusted, since the caller built it
             // from a name list and a stale one would store a column index off the end.
             Some(asked) => {
-                Some(Clustering::new(asked.columns().to_vec(), asked.width(), self.columns.len())?)
+                Some(Clustering::new(asked.columns().to_vec(), asked.width(), &self.columns)?)
             }
         };
         Ok(())

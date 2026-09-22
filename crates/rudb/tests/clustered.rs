@@ -1,0 +1,181 @@
+//! A load into a table that declared its row order comes out of the file pruned.
+//!
+//! Stage 1 of `$HOME/notes/Spec/2140/tenx`, end to end and at a size small enough to run in a
+//! test. The scan has always built a low and a high value per part out of whatever order the rows
+//! arrived in, and has always ruled parts out with them, so the only reason TPC-H reads six
+//! million rows to answer from thirty thousand is that the rows arrive in an order where every
+//! part's range is the whole table's range. Declaring the order and sorting the load is the fix,
+//! and there is no new pruning here, only rows put where the existing pruning can reach them.
+//!
+//! Both tests ask for the pruning and the answer together. The answer on its own would pass with
+//! the declaration ignored, since sorting rows does not change what a query returns, and the
+//! pruning on its own would pass on a predicate that matches nothing. The undeclared table beside
+//! the declared one is what says the part count means anything: it is the same rows, the same
+//! predicate and the same engine, and the order is the only thing that differs.
+
+use rudb::Database;
+use rudb_common::{Clustering, Field, LogicalType, Value, Width};
+
+/// Two hundred thousand rows over six and a half years, in an order nothing can rule out.
+///
+/// The dates step by 7919 days modulo 2400, and 7919 is prime to 2400, so the sequence visits
+/// every day in the range before it repeats one and any run of rows long enough to be a part
+/// covers nearly the whole range. That is the property `dbgen` gives `l_shipdate` for free and the
+/// one the declaration undoes. `l_orderkey` is scrambled the same way and for the same reason.
+const ROWS: &str = "SELECT ((r * 7919) % 200000)::BIGINT AS l_orderkey, \
+                    (r % 7 + 1)::INTEGER AS l_linenumber, \
+                    (DATE '1992-01-01' + ((r * 7919) % 2400)::INTEGER)::DATE AS l_shipdate \
+                    FROM range(200000) AS s(r)";
+
+const SHAPE: &str = "(l_orderkey BIGINT, l_linenumber INTEGER, l_shipdate DATE)";
+
+/// One calendar month of shipping dates, which is about one row in eighty of the table.
+const MONTH: &str = "WHERE l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'";
+
+/// The three columns of the cut down lineitem these tests load.
+fn fields() -> Vec<Field> {
+    vec![
+        Field::new("l_orderkey", LogicalType::BigInt),
+        Field::new("l_linenumber", LogicalType::Integer),
+        Field::new("l_shipdate", LogicalType::Date),
+    ]
+}
+
+/// The stage 0 layout, which is `month(l_shipdate), l_orderkey, l_linenumber`.
+fn stage_zero() -> Clustering {
+    Clustering::new(vec![2, 0, 1], Width::Month, &fields()).expect("the stage 0 layout")
+}
+
+/// A database on disk holding the table, loaded and checkpointed, and the path to clean up.
+///
+/// Written and read by the same handle, which is enough here because the checkpoint is what moves
+/// the rows into the file and the scan reads them from there afterwards. One thread throughout, so
+/// that the order rows come back in is the order they are stored in rather than a race.
+fn loaded(tag: &str, declare: Option<Clustering>) -> (Database, std::path::PathBuf) {
+    let path =
+        std::env::temp_dir().join(format!("rudb-clustered-{tag}-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let database = Database::open(name).expect("a file name starts a native database");
+    database.execute("SET threads = 1").expect("sets the thread count");
+    database.execute(&format!("CREATE TABLE lineitem {SHAPE}")).expect("creates");
+    if let Some(clustering) = declare {
+        database.with_catalog_mut(|catalog| {
+            let table = catalog.resolve(&["lineitem"]).expect("resolves");
+            catalog
+                .table_mut(&table)
+                .expect("the table is there")
+                .cluster_by(Some(clustering))
+                .expect("the columns are the table's");
+        });
+    }
+    database.execute(&format!("INSERT INTO lineitem {ROWS}")).expect("loads");
+    database.execute("CHECKPOINT").expect("commits");
+    (database, path)
+}
+
+/// The scan line of an `EXPLAIN ANALYZE`, which is the line carrying the part counts.
+fn scan_line(database: &Database, sql: &str) -> String {
+    let result = database.query(&format!("EXPLAIN ANALYZE {sql}")).expect("the explain ran");
+    let text = match result.value_at(0, 1) {
+        Value::Varchar(text) => text,
+        other => panic!("the plan came back as {other:?}"),
+    };
+    text.lines()
+        .take_while(|line| !line.is_empty())
+        .find(|line| line.contains("Get "))
+        .unwrap_or_else(|| panic!("no scan on the tree:\n{text}"))
+        .to_owned()
+}
+
+/// Every row of a result, as values.
+fn rows(database: &Database, sql: &str) -> Vec<Vec<Value>> {
+    let result = database.query(sql).expect("the query ran");
+    (0..result.len())
+        .map(|row| (0..result.width()).map(|column| result.value_at(row, column)).collect())
+        .collect()
+}
+
+#[test]
+fn a_load_into_a_declared_table_prunes_and_the_same_load_without_one_does_not() {
+    let (sorted, sorted_path) = loaded("sorted", Some(stage_zero()));
+    let (plain, plain_path) = loaded("plain", None);
+
+    let query = format!("SELECT count(*), sum(l_orderkey) FROM lineitem {MONTH}");
+    let wanted = rows(&plain, &query);
+    assert_eq!(rows(&sorted, &query), wanted, "sorting the rows on the way in changed the answer");
+    assert_ne!(
+        wanted[0][0],
+        Value::BigInt(0),
+        "a predicate that matches nothing would prune everything and prove nothing"
+    );
+
+    let declared = scan_line(&sorted, &query);
+    assert!(declared.contains("parts skipped"), "a declared order should prune: {declared}");
+
+    let undeclared = scan_line(&plain, &query);
+    assert!(
+        !undeclared.contains("parts skipped"),
+        "every part of the unsorted table spans nearly the whole range of dates, so nothing can be \
+         ruled out, and a load that pruned without a declaration would mean this test is measuring \
+         something other than the declaration: {undeclared}"
+    );
+
+    let _ = std::fs::remove_file(sorted_path);
+    let _ = std::fs::remove_file(plain_path);
+}
+
+#[test]
+fn the_rows_are_bucketed_by_the_declared_width_rather_than_sorted_on_the_column() {
+    // The pruning above would come out of an ordinary sort on the date just as well, so it does
+    // not say the width was honoured. What says it is the second key. Bucketed by month,
+    // `l_orderkey` runs in order across the whole of a month and the dates inside that month are
+    // in no order at all. Sorted on the date exactly, it would be the other way round. The first
+    // of those is the key locality the joins want and it is the entire reason the width is part of
+    // the declaration rather than the declaration being a plain column list.
+    let (database, path) = loaded("width", Some(stage_zero()));
+
+    // No ORDER BY on purpose: the answer is whatever order the rows are stored in, which is the
+    // thing being asserted. The scan runs on one thread, set in `loaded`, so that order is stable.
+    let month = rows(&database, &format!("SELECT l_shipdate, l_orderkey FROM lineitem {MONTH}"));
+    assert!(month.len() > 1000, "a month should be thousands of rows, not {}", month.len());
+
+    let keys: Vec<i64> = month
+        .iter()
+        .map(|row| match row[1] {
+            Value::BigInt(key) => key,
+            ref other => panic!("l_orderkey came back as {other:?}"),
+        })
+        .collect();
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the keys should run in order across the whole month"
+    );
+    let dates: Vec<i32> = month
+        .iter()
+        .map(|row| match row[0] {
+            Value::Date(day) => day,
+            ref other => panic!("l_shipdate came back as {other:?}"),
+        })
+        .collect();
+    assert!(
+        !dates.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the dates should not be in order inside the bucket, which is what makes the width a month \
+         and not a day"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_load_into_a_table_that_declared_nothing_is_left_in_the_order_it_arrived() {
+    // The sort is only ever added because a declaration asked for it, so the ordinary insert has
+    // to come out the way it went in. A sort that got added regardless would pass both tests above
+    // and would be a pass over every load in the engine that nobody asked for.
+    let (database, path) = loaded("asis", None);
+    let first = rows(&database, "SELECT l_orderkey FROM lineitem LIMIT 4");
+    let wanted: Vec<Vec<Value>> =
+        (0..4).map(|r: i64| vec![Value::BigInt((r * 7919) % 200_000)]).collect();
+    assert_eq!(first, wanted, "an undeclared load was reordered");
+    let _ = std::fs::remove_file(path);
+}
