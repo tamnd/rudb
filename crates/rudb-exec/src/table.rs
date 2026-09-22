@@ -2034,12 +2034,25 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>, across: 
             return;
         }
     }
-    for column in keys {
-        fold(column, rows, hashes, across);
+    // The spread is folded into the last column's pass rather than made into a pass of its own.
+    // It used to be a second walk of the whole run, which is a load, five operations and a store a
+    // row on top of the one that did the work, and hashing is the largest single symbol on the
+    // suite. With no key columns at all there is nothing to fold it into, and there is nothing to
+    // do either, because every row is still the zero `resize` left and `spread(0)` is zero.
+    let last = keys.len().saturating_sub(1);
+    for (at, column) in keys.iter().enumerate() {
+        fold(column, rows, hashes, across, at == last);
     }
-    for state in hashes.iter_mut() {
-        *state = spread(*state);
-    }
+}
+
+/// The running hash of a row, spread if this was the last key column and left alone if it was not.
+///
+/// `finish` is the same for every row of a pass, so the branch is outside the loop by the time this
+/// is compiled, and writing it this way is what keeps one copy of each of the passes below rather
+/// than two.
+#[inline]
+fn end(state: u64, finish: bool) -> u64 {
+    if finish { spread(state) } else { state }
 }
 
 /// Marks every row of a chunk whose whole key is the key of the row before it.
@@ -2165,7 +2178,7 @@ fn narrow(same: &mut [bool], validity: &rudb_vector::Validity, equal: impl Fn(us
 /// types, are missing on purpose: they fall through to the general path in every form, so there is
 /// nothing for them to disagree with. An interval is hashed as the one length its three counts add
 /// up to, which is what makes a day and twenty four hours one group.
-fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
+fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish: bool) {
     let validity = column.validity();
     if across == Across::OneInput {
         if let Some((codes, _)) = column.stable_dictionary_parts() {
@@ -2174,13 +2187,13 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
                 (validity.has_nulls(rows), codes.get(..rows), hashes.get_mut(..rows))
             {
                 for (state, &code) in hashes.iter_mut().zip(codes) {
-                    *state = mix(*state, u64::from(code));
+                    *state = end(mix(*state, u64::from(code)), finish);
                 }
                 return;
             }
             for (row, state) in hashes.iter_mut().enumerate().take(rows) {
                 let one = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
-                *state = mix(*state, one);
+                *state = end(mix(*state, one), finish);
             }
             return;
         }
@@ -2207,13 +2220,15 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
     // every query on the suite.
     let straight = !validity.has_nulls(rows);
     if let Some(packed) = column.packed_parts() {
-        fold_packed(&packed, wide, rows, straight, hashes, |row| {
+        fold_packed(&packed, wide, rows, straight, finish, hashes, |row| {
             validity.is_valid(row).then_some(row)
         });
         return;
     }
     if let Some(data) = column.data() {
-        if fold_data(data, rows, hashes, straight, |row| validity.is_valid(row).then_some(row)) {
+        if fold_data(data, rows, hashes, straight, finish, |row| {
+            validity.is_valid(row).then_some(row)
+        }) {
             return;
         }
     }
@@ -2239,7 +2254,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
                 let code = *at.get(row)? as usize;
                 inner.is_valid(code).then_some(code)
             };
-            if fold_data(data, rows, hashes, false, pick) {
+            if fold_data(data, rows, hashes, false, finish, pick) {
                 return;
             }
         }
@@ -2253,7 +2268,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
         // building a `Value` per row to hash it.
         if let Some(packed) = values.packed_parts() {
             let inner = values.validity();
-            fold_packed(&packed, wide, rows, false, hashes, |row| {
+            fold_packed(&packed, wide, rows, false, finish, hashes, |row| {
                 if !validity.is_valid(row) {
                     return None;
                 }
@@ -2271,7 +2286,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
     // bytes again for every row was most of the string group path. What is left after that is the
     // nested types and the intervals, which have no run of fixed width words to walk at all.
     for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-        *state = if text {
+        let one = if text {
             match column.bytes_at(row) {
                 Some(bytes) => mix(*state, bytes_word(bytes)),
                 None => mix(*state, NOTHING),
@@ -2279,6 +2294,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
         } else {
             fold_value(*state, &column.value_at(row))
         };
+        *state = end(one, finish);
     }
 }
 
@@ -2302,6 +2318,7 @@ fn fold_packed(
     wide: bool,
     rows: usize,
     straight: bool,
+    finish: bool,
     hashes: &mut [u64],
     pick: impl Fn(usize) -> Option<usize>,
 ) {
@@ -2309,25 +2326,27 @@ fn fold_packed(
     if straight {
         for (row, state) in hashes.iter_mut().enumerate().take(rows) {
             let value = base + i128::from(packed.code(row));
-            *state = if wide {
+            let one = if wide {
                 mix(mix(*state, value as u64), (value >> 64) as u64)
             } else {
                 mix(*state, value as u64)
             };
+            *state = end(one, finish);
         }
         return;
     }
     for (row, state) in hashes.iter_mut().enumerate().take(rows) {
         let Some(code) = pick(row) else {
-            *state = mix(*state, NOTHING);
+            *state = end(mix(*state, NOTHING), finish);
             continue;
         };
         let value = base + i128::from(packed.code(code));
-        *state = if wide {
+        let one = if wide {
             mix(mix(*state, value as u64), (value >> 64) as u64)
         } else {
             mix(*state, value as u64)
         };
+        *state = end(one, finish);
     }
 }
 
@@ -2347,6 +2366,7 @@ fn fold_data(
     rows: usize,
     hashes: &mut [u64],
     straight: bool,
+    finish: bool,
     pick: impl Fn(usize) -> Option<usize>,
 ) -> bool {
     /// One pass over the rows, turning each into a word the same way the general path does.
@@ -2361,7 +2381,7 @@ fn fold_data(
             if straight {
                 if let (Some(values), Some(hashes)) = (values.get(..rows), hashes.get_mut(..rows)) {
                     for (state, value) in hashes.iter_mut().zip(values) {
-                        *state = mix(*state, word(*value));
+                        *state = end(mix(*state, word(*value)), finish);
                     }
                     return true;
                 }
@@ -2371,7 +2391,7 @@ fn fold_data(
                     Some(value) => word(*value),
                     None => NOTHING,
                 };
-                *state = mix(*state, one);
+                *state = end(mix(*state, one), finish);
             }
             return true;
         }};
@@ -2397,7 +2417,7 @@ fn fold_data(
                     Some(bytes) => bytes_word(bytes),
                     None => NOTHING,
                 };
-                *state = mix(*state, one);
+                *state = end(mix(*state, one), finish);
             }
             true
         }
