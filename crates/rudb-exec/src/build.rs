@@ -76,6 +76,7 @@ use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
+use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
 use crate::prepared::Prepared;
 use crate::query::Query;
@@ -1304,6 +1305,7 @@ impl<'a> Building<'a, '_> {
                     }
                     Some(
                         function @ (TableFunction::RudbStrategies
+                        | TableFunction::RudbLinks
                         | TableFunction::DuckdbKeywords
                         | TableFunction::DuckdbTypes
                         | TableFunction::DuckdbFunctions
@@ -1326,6 +1328,9 @@ impl<'a> Building<'a, '_> {
                         | TableFunction::PragmaShowTablesExpanded),
                     ) => {
                         let table = match function {
+                            TableFunction::RudbLinks => {
+                                links(self.session, self.catalog, plan, index, columns)?
+                            }
                             TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
                             TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
                             TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,

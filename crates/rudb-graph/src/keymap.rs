@@ -67,6 +67,16 @@ impl Form {
         }
     }
 
+    /// What this form is called where a person reads it, which is `rudb_links()`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Dense => "dense",
+            Self::Sorted => "sorted",
+        }
+    }
+
     /// The form a header tag names.
     ///
     /// # Errors

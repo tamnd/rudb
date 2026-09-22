@@ -64,6 +64,16 @@ impl Cardinality {
         }
     }
 
+    /// What this cardinality is called where a person reads it, which is `rudb_links()`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExactlyOne => "exactly one",
+            Self::AtMostOne => "at most one",
+            Self::Unverified => "unverified",
+        }
+    }
+
     /// The cardinality a header tag names.
     ///
     /// # Errors
@@ -82,12 +92,7 @@ impl Cardinality {
 
 impl fmt::Display for Cardinality {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
-            Self::ExactlyOne => "exactly one",
-            Self::AtMostOne => "at most one",
-            Self::Unverified => "unverified",
-        };
-        formatter.write_str(text)
+        formatter.write_str(self.label())
     }
 }
 
