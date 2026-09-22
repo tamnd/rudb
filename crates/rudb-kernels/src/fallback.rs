@@ -129,6 +129,7 @@ fn form_name(form: Form) -> &'static str {
         Form::BitPacked => "bit-packed",
         Form::StringView => "string-view",
         Form::Fsst => "fsst",
+        Form::Gathered => "gathered",
         // `Form` is not exhaustive as far as this crate is concerned, and more encodings are coming
         // to it. A name rather than a panic means the day one lands is a day the report says
         // `other` for a while, not a day the report aborts the process.

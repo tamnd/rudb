@@ -163,6 +163,17 @@ pub enum Form {
     /// ordinary vector and can be in any of the forms above, so that is where a struct column gets
     /// made smaller.
     Struct,
+    /// One row id per row, into a source vector that is far longer than this one.
+    ///
+    /// The form a link join's parent columns are in, per `spec/graph/08-vector-engine.md` section
+    /// 8.2. Physically it is [`Form::Dictionary`] and logically it is the opposite of one, which is
+    /// why it is a form of its own rather than a dictionary with a note on it. A dictionary promises
+    /// that the values are few and distinct, and every kernel that has a dictionary arm takes that
+    /// promise by folding the operation over the values once and then indexing. A gather's source is
+    /// a whole parent table, so folding over it to answer two thousand rows reads fifteen million
+    /// values for nothing. Both forms want the same code and they want it under opposite conditions,
+    /// so the condition is [`Vector::fold_over_source`] and the form is what makes a kernel ask.
+    Gathered,
 }
 
 /// The values of a flat vector, one Rust vector per physical type.
@@ -484,6 +495,30 @@ enum Body {
     /// the same as it is for a list.
     Fields {
         children: Vec<Arc<Vector>>,
+    },
+    /// Row `r` is row `rids[offset + r]` of `source`, and is null where that is [`NO_ROW`].
+    ///
+    /// Late materialization written into the type system. A link join emits one of these per
+    /// projected parent column and reads nothing out of the parent at all, so a column that is
+    /// projected but never inspected is read once at the end for the rows that reached the end, and
+    /// a column used in a filter is filtered in this form over the distinct parent rows that were
+    /// actually reached rather than once per child row.
+    ///
+    /// The `rids` are shared and carry an `offset` for the reason [`Body::Packed`] carries one: a
+    /// link join fills one buffer of parent rows per child chunk and then the pipeline cuts it, and
+    /// a cut that copied the ids would spend more moving them than the gather it is describing
+    /// costs. Sharing makes a cut two words.
+    ///
+    /// [`NO_ROW`] is the whole of the outer join story here. Section 5.2 says a left link join keeps
+    /// the child rows whose link is the no parent sentinel and gathers null for them, and an inner
+    /// one drops them, so the operator decides which rows exist and this decides only what they
+    /// hold. That keeps the validity of a gather derivable rather than stored: a row is null when
+    /// its id is [`NO_ROW`] or when the source row it names is null, which is two loads and no
+    /// allocation, and the bitmap is materialized only when a kernel asks for one.
+    Gathered {
+        source: Arc<Vector>,
+        rids: Arc<Vec<u32>>,
+        offset: usize,
     },
 }
 
@@ -1118,6 +1153,93 @@ impl Vector {
         })
     }
 
+    /// One row of `source` per id, without reading any of them.
+    ///
+    /// What a link join emits for each of its parent columns, per `spec/graph/08-vector-engine.md`
+    /// section 8.2. Row `r` is row `rids[r]` of `source`, and is null where that is [`NO_ROW`].
+    ///
+    /// The ids are taken by `Arc` rather than by value because one link join fills one buffer of
+    /// parent rows per child chunk and then hands the same buffer to every projected parent column,
+    /// so a gather of eight columns is eight pointers and one buffer. [`Self::gathered_from`] is the
+    /// same thing starting part way in, which is what a cut of one produces.
+    ///
+    /// # Errors
+    ///
+    /// If an id is past the end of the source and is not [`NO_ROW`]. That check is a pass over the
+    /// ids and it is the only thing standing between a link built against the wrong parent and a
+    /// read of whatever happens to be at that offset, so it is not optional and it is not deferred:
+    /// `spec/graph/03-the-file-format.md` section 3.1 says a stale section is ignored rather than
+    /// repaired, and this is where a stale one stops being ignorable.
+    pub fn gathered(source: Arc<Vector>, rids: Arc<Vec<u32>>) -> Result<Self> {
+        let len = rids.len();
+        Self::gathered_from(source, rids, 0, len)
+    }
+
+    /// The same, reading `len` ids starting at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// If the range runs past the end of the ids, or if an id in it is past the end of the source.
+    pub fn gathered_from(
+        source: Arc<Vector>,
+        rids: Arc<Vec<u32>>,
+        offset: usize,
+        len: usize,
+    ) -> Result<Self> {
+        let end = offset.checked_add(len).ok_or_else(|| Error::internal("a gather that wraps"))?;
+        let Some(taken) = rids.get(offset..end) else {
+            return Err(Error::internal(format!(
+                "rows {offset} to {end} of a gather over {} ids",
+                rids.len()
+            )));
+        };
+        let rows = source.len();
+        if taken.iter().any(|&rid| rid != NO_ROW && rid as usize >= rows) {
+            return Err(Error::internal(format!(
+                "a gathered row id is past the {rows} rows of its source"
+            )));
+        }
+        Ok(Self {
+            ty: source.ty.clone(),
+            len,
+            // The mask is all valid and the nulls are real, which is the same split a dictionary
+            // makes: this level says every row exists and the body says what each one holds, and
+            // `is_null_at` reads through to answer. A mask here would be a second copy of what the
+            // ids already say and the two could disagree.
+            validity: Validity::AllValid,
+            body: Body::Gathered { source, rids, offset },
+        })
+    }
+
+    /// The source and the ids of a gathered vector, and `None` for any other form.
+    #[must_use]
+    pub fn gathered_parts(&self) -> Option<(&Arc<Self>, &[u32])> {
+        match &self.body {
+            Body::Gathered { source, rids, offset } => {
+                Some((source, rids.get(*offset..offset + self.len)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a kernel over this vector should fold over the source once and then index.
+    ///
+    /// Section 8.2's dispatch rule, which is one comparison and is the whole difference between a
+    /// gather and a dictionary. Every kernel with a dictionary arm already folds over the values
+    /// once and indexes, and that arm is right for a gather exactly when the source is shorter than
+    /// the rows being answered. A dictionary always is, by construction. A gather off a parent
+    /// table almost never is, and a kernel that took the dictionary arm anyway would read fifteen
+    /// million parent rows to answer two thousand child ones.
+    ///
+    /// `false` for every other form, so a kernel can ask this without first asking what it has.
+    #[must_use]
+    pub fn fold_over_source(&self) -> bool {
+        match &self.body {
+            Body::Gathered { source, .. } => source.len() < self.len,
+            _ => false,
+        }
+    }
+
     /// A vector of runs, one value each, with the row each run ends at.
     ///
     /// `ends` is exclusive and strictly increasing, so run `i` covers the rows from `ends[i - 1]` to
@@ -1544,6 +1666,13 @@ impl Vector {
             Body::Runs { ends, values } => {
                 ends.capacity() * size_of::<u32>() + share(values.footprint(), values)
             }
+            // The ids are shared between every cut of one link join's output, and the source is
+            // shared with every other column gathered off the same parent, so both are divided by
+            // their holders for the reason the dictionary above is. A gather whose source counted in
+            // full would report a parent table per projected column per chunk.
+            Body::Gathered { source, rids, .. } => {
+                share(rids.capacity() * size_of::<u32>(), rids) + share(source.footprint(), source)
+            }
             Body::Nested { entries, child } => {
                 entries.capacity() * size_of::<(u32, u32)>() + share(child.footprint(), child)
             }
@@ -1590,6 +1719,13 @@ impl Vector {
                 Some(run) => values.is_null_at(run),
                 None => true,
             },
+            // Section 8.2's lazy validity, which is this line. A gather has no mask of its own and
+            // does not need one: the id says whether there is a row and the source says whether that
+            // row is null, and both of those are already in memory.
+            Body::Gathered { source, rids, offset } => match rids.get(offset + index) {
+                Some(&NO_ROW) | None => true,
+                Some(&rid) => source.is_null_at(rid as usize),
+            },
             _ => false,
         }
     }
@@ -1606,6 +1742,15 @@ impl Vector {
         }
         match &self.body {
             Body::Dictionary { values, .. } | Body::Runs { values, .. } => values.never_null(),
+            // A gather is never null when no id is the sentinel and the source holds no nulls. The
+            // first of those is a pass over the ids rather than a constant, which is the one place
+            // this question is not free, and it is worth paying: the ids are four bytes a row and
+            // contiguous, and the alternative is reading through to the source once per row for the
+            // whole vector, which is the random access this form exists to postpone.
+            Body::Gathered { source, rids, offset } => {
+                source.never_null()
+                    && !rids[*offset..].iter().take(self.len).any(|&rid| rid == NO_ROW)
+            }
             _ => true,
         }
     }
@@ -1625,6 +1770,7 @@ impl Vector {
             Body::Runs { .. } => Form::Rle,
             Body::Nested { .. } => Form::List,
             Body::Fields { .. } => Form::Struct,
+            Body::Gathered { .. } => Form::Gathered,
         }
     }
 
@@ -1826,6 +1972,13 @@ impl Vector {
                 Some(run) => values.value_at(run),
                 None => Value::Null,
             },
+            // The one read every other reader of this form is: follow the id, and answer null when
+            // there is no row to follow. Written out once per reader rather than through a helper
+            // because each of them returns a different kind of nothing.
+            Body::Gathered { source, rids, offset } => match rids.get(offset + index) {
+                Some(&NO_ROW) | None => Value::Null,
+                Some(&rid) => source.value_at(rid as usize),
+            },
             // One value unpacked into a run of one, so that what a packed value means is decided in
             // the same place a flat one is rather than in a second copy of the type mapping that
             // could drift from it. It allocates, which this path is allowed to do and the typed
@@ -1985,6 +2138,9 @@ impl Vector {
                 values.text_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.text_at(run_holding(ends, index)?),
+            Body::Gathered { source, rids, offset } => {
+                source.text_at(row_of(rids, *offset, index)?)
+            }
             Body::Views { views, arena } => {
                 std::str::from_utf8(views.get(index)?.bytes_in(arena)?).ok()
             }
@@ -2014,6 +2170,9 @@ impl Vector {
                 values.bytes_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.bytes_at(run_holding(ends, index)?),
+            Body::Gathered { source, rids, offset } => {
+                source.bytes_at(row_of(rids, *offset, index)?)
+            }
             Body::Views { views, arena } => views.get(index)?.bytes_in(arena),
             Body::ExternalText { source } => source.bytes_at(index).ok().flatten(),
             Body::Flat(data) => data.bytes_at(index),
@@ -2047,6 +2206,10 @@ impl Vector {
             },
             Body::Runs { ends, values } => match run_holding(ends, index) {
                 Some(run) => values.try_bytes_at(run),
+                None => Ok(None),
+            },
+            Body::Gathered { source, rids, offset } => match row_of(rids, *offset, index) {
+                Some(row) => source.try_bytes_at(row),
                 None => Ok(None),
             },
             Body::Views { views, arena } => {
@@ -2194,7 +2357,9 @@ impl Vector {
                     values.try_bytes_at(code as usize)?;
                 }
             }
-            Body::Runs { values, .. } => values.validate_external()?,
+            Body::Runs { values, .. } | Body::Gathered { source: values, .. } => {
+                values.validate_external()?;
+            }
             Body::Nested { child, .. } => child.validate_external()?,
             Body::Fields { children } => {
                 for child in children {
@@ -2249,6 +2414,9 @@ impl Vector {
                 values.signed_at(usize::try_from(*codes.get(index)?).ok()?)
             }
             Body::Runs { ends, values } => values.signed_at(run_holding(ends, index)?),
+            Body::Gathered { source, rids, offset } => {
+                source.signed_at(row_of(rids, *offset, index)?)
+            }
             Body::Packed { words, width, base, offset } => Some(
                 *base + i128::from(code_at(words, (*offset + index) * *width as usize, *width)),
             ),
@@ -2322,6 +2490,7 @@ impl Vector {
             },
             Body::Dictionary { .. }
             | Body::Runs { .. }
+            | Body::Gathered { .. }
             | Body::Coded { .. }
             | Body::Views { .. }
             | Body::ExternalText { .. }
@@ -2345,6 +2514,10 @@ impl Vector {
         }
         match &self.body {
             Body::Dictionary { values, .. } | Body::Runs { values, .. } => values.none_null(),
+            Body::Gathered { source, rids, offset } => {
+                source.none_null()
+                    && !rids[*offset..].iter().take(self.len).any(|&rid| rid == NO_ROW)
+            }
             _ => true,
         }
     }
@@ -2414,6 +2587,15 @@ impl Vector {
                 codes: codes[at..end].to_vec(),
                 values: Arc::clone(values),
                 stable: *stable,
+            },
+            // The same cut [`Body::Packed`] below takes and for the same reason, and here it is free
+            // rather than merely cheap: a link join fills one buffer of parent rows per child chunk
+            // and the pipeline cuts it, so moving the starting row is what keeps the ids from being
+            // copied once per cut. Both ends of the gather stay shared, the ids and the source.
+            Body::Gathered { source, rids, offset } => Body::Gathered {
+                source: Arc::clone(source),
+                rids: Arc::clone(rids),
+                offset: offset + at,
             },
             // The bits are not byte aligned, so a cut either repacks them or moves the row the
             // reading starts at. Moving it is one addition and repacking is a pass, and a page is
@@ -2764,9 +2946,9 @@ impl Vector {
                     .map(|child| child.copied(at.clone(), forms_stay).map(Arc::new))
                     .collect::<Result<Vec<_>>>()?,
             },
-            // Unreachable, because `resolve` walks past both of the forms that point at another
-            // vector and stops at the first body that does not.
-            Body::Dictionary { .. } | Body::Runs { .. } => {
+            // Unreachable, because `resolve` walks past every form that points at another vector
+            // and stops at the first body that does not.
+            Body::Dictionary { .. } | Body::Runs { .. } | Body::Gathered { .. } => {
                 return Err(Error::internal(
                     "a form that points somewhere survived being resolved",
                 ));
@@ -2775,7 +2957,7 @@ impl Vector {
         Ok(Self { ty: self.ty.clone(), len: rows, validity, body })
     }
 
-    /// Where each wanted position lives in the first body that is not a dictionary, and that body.
+    /// Where each wanted position lives in the first body that points nowhere else, and that body.
     ///
     /// A position that is null anywhere on the way down, or past the end of anything on the way
     /// down, comes back as [`NOWHERE`]. That single sentinel is what keeps the copy loop from
@@ -2806,6 +2988,21 @@ impl Vector {
                         *slot = run_holding(ends, *slot).unwrap_or(NOWHERE);
                     }
                     values.as_ref()
+                }
+                // The same walk the dictionary above takes, with the sentinel folded into the one
+                // this loop already has. That composition is the whole reason a gather is a body
+                // rather than an operator: a filter over the output of a link join selects into the
+                // ids and copies nothing, and a gather off a gather is one walk down to whatever is
+                // at the bottom rather than two passes over the parent.
+                Body::Gathered { source: below, rids, offset } => {
+                    for slot in &mut at {
+                        *slot = if *slot == NOWHERE {
+                            NOWHERE
+                        } else {
+                            row_of(rids, *offset, *slot).unwrap_or(NOWHERE)
+                        };
+                    }
+                    below.as_ref()
                 }
                 _ => return (at, source),
             };
@@ -3242,6 +3439,27 @@ fn boundaries(data: &Data, validity: &Validity, len: usize) -> Vec<u32> {
 /// free and an `Option` would put a second branch next to the one already there.
 pub(crate) const NOWHERE: usize = usize::MAX;
 
+/// The row id of a row that is not in the source, which reads as null.
+///
+/// Public because whoever builds a [`Form::Gathered`] vector has to write it, and it is `u32::MAX`
+/// for the reason [`NOWHERE`] is `usize::MAX`: a bounds check the reader is doing anyway rejects it,
+/// where an `Option<u32>` would be eight bytes a row instead of four and a second branch beside the
+/// one already there. It costs the last row of a four billion row source, which is a source no
+/// column in this engine has.
+pub const NO_ROW: u32 = u32::MAX;
+
+/// Which source row a gathered row names, and `None` when it names none.
+///
+/// The `Option` is what every reader of [`Body::Gathered`] that returns an `Option` wants, so the
+/// three cases that are all *there is nothing here*, past the end of the ids, the sentinel, and an
+/// id that does not fit a `usize`, are collapsed once here rather than three times each.
+fn row_of(rids: &[u32], offset: usize, index: usize) -> Option<usize> {
+    match rids.get(offset + index) {
+        Some(&NO_ROW) | None => None,
+        Some(&rid) => Some(rid as usize),
+    }
+}
+
 /// A run of data copied at the given positions, with a zero wherever the position is [`NOWHERE`].
 ///
 /// A zero and not a skip, because every layout here is a parallel array to a validity mask and a
@@ -3638,7 +3856,7 @@ mod tests {
 
     use rudb_common::{Field, LogicalType, Value};
 
-    use super::{Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, VECTOR_SIZE, Vector};
+    use super::{Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, NO_ROW, VECTOR_SIZE, Vector};
     use crate::buffer::Buffer;
     use crate::fsst::SymbolTable;
     use crate::string::{StringColumn, StringView};
@@ -5659,6 +5877,183 @@ mod tests {
         assert!(
             Vector::string_views(LogicalType::Varchar, bad, arena).is_err(),
             "four bytes short of what the view claims"
+        );
+    }
+
+    /// The form at its simplest: an id per row, and the row it names.
+    #[test]
+    fn a_gathered_vector_reads_the_source_row_its_id_names() {
+        let source = Arc::new(integers(&[10, 20, 30, 40]));
+        let vector = Vector::gathered(source, Arc::new(vec![3, 0, 3, 1])).unwrap();
+        assert_eq!(vector.form(), Form::Gathered);
+        assert_eq!(vector.len(), 4);
+        assert_eq!(
+            vector.iter().collect::<Vec<_>>(),
+            vec![Value::Integer(40), Value::Integer(10), Value::Integer(40), Value::Integer(20)]
+        );
+    }
+
+    /// Section 8.2's lazy validity. The sentinel is a null and it is not in a mask anywhere, which is
+    /// what lets a left link join gather null for an unmatched child row without allocating one.
+    #[test]
+    fn a_gathered_row_with_no_source_row_is_null_without_a_mask() {
+        let source = Arc::new(integers(&[10, 20]));
+        let vector = Vector::gathered(source, Arc::new(vec![1, NO_ROW, 0])).unwrap();
+        assert!(!vector.validity().has_nulls(vector.len()), "the mask at this level says nothing");
+        assert!(vector.is_null_at(1));
+        assert!(!vector.is_null_at(0) && !vector.is_null_at(2));
+        assert_eq!(
+            vector.iter().collect::<Vec<_>>(),
+            vec![Value::Integer(20), Value::Null, Value::Integer(10)]
+        );
+        assert!(!vector.none_null(), "a sentinel is a null and the bulk answer has to agree");
+    }
+
+    /// The other half of the same rule: a null in the source is a null here, the way a dictionary's
+    /// nulls live in its values. Two ways for a row to be null and one answer from `is_null_at`.
+    #[test]
+    fn a_gather_of_a_null_source_row_is_null() {
+        let source = Arc::new(
+            Vector::from_values(LogicalType::Integer, &[Value::Integer(7), Value::Null]).unwrap(),
+        );
+        let vector = Vector::gathered(source, Arc::new(vec![1, 0, 1])).unwrap();
+        assert!(vector.is_null_at(0) && vector.is_null_at(2));
+        assert_eq!(vector.value_at(1), Value::Integer(7));
+        assert!(!vector.none_null());
+    }
+
+    /// An id past the end of the source is the one failure in this form that reads whatever happens
+    /// to be at that offset rather than failing, so it is refused where the vector is built.
+    #[test]
+    fn a_gathered_id_past_the_end_of_its_source_is_refused() {
+        let source = Arc::new(integers(&[1, 2, 3]));
+        assert!(Vector::gathered(Arc::clone(&source), Arc::new(vec![0, 3])).is_err());
+        assert!(
+            Vector::gathered(source, Arc::new(vec![0, NO_ROW])).is_ok(),
+            "the sentinel is not an id past the end, it is the absence of one"
+        );
+    }
+
+    /// A cut is the offset and nothing else, which is what keeps a pipeline from copying the ids once
+    /// per operator. Both ends stay shared and the rows answer the same.
+    #[test]
+    fn cutting_a_gather_moves_where_it_starts_and_copies_nothing() {
+        let source = Arc::new(integers(&[10, 20, 30, 40, 50]));
+        let rids = Arc::new(vec![4, 3, 2, 1, 0]);
+        let vector = Vector::gathered(Arc::clone(&source), Arc::clone(&rids)).unwrap();
+        let held = Arc::strong_count(&rids);
+        let cut = vector.slice(1, 3).unwrap();
+        assert_eq!(cut.form(), Form::Gathered);
+        assert_eq!(
+            Arc::strong_count(&rids),
+            held + 1,
+            "the cut shares the ids rather than copying"
+        );
+        assert_eq!(
+            cut.iter().collect::<Vec<_>>(),
+            vec![Value::Integer(40), Value::Integer(30), Value::Integer(20)]
+        );
+        assert_eq!(cut.gathered_parts().unwrap().1, [3, 2, 1]);
+    }
+
+    /// Composition, which is why this is a body and not an operator. A filter over the output of a
+    /// link join selects into the ids, and what comes out is one level rather than two.
+    #[test]
+    fn a_gather_of_a_gather_resolves_to_one_walk_over_the_source() {
+        let source = Arc::new(integers(&[10, 20, 30, 40]));
+        let inner = Vector::gathered(source, Arc::new(vec![3, 2, 1, 0])).unwrap();
+        let outer = inner.gather(&[0, 3]).unwrap();
+        assert_eq!(outer.iter().collect::<Vec<_>>(), vec![Value::Integer(40), Value::Integer(10)]);
+        assert_ne!(outer.form(), Form::Gathered, "the walk stops at what the ids point into");
+    }
+
+    /// The sentinel survives being gathered through, which it has to: a filter over a left link
+    /// join's output keeps the unmatched rows it kept and they are still null.
+    #[test]
+    fn gathering_through_a_sentinel_keeps_it_null() {
+        let source = Arc::new(integers(&[10, 20]));
+        let inner = Vector::gathered(source, Arc::new(vec![0, NO_ROW, 1])).unwrap();
+        let outer = inner.gather(&[1, 2, 1]).unwrap();
+        assert_eq!(
+            outer.iter().collect::<Vec<_>>(),
+            vec![Value::Null, Value::Integer(20), Value::Null]
+        );
+    }
+
+    /// Section 8.2's dispatch rule, which is the whole difference between this form and a dictionary
+    /// and is one comparison. A gather off a parent larger than the chunk does not want the
+    /// dictionary arm of any kernel, and a gather off a source smaller than the chunk does.
+    #[test]
+    fn folding_over_the_source_is_worth_it_only_when_the_source_is_the_shorter_one() {
+        let wide = Arc::new(integers(&(0..64).collect::<Vec<i32>>()));
+        let narrow = Arc::new(integers(&[1, 2]));
+        let off_wide = Vector::gathered(wide, Arc::new(vec![0, 1, 2])).unwrap();
+        let off_narrow = Vector::gathered(narrow, Arc::new(vec![0, 1, 0, 1, 0])).unwrap();
+        assert!(!off_wide.fold_over_source(), "sixty four source rows to answer three");
+        assert!(off_narrow.fold_over_source(), "two source rows to answer five");
+        assert!(!integers(&[1, 2]).fold_over_source(), "and every other form says no");
+    }
+
+    /// Strings, which read their bytes where the source already has them rather than through a value.
+    /// A gather of a string column is four bytes a row and no arena is touched until something asks.
+    #[test]
+    fn a_gathered_string_is_read_where_the_source_put_it() {
+        let mut column = StringColumn::new();
+        column.push("red");
+        column.push("a string too long to sit inside a sixteen byte view");
+        let source = Arc::new(Vector::flat(LogicalType::Varchar, Data::Varlen(column)).unwrap());
+        let vector = Vector::gathered(source, Arc::new(vec![1, 0, NO_ROW])).unwrap();
+        assert_eq!(vector.text_at(0), Some("a string too long to sit inside a sixteen byte view"));
+        assert_eq!(vector.text_at(1), Some("red"));
+        assert_eq!(vector.text_at(2), None);
+        assert_eq!(vector.bytes_at(1), Some(b"red".as_slice()));
+        assert_eq!(vector.value_at(1), Value::Varchar("red".into()));
+    }
+
+    /// The integer accessor a group by keys through, which has to agree with `value_at` at every
+    /// row or two rows holding one value land in two groups.
+    #[test]
+    fn the_signed_reader_of_a_gather_agrees_with_the_value_reader() {
+        let source = Arc::new(integers(&[10, 20, 30]));
+        let vector = Vector::gathered(source, Arc::new(vec![2, NO_ROW, 0, 1])).unwrap();
+        for row in 0..vector.len() {
+            let signed = vector.signed_at(row);
+            match vector.value_at(row) {
+                Value::Null => assert_eq!(signed, None),
+                Value::Integer(held) => assert_eq!(signed, Some(i128::from(held))),
+                other => panic!("an integer column answered {other}"),
+            }
+        }
+    }
+
+    /// Flattening gives up the form, which is what it is for, and what comes out holds the values the
+    /// gather stood for, nulls included.
+    #[test]
+    fn flattening_a_gather_writes_out_the_rows_it_pointed_at() {
+        let source = Arc::new(integers(&[10, 20, 30]));
+        let vector = Vector::gathered(source, Arc::new(vec![2, NO_ROW, 0])).unwrap();
+        let flat = vector.flatten().unwrap();
+        assert_eq!(flat.form(), Form::Flat);
+        assert_eq!(
+            flat.iter().collect::<Vec<_>>(),
+            vec![Value::Integer(30), Value::Null, Value::Integer(10)]
+        );
+    }
+
+    /// A gather counts a share of what it shares, for the reason a dictionary does. Eight columns
+    /// gathered off one parent are one parent between them, not eight.
+    #[test]
+    fn a_parent_gathered_by_many_columns_is_counted_about_once_between_them() {
+        let source = Arc::new(integers(&(0..4096).collect::<Vec<i32>>()));
+        let rids = Arc::new(vec![0; 64]);
+        let alone = Vector::gathered(Arc::clone(&source), Arc::clone(&rids)).unwrap().footprint();
+        let many = (0..8)
+            .map(|_| Vector::gathered(Arc::clone(&source), Arc::clone(&rids)).unwrap())
+            .collect::<Vec<_>>();
+        let together = many.iter().map(Vector::footprint).sum::<usize>();
+        assert!(
+            together < alone * 2,
+            "eight gathers off one parent reported {together} against {alone} for one"
         );
     }
 }
