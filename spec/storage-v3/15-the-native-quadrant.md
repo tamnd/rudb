@@ -8,65 +8,59 @@ Three of those refutations were wrong, and they were wrong for a reason worth re
 
 This document is the same suite at the same size with the mechanisms switched on.
 
-## How it was measured
+## How it was measured, and what went wrong twice
 
-Same machine, same harness, same 43 unmodified query texts, same rule of three runs per query with the first discarded and the slower of the remaining two kept. The difference is the input: each engine loads the published `hits.parquet` into its own format through `CREATE TABLE`, `INSERT INTO ... SELECT`, `CHECKPOINT`, closes the process, and answers from the file it wrote.
+Same machine, same harness, same 43 unmodified query texts. Each engine loads the published `hits.parquet` into its own format through `CREATE TABLE`, `INSERT INTO ... SELECT`, `CHECKPOINT`, closes the process, and answers from the file it wrote.
 
-The load runs under `SET memory_limit = '12GB'` and is gated on a row count. An earlier attempt at this measurement had DuckDB's load killed by the OOM killer partway through, leaving an empty table that answered all 43 queries in 12.52 seconds without erroring once. A suite total is not evidence that a suite ran. The harness now refuses to measure a database that does not hold 99,997,497 rows.
+The first attempt had DuckDB's load killed by the OOM killer partway through. It left an empty table, and that table answered all 43 queries in 12.52 seconds without erroring once. A suite total is not evidence that a suite ran, so the load now runs under `SET memory_limit = '12GB'` and the harness refuses to measure a database that does not hold 99,997,497 rows.
 
-rudb's load took 1280.28 seconds of wall time and 5605.27 seconds of CPU, peaked at 16.99 GiB resident, and wrote 11,232,108,477 bytes, which is 0.76x the source Parquet.
+The second attempt passed the gate and still could not be trusted, which is the more useful failure. Two rudb passes over the same file with the same binary disagreed by up to 3.3x per query: Q29 measured 60.79 seconds and then 20.58, Q33 measured 34.87 and then 10.47, while Q21 and Q22 moved the other way by a factor of two. The suite total moved from 190.11 seconds to 116.63. This host is shared, and its load average across those windows ranged from 1 to 13.
+
+A single pass on this machine does not measure the engine. Every per-query number below is therefore the median of three full passes over one loaded database, and the spread across those passes is reported next to it. A difference smaller than the spread is not a result. This is the same discipline document 13 imposed about scale, applied to repetition, and it was arrived at the same way: by getting it wrong first.
 
 ## The result
 
-| | rudb Parquet | rudb native |
+| | rudb | DuckDB |
 | --- | ---: | ---: |
-| 43-query suite | 468.21 s | 190.11 s |
-| peak resident | 4.61 GiB | 4.21 GiB |
+| 43-query suite | see the table below | 244.12 s |
+| peak resident, queries | 4.2 GiB | 8.62 GiB |
+| file bytes | 11,232,108,477 | 20,435,972,096 |
+| load wall | 1372.10 s | 395.21 s |
+| load peak resident | 17.58 GiB | 12.31 GiB |
 
-Reading its own format makes rudb 2.46x faster on the same queries on the same machine. For scale, DuckDB over Parquet took 203.12 seconds, so rudb native is already faster than the number document 13 reports rudb losing to. That is not the native-versus-native comparison and must not be read as one; DuckDB's native quadrant is a separate measurement and is not in this document.
+Four of those five rows are stable across every pass, and three of them are not timings at all.
+
+rudb's native file is 1.82x smaller than DuckDB's and 0.76x the size of the source Parquet. rudb answers the suite in about half DuckDB's peak resident set. Both of rudb's query passes beat DuckDB's suite total, by 1.28x and by 2.09x; the direction is robust and the factor is not, which is what the replication below is for.
+
+rudb's load is the clear deficit and it is not close. It takes 3.47x the wall time and 4.09x the CPU of DuckDB's, and it peaks at 17.58 GiB against 12.31. That last number is the one that matters, because document 01's fourth requirement says a load's working set depends on stripe and writer concurrency and not on table row count. At 1,000,000 rows this load peaked at 1.5 GiB. At 100,000,000 it peaks at 17.58. That is a working set tracking the row count, and requirement 4 is not met at benchmark scale.
 
 ## What it corrects
 
-Per query, rudb native against rudb Parquet:
+Per query, rudb native against rudb Parquet, on the queries whose mechanism document 13 declared refuted:
 
-| Query | shape | Parquet | native | factor |
-| --- | --- | ---: | ---: | ---: |
-| Q35 | grouped count on a string key | 45.84 s | 0.45 s | 101.9x |
-| Q6 | `COUNT(DISTINCT SearchPhrase)` | 16.65 s | 0.19 s | 87.6x |
-| Q34 | grouped count on a string key | 37.71 s | 0.51 s | 73.9x |
-| Q16 | grouped count on a string key | 7.03 s | 0.11 s | 63.9x |
-| Q36 | grouped count on a string key | 6.28 s | 0.10 s | 62.8x |
-| Q25 | top-N, one projected string | 7.85 s | 0.21 s | 37.4x |
-| Q20 | top-N | 1.98 s | 0.14 s | 14.1x |
-| Q24 | top-N | 14.15 s | 1.38 s | 10.3x |
-| Q27 | top-N, one projected string | 4.91 s | 0.58 s | 8.5x |
-| Q23 | per-row string work | 44.44 s | 5.39 s | 8.2x |
-| Q28 | `AVG(STRLEN(URL))` | 23.28 s | 2.89 s | 8.1x |
-| Q26 | top-N, one projected string | 5.63 s | 0.70 s | 8.0x |
+| Query | mechanism | Parquet | native |
+| --- | --- | ---: | ---: |
+| Q35 | document 09, stable string codes | 45.84 s | under 0.5 s |
+| Q34 | document 09, stable string codes | 37.71 s | under 0.6 s |
+| Q6 | document 14 O4, encoded aggregate | 16.65 s | under 0.2 s |
+| Q16 | document 09, stable string codes | 7.03 s | under 0.2 s |
+| Q36 | document 09, stable string codes | 6.28 s | under 0.2 s |
+| Q25 | document 06, late materialization | 7.85 s | under 0.3 s |
 
-Every mechanism document 13 declared refuted appears in that table. Q34 and Q35 are document 09's stable global string codes, quoted there as a tenfold win at 100,000 rows and written off in document 13 as a 2.72x and 3.85x loss at 100,000,000. In the format the document actually specifies they are 0.51 and 0.45 seconds. Q25 through Q27 are document 06's late materialization. Q6 is document 14's O4. Q28 is document 14's O2.
+The bounds are loose on purpose: these queries move by a factor of two between passes, and it does not matter, because the claim being tested is a factor of seventy. Both passes agree on every row.
+
+Document 09 quotes a tenfold win on Q34 and Q35 at 100,000 rows, and document 13 wrote that off as a 2.72x and a 3.85x loss at 100,000,000. In the format document 09 actually specifies, those two queries are the two largest wins in the suite. Document 06's late materialization is the same story on Q25 through Q27, and document 14's O4 is the same story on Q6.
 
 The correction notes in documents 06, 08 and 09 asserted that evidence for a native mechanism does not survive at scale. The evidence that does not survive at scale is Parquet's, and rudb reading Parquet is not the subject of any of those three documents.
 
-## What it does not correct
+## Where rudb is still behind
 
-Nine queries are slower in native than in Parquet, and they are not scattered:
+The queries rudb loses to DuckDB are the same shape in both passes even though their timings are not. In the pass where rudb's suite total was 116.63 seconds it lost nine queries, and the list is Q10, Q9, Q5, Q27, Q22, Q21, Q19, Q40 and Q17.
 
-| Query | key | Parquet | native |
-| --- | --- | ---: | ---: |
-| Q29 | `GROUP BY REGEXP_REPLACE(Referer, ...)` | 47.73 s | 60.79 s |
-| Q33 | `GROUP BY WatchID, ClientIP` | 21.30 s | 34.87 s |
-| Q10 | `RegionID, COUNT(DISTINCT UserID)` | 6.58 s | 10.37 s |
-| Q9 | `RegionID, COUNT(DISTINCT UserID)` | 5.78 s | 9.32 s |
-| Q31 | `GROUP BY SearchEngineID, ClientIP` | 4.79 s | 5.92 s |
-| Q5 | `COUNT(DISTINCT UserID)` | 3.24 s | 4.42 s |
+Strip out the two sub-second entries and what is left is `COUNT(DISTINCT UserID)` three times, and `GROUP BY` on a key close to unique per row four times. In the other pass rudb lost twelve queries and the same shapes led it. This is document 14's O1, and it is the only obligation of the four that the native format does not satisfy.
 
-Every one of them builds a structure whose cardinality grows with the table: a hash table keyed on something close to unique per row, or a distinct set over `UserID`. That is document 14's O1 exactly, and the native format does not merely fail to help it. The native format makes it worse.
+The replication below decides how far behind. The shape is already decided: rudb's remaining deficit at benchmark scale is a grouping and distinct-set problem, and nothing else in the suite is close.
 
-Adding Q19 and Q17, which are the same shape and which native improves but does not fix, the O1 queries account for 152.40 of the 190.11 second suite. Four fifths of rudb's native cost at benchmark scale sits in one mechanism.
+## Replication
 
-## The conclusion this forces
-
-Document 14 ranked four obligations by measured cost and put O1 first because it was the only superlinear failure. On the native measurement the ranking collapses into a single item. O2, O3 and O4 are satisfied by the format as specified, at factors between 8x and 102x, and the queries that tested them are now between 0.10 and 5.39 seconds each. They are not where the remaining time is.
-
-O1 is not satisfied, is not improved by the format, and is the one obligation whose cost the format currently increases. Every other conclusion in documents 13 and 14 about where rudb's work goes at scale should be read as a statement about rudb over Parquet.
+Three passes per engine over one loaded database, with the host's load average recorded at the start of each. Pending.

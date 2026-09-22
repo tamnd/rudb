@@ -48,9 +48,9 @@ structure of size `G`.** When `G` is small the distinction is invisible because 
 
 *Refuted by:* rudb's Q19 growing 117.4x when `R` grew 100x. A linear algorithm grows 100x. DuckDB grew 13.4x on the same query and the same file.
 
-*Refuted again, and more sharply, by the native format.* Every other obligation here is satisfied once rudb reads its own file. This one gets worse: document 15 measures Q29 at 60.79 seconds in native against 47.73 in Parquet, Q33 at 34.87 against 21.30, Q9 at 9.32 against 5.78, Q10 at 10.37 against 6.58, and Q5 at 4.42 against 3.24. Nine queries in the suite are slower in native than in Parquet and every one of them keys a structure that grows with the table. A format that speeds up 34 queries and slows down exactly the ones whose group count is unbounded is pointing at its grouping path and at nothing else.
+*Refuted again by the native format, which is the part that matters.* Every other obligation here is satisfied once rudb reads its own file, at factors between 8x and 102x. This one is not. Document 15 measures the native quadrant at full scale and every query rudb loses to DuckDB there is either a `COUNT(DISTINCT UserID)` or a `GROUP BY` on a key close to unique per row, in both of its passes, with no other shape in the list above a second.
 
-Together those queries plus Q19 and Q17 are 152.40 seconds of the 190.11 second native suite. Four fifths of rudb's cost at benchmark scale is this one obligation.
+A format change that improves 34 queries by up to two orders of magnitude and leaves exactly the unbounded-cardinality ones behind is pointing at its grouping path and at nothing else.
 
 **O2. A predicate or a scalar function over a column costs `O(D(Q, c))` evaluations, not `O(R)`.**
 Evaluating `STRLEN(URL)` 100,000,000 times when the dictionary has 15,000,000 entries is 85,000,000 evaluations of something already known. The result of a deterministic scalar function of a dictionary code is a property of the code. It is computed once per code and gathered per row, and the gather is an integer indexed load, which is the cheapest operation in the engine.
@@ -107,13 +107,16 @@ This is the enforcement mechanism that document 00's principle never had, and it
 
 The first revision ranked four items by their excess over DuckDB in the Parquet suite. Ranked instead by rudb's own measured cost in the native suite, which is the configuration the project ships and which needs no rival to compute, there is one item.
 
-1. **O1, partitioned grouping and partitioned distinct.** Q29, Q33, Q19, Q17, Q10, Q9, Q31, Q32 and
-   Q5 account for 152.40 seconds of the 190.11 second native suite. Nothing else is close: the
-   remaining 34 queries together are 37.71 seconds, and 28 of them are under one second each.
-2. **O2's remainder, a predicate result cache keyed by dictionary identity.** Q28 at 2.89 seconds is
-   the only query left that would measure it.
-3. **O3's remainder, widening document 06's eligibility rule.** Q24 at 1.38 seconds is the whole
-   opportunity.
+1. **O1, partitioned grouping and partitioned distinct.** Q29, Q33, Q19, Q17, Q22, Q21, Q10, Q9 and
+   Q5. These are the largest queries in rudb's native suite and they are every query it loses to
+   DuckDB there.
+2. **O2's remainder, a predicate result cache keyed by dictionary identity.** Q28 is the only query
+   left that would measure it, at a few seconds.
+3. **O3's remainder, widening document 06's eligibility rule.** Q24 is the whole opportunity, at
+   about a second and a half.
+4. **Load working set.** Not one of the four obligations, and the largest single gap in the native
+   quadrant: document 15 measures rudb's load at 3.47x DuckDB's wall time and 17.58 GiB peak,
+   against document 01's requirement that a load's working set not track the row count.
 
 O1 was already first in the previous ranking, for the right reason: it is the only one of the four whose failure is superlinear, and a superlinear term is the only kind that gets worse than the measurement says when the data grows again. ClickBench at 100,000,000 rows is not the largest table rudb is meant to hold. The native measurement adds a second reason, which is that the other three are no longer costing enough to rank.
 
@@ -121,7 +124,9 @@ It also narrows what O1 means. Q5, Q9 and Q10 are `COUNT(DISTINCT UserID)`, not 
 
 ## What this document does not claim
 
-The four obligations are derived from query shape, from growth rates, and from one format-to-format comparison, not from a profile. That evidence is strong enough to rank the work and to rule out the hypotheses that do not fit, since rudb using eight to twelve times less memory than DuckDB on the queries it loses worst rules out spilling, and since a format change that improved 34 queries and degraded 9 sharing one property is hard to attribute to anything but that property. It does not identify a line of code.
+The four obligations are derived from query shape, from growth rates, and from one format-to-format comparison, not from a profile. That evidence is strong enough to rank the work and to rule out the hypotheses that do not fit, since rudb using half DuckDB's peak resident set across the native suite rules out spilling, and since a format change that improves most of the suite by up to two orders of magnitude while leaving one shape behind is hard to attribute to anything but that shape. It does not identify a line of code.
+
+Document 15 also establishes how much noise this host contributes, and it is more than the project assumed: two passes of the same binary over the same file disagreed by up to 3.3x per query. No claim in either document rests on a difference smaller than that, and claims that did have been withdrawn.
 
 It is also worth saying plainly what the first revision of this document got wrong, because the mistake was not in the obligations. O1 through O4 were stated before the native measurement existed and all four survived it. The mistake was attaching each one to a refutation drawn from a configuration in which the mechanism under test was not running, and then ranking a work plan by those refutations. The obligations were falsifiable, which is what they were for. The evidence chosen to falsify them was measuring something else.
 
@@ -130,13 +135,14 @@ Before O1 is worked, the profile that confirms it must be taken at full scale in
 - **The knee.** Cache miss rate and TLB miss rate per probe against `G`, at four group counts
   spanning cache-resident to far larger than memory. The prediction is a knee where `G` leaves L3.
   If there is no knee, the cause is not the hash table and this document is wrong about Q19.
-- **The regression.** Why Q29, Q33, Q9, Q10 and Q5 are slower in native than in Parquet, when the
-  scan feeding them got faster. The prediction is that the native scan delivers rows to the
-  grouping path faster than the Parquet scan did, so a probe cost that was hidden behind decode is
-  now exposed. If instead the native path is doing something extra per group, that is a different
-  bug and it is cheaper to fix than partitioning.
+- **The asymmetry.** Why the native format improves the bounded-cardinality grouped queries by up
+  to two orders of magnitude and the unbounded ones barely at all, when both take the same code
+  path once the keys are in hand. The prediction is that the small-`G` queries are winning on the
+  scan and on code-space keys while the probe cost is unchanged underneath, so the probe is
+  invisible at small `G` and is the entire cost at large `G`. If instead the large-`G` queries are
+  taking a different path, that is a smaller bug than partitioning and should be found first.
 
-The second of those is the one to take first, because it is a comparison this project already has both sides of, and because an obligation that a format change made worse is usually a smaller mistake than an obligation that was never met.
+The second of those is the one to take first, because both sides of the comparison already exist in document 15 and it costs a profile rather than a design.
 
 O2, O3 and O4 no longer need a confirming profile. They needed one while they were reported as refuted, and they are not.
 
