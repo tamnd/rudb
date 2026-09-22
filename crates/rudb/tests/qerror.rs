@@ -52,17 +52,18 @@ fn warnings(database: &Database, sql: &str) -> String {
 #[test]
 fn the_statistics_section_measures_every_class_against_the_run() {
     // Two classes in one plan. The scan's count comes out of the catalog and is exact, so its
-    // q-error has to be one, and the group by over it is the constant that says a tenth of the rows
-    // survive, which is a guess and is wrong by the amount that constant is wrong by. Printing the
-    // two together and undivided would say the plan was two thirds right, which is true of neither
-    // half of it.
+    // q-error has to be one. The group by over it is read off the distinct count of the column it
+    // groups by, which is a guess and stays one however right it turns out, because a sketch that
+    // happened to land is still a sketch. Printing the two together and undivided would say the
+    // plan was two thirds right, which is true of neither half of it.
     let database = with_rows(1000);
     let section = statistics(&database, "SELECT a, count(*) FROM t GROUP BY a");
     assert!(section.contains("q-error against the rows the run produced, 3 measured"), "{section}");
     assert!(section.contains("\n    exact 1: 1 at 1\n"), "{section}");
-    // A tenth of a thousand is a hundred against a thousand, because every value of `a` is its own
-    // group, and the projection above carries the same guess.
-    assert!(section.contains("\n    estimated 2: 2 up to 10, worst 10.0\n"), "{section}");
+    // Every value of `a` is its own group and nothing filtered any of them away, so the estimate is
+    // the distinct count itself and the projection above carries it. The constant this replaced said
+    // a tenth of a thousand, which was a hundred groups where there are a thousand.
+    assert!(section.contains("\n    estimated 2: 2 at 1\n"), "{section}");
 }
 
 #[test]
