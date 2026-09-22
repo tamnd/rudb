@@ -732,7 +732,7 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
 
 /// Whether shifting a clock by an interval takes it out of the day it started in.
 ///
-/// [`shift`] brings a time round at midnight and throws away the whole days, because a time is a
+/// The shift above brings a time round at midnight and throws away the whole days, because a time is a
 /// clock and not a point in history, and that is the answer both engines give for the subtraction
 /// written on its own. A window frame bound wants the other reading of the same distance. `RANGE
 /// BETWEEN INTERVAL '2' HOUR PRECEDING` on a row at half past midnight is asking for everything
@@ -745,7 +745,7 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
 /// back past the start of the day twice over. So the question is asked here, where the interval is
 /// still in front of us, rather than guessed at from what came back.
 ///
-/// The whole days and the months count towards the distance here even though [`shift`] drops them,
+/// The whole days and the months count towards the distance here even though the shift drops them,
 /// which is the reference binary's behaviour for a frame and not an oversight: `RANGE BETWEEN
 /// INTERVAL '1' DAY PRECEDING` over a time key covers the whole day up to the row. A month is
 /// counted as the shortest one there is, since any whole month is longer than the day a clock holds
