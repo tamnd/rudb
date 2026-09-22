@@ -187,6 +187,28 @@ enum State {
     Extreme { held: Option<Box<Extremum>>, least: bool },
 }
 
+/// An accumulator's answer as a number, before anything decides what type it is written as.
+#[derive(Debug, Clone, Copy)]
+enum Answer {
+    /// No row contributed, so the answer is null whatever the column is.
+    Null,
+    /// A whole number, either an integer or the unscaled part of a decimal.
+    Whole(i128),
+    /// A floating point number.
+    Real(f64),
+}
+
+/// Which run at a time finish a call takes, decided once per call from the state and the column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Every answer is an [`Answer::Whole`] narrowed to the column's own integer width.
+    Whole,
+    /// Every answer is an [`Answer::Real`] written as a `DOUBLE`.
+    Double,
+    /// Every answer is an [`Answer::Real`] written as a `FLOAT`.
+    Float,
+}
+
 /// What a min or a max is holding.
 #[derive(Debug, Clone)]
 enum Extremum {
@@ -734,26 +756,36 @@ impl Accumulator {
     ///
     /// If the running total does not fit the declared return type.
     pub fn finish(&self) -> Result<Value> {
-        match &self.state {
-            State::Counted { count, .. } => Ok(Value::BigInt(*count)),
-            State::Whole { total, seen, .. } => {
-                if !seen {
-                    return Ok(Value::Null);
+        // The arithmetic is in `answer` so that the run at a time finish below reaches the same
+        // number by the same route. What is left here is turning that number into a `Value`, which
+        // is the part the run at a time finish exists to skip.
+        let Some(answer) = self.answer() else {
+            let State::Extreme { held, .. } = &self.state else {
+                return Err(Error::internal(
+                    "an accumulator with no number and no extreme in it".to_string(),
+                ));
+            };
+            return held.as_deref().map_or(Ok(Value::Null), Extremum::value);
+        };
+        match answer {
+            Answer::Null => Ok(Value::Null),
+            Answer::Whole(total) => match &self.state {
+                State::Counted { count, .. } => Ok(Value::BigInt(*count)),
+                State::Scaled { scale, .. } => {
+                    let width = match self.returns() {
+                        Return::Decimal(width) => width,
+                        _ => rudb_common::MAX_DECIMAL_WIDTH,
+                    };
+                    Ok(Value::Decimal { unscaled: total, width, scale: *scale })
                 }
-                let returns = self.returns().logical();
-                fit(*total, &returns).ok_or_else(|| {
-                    Error::out_of_range(format!("a sum of {total} does not fit in {}", returns))
-                })
-            }
-            State::Real { total, seen, .. } => {
-                if *seen == 0 {
-                    return Ok(Value::Null);
+                _ => {
+                    let returns = self.returns().logical();
+                    fit(total, &returns).ok_or_else(|| {
+                        Error::out_of_range(format!("a sum of {total} does not fit in {}", returns))
+                    })
                 }
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "the count of rows in one group is well inside the exact range"
-                )]
-                let answer = if self.kind() == Kind::Avg { total / *seen as f64 } else { *total };
+            },
+            Answer::Real(answer) => {
                 if self.returns() == Return::Float {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -763,9 +795,35 @@ impl Accumulator {
                 }
                 Ok(Value::Double(answer))
             }
+        }
+    }
+
+    /// The answer as a number, for the run at a time finish, or `None` for a state that owns one.
+    ///
+    /// This is [`Accumulator::finish`] with the `Value` left off the end of it, and the two share
+    /// every line that decides what the number is so that they cannot drift apart. `Whole` carries
+    /// an answer that belongs in an integer or an unscaled decimal, `Real` one that belongs in a
+    /// float, and the caller narrows either one to the column it is writing.
+    fn answer(&self) -> Option<Answer> {
+        match &self.state {
+            State::Counted { count, .. } => Some(Answer::Whole(i128::from(*count))),
+            State::Whole { total, seen, .. } => {
+                Some(if *seen { Answer::Whole(*total) } else { Answer::Null })
+            }
+            State::Real { total, seen, .. } => {
+                if *seen == 0 {
+                    return Some(Answer::Null);
+                }
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "the count of rows in one group is well inside the exact range"
+                )]
+                let answer = if self.kind() == Kind::Avg { total / *seen as f64 } else { *total };
+                Some(Answer::Real(answer))
+            }
             State::Mean { total, seen, exact, scale, .. } => {
                 if *seen == 0 {
-                    return Ok(Value::Null);
+                    return Some(Answer::Null);
                 }
                 let total = if *exact { exactly(*total) } else { mean_real(*total) };
                 // One division, by the count and the scale together. Where the column was a decimal
@@ -780,27 +838,44 @@ impl Accumulator {
                     reason = "the count of rows in one group is well inside the exact range"
                 )]
                 let divisor = *seen as f64 * pow10(*scale) as f64;
-                let answer = total / divisor;
-                if self.returns() == Return::Float {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "a declared FLOAT result is a FLOAT"
-                    )]
-                    return Ok(Value::Float(answer as f32));
-                }
-                Ok(Value::Double(answer))
+                Some(Answer::Real(total / divisor))
             }
-            State::Scaled { total, scale, seen, .. } => {
-                if !seen {
-                    return Ok(Value::Null);
-                }
-                let width = match self.returns() {
-                    Return::Decimal(width) => width,
-                    _ => rudb_common::MAX_DECIMAL_WIDTH,
-                };
-                Ok(Value::Decimal { unscaled: *total, width, scale: *scale })
+            State::Scaled { total, seen, .. } => {
+                Some(if *seen { Answer::Whole(*total) } else { Answer::Null })
             }
-            State::Extreme { held, .. } => held.as_deref().map_or(Ok(Value::Null), Extremum::value),
+            State::Extreme { .. } => None,
+        }
+    }
+
+    /// Which run at a time finish, if any, this state can take, given the column being written.
+    ///
+    /// The answer depends only on the state's shape and the column's type, and every state of one
+    /// call has the same shape, so the caller asks once per call rather than once per group.
+    fn route(&self, ty: &LogicalType) -> Option<Route> {
+        let returns = Return::new(ty);
+        match &self.state {
+            // COUNT declares BIGINT and `finish` answers BIGINT without consulting the type, so the
+            // run path takes it only where the two already agree.
+            State::Counted { .. } => (returns == Return::BigInt).then_some(Route::Whole),
+            State::Whole { returns: held, .. } => (returns == *held).then_some(Route::Whole),
+            // The state holds the sum of the stored integers and the column stores integers at its
+            // own scale, so the two scales have to be the same one for the total to go in as it is.
+            State::Scaled { returns: held, scale, .. } => match ty {
+                LogicalType::Decimal { scale: column, .. }
+                    if column == scale && returns == *held =>
+                {
+                    Some(Route::Whole)
+                }
+                _ => None,
+            },
+            State::Real { returns: held, .. } | State::Mean { returns: held, .. } => {
+                match (returns, held) {
+                    (Return::Float, Return::Float) => Some(Route::Float),
+                    (Return::Double, Return::Double) => Some(Route::Double),
+                    _ => None,
+                }
+            }
+            State::Extreme { .. } => None,
         }
     }
 
@@ -812,6 +887,136 @@ impl Accumulator {
         let added = i128::from(offset).checked_mul(i128::from(rows)).ok_or_else(overflowed)?;
         Ok(Value::HugeInt(total.checked_add(added).ok_or_else(overflowed)?))
     }
+}
+
+/// Finishes one call's states into one vector, without building a `Value` per group.
+///
+/// `at` is the groups to emit, in the order they are to be emitted, and the state for one of them is
+/// at `slot * stride + offset`, which is the same layout [`update_scattered`] folds into. The result
+/// is a flat vector of `ty` with as many rows as there are slots.
+///
+/// The row at a time alternative is what this replaces and it is what the caller falls back to when
+/// this returns `Ok(None)`. That path asks each accumulator for a `Value`, pushes it into a vector
+/// of values, and then hands the whole run to `Vector::from_values`, which pushes every value again
+/// into the flat data, reads them all back once more to build the validity mask, and drops them.
+/// Four passes and an owning tagged value per group per call to move eight bytes. Measured on TPC-H
+/// SF1 in `spec/perf/14-what-a-group-costs.md`, that was the single largest thing that grew when a
+/// grouped aggregate got another call, at 0.479 G of the 3.248 G two added calls cost.
+///
+/// What is left here is one pass. The route is decided once from the first state and the column
+/// type, the answers go into a run of numbers, and the run is narrowed into the column's own layout.
+/// Nothing is allocated per group and nothing is dropped per group.
+///
+/// `Ok(None)` is a shape this does not cover, which is a `min` or a `max`, whose state owns a value
+/// away from itself, and any call whose declared return type is not the one its state was built for.
+/// Those go the old way and answer the same.
+///
+/// # Errors
+///
+/// If a total does not fit the declared return type, which is the error [`Accumulator::finish`]
+/// raises for the same total, and an internal error if a slot is outside the states.
+pub fn finish_run(
+    states: &[Accumulator],
+    at: &[usize],
+    stride: usize,
+    offset: usize,
+    ty: &LogicalType,
+) -> Result<Option<Vector>> {
+    let Some(first) = at.first() else {
+        return Ok(None);
+    };
+    let reach = |slot: usize| {
+        states
+            .get(slot * stride + offset)
+            .ok_or_else(|| Error::internal(format!("group {slot} has no state for call {offset}")))
+    };
+    let Some(route) = reach(*first)?.route(ty) else {
+        return Ok(None);
+    };
+    // One `true` per row rather than a bitmap, because the mask is built from the run in one call
+    // afterwards and a byte a row is what that call reads. At a chunk of 2048 groups it is 2 KiB.
+    let mut valid = vec![true; at.len()];
+    let data = match route {
+        Route::Whole => {
+            let mut answers: Vec<i128> = Vec::with_capacity(at.len());
+            for (row, &slot) in at.iter().enumerate() {
+                match reach(slot)?.answer() {
+                    Some(Answer::Whole(total)) => answers.push(total),
+                    Some(Answer::Null) => {
+                        valid[row] = false;
+                        answers.push(0);
+                    }
+                    // A run whose first state took a route and whose later states cannot is a state
+                    // array that holds two shapes for one call, which the operator does not build.
+                    _ => return Ok(None),
+                }
+            }
+            narrow(&answers, &valid, ty)?
+        }
+        Route::Double | Route::Float => {
+            let mut answers: Vec<f64> = Vec::with_capacity(at.len());
+            for (row, &slot) in at.iter().enumerate() {
+                match reach(slot)?.answer() {
+                    Some(Answer::Real(answer)) => answers.push(answer),
+                    Some(Answer::Null) => {
+                        valid[row] = false;
+                        answers.push(0.0);
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            if route == Route::Float {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a declared FLOAT result is a FLOAT"
+                )]
+                Data::Float32(answers.iter().map(|&answer| answer as f32).collect())
+            } else {
+                Data::Float64(answers.into())
+            }
+        }
+    };
+    let vector = Vector::flat(ty.clone(), data)?;
+    Ok(Some(vector.with_validity(Validity::from_run(&valid))))
+}
+
+/// A run of whole answers as the layout `ty` stores, which is the check [`fit`] makes per value.
+///
+/// A null row carries a zero in the run and is skipped by the range check, because a value that is
+/// not there cannot fail to fit and the mask is what says it is not there.
+fn narrow(answers: &[i128], valid: &[bool], ty: &LogicalType) -> Result<Data> {
+    macro_rules! narrowed {
+        ($variant:ident, $native:ty) => {{
+            let mut out: Vec<$native> = Vec::with_capacity(answers.len());
+            for (row, &total) in answers.iter().enumerate() {
+                if !valid[row] {
+                    out.push(0);
+                    continue;
+                }
+                out.push(<$native>::try_from(total).map_err(|_| {
+                    Error::out_of_range(format!("a sum of {total} does not fit in {ty}"))
+                })?);
+            }
+            Data::$variant(out.into())
+        }};
+    }
+    Ok(match ty.physical() {
+        PhysicalType::Int8 => narrowed!(Int8, i8),
+        PhysicalType::Int16 => narrowed!(Int16, i16),
+        PhysicalType::Int32 => narrowed!(Int32, i32),
+        PhysicalType::Int64 => narrowed!(Int64, i64),
+        PhysicalType::Int128 => Data::Int128(answers.to_vec().into()),
+        PhysicalType::UInt8 => narrowed!(UInt8, u8),
+        PhysicalType::UInt16 => narrowed!(UInt16, u16),
+        PhysicalType::UInt32 => narrowed!(UInt32, u32),
+        PhysicalType::UInt64 => narrowed!(UInt64, u64),
+        PhysicalType::UInt128 => narrowed!(UInt128, u128),
+        other => {
+            return Err(Error::internal(format!(
+                "a whole aggregate answer cannot be written as {other:?}"
+            )));
+        }
+    })
 }
 
 /// Folds one vector into many accumulators, each row into the one its slot points at.
@@ -2725,6 +2930,107 @@ mod tests {
             update_scattered(&mut states, slots, STRIDE, OFFSET, input, slots.len())?;
         }
         (0..groups).map(|group| states[group * STRIDE + OFFSET].finish()).collect()
+    }
+
+    /// The states the two tests above build, handed back rather than finished.
+    fn scattered_states(
+        name: &str,
+        returns: &LogicalType,
+        batches: &[(Vector, Vec<usize>)],
+        groups: usize,
+        reads: bool,
+    ) -> Result<Vec<Accumulator>> {
+        let mut states = Vec::new();
+        for _ in 0..groups * STRIDE {
+            states.push(Accumulator::new(name, returns)?);
+        }
+        for (batch, slots) in batches {
+            let input = reads.then_some(batch);
+            update_scattered(&mut states, slots, STRIDE, OFFSET, input, slots.len())?;
+        }
+        Ok(states)
+    }
+
+    /// The run at a time finish against the `Value` at a time one, over every aggregate and type.
+    ///
+    /// [`finish_run`] is allowed to decline a shape. It is not allowed to answer differently from
+    /// the loop it replaces on a shape it takes, and that is the whole of what this checks: the same
+    /// states finished both ways, compared row by row with the nulls, at three null densities so
+    /// that a group which saw nothing and a group which saw only nulls are both in there.
+    ///
+    /// The second half of the assertion matters as much as the first. `min` and `max` are expected
+    /// to decline, every other aggregate over every numeric type is expected to be taken, and a
+    /// change that quietly stops covering `sum` would otherwise pass this test by falling back.
+    #[test]
+    fn the_run_at_a_time_finish_answers_what_the_value_at_a_time_finish_answers() {
+        let mut rng = Rng(0x5eed_ca11_ab1e_00f1);
+        let groups = 5;
+        let types = [
+            LogicalType::TinyInt,
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::HugeInt,
+            LogicalType::UBigInt,
+            LogicalType::Float,
+            LogicalType::Double,
+            LogicalType::decimal(9, 2).expect("a legal decimal"),
+            LogicalType::decimal(30, 6).expect("a legal decimal"),
+            LogicalType::Varchar,
+        ];
+        for ty in &types {
+            for name in ["count_star", "count", "sum", "avg", "min", "max"] {
+                let returns = returns_of(name, ty);
+                let reads = name != "count_star";
+                for nulls in [0_usize, 4, 1] {
+                    let batch = flat(ty, 97, nulls, &mut rng);
+                    let slots = deal(batch.len(), groups);
+                    let dealt = vec![(batch, slots)];
+                    let note = format!("{name} over {ty}, one null in {nulls}");
+                    let Ok(states) = scattered_states(name, &returns, &dealt, groups, reads) else {
+                        continue;
+                    };
+                    let at: Vec<usize> = (0..groups).collect();
+                    let slow: Vec<Value> = at
+                        .iter()
+                        .map(|&group| states[group * STRIDE + OFFSET].finish())
+                        .collect::<Result<_>>()
+                        .expect("the value at a time finish answers for every shape here");
+                    let fast = finish_run(&states, &at, STRIDE, OFFSET, &returns)
+                        .expect("no total here is out of range");
+                    let owns = matches!(name, "min" | "max");
+                    assert_eq!(fast.is_none(), owns, "{note}: taken when it should not be");
+                    let Some(fast) = fast else { continue };
+                    assert_eq!(fast.len(), groups, "{note}");
+                    assert_eq!(fast.logical_type(), &returns, "{note}");
+                    for (group, slow) in slow.iter().enumerate() {
+                        assert_eq!(&fast.value_at(group), slow, "{note}, group {group}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The groups the caller picked, in the order it picked them, which is what a `HAVING` or a
+    /// `LIMIT` over a partition hands down. The run at a time finish reads the slots rather than a
+    /// range, so an order that is not slot order has to come out in the order it was asked for.
+    #[test]
+    fn the_run_at_a_time_finish_follows_the_slots_it_is_given() {
+        let mut rng = Rng(0x5eed_ca11_ab1e_00f2);
+        let groups = 5;
+        let ty = LogicalType::BigInt;
+        let returns = returns_of("sum", &ty);
+        let batch = flat(&ty, 97, 4, &mut rng);
+        let slots = deal(batch.len(), groups);
+        let states = scattered_states("sum", &returns, &[(batch, slots)], groups, true)
+            .expect("a sum over BIGINT builds");
+        let at = [3_usize, 0, 4];
+        let fast = finish_run(&states, &at, STRIDE, OFFSET, &returns)
+            .expect("no total here is out of range")
+            .expect("a sum over BIGINT is a shape the run at a time finish takes");
+        for (row, &group) in at.iter().enumerate() {
+            let slow = states[group * STRIDE + OFFSET].finish().expect("the sum finishes");
+            assert_eq!(fast.value_at(row), slow, "row {row} is group {group}");
+        }
     }
 
     /// Every aggregate over every type, dealt out into five groups, against one accumulator each.

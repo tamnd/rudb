@@ -29,7 +29,7 @@ use rudb_common::{
     Error, Field, LogicalType, Memory, PhysicalType, Reservation, Result, Session, Stage, Value,
     stage,
 };
-use rudb_kernels::{Accumulator, NOWHERE, is_true, settle_extremes, update_scattered};
+use rudb_kernels::{Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_scattered};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
@@ -1776,12 +1776,24 @@ impl<'a> Aggregate<'a> {
         // chunks and charged once.
         scratch.grow(width_of(VECTOR_SIZE.min(output_groups) * size_of::<Value>()))?;
         let mut results: Vec<Value> = Vec::new();
+        // The groups of one chunk, as the slots they are stored at, which is what the run at a time
+        // finish below is handed. A selection already holds them in that form and a chunk that was
+        // not selected from is a range, written out here once per chunk rather than once per call.
+        let mut run: Vec<usize> = Vec::new();
         // row at a time: the outer loop steps a chunk at a time and the key columns are copied a
         // column at a time out of the table, so the only thing left here that is per group is asking
         // each accumulator for its result, which is 2g (#61).
         for start in (0..output_groups).step_by(VECTOR_SIZE) {
             let end = (start + VECTOR_SIZE).min(output_groups);
             let slots = selected.as_ref().map(|slots| &slots[start..end]);
+            let picked: &[usize] = match slots {
+                Some(slots) => slots,
+                None => {
+                    run.clear();
+                    run.extend(start..end);
+                    &run
+                }
+            };
             let mut columns = Vec::with_capacity(width + calls);
             let mut key = 0;
             for (at, ty) in types.iter().take(width).enumerate() {
@@ -1796,6 +1808,23 @@ impl<'a> Aggregate<'a> {
                 }
             }
             for (at, ty) in types.iter().skip(width).enumerate() {
+                // The run at a time finish, for a call whose state and output column agree on a
+                // shape it covers. It writes the whole column in one pass with no `Value` per group,
+                // where the loop below asks each accumulator for a `Value`, pushes it into a run of
+                // values, pushes every one of them again into the vector's flat data, reads them all
+                // back to build the mask and then drops them. `spec/perf/14-what-a-group-costs.md`
+                // measures that round trip as the largest single thing an added aggregate call
+                // costs, at 0.479 G of the 3.248 G two added calls spend on TPC-H SF1.
+                //
+                // Everything it does not cover falls through unchanged, which is a `min` or a `max`,
+                // whose state owns a value away from itself, an affine call, which finishes from
+                // another call's state, and the two compact shapes, which have no accumulators.
+                if !self.count_only && !self.compact_numeric && self.calls[at].affine.is_none() {
+                    if let Some(vector) = finish_run(&states, picked, calls, at, ty)? {
+                        columns.push(vector);
+                        continue;
+                    }
+                }
                 // What a result owns away from itself is not knowable until it has been asked for,
                 // so that part is charged as it arrives and given back once it is in the vector.
                 let mut taken = 0;
