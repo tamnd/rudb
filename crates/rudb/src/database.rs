@@ -50,6 +50,13 @@ pub(crate) struct Shared {
 struct Inner {
     catalog: RwLock<Catalog>,
     path: Option<PathBuf>,
+    /// Whether this database may write its file, which is [`Config::read_only`] turned around.
+    ///
+    /// Read in the two places the file is written, which is `CHECKPOINT` and the write on the way
+    /// out below. Kept here rather than read back off the settings because the write on the way out
+    /// happens while the database is being dropped, and a setting is a `SET` away from being
+    /// something else by then.
+    writable: bool,
     settings: Settings,
     memory: Memory,
     pool: Pool,
@@ -63,6 +70,26 @@ struct Inner {
     /// The lock is its own rather than the catalog's because this is not part of the catalog, and it
     /// is never contended: every caller is already holding the catalog lock when it gets here.
     facts: Mutex<Arc<rudb_opt::estimate::Facts>>,
+}
+
+/// The file is written when the last handle on the database goes away.
+///
+/// A table created in one run is in the file for the next one without anybody having to say
+/// `CHECKPOINT`, which is what DuckDB does and what a program embedding a database expects of it.
+/// This runs once however many handles and connections there were, because the state is behind an
+/// `Arc` and this is the drop of the thing inside it.
+///
+/// The error is swallowed, because a `Drop` has nowhere to put one. [`Database::close`] is the same
+/// write with the error handed back, for a program that wants to know. Nothing is written for an in
+/// memory database, which has no file, or for a read only one, which was asked not to.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let Some(path) = self.path.as_ref().filter(|_| self.writable) else {
+            return;
+        };
+        let catalog = self.catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let _ = persist(path, catalog);
+    }
 }
 
 impl Default for Database {
@@ -95,10 +122,12 @@ impl Database {
     pub fn with_config(config: Config) -> Self {
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
+        let writable = !config.read_only();
         let settings = Settings::new(config);
         let inner = Inner {
             catalog: RwLock::new(Catalog::new()),
             path: None,
+            writable,
             settings,
             memory,
             pool,
@@ -175,7 +204,7 @@ impl Database {
     /// `:memory:` and the empty string are an in memory database, which are DuckDB's two spellings
     /// of it. Anything else names a file in rudb's own native format, holding every table of the
     /// database. A name that does not exist yet is a database with nothing in it, and the file is
-    /// written by `CHECKPOINT`.
+    /// written by `CHECKPOINT` and again when the last handle on the database goes away.
     ///
     /// # Errors
     ///
@@ -209,10 +238,12 @@ impl Database {
         }
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
+        let writable = !config.read_only();
         let settings = Settings::new(config);
         let inner = Inner {
             catalog: RwLock::new(catalog),
             path: Some(path),
+            writable,
             settings,
             memory,
             pool,
@@ -225,6 +256,30 @@ impl Database {
     #[must_use]
     pub fn connect(&self) -> Connection {
         Connection::new(self.shared.clone())
+    }
+
+    /// Writes the file and hands back what went wrong, which dropping the database cannot do.
+    ///
+    /// The same write the last handle does on its way out, said out loud. A program that wants to
+    /// know whether its last session reached the disk calls this, and one that does not gets the
+    /// write anyway and never hears about a failure, which is the best a `Drop` can manage.
+    ///
+    /// Safe to call and then drop, because a checkpoint over a file that already holds exactly what
+    /// the catalog does returns without writing anything. Safe to call while other handles are
+    /// open too: it writes what the catalog says now, and the handle that goes out last writes
+    /// whatever has changed since.
+    ///
+    /// # Errors
+    ///
+    /// Everything `CHECKPOINT` raises. An in memory database and a read only one both have nothing
+    /// to write and are always `Ok`.
+    pub fn close(self) -> Result<()> {
+        let Some(path) = self.shared.inner.path.as_ref().filter(|_| self.shared.inner.writable)
+        else {
+            return Ok(());
+        };
+        let path = path.clone();
+        persist(&path, &mut self.shared.write())
     }
 
     /// Parses a statement so it can be run more than once, with values for its parameters.
@@ -1021,7 +1076,9 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::Checkpoint => {
-                if let Some(path) = &self.inner.path {
+                // A read only database answers this the way the pinned DuckDB does, which is by
+                // succeeding and writing nothing. It is not an error there and it is not one here.
+                if let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) {
                     persist(path, &mut catalog)?;
                 }
                 Ok(QueryResult::empty())
@@ -1039,8 +1096,11 @@ impl Shared {
                 // entry made before the query runs. Making it afterwards is also what leaves no
                 // table behind when the query fails.
                 // A temporary table never reaches the file, so it never takes this path however
-                // well it fits the shape otherwise.
-                if let Some(path) = self.inner.path.as_ref().filter(|_| !create.name.temporary()) {
+                // well it fits the shape otherwise, and neither does anything at all on a read only
+                // database, which is the one other way a statement writes the file without being a
+                // checkpoint.
+                let writable = self.inner.writable && !create.name.temporary();
+                if let Some(path) = self.inner.path.as_ref().filter(|_| writable) {
                     let fresh = create.source.is_some() && catalog.table(&create.name).is_err();
                     let alone = fresh && !path.exists() && catalog.stored_tables().count() == 0;
                     if fresh && (alone || appendable(path, &catalog, &create.name)?) {
@@ -1103,8 +1163,9 @@ impl Shared {
                 let ((), optimize_ns) =
                     timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
                 // Same as the create above: rows going into a temporary table are rows the file
-                // never sees.
-                if let Some(path) = self.inner.path.as_ref().filter(|_| !insert.name.temporary()) {
+                // never sees, and a read only database writes no file at all.
+                let writable = self.inner.writable && !insert.name.temporary();
+                if let Some(path) = self.inner.path.as_ref().filter(|_| writable) {
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
                     // the way, which is the difference between loading a table and having to fit

@@ -30,12 +30,18 @@ pub struct Config {
     memory_limit: Option<u64>,
     threads: usize,
     query_timeout: Option<Duration>,
+    read_only: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         let threads = rudb_io::execution_cores();
-        Self { memory_limit: rudb_io::default_memory_limit(), threads, query_timeout: None }
+        Self {
+            memory_limit: rudb_io::default_memory_limit(),
+            threads,
+            query_timeout: None,
+            read_only: false,
+        }
     }
 }
 
@@ -93,6 +99,29 @@ impl Config {
     #[must_use]
     pub fn query_timeout(&self) -> Option<Duration> {
         self.query_timeout
+    }
+
+    /// Whether this database is allowed to write its file.
+    ///
+    /// Enforced where the file is written, which is `CHECKPOINT` and the write a database does when
+    /// it closes, and both of those do nothing under it rather than raising. `CHECKPOINT` doing
+    /// nothing and saying so is what the pinned DuckDB does with a read only database, measured.
+    ///
+    /// What it does not do yet is refuse the statements. DuckDB answers `INSERT` on a read only
+    /// database with `Cannot execute statement of type "INSERT" on database "x" which is attached
+    /// in read-only mode!` and refuses to open a file that is not there at all, and neither of
+    /// those happens here, which is #1225. So a write under this still changes the tables this
+    /// process can see and is still gone when the process ends, and the file is what is protected.
+    #[must_use]
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The same settings, opening the file without writing it.
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     /// The same settings with this memory limit.
@@ -169,6 +198,7 @@ impl Config {
                     |timeout| format!("{}ms", timeout.as_millis()),
                 ),
             ),
+            ("read-only", self.read_only.to_string()),
         ]
     }
 }
