@@ -88,6 +88,7 @@ use crate::sort::Sort;
 use crate::source::{
     Dummy, FileScan, Filters, Frequencies, Pushdown, Scan, Series, Summary, Values,
 };
+use crate::storagenames::storage_info;
 use crate::strategies::strategies;
 use crate::stream::{Edge, Filter, Limit, Project};
 use crate::topn::TopN;
@@ -998,6 +999,33 @@ fn profiling(session: &Session) -> bool {
     session.get("enable_profiling").is_some_and(|format| format != rudb_functions::UNSET)
 }
 
+/// The one table name a pragma was called with.
+///
+/// The binder folds the two column describing pragmas into a `VALUES` while it binds them, so their
+/// name never reaches here. `pragma_storage_info` is the one that does, because its rows are read
+/// off the file and there are as many of them as the table has parts times columns, which is not
+/// something to fold into a plan.
+///
+/// A name that is not a constant is refused rather than evaluated, which is the same answer the
+/// binder gives the other two and for the same missing piece: there is no constant folding in front
+/// of this, so `pragma_storage_info('l' || 'ineitem')` is an expression at this point and not a
+/// name.
+fn pragma_name(plan: &Plan, args: Slice) -> Result<String> {
+    let [argument] = plan.expr_list(args) else {
+        return Err(Error::internal("a pragma that resolved to more than one name"));
+    };
+    let Expr::Constant(reference) = *plan.expr(*argument) else {
+        return Err(Error::not_implemented(
+            "pragma_storage_info() given a name that is not a constant",
+        ));
+    };
+    match plan.value(reference) {
+        Value::Varchar(name) => Ok(name.clone()),
+        Value::Null => Ok("NULL".to_string()),
+        other => Err(Error::internal(format!("a pragma name bound as VARCHAR arrived as {other}"))),
+    }
+}
+
 impl<'a> Building<'a, '_> {
     /// The id of the operator holding the side of this node that has to finish first.
     ///
@@ -1260,6 +1288,19 @@ impl<'a> Building<'a, '_> {
                         .watched(counters.clone());
                         let schema = scan.schema().clone();
                         Segment::new(Arc::new(Watched::new(scan, counters)), schema)
+                    }
+                    Some(TableFunction::PragmaStorageInfo) => {
+                        let written = pragma_name(plan, args)?;
+                        let table = storage_info(self.catalog, &written, plan, index, columns)?;
+                        let schema = table.schema().clone();
+                        let counters = self.watch(
+                            reference,
+                            id,
+                            pipeline,
+                            "Metadata",
+                            Some(TableFunction::PragmaStorageInfo.name()),
+                        );
+                        Segment::new(Arc::new(Watched::new(table, counters)), schema)
                     }
                     Some(
                         function @ (TableFunction::RudbStrategies

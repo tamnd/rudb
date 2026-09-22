@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value};
-use rudb_native::{Common, FrequencyOccurrences, Reader as NativeReader, Stripes};
+use rudb_native::{Common, FrequencyOccurrences, Reader as NativeReader, StoredPart, Stripes};
 use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
 
@@ -747,6 +747,24 @@ impl Table {
     #[must_use]
     pub fn rows(&self) -> &Rows {
         &self.rows
+    }
+
+    /// What every stored part of one column is encoded as, which is what `pragma_storage_info`
+    /// reports.
+    ///
+    /// Empty for a table with no file behind it, and for the memory half of a table that has both.
+    /// A chunk that has not been written yet has no encoding to report, because the encoder has not
+    /// run on it and will not until a checkpoint, so the honest answer is no rows rather than a row
+    /// claiming the chunk is stored plain.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema, or a page the reader has to open is invalid.
+    pub fn stored(&self, column: usize) -> Result<Vec<StoredPart>> {
+        match &self.rows {
+            Rows::Memory(_) => Ok(Vec::new()),
+            Rows::Native(reader) | Rows::Grown(reader, _) => reader.stored(column),
+        }
     }
 
     /// How many rows hold each value of each column, named, for the planner to ask.
