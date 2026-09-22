@@ -186,6 +186,45 @@ impl Rank {
     fn bytes(&self) -> usize {
         self.superblocks.len() * size_of::<u32>() + self.blocks.len() * size_of::<u16>()
     }
+
+    /// How many blocks and superblocks index a bitmap of this many words.
+    ///
+    /// Derived rather than stored, because both counts are a function of the range the header
+    /// already carries and a stored count is a count that can disagree with the array it describes.
+    fn shape(words: usize) -> (usize, usize) {
+        let blocks = words.div_ceil(BLOCK_BITS / 64);
+        (blocks, blocks.div_ceil(BLOCKS_PER_SUPERBLOCK))
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        for count in &self.superblocks {
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        for offset in &self.blocks {
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+
+    /// Reads an index over a bitmap of `words` words from exactly the bytes it takes.
+    fn read(bytes: &[u8], words: usize) -> Result<Self> {
+        let (blocks, superblocks) = Self::shape(words);
+        let split = superblocks * size_of::<u32>();
+        if bytes.len() != split + blocks * size_of::<u16>() {
+            return Err(malformed(
+                "a dense key map's rank index is not the size its range implies",
+            ));
+        }
+        Ok(Self {
+            superblocks: bytes[..split]
+                .chunks_exact(size_of::<u32>())
+                .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+                .collect(),
+            blocks: bytes[split..]
+                .chunks_exact(size_of::<u16>())
+                .map(|word| u16::from_le_bytes(word.try_into().expect("two bytes")))
+                .collect(),
+        })
+    }
 }
 
 /// The three forms, behind one interface.
@@ -302,6 +341,142 @@ impl KeyMap {
     #[must_use]
     pub fn observed(&self) -> &Observed {
         &self.observed
+    }
+
+    /// The value every stored key is an offset from, which is the smallest key.
+    pub(crate) fn base(&self) -> i128 {
+        match &self.body {
+            Body::Identity { base, .. } | Body::Dense { base, .. } | Body::Sorted { base, .. } => {
+                *base
+            }
+        }
+    }
+
+    /// Appends the form's own bytes, after the header that `wire` has already written.
+    ///
+    /// Nothing here is stored that the header and the form together derive. The identity form
+    /// writes nothing at all, because its count is the header's row count, which is section 3.3's
+    /// "no extents beyond the header" in code rather than in prose.
+    pub(crate) fn write_body(&self, out: &mut Vec<u8>) -> Result<()> {
+        match &self.body {
+            Body::Identity { .. } => Ok(()),
+            Body::Dense { range, bits, rank, .. } => {
+                out.extend_from_slice(&range.to_le_bytes());
+                for word in bits {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+                rank.write(out);
+                Ok(())
+            }
+            Body::Sorted { key_width, keys, rid_width, perm, .. } => {
+                // The widths are a byte each, and a width past sixty four is a width no `u64` key
+                // offset can have taken, so it is a torn header rather than a wide key.
+                let widths = [*key_width, *rid_width];
+                for width in widths {
+                    let width = u8::try_from(width)
+                        .map_err(|_| malformed("a sorted key map's width does not fit a byte"))?;
+                    out.push(width);
+                }
+                out.extend_from_slice(keys);
+                out.extend_from_slice(perm);
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads back what [`KeyMap::write_body`] wrote, and fills in the maximum key.
+    ///
+    /// The maximum is not in the header because each form derives it: identity from its count,
+    /// dense from its range, sorted from its last stored key. That is the whole reason this takes
+    /// [`Observed`] and returns a map rather than taking a finished one.
+    ///
+    /// # Errors
+    ///
+    /// If the body is not exactly the length its header implies. Exactly, not at least: a body
+    /// longer than its form needs means the header and the body disagree about which form this is,
+    /// and the safe reading of a disagreement is neither of them.
+    pub(crate) fn read_body(
+        form: Form,
+        base: i128,
+        mut observed: Observed,
+        body: &[u8],
+    ) -> Result<Self> {
+        match form {
+            Form::Identity => {
+                if !body.is_empty() {
+                    return Err(malformed("an identity key map has no body"));
+                }
+                if observed.rows > 0 {
+                    observed.max = Some(
+                        base.checked_add(i128::from(observed.rows) - 1)
+                            .ok_or_else(|| malformed("an identity key map's range overflows"))?,
+                    );
+                }
+                Ok(Self { body: Body::Identity { base, count: observed.rows }, observed })
+            }
+            Form::Dense => {
+                let Some(head) = body.get(..size_of::<u64>()) else {
+                    return Err(malformed("a dense key map has no range"));
+                };
+                let range = u64::from_le_bytes(head.try_into().expect("eight bytes"));
+                let Ok(range_usize) = usize::try_from(range) else {
+                    return Err(malformed("a dense key map's range does not fit this machine"));
+                };
+                let words = range_usize.div_ceil(64);
+                let bitmap = words * size_of::<u64>();
+                let rest = &body[size_of::<u64>()..];
+                if rest.len() < bitmap {
+                    return Err(malformed("a dense key map's bitmap is shorter than its range"));
+                }
+                let bits: Vec<u64> = rest[..bitmap]
+                    .chunks_exact(size_of::<u64>())
+                    .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
+                    .collect();
+                let rank = Rank::read(&rest[bitmap..], words)?;
+                observed.max = Some(
+                    base.checked_add(i128::from(range) - 1)
+                        .ok_or_else(|| malformed("a dense key map's range overflows"))?,
+                );
+                Ok(Self { body: Body::Dense { base, range, bits, rank }, observed })
+            }
+            Form::Sorted => {
+                if body.len() < 2 {
+                    return Err(malformed("a sorted key map has no widths"));
+                }
+                let key_width = usize::from(body[0]);
+                let rid_width = usize::from(body[1]);
+                if key_width == 0 || key_width > 64 || rid_width == 0 || rid_width > 64 {
+                    return Err(malformed("a sorted key map's width is not one a u64 can take"));
+                }
+                let count = observed.rows;
+                let Ok(count_usize) = usize::try_from(count) else {
+                    return Err(malformed(
+                        "a sorted key map holds more keys than this machine can",
+                    ));
+                };
+                let key_bytes = (count_usize * key_width).div_ceil(8);
+                let perm_bytes = (count_usize * rid_width).div_ceil(8);
+                let rest = &body[2..];
+                if rest.len() != key_bytes + perm_bytes {
+                    return Err(malformed(
+                        "a sorted key map's arrays are not the size its widths and count imply",
+                    ));
+                }
+                let keys = rest[..key_bytes].to_vec();
+                let perm = rest[key_bytes..].to_vec();
+                if count > 0 {
+                    let largest = bitpack::tail_at(&keys, key_width, count_usize - 1)?;
+                    observed.max =
+                        Some(base.checked_add(i128::from(largest)).ok_or_else(|| {
+                            malformed("a sorted key map's largest key overflows")
+                        })?);
+                }
+                Ok(Self {
+                    body: Body::Sorted { base, key_width, keys, rid_width, perm, count },
+                    observed,
+                })
+            }
+        }
     }
 
     /// Keys this map resolves.
