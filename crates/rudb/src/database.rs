@@ -439,7 +439,11 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     // half is what a drop leaves behind: every table that is left is still native, and without
     // asking the file which tables it names the checkpoint would decide there was nothing to do and
     // the dropped one would still be there on the next open.
-    let clean = catalog.tables().all(|table| table.rows().is_native());
+    // Every table already in the file, and every declaration in the file already the one the
+    // catalog holds. The second half is what stops a `CLUSTER BY` on a table that was checkpointed
+    // before the declaration existed from being decided as nothing to do and quietly lost.
+    let clean =
+        catalog.tables().all(|table| table.rows().is_native() && table.clustering_is_stored());
     if clean && committed(path)?.is_some_and(|held| held == wanted(&names)) {
         return Ok(());
     }
@@ -459,6 +463,9 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
             None => rudb_native::Writer::create(&temporary, name.table.clone(), fields)?,
             Some(writer) => writer.next(name.table.clone(), fields)?,
         };
+        if let Some(clustering) = table.clustering() {
+            open = open.declare(clustering.clone())?;
+        }
         for at in 0..table.rows().chunk_count() {
             open.append(&table.rows().read(at, &columns)?)?;
         }
@@ -534,6 +541,12 @@ fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Resu
             None => rudb_native::Writer::open(path, name.table.clone(), fields)?,
             Some(writer) => writer.next(name.table.clone(), fields)?,
         };
+        // The tables already in the file keep theirs, because they are carried forward by
+        // directory pointer and their bytes are not rewritten. Only the ones being written here
+        // need it said again.
+        if let Some(clustering) = table.clustering() {
+            open = open.declare(clustering.clone())?;
+        }
         for at in 0..table.rows().chunk_count() {
             open.append(&table.rows().read(at, &columns)?)?;
         }

@@ -359,7 +359,21 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
         }
     };
     let after = if filtered { " after the filter above" } else { "" };
-    format!("  [{} rows{after}, {}{memory}{slow}]", operator.rows_out, duration(operator.wall_ns))
+    // A scan that pruned nothing says nothing, because a reader who sees "0 of 5861 parts skipped"
+    // on every scan of every query stops reading the clause. A scan that pruned something is the
+    // whole reason this number is on the line, since a predicate that prunes and a predicate that
+    // matches nothing produce the same row count and want different work.
+    let parts = operator.parts_read.saturating_add(operator.parts_pruned);
+    let skipped = if operator.parts_pruned == 0 {
+        String::new()
+    } else {
+        format!(", {} of {parts} parts skipped", operator.parts_pruned)
+    };
+    format!(
+        "  [{} rows{after}, {}{skipped}{memory}{slow}]",
+        operator.rows_out,
+        duration(operator.wall_ns)
+    )
 }
 
 /// The operator row with this id.
@@ -787,10 +801,13 @@ mod tests {
 
     #[test]
     fn the_document_gets_one_class_per_operator_and_the_number_that_goes_with_it() {
-        // Not equal rather than greater than, so the scan cannot take the filter and the two nodes
-        // stay two operators. The test below is the other case.
+        // An aggregate rather than a filter over a table, because a filter over a table is applied
+        // by the scan whatever its predicate says and the two nodes become one operator. The test
+        // below is that case. This one wants two decisions that came out differently, and an
+        // aggregate over a table is the shortest plan that has them: the table is counted and what
+        // comes out of the grouping is estimated.
         let plan = parsed(concat!(
-            "Filter (#0.0::INTEGER <> 1::INTEGER)::BOOLEAN\n",
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]\n",
             "  Get memory.main.t AS t #0 [a::INTEGER]\n",
         ));
         let mut facts = Facts::new();

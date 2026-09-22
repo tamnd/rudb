@@ -26,6 +26,7 @@
 
 pub mod bounds;
 pub mod cancel;
+pub mod clustering;
 pub mod error;
 pub mod memory;
 pub mod rules;
@@ -39,6 +40,7 @@ pub mod value;
 
 pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;
+pub use clustering::{Clustering, Width};
 pub use error::{Error, ErrorCode, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};

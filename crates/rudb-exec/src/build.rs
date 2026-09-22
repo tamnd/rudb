@@ -1039,13 +1039,36 @@ impl<'a> Building<'a, '_> {
         kind: &str,
         detail: Option<&str>,
     ) -> Arc<Counters> {
+        self.watch_doing(node, None, id, pipeline, kind, detail)
+    }
+
+    /// The same, for an operator that is also doing the work of a node that got no operator.
+    ///
+    /// A scan that took a filter into itself sits on that filter's seams as well as its own, and it
+    /// is the only row in the document where they can be reported, since the filter has no row. Left
+    /// out, pinning a compaction strategy and then reading the document to see whether it ran gives
+    /// the answer no on every query whose filter moved down, which is most of ClickBench.
+    ///
+    /// The two nodes are different kinds, so their seam lists do not overlap and neither entry is
+    /// written twice. Two nodes of a kind would be a different arrangement than this one.
+    fn watch_doing(
+        &self,
+        node: NodeRef,
+        also: Option<NodeRef>,
+        id: u32,
+        pipeline: u32,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> Arc<Counters> {
         let mut counters = Counters::new(id, pipeline, kind).charging_cpu(profiling(self.session));
         if let Some(detail) = detail {
             counters = counters.detailed(detail);
         }
-        for seam in seams_of(self.plan.node(node)) {
-            if let Some(running) = registries().running(*seam, self.seams) {
-                counters = counters.chose(seam.name(), &running.name, running.is_reference);
+        for node in std::iter::once(node).chain(also) {
+            for seam in seams_of(self.plan.node(node)) {
+                if let Some(running) = registries().running(*seam, self.seams) {
+                    counters = counters.chose(seam.name(), &running.name, running.is_reference);
+                }
             }
         }
         self.report.watch(counters)
@@ -1160,6 +1183,17 @@ impl<'a> Building<'a, '_> {
                     sideways: self.sideways.take(),
                     cutoff: self.cutoff.take(),
                 };
+                // Read before the filters are handed over, because it is the one thing the scan's
+                // row in the document needs out of them and the scan owns them after this line.
+                let moved = filters.pushed.as_ref().map(|pushed| pushed.node);
+                let counters = self.watch_doing(
+                    reference,
+                    moved,
+                    id,
+                    pipeline,
+                    "Scan",
+                    Some(plan.string(table)),
+                );
                 let scan = Scan::new(
                     plan,
                     self.catalog.table(&name)?,
@@ -1168,10 +1202,9 @@ impl<'a> Building<'a, '_> {
                     filters,
                     self.seams,
                     self.session,
-                )?;
+                )?
+                .watched(counters.clone());
                 let schema = scan.schema().clone();
-                let counters =
-                    self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));
                 Segment::new(Arc::new(Watched::new(scan, counters)), schema)
             }
             Node::Dummy => {
@@ -1337,10 +1370,11 @@ impl<'a> Building<'a, '_> {
                 // Which filters can go is not decided here, because `EXPLAIN` has to say the same
                 // thing about the same plan and a second copy of the condition is a second chance
                 // to answer it differently.
-                self.pushing = rudb_opt::bounds::into_scan(plan, reference).map(|tests| Pushdown {
+                self.pushing = rudb_opt::bounds::into_scan(plan, reference).map(|moved| Pushdown {
                     node: reference,
                     predicate,
-                    tests,
+                    tests: moved.tests,
+                    whole: moved.whole,
                 });
                 // Whether there was an offer at all, held here because afterwards the field says
                 // only whether there is one now. Gone can mean taken or it can mean never made, and

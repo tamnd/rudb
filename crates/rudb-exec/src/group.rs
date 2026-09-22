@@ -44,7 +44,7 @@ use crate::rows;
 use crate::schema::Schema;
 use crate::signed::SignedBlock;
 use crate::spill::{Reader, Spill};
-use crate::table::{Probe, Table, Walk};
+use crate::table::{Origin, Probe, Table, Walk};
 
 /// One aggregate call, taken apart once when the operator is built.
 #[derive(Debug, Clone)]
@@ -1262,6 +1262,7 @@ impl<'a> Aggregate<'a> {
             // empty until a chunk arrives that it can answer, and kept across the chunks of a row
             // group, which is the whole point of holding them here.
             coded_on: Vec::new(),
+            coded_places: Vec::new(),
             coded_map: Vec::new(),
             missing: Vec::new(),
             same: Vec::new(),
@@ -1315,6 +1316,7 @@ impl<'a> Aggregate<'a> {
             slots,
             walk,
             coded_on,
+            coded_places,
             coded_map,
             missing,
             same,
@@ -1373,9 +1375,10 @@ impl<'a> Aggregate<'a> {
                 coded_map.clear();
                 coded_map.resize(codes.combos(), NOWHERE);
             }
+            codes.places(*length, coded_places);
             missing.clear();
             for (row, slot) in slots.iter_mut().enumerate() {
-                let found = coded_map[codes.at(row)];
+                let found = coded_map[coded_places[row]];
                 if found == NOWHERE {
                     missing.push(row);
                 } else {
@@ -1404,9 +1407,9 @@ impl<'a> Aggregate<'a> {
         // The rows the map had nothing for, which are the first row of each combination and no
         // others. They go through the probe and the insert every row used to go through, and what
         // comes back is written into the map so that the rest of the row group skips both.
-        if let Some(codes) = &direct {
+        if direct.is_some() {
             for &row in missing.iter() {
-                let index = codes.at(row);
+                let index = coded_places[row];
                 // Two rows of one chunk can be the first two of one combination, and the first of
                 // them filled the map on its way past.
                 if coded_map[index] != NOWHERE {
@@ -3128,13 +3131,15 @@ pub(crate) struct Building {
     slots: Vec<usize>,
     /// What the batched probe walks with, kept so that a chunk allocates nothing for it.
     walk: Walk,
-    /// The dictionaries `coded_map` was filled against, which is what says it still means anything.
+    /// What `coded_map` was filled against, which is what says it still means anything.
     ///
     /// Empty when the last chunk was not one the direct map could answer, so the map is rebuilt
     /// rather than read. See [`Coded`](crate::table::Coded).
-    coded_on: Vec<Arc<Vector>>,
+    coded_on: Vec<Origin>,
     /// One slot per combination of codes, or [`NOWHERE`] where that combination has not been seen.
     coded_map: Vec<usize>,
+    /// Which combination each row of the last chunk is, worked out one key column at a time.
+    coded_places: Vec<usize>,
     /// The rows of the last chunk the map had no slot for, in row order.
     missing: Vec<usize>,
     /// One flag per row of the last chunk, true where the row's key is the key of the row before.
@@ -4523,19 +4528,60 @@ fn scatter_bigint(partitions: &mut [BigIntDistinctPartition], shift: u32, value:
     partitions[(hash >> shift) as usize].rows.push(value);
 }
 
+/// What a distinct table of this many slots costs, the values and the bit a slot beside them.
+fn distinct_table_bytes(capacity: usize) -> usize {
+    capacity * size_of::<i64>() + capacity.div_ceil(8)
+}
+
+/// Doubles a distinct table and puts everything in it back.
+///
+/// Nothing but the value is stored, so the new place is worked out from the value the same way the
+/// first one was. There is no hash to carry and nothing to compare on the way in, because a table
+/// that is being rebuilt out of a table already holds each value once.
+fn regrow_distinct(slots: &mut Vec<i64>, filled: &mut Vec<u64>) {
+    let capacity = slots.len() * 2;
+    let mask = capacity - 1;
+    let mut next = vec![0_i64; capacity];
+    let mut taken = vec![0_u64; capacity.div_ceil(64)];
+    for (from, &value) in slots.iter().enumerate() {
+        if filled[from / 64] & (1_u64 << (from % 64)) == 0 {
+            continue;
+        }
+        let mut at = spread(mix(0, value as u64)) as usize & mask;
+        while taken[at / 64] & (1_u64 << (at % 64)) != 0 {
+            at = (at + 1) & mask;
+        }
+        taken[at / 64] |= 1_u64 << (at % 64);
+        next[at] = value;
+    }
+    *slots = next;
+    *filled = taken;
+}
+
 /// How many distinct values one radix partition holds, across the runs its instances handed over.
 ///
 /// The table is the values themselves with a bit a slot saying which ones are filled, rather than an
 /// index into the run the way it was when there was one run to index. Nothing is moved into place, so
 /// the runs are only ever read.
+///
+/// It is sized by the distinct values it ends up holding rather than by the values that arrive,
+/// because those are not the same number and on ClickBench they are not close. `COUNT(DISTINCT
+/// UserID)` over `hits` scatters a million and a half values into a partition and keeps two hundred
+/// and seventy thousand of them, so a table sized by what arrives is twelve times larger than the
+/// one that is wanted, and with every partition being built at once that is a gigabyte of tables
+/// that no probe ever hits twice. Doubling from small costs one rehash of what is in the table at
+/// the time, which summed over every doubling is under twice the final contents, and buys a million
+/// and a half probes into something that has a chance of being in cache.
 fn bigint_distinct_partition(partition: &mut BigIntDistinctRuns, memory: &Memory) -> Result<i64> {
     let held: usize = partition.runs.iter().map(Vec::len).sum();
-    let capacity = held.saturating_mul(2).max(64).next_power_of_two();
+    let ceiling = held.saturating_mul(2).max(64).next_power_of_two();
+    let mut capacity = ceiling.min(1024);
     let mut working = memory.reservation();
-    working.grow(width_of(capacity * size_of::<i64>() + capacity.div_ceil(8)))?;
+    working.grow(width_of(distinct_table_bytes(capacity)))?;
     let mut slots = vec![0_i64; capacity];
     let mut filled = vec![0_u64; capacity.div_ceil(64)];
-    let mask = capacity - 1;
+    let mut mask = capacity - 1;
+    let mut limit = capacity / 2;
     let mut unique = 0_usize;
     let timing = stage::Timing::start(Stage::Fold);
     for run in &partition.runs {
@@ -4553,6 +4599,13 @@ fn bigint_distinct_partition(partition: &mut BigIntDistinctRuns, memory: &Memory
                     break;
                 }
                 at = (at + 1) & mask;
+            }
+            if unique >= limit && capacity < ceiling {
+                working.grow(width_of(distinct_table_bytes(capacity)))?;
+                regrow_distinct(&mut slots, &mut filled);
+                capacity *= 2;
+                mask = capacity - 1;
+                limit = capacity / 2;
             }
         }
     }

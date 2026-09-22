@@ -12,16 +12,22 @@
 //! was. The first was already here, the third is what everything did before, and the middle one is
 //! what this is for.
 //!
-//! What can go wrong is a wrong answer rather than a slow query, in two directions. A conjunct the
-//! scan cannot express and nobody above applies is rows that should have gone and did not. A chunk
-//! waved through that holds a row the filter wanted gone is the same thing one chunk at a time, and
-//! the way to get there is a null, because `v >= 10` over a null row is unknown rather than true.
-//! Both directions are below, and every answer is checked against the same query with the pushdown
-//! out of reach rather than against a number written down here.
+//! Which of the three a chunk gets is the only thing the conjuncts decide. Whether the filter moves
+//! at all is decided by where it sits, and a filter directly over a stored table moves whatever its
+//! predicate says, because it does the same work in either place and moving it saves an operator
+//! boundary and a chunk handed across it. So a predicate with an `OR` in it runs inside the scan and
+//! reads as no test, which means every chunk it touches gets the third answer.
 //!
-//! The way to put it out of reach is to write the predicate so that one conjunct is not a comparison
-//! against a constant. `k + 0 >= 10` keeps exactly the rows `k >= 10` keeps and reads as nothing the
-//! scan can take, so the pair of them is one answer computed two ways.
+//! What can go wrong is a wrong answer rather than a slow query, in two directions. A conjunct
+//! nobody applies is rows that should have gone and did not. A chunk waved through that holds a row
+//! the filter wanted gone is the same thing one chunk at a time, and the two ways to get there are a
+//! null, because `v >= 10` over a null row is unknown rather than true, and a predicate read as
+//! proving more than it does. Both directions are below, and every answer is checked against the
+//! same rows counted with the pushdown out of reach rather than against a number written down here.
+//!
+//! Putting it out of reach used to mean writing one conjunct as something the bounds reader could
+//! not take, and `k + 0 >= 10` was the way. That stopped working when the two questions above came
+//! apart, so what blocks it now is a node between the filter and the table. See [`blocked`].
 
 use rudb::Database;
 use rudb_common::Value;
@@ -59,31 +65,47 @@ fn filtered(db: &Database, query: &str) -> bool {
     metrics.operators.iter().any(|operator| operator.kind == "Filter")
 }
 
+/// The same two numbers, counted over rows the scan cannot have filtered.
+///
+/// The union adds a branch that matches nothing, so the rows are the rows of `t` and the filter is
+/// left sitting on a set operation rather than on a table. Nothing reaches through one of those, so
+/// the comparison runs in an operator of its own over every row, which is the arrangement the whole
+/// of this file is checking the scan against. The inner `k < 0` goes into its own scan and is not
+/// the filter these tests look for, because it matches no row and produces none.
+///
+/// Contrived, and the honest reason is that the straightforward way is gone. A filter over a stored
+/// table always moves into the scan now, so there is no predicate that leaves one above it and an
+/// oracle has to be a different shape rather than a different predicate.
+fn blocked(predicate: &str) -> String {
+    format!(
+        "SELECT count(*), sum(k) FROM \
+         (SELECT * FROM t UNION ALL SELECT * FROM t WHERE k < 0) WHERE {predicate}"
+    )
+}
+
 /// The same count with the filter in the scan and with it out of reach of the scan, which must agree.
 ///
-/// `predicate` is compared against `blocked`, which is the caller's rewriting of it into something
-/// that keeps the same rows and that the scan cannot take. Both the answers and which of them built
-/// a filter operator are checked, since two queries agreeing because neither was pushed down would
-/// be a test that passes and covers nothing.
-fn agree(db: &Database, predicate: &str, blocked: &str) {
+/// Both the answers and which of them built a filter operator are checked, since two queries
+/// agreeing because neither was pushed down would be a test that passes and covers nothing.
+fn agree(db: &Database, predicate: &str) {
     let pushed = format!("SELECT count(*), sum(k) FROM t WHERE {predicate}");
-    let above = format!("SELECT count(*), sum(k) FROM t WHERE {blocked}");
+    let above = blocked(predicate);
     let result = db.query(&pushed).expect("the pushed query ran");
     let wanted = db.query(&above).expect("the blocked query ran");
     let (result, wanted): (Vec<_>, Vec<_>) = (result.rows().collect(), wanted.rows().collect());
-    assert_eq!(result, wanted, "{predicate} and {blocked} differ");
+    assert_eq!(result, wanted, "{predicate} answers differently once it is out of the scan");
     assert!(!filtered(db, &pushed), "{predicate} built a filter operator");
-    assert!(filtered(db, &above), "{blocked} was pushed down after all");
+    assert!(filtered(db, &above), "{predicate} was pushed down even with a set operation under it");
 }
 
 #[test]
 fn a_filter_of_one_comparison_is_applied_by_the_scan_and_no_operator_is_built_for_it() {
     let db = database();
-    agree(&db, "k >= 2500", "k + 0 >= 2500");
-    agree(&db, "k < 2500", "k + 0 < 2500");
-    agree(&db, "k = 2500", "k + 0 = 2500");
-    agree(&db, "k > 4999", "k + 0 > 4999");
-    agree(&db, "k <= 0", "k + 0 <= 0");
+    agree(&db, "k >= 2500");
+    agree(&db, "k < 2500");
+    agree(&db, "k = 2500");
+    agree(&db, "k > 4999");
+    agree(&db, "k <= 0");
 }
 
 /// The chunks past the constant are proved whole and never compared, and the answer is the same as
@@ -91,7 +113,7 @@ fn a_filter_of_one_comparison_is_applied_by_the_scan_and_no_operator_is_built_fo
 #[test]
 fn a_filter_most_of_a_clustered_column_passes_answers_the_same_as_one_that_compares_every_row() {
     let db = database();
-    agree(&db, "k >= 10", "k + 0 >= 10");
+    agree(&db, "k >= 10");
     assert_eq!(one(&db, "SELECT count(*) FROM t WHERE k >= 10"), Value::BigInt(4990));
 }
 
@@ -99,10 +121,10 @@ fn a_filter_most_of_a_clustered_column_passes_answers_the_same_as_one_that_compa
 #[test]
 fn every_conjunct_of_an_and_goes_into_the_scan_together() {
     let db = database();
-    agree(&db, "k >= 10 AND k < 4000", "k + 0 >= 10 AND k < 4000");
-    agree(&db, "k >= 10 AND v < 50", "k + 0 >= 10 AND v < 50");
-    agree(&db, "k >= 10 AND v < 50 AND s >= 'v'", "k + 0 >= 10 AND v < 50 AND s >= 'v'");
-    agree(&db, "k BETWEEN 100 AND 3000", "k + 0 BETWEEN 100 AND 3000");
+    agree(&db, "k >= 10 AND k < 4000");
+    agree(&db, "k >= 10 AND v < 50");
+    agree(&db, "k >= 10 AND v < 50 AND s >= 'v'");
+    agree(&db, "k BETWEEN 100 AND 3000");
 }
 
 /// A null is not a row that passes, however the two ends of the chunk fall.
@@ -113,8 +135,8 @@ fn every_conjunct_of_an_and_goes_into_the_scan_together() {
 #[test]
 fn a_column_with_nulls_in_it_is_never_waved_through_on_its_bounds_alone() {
     let db = database();
-    agree(&db, "v >= 0", "v + 0 >= 0");
-    agree(&db, "v < 100", "v + 0 < 100");
+    agree(&db, "v >= 0");
+    agree(&db, "v < 100");
     let nulls = 5000_i64.div_euclid(7) + 1;
     assert_eq!(one(&db, "SELECT count(*) FROM t WHERE v >= 0"), Value::BigInt(5000 - nulls));
     assert_eq!(one(&db, "SELECT count(*) FROM t WHERE v IS NULL"), Value::BigInt(nulls));
@@ -124,39 +146,43 @@ fn a_column_with_nulls_in_it_is_never_waved_through_on_its_bounds_alone() {
 #[test]
 fn a_string_column_is_pushed_down_the_same_way_a_number_is() {
     let db = database();
-    agree(&db, "s >= 'v'", "s || '' >= 'v'");
-    agree(&db, "s = 'v3'", "s || '' = 'v3'");
+    agree(&db, "s >= 'v'");
+    agree(&db, "s = 'v3'");
 }
 
-/// What the scan will not take, each for its own reason, and which therefore keeps its operator.
+/// What no zone map can read, each for its own reason, and which goes into the scan regardless.
 ///
 /// An `OR` first, since a disjunct being false says nothing about the row. Then a comparison of two
 /// columns, where the bounds of one say nothing about the other's value in the same row. Then an
 /// expression over a column rather than a column, and a predicate that is not a comparison at all.
+/// None of them can rule a chunk out or prove one whole, so every chunk is compared, which is what
+/// the operator above the scan was doing before it moved.
+///
+/// The `OR` is the one that cost something. ClickBench 40 writes `TraficSourceID IN (-1, 6)`, which
+/// is bound as a disjunction, and it was the only query in that suite slower than DuckDB.
 ///
 /// `BETWEEN` is not in the list, and it is the interesting absence. It reaches the builder already
-/// written out as two comparisons of a column against a constant, so it pushes down like any other
-/// pair of conjuncts and there is nothing here for it to fail.
+/// written out as two comparisons of a column against a constant, so it reads as two tests like any
+/// other pair of conjuncts and there is nothing here for it to fail.
 #[test]
-fn a_predicate_the_scan_cannot_express_keeps_its_filter_operator() {
+fn a_predicate_no_zone_map_can_read_still_moves_into_the_scan() {
     let db = database();
     for predicate in ["k < 10 OR k > 4990", "k = v", "k % 3 = 0", "s IS NULL"] {
-        let query = format!("SELECT count(*) FROM t WHERE {predicate}");
-        assert!(filtered(&db, &query), "{predicate} was pushed into the scan");
+        agree(&db, predicate);
     }
 }
 
-/// Half a predicate is not half pushed down, it is not pushed down at all.
+/// Half a predicate read as tests does not make the other half a proof about a chunk.
 ///
-/// One conjunct the scan cannot express is enough to leave the whole filter above it, because a scan
-/// applying the other conjunct and nothing applying this one is rows that should have gone and did
-/// not. Splitting the two is worth doing and is a rewrite of the plan rather than a branch in the
-/// builder, so until it exists the answer here is the conservative one.
+/// `k >= 10` reads and `k % 3 = 0` does not, and the whole thing runs in the scan. What must not
+/// happen is the readable half being used to wave a chunk through, since every row of a chunk being
+/// over ten says nothing about which of them divide by three. The tests are thrown away rather than
+/// kept for that reason, and a count that came out at 4990 rather than 1663 is what keeping them
+/// would look like.
 #[test]
-fn one_conjunct_the_scan_cannot_take_leaves_the_whole_filter_where_it_was() {
+fn one_conjunct_no_zone_map_can_read_stops_the_whole_predicate_being_a_proof() {
     let db = database();
-    let query = "SELECT count(*), sum(k) FROM t WHERE k >= 10 AND k % 3 = 0";
-    assert!(filtered(&db, query), "the readable conjunct took the rest of the predicate with it");
+    agree(&db, "k >= 10 AND k % 3 = 0");
     assert_eq!(one(&db, "SELECT count(*) FROM t WHERE k >= 10 AND k % 3 = 0"), Value::BigInt(1663));
 }
 
@@ -164,7 +190,7 @@ fn one_conjunct_the_scan_cannot_take_leaves_the_whole_filter_where_it_was() {
 #[test]
 fn a_filter_no_chunk_can_match_answers_nothing_without_reading_a_row() {
     let db = database();
-    agree(&db, "k >= 100000", "k + 0 >= 100000");
+    agree(&db, "k >= 100000");
     assert_eq!(one(&db, "SELECT count(*) FROM t WHERE k >= 100000"), Value::BigInt(0));
 }
 

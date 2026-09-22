@@ -20,7 +20,62 @@ pub enum Validity {
     Mask(Bitmap),
 }
 
+/// A [`Validity`] borrowed as a `Copy` value, so a row loop can decide the case once.
+///
+/// The three cases are the same three. The difference is that this is a small `Copy` value rather
+/// than a shared reference to one, and that is what lets the compiler lift the match out of a row
+/// loop. Through a `&Validity` it cannot: the loops that ask row by row also call into code the
+/// compiler cannot see through, it has to assume one of those calls could write through the
+/// reference, and so it reloads the discriminant and re-decides the case on every row.
+///
+/// The note at the top of this file says the cost of knowing which case you are in is one branch
+/// per vector rather than one per value. Read through [`Validity::is_valid`] that is true wherever
+/// the compiler can see the whole loop and false wherever it cannot. Read through this it is true
+/// either way, because there is no reference left for a call inside the loop to have written
+/// through.
+///
+/// How much that is worth is small and worth saying plainly. On q01 it is 0.54 percent of the
+/// query, which is the one place it shows up at all, because q01's decimals arrive as a dictionary
+/// over a packed run and the four packed loops are where the reference was surviving. q10 and q18
+/// both come out inside their own control spread, which is to say unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Live<'l> {
+    /// Nothing is null.
+    All,
+    /// Everything is null.
+    None,
+    /// Some of each, one bit per value, set meaning valid.
+    Mask(&'l Bitmap),
+}
+
+impl Live<'_> {
+    /// Whether the value at `index` is not null.
+    ///
+    /// The same answer [`Validity::is_valid`] gives for the same row, including reporting invalid
+    /// rather than panicking for a read past the end of a partially filled vector.
+    #[must_use]
+    #[inline]
+    pub fn at(self, index: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Mask(mask) => mask.get(index),
+        }
+    }
+}
+
 impl Validity {
+    /// This validity as the `Copy` value a row loop should hold. See [`Live`].
+    #[must_use]
+    #[inline]
+    pub fn live(&self) -> Live<'_> {
+        match self {
+            Self::AllValid => Live::All,
+            Self::AllInvalid => Live::None,
+            Self::Mask(mask) => Live::Mask(mask),
+        }
+    }
+
     /// How many bytes of memory this representation is holding.
     ///
     /// The two cheap arms hold none at all, which is the point of having them.
@@ -448,5 +503,19 @@ mod tests {
         assert_eq!(Validity::from_iter(16, |_| false), Validity::AllInvalid);
         let mixed = Validity::from_iter(16, |i| i % 2 == 0);
         assert_eq!(mixed.count_valid(16), 8);
+    }
+
+    #[test]
+    fn the_borrowed_view_answers_what_the_owned_one_does() {
+        // Including past the end of the vector, which the kernels rely on and which is the one
+        // answer a reader would not guess from the three case names.
+        for validity in
+            [Validity::AllValid, Validity::AllInvalid, Validity::from_iter(16, |i| i % 3 == 0)]
+        {
+            let live = validity.live();
+            for row in 0..24 {
+                assert_eq!(live.at(row), validity.is_valid(row), "row {row} of {validity:?}");
+            }
+        }
     }
 }
