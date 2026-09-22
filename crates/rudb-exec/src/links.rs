@@ -52,7 +52,23 @@ fn row(catalog: &Catalog, link: &Relationship) -> Vec<Value> {
     let stored = key_map_of(catalog, &link.parent);
     let held = forward_link_of(catalog, link);
     let shape = degrees_of(catalog, link);
-    let (cardinality, note) = verdict(catalog, link, stored.as_ref(), held.as_ref());
+    // A structure is stored, or it was measured and turned away, or nothing has looked at the
+    // column. The first two both have a size and the third does not, so the size column falls back
+    // to the budget record and only goes null for the third.
+    let map_bytes = stored
+        .as_ref()
+        .map(|map| map.bytes as u64)
+        .or_else(|| refused_key_map_of(catalog, &link.parent));
+    let link_bytes =
+        held.as_ref().map(|held| held.bytes() as u64).or_else(|| refused_link_of(catalog, link));
+    let (cardinality, note) = verdict(
+        catalog,
+        link,
+        stored.as_ref(),
+        held.as_ref(),
+        map_bytes.is_some(),
+        link_bytes.is_some(),
+    );
     vec![
         text(&link.name()),
         text(&link.child.table),
@@ -61,13 +77,9 @@ fn row(catalog: &Catalog, link: &Relationship) -> Vec<Value> {
         text(&link.parent.columns.join(", ")),
         text(cardinality),
         stored.as_ref().map_or(Value::Null, |map| text(map.form.label())),
-        stored
-            .as_ref()
-            .map_or(Value::Null, |map| Value::BigInt(i64::try_from(map.bytes).unwrap_or(i64::MAX))),
+        map_bytes.map_or(Value::Null, |bytes| Value::BigInt(clamp(bytes))),
         held.as_ref().map_or(Value::Null, |held| text(held.form().label())),
-        held.as_ref().map_or(Value::Null, |held| {
-            Value::BigInt(i64::try_from(held.bytes()).unwrap_or(i64::MAX))
-        }),
+        link_bytes.map_or(Value::Null, |bytes| Value::BigInt(clamp(bytes))),
         shape.as_ref().map_or(Value::Null, |shape| Value::Double(shape.mean())),
         shape.as_ref().map_or(Value::Null, |shape| Value::BigInt(clamp(shape.highest()))),
         shape.as_ref().map_or(Value::Null, |shape| Value::BigInt(clamp(shape.percentile(0.99)))),
@@ -78,13 +90,13 @@ fn row(catalog: &Catalog, link: &Relationship) -> Vec<Value> {
     ]
 }
 
-/// A degree that fits in the signed integer the column is.
+/// A count that fits in the signed integer the column is.
 ///
-/// A degree past nine quintillion is one this codebase will not meet, and saturating is the right
-/// answer for the one place it could come from: the last histogram bucket's bound, which is already
-/// a bound rather than a count.
-fn clamp(degree: u64) -> i64 {
-    i64::try_from(degree).unwrap_or(i64::MAX)
+/// A degree or a size past nine quintillion is one this codebase will not meet, and saturating is
+/// the right answer for the one place either could come from: the last histogram bucket's bound,
+/// which is already a bound rather than a count.
+fn clamp(count: u64) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
 }
 
 /// A key map found in a table, reduced to what the table reports.
@@ -108,6 +120,39 @@ fn key_map_of(catalog: &Catalog, parent: &Side) -> Option<Stored> {
     let Rows::Native(reader) = table.rows() else { return None };
     let map = rudb_native::graph::key_map(reader, column)?;
     Some(Stored { form: map.form(), bytes: map.bytes(), distinct: map.observed().distinct })
+}
+
+/// What a key map over a relationship's parent side would have cost, when a build measured one and
+/// did not keep it.
+///
+/// The form it would have taken is on the record too and is not reported. A form column that named
+/// a form no join can read would be the one thing this table does not do, which is to mix what is
+/// believed with what is there. The size is different: it is a fact about a structure that does not
+/// exist, and it is the number somebody raising `graph_budget` needs.
+fn refused_key_map_of(catalog: &Catalog, parent: &Side) -> Option<u64> {
+    if parent.columns.len() != 1 {
+        return None;
+    }
+    let table = table_named(catalog, &parent.table)?;
+    let column = table.column_index(&parent.columns[0])?;
+    let Rows::Native(reader) = table.rows() else { return None };
+    rudb_native::graph::refused_key_map(reader, column).map(|(_, bytes)| bytes)
+}
+
+/// What a forward link over a relationship's child column would have cost, when a build measured
+/// one and did not keep it.
+///
+/// This asks the child table alone, where [`forward_link_of`] checks that the stored link names the
+/// parent this declaration names. There is nothing to check against: the field a stored link keeps
+/// its parent binding in is the field a budget record keeps its size in, so the record says what a
+/// link over this column would have cost and not which parent it was measured against. The record
+/// is keyed by the child column, the way a degree section is, so two declarations over the same
+/// column and different parents read the same size, which is the size of whichever was built last.
+fn refused_link_of(catalog: &Catalog, link: &Relationship) -> Option<u64> {
+    let [child_key] = &link.child.columns[..] else { return None };
+    let child = table_named(catalog, &link.child.table)?;
+    let Rows::Native(rows) = child.rows() else { return None };
+    rudb_native::graph::refused_link(rows, child.column_index(child_key)?).map(|(_, bytes)| bytes)
 }
 
 /// The stored forward link of a relationship, when both of its tables are in the same file and the
@@ -175,6 +220,8 @@ fn verdict(
     link: &Relationship,
     stored: Option<&Stored>,
     held: Option<&rudb_graph::Link>,
+    measured_map: bool,
+    measured_link: bool,
 ) -> (&'static str, Option<&'static str>) {
     let Some(stored) = stored else {
         if table_named(catalog, &link.parent.table).is_none() {
@@ -184,6 +231,18 @@ fn verdict(
             return (
                 Cardinality::Unverified.label(),
                 Some("a composite key needs a folded key map, which is not built"),
+            );
+        }
+        // A build that looked and decided against it is a fourth answer, and the note says so
+        // without saying why, because the record keeps the size and not the reason. The two
+        // reasons a build has are the budget and a key that repeats, and key_map_bytes against
+        // graph_budget is what tells them apart.
+        if measured_map {
+            return (
+                Cardinality::Unverified.label(),
+                Some(
+                    "the key map was measured and not kept, so key_map_bytes is what it would cost",
+                ),
             );
         }
         return (Cardinality::Unverified.label(), Some("no key map is stored"));
@@ -203,6 +262,10 @@ fn verdict(
         Some(_) => (
             Cardinality::AtMostOne.label(),
             Some("some child rows have no parent, so this is not exactly one"),
+        ),
+        None if measured_link => (
+            Cardinality::AtMostOne.label(),
+            Some("the link was measured and not kept, so link_bytes is what it would cost"),
         ),
         None => (Cardinality::AtMostOne.label(), Some("no link is stored")),
     }

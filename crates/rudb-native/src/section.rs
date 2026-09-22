@@ -124,7 +124,8 @@ pub struct Section {
     /// Kind-specific flags. For a key map this carries which of the three forms was chosen, which
     /// is why a reader never has to guess a form.
     pub flags: u32,
-    /// Bytes of kind-specific header at the front of the first extent.
+    /// Bytes of kind-specific header at the front of the first extent, or, when there are no
+    /// extents, what the structure would have cost. See [`Self::refused`].
     pub header_bytes: u32,
 }
 
@@ -220,6 +221,27 @@ impl Section {
     #[must_use]
     pub fn usable(&self, generation: u64) -> bool {
         self.known() && self.current(generation)
+    }
+
+    /// What this structure would have cost, when the entry is a record of one that did not fit.
+    ///
+    /// Section 3.7 asks for a relationship that did not fit the budget to be recorded with its size
+    /// rather than forgotten, so that raising `graph_budget` is a decision somebody can make from a
+    /// number. An entry with no extents is that record, and the number is in [`Self::header_bytes`],
+    /// which has nothing else to mean when there is no first extent to have a header at the front
+    /// of. [`Self::flags`] keeps the meaning it has for a built section of the same kind, so a
+    /// record says which form the structure would have taken as well as what it would have cost.
+    ///
+    /// `None` for a section that is in the file, which is the ordinary case and is the one where
+    /// the size is the payload's own length.
+    ///
+    /// A size past four gigabytes saturates, because the field is a `u32`. The largest structure
+    /// this project expects to refuse is a packed forward link over an SF100 `lineitem`, which is
+    /// about 2.1 GB, so the saturation is a bound rather than a rounding, and a saturated record
+    /// still says *far more than the budget* correctly.
+    #[must_use]
+    pub fn refused(&self) -> Option<u64> {
+        (self.extents == 0).then(|| u64::from(self.header_bytes))
     }
 }
 

@@ -28,7 +28,7 @@ A section table entry is fifty six bytes.
 | `extent_bytes` | 4 | how long the extent list is |
 | `hash` | 8 | checksum of the extent list |
 | `flags` | 4 | per-kind, defined below |
-| `header_bytes` | 4 | length of the kind-specific header, which is inline at the front of the first extent |
+| `header_bytes` | 4 | length of the kind-specific header, which is inline at the front of the first extent, or, when `extents` is zero, what the structure would have cost |
 
 Three rules govern it and all three exist because of something that has already gone wrong in this codebase.
 
@@ -95,6 +95,8 @@ Graph sections are a cache and a cache needs a size. The default is that the tot
 Below sixty four kilobytes of sections the share does not apply and everything fits. A percentage is the right rule for a structure whose size is worth arguing about and it stops meaning anything at the bottom: an identity key map is forty bytes on a table of any size, a key column of sequential integers encodes to a constant delta and almost no bytes, and ten percent of almost nothing is under forty. The pure rule would throw away the cheapest structure in the system for being expensive, and what it would be measuring is how well the column compressed rather than what the cache costs.
 
 When the budget binds, relationships are built in order of expected value, which the builder estimates as the number of child rows divided by the section's bytes, biased toward relationships the query log has actually used. A relationship that does not fit is recorded as not built, with its size, so `rudb_links()` shows what a larger budget would buy rather than leaving the user to guess.
+
+The record is a section table entry with no extents. `kind` and `id` say which structure was turned away, `flags` carries the form it would have taken, and `header_bytes` carries what its payload would have been, which it can do because an entry with nothing behind it has no header for the field to describe. Fifty six bytes per refusal is what this costs, it is paid once per column the builder looked at rather than once per query, and a reader that knows nothing of the convention sees an entry with no payload, which is the same thing as no entry at all. The two reasons a build has for turning a structure away are the budget and a parent key that repeats, and the record does not say which, because the size against the budget is what distinguishes them and both are already in the table.
 
 The monotone case is the reason this budget is livable. On TPC-H SF100 the three large relationships are `lineitem → orders` at 106 MB monotone, `partsupp → part` at about 14 MB monotone, and `lineitem → part` at 1.88 GB non-monotone. The first two are free against any budget. The third is the one that has to justify itself, and document 09 section 9.5 is the measurement that decides whether it does.
 
