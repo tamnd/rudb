@@ -167,7 +167,7 @@
 
 use rudb_common::{LogicalType, Result};
 use rudb_plan::{
-    BuildSide, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+    Bound, BuildSide, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
 };
 
 use crate::pass::{Context, Pass};
@@ -328,12 +328,22 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         // Nothing goes through a limit and the recursion happens anyway, because a filter that is
         // already below the limit still has somewhere to go. A top N is a limit with a sort inside
         // it, so it holds the same line.
+        //
+        // What does happen here is that the projections under the limit are brought up over it, so
+        // that a predicate stuck above the limit still lands under the projections it reads. See
+        // [`crossed`] for why that is this pass's job rather than limit pushdown's.
         Node::Limit { input, count, offset } => {
-            let rebuilt = node(plan, input, Vec::new(), tables);
-            let above = if rebuilt == input {
-                at
-            } else {
-                plan.add_node(Node::Limit { input: rebuilt, count, offset })
+            let mut pending = pending;
+            let above = match crossed(plan, at, &mut pending, tables) {
+                Some(built) => built,
+                None => {
+                    let rebuilt = node(plan, input, Vec::new(), tables);
+                    if rebuilt == input {
+                        at
+                    } else {
+                        plan.add_node(Node::Limit { input: rebuilt, count, offset })
+                    }
+                }
             };
             filter(plan, above, pending)
         }
@@ -1048,6 +1058,110 @@ fn joined_with(plan: &mut Plan, op: ConjunctionOp, parts: &[ExprRef]) -> ExprRef
     plan.add_expr(Expr::Conjunction { op, children }, LogicalType::Boolean)
 }
 
+/// `Filter / [Limit | Project]* / rest` rebuilt as `Project* / Filter / Limit* / rest`.
+///
+/// A projection hands on one row for every row it is given, so a limit above it and the same limit
+/// below it keep the same rows, and that is what limit pushdown is for. What this does is the same
+/// trade seen from the other side. A predicate above a limit cannot go under the limit, but it can
+/// go under the projections that are down there with it, and the way to put it under them is to
+/// bring them up. Both of those leave `Project / Filter / Limit`, which is the plan either pass on
+/// its own would have arrived at if it had gone second.
+///
+/// Doing it here rather than leaving it to limit pushdown is not a preference. The two passes make
+/// work for each other: a limit traded with a projection hands this pass a projection to go through,
+/// and a filter moved under a projection hands limit pushdown a projection to cross. Each round of
+/// that moves one more level of a nested query, so no number of extra runs is enough and the fixed
+/// sequence does not settle. Nor can they be reordered, since this pass has to be in front of join
+/// order and limit pushdown has to be behind the unread materialisation drop. Crossing the whole run
+/// of limits and projections in one go is what ends it: afterwards there is no limit left with a
+/// projection under it anywhere a predicate could have used one, so limit pushdown has nothing to
+/// hand back.
+///
+/// `pending` is left holding the parts that did not move, which the caller puts back above whatever
+/// comes out. `None` means nothing moved and the caller should carry on as it would have.
+fn crossed(
+    plan: &mut Plan,
+    at: NodeRef,
+    pending: &mut Vec<ExprRef>,
+    tables: &mut Tables,
+) -> Option<NodeRef> {
+    if pending.is_empty() {
+        return None;
+    }
+    let mut limits: Vec<(Bound, Bound)> = Vec::new();
+    let mut projects: Vec<(u32, Slice, Slice)> = Vec::new();
+    let mut bottom = at;
+    loop {
+        match *plan.node(bottom) {
+            // A limit that reads its count off a column has to stay above the projection that
+            // produces the column, which is the line limit pushdown holds for the same reason.
+            Node::Limit { input, count, offset } => {
+                if count.read().is_some() || offset.read().is_some() {
+                    return None;
+                }
+                limits.push((count, offset));
+                bottom = input;
+            }
+            // One row out per row in is what makes the two orders the same rows. An expression that
+            // reads more than its own row does not have it, and the binder cannot build one in a
+            // projection today, so this is asked rather than assumed.
+            Node::Project { input, index, exprs, names } => {
+                if !plan.expr_list(exprs).iter().all(|&expr| walk::elementwise(plan, expr)) {
+                    return None;
+                }
+                projects.push((index, exprs, names));
+                bottom = input;
+            }
+            _ => break,
+        }
+    }
+    if projects.is_empty() {
+        return None;
+    }
+    let mut moved = Vec::new();
+    let mut stay = Vec::new();
+    for &part in pending.iter() {
+        match through(plan, part, &projects) {
+            Some(rewritten) => moved.push(rewritten),
+            None => stay.push(part),
+        }
+    }
+    if moved.is_empty() {
+        return None;
+    }
+    *pending = stay;
+    // Built from the bottom, since a node may only point at one behind it in the arena. The limits
+    // keep their order among themselves and so do the projections, which is what makes this the same
+    // query: the innermost limit is still the first thing the rows meet.
+    let mut built = node(plan, bottom, Vec::new(), tables);
+    for (count, offset) in limits.into_iter().rev() {
+        built = plan.add_node(Node::Limit { input: built, count, offset });
+    }
+    built = filter(plan, built, moved);
+    for (index, exprs, names) in projects.into_iter().rev() {
+        built = plan.add_node(Node::Project { input: built, index, exprs, names });
+    }
+    Some(built)
+}
+
+/// `expr` written against what the bottom of a run of projections produces, if it can be.
+///
+/// One [`substitutable`] check and one [`substituted`] rewrite per projection, outermost first,
+/// since each one is written in terms of the one below it. A projection that refuses stops the whole
+/// thing rather than half of it, because a predicate rewritten halfway down is written against
+/// columns that are not where it would be put back.
+fn through(plan: &mut Plan, expr: ExprRef, projects: &[(u32, Slice, Slice)]) -> Option<ExprRef> {
+    let mut expr = expr;
+    for &(index, exprs, _) in projects {
+        let held = plan.expr_list(exprs).to_vec();
+        if !substitutable(plan, expr, index, &held) {
+            return None;
+        }
+        expr = substituted(plan, expr, index, &held);
+    }
+    Some(expr)
+}
+
 /// Sorts `pending` into the parts that can be written in terms of `held` and the parts that cannot.
 ///
 /// The first list is what [`substitute`] is allowed to be called with, and the check it does is what
@@ -1307,6 +1421,92 @@ Sort [#0.0::INTEGER ASC NULLS LAST]
 Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
   Limit 2 offset 0
     Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(text), text);
+    }
+
+    #[test]
+    fn a_filter_stuck_above_a_limit_brings_the_projection_under_it_up() {
+        // The predicate still does not cross the limit. What moves is the projection, so that the
+        // predicate ends up written against the scan's column instead of the projection's output.
+        // Without this, limit pushdown makes the same trade one pass later and hands this pass work
+        // it has already gone past, which is the fixed sequence not settling.
+        let before = "\
+Filter (#1.0::INTEGER > 1::INTEGER)::BOOLEAN
+  Limit 4 offset 0
+    Project #1 [#0.0::INTEGER AS x]
+      Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Project #1 [#0.0::INTEGER AS x]
+  Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
+    Limit 4 offset 0
+      Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_whole_run_of_limits_and_projections_is_crossed_in_one_go() {
+        // One level per run is what the two passes were doing to each other, and a query nested
+        // three deep then took three runs. Every projection comes up and every limit stays down, in
+        // the order they were in, so the innermost limit is still the first thing the rows meet.
+        let before = "\
+Filter (#2.0::INTEGER > 1::INTEGER)::BOOLEAN
+  Limit 4 offset 0
+    Project #2 [#1.0::INTEGER AS x]
+      Limit 9 offset 0
+        Project #1 [#0.0::INTEGER AS x]
+          Get memory.main.t AS t #0 [a::INTEGER]
+";
+        let after = "\
+Project #2 [#1.0::INTEGER AS x]
+  Project #1 [#0.0::INTEGER AS x]
+    Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
+      Limit 4 offset 0
+        Limit 9 offset 0
+          Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_predicate_the_projection_refuses_leaves_the_limit_where_it_was() {
+        // The projection computes the column from a volatile call, so the predicate cannot be
+        // rewritten in terms of what it reads, and with nothing to move there is no reason to
+        // rearrange anything. The same answer the pass gave before any of this was written.
+        let text = "\
+Filter (#1.0::DOUBLE > 1.0::DOUBLE)::BOOLEAN
+  Limit 4 offset 0
+    Project #1 [random()::DOUBLE AS r]
+      Get memory.main.t AS t #0 [a::INTEGER]
+";
+        assert_eq!(pushed(text), text);
+    }
+
+    #[test]
+    fn a_limit_that_reads_its_count_off_a_column_keeps_the_projection_under_it() {
+        // The count is one of the columns the projection produces, so bringing the projection up
+        // would leave the limit above the only place the number can be read from. Limit pushdown
+        // refuses the same shape for the same reason.
+        let text = "\
+Filter (#1.0::INTEGER > 1::INTEGER)::BOOLEAN
+  Limit #1.1::INTEGER offset 0
+    Project #1 [#0.0::INTEGER AS x, #0.1::INTEGER AS n]
+      Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(text), text);
+    }
+
+    #[test]
+    fn a_limit_over_a_scan_is_still_where_a_predicate_stops() {
+        // Nothing under the limit to bring up, so this is the plain refusal and not a rearrangement
+        // that happens to come out looking the same.
+        let text = "\
+Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN
+  Limit 2 offset 0
+    Limit 5 offset 1
+      Get memory.main.t AS t #0 [a::INTEGER]
 ";
         assert_eq!(pushed(text), text);
     }
