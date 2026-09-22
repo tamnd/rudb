@@ -70,6 +70,8 @@ So there is a curve and not a point, and the planner picks a place on it:
 
 Both ends beat rudb today on both axes. The low memory end clears ten times less resources by a factor of seven and misses ten times faster by a factor of six. There is no point on this curve that clears both, which is consistent with what document 25 proved about the floor and is the reason it is drawn here.
 
+**Document 27 built the low memory end and measured it, and the projection above was pessimistic on both axes.** It holds the whole query in 89.3 MiB rather than 64 plus a table, certifies at a threshold of 3,540 against an answer whose last row is 247,459, and counts 3,394 keys exactly out of 19,720,796. Carried into the engine that is about 96 seconds of processor time against today's 147 and about 90 MiB against today's 3,884, which is fifty four times under DuckDB rather than seventy six but against a real measurement rather than an estimate of one.
+
 ## What this changes about the target
 
 Twenty of ClickBench's forty three queries are a count grouped by something and ordered by that count, and every one of them today builds a table proportional to the input's cardinality. Two of them, 32 and 33, group by a key close to unique across a hundred million rows, and those are the ones where the table is largest and the answer smallest. This design bounds all of them by a constant the query does not choose.
