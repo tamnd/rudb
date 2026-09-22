@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.82
+
+A patch release of two pull requests, both about a database being a file rather than a session. A table created in one run is now there in the next one without anybody saying `CHECKPOINT`, which is what DuckDB does. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
+
+A native file can hold no table at all, in #1224. The writer took its first table when the file was created and committed the one it was on at the end, so a catalog with nothing in it could be read and never written, and a checkpoint over a database somebody had dropped the last table out of raised and left the dropped table in the file. That is a statement that succeeded being undone by the write that was meant to publish it. The format already allowed it, because a catalog is a count and then that many entries and a count of nought encodes the same way every other count does, which is why nothing about this is a version change.
+
+A database opened on a file is written when the last handle on it goes away, in #1226. The write is a `Drop` on the shared state, so it happens once however many handles and connections there were and it is the last one going that does it, and `Database::close` is the same write with the error handed back, for a caller that wants to know whether its last session reached the disk. A `Drop` has nowhere to put an error, which is the whole reason `close` exists beside it. The shell calls it at the end of a session and turns a failed write into a message and a failing exit code, and `.open` goes through the same door.
+
+`Config::read_only` is new in the same pull request, and it means the file is never written. The `-readonly` flag was parsed and used nowhere before this, so a write on close would have started writing files a user had asked not to be written. It is enforced in the three places that write the file, which are `CHECKPOINT`, the create and insert paths that write rows into the file as they run, and the write on the way out. A `CHECKPOINT` under it succeeds and writes nothing, which is what the pinned binary does. What it does not do is refuse the statements by name or refuse to open a database that is not there, both of which DuckDB does and both of which are #1225, so a write under a read only database still changes the tables that process can see and is still gone when the process ends.
+
 ## 0.3.81
 
 A patch release of one pull request. It is the last construct the binder refused by name, which was a limit written as a percentage whose share or offset is a subquery. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
