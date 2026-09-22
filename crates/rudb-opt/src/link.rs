@@ -58,7 +58,7 @@
 //! slow is visibly a hash join, and a link that went unread because a projection two nodes up
 //! dropped the row id looks from the outside exactly like a link that was never built.
 //!
-//! So [`decided`] hands back a [`Why`] for every join it looks at, the rewrite acts on the ones
+//! So one walk hands back a [`Why`] for every join it looks at, the rewrite acts on the ones
 //! that say yes, and [`why`] is what `EXPLAIN` asks afterwards. One implementation and two callers,
 //! because two walks that both worked out why a join is a hash join would agree on the day they
 //! were written and disagree some time after, and the one that would be wrong is the one somebody
