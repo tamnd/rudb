@@ -433,7 +433,7 @@ impl<'a> Transform<'a> {
         Ok(())
     }
 
-    /// `Statement <- SelectStatement / ...`, twenty seven alternatives of which four are done.
+    /// `Statement <- SelectStatement / ...`, twenty seven alternatives of which ten are done.
     fn statement(&mut self, node: u32) -> Result<Statement> {
         let inner = self.first(node);
         match self.name(inner) {
@@ -449,6 +449,10 @@ impl<'a> Transform<'a> {
             "PragmaStatement" => self.pragma_statement(inner),
             "ExplainStatement" => self.explain_statement(inner),
             "CheckpointStatement" => Ok(Statement::Checkpoint),
+            "CallStatement" => {
+                let query = self.call_query(inner)?;
+                Ok(Statement::Query(query))
+            }
             _ => self.unsupported(inner),
         }
     }
@@ -500,11 +504,46 @@ impl<'a> Transform<'a> {
             }
         }
         let inner = self.first(self.find(node, "ExplainableStatements"));
-        if self.name(inner) != "ExplainSelectStatement" {
-            return self.unsupported(inner);
-        }
-        let query = self.query(self.find(inner, "SelectStatementInternal"))?;
+        let query = match self.name(inner) {
+            "ExplainSelectStatement" => self.query(self.find(inner, "SelectStatementInternal"))?,
+            // A call is a query with the `SELECT *` left off, so it has the plan the query has and
+            // there is no reason for the two spellings to differ about what `EXPLAIN` prints.
+            "CallStatement" => self.call_query(inner)?,
+            _ => return self.unsupported(inner),
+        };
         Ok(Statement::Explain { query, analyze, statistics })
+    }
+
+    /// `CallStatement <- 'CALL' QualifiedTableFunction TableFunctionArguments`, which is the table
+    /// function in the `FROM` clause with the clause left off.
+    ///
+    /// The two sub-rules are the same two the `FROM` clause form reads, so this is one statement
+    /// written two ways and not two things that resemble each other. It becomes the query the long
+    /// spelling would have produced, which is how the pragma call is handled a few hundred lines up
+    /// and for the same reason: one plan means one set of answers, and a second path through the
+    /// binder for a statement that does the same work is a place for the two to drift apart.
+    ///
+    /// The rule has no alias and no `WITH ORDINALITY`, so there is nothing here to turn away. What
+    /// the function is called and whether it exists are the binder's questions, and a name that is
+    /// not a table function gets the binder's own words about it rather than a parse error, which
+    /// is what the other spelling gets.
+    fn call_query(&mut self, node: u32) -> Result<QueryRef> {
+        let name = self.name_parts(self.find(node, "QualifiedTableFunction"));
+        let mut args = Vec::new();
+        // `TableFunctionArguments <- Parens(List(FunctionArgument)?)`, so `CALL f()` has the
+        // wrapper with no list under it and comes through here with no arguments.
+        for kid in self.kids(self.find(node, "TableFunctionArguments")) {
+            args.push(self.table_argument(kid)?);
+        }
+        let args = self.target_slice(args);
+        let source = self.push_source(Source::Function {
+            name,
+            args,
+            alias: NONE,
+            columns: Slice::default(),
+            pragma: false,
+        });
+        Ok(self.star_over(source))
     }
 
     /// `SetStatement <- 'SET' SetAssignmentOrTimeZone`.
