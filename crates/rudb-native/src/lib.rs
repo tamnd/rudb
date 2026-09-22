@@ -126,6 +126,15 @@ fn page_bytes(pages: &[Option<Page>], at: usize) -> u64 {
     pages.get(at).and_then(Option::as_ref).map_or(0, Page::bytes)
 }
 
+/// The xxHash64 of `bytes`, which is what every span this format stores is checked against.
+///
+/// It walks the input as chunks rather than as offsets into it, and that is the only thing about it
+/// worth a comment. The offset form reads `bytes[at..at + 8]`, and neither the slicing nor the
+/// `try_into` behind it can be proved in range by a compiler that does not know where `at` stopped,
+/// so each of the four lanes paid for a bounds check and a length check on every thirty two bytes.
+/// A chunk carries its own length, so both fold away and the loop is the multiplies and rotates it
+/// was meant to be. That loop runs over every byte of every span a query reads, which on ClickBench
+/// 8 is about five percent of the query.
 fn checksum(bytes: &[u8]) -> u64 {
     const P1: u64 = 11_400_714_785_074_694_791;
     const P2: u64 = 14_029_467_366_897_019_727;
@@ -136,21 +145,22 @@ fn checksum(bytes: &[u8]) -> u64 {
         state.wrapping_add(word.wrapping_mul(P2)).rotate_left(31).wrapping_mul(P1)
     };
     let merge = |state: u64, lane: u64| (state ^ round(0, lane)).wrapping_mul(P1).wrapping_add(P4);
-    let word =
-        |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight checksum bytes"));
+    let word = |chunk: &[u8]| u64::from_le_bytes(chunk.try_into().expect("eight checksum bytes"));
 
-    let mut at = 0;
+    // Asked for before the loop rather than after it, because a `ChunksExact` settles what it
+    // cannot divide when it is built and hands back the same tail whether it has been walked or not.
+    let mut blocks = bytes.chunks_exact(32);
+    let mut rest = blocks.remainder();
     let mut hash = if bytes.len() >= 32 {
         let mut one = P1.wrapping_add(P2);
         let mut two = P2;
         let mut three = 0;
         let mut four = 0_u64.wrapping_sub(P1);
-        while at + 32 <= bytes.len() {
-            one = round(one, word(at));
-            two = round(two, word(at + 8));
-            three = round(three, word(at + 16));
-            four = round(four, word(at + 24));
-            at += 32;
+        for block in blocks.by_ref() {
+            one = round(one, word(&block[..8]));
+            two = round(two, word(&block[8..16]));
+            three = round(three, word(&block[16..24]));
+            four = round(four, word(&block[24..]));
         }
         let combined = one
             .rotate_left(1)
@@ -162,21 +172,22 @@ fn checksum(bytes: &[u8]) -> u64 {
         P5
     };
     hash = hash.wrapping_add(bytes.len() as u64);
-    while at + 8 <= bytes.len() {
-        hash ^= round(0, word(at));
+    let mut words = rest.chunks_exact(8);
+    for chunk in words.by_ref() {
+        hash ^= round(0, word(chunk));
         hash = hash.rotate_left(27).wrapping_mul(P1).wrapping_add(P4);
-        at += 8;
     }
-    if at + 4 <= bytes.len() {
-        let tail = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four checksum bytes"));
-        hash ^= u64::from(tail).wrapping_mul(P1);
+    rest = words.remainder();
+    if rest.len() >= 4 {
+        let (head, tail) = rest.split_at(4);
+        let quarter = u32::from_le_bytes(head.try_into().expect("four checksum bytes"));
+        hash ^= u64::from(quarter).wrapping_mul(P1);
         hash = hash.rotate_left(23).wrapping_mul(P2).wrapping_add(P3);
-        at += 4;
+        rest = tail;
     }
-    while at < bytes.len() {
-        hash ^= u64::from(bytes[at]).wrapping_mul(P5);
+    for &byte in rest {
+        hash ^= u64::from(byte).wrapping_mul(P5);
         hash = hash.rotate_left(11).wrapping_mul(P1);
-        at += 1;
     }
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(P2);
@@ -8070,5 +8081,46 @@ mod tests {
         assert_eq!(catalog.opening.reads, 2, "opening the catalog read more than the slot");
         assert_eq!(catalog.names().len(), 3);
         fs::remove_file(file).expect("remove scratch file");
+    }
+
+    /// The checksum answers what it has always answered, at every length its branches split on.
+    ///
+    /// This is a compatibility test rather than a correctness one. Nothing about the hash has to be
+    /// any particular function, but a file already on disk carries the answers the version that
+    /// wrote it gave, so a change here is a change that makes every stored file fail to verify. The
+    /// lengths are the ones the code makes decisions about: nothing, under a block, a block exactly,
+    /// a block and a word, a word and a half word, and a half word and a byte.
+    ///
+    /// The empty answer is the published xxHash64 vector for an empty input at seed zero, which is
+    /// also a check that this is the function it says it is.
+    #[test]
+    fn the_checksum_answers_what_it_has_always_answered() {
+        let bytes: Vec<u8> =
+            (0..1000_u32).map(|at| (at.wrapping_mul(31).wrapping_add(7) % 251) as u8).collect();
+        for (length, expected) in [
+            (0, 0xef46_db37_51d8_e999),
+            (1, 0xa96c_7f0c_e858_bbb7),
+            (3, 0x56e6_9576_32a4_87f9),
+            (4, 0xc60d_15b1_e3ff_8f04),
+            (5, 0x8088_1585_8624_dd4e),
+            (7, 0xafbe_fc3d_6c6f_9a8e),
+            (8, 0x3da5_c7aa_2696_83e0),
+            (9, 0x465e_c429_b13c_3892),
+            (15, 0xdee8_9d8a_065a_6233),
+            (16, 0x1330_489a_7767_9c80),
+            (31, 0x3391_303d_485e_846e),
+            (32, 0x40b7_aff7_5d45_bbc8),
+            (33, 0x4997_cae4_951c_17a5),
+            (39, 0x5807_28fd_5c14_5739),
+            (40, 0xf95c_f6f5_c08a_3d3b),
+            (63, 0x2944_b4da_fc69_b206),
+            (64, 0xbb76_f6ef_19bd_5a1b),
+            (65, 0x814e_0c65_4a9f_d640),
+            (127, 0x00de_aab1_31cf_f89b),
+            (1000, 0x9e33_00c1_cde3_c58d),
+        ] {
+            assert_eq!(checksum(&bytes[..length]), expected, "the checksum of {length} bytes");
+        }
+        assert_eq!(checksum(b"the quick brown fox jumps over the lazy dog"), 0xed71_4233_c5a9_a792);
     }
 }
