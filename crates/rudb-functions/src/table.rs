@@ -426,12 +426,14 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
 fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<ResolvedTable> {
     if let Some(columns) = file_columns(function) {
         // Two overloads, one path and a list of them, which is DuckDB's pair. The list is where
-        // `read_parquet(['a.parquet', 'b.parquet'])` binds, and an empty list arrives typed
-        // `INTEGER[]` there and here, so it lands on the no overload message rather than on a read
-        // of nothing.
-        let list = LogicalType::list(LogicalType::Varchar);
+        // `read_parquet(['a.parquet', 'b.parquet'])` binds. An empty list is a list of the untyped
+        // null and it binds here too, because a list with nothing in it is a fine list and the
+        // objection to it is that it names no file, which is what the reader says about it rather
+        // than what this table says.
         let single = arguments.len() == 1 && arguments[0] == LogicalType::Varchar;
-        let many = arguments.len() == 1 && arguments[0] == list;
+        let many = arguments.len() == 1
+            && matches!(&arguments[0], LogicalType::List(element)
+                if **element == LogicalType::Varchar || **element == LogicalType::Null);
         // A bare null matches, and is a sentence about nulls rather than about overloads, which is
         // what DuckDB answers `read_parquet(NULL)` with. It is left as a null rather than cast to a
         // path so that the binder still has a null to recognise when it goes looking for the name.
@@ -439,8 +441,11 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
         if !single && !many && !nothing {
             return Err(no_overload(function, arguments));
         }
+        // A list keeps the type it arrived with rather than being cast to a list of strings, because
+        // the two that reach here are already one of those and a cast between two list types is
+        // machinery this does not need. The reader reads the values and not the declaration.
         let wanted = if many {
-            list
+            arguments[0].clone()
         } else if nothing {
             LogicalType::Null
         } else {

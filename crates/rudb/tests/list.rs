@@ -94,17 +94,14 @@ fn every_item_has_to_find_a_file_of_its_own() {
 }
 
 #[test]
-fn an_empty_list_is_the_message_about_overloads_because_it_has_no_element_type() {
-    // `[]` is an `INTEGER[]` before anything looks at what it is for, so it never reaches the file
-    // reader. DuckDB reports it the same way and this is its sentence.
-    let message = refusal("SELECT * FROM read_parquet([])");
-    assert!(
-        message.starts_with(
-            "No function matches the given name and argument types 'read_parquet(INTEGER[])'"
-        ),
-        "{message}"
+fn an_empty_list_is_the_reader_saying_it_has_no_file_to_read() {
+    // `[]` is a list of the untyped null, which the file overload takes, so the empty list reaches
+    // the reader rather than being turned away for having the wrong type. DuckDB lets it through to
+    // the same place and this is the sentence it answers with there.
+    assert_eq!(
+        refusal("SELECT * FROM read_parquet([])"),
+        "\"read_parquet\" needs at least one file to read"
     );
-    assert!(message.contains("read_parquet(VARCHAR[])"), "{message}");
 }
 
 #[test]
@@ -148,10 +145,26 @@ fn a_list_where_an_expression_goes_computes_since_there_is_a_vector_for_it() {
 }
 
 #[test]
-fn a_list_of_columns_is_the_half_of_the_gap_that_is_still_there() {
-    // The vector exists and the folding in the binder does not know it yet. A list of constants is
-    // folded into one value, which is why the test above passes, and a list with a column in it has
-    // nothing to fold into and no `list_value` function to become a call to. The message names what
-    // is missing rather than pretending the syntax is unknown.
-    assert_eq!(refusal("SELECT [a, 2] FROM (SELECT 1 AS a)"), "a list of anything but constants");
+fn a_list_of_columns_computes_now_that_a_list_is_a_call() {
+    // This used to be the other half of the gap. A list of constants folded into one value and a
+    // list with a column in it had nothing to fold into and no `list_value` function to become a
+    // call to, so it was refused. A list literal is that call now, which is what takes the folding
+    // out of the question of whether a list can be written at all.
+    let database = Database::new();
+    assert_eq!(
+        database.value("SELECT [a, 2] FROM (SELECT 1 AS a)").expect("runs"),
+        Value::List {
+            element: rudb_common::LogicalType::Integer,
+            values: vec![Value::Integer(1), Value::Integer(2)],
+        }
+    );
+}
+
+#[test]
+fn a_file_name_inside_a_list_does_not_have_to_be_written_out() {
+    // The reader needs the name before the plan runs, which is not the same as needing it written
+    // down. The list is a call and what reaches the reader is whatever the folding makes of it, so a
+    // name that is built out of constants is a name.
+    let from = format!("read_parquet([{} || ''])", parquet("p1.parquet"));
+    assert_eq!(one("count(*)", &from), Value::BigInt(3));
 }

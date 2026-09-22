@@ -307,40 +307,25 @@ impl Binder<'_> {
         Ok(constant)
     }
 
-    /// `[a, b, c]`, which is a LIST value.
+    /// `[a, b, c]`, which is a call to `list_value`.
     ///
-    /// Constants only, because a list is folded into one `Value` here rather than evaluated. There is
-    /// a LIST vector to compute into as of #302, so what is missing now is the other half: a
-    /// `list_value` function for the folding to become a call to. Until that exists `[a, b]` over
-    /// columns has nowhere to be evaluated, and the one thing a list is for today is the file argument
-    /// of `read_parquet`, which is constants.
+    /// A bracket is that call on the pin too, which is why a query that writes one gets a column
+    /// named `list_value(a, b, c)` back from both engines. Binding it as a call rather than folding
+    /// it into a `Value` here is what lets a list hold a column: the items are arguments, they are
+    /// cast to the element type by the same resolution every other call goes through, and the
+    /// executor evaluates it per row like anything else. A list of constants still comes out as one
+    /// value, because the folder answers a call whose arguments are all constants, which is what
+    /// `read_parquet(['a', 'b'])` reads.
     ///
-    /// The element type is what the items promote to, and an empty list is `INTEGER[]`, both of
-    /// which are DuckDB's answers and were measured against the binary.
+    /// The element type is what the items promote to and an empty list is `"NULL"[]`, both of which
+    /// are the pin's answers and both of which are decided in `rudb-functions` rather than here.
     fn bind_list(&mut self, ast: &Ast, items: ast::Slice, scope: &Scope) -> Result<ExprRef> {
         let written = ast.expr_list(items).to_vec();
-        let mut values = Vec::with_capacity(written.len());
+        let mut args = Vec::with_capacity(written.len());
         for item in written {
-            let bound = self.bind_expr(ast, item, scope)?;
-            let Expr::Constant(reference) = *self.plan().expr(bound) else {
-                return Err(Error::not_implemented("a list of anything but constants"));
-            };
-            values.push(self.plan().value(reference).clone());
+            args.push(self.bind_expr(ast, item, scope)?);
         }
-        let mut element = LogicalType::Integer;
-        for (at, value) in values.iter().enumerate() {
-            let ty = value.logical_type();
-            if value.is_null() {
-                continue;
-            }
-            element = if at == 0 { ty } else { mixed(&element, &ty)? };
-        }
-        for value in &values {
-            if !value.is_null() && value.logical_type() != element {
-                return Err(Error::not_implemented("a list whose items are not all one type"));
-            }
-        }
-        Ok(self.add_constant(Value::List { element, values }))
+        self.call("list_value", args)
     }
 
     fn bind_unary(
@@ -1000,13 +985,6 @@ impl Binder<'_> {
         let constant = self.add_constant(Value::Boolean(wanted));
         self.compare(op, condition, constant)
     }
-}
-
-/// The type two items of a list literal meet at.
-fn mixed(left: &LogicalType, right: &LogicalType) -> Result<LogicalType> {
-    left.promote(right).ok_or_else(|| {
-        Error::binder(format!("Cannot mix values of type {left} and type {right} in a list"))
-    })
 }
 
 /// The type two branches of a `CASE` meet at.
