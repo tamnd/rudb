@@ -2596,12 +2596,18 @@ impl NativeText {
     /// value, one for the end and one for the start that is the end before it, and on the ClickBench
     /// `URL` dictionary of eighteen million that was most of the half second a `LIKE` over it took.
     ///
-    /// [`bitpack::unpack_tail`] walks the run instead, which makes the window a fixed width and so
-    /// an unaligned load, and reads the bit position off a counter. A run is five hundred and twelve
-    /// values and a block is two of them, so a block of a thousand and twenty four values costs two
-    /// calls here and nothing per value.
+    /// [`bitpack::unpack_tail_into`] walks the run instead, which makes the window a fixed width and
+    /// so an unaligned load, and reads the bit position off a counter. A run is five hundred and
+    /// twelve values and a block is two of them, so a block of a thousand and twenty four values
+    /// costs two calls here and nothing per value.
+    ///
+    /// The answer is written straight into the result. A run that is wanted from its first value,
+    /// which is every run but the one the sweep starts in, unpacks into its own window of the result
+    /// and is never copied. Only a run joined part way through needs the scratch buffer, and there is
+    /// at most one of those per sweep, so the buffer is allocated the first time one turns up.
     fn ends_within(&self, first: usize, last: usize) -> Result<Vec<u64>> {
-        let mut ends = Vec::with_capacity(last.saturating_sub(first));
+        let mut ends = vec![0u64; last.saturating_sub(first)];
+        let mut scratch = Vec::new();
         let mut at = first;
         while at < last {
             let run = at / TEXT_OFFSET_RUN;
@@ -2611,12 +2617,21 @@ impl NativeText {
                 .offsets
                 .get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)
                 .ok_or_else(|| invalid("global dictionary offsets are short"))?;
-            let run_ends = bitpack::unpack_tail(bytes, self.offset_bits, held)
-                .map_err(|_| invalid("global dictionary offsets are short"))?;
-            let within = run_ends
-                .get(at % TEXT_OFFSET_RUN..stop - run * TEXT_OFFSET_RUN)
-                .ok_or_else(|| invalid("global dictionary offsets are short"))?;
-            ends.extend_from_slice(within);
+            let from = at % TEXT_OFFSET_RUN;
+            let upto = stop - run * TEXT_OFFSET_RUN;
+            if upto > held || bytes.len() < bitpack::tail_len(held, self.offset_bits) {
+                return Err(invalid("global dictionary offsets are short"));
+            }
+            let into = &mut ends[at - first..stop - first];
+            if from == 0 {
+                bitpack::unpack_tail_into(bytes, self.offset_bits, into, |bits| bits)
+                    .map_err(|_| invalid("global dictionary offsets are short"))?;
+            } else {
+                scratch.resize(held, 0);
+                bitpack::unpack_tail_into(bytes, self.offset_bits, &mut scratch, |bits| bits)
+                    .map_err(|_| invalid("global dictionary offsets are short"))?;
+                into.copy_from_slice(&scratch[from..upto]);
+            }
             at = stop;
         }
         Ok(ends)
