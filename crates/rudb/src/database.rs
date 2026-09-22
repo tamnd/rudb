@@ -235,6 +235,13 @@ impl Database {
             for name in names {
                 catalog.create_native_table(native.table(&name)?)?;
             }
+            // After the tables, because a view is allowed to stand over one and the name check in
+            // the catalog is over both. Nothing binds here, so the order does not matter to the
+            // body, but it matters to the sentence a clash produces.
+            let views = native.views().cloned().collect::<Vec<_>>();
+            for view in &views {
+                catalog.create_native_view(view)?;
+            }
         }
         let memory = Memory::new(config.memory_limit());
         let pool = runtime(&config);
@@ -487,6 +494,7 @@ impl Database {
 /// be kept alive by every checkpoint for as long as the database is open.
 fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     let names = catalog.stored_tables().map(|table| table.name().clone()).collect::<Vec<_>>();
+    let views = views(catalog);
     // Nothing to write is every table already in the file and the file holding no other. The second
     // half is what a drop leaves behind: every table that is left is still native, and without
     // asking the file which tables it names the checkpoint would decide there was nothing to do and
@@ -497,7 +505,17 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     let clean = catalog
         .stored_tables()
         .all(|table| table.rows().is_native() && table.clustering_is_stored());
-    if clean && committed(path)?.is_some_and(|held| held == wanted(&names)) {
+    let held = committed(path)?;
+    // The views are compared by what they are rather than by their whole record, because the column
+    // list on a record is a cache the binder writes over every time somebody selects from the view.
+    // Comparing that too would make a plain `SELECT` from a view leave the file looking out of date,
+    // and the next checkpoint would write the whole database again to store a list that answers the
+    // same questions it already answered.
+    if clean
+        && held
+            .as_ref()
+            .is_some_and(|held| held.tables == wanted(&names) && same_views(&held.views, &views))
+    {
         return Ok(());
     }
     // A database with no table in it is still a database, and the file has to say so or the tables
@@ -506,10 +524,16 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     // rewrite below it, written as an empty file and renamed over whatever was there.
     if names.is_empty() {
         let temporary = scratch(path)?;
-        rudb_native::Writer::empty(&temporary)?;
+        rudb_native::Writer::empty(&temporary, &views)?;
         return rename(&temporary, path);
     }
-    if appended(path, catalog, &names)? {
+    // Only the views moved, so nothing has to be written again. Everything the file holds is still
+    // the right bytes in the right place and the commit is a new catalog naming the same pages.
+    if clean && held.is_some_and(|held| held.tables == wanted(&names)) {
+        rudb_native::Writer::restate(path, &views)?;
+        return rebind(path, catalog, &names);
+    }
+    if appended(path, catalog, &names, &views)? {
         return rebind(path, catalog, &names);
     }
     let temporary = scratch(path)?;
@@ -531,7 +555,7 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
         writer = Some(open);
     }
     let writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
-    writer.finish()?;
+    writer.with_views(views).finish()?;
     rename(&temporary, path)?;
     rebind(path, catalog, &names)
 }
@@ -555,16 +579,31 @@ fn rename(temporary: &Path, path: &Path) -> Result<()> {
     std::fs::rename(temporary, path).map_err(|error| Error::io(error.to_string()))
 }
 
-/// Which tables the committed file names, or `None` for a path nothing has been written to yet.
+/// What the committed file holds, or `None` for a path nothing has been written to yet.
 ///
 /// A path that is there but is not a native file this build can read is an error rather than a
 /// `None`, because the caller's other answer is to write the whole file, and writing over something
 /// that might be somebody else's is worse than refusing.
-fn committed(path: &Path) -> Result<Option<BTreeSet<String>>> {
-    Ok(held_rows(path)?.map(|held| held.into_keys().collect()))
+fn committed(path: &Path) -> Result<Option<Held>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let held = rudb_native::Catalog::open(path)?;
+    Ok(Some(Held {
+        tables: held.names().map(str::to_string).collect(),
+        views: held.views().cloned().collect(),
+    }))
 }
 
-/// The same tables with the row count the committed catalog records for each of them.
+/// What the committed file says it holds, without reading a table directory for any of it.
+struct Held {
+    /// The names of its tables, which is all a checkpoint has to know about them.
+    tables: BTreeSet<String>,
+    /// Its views, whole, since a view is entirely in the catalog level.
+    views: Vec<rudb_native::ViewEntry>,
+}
+
+/// The tables with the row count the committed catalog records for each of them.
 ///
 /// Only one caller needs the counts and it needs them for one question, which is whether a table
 /// already in the file would be in the way of a load streaming into it. See [`appendable`].
@@ -579,6 +618,34 @@ fn held_rows(path: &Path) -> Result<Option<BTreeMap<String, usize>>> {
 /// The same set of names, taken from the catalog instead.
 fn wanted(names: &[QualifiedName]) -> BTreeSet<String> {
     names.iter().map(|name| name.table.clone()).collect()
+}
+
+/// The views a file written from this catalog now would hold.
+///
+/// The column list goes in as it stands, cache and all. See
+/// `rudb_catalog::Catalog::create_native_view` for why a file carries a cache at all.
+fn views(catalog: &Catalog) -> Vec<rudb_native::ViewEntry> {
+    catalog
+        .stored_views()
+        .map(|view| rudb_native::ViewEntry {
+            name: view.name().table.clone(),
+            sql: view.sql().to_string(),
+            statement: view.statement().to_string(),
+            aliases: view.aliases().to_vec(),
+            columns: view.columns(),
+        })
+        .collect()
+}
+
+/// Whether two lists of views are the same views, ignoring the column cache on each.
+fn same_views(held: &[rudb_native::ViewEntry], wanted: &[rudb_native::ViewEntry]) -> bool {
+    held.len() == wanted.len()
+        && held.iter().zip(wanted).all(|(held, wanted)| {
+            held.name == wanted.name
+                && held.sql == wanted.sql
+                && held.statement == wanted.statement
+                && held.aliases == wanted.aliases
+        })
 }
 
 /// Builds a key map over the parent column of every declared relationship.
@@ -650,9 +717,14 @@ fn rebind(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Result
 /// disagree about which tables exist, and the caller writes the whole file instead. A file that is
 /// there but is not a native file this build can read is an error either way, so the error from
 /// reading it is returned rather than swallowed into a rewrite that would overwrite it.
-fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Result<bool> {
+fn appended(
+    path: &Path,
+    catalog: &mut Catalog,
+    names: &[QualifiedName],
+    views: &[rudb_native::ViewEntry],
+) -> Result<bool> {
     let Some(held) = committed(path)? else { return Ok(false) };
-    if held.is_empty() {
+    if held.tables.is_empty() {
         return Ok(false);
     }
     let native = names
@@ -660,7 +732,7 @@ fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Resu
         .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_native()))
         .map(|name| name.table.clone())
         .collect::<BTreeSet<_>>();
-    if held != native {
+    if held.tables != native {
         return Ok(false);
     }
     let dirty =
@@ -686,7 +758,10 @@ fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Resu
         writer = Some(open);
     }
     let Some(writer) = writer else { return Ok(false) };
-    writer.finish()?;
+    // Told rather than carried forward, because the caller's list is the catalog's and the writer's
+    // is whatever the committed generation had. A view that was dropped since then is only missing
+    // from the first of those.
+    writer.with_views(views.to_vec()).finish()?;
     Ok(true)
 }
 
@@ -722,6 +797,9 @@ fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<
         .collect::<BTreeSet<_>>();
     // The count as well as the set, because a table that is in neither is a table with rows in
     // memory that this generation would not carry.
+    // Views are not asked about, because the writer that follows this carries forward whatever the
+    // committed generation says about them and does not have to be told. A view made or dropped
+    // since then is settled by the checkpoint after it, which sees the two lists differ.
     Ok(carried == native && others == native.len())
 }
 

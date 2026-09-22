@@ -350,6 +350,33 @@ impl Catalog {
         Ok(())
     }
 
+    /// Registers a view read back out of a native file in the default catalog and schema.
+    ///
+    /// The columns go in as the cache they were written as, which is the whole reason they are in
+    /// the file. Nothing has bound the body in this process, so a catalog that started the columns
+    /// empty would answer `is_bound` false until somebody selected from the view, and the pin
+    /// answers true straight after an open. Binding every view here instead would make opening a
+    /// database cost a bind per view and would fail on a view whose table is in a database that has
+    /// not been attached yet.
+    ///
+    /// # Errors
+    ///
+    /// If its name is already used by a table or another view.
+    pub fn create_native_view(&mut self, view: &rudb_native::ViewEntry) -> Result<()> {
+        let name = QualifiedName::new(
+            self.default_catalog.clone(),
+            self.default_schema.clone(),
+            view.name.clone(),
+        );
+        self.create_view(View::new(
+            name,
+            view.sql.clone(),
+            view.statement.clone(),
+            view.aliases.clone(),
+            view.columns.clone(),
+        ))
+    }
+
     /// Creates a view.
     ///
     /// The body is not checked here. Whether it binds is the binder's question and it is asked
@@ -627,6 +654,29 @@ impl Catalog {
             .iter()
             .flat_map(|database| database.schemas.iter())
             .flat_map(|schema| schema.tables.iter())
+    }
+
+    /// Every view a database file would hold, which is every view a person made in a real database.
+    ///
+    /// The filter is on the database rather than on the name, unlike [`Catalog::stored_tables`],
+    /// because views have two kinds to leave out and tables only have one. `temp` holds the ones
+    /// somebody made that go when the session does, and `system` holds the ones the engine ships
+    /// with, which are in every catalog already and would come back doubled if a file named them.
+    /// Both of those are the internal databases, so one question answers both.
+    pub fn stored_views(&self) -> impl Iterator<Item = &View> {
+        self.databases
+            .iter()
+            .filter(|database| !database.internal)
+            .flat_map(|database| database.schemas.iter())
+            .flat_map(|schema| schema.views.iter())
+    }
+
+    /// Every view, in creation order within a schema, the engine's own included.
+    pub fn views(&self) -> impl Iterator<Item = &View> {
+        self.databases
+            .iter()
+            .flat_map(|database| database.schemas.iter())
+            .flat_map(|schema| schema.views.iter())
     }
 
     /// The readings of a written name, best first.
