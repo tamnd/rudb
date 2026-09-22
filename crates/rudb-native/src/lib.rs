@@ -2389,6 +2389,26 @@ struct NativeText {
     /// Bits one offset is packed at, which is what the largest block of this column spans and is the
     /// same for every block of it.
     offset_bits: usize,
+    /// The same ends unpacked, built once enough readers have asked for one at a time.
+    ///
+    /// Reading one offset out of the packed form costs about fifty instructions: a division to find
+    /// the run, a bounds check to slice it, a shift to reach the bit the value starts at and a
+    /// narrowing on the way out. That is the right price for a reader that wants a handful. It is
+    /// the wrong price for `STRLEN` over a column, which asks for one per row and nothing else, and
+    /// where a million of them was a third of ClickBench 28.
+    ///
+    /// Unpacking a run into an array costs about three instructions a value, so once the reads reach
+    /// a fraction of the dictionary the table has already paid for itself and every read after it is
+    /// a load. [`Self::ends_worth_unpacking`] is that fraction and [`Self::ends_asked`] counts
+    /// against it, because a table built for a reader that wanted three values is four bytes a value
+    /// spent on nothing.
+    value_ends: OnceLock<Option<Vec<u32>>>,
+    /// How many single offset reads have come in while the table is not built.
+    ///
+    /// Relaxed, and read only against a threshold, so two threads racing here means the table is
+    /// built one read early or one read late. Counting stops the moment the table exists, because
+    /// [`OnceLock::get`] settles it before this is touched.
+    ends_asked: AtomicUsize,
     /// How many entries the sorted order has, which is the value count.
     ranks: usize,
     /// Where the sorted order starts in the file. It is read a block at a time and only when
@@ -2594,8 +2614,55 @@ impl NativeText {
         Ok(bytes)
     }
 
+    /// How many single offset reads make [`Self::value_ends`] worth building.
+    ///
+    /// A sixteenth of the dictionary. Unpacking costs about three instructions a value and a packed
+    /// read costs about fifty, so the reads have repaid the build by then several times over, and a
+    /// reader that wants fewer than that is left on the packed form rather than made to pay four
+    /// bytes a value for a table it will not finish using. The floor is there because a sixteenth of
+    /// a short dictionary is a handful of reads, and a table nobody needed is still an allocation.
+    fn ends_worth_unpacking(&self) -> usize {
+        (self.values / 16).max(TEXT_PAYLOAD_VALUES)
+    }
+
+    /// The unpacked ends, if they are built or if this read is the one that makes them worth it.
+    fn value_ends(&self) -> Option<&[u32]> {
+        if let Some(built) = self.value_ends.get() {
+            return built.as_deref();
+        }
+        if self.ends_asked.fetch_add(1, Atomic::Relaxed) < self.ends_worth_unpacking() {
+            return None;
+        }
+        self.value_ends.get_or_init(|| self.unpack_ends()).as_deref()
+    }
+
+    /// Every end of the column, a run at a time.
+    ///
+    /// `None` rather than an error on anything wrong, because this is a cache in front of a reader
+    /// that answers the same question. A column whose offsets are short or whose ends do not fit in
+    /// four bytes gets no table and the same error it would have got, from the read that wanted it.
+    fn unpack_ends(&self) -> Option<Vec<u32>> {
+        let mut ends = vec![0u32; self.values];
+        for (run, into) in ends.chunks_mut(TEXT_OFFSET_RUN).enumerate() {
+            let bytes = self.offsets.get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)?;
+            bitpack::unpack_tail_into(bytes, self.offset_bits, into, |bits| {
+                u32::try_from(bits).unwrap_or(u32::MAX)
+            })
+            .ok()?;
+        }
+        // An end that did not fit was stored as the sentinel, and a real one cannot reach it because
+        // a payload block is far smaller than four gigabytes. So the column keeps the packed reader.
+        if ends.contains(&u32::MAX) { None } else { Some(ends) }
+    }
+
     /// Where the value at `index` ends inside its payload block.
     fn end_within(&self, index: usize) -> Result<u32> {
+        if let Some(ends) = self.value_ends() {
+            return ends
+                .get(index)
+                .copied()
+                .ok_or_else(|| invalid("global dictionary offsets are short"));
+        }
         let run = index / TEXT_OFFSET_RUN;
         let bytes = self
             .offsets
@@ -2669,6 +2736,17 @@ impl NativeText {
     /// twice and does the bounds arithmetic once. This is asked once per string a text column hands
     /// out, and on ClickBench 27 the two reads together were a quarter of the query.
     fn span_within(&self, index: usize) -> Result<(u32, u32)> {
+        if let Some(ends) = self.value_ends() {
+            let end =
+                *ends.get(index).ok_or_else(|| invalid("global dictionary offsets are short"))?;
+            // The value before it in the same block, and zero where there is no value before it.
+            // `index` is inside the table, so the one under it is too.
+            let start = if index % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[index - 1] };
+            if start > end {
+                return Err(invalid("global dictionary value ends before it starts"));
+            }
+            return Ok((start, end));
+        }
         let within = index % TEXT_OFFSET_RUN;
         let (start, end) = if within == 0 {
             (self.start_within(index)?, self.end_within(index)?)
@@ -2982,6 +3060,11 @@ impl TextSource for NativeText {
 
     fn footprint(&self) -> usize {
         self.offsets.capacity()
+            + self
+                .value_ends
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(0, |ends| ends.capacity() * size_of::<u32>())
             + self
                 .code_ranks
                 .get()
@@ -6864,6 +6947,8 @@ fn open_global_dictionary(
             values: count,
             offsets,
             offset_bits,
+            value_ends: OnceLock::new(),
+            ends_asked: AtomicUsize::new(0),
             ranks,
             rank_at: page.offset + index_len as u64,
             rank_ends,
@@ -9894,6 +9979,55 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The unpacked ends answer what the packed ends answer, on both sides of the switch.
+    ///
+    /// A column asked for one offset at a time reads them out of the packed form until the reads
+    /// are worth a table and out of the table after that, so every value here is read twice and the
+    /// two passes are compared against the spellings and against each other. Two thousand eight
+    /// hundred values is two payload blocks and a bit, which puts the switch in the middle of the
+    /// first pass and means the pass straddles a block boundary, where the start of a value is zero
+    /// rather than the end of the value before it.
+    #[test]
+    fn the_unpacked_ends_answer_what_the_packed_ends_answer() {
+        let path = path("dictionary-unpacked-ends");
+        let spellings = (0..2_800)
+            .map(|index| Value::Varchar(format!("value {index:08} {}", "x".repeat(index % 40))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        assert_eq!(dictionary.len(), spellings.len(), "every value is distinct");
+        let wanted = (0..spellings.len())
+            .map(|index| format!("value {index:08} {}", "x".repeat(index % 40)).into_bytes())
+            .collect::<Vec<_>>();
+
+        let pass = |what: &str| {
+            for (index, value) in wanted.iter().enumerate() {
+                let len = dictionary.try_bytes_len_at(index).expect("read").expect("a value");
+                assert_eq!(len, value.len(), "{what} has the wrong length at {index}");
+                let bytes = dictionary.try_bytes_at(index).expect("read").expect("a value");
+                assert_eq!(bytes, value.as_slice(), "{what} has the wrong value at {index}");
+            }
+        };
+        pass("the first pass");
+        pass("the second pass");
         fs::remove_file(path).expect("remove scratch file");
     }
 
