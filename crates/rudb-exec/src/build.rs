@@ -1595,6 +1595,14 @@ impl<'a> Building<'a, '_> {
             }),
             None => aggregate,
         };
+        // The range of the one integer grouping key, where the planner found one. Not capped by the
+        // group limit the way the presize above is, because this is the range the key lies in and
+        // not a number of groups to take room for: narrowing it would leave values with no cell,
+        // which is exactly what it is not allowed to be.
+        let aggregate = match self.plan.dense(index) {
+            Some((low, values)) => aggregate.over_range(low, values),
+            None => aggregate,
+        };
         let aggregate = match bound.top_counts {
             Some((bound, call)) => aggregate.top_counts(bound, call),
             None => aggregate,

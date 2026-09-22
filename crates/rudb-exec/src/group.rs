@@ -183,6 +183,17 @@ pub(crate) struct Aggregate<'a> {
     /// Groups for the whole aggregate, so a table built for a radix partition takes its [`Share`]
     /// of this rather than all of it.
     presize: Option<u64>,
+    /// The range the one integer grouping key lies in, where the planner said it has one.
+    ///
+    /// A shortcut and never a rule. The table it reaches holds the same groups in the same slots
+    /// whether or not it hears this, and a key value the range does not cover is looked up the way
+    /// it always was. `rudb_opt`'s `dense` pass is where it comes from and where the reasoning about
+    /// which ranges are worth acting on lives.
+    ///
+    /// Not to be confused with `dense` below, which is a different structure for a different case:
+    /// that one is a grouped count over a stable dictionary, keyed by the storage code, and it
+    /// replaces the hash table rather than sitting beside it.
+    span: Option<(i128, u64)>,
     /// The groups a pushed down limit keeps, agreed once and used by every instance.
     agreed: Mutex<Option<Agreed>>,
     /// Whether [`Agreed::keys`] is filled in, so the fold can ask without taking the lock.
@@ -763,6 +774,7 @@ impl<'a> Aggregate<'a> {
             having_count: None,
             max_groups: None,
             presize: None,
+            span: None,
             agreed: Mutex::new(None),
             settled: AtomicBool::new(false),
             by_vector,
@@ -807,6 +819,12 @@ impl<'a> Aggregate<'a> {
     /// has a ceiling at all.
     pub(crate) fn presize(mut self, groups: u64) -> Self {
         self.presize = Some(groups);
+        self
+    }
+
+    /// The range the one integer grouping key lies in, from `rudb_opt`'s `dense` pass.
+    pub(crate) fn over_range(mut self, low: i128, values: u64) -> Self {
+        self.span = Some((low, values));
         self
     }
 
@@ -1318,9 +1336,18 @@ impl<'a> Aggregate<'a> {
             table: {
                 let types: Vec<_> =
                     self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
-                match self.presize.map(|groups| share.of(groups)) {
+                let table = match self.presize.map(|groups| share.of(groups)) {
                     Some(groups) => Table::with_groups(&types, groups),
                     None => Table::new(&types),
+                };
+                // Only where the table is the whole aggregate's. The range cannot be shared the
+                // way the presize above is: a partition is split by hash bits and any value can
+                // land in any of them, so a partition's array would have to cover the whole range
+                // anyway, and sixty four copies of it is sixty four times the memory for the same
+                // shortcut. A partition probes the buckets, which is what it did before.
+                match (self.span.filter(|_| share == Share::Whole), types.as_slice()) {
+                    (Some((low, values)), [ty]) => table.over_range(low, values, ty),
+                    _ => table,
                 }
             },
             states: Vec::new(),
