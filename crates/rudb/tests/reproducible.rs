@@ -62,7 +62,9 @@ fn reads(database: &Database) -> Reads {
         let table = catalog.table(&name).expect("the one table");
         match table.rows() {
             Rows::Native(reader) => reader.reads(),
-            Rows::Memory(_) => panic!("the table is in memory, so this test is not testing a file"),
+            Rows::Memory(_) | Rows::Grown(_, _) => {
+                panic!("the table has rows in memory, so this test is not testing a file")
+            }
         }
     })
 }
