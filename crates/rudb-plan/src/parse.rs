@@ -326,6 +326,28 @@ impl Reader<'_> {
                 let on = read_expr_list(plan, c)?;
                 Ok(Built::unary(move |input| Node::Distinct { input, on }))
             }
+            // The child first and the parent second, which is the order the printer writes the
+            // inputs in and the order `children` hands them back. There is no build side to read
+            // because there is no build.
+            "LinkJoin" => {
+                let kind = read_keyword(c, &JoinKind::ALL, JoinKind::keyword, "a join kind")?;
+                c.expect_word("on")?;
+                c.expect("=")?;
+                let conditions = read_expr_list(plan, c)?;
+                c.expect_word("rid")?;
+                c.expect("=")?;
+                let rid = read_expr(plan, c)?;
+                Ok(Built {
+                    arity: 2,
+                    assemble: Box::new(move |child, parent| Node::LinkJoin {
+                        child,
+                        parent,
+                        kind,
+                        conditions,
+                        rid,
+                    }),
+                })
+            }
             "Join" | "DependentJoin" => {
                 let kind = read_keyword(c, &JoinKind::ALL, JoinKind::keyword, "a join kind")?;
                 c.expect_word("on")?;

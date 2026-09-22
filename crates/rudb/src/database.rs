@@ -71,6 +71,13 @@ struct Inner {
     /// The lock is its own rather than the catalog's because this is not part of the catalog, and it
     /// is never contended: every caller is already holding the catalog lock when it gets here.
     facts: Mutex<Arc<rudb_opt::estimate::Facts>>,
+    /// The relationships the last statement planned from, kept for the next one.
+    ///
+    /// Cached the same way and for the same reason, and on one more key: what is declared comes
+    /// from a setting, so a `SET graph_links` between two statements has to be seen even when the
+    /// catalog has not moved. The pair that is stored is the generation and the setting text the
+    /// list was read at, and either one changing rereads it.
+    relationships: Mutex<(u64, String, Arc<Vec<rudb_opt::link::Linked>>)>,
 }
 
 /// The file is written when the last handle on the database goes away.
@@ -133,6 +140,7 @@ impl Database {
             memory,
             pool,
             facts: Mutex::default(),
+            relationships: Mutex::default(),
         };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
@@ -262,6 +270,7 @@ impl Database {
             memory,
             pool,
             facts: Mutex::default(),
+            relationships: Mutex::default(),
         };
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
@@ -1150,7 +1159,73 @@ impl Shared {
         let mut context =
             rudb_opt::pass::Context::without(&self.inner.settings.disabled_optimizers())?;
         context.measure(self.facts(catalog));
+        context.relate(self.relationships(catalog));
+        context.size(self.inner.settings.sizes());
         Ok(context)
+    }
+
+    /// The relationships this catalog's files hold a readable forward link for.
+    ///
+    /// The seam the graph layer reaches the optimizer through, and the place the difference between
+    /// a declaration and a measurement is enforced. What is declared is a setting, which is what
+    /// somebody believes. What goes in here is the subset of it the child's file actually holds a
+    /// link for, and a link is only written once the build has read the parent side and found it
+    /// unique, so a plan that reads one is relying on something that was checked rather than on
+    /// something that was said.
+    ///
+    /// A poisoned lock is a cache that is not there, for the reason [`Self::facts`] says.
+    fn relationships(&self, catalog: &Catalog) -> Arc<Vec<rudb_opt::link::Linked>> {
+        let declared = self.inner.settings.links();
+        // The common case by a long way, and the one worth not taking a lock for: no relationship
+        // is declared, so there is nothing to look for and nothing to cache.
+        if declared.is_empty() {
+            return Arc::default();
+        }
+        let generation = catalog.generation();
+        let mut held = match self.inner.relationships.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if held.0 != generation || held.1 != declared {
+            let found = Arc::new(Self::related(catalog, &declared));
+            *held = (generation, declared, found);
+        }
+        Arc::clone(&held.2)
+    }
+
+    /// Every declared relationship, with whether the files answer for it, read once.
+    ///
+    /// The ones no file answers for are kept rather than dropped. Only a built one licenses a
+    /// rewrite, and the planner is careful about that, but a declaration whose link was never built
+    /// is exactly the case somebody wants explained: it looks from the outside like a relationship
+    /// nobody declared, and `spec/graph/06-the-optimizer.md` section 6.7 asks for the two to be told
+    /// apart in the plan output.
+    ///
+    /// A declaration this cannot parse contributes nothing, which is the same silence
+    /// `rudb_links()` gives it: a setting the parser refused is one no build acted on either, so
+    /// there is no link to find for it whatever this did.
+    fn related(catalog: &Catalog, declared: &str) -> Vec<rudb_opt::link::Linked> {
+        let mut found = Vec::new();
+        for link in rudb_graph::parse_links(declared).unwrap_or_default() {
+            // One column each. A composite relationship is two key maps over a folded key and
+            // nothing folds one yet, so there is no link stored for one and nothing to plan over.
+            let ([child_key], [parent_key]) = (&link.child.columns[..], &link.parent.columns[..])
+            else {
+                continue;
+            };
+            let built = stored_link(
+                catalog,
+                (&link.child.table, child_key),
+                (&link.parent.table, parent_key),
+            );
+            let sides = (&link.child.table, child_key, &link.parent.table, parent_key);
+            found.push(if built {
+                rudb_opt::link::Linked::built(sides.0, sides.1, sides.2, sides.3)
+            } else {
+                rudb_opt::link::Linked::declared(sides.0, sides.1, sides.2, sides.3)
+            });
+        }
+        found
     }
 
     /// The counts for this catalog, built if the ones in hand are out of date and reused if not.
@@ -1486,6 +1561,46 @@ fn planned(
     Ok(plan)
 }
 
+/// Whether the child's file holds a forward link for that relationship, built against that parent.
+///
+/// The same question `rudb_links()` answers in its stored columns, asked here for one relationship
+/// at a time. Both tables have to be in the same file, because a row id is a position in a table and
+/// a link that named a parent in another file would only be resolvable by a reader that had both
+/// open and had checked that neither had moved. The binding check inside `stored_link` is what
+/// catches a parent that was rewritten since the link was built.
+fn stored_link(catalog: &Catalog, child: (&str, &str), parent: (&str, &str)) -> bool {
+    let Some(child_table) = table_named(catalog, child.0) else { return false };
+    let Some(parent_table) = table_named(catalog, parent.0) else { return false };
+    let (
+        rudb_catalog::table::Rows::Native(child_rows),
+        rudb_catalog::table::Rows::Native(parent_rows),
+    ) = (child_table.rows(), parent_table.rows())
+    else {
+        return false;
+    };
+    let (Some(child_column), Some(parent_column)) =
+        (child_table.column_index(child.1), parent_table.column_index(parent.1))
+    else {
+        return false;
+    };
+    let edge = Edge {
+        child: child_table.name().table.clone(),
+        child_column,
+        parent: parent_table.name().table.clone(),
+        parent_column,
+    };
+    rudb_native::graph::stored_link(child_rows, parent_rows, &edge).is_some()
+}
+
+/// The first table of that name in any schema of any database.
+///
+/// A relationship names a table and not a qualified name, because the `graph_links` grammar has no
+/// dot in it and the tables of one benchmark are in one schema. A name that is ambiguous across two
+/// databases resolves to the first, which is the order `duckdb_tables()` lists them in.
+fn table_named<'a>(catalog: &'a Catalog, name: &str) -> Option<&'a rudb_catalog::Table> {
+    catalog.tables().into_iter().find(|table| table.name().table.eq_ignore_ascii_case(name))
+}
+
 /// Builds and drains one plan, stopping if the token says to or if it runs out of memory.
 ///
 /// The result is materialized, so it is charged, and the charge is handed to the result and
@@ -1732,7 +1847,7 @@ fn explaining(
     let facts = context.facts();
     let statistics = asked.statistics();
     if !asked.analyze {
-        let text = rudb_opt::explain::explain_with(plan, facts, seams, statistics);
+        let text = rudb_opt::explain::explain_with(plan, context, seams, statistics);
         return explained("logical_plan", &text);
     }
     // `EXPLAIN ANALYZE` is the one place a person reads these numbers with their own eyes rather
@@ -1750,7 +1865,7 @@ fn explaining(
         Under::new(budget, facts, seams.settings(), &profiled, Rows::ForACaller).after(planning);
     let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
-    let text = rudb_opt::explain::analyzed(plan, facts, seams, measured, statistics);
+    let text = rudb_opt::explain::analyzed(plan, context, seams, measured, statistics);
     explained("analyzed_plan", &text)
 }
 

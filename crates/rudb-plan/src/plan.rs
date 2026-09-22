@@ -680,6 +680,12 @@ impl Plan {
             Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
                 self.each_column(conditions, found);
             }
+            // The row id counts as a column this node reads, for the reason the fetch's row does:
+            // it is an input to the operator rather than something it hands on.
+            Node::LinkJoin { conditions, rid, .. } => {
+                self.each_column(conditions, found);
+                self.read_columns(rid, found);
+            }
         }
     }
 
@@ -1061,6 +1067,32 @@ impl Plan {
                     }
                 }
             }
+            Node::LinkJoin { kind, conditions, rid, .. } => {
+                // Section 5.2's four. Right and full need the parent rows nothing pointed at,
+                // which is the backward direction, and the rest are not joins over a key at all.
+                if !matches!(
+                    kind,
+                    JoinKind::Inner | JoinKind::Left | JoinKind::Semi | JoinKind::Anti
+                ) {
+                    return fail("reads a link for a join kind a forward link cannot answer");
+                }
+                let conditions = self.checked_expr_list(conditions, reference)?;
+                // Exactly one, because the shape this node names is one equality over a declared
+                // relationship. A second condition is a filter the rewrite should have left above
+                // the join, and accepting one here would mean silently dropping it.
+                if conditions.len() != 1 {
+                    return fail("reads a link for something other than a single equality");
+                }
+                for &condition in conditions {
+                    if *self.expr_type(condition) != LogicalType::Boolean {
+                        return fail("joins on a condition that is not BOOLEAN");
+                    }
+                }
+                self.checked_expr(rid, reference)?;
+                if *self.expr_type(rid) != LogicalType::BigInt {
+                    return fail("reads a link through a row id that is not BIGINT");
+                }
+            }
             Node::DependentJoin { kind, conditions, .. } => {
                 if matches!(kind, JoinKind::Right | JoinKind::Full | JoinKind::Positional) {
                     return fail("has a join kind that cannot preserve an outer row dependency");
@@ -1188,9 +1220,9 @@ impl Plan {
                 self.sort_key_list(keys).iter().map(|key| (key.expr, false, false)).collect()
             }
             Node::Distinct { on, .. } => plain(self.expr_list(on)),
-            Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
-                plain(self.expr_list(conditions))
-            }
+            Node::Join { conditions, .. }
+            | Node::LinkJoin { conditions, .. }
+            | Node::DependentJoin { conditions, .. } => plain(self.expr_list(conditions)),
         }
     }
 
@@ -1489,6 +1521,44 @@ mod tests {
         plan.set_root(project);
         let message = plan.validate().unwrap_err().to_string();
         assert!(message.contains("window function outside"), "unhelpful message: {message}");
+    }
+
+    /// A link join reads one forward link per child row, and both halves of that sentence are
+    /// checked here. A kind a forward link cannot answer is refused, because right and full need
+    /// the parent rows nothing pointed at and a forward link is not asked that question. More than
+    /// one condition is refused, because the one condition is the link.
+    #[test]
+    fn a_link_join_is_refused_for_what_a_forward_link_cannot_answer() {
+        let refused = |kind, count: usize| {
+            let mut plan = Plan::new();
+            let left = plan.add_expr(Expr::Column(ColumnBinding::new(0, 0)), LogicalType::BigInt);
+            let on = plan.add_expr(
+                Expr::Compare { op: CompareOp::Equal, left, right: left },
+                LogicalType::Boolean,
+            );
+            let conditions = plan.add_expr_list(&vec![on; count]);
+            let rid = plan.add_expr(Expr::Column(ColumnBinding::new(0, 1)), LogicalType::BigInt);
+            let child = plan.add_node(Node::Dummy);
+            let parent = plan.add_node(Node::Dummy);
+            let join = plan.add_node(Node::LinkJoin { child, parent, kind, conditions, rid });
+            plan.set_root(join);
+            plan.validate().map(|()| String::new()).unwrap_or_else(|error| error.to_string())
+        };
+
+        for kind in [JoinKind::Right, JoinKind::Full, JoinKind::Mark, JoinKind::Positional] {
+            let message = refused(kind, 1);
+            assert!(
+                message.contains("a forward link cannot answer"),
+                "{kind:?} was allowed: {message}"
+            );
+        }
+        for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti] {
+            assert_eq!(refused(kind, 1), "", "{kind:?} is one of section 5.2's four");
+        }
+        let message = refused(JoinKind::Inner, 2);
+        assert!(message.contains("a single equality"), "unhelpful message: {message}");
+        let message = refused(JoinKind::Inner, 0);
+        assert!(message.contains("a single equality"), "unhelpful message: {message}");
     }
 
     /// The backwards-reference rule is what makes a cycle impossible, so the check for it has to

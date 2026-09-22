@@ -44,9 +44,10 @@
 
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, QualifiedName, Table};
-use rudb_common::{Cancel, Error, Field, Memory, Result, Session, Value};
+use rudb_catalog::{Catalog, Parent, QualifiedName, Table};
+use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_functions::TableFunction;
+use rudb_graph::Link;
 use rudb_kernels::Accumulator;
 use rudb_metrics::{Counters, Driver, Report};
 use rudb_parquet::{Bound, Op};
@@ -76,6 +77,7 @@ use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
+use crate::linkjoin::LinkJoin;
 use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
 use crate::prepared::Prepared;
@@ -563,6 +565,46 @@ fn whole_table<'a>(
     Ok(Some((table, index, columns)))
 }
 
+/// The stored table one node under `node` reads, found by the table index its columns are bound to.
+///
+/// A link join's child is a scan and may be a scan under a filter, because a row id survives a
+/// filter as the selection is applied to the sequence that carries it. So the search is down the
+/// tree rather than at the top of it, and what it matches on is the index the join's own condition
+/// named, which is the only thing that says which scan is the one the link is indexed by.
+fn scanned<'a>(
+    plan: &Plan,
+    catalog: &'a Catalog,
+    node: NodeRef,
+    index: u32,
+) -> Result<Option<(&'a Table, Slice)>> {
+    if let Some((table, found, columns)) = whole_table(plan, catalog, node)? {
+        if found == index {
+            return Ok(Some((table, columns)));
+        }
+    }
+    for child in plan.node(node).children().into_iter().flatten() {
+        if let Some(found) = scanned(plan, catalog, child, index)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// The two columns one equality holds equal, when that is what the conditions are.
+///
+/// Anything else is `None`, including one equality between a column and something computed, because
+/// a link is indexed by a column and an expression over one is not that column.
+fn equated_pair(plan: &Plan, conditions: Slice) -> Option<[ColumnBinding; 2]> {
+    let [condition] = plan.expr_list(conditions) else { return None };
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(*condition) else {
+        return None;
+    };
+    match (plan.expr(left), plan.expr(right)) {
+        (&Expr::Column(left), &Expr::Column(right)) => Some([left, right]),
+        _ => None,
+    }
+}
+
 /// Which column of the stored table a binding into `index` names, by name rather than by position.
 fn stored_column(
     plan: &Plan,
@@ -972,6 +1014,16 @@ struct Building<'a, 'b> {
     held: Vec<Held>,
 }
 
+/// What a link join reads out of the catalog, gathered before either input is built.
+struct Linked {
+    link: Arc<Link>,
+    parent: Arc<Parent>,
+    /// The stored position and the type of each parent column the join projects, in output order.
+    projected: Vec<(usize, LogicalType)>,
+    /// Those same columns as the schema the bindings above this join resolve against.
+    parent_schema: Schema,
+}
+
 /// A materialised `WITH` that has been built, for the reads of it under the body being walked.
 struct Held {
     /// The number the plan pairs a read with what it reads by.
@@ -1129,6 +1181,313 @@ impl<'a> Building<'a, '_> {
         parent
     }
 
+    /// Every call that stands where a table goes, which is a file scan, a metadata table or a
+    /// series.
+    ///
+    /// Its own function for the reason [`Self::join`] is: [`Self::node`] recurses once per plan
+    /// node and a debug frame carries every local of every arm. This arm is a match of its own
+    /// with a couple of dozen branches under it, none of which can recurse, so it is pure weight
+    /// on a frame that every deep plan pays for.
+    ///
+    /// It reads the node again rather than being handed the six fields, because six more
+    /// arguments is a signature nobody can call correctly and the read is a slice index.
+    fn table_function(&mut self, reference: NodeRef) -> Result<Segment<'a>> {
+        let plan = self.plan;
+        let id = self.shape.operator(reference);
+        let pipeline = self.shape.pipeline(reference);
+        let Node::TableFunction { index, function, args, options, settings, columns } =
+            *plan.node(reference)
+        else {
+            return Err(Error::internal("a table function was built from a node that is not one"));
+        };
+        let name = plan.string(function);
+        // Taken here rather than inside the file scan arm so that a table function that is
+        // not one leaves nothing behind for whatever is built next.
+        let runtime = self.sideways.take();
+        Ok(match TableFunction::lookup(name) {
+            Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
+                let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
+                let tests = std::mem::take(&mut self.pruning);
+                let scan = FileScan::new(
+                    plan, index, function, args, options, settings, columns, tests, runtime,
+                )?
+                .watched(counters.clone());
+                let schema = scan.schema().clone();
+                Segment::new(Arc::new(Watched::new(scan, counters)), schema)
+            }
+            Some(TableFunction::PragmaStorageInfo) => {
+                let written = pragma_name(plan, args)?;
+                let table = storage_info(self.catalog, &written, plan, index, columns)?;
+                let schema = table.schema().clone();
+                let counters = self.watch(
+                    reference,
+                    id,
+                    pipeline,
+                    "Metadata",
+                    Some(TableFunction::PragmaStorageInfo.name()),
+                );
+                Segment::new(Arc::new(Watched::new(table, counters)), schema)
+            }
+            Some(
+                function @ (TableFunction::RudbStrategies
+                | TableFunction::RudbLinks
+                | TableFunction::DuckdbKeywords
+                | TableFunction::DuckdbTypes
+                | TableFunction::DuckdbFunctions
+                | TableFunction::DuckdbSettings
+                | TableFunction::DuckdbDatabases
+                | TableFunction::DuckdbSchemas
+                | TableFunction::DuckdbTables
+                | TableFunction::DuckdbViews
+                | TableFunction::DuckdbColumns
+                | TableFunction::DuckdbExtensions
+                | TableFunction::DuckdbOptimizers
+                | TableFunction::DuckdbDialects
+                | TableFunction::DuckdbGrammarExtensions
+                | TableFunction::PragmaVersion
+                | TableFunction::PragmaPlatform
+                | TableFunction::PragmaUserAgent
+                | TableFunction::PragmaDatabaseSize
+                | TableFunction::PragmaShowTables
+                | TableFunction::PragmaShowDatabases
+                | TableFunction::PragmaShowTablesExpanded),
+            ) => {
+                let table = match function {
+                    TableFunction::RudbLinks => {
+                        links(self.session, self.catalog, plan, index, columns)?
+                    }
+                    TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
+                    TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
+                    TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,
+                    TableFunction::DuckdbSettings => {
+                        settingnames(self.session, plan, index, columns)?
+                    }
+                    TableFunction::DuckdbDatabases => {
+                        databasenames(self.catalog, plan, index, columns)?
+                    }
+                    TableFunction::DuckdbSchemas => {
+                        schemanames(self.catalog, plan, index, columns)?
+                    }
+                    TableFunction::DuckdbTables => tablenames(self.catalog, plan, index, columns)?,
+                    TableFunction::DuckdbViews => viewnames(self.catalog, plan, index, columns)?,
+                    TableFunction::DuckdbColumns => {
+                        columnnames(self.catalog, plan, index, columns)?
+                    }
+                    TableFunction::DuckdbExtensions => extensions(plan, index, columns)?,
+                    TableFunction::DuckdbOptimizers => optimizers(plan, index, columns)?,
+                    TableFunction::DuckdbDialects => dialects(plan, index, columns)?,
+                    TableFunction::DuckdbGrammarExtensions => {
+                        grammar_extensions(plan, index, columns)?
+                    }
+                    TableFunction::PragmaVersion => version(plan, index, columns)?,
+                    TableFunction::PragmaPlatform => platform(plan, index, columns)?,
+                    TableFunction::PragmaUserAgent => user_agent(plan, index, columns)?,
+                    TableFunction::PragmaDatabaseSize => {
+                        database_size(self.catalog, self.memory, plan, index, columns)?
+                    }
+                    TableFunction::PragmaShowTables => {
+                        showtables(self.catalog, plan, index, columns)?
+                    }
+                    TableFunction::PragmaShowDatabases => {
+                        showdatabases(self.catalog, plan, index, columns)?
+                    }
+                    TableFunction::PragmaShowTablesExpanded => {
+                        showtablesexpanded(self.catalog, plan, index, columns)?
+                    }
+                    _ => strategies(plan, index, columns)?,
+                };
+                let schema = table.schema().clone();
+                // `EXPLAIN` names the table rather than the operator, because every one of
+                // these is the same operator and a plan that said `Metadata` four times
+                // would not say which four tables it read.
+                let counters =
+                    self.watch(reference, id, pipeline, "Metadata", Some(function.name()));
+                Segment::new(Arc::new(Watched::new(table, counters)), schema)
+            }
+            _ => {
+                let series = Series::new(plan, index, name, args)?;
+                let schema = series.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "Series", Some(name));
+                Segment::new(Arc::new(Watched::new(series, counters)), schema)
+            }
+        })
+    }
+
+    /// The hash join, and the three operators that are it done better.
+    ///
+    /// Its own function rather than an arm of [`Self::node`] because [`Self::node`] recurses once
+    /// per plan node and a debug frame carries every local of every arm it might take. This arm
+    /// holds four operators by value before any of them is behind an `Arc`, which made it the
+    /// largest of them by some way, and a plan deep enough to matter ran out of stack on the
+    /// platform with the smallest one before it ran out of nodes. Moving it here costs a call and
+    /// buys back the depth for every plan that is not a join.
+    ///
+    /// It reads the node again rather than being handed the five fields, for the reason
+    /// [`Self::table_function`] does.
+    fn join(&mut self, reference: NodeRef) -> Result<Segment<'a>> {
+        let plan = self.plan;
+        let memory = self.memory;
+        let id = self.shape.operator(reference);
+        let pipeline = self.shape.pipeline(reference);
+        let Node::Join { left, right, kind, conditions, build } = *plan.node(reference) else {
+            return Err(Error::internal("a join was built from a node that is not one"));
+        };
+        // One side runs first, because no row of the other one can be answered until every
+        // row it might match has been seen. That is the dependency edge, and it is the same
+        // one the hash join builds on. The driving side is a pipeline of its own rather than
+        // part of the one above it, because it ends in a sink, and it waits for the build
+        // side.
+        //
+        // Which side is which is the flag, written by `rudb_opt`'s `sides` pass from an
+        // estimate of how many rows each input produces. Running the two the other way
+        // round means running the mirror of the join kind, because a kind names its sides:
+        // a `LEFT` join with its inputs swapped is a `RIGHT` join over the same rows. The
+        // pass only ever sets the flag on the kinds that have a mirror, and this refuses
+        // the rest rather than producing the wrong answer quietly.
+        let marker = mark_binding(plan, right, kind);
+        let swapped = build == BuildSide::Left;
+        let (held, driving) = if swapped { (left, right) } else { (right, left) };
+        // A semi or an anti join has no mirror, because the kind it would be mirrored into
+        // is not a kind: its left input is the subject rather than a side and swapping the
+        // two does not give a join anybody can write down. What it gives is a different
+        // operator over the same join, one that gathers the subject and marks it as the
+        // other side streams past, and `crate::join::Marking` is that operator. The kind
+        // stays the plan's own, so the swap costs no new spelling of anything either.
+        let marking = swapped && matches!(kind, JoinKind::Semi | JoinKind::Anti);
+        let kind = if swapped && !marking {
+            kind.mirrored().ok_or_else(|| {
+                Error::internal(format!(
+                    "a {} join was given a build side it has no mirror for",
+                    kind.keyword()
+                ))
+            })?
+        } else {
+            kind
+        };
+        let gather_id = self.gathered(reference);
+        let gathering = self.shape.pipeline(held);
+        let held = self.node(held)?;
+        let held_schema = held.schema.clone();
+        // The edge this join's runtime filter crosses, made before either side is built
+        // because the sink on one side fills it and the scan on the other reads it. It stays
+        // inert unless the join arms it below, which most joins cannot. See
+        // `crate::sideways`.
+        let sideways = Sideways::new();
+        // The chunks as chunks rather than a row per row. A join reads this side by
+        // position, to build its table and then once per match, so taking it apart into a
+        // `Vec<Value>` per row here would be an allocation per row for a layout the join
+        // then has to transpose back into columns. See `crate::side::Build`.
+        // A positional join pairs row `n` of one side with row `n` of the other, so for that
+        // one the order this side is kept in is the answer and the pipeline under it runs
+        // on one thread. Every other kind reads this side through a table or by position
+        // and the order only decides which of two equal rows comes out first.
+        let ordered = kind == JoinKind::Positional;
+        let (gather, gathered) = Keep::watching(memory, Some(Arc::clone(&sideways)), ordered);
+        let watched = self.watch(reference, gather_id, gathering, "Gather", None);
+        self.close(held, gathering, Arc::new(Watched::new(gather, watched)));
+        // Offered to the driving side while it is built, which is how it reaches the scan
+        // down there. Cleared afterwards so that nothing built later picks it up.
+        self.sideways = Some(Arc::clone(&sideways));
+        let mut left = self.node(driving)?;
+        self.sideways = None;
+        let side = Gathered { schema: &held_schema, chunks: gathered, marker, swapped };
+        // A lookup answers this join and the kind decides about a driving row from that
+        // row's own matches, so nothing has to be held and the driving side streams
+        // through. That is one less copy of a side, an answer that is never collected, and
+        // a pipeline no longer pinned to one thread by a sink that refuses to run twice.
+        //
+        // The plan's shape does not know about this and counts a pipeline here that the
+        // built query then fuses away, the same way it would if a cross product were a join
+        // node. Nothing runs wrong because of it: what the driver waits on is `after` on
+        // the segment, which is set right below, and the shape is only where the numbers on
+        // the counters come from. What it costs is that a profile divides the time between
+        // two pipeline ids that are really one, and what it would take to fix is teaching
+        // `rudb_plan` the same question this line asks, in a second place, where the two
+        // could disagree and the disagreement would be a wrong plan rather than a coarse
+        // profile.
+        // Armed now rather than when the filter was made, because whether there is a key
+        // to hand over is a question about the conditions and only the operator has split
+        // them. A join that answers nothing leaves the filter inert, which is a scan that
+        // reads everything exactly as it did before.
+        // The binding the join knows is the one the projection above the scan hands it, so
+        // it is turned into the scan's own before either half is armed. Both halves
+        // together, because the build side pass that fills the filter is only worth making
+        // when there is a scan that will read it.
+        let zone = self.session.session_time_zone();
+        let arm = |keyed: Option<(ExprRef, ColumnBinding)>| {
+            let Some((key, binding)) = keyed else {
+                return;
+            };
+            let Some(binding) = sideways::beneath(plan, driving, binding) else {
+                return;
+            };
+            sideways.keying(Keyed::new(plan, key, held_schema.clone(), zone));
+            sideways.about(binding);
+        };
+        // The join turned around, which is the subject side gathered and marked while the
+        // other side streams past. It ends the pipeline rather than sitting in it, because
+        // no gathered row can be said to have matched nothing until the last driving row
+        // has been through. See `crate::join::Marking`.
+        if marking {
+            let made =
+                Marking::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory);
+            let Some((mark, out)) = made else {
+                return Err(Error::internal(format!(
+                    "a {} join was given a build side no lookup can answer it from",
+                    kind.keyword()
+                )));
+            };
+            let mark = mark.in_session(self.session);
+            arm(mark.sideways());
+            let schema = mark.schema().clone();
+            let counters = self.watch(reference, id, pipeline, "Mark", None);
+            let reading = Arc::clone(&counters);
+            let mark = mark.watched(Arc::clone(&counters));
+            left.after.push(gathering);
+            self.close(left, pipeline, Arc::new(Watched::new(mark, counters)));
+            let reader = Arc::new(Watched::new(out, reading));
+            return Ok(Segment::reading(reader, schema, pipeline));
+        }
+        // An outer join that gathered the side it keeps. It streams the pairs like any
+        // probe and owes a padded row for every gathered row nothing matched, which it
+        // hands over once the driving side is finished. See `crate::join::Padding`.
+        if let Some(pad) =
+            Padding::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
+        {
+            let pad = pad.in_session(self.session);
+            arm(pad.sideways());
+            let schema = pad.schema().clone();
+            // Named for what it does rather than for the kind, because the kind on the
+            // plan line above it already says which outer join this is and what a reader
+            // of a profile wants to know here is which of the two operators ran.
+            let counters = self.watch(reference, id, pipeline, "Pad", None);
+            let pad = pad.watched(Arc::clone(&counters));
+            left.after.push(gathering);
+            return Ok(left.then(Arc::new(Watched::new(pad, counters)), schema));
+        }
+        if let Some(probe) =
+            Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
+        {
+            let probe = probe.in_session(self.session);
+            arm(probe.sideways());
+            let schema = probe.schema().clone();
+            let counters = self.watch(reference, id, pipeline, "Probe", None);
+            let probe = probe.watched(Arc::clone(&counters));
+            left.after.push(gathering);
+            return Ok(left.then(Arc::new(Watched::new(probe, counters)), schema));
+        }
+        let (join, out) =
+            Join::new(plan, &left.schema, side, kind, conditions, self.cancel, memory);
+        let join = join.in_session(self.session);
+        let schema = join.schema().clone();
+        let counters = self.watch(reference, id, pipeline, "Join", None);
+        let reading = Arc::clone(&counters);
+        let join = join.watched(Arc::clone(&counters));
+        left.after.push(gathering);
+        self.close(left, pipeline, Arc::new(Watched::new(join, counters)));
+        Ok(Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline))
+    }
+
     fn aggregate(
         &mut self,
         reference: NodeRef,
@@ -1196,6 +1555,104 @@ impl<'a> Building<'a, '_> {
         let reading = Arc::clone(&counters);
         self.close(below, pipeline, Arc::new(Watched::new(aggregate, counters)));
         Ok(Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline))
+    }
+
+    /// Everything a link join needs out of the catalog, or the reason it cannot be built.
+    ///
+    /// The edge is derived here rather than carried in the plan, and the derivation is the reason
+    /// `Plan::check` insists on exactly one equality. That equality names two columns, each of them
+    /// a binding into a table index, and a table index reaches the `Get` that introduced it, and a
+    /// `Get` names a stored table whose columns have positions. So the four fields of the
+    /// [`rudb_native::graph::Edge`] a stored link is looked up by are read out of the plan rather
+    /// than written into it, and there is no second spelling of the relationship that could
+    /// disagree with the first.
+    ///
+    /// Every failure here is internal, because the rule that wrote the node is the one that checked
+    /// all of this. The checks stay anyway: what they defend against is a link written against a
+    /// table that has since been rewritten, and section 3.1 says a graph section may only change
+    /// the time.
+    fn linked(
+        &self,
+        reference: NodeRef,
+        child: NodeRef,
+        parent: NodeRef,
+        conditions: Slice,
+    ) -> Result<Linked> {
+        let (plan, catalog) = (self.plan, self.catalog);
+        let refuse =
+            |why: &str| Error::internal(format!("a link join over {why}, which cannot be read"));
+        let Some((parent_table, parent_index, parent_columns)) =
+            whole_table(plan, catalog, parent)?
+        else {
+            return Err(refuse("a parent that is not a stored table"));
+        };
+        let [first, second] = equated_pair(plan, conditions)
+            .ok_or_else(|| refuse("something other than one equality between two columns"))?;
+        // Either way round is the same edge, since an equality has no sides.
+        let (child_key, parent_key) =
+            match (first.table == parent_index, second.table == parent_index) {
+                (false, true) => (first, second),
+                (true, false) => (second, first),
+                _ => return Err(refuse("an equality that does not read both of its inputs")),
+            };
+        let Some((child_table, child_columns)) = scanned(plan, catalog, child, child_key.table)?
+        else {
+            return Err(refuse("a child that is not a stored table"));
+        };
+        let (Some(child_rows), Some(parent_rows)) =
+            (child_table.rows().stored(), parent_table.rows().stored())
+        else {
+            return Err(refuse("a table that is not one committed file"));
+        };
+        let edge = rudb_native::graph::Edge {
+            child: child_table.name().table.clone(),
+            child_column: stored_column(
+                plan,
+                child_table,
+                child_key.table,
+                child_columns,
+                child_key,
+            )
+            .ok_or_else(|| refuse("a child key that is not a stored column"))?,
+            parent: parent_table.name().table.clone(),
+            parent_column: stored_column(
+                plan,
+                parent_table,
+                parent_index,
+                parent_columns,
+                parent_key,
+            )
+            .ok_or_else(|| refuse("a parent key that is not a stored column"))?,
+        };
+        let link = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)
+            .ok_or_else(|| refuse("a relationship the child's file has no link for"))?;
+        // A semi or an anti join reads no column of the parent, which is not a special case here so
+        // much as the reason those two are nearly free: the list below is empty, so the operator
+        // holds nothing, reads nothing, and its output is the child's columns as they arrived.
+        let reads = !matches!(
+            *plan.node(reference),
+            Node::LinkJoin { kind: JoinKind::Semi | JoinKind::Anti, .. }
+        );
+        let fields = if reads { plan.field_list(parent_columns).to_vec() } else { Vec::new() };
+        let mut projected = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let at = parent_table
+                .column_index(&field.name)
+                .ok_or_else(|| refuse("a parent column the stored table does not have"))?;
+            projected.push((at, field.ty.clone()));
+        }
+        // What is left of the query's budget, since the columns are held for as long as anything
+        // above can still read through them. A parent that will not fit in it is reported by the
+        // operator rather than here, for the reason on `LinkJoin::read_parent`.
+        let budget = self.memory.limit().map_or(usize::MAX, |limit| {
+            usize::try_from(limit.saturating_sub(self.memory.used())).unwrap_or(usize::MAX)
+        });
+        Ok(Linked {
+            link: Arc::new(link),
+            parent: Arc::new(Parent::new(parent_table.rows().clone(), budget)),
+            projected,
+            parent_schema: Schema::numbered(fields, parent_index),
+        })
     }
 
     /// The segment a node produces, closing any pipeline that ends underneath it.
@@ -1274,123 +1731,7 @@ impl<'a> Building<'a, '_> {
                 let counters = self.watch(reference, id, pipeline, "Values", None);
                 Segment::new(Arc::new(Watched::new(values, counters)), schema)
             }
-            Node::TableFunction { index, function, args, options, settings, columns } => {
-                let name = plan.string(function);
-                // Taken here rather than inside the file scan arm so that a table function that is
-                // not one leaves nothing behind for whatever is built next.
-                let runtime = self.sideways.take();
-                match TableFunction::lookup(name) {
-                    Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
-                        let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
-                        let tests = std::mem::take(&mut self.pruning);
-                        let scan = FileScan::new(
-                            plan, index, function, args, options, settings, columns, tests, runtime,
-                        )?
-                        .watched(counters.clone());
-                        let schema = scan.schema().clone();
-                        Segment::new(Arc::new(Watched::new(scan, counters)), schema)
-                    }
-                    Some(TableFunction::PragmaStorageInfo) => {
-                        let written = pragma_name(plan, args)?;
-                        let table = storage_info(self.catalog, &written, plan, index, columns)?;
-                        let schema = table.schema().clone();
-                        let counters = self.watch(
-                            reference,
-                            id,
-                            pipeline,
-                            "Metadata",
-                            Some(TableFunction::PragmaStorageInfo.name()),
-                        );
-                        Segment::new(Arc::new(Watched::new(table, counters)), schema)
-                    }
-                    Some(
-                        function @ (TableFunction::RudbStrategies
-                        | TableFunction::RudbLinks
-                        | TableFunction::DuckdbKeywords
-                        | TableFunction::DuckdbTypes
-                        | TableFunction::DuckdbFunctions
-                        | TableFunction::DuckdbSettings
-                        | TableFunction::DuckdbDatabases
-                        | TableFunction::DuckdbSchemas
-                        | TableFunction::DuckdbTables
-                        | TableFunction::DuckdbViews
-                        | TableFunction::DuckdbColumns
-                        | TableFunction::DuckdbExtensions
-                        | TableFunction::DuckdbOptimizers
-                        | TableFunction::DuckdbDialects
-                        | TableFunction::DuckdbGrammarExtensions
-                        | TableFunction::PragmaVersion
-                        | TableFunction::PragmaPlatform
-                        | TableFunction::PragmaUserAgent
-                        | TableFunction::PragmaDatabaseSize
-                        | TableFunction::PragmaShowTables
-                        | TableFunction::PragmaShowDatabases
-                        | TableFunction::PragmaShowTablesExpanded),
-                    ) => {
-                        let table = match function {
-                            TableFunction::RudbLinks => {
-                                links(self.session, self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
-                            TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
-                            TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,
-                            TableFunction::DuckdbSettings => {
-                                settingnames(self.session, plan, index, columns)?
-                            }
-                            TableFunction::DuckdbDatabases => {
-                                databasenames(self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::DuckdbSchemas => {
-                                schemanames(self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::DuckdbTables => {
-                                tablenames(self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::DuckdbViews => {
-                                viewnames(self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::DuckdbColumns => {
-                                columnnames(self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::DuckdbExtensions => extensions(plan, index, columns)?,
-                            TableFunction::DuckdbOptimizers => optimizers(plan, index, columns)?,
-                            TableFunction::DuckdbDialects => dialects(plan, index, columns)?,
-                            TableFunction::DuckdbGrammarExtensions => {
-                                grammar_extensions(plan, index, columns)?
-                            }
-                            TableFunction::PragmaVersion => version(plan, index, columns)?,
-                            TableFunction::PragmaPlatform => platform(plan, index, columns)?,
-                            TableFunction::PragmaUserAgent => user_agent(plan, index, columns)?,
-                            TableFunction::PragmaDatabaseSize => {
-                                database_size(self.catalog, self.memory, plan, index, columns)?
-                            }
-                            TableFunction::PragmaShowTables => {
-                                showtables(self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::PragmaShowDatabases => {
-                                showdatabases(self.catalog, plan, index, columns)?
-                            }
-                            TableFunction::PragmaShowTablesExpanded => {
-                                showtablesexpanded(self.catalog, plan, index, columns)?
-                            }
-                            _ => strategies(plan, index, columns)?,
-                        };
-                        let schema = table.schema().clone();
-                        // `EXPLAIN` names the table rather than the operator, because every one of
-                        // these is the same operator and a plan that said `Metadata` four times
-                        // would not say which four tables it read.
-                        let counters =
-                            self.watch(reference, id, pipeline, "Metadata", Some(function.name()));
-                        Segment::new(Arc::new(Watched::new(table, counters)), schema)
-                    }
-                    _ => {
-                        let series = Series::new(plan, index, name, args)?;
-                        let schema = series.schema().clone();
-                        let counters = self.watch(reference, id, pipeline, "Series", Some(name));
-                        Segment::new(Arc::new(Watched::new(series, counters)), schema)
-                    }
-                }
-            }
+            Node::TableFunction { .. } => self.table_function(reference)?,
             Node::LateralFunction { input, index, function, args, columns, .. } => {
                 let below = self.node(input)?;
                 let name = plan.string(function);
@@ -1614,170 +1955,31 @@ impl<'a> Building<'a, '_> {
                 self.close(below, pipeline, Arc::new(Watched::new(distinct, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
-            Node::Join { left, right, kind, conditions, build } => {
-                // One side runs first, because no row of the other one can be answered until every
-                // row it might match has been seen. That is the dependency edge, and it is the same
-                // one the hash join builds on. The driving side is a pipeline of its own rather than
-                // part of the one above it, because it ends in a sink, and it waits for the build
-                // side.
-                //
-                // Which side is which is the flag, written by `rudb_opt`'s `sides` pass from an
-                // estimate of how many rows each input produces. Running the two the other way
-                // round means running the mirror of the join kind, because a kind names its sides:
-                // a `LEFT` join with its inputs swapped is a `RIGHT` join over the same rows. The
-                // pass only ever sets the flag on the kinds that have a mirror, and this refuses
-                // the rest rather than producing the wrong answer quietly.
-                let marker = mark_binding(plan, right, kind);
-                let swapped = build == BuildSide::Left;
-                let (held, driving) = if swapped { (left, right) } else { (right, left) };
-                // A semi or an anti join has no mirror, because the kind it would be mirrored into
-                // is not a kind: its left input is the subject rather than a side and swapping the
-                // two does not give a join anybody can write down. What it gives is a different
-                // operator over the same join, one that gathers the subject and marks it as the
-                // other side streams past, and `crate::join::Marking` is that operator. The kind
-                // stays the plan's own, so the swap costs no new spelling of anything either.
-                let marking = swapped && matches!(kind, JoinKind::Semi | JoinKind::Anti);
-                let kind = if swapped && !marking {
-                    kind.mirrored().ok_or_else(|| {
-                        Error::internal(format!(
-                            "a {} join was given a build side it has no mirror for",
-                            kind.keyword()
-                        ))
-                    })?
-                } else {
-                    kind
-                };
-                let gather_id = self.gathered(reference);
-                let gathering = self.shape.pipeline(held);
-                let held = self.node(held)?;
-                let held_schema = held.schema.clone();
-                // The edge this join's runtime filter crosses, made before either side is built
-                // because the sink on one side fills it and the scan on the other reads it. It stays
-                // inert unless the join arms it below, which most joins cannot. See
-                // `crate::sideways`.
-                let sideways = Sideways::new();
-                // The chunks as chunks rather than a row per row. A join reads this side by
-                // position, to build its table and then once per match, so taking it apart into a
-                // `Vec<Value>` per row here would be an allocation per row for a layout the join
-                // then has to transpose back into columns. See `crate::side::Build`.
-                // A positional join pairs row `n` of one side with row `n` of the other, so for that
-                // one the order this side is kept in is the answer and the pipeline under it runs
-                // on one thread. Every other kind reads this side through a table or by position
-                // and the order only decides which of two equal rows comes out first.
-                let ordered = kind == JoinKind::Positional;
-                let (gather, gathered) =
-                    Keep::watching(memory, Some(Arc::clone(&sideways)), ordered);
-                let watched = self.watch(reference, gather_id, gathering, "Gather", None);
-                self.close(held, gathering, Arc::new(Watched::new(gather, watched)));
-                // Offered to the driving side while it is built, which is how it reaches the scan
-                // down there. Cleared afterwards so that nothing built later picks it up.
-                self.sideways = Some(Arc::clone(&sideways));
-                let mut left = self.node(driving)?;
-                self.sideways = None;
-                let side = Gathered { schema: &held_schema, chunks: gathered, marker, swapped };
-                // A lookup answers this join and the kind decides about a driving row from that
-                // row's own matches, so nothing has to be held and the driving side streams
-                // through. That is one less copy of a side, an answer that is never collected, and
-                // a pipeline no longer pinned to one thread by a sink that refuses to run twice.
-                //
-                // The plan's shape does not know about this and counts a pipeline here that the
-                // built query then fuses away, the same way it would if a cross product were a join
-                // node. Nothing runs wrong because of it: what the driver waits on is `after` on
-                // the segment, which is set right below, and the shape is only where the numbers on
-                // the counters come from. What it costs is that a profile divides the time between
-                // two pipeline ids that are really one, and what it would take to fix is teaching
-                // `rudb_plan` the same question this line asks, in a second place, where the two
-                // could disagree and the disagreement would be a wrong plan rather than a coarse
-                // profile.
-                // Armed now rather than when the filter was made, because whether there is a key
-                // to hand over is a question about the conditions and only the operator has split
-                // them. A join that answers nothing leaves the filter inert, which is a scan that
-                // reads everything exactly as it did before.
-                // The binding the join knows is the one the projection above the scan hands it, so
-                // it is turned into the scan's own before either half is armed. Both halves
-                // together, because the build side pass that fills the filter is only worth making
-                // when there is a scan that will read it.
-                let zone = self.session.session_time_zone();
-                let arm = |keyed: Option<(ExprRef, ColumnBinding)>| {
-                    let Some((key, binding)) = keyed else {
-                        return;
-                    };
-                    let Some(binding) = sideways::beneath(plan, driving, binding) else {
-                        return;
-                    };
-                    sideways.keying(Keyed::new(plan, key, held_schema.clone(), zone));
-                    sideways.about(binding);
-                };
-                // The join turned around, which is the subject side gathered and marked while the
-                // other side streams past. It ends the pipeline rather than sitting in it, because
-                // no gathered row can be said to have matched nothing until the last driving row
-                // has been through. See `crate::join::Marking`.
-                if marking {
-                    let made = Marking::new(
-                        plan,
-                        &left.schema,
-                        &side,
-                        kind,
-                        conditions,
-                        self.cancel,
-                        memory,
-                    );
-                    let Some((mark, out)) = made else {
-                        return Err(Error::internal(format!(
-                            "a {} join was given a build side no lookup can answer it from",
-                            kind.keyword()
-                        )));
-                    };
-                    let mark = mark.in_session(self.session);
-                    arm(mark.sideways());
-                    let schema = mark.schema().clone();
-                    let counters = self.watch(reference, id, pipeline, "Mark", None);
-                    let reading = Arc::clone(&counters);
-                    let mark = mark.watched(Arc::clone(&counters));
-                    left.after.push(gathering);
-                    self.close(left, pipeline, Arc::new(Watched::new(mark, counters)));
-                    let reader = Arc::new(Watched::new(out, reading));
-                    return Ok(Segment::reading(reader, schema, pipeline));
-                }
-                // An outer join that gathered the side it keeps. It streams the pairs like any
-                // probe and owes a padded row for every gathered row nothing matched, which it
-                // hands over once the driving side is finished. See `crate::join::Padding`.
-                if let Some(pad) =
-                    Padding::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
-                {
-                    let pad = pad.in_session(self.session);
-                    arm(pad.sideways());
-                    let schema = pad.schema().clone();
-                    // Named for what it does rather than for the kind, because the kind on the
-                    // plan line above it already says which outer join this is and what a reader
-                    // of a profile wants to know here is which of the two operators ran.
-                    let counters = self.watch(reference, id, pipeline, "Pad", None);
-                    let pad = pad.watched(Arc::clone(&counters));
-                    left.after.push(gathering);
-                    return Ok(left.then(Arc::new(Watched::new(pad, counters)), schema));
-                }
-                if let Some(probe) =
-                    Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)
-                {
-                    let probe = probe.in_session(self.session);
-                    arm(probe.sideways());
-                    let schema = probe.schema().clone();
-                    let counters = self.watch(reference, id, pipeline, "Probe", None);
-                    let probe = probe.watched(Arc::clone(&counters));
-                    left.after.push(gathering);
-                    return Ok(left.then(Arc::new(Watched::new(probe, counters)), schema));
-                }
-                let (join, out) =
-                    Join::new(plan, &left.schema, side, kind, conditions, self.cancel, memory);
-                let join = join.in_session(self.session);
-                let schema = join.schema().clone();
-                let counters = self.watch(reference, id, pipeline, "Join", None);
-                let reading = Arc::clone(&counters);
-                let join = join.watched(Arc::clone(&counters));
-                left.after.push(gathering);
-                self.close(left, pipeline, Arc::new(Watched::new(join, counters)));
-                Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
+            // One pipeline rather than two, which is the whole of what this node buys. The parent
+            // is not walked into at all: it is read column by column out of the catalog, and what
+            // the child's rows carry away from it is a row id per row and a pointer per column.
+            Node::LinkJoin { child, parent, kind, conditions, rid } => {
+                let found = self.linked(reference, child, parent, conditions)?;
+                let below = self.node(child)?;
+                let operator = LinkJoin::new(
+                    plan,
+                    kind,
+                    found.link,
+                    found.parent,
+                    found.projected,
+                    rid,
+                    &below.schema,
+                    &found.parent_schema,
+                    self.seams,
+                    memory,
+                    self.cancel.clone(),
+                )?
+                .in_session(self.session);
+                let schema = operator.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "LinkJoin", None);
+                below.then(Arc::new(Watched::new(operator, counters)), schema)
             }
+            Node::Join { .. } => self.join(reference)?,
             Node::CrossProduct { left, right } => {
                 // The right side runs first and is kept as the chunks it arrived in, because it is
                 // replayed once per left row. The left side streams, which is the whole point of

@@ -23,6 +23,19 @@
 //! written and disagree some time after, and the one that would be wrong is this one, which is the
 //! one somebody reads when they are trying to find out why a query is slow.
 //!
+//! # Why a join says which algorithm it is and why the other one was not
+//!
+//! `spec/graph/06-the-optimizer.md` section 6.7, and the argument there is worth repeating: this
+//! layer's failure mode is silence. A hash join that is slow is visibly a hash join, and a link
+//! that was not read because a projection two nodes up dropped the row id looks exactly like a link
+//! that does not exist. So a join over a session that declared relationships carries the reason on
+//! its line, and the reason comes from [`crate::link::why`], which is the code the decision was
+//! made with rather than a second reading of the same plan.
+//!
+//! Nothing at all on a session that declared none, which is almost every session. A clause on every
+//! join of every query saying no relationship was declared is one people stop reading, and then
+//! they stop reading it on the plan where it says something.
+//!
 //! # What the reference marker means
 //!
 //! Every operator at F0 is running the simplest correct implementation of everything it does, and a
@@ -52,10 +65,11 @@ use rudb_plan::{
 use rudb_seam::{Registries, SeamId, Settings};
 
 use crate::estimate::{CARDINALITY, DISTINCT, Facts, rows_stat, rows_stat_into};
+use crate::pass::Context;
 
 /// Whether `EXPLAIN` was asked what the planner knew.
 ///
-/// A named pair rather than a `bool`, because `explain_with(plan, facts, seams, true)` at a call
+/// A named pair rather than a `bool`, because `explain_with(plan, context, seams, true)` at a call
 /// site says nothing about what is true.
 ///
 /// It is off by default because the plan is what somebody reading `EXPLAIN` came for, and a use and
@@ -120,10 +134,10 @@ impl<'a> Seams<'a> {
 /// The plan section is the same either way. What is missing is the seam section, which is why this
 /// exists for tests and for anything that wants the tree and nothing else.
 #[must_use]
-pub fn explain(plan: &Plan, facts: &Facts) -> String {
+pub fn explain(plan: &Plan, context: &Context) -> String {
     let settings = Settings::new();
     let registries = Registries::new();
-    explain_with(plan, facts, Seams::new(&settings, &registries), Statistics::NotAsked)
+    explain_with(plan, context, Seams::new(&settings, &registries), Statistics::NotAsked)
 }
 
 /// The plan as `EXPLAIN` prints it: the tree, then the pipelines, then the seams.
@@ -138,11 +152,11 @@ pub fn explain(plan: &Plan, facts: &Facts) -> String {
 #[must_use]
 pub fn explain_with(
     plan: &Plan,
-    facts: &Facts,
+    context: &Context,
     seams: Seams<'_>,
     statistics: Statistics,
 ) -> String {
-    printed(plan, facts, seams, None, statistics)
+    printed(plan, context, seams, None, statistics)
 }
 
 /// The plan as `EXPLAIN ANALYZE` prints it, which is the same three sections with what happened
@@ -155,12 +169,12 @@ pub fn explain_with(
 #[must_use]
 pub fn analyzed(
     plan: &Plan,
-    facts: &Facts,
+    context: &Context,
     seams: Seams<'_>,
     measured: &Document,
     statistics: Statistics,
 ) -> String {
-    printed(plan, facts, seams, Some(measured), statistics)
+    printed(plan, context, seams, Some(measured), statistics)
 }
 
 /// Writes the estimated row count of every node onto the operator row that node became, and the
@@ -210,15 +224,16 @@ pub fn record_estimates(plan: &Plan, facts: &Facts, document: &mut Document) {
 /// The three sections, with the measured numbers in them if there are any.
 fn printed(
     plan: &Plan,
-    facts: &Facts,
+    context: &Context,
     seams: Seams<'_>,
     measured: Option<&Document>,
     statistics: Statistics,
 ) -> String {
+    let facts = context.facts();
     let shape = Shape::of(plan);
     let keys = keys_of(plan);
     let printing =
-        Printing { plan, facts, shape: &shape, seams, measured, statistics, keys: &keys };
+        Printing { plan, context, facts, shape: &shape, seams, measured, statistics, keys: &keys };
     let mut out = String::new();
     printing.write_node(plan.root(), 0, false, &mut out);
     write_pipelines(&shape, measured, &mut out);
@@ -269,6 +284,8 @@ fn estimate(stat: Stat<u64>, statistics: Statistics) -> String {
 #[derive(Clone, Copy)]
 struct Printing<'a> {
     plan: &'a Plan,
+    /// What the planner was told, which is what the join lines are attributed from.
+    context: &'a Context,
     facts: &'a Facts,
     shape: &'a Shape,
     seams: Seams<'a>,
@@ -310,11 +327,12 @@ impl Printing<'_> {
             Statistics::Asked => tells_apart(self.keys.get(node as usize)),
             Statistics::NotAsked => String::new(),
         };
+        let chose = chosen(self.plan, node, self.context);
         // The estimate goes after the operator rather than in a column of its own, because the tree
         // is indented and a column would have to be wider than the deepest line to line up.
         let _ = writeln!(
             out,
-            "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{told}{marker}{actual}",
+            "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{told}{chose}{marker}{actual}",
             "",
             indent = depth * 2
         );
@@ -336,6 +354,35 @@ impl Printing<'_> {
         for child in children(self.plan.node(node)) {
             self.write_node(child, depth + 1, moved, out);
         }
+    }
+}
+
+/// Which join algorithm this node is, and why the other one was not, as a bracket on its line.
+///
+/// `spec/graph/06-the-optimizer.md` section 6.7 asks for exactly this, and says why: a hash join
+/// that is slow is visibly a hash join, and a link that was not read because a projection two nodes
+/// up dropped the row id looks from the outside exactly like a link that was never built. Without
+/// the reason in the plan output nobody finds the difference.
+///
+/// Nothing at all on every other kind of node, and nothing on a join in a session that has declared
+/// no relationships. A reader of a plan over a database with no graph in it would otherwise get the
+/// same sentence on every join of every query, which is the kind of clause people stop reading.
+fn chosen(plan: &Plan, node: NodeRef, context: &Context) -> String {
+    if context.links().is_empty() {
+        return String::new();
+    }
+    let Some(why) = crate::link::why(plan, node, context) else {
+        return String::new();
+    };
+    // Which algorithm is read off the node and not off the reason, because the node is what ran. A
+    // plain join whose reason says the link should have been read is a plan the rewrite never saw,
+    // which happens when somebody turned it off, and printing "reads the link" over a hash join
+    // because the rule would have chosen one is the plan output lying about the plan.
+    let taken = matches!(plan.node(node), Node::LinkJoin { .. });
+    match (taken, why.chosen()) {
+        (true, _) => format!(" [reads the link, because {why}]"),
+        (false, false) => format!(" [builds a hash table, because {why}]"),
+        (false, true) => " [builds a hash table, because the link_join rewrite is off]".to_owned(),
     }
 }
 
@@ -696,30 +743,38 @@ mod tests {
     use rudb_plan::Plan;
     use rudb_seam::{Registries, Settings};
 
-    use super::{Seams, Shape, Statistics, explain, explain_with, record_estimates};
+    use super::{Context, Seams, Shape, Statistics, explain, explain_with, record_estimates};
     use crate::estimate::Facts;
 
     fn parsed(text: &str) -> Plan {
         Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"))
     }
 
-    fn printed(text: &str, tables: &[(&str, u64)]) -> String {
+    /// A planner that knows how large those tables are and nothing else.
+    fn knowing(tables: &[(&str, u64)]) -> Context {
         let mut facts = Facts::new();
         for (table, count) in tables {
             facts.record("memory", "main", table, *count);
         }
-        explain(&parsed(text), &facts)
+        let mut context = Context::new();
+        context.measure(std::sync::Arc::new(facts));
+        context
+    }
+
+    fn printed(text: &str, tables: &[(&str, u64)]) -> String {
+        explain(&parsed(text), &knowing(tables))
     }
 
     /// The same thing with the statistics asked for, which is `EXPLAIN (STATISTICS)`.
     fn asked(text: &str, tables: &[(&str, u64)]) -> String {
-        let mut facts = Facts::new();
-        for (table, count) in tables {
-            facts.record("memory", "main", table, *count);
-        }
         let settings = Settings::new();
         let registries = Registries::new();
-        explain_with(&parsed(text), &facts, Seams::new(&settings, &registries), Statistics::Asked)
+        explain_with(
+            &parsed(text),
+            &knowing(tables),
+            Seams::new(&settings, &registries),
+            Statistics::Asked,
+        )
     }
 
     /// The tree, without the sections under it, which is the part most tests are about.
@@ -915,6 +970,70 @@ mod tests {
     }
 
     #[test]
+    fn a_session_with_no_relationships_says_nothing_about_links_on_any_join() {
+        // The clause is worth having because it is rare. A sentence about links on every join of
+        // every query over a database with no graph in it is a sentence people stop reading, and
+        // then they stop reading it on the one plan where it says something.
+        let out = printed(
+            concat!(
+                "Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+                "  Get memory.main.l AS l #0 [a::INTEGER]\n",
+                "  Get memory.main.r AS r #1 [a::INTEGER]\n",
+            ),
+            &[("l", 10), ("r", 10)],
+        );
+        assert!(!out.contains("hash table"), "{out}");
+        assert!(!out.contains("reads the link"), "{out}");
+    }
+
+    #[test]
+    fn a_join_in_a_session_that_has_relationships_says_which_algorithm_and_why() {
+        let mut context = knowing(&[("lineitem", 6_000_000), ("orders", 1_500_000)]);
+        context.relate(std::sync::Arc::new(vec![crate::link::Linked::built(
+            "lineitem",
+            "l_orderkey",
+            "orders",
+            "o_orderkey",
+        )]));
+        let mut plan = parsed(concat!(
+            "Project #2 [#0.0::BIGINT AS k]\n",
+            "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.lineitem AS lineitem #0 [l_orderkey::BIGINT]\n",
+            "    Get memory.main.orders AS orders #1 [o_orderkey::BIGINT]\n",
+        ));
+        // This prints a plan rather than optimizing one, so the join is still a join over a
+        // relationship the rule would have taken. Which is the case the wording is careful about:
+        // the algorithm comes off the node, so the line says hash join and blames the rewrite
+        // rather than claiming a link was read.
+        let out = explain(&plan, &context);
+        assert!(
+            out.contains("[builds a hash table, because the link_join rewrite is off]"),
+            "{out}"
+        );
+        // And the clause is on the join's line and on no other, because the question is about a
+        // join and a scan that answered it would be answering about its parent.
+        assert_eq!(
+            tree(&out).iter().filter(|line| line.contains("hash table")).count(),
+            1,
+            "{out}"
+        );
+
+        // Then the same plan after the rewrite has had it, which is what an ordinary `EXPLAIN`
+        // prints. The reason is the bullet of section 6.4 that took it rather than a repeat of the
+        // node's own name.
+        crate::pass::Pass::run(&crate::link::LinkJoinRewrite, &mut plan, &context)
+            .expect("the pass does not fail");
+        let out = explain(&plan, &context);
+        assert!(
+            out.contains(
+                "[reads the link, because the parent does not fit in cache and its projection \
+                 is 8 bytes, which is under 32]"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn a_plan_that_does_not_break_is_one_pipeline_and_says_so() {
         let out = printed("Get memory.main.t AS t #0 [a::INTEGER]\n", &[("t", 4)]);
         assert!(out.contains("[pipeline 0]"), "{out}");
@@ -983,7 +1102,7 @@ mod tests {
         );
         let out = explain_with(
             &plan,
-            &Facts::new(),
+            &knowing(&[]),
             Seams::new(&settings, &registries),
             Statistics::NotAsked,
         );

@@ -207,6 +207,7 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => collect(plan, input, set),
         Node::Join { left, right, .. }
+        | Node::LinkJoin { child: left, parent: right, .. }
         | Node::DependentJoin { left, right, .. }
         | Node::CrossProduct { left, right } => {
             collect(plan, left, set);

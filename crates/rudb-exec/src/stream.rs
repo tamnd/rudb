@@ -174,6 +174,11 @@ fn reads(node: &Node) -> u32 {
         | Node::SetOp { .. } => 2,
         Node::TopN { .. } | Node::CrossProduct { .. } => 2,
         Node::Join { .. } | Node::DependentJoin { .. } => 3,
+        // Once, which is the whole claim of section 5.2. There is no build side to write and read
+        // back, no hash table to probe and no parent row copied anywhere: the child is scanned, the
+        // link is read beside its columns, and the parent's columns are gathered rather than
+        // materialised. A link join reads its rows the number of times a filter does.
+        Node::LinkJoin { .. } => 1,
         Node::Sort { .. } => 3,
     }
 }

@@ -266,6 +266,65 @@ fn a_three_way_join_survives_the_round_trip() {
     assert!(dump.contains(" OR "), "the disjunction is not in\n{dump}");
 }
 
+/// The four kinds a forward link can answer, each through the printer and the reader.
+///
+/// A link join prints no build side, because it has no build. That is the one thing here that is
+/// not just a second spelling of the join above it, so the test asserts on its absence rather than
+/// trusting the round trip alone: a reader that quietly accepted `build=` would read back a plan
+/// that prints the same and means something the operator cannot do.
+#[test]
+fn every_kind_a_link_join_answers_survives_the_round_trip() {
+    for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti] {
+        let mut plan = Plan::new();
+        let lineitem = get(
+            &mut plan,
+            "lineitem",
+            0,
+            &[
+                ("l_orderkey", LogicalType::BigInt),
+                ("l_price", LogicalType::Double),
+                // The child's row id, carried as a column the way section 5.1 says it is.
+                ("file_row_number", LogicalType::BigInt),
+            ],
+        );
+        let orders = get(
+            &mut plan,
+            "orders",
+            1,
+            &[("o_orderkey", LogicalType::BigInt), ("o_status", LogicalType::Varchar)],
+        );
+        let child_key = column(&mut plan, 0, 0, LogicalType::BigInt);
+        let parent_key = column(&mut plan, 1, 0, LogicalType::BigInt);
+        let on = plan.add_expr(
+            Expr::Compare { op: CompareOp::Equal, left: child_key, right: parent_key },
+            LogicalType::Boolean,
+        );
+        let conditions = plan.add_expr_list(&[on]);
+        let rid = column(&mut plan, 0, 2, LogicalType::BigInt);
+        let join = plan.add_node(Node::LinkJoin {
+            child: lineitem,
+            parent: orders,
+            kind,
+            conditions,
+            rid,
+        });
+        plan.set_root(join);
+
+        let dump = round_trips(&plan);
+        assert!(
+            dump.starts_with(&format!("LinkJoin {} on=", kind.keyword())),
+            "the kind is not in\n{dump}"
+        );
+        assert!(!dump.contains("build="), "a link join has no build side\n{dump}");
+        assert!(dump.contains(" rid=#0.2::BIGINT"), "the row id is not named\n{dump}");
+        // The child is the first input, which is the side the operator streams.
+        assert!(
+            dump.contains("  Get memory.main.lineitem"),
+            "the child is not the first input\n{dump}"
+        );
+    }
+}
+
 /// A `VALUES` list, a `CASE` over it, and a cast, all in one plan. `VALUES` is the only operator
 /// whose arguments are a list of lists, so it is the one that finds a reader that splits on commas
 /// without counting brackets.

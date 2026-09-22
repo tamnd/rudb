@@ -42,6 +42,10 @@ pub fn seams_of(node: &Node) -> &'static [SeamId] {
         Node::Join { .. } => {
             &[SeamId::JoinBuild, SeamId::JoinFilter, SeamId::HashKey, SeamId::HashFunction]
         }
+        // None of the four, which is the point of the operator. There is no build to tune, no
+        // runtime filter to push, no key to hash and no hash function to choose. What it has
+        // instead is a gather, and the seam that names a gather is the vector form one.
+        Node::LinkJoin { .. } => &[SeamId::VectorForm],
         Node::Dummy
         | Node::Values { .. }
         | Node::TableFunction { .. }
