@@ -5823,6 +5823,10 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     db.execute("INSERT INTO orders SELECT i, 1 + i % 4000 FROM range(1, 10001) AS r(i)").unwrap();
     db.execute("SET graph_links = 'orders(o_custkey) -> customer(c_custkey)'").unwrap();
     db.execute("CHECKPOINT").unwrap();
+    // The layer is opt in, per `spec/graph/09-measurement.md` section 9.2 and the default in
+    // `rudb_common::rules`. The checkpoint above wrote the link either way, which is the point of
+    // the default: a file carries the section and a session decides whether anything reads it.
+    db.execute("SET graph_sections = 'on'").unwrap();
 
     // Four thousand customers fit in any cache there is, so the rule declines them, which is the
     // rule working rather than the pass failing. The setting is what a test uses to ask about the
@@ -5864,6 +5868,15 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     assert!(!explained(&db, sql).contains("LinkJoin"), "the pass is still on");
     assert_eq!(linked, rows(&db, sql), "the link join answered a different question");
     db.execute("RESET disabled_optimizers").unwrap();
+
+    // Section 9.2, the other switch and the one the ablation actually uses. Turning the pass off
+    // leaves the sections readable and stops one rewrite. Turning the sections off takes the whole
+    // layer away, and the two have to agree or the ablation is measuring the wrong thing.
+    db.execute("SET graph_sections = 'off'").unwrap();
+    assert!(!explained(&db, sql).contains("LinkJoin"), "the sections are still being read");
+    assert_eq!(linked, rows(&db, sql), "the layer changed an answer rather than a time");
+    db.execute("SET graph_sections = 'on'").unwrap();
+    assert!(explained(&db, sql).contains("LinkJoin"), "turning the sections back on did nothing");
 
     db.execute("RESET graph_cache_bytes").unwrap();
     assert_eq!(db.setting("graph_cache_bytes").unwrap(), "8.0 MiB", "reset is the default");
