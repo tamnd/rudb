@@ -1160,6 +1160,7 @@ impl Shared {
             rudb_opt::pass::Context::without(&self.inner.settings.disabled_optimizers())?;
         context.measure(self.facts(catalog));
         context.relate(self.relationships(catalog));
+        context.size(self.inner.settings.sizes());
         Ok(context)
     }
 

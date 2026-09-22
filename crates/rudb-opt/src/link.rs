@@ -68,7 +68,7 @@ use crate::pass::{Context, Pass};
 /// per row over something that was going to be in cache.
 ///
 /// Owed a setting and a measurement, both of them document 09 section 9.3.
-const CACHE_BYTES: u64 = 8 * 1024 * 1024;
+pub const CACHE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How wide the parent's projection may be before a hash join is worth its build.
 ///
@@ -77,7 +77,26 @@ const CACHE_BYTES: u64 = 8 * 1024 * 1024;
 /// is moving enough bytes that the build pays for itself.
 ///
 /// Owed a setting and a measurement, both of them document 09 section 9.3.
-const NARROW_BYTES: usize = 32;
+pub const NARROW_BYTES: usize = 32;
+
+/// The two numbers section 6.4 is decided by, as a statement has left them.
+///
+/// One type rather than two arguments because they are read together, changed together and are the
+/// same kind of thing: a guess about a machine that a measurement is supposed to replace. The
+/// defaults are [`CACHE_BYTES`] and [`NARROW_BYTES`], and `RESET` puts them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizes {
+    /// How much of the parent has to fit for its hash table to stay cache resident.
+    pub cache_bytes: u64,
+    /// How wide the parent's projection may be before a hash join is worth its build.
+    pub narrow_bytes: usize,
+}
+
+impl Default for Sizes {
+    fn default() -> Self {
+        Self { cache_bytes: CACHE_BYTES, narrow_bytes: NARROW_BYTES }
+    }
+}
 
 /// A relationship the child's file holds a readable forward link for.
 ///
@@ -310,12 +329,13 @@ fn worth_it(
     }
     let width: usize =
         plan.field_list(found.projected).iter().map(|field| field.ty.physical().size()).sum();
+    let sizes = context.sizes();
     let rows = estimate::rows(plan, parent, context.facts());
     // A parent nobody has counted is planned as one that does not fit, which is the answer that
     // stays right as a table grows: a hash join over a parent this pass declined is the plan that
     // ran before there were links at all.
     let fits = rows.is_some_and(|rows| {
-        rows.saturating_mul(u64::try_from(width).unwrap_or(u64::MAX)) <= CACHE_BYTES
+        rows.saturating_mul(u64::try_from(width).unwrap_or(u64::MAX)) <= sizes.cache_bytes
     });
     if fits {
         return false;
@@ -325,7 +345,7 @@ fn worth_it(
     // nothing records it. A clustered child is the case the link join wins by the most, so what
     // this costs is some of the win rather than any of the correctness, and until it is recorded
     // every parent that does not fit is decided by the width below.
-    width < NARROW_BYTES
+    width < sizes.narrow_bytes
 }
 
 /// The two columns one equality holds equal, when that is what the conditions are.

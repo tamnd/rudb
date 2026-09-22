@@ -5723,6 +5723,58 @@ fn a_forward_link_takes_the_monotone_form_only_when_every_child_row_has_a_parent
 }
 
 #[test]
+fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_same() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-graph-linkjoin-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("CREATE TABLE customer (c_custkey INTEGER, c_name VARCHAR)").unwrap();
+    db.execute("CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER)").unwrap();
+    db.execute("INSERT INTO customer SELECT i, 'c' || i FROM range(1, 4001) AS r(i)").unwrap();
+    db.execute("INSERT INTO orders SELECT i, 1 + i % 4000 FROM range(1, 10001) AS r(i)").unwrap();
+    db.execute("SET graph_links = 'orders(o_custkey) -> customer(c_custkey)'").unwrap();
+    db.execute("CHECKPOINT").unwrap();
+
+    // Four thousand customers fit in any cache there is, so the rule declines them, which is the
+    // rule working rather than the pass failing. The setting is what a test uses to ask about the
+    // other side of the crossover without writing a parent that really does not fit.
+    let sql = "SELECT count(*), sum(o_orderkey) FROM orders JOIN customer ON o_custkey = c_custkey";
+    let explained = |db: &Database, sql: &str| match db
+        .query(&format!("EXPLAIN {sql}"))
+        .expect("the explain ran")
+        .value_at(0, 1)
+    {
+        Value::Varchar(text) => text,
+        other => panic!("the plan came back as {other:?}"),
+    };
+    assert!(!explained(&db, sql).contains("LinkJoin"), "four thousand customers were worth a link");
+
+    db.execute("SET graph_cache_bytes = 1").unwrap();
+    assert_eq!(db.setting("graph_cache_bytes").unwrap(), "1 bytes");
+    let plan = explained(&db, sql);
+    assert!(plan.contains("LinkJoin"), "the join was not planned as a link join:\n{plan}");
+
+    // The whole of section 3.1: the sections change the time and not the answer. The control is
+    // the same query in the same process with the pass turned off.
+    let linked = rows(&db, sql);
+    db.execute("SET disabled_optimizers = 'link_join'").unwrap();
+    assert!(!explained(&db, sql).contains("LinkJoin"), "the pass is still on");
+    assert_eq!(linked, rows(&db, sql), "the link join answered a different question");
+    db.execute("RESET disabled_optimizers").unwrap();
+
+    db.execute("RESET graph_cache_bytes").unwrap();
+    assert_eq!(db.setting("graph_cache_bytes").unwrap(), "8.0 MiB", "reset is the default");
+
+    drop(db);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_checkpoint_builds_a_key_map_over_the_parent_of_every_declared_relationship() {
     let path = std::env::temp_dir().join(format!(
         "rudb-graph-checkpoint-{}-{}.rdb",

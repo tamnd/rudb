@@ -680,6 +680,12 @@ impl Plan {
             Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
                 self.each_column(conditions, found);
             }
+            // The row id counts as a column this node reads, for the reason the fetch's row does:
+            // it is an input to the operator rather than something it hands on.
+            Node::LinkJoin { conditions, rid, .. } => {
+                self.each_column(conditions, found);
+                self.read_columns(rid, found);
+            }
         }
     }
 

@@ -67,6 +67,8 @@ pub struct Context {
     /// The relationships a link join may be planned over, which is empty for almost every
     /// statement and is the whole of what the graph layer adds to this type.
     links: std::sync::Arc<Vec<crate::link::Linked>>,
+    /// The two numbers section 6.4 chooses between a link join and a hash join with.
+    sizes: crate::link::Sizes,
 }
 
 impl Context {
@@ -204,6 +206,21 @@ impl Context {
     #[must_use]
     pub fn links(&self) -> &[crate::link::Linked] {
         &self.links
+    }
+
+    /// Sets the two numbers the link join rule is decided by.
+    ///
+    /// Settings rather than constants because neither one can be read off the machine the query is
+    /// running on and both of them are the sort of number a measurement moves. See
+    /// [`crate::link::Sizes`].
+    pub fn size(&mut self, sizes: crate::link::Sizes) {
+        self.sizes = sizes;
+    }
+
+    /// The two numbers the link join rule is decided by.
+    #[must_use]
+    pub fn sizes(&self) -> crate::link::Sizes {
+        self.sizes
     }
 }
 
