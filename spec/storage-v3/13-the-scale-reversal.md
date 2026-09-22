@@ -6,6 +6,8 @@ Every design document in this series before it carries an evidence section, and 
 
 It is filed as evidence rather than as a design because nothing here proposes a mechanism. It establishes what is true, which is the thing document 14 then has to explain.
 
+**Scope.** Both engines here read Parquet. That isolates execution from storage, which is what makes the comparison fair, and it is also the limit of what the measurement can say. Every storage mechanism this series specifies is switched off in it: reading Parquet, rudb has no dictionary of its own to hold stable codes over and no native stripe to defer a projection past. A result here is a result about rudb's execution over a foreign file. It is not evidence about any document in this series that specifies the native format, and the first revision of this document used it that way and was wrong to. Document 15 is the same suite at the same size over each engine's own format, and the sections below are corrected against it.
+
 ## How it was measured
 
 The source is the published ClickBench `hits.parquet`, 14,779,976,446 bytes, and its one million row prefix. Both engines read the same file through a view with the loader conversion ClickBench itself applies, so the 43 query texts are unmodified. Both engines therefore run against Parquet, not against their own formats: the comparison isolates execution from storage, and neither side gets the advantage of a file it wrote.
@@ -23,22 +25,18 @@ One hundred times the data costs rudb 27.8x and DuckDB 10.9x. Both are sublinear
 
 The middle of the ladder agrees. Document 01 records a ten-million-row audit at 5.765 seconds of rudb Parquet against 4.108 seconds of DuckDB Parquet, which is rudb behind by 1.40x. Placed between the two measurements here that gives 1.11x ahead, 1.40x behind, 2.30x behind, monotone across two decades. That audit summed in-process query timers rather than child process wall time, so it is corroboration of the trend and not a fourth point on the same curve.
 
-Peak resident set moves the other way. Across the 43 queries the largest rudb process held 4.61 GB and the largest DuckDB process held 6.77 GB, so rudb uses 1.47x less memory at the same time as it spends 2.30x more of it. rudb is not losing because it ran out of room. On the five queries where it is furthest behind on time it is also using between eight and twelve times less memory than
+Peak resident set moves the other way. Across the 43 queries the largest rudb process held 4.61 GiB and the largest DuckDB process held 6.77 GiB, so rudb uses 1.47x less memory at the same time as it spends 2.30x more of it. rudb is not losing because it ran out of room. On the five queries where it is furthest behind on time it is also using between eight and twelve times less memory than
 DuckDB. That combination of less memory, more time and the same answer is the shape of an engine that is re-deriving something instead of holding it, and it is the single most useful fact in this document.
 
 ## What it falsifies
 
-Three decisions in this series were accepted on measurements that do not survive.
+Three decisions in this series were accepted on measurements taken two orders of magnitude below the benchmark size. Documents 09, 06 and 08 record wins at 100,000 and 1,000,000 rows as the justification for stable global string codes, for native late materialization, and for the shared arena transition. None of the three had ever been measured at 100,000,000.
 
-Document 09 records Q34 at 1.56 ms against DuckDB's 16.00 ms and Q35 at 1.52 ms against 19.00 ms, measured at 100,000 rows: a tenfold win, and the stated justification for stable global string codes. At 100,000,000 rows Q34 is 0.37x and Q35 is 0.26x, both losses. The mechanism may still be right. The evidence offered for it is not evidence at the scale that decides it.
+The first revision of this document went further and said those wins reverse at scale, citing Q34 at 0.37x, Q35 at 0.26x and Q24 at 0.44x here. That was an error of scope rather than of arithmetic. All three mechanisms are native-format mechanisms and all three are inert in this measurement, so these numbers are the cost of rudb executing without them and say nothing about whether they work. Document 15 measures them at full scale in the format they are specified for, where Q34 is 0.51 seconds, Q35 is 0.45, and Q24 through Q27 are between 0.21 and 1.38. They work.
 
-Document 06 records Q24 falling from 76.3 ms to 20.5 ms against DuckDB's 43.0 ms at 1,000,000 rows, a 2.1x win, as the result that justifies native late materialization. At 100,000,000 rows Q24 is
-0.44x. The rewrite still fires; it stops being sufficient.
+What survives is the narrower claim, which is still worth making: three documents closed a design question on a number from the wrong end of the scale, and until document 15 the series had no record of whether any of them held.
 
-Document 08 records Q34 falling from 60.5 ms to 47.8 ms at 1,000,000 rows against DuckDB's 26.0 ms.
-That one is honest about being a loss, and the loss widens with scale rather than closing.
-
-One decision survives, and the reason it survives is the important part. Document 05's persisted zone maps were measured on Q37 through Q40 at 1,000,000 rows. At 100,000,000 rows Q41, Q42 and Q43 are rudb wins of 3.24x, 1.68x and 2.92x, and Q37 and Q40 are the mildest losses in their shape class. Zone maps are the one mechanism in this series whose benefit is defined as *work not done* rather than as a smaller constant on work still done, and it is the one mechanism whose advantage grows with the data instead of evaporating.
+One decision was already tested across the gap, and the reason it holds up is the important part. Document 05's persisted zone maps were measured on Q37 through Q40 at 1,000,000 rows. At 100,000,000 rows Q41, Q42 and Q43 are rudb wins of 3.24x, 1.68x and 2.92x, and Q37 and Q40 are the mildest losses in their shape class. Zone maps are the one mechanism in this series whose benefit is defined as *work not done* rather than as a smaller constant on work still done, and it is the one mechanism whose advantage grows with the data instead of evaporating.
 
 ## The four shapes
 
@@ -94,6 +92,8 @@ Q15, Q17, Q18, Q39, Q41 and Q43, and with the exception of Q18 they are small qu
 
 ## The rule this imposes
 
-No decision in this series is accepted on evidence measured below the scale of the benchmark it claims to serve. A mechanism measured at 1,000,000 rows may be reported, and its number may be encouraging, but it does not close a design question. Three of the twelve documents here closed one on a measurement that the next two orders of magnitude reverse, and the cost of that is not the three mechanisms, two of which are probably correct, but that the series has no record of which of its decisions were ever tested against the thing it is trying to beat.
+No decision in this series is accepted on evidence measured below the scale of the benchmark it claims to serve. A mechanism measured at 1,000,000 rows may be reported, and its number may be encouraging, but it does not close a design question. Three of the twelve documents here closed one at 100,000 or 1,000,000 rows, and the cost of that was not that the mechanisms were wrong, because document 15 later found all three of them right, but that for the length of this series nobody could tell.
+
+A second rule follows from how the first revision of this document was misused, including by itself. A measurement is evidence only for the configuration it ran in. This one runs both engines over Parquet, so it is evidence about execution and about nothing that the native format does. Stating which mechanisms a measurement holds switched off is part of reporting it.
 
 Where a full-scale measurement is genuinely impractical, the document must say so, state the scale it did reach, and name the quantity it is assuming stays flat. Document 14 is about why that quantity is almost never flat.

@@ -4,8 +4,7 @@
 
 Document 00 already states this: "Execution runs on encoded data wherever the encoding permits it.
 A dictionary encoded column is grouped on its codes. Decoding is a fallback path, not the default path." It is the right principle and it has not held, and the reason it has not held is that
-"wherever the encoding permits it" cannot be falsified. Every document in this series satisfies it.
-Document 13 measures an engine that satisfies it and loses by 2.30x.
+"wherever the encoding permits it" cannot be falsified. Every document in this series satisfies it, and the series had no way to tell which of its mechanisms were carrying their weight until documents 13 and 15 measured them at full size. One of the two measurements then read as refuting three mechanisms that the other shows working, which is what an unfalsifiable principle costs.
 
 This document restates the same idea as a cost model with named quantities, so that a mechanism can be tested against it by measurement rather than by reading.
 
@@ -22,7 +21,7 @@ A query does not have a cost. It has a *lower bound*, and the bound is set by th
 3. **The values it must emit.** A `LIMIT 10` emits ten rows. The columns not used for filtering or
    ordering should be read for ten rows.
 
-An engine whose cost tracks these three is doing less work because it needs less, not because it was tuned. An engine whose cost tracks rows-scanned-times-columns-projected is the one document 13 measured.
+An engine whose cost tracks these three is doing less work because it needs less, not because it was tuned. An engine whose cost tracks rows-scanned-times-columns-projected is the one document 13 measured, and document 15 shows that the native format moves rudb off that curve for the second and third quantities above, the distinct values it must consider and the values it must emit, and leaves it on the curve wherever the answer itself grows with the table.
 
 ## The quantities
 
@@ -38,24 +37,31 @@ For a query `Q` over table `T`:
 
 ## The obligations
 
-Each is a claim about how cost must scale, each names the query in the suite that tests it, and each names the measurement that refutes it. None of them is a claim that rudb satisfies it today; document 13 is the evidence that rudb satisfies none of the four.
+Each is a claim about how cost must scale, each names the query in the suite that tests it, and each names the measurement that decides it.
+
+The first revision of this section reported all four as refuted, on document 13. Document 13 measures both engines over Parquet, where rudb has no dictionary of its own, and three of these four obligations are about what an engine can do with a dictionary it owns. Document 15 measures the same suite at the same size over rudb's own format and finds O2, O3 and O4 satisfied at factors between 8x and 102x. Only O1 is refuted, and it is refuted harder than document 13 could see.
 
 **O1. Grouping costs `O(R)` probes and `O(G)` memory traffic, not `O(R)` random accesses into a
 structure of size `G`.** When `G` is small the distinction is invisible because the structure sits in cache. When `G` approaches `R` every probe is a miss and a linear algorithm acquires a memory latency term that behaves like a second factor. The fix is not a faster hash: it is to stop probing a structure larger than cache, by partitioning on the key's high bits until each partition's group count fits, which converts random misses into sequential passes.
 
-*Tested by:* Q19, key `(UserID, minute(EventTime), SearchPhrase)`, `G` close to `R`.
-*Refuted by:* rudb's Q19 growing 117.4x when `R` grew 100x. A linear algorithm grows 100x. DuckDB
-grew 13.4x on the same query and the same file.
+*Tested by:* Q19, key `(UserID, minute(EventTime), SearchPhrase)`, `G` close to `R`. Also Q29, Q33, Q17, Q31, Q32, and the `COUNT(DISTINCT UserID)` family Q5, Q9, Q10, where the distinct set is the structure that grows.
+
+*Refuted by:* rudb's Q19 growing 117.4x when `R` grew 100x. A linear algorithm grows 100x. DuckDB grew 13.4x on the same query and the same file.
+
+*Refuted again, and more sharply, by the native format.* Every other obligation here is satisfied once rudb reads its own file. This one gets worse: document 15 measures Q29 at 60.79 seconds in native against 47.73 in Parquet, Q33 at 34.87 against 21.30, Q9 at 9.32 against 5.78, Q10 at 10.37 against 6.58, and Q5 at 4.42 against 3.24. Nine queries in the suite are slower in native than in Parquet and every one of them keys a structure that grows with the table. A format that speeds up 34 queries and slows down exactly the ones whose group count is unbounded is pointing at its grouping path and at nothing else.
+
+Together those queries plus Q19 and Q17 are 152.40 seconds of the 190.11 second native suite. Four fifths of rudb's cost at benchmark scale is this one obligation.
 
 **O2. A predicate or a scalar function over a column costs `O(D(Q, c))` evaluations, not `O(R)`.**
 Evaluating `STRLEN(URL)` 100,000,000 times when the dictionary has 15,000,000 entries is 85,000,000 evaluations of something already known. The result of a deterministic scalar function of a dictionary code is a property of the code. It is computed once per code and gathered per row, and the gather is an integer indexed load, which is the cheapest operation in the engine.
 
-Document 09 already contains this as a sentence, "predicate results may later be cached by dictionary identity, prepared expression, and code when repeated codes make that cheaper than row evaluation", filed under *later*. Document 13 says it is the third largest loss in the suite.
+Document 09 already contains this as a sentence, "predicate results may later be cached by dictionary identity, prepared expression, and code when repeated codes make that cheaper than row evaluation", filed under *later*.
 
-*Tested by:* Q28, `AVG(STRLEN(URL)) GROUP BY CounterID`, a few thousand groups so O1 is not in play,
-and no `LIKE` so the cost is purely per-row string handling.
-*Refuted by:* rudb's Q28 growing 40.1x against DuckDB's 7.5x, in 128 MB against DuckDB's 1,257 MB.
-rudb held ten times less state and spent five times more time, which is what re-deriving looks like.
+*Tested by:* Q28, `AVG(STRLEN(URL)) GROUP BY CounterID`, a few thousand groups so O1 is not in play, and no `LIKE` so the cost is purely per-row string handling. Also Q23, Q34, Q35, Q16 and Q36, whose work is a grouped count over a string key with a bounded group count.
+
+*Satisfied in native.* Document 15 measures Q28 at 2.89 seconds against 23.28 in Parquet, Q23 at 5.39 against 44.44, Q34 at 0.51 against 37.71, Q35 at 0.45 against 45.84, Q16 at 0.11 against 7.03 and Q36 at 0.10 against 6.28. The first revision of this section called Q28's 40.1x growth in Parquet a refutation. It was a measurement of rudb without a dictionary, which is the one condition under which this obligation is impossible to meet, and the 8.1x that appears the moment rudb reads its own file is the mechanism working.
+
+What remains open is the *later* in document 09's sentence. Q28 at 2.89 seconds is the largest of the six and it is the only one that evaluates a scalar function rather than grouping on the code directly, so it is the one query in the suite that would still test a predicate result cache. That is a question worth an experiment, not a deficit worth ranking.
 
 **O3. A top-N reads `F(Q)` columns for `R` rows and `P(Q)` columns for `K` rows.** Document 06
 specifies exactly this and gates it behind "at least eight columns must be deferred beyond the ordering columns" and "TopN plus offset must select at most 1024 rows". Q25 projects one column and orders by another, so it defers one column and the rewrite cannot fire. The eligibility rule was written for `SELECT *` and the suite's top-N queries are not `SELECT *`.
@@ -63,15 +69,20 @@ specifies exactly this and gates it behind "at least eight columns must be defer
 The obligation is not "defer many columns". It is that the number of *values materialized* is
 `|F(Q)| * R + |P(Q)| * K`, which for Q25 is `R` ordering keys and ten strings. The string payload of a filtered column is the expensive part and there is one of it.
 
-*Tested by:* Q25, Q26, Q27, each with one projected column and a `K` of ten.
-*Refuted by:* rudb's Q25 growing 65.4x against DuckDB's 8.9x while the answer stayed at ten rows.
+*Tested by:* Q25, Q26, Q27, each with one projected column and a `K` of ten, and Q20 and Q24.
+
+*Satisfied in native.* Document 15 measures Q25 at 0.21 seconds against 7.85 in Parquet, Q26 at 0.70 against 5.63, Q27 at 0.58 against 4.91, Q20 at 0.14 against 1.98 and Q24 at 1.38 against 14.15. The first revision cited Q25's 65.4x growth in Parquet as the refutation, where the native stripes this rewrite defers past do not exist and the rewrite cannot fire at all.
+
+The eligibility rule is still too narrow and document 06 now says so on its own terms. Q25 through Q27 defer one column, fail the eight-column test, and reach those timings anyway, so widening the rule is an improvement to a path that is already working rather than a repair to a broken one.
 
 **O4. An aggregate over an encoded column costs the encoding, not the decoding.** A run-length
 column's `SUM` is arithmetic on the runs. A dictionary column's `COUNT(DISTINCT)` is a population count over a presence bitmap of width `D`. `MIN` and `MAX` of a dictionary column whose entries are stored in sorted order are two lookups.
 
-*Tested by:* Q6, `COUNT(DISTINCT SearchPhrase)`, against Q5, `COUNT(DISTINCT UserID)`. Q5 is an
-integer and rudb loses it by 1.33x. Q6 is a string and rudb loses it by 5.0x. The gap between those two numbers is the cost of treating the string as bytes rather than as a code.
-*Refuted by:* that gap.
+*Tested by:* Q6, `COUNT(DISTINCT SearchPhrase)`, against Q5, `COUNT(DISTINCT UserID)`. The two queries are the same aggregate over a string column and an integer column, so the difference between them is the value of the encoding.
+
+*Satisfied in native, and the comparison reverses.* In Parquet, Q6 costs 16.65 seconds and Q5 costs 3.24, and the first revision of this section read that 5.1x gap as the cost of treating a string as bytes. In native, Q6 costs 0.19 seconds and Q5 costs 4.42. Counting the distinct values of a string column is now 23.3x *cheaper* than counting the distinct values of an integer column over the same rows, because the string column has a dictionary and the answer is a property of it, while the integer column has to build a set sized with the data.
+
+That reversal is the clearest statement of the principle in the suite, and it relocates the problem. The expensive case is not the encoded column. It is the unencoded one, and `COUNT(DISTINCT UserID)` builds exactly the kind of structure O1 is about, which is why Q5, Q9 and Q10 are all slower in native than in Parquet. O4 is met; what Q5 is waiting for is O1.
 
 ## The slope test
 
@@ -94,34 +105,39 @@ This is the enforcement mechanism that document 00's principle never had, and it
 
 ## Order of work
 
-By measured cost in the 100,000,000-row suite, counting only the excess over DuckDB:
+The first revision ranked four items by their excess over DuckDB in the Parquet suite. Ranked instead by rudb's own measured cost in the native suite, which is the configuration the project ships and which needs no rival to compute, there is one item.
 
-1. **O1, partitioned grouping.** Q19, Q33, Q34, Q35, Q14, Q23, Q22, Q13, Q16, Q31, Q32 account for
-   278.8 seconds of rudb's 468.2 and 88.3 seconds of DuckDB's 203.1. That is 190 seconds of a
-   265-second deficit, in one mechanism.
-2. **O2, evaluation in code space.** Q28, Q21, Q22, Q23 and Q6, roughly 120 seconds against 25.
-   Overlaps O1 on Q22 and Q23, so the two must be sequenced rather than measured independently.
-3. **O3, top-N eligibility.** Q24 through Q27, roughly 32 seconds against 13. Smallest of the
-   three and by far the smallest change, since document 06's machinery exists and the eligibility
-   rule is the thing that is wrong.
-4. **O4, encoded aggregates.** Q5 and Q6, roughly 20 seconds against 6, and mostly subsumed by O2.
+1. **O1, partitioned grouping and partitioned distinct.** Q29, Q33, Q19, Q17, Q10, Q9, Q31, Q32 and
+   Q5 account for 152.40 seconds of the 190.11 second native suite. Nothing else is close: the
+   remaining 34 queries together are 37.71 seconds, and 28 of them are under one second each.
+2. **O2's remainder, a predicate result cache keyed by dictionary identity.** Q28 at 2.89 seconds is
+   the only query left that would measure it.
+3. **O3's remainder, widening document 06's eligibility rule.** Q24 at 1.38 seconds is the whole
+   opportunity.
 
-O1 first, and not because it is the largest: because it is the only one of the four whose failure is superlinear. The other three cost a constant factor and will still be there afterwards. A superlinear term is the only kind that gets worse than the measurement says when the data grows again, and ClickBench at 100,000,000 rows is not the largest table rudb is meant to hold.
+O1 was already first in the previous ranking, for the right reason: it is the only one of the four whose failure is superlinear, and a superlinear term is the only kind that gets worse than the measurement says when the data grows again. ClickBench at 100,000,000 rows is not the largest table rudb is meant to hold. The native measurement adds a second reason, which is that the other three are no longer costing enough to rank.
+
+It also narrows what O1 means. Q5, Q9 and Q10 are `COUNT(DISTINCT UserID)`, not `GROUP BY`, and they regress in native alongside the grouped queries. Whatever partitioning is built has to serve the distinct path and the grouping path as one mechanism, because the suite penalises them identically.
 
 ## What this document does not claim
 
-The four obligations are derived from query shape and from growth rates, not from a profile. Shape evidence is strong enough to rank the work and to rule out the hypotheses that do not fit, since rudb using eight to twelve times less memory than DuckDB on the queries it loses worst rules out spilling and Q28 having only a few thousand groups rules out O1 as its cause, but it does not identify a line of code.
+The four obligations are derived from query shape, from growth rates, and from one format-to-format comparison, not from a profile. That evidence is strong enough to rank the work and to rule out the hypotheses that do not fit, since rudb using eight to twelve times less memory than DuckDB on the queries it loses worst rules out spilling, and since a format change that improved 34 queries and degraded 9 sharing one property is hard to attribute to anything but that property. It does not identify a line of code.
 
-Before each obligation is worked, the profile that confirms it must be taken at full scale:
+It is also worth saying plainly what the first revision of this document got wrong, because the mistake was not in the obligations. O1 through O4 were stated before the native measurement existed and all four survived it. The mistake was attaching each one to a refutation drawn from a configuration in which the mechanism under test was not running, and then ranking a work plan by those refutations. The obligations were falsifiable, which is what they were for. The evidence chosen to falsify them was measuring something else.
 
-- **O1.** Cache miss rate and TLB miss rate per probe against `G`, at four group counts spanning
-  cache-resident to far larger than memory. The prediction is a knee where `G` leaves L3. If there
-  is no knee, the cause is not the hash table and this document is wrong about Q19.
-- **O2.** Instruction counts attributed to string decode and to the scalar kernel on Q28, against
-  `D(URL)` counted from the dictionary. The prediction is that decode dominates and that its count
-  is proportional to `R` rather than to `D`.
-- **O3.** Bytes read per column on Q25. The prediction is that the `SearchPhrase` payload is read
-  in full rather than for ten rows.
-- **O4.** The same on Q6 against Q5.
+Before O1 is worked, the profile that confirms it must be taken at full scale in the native format:
+
+- **The knee.** Cache miss rate and TLB miss rate per probe against `G`, at four group counts
+  spanning cache-resident to far larger than memory. The prediction is a knee where `G` leaves L3.
+  If there is no knee, the cause is not the hash table and this document is wrong about Q19.
+- **The regression.** Why Q29, Q33, Q9, Q10 and Q5 are slower in native than in Parquet, when the
+  scan feeding them got faster. The prediction is that the native scan delivers rows to the
+  grouping path faster than the Parquet scan did, so a probe cost that was hidden behind decode is
+  now exposed. If instead the native path is doing something extra per group, that is a different
+  bug and it is cheaper to fix than partitioning.
+
+The second of those is the one to take first, because it is a comparison this project already has both sides of, and because an obligation that a format change made worse is usually a smaller mistake than an obligation that was never met.
+
+O2, O3 and O4 no longer need a confirming profile. They needed one while they were reported as refuted, and they are not.
 
 A profile that contradicts its prediction retires the obligation rather than the profile.
