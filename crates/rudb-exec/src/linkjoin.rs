@@ -163,6 +163,10 @@ impl LinkJoin {
     /// reading the child's own validity, and neither of the kinds here asks that question.
     fn resolve(&self, chunk: &Chunk, local: &mut Linking) -> Result<()> {
         let rows = chunk.len();
+        // flatten: the match below reads the row ids as a plain `&[i64]` and the loop after it
+        // walks every one of them in order and asks the link about it. So each value is read once,
+        // there is nothing here that a compact form would let the operator skip, and the cost of
+        // leaving it compact would be a dispatch per row on the way out of it.
         let ids = self.rid.evaluate_one(chunk, &mut local.scratch)?.flatten()?;
         let held: &[i64] = match ids.data() {
             Some(Data::Int64(values)) if !ids.validity().has_nulls(rows) => values.as_slice(),

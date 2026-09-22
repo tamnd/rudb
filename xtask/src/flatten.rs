@@ -50,7 +50,8 @@ const MARKER: &str = "flatten:";
 /// the list is short and grows a line at a time when somebody writes a shape it does not cover. A
 /// long speculative list would defeat the point, since the value of this rule is entirely in it
 /// failing on something it has not seen before.
-const ADAPTERS: [&str; 7] = ["iter", "into_iter", "copied", "cloned", "map", "filter_map", "ok"];
+const ADAPTERS: [&str; 8] =
+    ["iter", "into_iter", "values", "copied", "cloned", "map", "filter_map", "ok"];
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     let mut files = Vec::new();
@@ -195,6 +196,7 @@ mod tests {
         assert_eq!(classify("        for child in node.children().into_iter()"), Kind::Standard);
         assert_eq!(classify("        self.slots.get(index).copied()"), Kind::Standard);
         assert_eq!(classify("        if values.iter()"), Kind::Standard);
+        assert_eq!(classify("    held.values()"), Kind::Standard);
     }
 
     /// The case the rule is worth having. A chain ending in something nobody listed is not waved
