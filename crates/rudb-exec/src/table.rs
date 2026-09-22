@@ -867,7 +867,10 @@ enum StoredData {
         values: Vec<i128>,
     },
     Varchar(StringColumn),
-    StableText { dictionary: Arc<Vector>, codes: Vec<u32> },
+    StableText {
+        dictionary: Arc<Vector>,
+        codes: Vec<u32>,
+    },
     Other(Vec<Stored>),
 }
 
@@ -909,9 +912,7 @@ fn one_integer_of(value: &Value) -> Option<i128> {
 /// key that came in through [`one_integer_of`] and is the harmless answer if it ever did.
 fn one_integer_as(ty: &rudb_common::LogicalType, held: i128) -> Value {
     match ty {
-        rudb_common::LogicalType::Date => {
-            Value::Date(i32::try_from(held).unwrap_or(i32::MAX))
-        }
+        rudb_common::LogicalType::Date => Value::Date(i32::try_from(held).unwrap_or(i32::MAX)),
         rudb_common::LogicalType::Time => Value::Time(i64::try_from(held).unwrap_or(i64::MAX)),
         rudb_common::LogicalType::Timestamp => {
             Value::Timestamp(i64::try_from(held).unwrap_or(i64::MAX))
@@ -2451,8 +2452,9 @@ mod tests {
     fn a_key_of_every_form(ty: &LogicalType, of: impl Fn(i64) -> Value) {
         let rows = 30_000i64;
         let number = |row: i64| (row * 7919) % 5003;
-        let values: Vec<Value> =
-            (0..rows).map(|row| if row % 61 == 0 { Value::Null } else { of(number(row)) }).collect();
+        let values: Vec<Value> = (0..rows)
+            .map(|row| if row % 61 == 0 { Value::Null } else { of(number(row)) })
+            .collect();
         let types = [ty.clone()];
         let flatly = [flat(ty.clone(), &values)];
         let (was, before) = one_at_a_time(&flatly, values.len(), &types);
