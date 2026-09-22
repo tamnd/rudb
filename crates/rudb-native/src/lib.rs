@@ -262,6 +262,18 @@ struct FrequencySummary {
     ordinals: Vec<u64>,
 }
 
+/// The values one column's frequency synopsis lists, with a bound on everything it left out.
+///
+/// What [`Reader::frequency_prefix`] answers. The counts are exact, and `omitted_max` is how many
+/// rows any value not in the list can hold, which is zero when nothing was left out at all.
+#[derive(Debug, Clone)]
+pub struct FrequencyPrefix {
+    /// Every value the synopsis lists, with the number of rows holding it, count descending.
+    pub entries: Vec<(Value, u64)>,
+    /// How many rows the most common value outside the list holds, and zero for a complete list.
+    pub omitted_max: u64,
+}
+
 /// Sparse row ordinals covered by a numeric frequency candidate set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrequencyOccurrences {
@@ -2812,6 +2824,35 @@ impl Reader {
     ///
     /// If the column is outside the schema or a stored value does not fit its declared type.
     pub fn exact_frequencies(&self, column: usize) -> Result<Option<Vec<(Value, u64)>>> {
+        let Some(prefix) = self.frequency_prefix(column)? else {
+            return Ok(None);
+        };
+        Ok((prefix.omitted_max == 0).then_some(prefix.entries))
+    }
+
+    /// Every value the synopsis lists with the number of rows holding it, and a bound on the rest.
+    ///
+    /// The counts are exact whether or not the list is complete. The heavy hitter pass keeps a
+    /// bounded candidate set and then recounts only the candidates that survived it, so a value that
+    /// made it into the list carries the number of rows that really hold it rather than whatever the
+    /// pass had left over. What the pass loses is values, not counts.
+    ///
+    /// `omitted_max` is how many rows the most common value left out can hold, and zero says nothing
+    /// was left out at all, which is what [`exact_frequencies`] asks for. Above zero the list is the
+    /// leading values of the column and everything else is somewhere between no rows and that bound.
+    ///
+    /// That prefix is worth reading on its own. A column with a value in half its rows and a long
+    /// tail behind it has no complete synopsis and never will, and it is the column where dividing
+    /// the rows by the distinct count is furthest from the truth.
+    ///
+    /// `None` when the column has no synopsis.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema or a stored value does not fit its declared type.
+    ///
+    /// [`exact_frequencies`]: Self::exact_frequencies
+    pub fn frequency_prefix(&self, column: usize) -> Result<Option<FrequencyPrefix>> {
         let field = self
             .table
             .fields
@@ -2820,10 +2861,8 @@ impl Reader {
         let Some(summary) = self.table.frequencies.get(column).and_then(Option::as_ref) else {
             return Ok(None);
         };
-        if summary.omitted_max > 0 {
-            return Ok(None);
-        }
-        self.decode_frequencies(column, &field.ty, &summary.entries).map(Some)
+        let entries = self.decode_frequencies(column, &field.ty, &summary.entries)?;
+        Ok(Some(FrequencyPrefix { entries, omitted_max: summary.omitted_max }))
     }
 
     /// Turns stored frequency entries into values of the column's own type.
@@ -6169,6 +6208,60 @@ mod tests {
         // A constant of another domain against an integer column. Nothing in the list compares
         // with it, so the zero above would be an artefact of the mismatch rather than a fact.
         assert_eq!(common.rows_with(column, &Bound::Bytes(b"four".to_vec())), Stat::Unknown);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn the_planner_gets_an_exact_count_for_a_leading_value_of_an_incomplete_synopsis() {
+        // The case a complete synopsis does not cover, and the one worth the most. 16,000 rows over
+        // 601 distinct values, 10,000 of them holding a single value and the rest spread ten apiece
+        // over six hundred more. The writer holds 512 values, so the list is a prefix and most of
+        // the tail is outside it. The counts inside it are still exact, because the pass recounts
+        // the candidates that survived it, so `id = 1` is ten thousand rows rather than the
+        // twenty six a distinct count of 601 would divide its way to.
+        let path = path("frequency_prefix_for_the_planner");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let mut values = vec![Value::Integer(1); 10_000];
+        for _ in 0..10 {
+            values.extend((0..600).map(|tail| Value::Integer(1_000 + tail)));
+        }
+        // A vector holds 8,192 rows, so this goes in as several parts. The pass that takes the
+        // synopsis walks the whole column rather than a part, so the counts are the same either way.
+        for part in values.chunks(8_000) {
+            let rows = Chunk::new(vec![
+                Vector::from_values(LogicalType::Integer, part).expect("integers"),
+            ])
+            .expect("one column");
+            writer.append(&rows).expect("a part");
+        }
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let prefix =
+            reader.frequency_prefix(0).expect("a readable synopsis").expect("the column has one");
+        // A prefix and not the whole column, and the writer said how many rows anything left out of
+        // it can hold.
+        assert_eq!(prefix.entries.len(), 512);
+        assert_eq!(prefix.omitted_max, 10);
+        let common = Common::new(reader);
+        assert_eq!(common.rows(), 16_000);
+        let column = common.column("id").expect("the file has that column");
+        assert_eq!(
+            common.rows_with(column, &Bound::Int(1)),
+            Stat::exact(10_000, Provenance::FrequencySynopsis)
+        );
+        // In the prefix, because ties go to the smaller value and the prefix reaches 1,510.
+        assert_eq!(
+            common.rows_with(column, &Bound::Int(1_100)),
+            Stat::exact(10, Provenance::FrequencySynopsis)
+        );
+        // Outside it, and a prefix says nothing about a value it does not list. Not zero, which is
+        // what a complete list would say, and the file holds ten rows of this one.
+        assert_eq!(common.rows_with(column, &Bound::Int(1_550)), Stat::Unknown);
+        // Not in the file at all, and still nothing rather than a zero. A prefix cannot tell the
+        // two apart, which is the whole of what it gives up.
+        assert_eq!(common.rows_with(column, &Bound::Int(9_999)), Stat::Unknown);
         fs::remove_file(&path).expect("clean up");
     }
 
