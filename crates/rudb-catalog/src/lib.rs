@@ -26,5 +26,5 @@ pub use held::Held;
 pub use name::{QualifiedName, same_name};
 pub use rudb_native::StoredPart;
 pub use system::{INFORMATION_SCHEMA, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG};
-pub use table::{Table, duplicate_check};
+pub use table::{Rows, Table, duplicate_check};
 pub use view::View;

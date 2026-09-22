@@ -206,6 +206,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ReadParquet,
     TableFunction::ReadCsv,
     TableFunction::RudbStrategies,
+    TableFunction::RudbLinks,
     TableFunction::DuckdbKeywords,
     TableFunction::DuckdbTypes,
     TableFunction::DuckdbFunctions,
@@ -242,6 +243,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => vec![1],
         TableFunction::RudbStrategies
+        | TableFunction::RudbLinks
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions

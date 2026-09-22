@@ -1,6 +1,6 @@
 [package]
-name = "rudb-native"
-description = "Rudb single-file columnar storage reader and writer."
+name = "rudb-graph"
+description = "Row ids, key maps and relationships: the structures the link join is built on."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,9 +15,6 @@ readme.workspace = true
 [dependencies]
 rudb-common.workspace = true
 rudb-encoding.workspace = true
-rudb-graph.workspace = true
-rudb-storage.workspace = true
-rudb-vector.workspace = true
 
 [lints]
 workspace = true

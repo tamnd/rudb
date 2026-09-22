@@ -85,6 +85,8 @@ pub enum TableFunction {
     ReadCsv,
     /// `rudb_strategies()`, every seam and every implementation registered against it.
     RudbStrategies,
+    /// `rudb_links()`, every relationship declared and what is stored for it.
+    RudbLinks,
     /// `duckdb_keywords()`, every word the grammar knows and which class each one is in.
     DuckdbKeywords,
     /// `duckdb_types()`, every type name the engine knows and what each one stands for.
@@ -151,6 +153,7 @@ impl TableFunction {
             Self::ReadParquet => "read_parquet",
             Self::ReadCsv => "read_csv",
             Self::RudbStrategies => "rudb_strategies",
+            Self::RudbLinks => "rudb_links",
             Self::DuckdbKeywords => "duckdb_keywords",
             Self::DuckdbTypes => "duckdb_types",
             Self::DuckdbFunctions => "duckdb_functions",
@@ -283,6 +286,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("rudb_strategies") {
             return Some(Self::RudbStrategies);
+        }
+        if name.eq_ignore_ascii_case("rudb_links") {
+            return Some(Self::RudbLinks);
         }
         if name.eq_ignore_ascii_case("duckdb_keywords") {
             return Some(Self::DuckdbKeywords);
@@ -532,6 +538,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::RudbStrategies
+        | TableFunction::RudbLinks
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions
@@ -563,6 +570,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
 fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
     match function {
         TableFunction::RudbStrategies => Some(strategy_fields()),
+        TableFunction::RudbLinks => Some(link_fields()),
         TableFunction::DuckdbKeywords => Some(keyword_fields()),
         TableFunction::DuckdbTypes => Some(type_fields()),
         TableFunction::DuckdbFunctions => Some(function_fields()),
@@ -750,6 +758,40 @@ pub fn strategy_fields() -> Vec<Field> {
         Field::new("determinism", LogicalType::Varchar),
         Field::new("is_reference", LogicalType::Boolean),
         Field::new("is_default", LogicalType::Boolean),
+    ]
+}
+
+/// The columns `rudb_links()` produces.
+///
+/// Section 2.6 of spec/graph/02-the-data-model.md asks this table for what was declared, what was
+/// verified, and what is physically there, and the three are separate columns because they are
+/// separate claims. `cardinality` is what the build observed and not what a declaration asserted:
+/// section 2.3 says a declared relationship whose parent side turns out not to be unique is
+/// reported `unverified` and gets no structure, so a reader who sees `unverified` here is being told
+/// why the join they expected to be fast is not.
+///
+/// `key_map_bytes` is filled whether or not the map was kept, which is the whole point of section
+/// 3.7's budget record: a relationship that did not fit is a number rather than a silence, so
+/// raising `graph_budget` is a decision somebody can make from what this says.
+///
+/// The link columns are what milestone G2 fills. They are here and null rather than absent for the
+/// reason `rudb_strategies()` lists a seam with no implementations: a structure that is planned and
+/// not built is a commitment, and a table that showed only what exists would make the layer look
+/// finished.
+#[must_use]
+pub fn link_fields() -> Vec<Field> {
+    vec![
+        Field::new("name", LogicalType::Varchar),
+        Field::new("child_table", LogicalType::Varchar),
+        Field::new("child_key", LogicalType::Varchar),
+        Field::new("parent_table", LogicalType::Varchar),
+        Field::new("parent_key", LogicalType::Varchar),
+        Field::new("cardinality", LogicalType::Varchar),
+        Field::new("key_map", LogicalType::Varchar),
+        Field::new("key_map_bytes", LogicalType::BigInt),
+        Field::new("link", LogicalType::Varchar),
+        Field::new("link_bytes", LogicalType::BigInt),
+        Field::new("note", LogicalType::Varchar),
     ]
 }
 

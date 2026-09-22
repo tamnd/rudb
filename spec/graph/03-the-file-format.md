@@ -1,6 +1,6 @@
 # 3. The file format
 
-This document extends rudb's single-file native format, `crates/rudb-native/src/lib.rs`, from version 10 to version 11. It adds one general mechanism, the section table, and three section kinds that use it. Everything stays in one file. Nothing here is a sidecar on the filesystem, a second database, or an external index.
+This document extends rudb's single-file native format, `crates/rudb-native/src/lib.rs`, from format 22 to format 23. Earlier drafts of this document said version 10 to version 11, which was the numbering the format had when the document was written and has not been since: the code's `FORMAT` constant is what counts and it reached 22 before anything here was built. It adds one general mechanism, the section table, and three section kinds that use it. Everything stays in one file. Nothing here is a sidecar on the filesystem, a second database, or an external index.
 
 ## 3.1 The invariant
 
@@ -12,7 +12,9 @@ The cost of the invariant is that no graph section may hold information that is 
 
 ## 3.2 The section table
 
-Version 10 writes a header of eighty bytes with two twenty-eight byte slots for the directory, alternating by generation, and a directory that names one page per column per stripe plus a per-stripe index page of lengths and checksums. Version 11 changes the header's magic to `RUDBNV11`, sets `FORMAT` to 11, and adds to the directory one list: the section table.
+Format 22 writes a header of eighty bytes with two twenty-eight byte slots for the directory, alternating by generation, and a directory that names one page per column per stripe plus a per-stripe index page of lengths and checksums. Format 23 sets `FORMAT` to 23 and adds to the directory one list, behind its own eight byte tag `RUDBSE1\0` at the end: the section table.
+
+The magic stays `RUDBNV10` and does not move with the format number. The reader already tells the two failures apart and the messages are different for a reason: a wrong magic means a file that was never ours and the answer is to look at the path, while a wrong format means our own file from another build and the answer is the version number this build wants. Moving the magic every time the format changes would turn the second question into the first and throw away the only part of the message that helps.
 
 A section table entry is fifty six bytes.
 
@@ -30,13 +32,13 @@ A section table entry is fifty six bytes.
 
 Three rules govern it and all three exist because of something that has already gone wrong in this codebase.
 
-**A reader ignores a `kind` it does not know.** This is what makes version 11 the last bump this mechanism needs. A new section kind, a fifth key map form, a completely different structure invented in 2027, all of them are an entry with an unfamiliar tag in a file that older code still reads correctly, because of section 3.1.
+**A reader ignores a `kind` it does not know.** This is what makes format 23 the last bump this mechanism needs. A new section kind, a fifth key map form, a completely different structure invented in 2027, all of them are an entry with an unfamiliar tag in a file that older code still reads correctly, because of section 3.1.
 
-**A section is a list of extents of at most sixty four megabytes, each independently checksummed and independently readable.** Issue #745 is that the version 10 directory is one hundred and twenty eight megabyte buffer and a hundred million row load fails against it. The neighbour array of a backward adjacency on TPC-H `lineitem` at SF100 is two gigabytes. A section that had to be one page, or one buffer, would reproduce #745 immediately and at a larger scale. Extents mean a reader `pread`s the two it needs.
+**A section is a list of extents of at most sixty four megabytes, each independently checksummed and independently readable.** Issue #745 is that the format 22 directory is one hundred and twenty eight megabyte buffer and a hundred million row load fails against it. The neighbour array of a backward adjacency on TPC-H `lineitem` at SF100 is two gigabytes. A section that had to be one page, or one buffer, would reproduce #745 immediately and at a larger scale. Extents mean a reader `pread`s the two it needs.
 
 **Sections are written before the directory that names them, and the directory is committed by the existing two-generation header swap.** A crash mid-write leaves unreferenced bytes at the end of the file, which is what a crash mid-column-write already leaves. There is no new recovery path.
 
-Version 10 files are readable by a version 11 reader: their section table is empty. Version 11 files are not readable by a version 10 reader, and that is accepted rather than worked around, because the format is at 0.3.x and is not yet something anyone has on disk that this project did not put there. `../12-duckdb-compat.md` is unaffected; none of this touches the DuckDB format, which has no place to put it.
+Format 22 files are readable by a format 23 reader: their directory ends before the section table's tag, and a directory that ends there is a table with no sections, which by section 3.1 is a table that answers every query correctly and more slowly. The reader carries a list of readable formats rather than a single number, and the list has two entries for this one reason. Format 23 files are not readable by a format 22 reader, and that is accepted rather than worked around, because the format is at 0.3.x and is not yet something anyone has on disk that this project did not put there. `../12-duckdb-compat.md` is unaffected; none of this touches the DuckDB format, which has no place to put it.
 
 ## 3.3 Kind one: the key map, `RUDBKM1`
 
@@ -81,6 +83,8 @@ No adjacency for a relationship whose parent side failed uniqueness verification
 ## 3.7 The budget
 
 Graph sections are a cache and a cache needs a size. The default is that the total bytes of all graph sections for a table may not exceed **ten percent** of that table's stored column bytes, and the setting `graph_budget` raises or lowers it. `../stats/03-the-file-format.md` takes a further two percent for statistics sections through the same section table, budgeted separately so that one cannot quietly consume the other's room. Parachute allowed itself fifteen percent for a comparable structure and reported 1.54x on JOB, which is the closest published data point for what this kind of space buys.
+
+Below sixty four kilobytes of sections the share does not apply and everything fits. A percentage is the right rule for a structure whose size is worth arguing about and it stops meaning anything at the bottom: an identity key map is forty bytes on a table of any size, a key column of sequential integers encodes to a constant delta and almost no bytes, and ten percent of almost nothing is under forty. The pure rule would throw away the cheapest structure in the system for being expensive, and what it would be measuring is how well the column compressed rather than what the cache costs.
 
 When the budget binds, relationships are built in order of expected value, which the builder estimates as the number of child rows divided by the section's bytes, biased toward relationships the query log has actually used. A relationship that does not fit is recorded as not built, with its size, so `rudb_links()` shows what a larger budget would buy rather than leaving the user to guess.
 

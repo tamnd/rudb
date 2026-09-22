@@ -32,10 +32,9 @@ rudb-opt.workspace = true
 rudb-functions.workspace = true
 rudb-csv.workspace = true
 rudb-parquet.workspace = true
-
-[dev-dependencies]
-# For writing a native file a scan can be pointed at, which is the only way to test what a scan
-# does with stripes.
+# For `rudb_links()`, which reads a declared relationship out of the session and the key map that
+# was built for it out of the file the parent table is in.
+rudb-graph.workspace = true
 rudb-native.workspace = true
 
 [lints]

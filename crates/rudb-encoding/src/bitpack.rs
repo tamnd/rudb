@@ -446,6 +446,29 @@ pub fn tail_len(count: usize, width: usize) -> usize {
 /// If `count` is not below [`VALUES`], if `width` exceeds 64, or if a value does not fit.
 pub fn pack_tail(values: &[u64], width: usize, output: &mut Vec<u8>) -> Result<()> {
     check_tail(values.len(), width)?;
+    pack_linear(values, width, output)
+}
+
+/// Packs any number of values in the layout [`pack_tail`] writes.
+///
+/// [`pack_tail`] is this with a bound, and the bound is a statement about columns rather than about
+/// the layout: a column that has a whole unit of values has a transposed unit to put them in, so
+/// the sequential layout is for the remainder and asking for it with a full unit in hand is a bug.
+///
+/// A key map is the other kind of caller. It is not a column, it is never decoded as a run, and
+/// every read of it is a single [`tail_at`] out of the middle of a binary search, so the transposed
+/// layout would buy it nothing and the bound would cost it the form: the sorted key map over
+/// fifteen million `orders` rows is fifteen million values in one array addressed by index. The
+/// writer's carry chain is still here and is still serial, and that is a build time cost paid once
+/// over a column that is being sorted anyway.
+///
+/// # Errors
+///
+/// If `width` exceeds 64, or if a value does not fit in `width` bits.
+pub fn pack_linear(values: &[u64], width: usize, output: &mut Vec<u8>) -> Result<()> {
+    if width > 64 {
+        return Err(Error::internal(format!("{width} bits does not fit in 64")));
+    }
     if width == 0 {
         return check_all_zero(values);
     }

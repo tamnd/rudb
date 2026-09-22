@@ -5528,6 +5528,155 @@ fn set_threads_is_recorded_even_though_nothing_runs_in_parallel_yet() {
 }
 
 #[test]
+fn a_relationship_is_declared_by_a_setting_and_read_back_from_one() {
+    let db = Database::new();
+    assert_eq!(db.setting("graph_links").unwrap(), "", "a fresh database declares nothing");
+
+    db.execute(
+        "SET graph_links = 'lineitem(l_orderkey) -> orders(o_orderkey), \
+         orders(o_custkey) -> customer(c_custkey)'",
+    )
+    .unwrap();
+    let declared = rudb_graph::parse_links(&db.setting("graph_links").unwrap()).unwrap();
+    assert_eq!(declared.len(), 2);
+    assert_eq!(declared[0].name(), "lineitem(l_orderkey) -> orders(o_orderkey)");
+    assert_eq!(
+        declared[0].cardinality,
+        rudb_graph::Cardinality::Unverified,
+        "a declaration says what the author believes and the build says what is true"
+    );
+
+    // Refused where the author can see it. A declaration that does not parse would otherwise be
+    // carried to a checkpoint that silently built nothing out of it.
+    let error = db.execute("SET graph_links = 'lineitem(l_orderkey)'").unwrap_err();
+    assert!(error.to_string().contains("child(column) -> parent(column)"), "{error}");
+    assert_eq!(
+        rudb_graph::parse_links(&db.setting("graph_links").unwrap()).unwrap().len(),
+        2,
+        "and the declaration that worked is still there"
+    );
+
+    db.execute("RESET graph_links").unwrap();
+    assert_eq!(db.setting("graph_links").unwrap(), "");
+}
+
+#[test]
+fn rudb_links_says_what_is_declared_and_what_of_it_is_built() {
+    let db = Database::new();
+    assert!(rows(&db, "SELECT name FROM rudb_links()").is_empty(), "nothing declared, no rows");
+
+    db.create_table("customer", vec![Field::new("c_custkey", LogicalType::Integer)]).unwrap();
+    db.append("customer", &[vec![Value::Integer(1)], vec![Value::Integer(2)]]).unwrap();
+    db.execute(
+        "SET graph_links = 'orders(o_custkey) -> customer(c_custkey), \
+         lineitem(l_orderkey) -> orders(o_orderkey)'",
+    )
+    .unwrap();
+
+    // The declaration is a row whether or not anything was built, because a reader who cannot tell
+    // a relationship nobody declared from one nothing acted on cannot tell which to fix.
+    let listed = rows(
+        &db,
+        "SELECT parent_table, cardinality, key_map, key_map_bytes, link, note FROM rudb_links() \
+         ORDER BY parent_table",
+    );
+    assert_eq!(
+        listed,
+        vec![
+            vec![
+                Value::Varchar("customer".into()),
+                Value::Varchar("unverified".into()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Varchar("no key map is stored".into()),
+            ],
+            vec![
+                Value::Varchar("orders".into()),
+                Value::Varchar("unverified".into()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Varchar("no table of that name".into()),
+            ],
+        ],
+        "a memory table holds no sections and a table that is not here holds nothing at all"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT child_table, child_key, parent_key FROM rudb_links() WHERE \
+             parent_table = 'customer'"
+        ),
+        vec![vec![
+            Value::Varchar("orders".into()),
+            Value::Varchar("o_custkey".into()),
+            Value::Varchar("c_custkey".into()),
+        ]]
+    );
+}
+
+#[test]
+fn a_checkpoint_builds_a_key_map_over_the_parent_of_every_declared_relationship() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-graph-checkpoint-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let declaration = "SET graph_links = 'orders(o_custkey) -> customer(c_custkey)'";
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("CREATE TABLE customer (c_custkey INTEGER, c_name VARCHAR)").unwrap();
+    db.execute("CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER)").unwrap();
+    db.execute("INSERT INTO customer SELECT i, 'c' || i FROM range(1, 4001) AS r(i)").unwrap();
+    db.execute("INSERT INTO orders SELECT i, 1 + i % 4000 FROM range(1, 10001) AS r(i)").unwrap();
+    db.execute(declaration).unwrap();
+    db.execute("CHECKPOINT").unwrap();
+
+    let built = rows(&db, "SELECT cardinality, key_map, key_map_bytes > 0, note FROM rudb_links()");
+    assert_eq!(
+        built,
+        vec![vec![
+            Value::Varchar("at most one".into()),
+            Value::Varchar("identity".into()),
+            Value::Boolean(true),
+            Value::Null,
+        ]],
+        "a distinct ascending key column maps by subtraction and the declaration is now a \
+         measurement"
+    );
+    // The queries the declaration was made for are the ones that have to keep their answers.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey"),
+        vec![vec![Value::BigInt(10000)]]
+    );
+    drop(db);
+
+    // A reader that opens the file again finds the sections, and one that never heard of the
+    // setting finds the same rows: section 3.1 says the sections change the time and not the
+    // answer.
+    let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    assert_eq!(
+        rows(&reopened, "SELECT count(*), max(c_custkey) FROM customer"),
+        vec![vec![Value::BigInt(4000), Value::Integer(4000)]]
+    );
+    assert!(
+        rows(&reopened, "SELECT name FROM rudb_links()").is_empty(),
+        "a declaration is a session's and not the file's"
+    );
+    reopened.execute(declaration).unwrap();
+    assert_eq!(
+        rows(&reopened, "SELECT key_map FROM rudb_links()"),
+        vec![vec![Value::Varchar("identity".into())]],
+        "and the map that was built is read back without being built again"
+    );
+    drop(reopened);
+    std::fs::remove_file(path).expect("the temporary native database is removed");
+}
+
+#[test]
 fn a_seam_is_set_and_read_back_through_the_statement_everything_else_goes_through() {
     let db = Database::new();
     assert_eq!(db.setting("seam.hash.table").unwrap(), "default");

@@ -224,6 +224,7 @@ dependencies = [
  "rudb-common",
  "rudb-exec",
  "rudb-functions",
+ "rudb-graph",
  "rudb-io",
  "rudb-kernels",
  "rudb-metrics",
@@ -350,6 +351,7 @@ dependencies = [
  "rudb-csv",
  "rudb-encoding",
  "rudb-functions",
+ "rudb-graph",
  "rudb-io",
  "rudb-jit",
  "rudb-kernels",
@@ -386,6 +388,14 @@ dependencies = [
  "rudb-parquet",
  "rudb-parse",
  "rudb-vector",
+]
+
+[[package]]
+name = "rudb-graph"
+version = "0.3.82"
+dependencies = [
+ "rudb-common",
+ "rudb-encoding",
 ]
 
 [[package]]
@@ -456,6 +466,7 @@ version = "0.4.0"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
+ "rudb-graph",
  "rudb-storage",
  "rudb-vector",
 ]
