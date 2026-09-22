@@ -97,7 +97,22 @@ Two ideas were measured and dropped before the one above. Both looked obviously 
 ## What follows
 
 - An `INTEGER` key behind a filter is 3.33 times behind duckdb and a `BIGINT` key is 3.35. That is now the whole of the remaining gap for every fixed width key, and it is one thing rather than five. The profile of the date key query after this change is `Column::holds` at 21.96 percent, `table::hash` at 16.63, `Vector::signed_at` at 16.42 and `Table::probe_at` at 11.30, which is half the query in the row at a time probe.
-- That probe is row at a time because the table is small. A group by on 2,526 distinct dates is under the eight thousand bucket threshold that sends a table down the one row path, so the batched compare this change added arms to is never reached on it. The threshold was chosen against cache misses, which a small table does not have, but the batched compare also hoists the type dispatch out of the row loop, which a small table does pay for. That is the next measurement.
+- That probe is row at a time because the table is small. A group by on 2,526 distinct dates is under the eight thousand bucket threshold that sends a table down the one row path, so the batched compare this change added arms to is never reached on it. The threshold was chosen against cache misses, which a small table does not have, but the batched compare also hoists the type dispatch out of the row loop, which a small table does pay for.
+
+  Measured by building the same tree with the threshold set to zero, so that every table takes the batch:
+
+  | group by, filtered | threshold | no threshold | duckdb |
+  | --- | --- | --- | --- |
+  | a varchar key | 0.841 | 0.837 | 0.715 |
+  | an integer key | 2.384 | 2.005 | 0.732 |
+  | a bigint key | 3.071 | 2.675 | 0.899 |
+  | a date key | 2.371 | 2.087 | 0.584 |
+  | a decimal key | 2.394 | 2.165 | 0.653 |
+  | q01 | 4.372 | 4.371 | 1.475 |
+  | q03 | 1.772 | 1.777 | 1.114 |
+  | q10 | 2.544 | 2.573 | 1.942 |
+
+  Between 10 and 16 percent on a table of a few thousand groups, and nothing at all on q01, q03 and q10. q01 groups on four rows, which is the shape the threshold was put in for, and it does not move, so the threshold is buying nothing on the query it was written against and costing a sixth on the ones above it. It is not a one line change, because zero is not the answer either and what the threshold should be is a measurement over the whole suite, but it is the largest thing left on a fixed width key.
 - The cell rewrite of q01 stays refuted until a key column costs what an arithmetic column costs.
 
 ## What this note does not claim
