@@ -67,12 +67,21 @@
 //! [`Sketch::add_hash`] returns on a comparison for every value above the threshold, which after the
 //! first few thousand rows is nearly all of them.
 //!
-//! Measured on server2 over a release build, three loads each. ClickBench `hits`, a million rows
-//! of a hundred and five columns, takes about 4.5 seconds wall, of which 2.4 is statistics and 1.8
-//! of that 2.4 is this. TPC-H `lineitem` at scale factor 1, six million rows of sixteen columns,
-//! takes about 3.3 seconds wall, 2.0 statistics and 1.6 of it here. So a distinct count costs
-//! roughly three times what the zone map beside it does, which is about what a hash against two
-//! comparisons should cost, and both together are around half the load.
+//! Measured on server2 over a release build, three loads each, back when the sketch was the only
+//! counter on this pass. ClickBench `hits`, a million rows of a hundred and five columns, takes
+//! about 4.5 seconds wall, of which 2.4 is statistics and 1.8 of that 2.4 is this. TPC-H
+//! `lineitem` at scale factor 1, six million rows of sixteen columns, takes about 3.3 seconds
+//! wall, 2.0 statistics and 1.6 of it here. So a distinct count costs roughly three times what the
+//! zone map beside it does, which is about what a hash against two comparisons should cost, and
+//! both together are around half the load.
+//!
+//! The tally moved work between the two counters rather than adding a third, so those totals still
+//! stand and the split inside the second of them no longer does: a column the tally is counting is
+//! a column the sketch never sees, and most columns of both these tables are that kind. What was
+//! measured after the tally went in is the total, on four million rows of forty columns with
+//! nothing else running on the machine: 3.75 seconds against 3.85 for columns of two to forty one
+//! values, and 4.27 against 4.41 for columns of a million. The per counter split on `hits` has not
+//! been taken again.
 //!
 //! The memory is 128 KB a column at the default k, so a hundred and five column table like
 //! ClickBench `hits` holds 13 MB of sketch. That is the price of the whole table's statistics and
