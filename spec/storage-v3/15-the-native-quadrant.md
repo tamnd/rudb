@@ -22,7 +22,7 @@ A single pass on this machine does not measure the engine. Every per-query numbe
 
 | | rudb | DuckDB |
 | --- | ---: | ---: |
-| 43-query suite | see the table below | 244.12 s |
+| 43-query suite | 116.63 s and 190.11 s, two passes | 244.12 s |
 | peak resident, queries | 4.2 GiB | 8.62 GiB |
 | file bytes | 11,232,108,477 | 20,435,972,096 |
 | load wall | 1372.10 s | 395.21 s |
@@ -61,6 +61,12 @@ Strip out the two sub-second entries and what is left is `COUNT(DISTINCT UserID)
 
 The replication below decides how far behind. The shape is already decided: rudb's remaining deficit at benchmark scale is a grouping and distinct-set problem, and nothing else in the suite is close.
 
-## Replication
+## Replication, and what this host can and cannot support
 
-Three passes per engine over one loaded database, with the host's load average recorded at the start of each. Pending.
+The three-pass replication described above was set up and started, and it has not produced usable medians, because the machine is shared and went to a load average of 34 on 32 cores partway through the first pass while other people were compiling. A pass that took twelve minutes on a quiet host took over half an hour. Timing data collected under that is measuring the neighbours.
+
+This is recorded rather than worked around because it bounds what the whole series may claim. On this host, a per-query wall time is good to about a factor of three unless it is replicated in a quiet window, and no document here should quote one to two significant figures again. The measurements in this document that are quoted precisely are the ones that do not depend on timing at all: file bytes, row counts, peak resident set, and which engine wins a query by more than 3x.
+
+The three claims in the section above survive that bound with room to spare, because they are factors of seventy and upward against a threefold error bar. The claim about how far rudb is behind on O1 does not, and is deliberately left as a shape rather than a number.
+
+What is needed to close it is not a better analysis. It is one pass of the four quadrants on a machine nobody else is using, and until that exists the honest form of rudb's standing against DuckDB in the native quadrant is: ahead on the suite total in both passes, ahead on memory by 2x, ahead on file size by 1.82x, behind on load by 3.47x, and behind on high-cardinality grouping by an amount this host cannot yet resolve.
