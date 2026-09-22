@@ -769,6 +769,18 @@ mod tests {
         path
     }
 
+    /// Every value of the one column, in rid order, which is what a scan of this table answers.
+    fn rows_of(reader: &Reader) -> Vec<Value> {
+        let mut out = Vec::new();
+        for part in 0..reader.parts() {
+            let chunk = reader.read(part, &[0]).expect("a part reads back");
+            for row in 0..chunk.len() {
+                out.push(chunk.value_at(0, row));
+            }
+        }
+        out
+    }
+
     fn reopen(path: &PathBuf) -> Reader {
         Catalog::open(path).expect("reopen").table("t").expect("the table")
     }
@@ -920,6 +932,49 @@ mod tests {
 
         drop(reader);
         fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_file_from_before_the_section_table_opens_and_every_statistic_is_unknown() {
+        // Exit criterion 3 of #762, the statistics half of it. A build that knows about summaries
+        // opens a file written by a build that did not, with no rewrite and no repair, states
+        // nothing about that file's columns, and reads back exactly what the same rows read back
+        // out of a file this build wrote.
+        //
+        // `None` is what `Unknown` is at this layer, and the two readers answer it for every reason
+        // there is rather than distinguishing them, which is section 3.1: there is nothing a caller
+        // could do differently on hearing *the file predates statistics* rather than *the section
+        // does not checksum*, because both are answered by planning the query the way it was
+        // planned before statistics existed.
+        //
+        // The older file is this build's file with the version stamped back and nothing attached,
+        // for the reason the format 22 test in `lib.rs` gives: the two formats differ only in a
+        // trailing directory block, so a file that never had one is a format 22 file already and
+        // the stamp is the only thing left to change. No fixture to go stale and no second encoder
+        // to drift.
+        let values = (1..=3000_i64).map(Some).collect::<Vec<_>>();
+        let current = table_of("with_sections", &values);
+        let older = table_of("before_sections", &values);
+        build_stats(&current, "t", &[0]).expect("this build states what its columns hold");
+
+        let file = fs::OpenOptions::new().write(true).open(&older).expect("reopen to patch");
+        crate::write_at(&file, 8, &22_u32.to_le_bytes()).expect("stamp the older format");
+        drop(file);
+
+        let new = reopen(&current);
+        assert!(summary(&new, 0).is_some(), "the file this build wrote says what it holds");
+
+        let old = reopen(&older);
+        assert!(old.table().sections().is_empty(), "an older file names no sections");
+        assert!(summary(&old, 0).is_none(), "and so says nothing about its columns");
+        assert!(sketches(&old, 0).is_none());
+        assert!(read_columns(&old).is_empty(), "nor promotes any of them");
+        assert_eq!(rows_of(&old), rows_of(&new), "and answers what the newer file answers");
+
+        drop(new);
+        drop(old);
+        fs::remove_file(&current).expect("clean up");
+        fs::remove_file(&older).expect("clean up");
     }
 
     #[test]
