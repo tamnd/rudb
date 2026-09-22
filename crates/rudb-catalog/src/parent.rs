@@ -67,7 +67,7 @@ impl Parent {
     /// The whole of one column, or `None` if reading it would go past the budget.
     ///
     /// The type is the caller's because the table's field list is the caller's. Passing the wrong
-    /// one is caught by [`concat`], which refuses pieces that do not agree with it.
+    /// one is caught by [`rudb_vector::concat()`], which refuses pieces that do not agree with it.
     ///
     /// # Errors
     ///
