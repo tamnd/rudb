@@ -375,6 +375,32 @@ pub fn pack_with<T: Packable>(
 ///
 /// As [`unpack_transposed`].
 pub fn unpack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Result<()> {
+    unpack_mapped(input, width, output, T::from_u64)
+}
+
+/// As [`unpack`], putting each value through `value` on the way out.
+///
+/// The caller that wants this is one whose output is not the packed type. Frame of reference coding
+/// stores offsets from a base and hands back the base plus the offset, and a decode that unpacks
+/// into a buffer of offsets and then walks that buffer adding the base writes every value twice and
+/// reads it once in between. There is nowhere for the second pass to hide: the buffer is 8 KB, a
+/// chunk is about one unit, and a scan reads a chunk per part per column, so the pass is the same
+/// order of work as the unpacking it follows.
+///
+/// The mapping belongs at the store rather than after it because that is the one place the value is
+/// already in a register. Both loops below end in a store, so `value` is applied to something
+/// nothing else has to load again, and for the identity it compiles to what [`unpack`] compiled to
+/// before this existed.
+///
+/// # Errors
+///
+/// As [`unpack_transposed`].
+pub fn unpack_mapped<T: Packable, U: Copy>(
+    input: &[T],
+    width: usize,
+    output: &mut [U],
+    value: impl Fn(u64) -> U,
+) -> Result<()> {
     check_width::<T>(width)?;
     check_vector_len(output.len(), "output")?;
     if input.len() != packed_len::<T>(width) {
@@ -385,7 +411,7 @@ pub fn unpack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Resul
         )));
     }
     if width == 0 {
-        output.fill(T::from_u64(0));
+        output.fill(value(0));
         return Ok(());
     }
 
@@ -403,7 +429,7 @@ pub fn unpack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Resul
         let into = &mut output[base..base + lanes];
         if shift + width <= T::WIDTH {
             for lane in 0..lanes {
-                into[lane] = T::from_u64((low[lane].to_u64() >> shift) & mask);
+                into[lane] = value((low[lane].to_u64() >> shift) & mask);
             }
         } else {
             // The value straddles two words, so `shift` is above zero, the carry in from the word
@@ -413,8 +439,8 @@ pub fn unpack<T: Packable>(input: &[T], width: usize, output: &mut [T]) -> Resul
             let carried = T::WIDTH - shift;
             let high = &input[(word + 1) * lanes..(word + 2) * lanes];
             for lane in 0..lanes {
-                let value = (low[lane].to_u64() >> shift) | (high[lane].to_u64() << carried);
-                into[lane] = T::from_u64(value & mask);
+                let bits = (low[lane].to_u64() >> shift) | (high[lane].to_u64() << carried);
+                into[lane] = value(bits & mask);
             }
         }
     }
@@ -517,9 +543,36 @@ pub fn pack_linear(values: &[u64], width: usize, output: &mut Vec<u8>) -> Result
 /// If `count` is not below [`VALUES`], if `width` exceeds 64, or if the input is shorter than
 /// [`tail_len`].
 pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>> {
+    // Ahead of the buffer, so that a count off a corrupt file is refused rather than allocated for.
+    check_tail(count, width)?;
+    let mut values = vec![0u64; count];
+    unpack_tail_into(input, width, &mut values, |bits| bits)?;
+    Ok(values)
+}
+
+/// As [`unpack_tail`], into a buffer the caller owns and through a mapping on the way out.
+///
+/// How many values to read is `output.len()`. This is the form the decoders want and
+/// [`unpack_tail`] is now a wrapper over it, because a cascade calls this once per chunk and a scan
+/// reads a chunk per part per column: returning a fresh `Vec` is an allocation per chunk, and
+/// handing back raw offsets for the caller to add a base to in a second pass is a second write of
+/// every value. Both of those are per value costs wearing the clothes of a per call one. See
+/// [`unpack_mapped`] for why the mapping goes at the store.
+///
+/// # Errors
+///
+/// As [`unpack_tail`].
+pub fn unpack_tail_into<U: Copy>(
+    input: &[u8],
+    width: usize,
+    output: &mut [U],
+    value: impl Fn(u64) -> U,
+) -> Result<()> {
+    let count = output.len();
     check_tail(count, width)?;
     if width == 0 {
-        return Ok(vec![0; count]);
+        output.fill(value(0));
+        return Ok(());
     }
     if input.len() < tail_len(count, width) {
         return Err(Error::internal(format!(
@@ -529,7 +582,6 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
         )));
     }
     let mask = u128::from(low_mask(width));
-    let mut values = Vec::with_capacity(count);
     let read = |window: u128, bit: usize| ((window >> bit) & mask) as u64;
     // A buffer shorter than a window is one load for the whole call, because everything it holds is
     // inside it. Short arrays are most of what a cascade stores, so this is the common case by
@@ -538,10 +590,10 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
         let mut window = [0u8; WINDOW];
         window[..input.len()].copy_from_slice(input);
         let word = u128::from_le_bytes(window);
-        for index in 0..count {
-            values.push(read(word, index * width));
+        for (index, slot) in output.iter_mut().enumerate() {
+            *slot = value(read(word, index * width));
         }
-        return Ok(values);
+        return Ok(());
     }
     // Otherwise a value is read where it lies, until the window would run off the end.
     let whole = (((input.len() - WINDOW) * 8) / width + 1).min(count);
@@ -551,17 +603,17 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
         // instruction each where a 128 bit shift is three, and every real width is down here: the
         // offsets a text block carries are seventeen bits and a dictionary code is fewer.
         let mask = low_mask(width);
-        for index in 0..whole {
+        for (index, slot) in output[..whole].iter_mut().enumerate() {
             let bit = index * width;
             let word = word_at(input, bit / 8);
-            values.push((word >> (bit % 8)) & mask);
+            *slot = value((word >> (bit % 8)) & mask);
         }
     } else {
-        for index in 0..whole {
+        for (index, slot) in output[..whole].iter_mut().enumerate() {
             let bit = index * width;
             let mut window = [0u8; WINDOW];
             window.copy_from_slice(&input[bit / 8..bit / 8 + WINDOW]);
-            values.push(read(u128::from_le_bytes(window), bit % 8));
+            *slot = value(read(u128::from_le_bytes(window), bit % 8));
         }
     }
     if whole < count {
@@ -572,11 +624,11 @@ pub fn unpack_tail(input: &[u8], width: usize, count: usize) -> Result<Vec<u64>>
         let mut window = [0u8; WINDOW];
         window.copy_from_slice(&input[base..]);
         let word = u128::from_le_bytes(window);
-        for index in whole..count {
-            values.push(read(word, index * width - base * 8));
+        for (offset, slot) in output[whole..].iter_mut().enumerate() {
+            *slot = value(read(word, (whole + offset) * width - base * 8));
         }
     }
-    Ok(values)
+    Ok(())
 }
 
 /// One value of a run written by [`pack_tail`], read where it lies.
@@ -810,6 +862,62 @@ mod tests {
         agree::<u16>();
         agree::<u32>();
         agree::<u64>();
+    }
+
+    #[test]
+    fn a_mapped_unpack_gives_what_unpacking_and_then_mapping_gives() {
+        // The frame of reference decode is the caller, so the mapping under test is the one it
+        // uses: a signed base added to an unsigned offset, into an output of a different type from
+        // the packed words. Checked at every width because the two inner loops of `unpack_mapped`
+        // split on whether a value straddles two words, and which one runs depends on the width.
+        for width in 0..=64 {
+            let values = sample::<u64>(width);
+            let mut packed = vec![0u64; packed_len::<u64>(width)];
+            pack(&values, width, &mut packed).unwrap();
+
+            let base = -7i64;
+            let mut mapped = vec![0i64; VALUES];
+            unpack_mapped(&packed, width, &mut mapped, |offset| {
+                (i128::from(base) + i128::from(offset)) as i64
+            })
+            .unwrap();
+
+            let mut plain = vec![0u64; VALUES];
+            unpack(&packed, width, &mut plain).unwrap();
+            let expected: Vec<i64> = plain
+                .iter()
+                .map(|offset| (i128::from(base) + i128::from(*offset)) as i64)
+                .collect();
+            assert_eq!(mapped, expected, "at {width} bits");
+        }
+    }
+
+    #[test]
+    fn a_mapped_tail_gives_what_unpacking_the_tail_and_then_mapping_gives() {
+        // Every length, because `unpack_tail_into` has three paths through it and which one a call
+        // takes depends on how many bytes the run came to: everything inside one window, a walk
+        // that stops a window short of the end, and the leftovers after that walk.
+        for width in [0usize, 1, 7, 17, 32, 57, 58, 64] {
+            for count in [1usize, 2, 63, 64, 300, 1023] {
+                let values: Vec<u64> = sample::<u64>(width).into_iter().take(count).collect();
+                let mut packed = Vec::new();
+                pack_tail(&values, width, &mut packed).unwrap();
+
+                let base = 11i64;
+                let mut mapped = vec![0i64; count];
+                unpack_tail_into(&packed, width, &mut mapped, |offset| {
+                    (i128::from(base) + i128::from(offset)) as i64
+                })
+                .unwrap();
+
+                let plain = unpack_tail(&packed, width, count).unwrap();
+                let expected: Vec<i64> = plain
+                    .iter()
+                    .map(|offset| (i128::from(base) + i128::from(*offset)) as i64)
+                    .collect();
+                assert_eq!(mapped, expected, "{count} values at {width} bits");
+            }
+        }
     }
 
     #[test]

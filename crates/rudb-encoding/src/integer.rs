@@ -440,19 +440,23 @@ fn encode_packed(values: &[i64], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// The buffers a decode reuses from one unit of 1024 values to the next.
+/// The buffer a decode reuses from one unit of 1024 values to the next.
 ///
-/// Every one of these used to be allocated inside the loop, and because they were allocated with a
-/// value rather than grown, the allocator zeroed them and then the decode overwrote every byte. In a
-/// ClickBench profile that zeroing was the single largest item, ahead of the unpacking it was making
-/// room for, because a scan pays it once per 1024 rows of every packed integer column it reads.
+/// This used to be allocated inside the loop, and because it was allocated with a value rather than
+/// grown, the allocator zeroed it and then the decode overwrote every byte. In a ClickBench profile
+/// that zeroing was the single largest item, ahead of the unpacking it was making room for, because
+/// a scan pays it once per 1024 rows of every packed integer column it reads.
 ///
 /// It is threaded through the recursion rather than made per call because a chunk is a cascade. A
 /// dictionary of deltas is three nested decodes, and each of them would otherwise make its own.
 ///
-/// Both start empty and are grown on the first unit that needs them, to their largest size
-/// rather than to the size that unit wants, so that every unit after the first finds them the right
-/// length already and nothing is zeroed or resized again.
+/// It starts empty and is grown on the first unit that needs it, to its largest size rather than to
+/// the size that unit wants, so that every unit after the first finds it the right length already
+/// and nothing is zeroed or resized again.
+///
+/// There used to be a second buffer here holding one unit of unpacked offsets, which the decode
+/// then walked to add the frame of reference base back on. The unpackers take the base now and
+/// write into the chunk directly, so that buffer and the pass over it are both gone.
 ///
 /// It lives on the thread rather than in the caller, which is worth saying why. A chunk is a row
 /// group, and a row group in the native format is about a thousand rows, which is one unit. So there
@@ -466,8 +470,6 @@ struct Decoding {
     /// The packed words of one unit, as read off the wire. Held at the width 64 length, which is the
     /// largest a unit can be, so a narrower unit uses the front of it.
     packed: Vec<u64>,
-    /// One unit of unpacked offsets, before the base is added back.
-    unit: Vec<u64>,
 }
 
 thread_local! {
@@ -490,15 +492,14 @@ fn with_decoding<T>(run: impl FnOnce(&mut Decoding) -> T) -> T {
 }
 
 impl Decoding {
-    /// Buffers that have not made room for anything yet.
+    /// A buffer that has not made room for anything yet.
     const fn new() -> Self {
-        Self { packed: Vec::new(), unit: Vec::new() }
+        Self { packed: Vec::new() }
     }
 
     /// Makes room for one unit. A no op every time after the first.
     fn ready(&mut self) {
-        if self.unit.len() != VALUES {
-            self.unit.resize(VALUES, 0);
+        if self.packed.len() != bitpack::packed_len::<u64>(64) {
             self.packed.resize(bitpack::packed_len::<u64>(64), 0);
         }
     }
@@ -510,24 +511,32 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
     match kind {
         Kind::Constant => Ok(vec![reader.i64()?; count]),
         Kind::Packed => {
-            let mut values = Vec::with_capacity(count);
+            // One buffer for the chunk, and every value written into it once. Both unpackers take
+            // the frame of reference base and put the value it belongs to where it goes, so there
+            // is no unit of raw offsets in between and no second pass to fold the base back in.
+            let mut values = vec![0i64; count];
             scratch.ready();
-            while values.len() < count {
+            let mut done = 0;
+            while done < count {
                 let base = reader.i64()?;
                 let width = reader.u8()? as usize;
-                let wanted = (count - values.len()).min(VALUES);
+                let wanted = (count - done).min(VALUES);
+                let into = &mut values[done..done + wanted];
                 if wanted == VALUES {
                     let words = bitpack::packed_len::<u64>(width);
                     for word in &mut scratch.packed[..words] {
                         *word = reader.u64()?;
                     }
-                    bitpack::unpack(&scratch.packed[..words], width, &mut scratch.unit)?;
-                    values.extend(scratch.unit.iter().map(|offset| value_from(*offset, base)));
+                    bitpack::unpack_mapped(&scratch.packed[..words], width, into, |offset| {
+                        value_from(offset, base)
+                    })?;
                 } else {
                     let bytes = reader.bytes(bitpack::tail_len(wanted, width))?;
-                    let unit = bitpack::unpack_tail(bytes, width, wanted)?;
-                    values.extend(unit.iter().map(|offset| value_from(*offset, base)));
+                    bitpack::unpack_tail_into(bytes, width, into, |offset| {
+                        value_from(offset, base)
+                    })?;
                 }
+                done += wanted;
             }
             Ok(values)
         }
