@@ -656,6 +656,15 @@ mod tests {
         std::env::temp_dir().join(format!("rudb-graph-{label}-{}-{stamp}.rdb", std::process::id()))
     }
 
+    /// The graph sections of a table, which is every section this module could have written.
+    ///
+    /// A table carries a summary and a sketch per column out of the write itself now, and a test
+    /// about key maps is not about those. Filtering by kind rather than subtracting a count, so a
+    /// table whose summaries did not fit the budget does not quietly change what is asserted.
+    fn graph_sections(reader: &Reader) -> Vec<&section::Section> {
+        reader.table().sections().iter().filter(|held| held.among(section::GRAPH_KINDS)).collect()
+    }
+
     /// A one column table of these keys, written a thousand rows to a part.
     fn table_of(label: &str, keys: &[Option<i64>]) -> PathBuf {
         let path = path(label);
@@ -775,7 +784,7 @@ mod tests {
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
         assert!(key_map(&reader, 0).is_none(), "nothing was written to read back");
-        assert!(reader.table().sections().is_empty());
+        assert!(graph_sections(&reader).is_empty());
 
         fs::remove_file(&path).expect("clean up");
     }
@@ -804,12 +813,8 @@ mod tests {
         drop(reader);
 
         // And a map stamped against a generation this table is not at is dropped rather than used.
-        let mut entry = Catalog::open(&path)
-            .expect("reopen")
-            .table("parent")
-            .expect("the table")
-            .table()
-            .sections()[0];
+        let held = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
+        let mut entry = *graph_sections(&held).first().copied().expect("the key map");
         assert!(entry.usable(generation));
         entry.generation = generation + 1;
         assert!(!entry.usable(generation), "a rewrite invalidates rather than corrupts");
@@ -825,7 +830,7 @@ mod tests {
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
         let extent = reader
-            .extents(&reader.table().sections()[0])
+            .extents(graph_sections(&reader).first().copied().expect("the key map"))
             .expect("extent table")
             .first()
             .copied()
@@ -891,7 +896,7 @@ mod tests {
         assert_eq!(built[1].form, Form::Dense);
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
-        assert_eq!(reader.table().sections().len(), 2, "one commit and two entries");
+        assert_eq!(graph_sections(&reader).len(), 2, "one commit and two entries");
         assert_eq!(key_map(&reader, 0).expect("the id map").form(), Form::Identity);
         assert_eq!(key_map(&reader, 1).expect("the code map").form(), Form::Dense);
         assert_eq!(
@@ -944,7 +949,7 @@ mod tests {
         assert!(built[0].bytes as u64 > built[0].column_bytes, "{built:?}");
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
-        assert!(reader.table().sections().is_empty(), "and nothing was written");
+        assert!(graph_sections(&reader).is_empty(), "and nothing was written");
         assert!(key_map(&reader, 0).is_none());
         drop(reader);
 
