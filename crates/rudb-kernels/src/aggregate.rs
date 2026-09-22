@@ -549,9 +549,11 @@ impl Accumulator {
         {
             *scale = *held;
         }
+        // Every arm that adds something up asks what the column is first. See [`addable`] for why
+        // that is not the free check it looks like.
         let want = match (&self.state, input.logical_type()) {
-            (State::Whole { .. }, _) => Want::Whole,
-            (State::Real { total, .. }, ty) => {
+            (State::Whole { .. }, ty) if ty.is_integer() => Want::Whole,
+            (State::Real { total, .. }, ty) if addable(ty) => {
                 Want::Real { scale: decimal_scale(ty), from: *total }
             }
             // An exact mean over an integer or a decimal column is read the way a sum is and
@@ -565,7 +567,7 @@ impl Accumulator {
             }
             // The scale is zero whatever the column is, because the total a mean carries is already
             // in the units the column stores, and moving the point is the finish's job.
-            (State::Mean { total, exact, .. }, _) => {
+            (State::Mean { total, exact, .. }, ty) if addable(ty) => {
                 let from = if *exact { exactly(*total) } else { mean_real(*total) };
                 Want::Real { scale: 0, from }
             }
@@ -580,9 +582,10 @@ impl Accumulator {
             {
                 Want::Whole
             }
-            (State::Scaled { .. }, _) => return Ok(false),
             (State::Extreme { .. }, _) => Want::Extreme(least),
-            (State::Counted { .. }, _) => return Ok(false),
+            // A scale that does not match, a count, and any total over a column that is not a
+            // number. All three go to the row at a time loop, which is right about them.
+            _ => return Ok(false),
         };
         let Some(contribution) = gather(input, rows, &nulls, want) else {
             return Ok(false);
@@ -1066,7 +1069,9 @@ pub fn update_scattered(
         State::Extreme { least, .. } => Some(least),
         _ => None,
     };
-    let into = Where { slots, stride, offset };
+    // Cut to the rows there are, so that the loops below index it without a check of their own.
+    // The length was compared against `rows` just above, which is the one place it has to be.
+    let into = Where { slots: &slots[..rows], stride, offset };
     // `count(*)` reads nothing, so it never asks for the argument it does not have.
     if kind == Kind::CountStar {
         for row in 0..rows {
@@ -1436,7 +1441,14 @@ enum Feed {
 fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
     match (&first.state, ty) {
         (State::Counted { .. }, _) => Some(Feed::Counted),
-        (State::Whole { .. }, _) => Some(Feed::Total),
+        // A whole total adds the integers of an integer column. The type is asked about rather
+        // than taken for granted because a date and a timestamp are stored as integers too, and
+        // summing one of those is not a thing you can do: the row at a time path says `summing a
+        // DATE` and declines, so a loop that quietly added the days up would be answering a
+        // question the engine has already refused. Anything this arm turns down goes down that
+        // path and gets the same refusal.
+        (State::Whole { .. }, ty) if ty.is_integer() => Some(Feed::Total),
+        (State::Whole { .. }, _) => None,
         (State::Scaled { scale, .. }, LogicalType::Decimal { scale: held, .. })
             if held == scale =>
         {
@@ -1451,20 +1463,69 @@ fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
         }
         // A mean whose column is a float carries its total in that column's own units, which is
         // why the scale here is the column's and is zero for everything that reaches this arm.
-        (State::Mean { .. } | State::Real { .. }, ty) => {
+        (State::Mean { .. } | State::Real { .. }, ty) if addable(ty) => {
             Some(Feed::Real { scale: decimal_scale(ty) })
         }
+        (State::Mean { .. } | State::Real { .. }, _) => None,
         // A number is compared as a number and anything else is compared the way the comparison
         // kernel says, which a run of `i128` cannot do for a float, a string or a date. A decimal
         // is here too because every row of one column holds the same scale, so the unscaled
         // integers order the way the numbers do. That is q02's grouped `min` over `DECIMAL(15, 2)`.
+        // A date, a time and a timestamp are here for the same reason a decimal is. Each one is a
+        // single signed integer of a single unit and each one orders the way that integer does, so
+        // the loop that compares a run of `i128` answers them exactly as it answers an `INTEGER`.
+        // They were left out at first and the cost of leaving them out was not small: a grouped
+        // `min` over `l_shipdate` came to 776 instructions a row against 90 for the same `min` over
+        // an `INTEGER`, because the type fell through to the path that builds a `Value` per row.
+        // See [`../../../spec/perf/15-what-a-row-costs.md`].
         (State::Extreme { .. }, ty)
-            if ty.is_integer() || matches!(ty, LogicalType::Decimal { .. }) =>
+            if ty.is_integer()
+                || matches!(
+                    ty,
+                    LogicalType::Decimal { .. }
+                        | LogicalType::Date
+                        | LogicalType::Time
+                        | LogicalType::Timestamp
+                ) =>
         {
             Some(Feed::Extreme(first.kind() == Kind::Min))
         }
         (State::Extreme { .. }, _) => None,
     }
+}
+
+/// Runs a body for every row of a chunk that is not null, with the null question settled before
+/// the loop starts rather than asked again on every row.
+///
+/// This is loop unswitching, written out rather than left to the compiler because the compiler did
+/// not do it. The loops below all started as `if !nulls.at(row) { continue }`, and `Live::at` is
+/// three lines and `#[inline]`, so it reads like nothing. What it came to on q01 was twelve of the
+/// forty five instructions the scatter spent per row: the validity's own discriminant read twice, a
+/// load of the bitmap's pointer out of the `Vec` behind it, and a bounds check of the word, all of
+/// them per row and none of them changing from one row to the next. See
+/// [`../../../spec/perf/15-what-a-row-costs.md`].
+///
+/// The three arms are the three shapes a validity has. Nothing folds when everything is null, so
+/// that arm is empty. Nothing is checked when nothing is null, so that arm is the bare loop. The
+/// third takes the words once and indexes them, and cuts the row count to the rows the words cover
+/// because a row past the end of a bitmap is not there and reads as invalid, which is the one thing
+/// [`rudb_vector::Bitmap::get`] does that indexing does not.
+macro_rules! live_rows {
+    ($nulls:expr, $rows:expr, |$row:ident| $body:block) => {
+        match $nulls {
+            Live::None => {}
+            Live::All => {
+                for $row in 0..$rows $body
+            }
+            Live::Mask(mask) => {
+                let words = mask.words();
+                let covered = $rows.min(words.len().saturating_mul(u64::BITS as usize));
+                for $row in 0..covered {
+                    if words[$row / 64] >> ($row % 64) & 1 == 1 $body
+                }
+            }
+        }
+    };
 }
 
 /// One pass over a vector, folding each row into the accumulator it belongs to.
@@ -1479,15 +1540,12 @@ fn spread(
     // Both counts are answered by the mask on its own, whatever the form and whatever the type, so
     // they come back before there is any question of which loop to run.
     if matches!(feed, Feed::Counted) {
-        for row in 0..rows {
-            if !nulls.at(row) {
-                continue;
-            }
+        live_rows!(nulls, rows, |row| {
             let Some(index) = into.index(row) else { continue };
             if let State::Counted { count, .. } = &mut states[index].state {
                 *count += 1;
             }
-        }
+        });
         return Ok(true);
     }
     match input.form() {
@@ -1504,6 +1562,9 @@ fn spread(
             if codes.len() < rows {
                 return Ok(false);
             }
+            // Cut to the rows there are, for the reason `update_scattered` cuts the slots: the
+            // gather below reads this once per row and the length is the same every time.
+            let codes = &codes[..rows];
             let Some(data) = values.data() else {
                 // A dictionary whose values are a packed run, which is the form a stored column of
                 // numbers with few distinct values in it arrives in, and the form every decimal of
@@ -1578,10 +1639,7 @@ fn total_into<M: Fn(usize) -> usize>(
             match run.data {
                 $(Data::$variant(values) => {
                     let values = values.as_slice();
-                    for row in 0..run.rows {
-                        if !run.nulls.at(row) {
-                            continue;
-                        }
+                    live_rows!(run.nulls, run.rows, |row| {
                         let Some(index) = into.index(row) else { continue };
                         let (State::Whole { total, seen, .. }
                             | State::Scaled { total, seen, .. }) = &mut states[index].state
@@ -1592,7 +1650,7 @@ fn total_into<M: Fn(usize) -> usize>(
                             .checked_add(i128::from(values[at(row)]))
                             .ok_or_else(overflowed)?;
                         *seen = true;
-                    }
+                    });
                 })+
                 // The same width `mean_into` leaves, for the same reason it leaves it.
                 _ => return Ok(false),
@@ -1626,10 +1684,7 @@ fn mean_into<M: Fn(usize) -> usize>(
             match run.data {
                 $(Data::$variant(values) => {
                     let values = values.as_slice();
-                    for row in 0..run.rows {
-                        if !run.nulls.at(row) {
-                            continue;
-                        }
+                    live_rows!(run.nulls, run.rows, |row| {
                         let Some(index) = into.index(row) else { continue };
                         let number = i128::from(values[at(row)]);
                         let State::Mean { total, seen, exact, scale: held, .. } =
@@ -1643,7 +1698,7 @@ fn mean_into<M: Fn(usize) -> usize>(
                             None => widened(total, exact, number),
                         }
                         *seen += 1;
-                    }
+                    });
                 })+
                 // A value wider than an `i128` can hold has no exact accumulator here, so it goes
                 // the row at a time way, which reports what it cannot add.
@@ -1692,10 +1747,7 @@ fn packed_into<M: Fn(usize) -> usize>(
             if wide {
                 return Ok(false);
             }
-            for row in 0..rows {
-                if !nulls.at(row) {
-                    continue;
-                }
+            live_rows!(nulls, rows, |row| {
                 let Some(index) = into.index(row) else { continue };
                 let (State::Whole { total, seen, .. } | State::Scaled { total, seen, .. }) =
                     &mut states[index].state
@@ -1706,7 +1758,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                     .checked_add(base + i128::from(packed.code(at(row))))
                     .ok_or_else(overflowed)?;
                 *seen = true;
-            }
+            });
             Ok(true)
         }
         // The same loop `mean_into` is, and the same reason for it.
@@ -1714,10 +1766,7 @@ fn packed_into<M: Fn(usize) -> usize>(
             if wide {
                 return Ok(false);
             }
-            for row in 0..rows {
-                if !nulls.at(row) {
-                    continue;
-                }
+            live_rows!(nulls, rows, |row| {
                 let Some(index) = into.index(row) else { continue };
                 let number = base + i128::from(packed.code(at(row)));
                 let State::Mean { total, seen, exact, scale: held, .. } = &mut states[index].state
@@ -1730,30 +1779,24 @@ fn packed_into<M: Fn(usize) -> usize>(
                     None => widened(total, exact, number),
                 }
                 *seen += 1;
-            }
+            });
             Ok(true)
         }
         Feed::Real { scale } => {
             let factor = pow10(scale) as f64;
             let scaled = scale != 0;
-            for row in 0..rows {
-                if !nulls.at(row) {
-                    continue;
-                }
+            live_rows!(nulls, rows, |row| {
                 let Some(index) = into.index(row) else { continue };
                 let number = (base + i128::from(packed.code(at(row)))) as f64;
                 fold_real(&mut states[index], if scaled { number / factor } else { number });
-            }
+            });
             Ok(true)
         }
         Feed::Extreme(least) => {
             if wide {
                 return Ok(false);
             }
-            for row in 0..rows {
-                if !nulls.at(row) {
-                    continue;
-                }
+            live_rows!(nulls, rows, |row| {
                 let Some(index) = into.index(row) else { continue };
                 let number = base + i128::from(packed.code(at(row)));
                 let State::Extreme { held, .. } = &mut states[index].state else {
@@ -1772,7 +1815,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                     let value = input.try_value_at(row)?;
                     *held = Some(Box::new(Extremum::Held(value)));
                 }
-            }
+            });
             Ok(true)
         }
     }
@@ -1817,14 +1860,11 @@ fn real_into<M: Fn(usize) -> usize>(
         (@run $values:expr, $convert:expr) => {{
             let values = $values.as_slice();
             let convert = $convert;
-            for row in 0..run.rows {
-                if !run.nulls.at(row) {
-                    continue;
-                }
+            live_rows!(run.nulls, run.rows, |row| {
                 let Some(index) = into.index(row) else { continue };
                 let number = convert(values[at(row)]);
                 fold_real(&mut states[index], if scaled { number / factor } else { number });
-            }
+            });
         }};
     }
     rudb_vector::for_each_layout!(integer, each);
@@ -1869,10 +1909,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                     // are usually two different groups and there is nothing to reduce before it.
                     // The `Value` below is built on a win rather than on a row, which is the part
                     // that makes this loop worth having over the one it replaced.
-                    for row in 0..run.rows {
-                        if !run.nulls.at(row) {
-                            continue;
-                        }
+                    live_rows!(run.nulls, run.rows, |row| {
                         let Some(index) = into.index(row) else { continue };
                         let number = i128::from(values[at(row)]);
                         let State::Extreme { held, .. } = &mut states[index].state else {
@@ -1894,7 +1931,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                             let value = run.input.try_value_at(row)?;
                             *held = Some(Box::new(Extremum::Held(value)));
                         }
-                    }
+                    });
                 })+
                 _ => return Ok(false),
             }
@@ -1918,6 +1955,10 @@ fn mark(value: &Value, scale: u8) -> Option<i128> {
     match *value {
         Value::Decimal { unscaled, scale: held, .. } if held == scale => Some(unscaled),
         Value::Decimal { .. } => None,
+        // The same three types [`feed_of`] lets through, read as the integer they are stored as.
+        // This is the grouping [`rudb_vector::Vector::signed_at`] already makes for the same reason.
+        Value::Date(days) => Some(i128::from(days)),
+        Value::Time(micros) | Value::Timestamp(micros) => Some(i128::from(micros)),
         _ => integral(value),
     }
 }
@@ -1958,6 +1999,18 @@ fn overflowed() -> Error {
 
 fn overlong() -> Error {
     Error::out_of_range("more rows in one vector than a count can hold".to_string())
+}
+
+/// Whether a column of this type is one the totalling loops can add up.
+///
+/// A number is, and nothing else is. This has to be asked rather than assumed because a date and a
+/// timestamp are held as integers and a loop that dispatches on how the values are stored will
+/// happily add the days of one up. The row at a time path refuses that with `summing a DATE`, so a
+/// vector loop that answered it would be disagreeing with the engine rather than going faster than
+/// it. A string reaches the same place by a different route and is refused the same way.
+fn addable(ty: &LogicalType) -> bool {
+    ty.is_integer()
+        || matches!(ty, LogicalType::Decimal { .. } | LogicalType::Float | LogicalType::Double)
 }
 
 /// The scale a type holds its numbers at, which is zero for everything that is not a decimal.
@@ -2788,6 +2841,11 @@ mod tests {
             LogicalType::Decimal { width, scale } => {
                 Value::Decimal { unscaled: i128::from(number) * 7, width, scale }
             }
+            LogicalType::Date => Value::Date(number as i32),
+            // A time of day is not negative, so this one takes the magnitude rather than the
+            // number, which is the same thing the unsigned types above do.
+            LogicalType::Time => Value::Time(positive as i64),
+            LogicalType::Timestamp => Value::Timestamp(number),
             LogicalType::Varchar => Value::Varchar(format!("w{number}")),
             _ => panic!("no sample for {ty}"),
         }
@@ -2841,6 +2899,11 @@ mod tests {
             LogicalType::decimal(9, 2).expect("a legal decimal"),
             LogicalType::decimal(18, 4).expect("a legal decimal"),
             LogicalType::decimal(30, 6).expect("a legal decimal"),
+            // The three types a `min` and a `max` read as the integer they are stored as. They
+            // were left out when this test was written, and what the gap cost is in [`feed_of`].
+            LogicalType::Date,
+            LogicalType::Time,
+            LogicalType::Timestamp,
             LogicalType::Varchar,
         ];
         for ty in &types {
@@ -3059,6 +3122,11 @@ mod tests {
             LogicalType::decimal(9, 2).expect("a legal decimal"),
             LogicalType::decimal(18, 4).expect("a legal decimal"),
             LogicalType::decimal(30, 6).expect("a legal decimal"),
+            // The same three as above, and this is the test that covers the loop they now take,
+            // since the widening in [`feed_of`] is about the scattered path.
+            LogicalType::Date,
+            LogicalType::Time,
+            LogicalType::Timestamp,
             LogicalType::Varchar,
         ];
         for ty in &types {
@@ -3162,6 +3230,44 @@ mod tests {
         update_scattered(&mut states, &slots, 1, 0, Some(&words), 3).expect("folds them in");
         assert_eq!(states[0].finish().expect("finishes"), Value::Varchar("a".into()));
         assert_eq!(fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat), 0);
+        // A date, a time and a timestamp are each one signed integer of one unit, so the loop that
+        // compares a run of them answers a `min` the same way it answers a `min` over an
+        // `INTEGER`. They were not on this list once and a grouped `min` over `l_shipdate` cost
+        // 776 instructions a row rather than 90 because of it.
+        for (ty, values, least) in [
+            (
+                LogicalType::Date,
+                vec![Value::Date(3), Value::Date(1), Value::Date(2)],
+                Value::Date(2),
+            ),
+            (
+                LogicalType::Time,
+                vec![Value::Time(30), Value::Time(10), Value::Time(20)],
+                Value::Time(20),
+            ),
+            (
+                LogicalType::Timestamp,
+                vec![Value::Timestamp(30), Value::Timestamp(10), Value::Timestamp(20)],
+                Value::Timestamp(20),
+            ),
+        ] {
+            let column = Vector::from_values(ty.clone(), &values).expect("a vector of this type");
+            for name in ["min", "max"] {
+                fallback::reset();
+                let mut states = vec![Accumulator::new(name, &ty).expect("known"); 2];
+                update_scattered(&mut states, &slots, 1, 0, Some(&column), 3)
+                    .expect("folds them in");
+                assert_eq!(
+                    fallback::count(Kernel::Aggregate, Form::Flat, Form::Flat),
+                    0,
+                    "{name} over a {ty} took the row at a time path"
+                );
+            }
+            // Rows nought and two are the group, and the smaller of the two is the third value.
+            let mut states = vec![Accumulator::new("min", &ty).expect("known"); 2];
+            update_scattered(&mut states, &slots, 1, 0, Some(&column), 3).expect("folds them in");
+            assert_eq!(states[0].finish().expect("finishes"), least);
+        }
     }
 
     /// The two forms our own storage hands out for a column of numbers, a packed run and a
