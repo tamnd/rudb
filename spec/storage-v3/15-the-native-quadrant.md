@@ -14,6 +14,8 @@ Same machine, same harness, same 43 unmodified query texts. Each engine loads th
 
 The first attempt had DuckDB's load killed by the OOM killer partway through. It left an empty table, and that table answered all 43 queries in 12.52 seconds without erroring once. A suite total is not evidence that a suite ran, so the load now runs under `SET memory_limit = '12GB'` and the harness refuses to measure a database that does not hold 99,997,497 rows.
 
+Document 17 shows that gate is necessary and not sufficient: a DuckDB copy loaded without the type conversion the published setup performs holds exactly the right rows and agrees with rudb on `SUM(UserID)` to the digit, and still fails eight of the 43 queries in about a tenth of a second each, which a suite total reports as 35 queries of work under 43 queries of label.
+
 The second attempt passed the gate and still could not be trusted, which is the more useful failure. Two rudb passes over the same file with the same binary disagreed by up to 3.3x per query: Q29 measured 60.79 seconds and then 20.58, Q33 measured 34.87 and then 10.47, while Q21 and Q22 moved the other way by a factor of two. The suite total moved from 190.11 seconds to 116.63. This host is shared, and its load average across those windows ranged from 1 to 13.
 
 A single pass on this machine does not measure the engine. The measurement was therefore repeated three times per engine over one loaded database, and the last three sections report those passes, what they establish, and what this host makes unmeasurable. This is the same discipline document 13 imposed about scale, applied to repetition, and it was arrived at the same way: by getting it wrong first.
@@ -33,6 +35,8 @@ Three of those five rows are not timings at all, and are exact.
 rudb's native file is 1.82x smaller than DuckDB's and 0.76x the size of the source Parquet. rudb answers the suite in about half DuckDB's peak resident set, and it answers it 2.09x faster. Six further passes under contention, reported below, put rudb ahead on every one of them by a margin that does not overlap DuckDB's range at all.
 
 rudb's load is the clear deficit and it is not close. It takes 3.47x the wall time and 4.09x the CPU of DuckDB's, and it peaks at 17.58 GiB against 12.31. That last number is the one that matters, because document 01's fourth requirement says a load's working set depends on stripe and writer concurrency and not on table row count. At 1,000,000 rows this load peaked at 1.5 GiB. At 100,000,000 it peaks at 17.58. That is a working set tracking the row count, and requirement 4 is not met at benchmark scale.
+
+**Document 17 makes that last conclusion underdetermined rather than wrong.** The same 30,000,000 row table loaded by `CREATE TABLE AS SELECT` peaks at 20.85 GiB and does not finish, and loaded by `CREATE TABLE` followed by `INSERT INTO ... SELECT` peaks at 4.15 GiB and does, a factor of 5.02 between two spellings of one load. This section does not record which spelling produced the 17.58, and the gap between them is wider than the gap being reasoned about.
 
 ## What it corrects
 
