@@ -50,7 +50,7 @@
 
 use std::cmp::Ordering;
 
-use crate::{LogicalType, Stat, Value};
+use crate::{Error, LogicalType, Result, Stat, Value};
 
 /// The scale a microsecond count sits at, which is what every time and timestamp constant is.
 pub const MICROS: u8 = 6;
@@ -790,6 +790,105 @@ fn measured(tests: &[Test], column: usize, low: f64, high: f64) -> Option<Spread
     (read > 0 && fraction.is_finite()).then_some(Spread { fraction, read })
 }
 
+/// The tag byte that says a bound is absent.
+///
+/// The five tags below are a format commitment and not an implementation detail. They are the bytes
+/// the native directory has written for a zone map's two ends since format 10, so the numbers cannot
+/// be reassigned and a new kind of bound takes the next free one. They are here rather than in the
+/// format because a second writer now needs them: a column summary carries the same two ends, and
+/// two encodings of one type is how the two quietly stop agreeing.
+const ABSENT: u8 = 0;
+const INT: u8 = 1;
+const REAL: u8 = 2;
+const BYTES: u8 = 3;
+const SCALED: u8 = 4;
+
+/// Appends a bound, or the one byte that says there is none.
+///
+/// # Errors
+///
+/// If a byte bound is longer than a `u32` can count, which is a bound nothing could have produced
+/// from a column and which would otherwise be written with a truncated length.
+pub fn put(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
+    match bound {
+        None => out.push(ABSENT),
+        Some(Bound::Int(value)) => {
+            out.push(INT);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Some(Bound::Real(value)) => {
+            out.push(REAL);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Some(Bound::Bytes(value)) => {
+            out.push(BYTES);
+            let length = u32::try_from(value.len())
+                .map_err(|_| Error::invalid_input("a bound longer than four gigabytes"))?;
+            out.extend_from_slice(&length.to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        Some(Bound::Scaled { unscaled, scale }) => {
+            out.push(SCALED);
+            out.extend_from_slice(&unscaled.to_le_bytes());
+            out.push(*scale);
+        }
+    }
+    Ok(())
+}
+
+/// Reads a bound written by [`put`], advancing `at` past it.
+///
+/// # Errors
+///
+/// If the bytes run out part way through one, or if the tag is not one of the five. An unknown tag
+/// is an error rather than a skip because a bound is variable width and there is no way to step over
+/// one whose shape is unknown, which is the reason the tag list is closed while a section kind's is
+/// not.
+pub fn get(bytes: &[u8], at: &mut usize) -> Result<Option<Bound>> {
+    let mut take = |len: usize| -> Result<&[u8]> {
+        let end = at.checked_add(len).ok_or_else(|| torn("a length that overflows"))?;
+        let taken = bytes.get(*at..end).ok_or_else(|| torn("fewer bytes than it names"))?;
+        *at = end;
+        Ok(taken)
+    };
+    let tag = take(1)?[0];
+    Ok(match tag {
+        ABSENT => None,
+        INT => Some(Bound::Int(i128::from_le_bytes(sixteen(take(16)?)?))),
+        REAL => Some(Bound::Real(f64::from_le_bytes(eight(take(8)?)?))),
+        BYTES => {
+            let length = u32::from_le_bytes(four(take(4)?)?) as usize;
+            Some(Bound::Bytes(take(length)?.to_vec()))
+        }
+        SCALED => {
+            let unscaled = i128::from_le_bytes(sixteen(take(16)?)?);
+            Some(Bound::Scaled { unscaled, scale: take(1)?[0] })
+        }
+        _ => return Err(torn(format!("a bound tag of {tag}"))),
+    })
+}
+
+/// The three widths this codec reads, each as an array rather than a slice.
+///
+/// `take` above has already checked the length, so the error arm never runs. It is a `map_err`
+/// rather than an `expect` so that a reader of a torn file cannot be made to panic by any argument
+/// about whether the check above is really airtight.
+fn sixteen(bytes: &[u8]) -> Result<[u8; 16]> {
+    bytes.try_into().map_err(|_| torn("a short field"))
+}
+
+fn eight(bytes: &[u8]) -> Result<[u8; 8]> {
+    bytes.try_into().map_err(|_| torn("a short field"))
+}
+
+fn four(bytes: &[u8]) -> Result<[u8; 4]> {
+    bytes.try_into().map_err(|_| torn("a short field"))
+}
+
+fn torn(what: impl Into<String>) -> Error {
+    Error::invalid_input(format!("a stored bound has {}", what.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
@@ -1208,5 +1307,59 @@ mod tests {
         assert_eq!(upper, Bound::Int(9));
         // Across domains neither moves, because there is no order to move along.
         assert_eq!(Bound::Int(4).smaller(Bound::Bytes(Vec::new())), Bound::Int(4));
+    }
+
+    #[test]
+    fn every_kind_of_bound_survives_being_written_down() {
+        let each = [
+            None,
+            Some(Bound::Int(i128::MIN)),
+            Some(Bound::Int(i128::MAX)),
+            Some(Bound::Real(-0.5)),
+            Some(Bound::Bytes(Vec::new())),
+            Some(Bound::Bytes(b"lineitem".to_vec())),
+            Some(Bound::Scaled { unscaled: -1234, scale: 2 }),
+        ];
+        for bound in each {
+            let mut bytes = Vec::new();
+            super::put(&mut bytes, bound.as_ref()).expect("put");
+            let mut at = 0;
+            assert_eq!(super::get(&bytes, &mut at).expect("get"), bound);
+            assert_eq!(at, bytes.len(), "the reader stops where the writer stopped");
+        }
+    }
+
+    #[test]
+    fn several_bounds_in_a_row_read_back_in_order() {
+        // The reason `get` advances a cursor rather than taking a slice. Everything that writes
+        // bounds writes more than one of them, and a bound is variable width, so the only way to
+        // find the second is to have finished reading the first.
+        let each =
+            [Some(Bound::Bytes(b"a".to_vec())), None, Some(Bound::Int(7)), Some(Bound::Real(1.5))];
+        let mut bytes = Vec::new();
+        for bound in &each {
+            super::put(&mut bytes, bound.as_ref()).expect("put");
+        }
+        let mut at = 0;
+        for bound in &each {
+            assert_eq!(super::get(&bytes, &mut at).expect("get"), *bound);
+        }
+        assert_eq!(at, bytes.len());
+    }
+
+    #[test]
+    fn a_truncated_bound_is_refused_rather_than_read_past() {
+        let mut bytes = Vec::new();
+        super::put(&mut bytes, Some(&Bound::Bytes(b"lineitem".to_vec()))).expect("put");
+        for short in 0..bytes.len() {
+            let mut at = 0;
+            assert!(super::get(&bytes[..short], &mut at).is_err(), "{short} bytes");
+        }
+    }
+
+    #[test]
+    fn an_unknown_tag_is_an_error_because_a_bound_cannot_be_stepped_over() {
+        let mut at = 0;
+        assert!(super::get(&[9], &mut at).is_err());
     }
 }
