@@ -45,6 +45,13 @@ rudb-pipeline = 4
 # Storage and the format readers. None of these depends on the execution engine, which is what
 # keeps each of them usable and testable on its own.
 rudb-storage = 5
+# The graph layer's structures, per spec/graph/02-the-data-model.md. Rank 5 because a row id, a key
+# map and a relationship are facts about a table's own columns and nothing else: this crate knows
+# what a `rid` is and how to turn a key into one, and it deliberately does not know what a file, a
+# page or a plan is. `rudb-native` at rank 6 is what puts a key map on disk, which is the right way
+# round. A key map that could see the format would be a key map that could only be tested through
+# one.
+rudb-graph = 5
 rudb-native = 6
 rudb-arrow = 5
 rudb-csv = 5

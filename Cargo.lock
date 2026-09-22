@@ -389,6 +389,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-graph"
+version = "0.3.81"
+dependencies = [
+ "rudb-common",
+ "rudb-encoding",
+]
+
+[[package]]
 name = "rudb-iceberg"
 version = "0.4.0"
 dependencies = [
