@@ -5775,6 +5775,54 @@ fn a_join_no_lookup_answers_says_so_in_the_profile() {
     );
 }
 
+/// A join is the one operator with two inputs and one row in the document, so its own row counts
+/// the driving side alone. Without this the gathered side, which is the half of the query most of
+/// the memory and most of the surprises are in, is not in the document at all.
+#[test]
+fn a_join_says_what_it_built_and_what_it_chose() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x = u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let joined = operator(metrics, "Probe").joined.clone().expect("a join reports what it did");
+    assert_eq!(joined.algorithm, rudb_metrics::Algorithm::Hash);
+    assert_eq!(joined.build_rows, 4, "the whole gathered side went into the table");
+    assert!(joined.build_bytes > 0, "a table that holds four rows cost something to hold them");
+    let declined = &joined.declined;
+    assert_eq!(declined.len(), 1, "the nested loop was the only other answer");
+    assert_eq!(declined[0].algorithm, rudb_metrics::Algorithm::Loop);
+    assert!(declined[0].reason.contains("equality"), "{}", declined[0].reason);
+}
+
+/// The reason is the point of recording it. A nested loop over two sides is the two multiplied, and
+/// the fix is nearly always a condition the binder could not find an equality in, which is a thing
+/// somebody reading a slow query has to be told rather than left to guess from the time.
+#[test]
+fn a_join_with_no_lookup_says_why_it_had_to_walk_every_pair() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x < u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let joined = operator(metrics, "Join").joined.clone().expect("a join reports what it did");
+    assert_eq!(joined.algorithm, rudb_metrics::Algorithm::Loop);
+    assert_eq!(joined.build_rows, 4, "the gathered side is walked once per driving row");
+    assert_eq!(joined.declined.len(), 1, "the table was the only other answer");
+    assert_eq!(joined.declined[0].algorithm, rudb_metrics::Algorithm::Hash);
+    assert!(joined.declined[0].reason.contains("no conjunct"), "{}", joined.declined[0].reason);
+}
+
+/// Everything that is not a join leaves the key out rather than writing a null into it, because the
+/// rest of the plan is most of the plan and a reader filtering for joins should not have to know
+/// which of the null shaped rows are one.
+#[test]
+fn an_operator_that_is_not_a_join_has_no_join_record() {
+    let db = database();
+    let result = db.query("SELECT sum(x) FROM t WHERE x > 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    assert!(
+        metrics.operators.iter().all(|operator| operator.joined.is_none()),
+        "no operator in this query has two inputs"
+    );
+}
+
 #[test]
 fn a_statement_that_runs_no_plan_has_nothing_to_report() {
     let db = database();

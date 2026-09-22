@@ -46,7 +46,7 @@
   "estimates": {
     "exact": 1,
     "certified": 1,
-    "estimated": 1,
+    "estimated": 2,
     "unknown": 0
   },
   "strategies": [
@@ -182,6 +182,41 @@
       "reference_impl": false
     },
     {
+      "id": 6,
+      "pipeline": 0,
+      "kind": "Probe",
+      "detail": "hits.ClientIP = banned.ClientIP",
+      "rows_in": 99997497,
+      "rows_out": 41983110,
+      "estimated_rows": 99997497,
+      "estimate_class": "estimated",
+      "estimate_provenance": "default",
+      "wall_ns": 210000000,
+      "cpu_ns": 1400000000,
+      "bytes_read": 0,
+      "bytes_decoded": 0,
+      "bytes_spilled": 0,
+      "fallbacks": {
+        "total": 0
+      },
+      "memory": {
+        "reserved": 0,
+        "high_water": 0
+      },
+      "reference_impl": false,
+      "join": {
+        "algorithm": "hash",
+        "build_rows": 4096,
+        "build_bytes": 262144,
+        "declined": [
+          {
+            "algorithm": "nested loop",
+            "reason": "the condition holds an equality, so a driving row's matches are one lookup"
+          }
+        ]
+      }
+    },
+    {
       "id": 7,
       "pipeline": 1,
       "kind": "Sort",
@@ -216,7 +251,7 @@
   ],
   "warnings": [
     "operator 7 (Sort) spilled 11.4 MiB",
-    "1 of the 3 operators ran a reference implementation, which is the slow path kept for differential testing, and 2 of them chose from a seam that had an alternative",
+    "1 of the 4 operators ran a reference implementation, which is the slow path kept for differential testing, and 2 of them chose from a seam that had an alternative",
     "97,666 calls took the row at a time path, 48,827 of them flatten in operator 5 (HashAggregate)",
     "operator 5 (HashAggregate) was estimated at 2,400,000 rows and produced 41,983,110 (q-error 17.5)"
   ]

@@ -10,11 +10,12 @@
 //! estimate the optimizer made and whether this is a reference implementation are all known when
 //! the operator is built and none of them move afterwards.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::{Cause, Spent, Stage, Tally};
 
-use crate::document::{Implementation, Memory, Operator};
+use crate::document::{Implementation, Joined, Memory, Operator};
 
 /// The counters for one operator.
 #[derive(Debug)]
@@ -49,6 +50,12 @@ pub struct Counters {
     /// A fixed array rather than a map, because the shim adds to this around every operator call
     /// and a map would be a hash per call to store a number that is almost always zero.
     fallbacks: [AtomicU64; Cause::ALL.len()],
+    /// What a join did, for an operator that is one.
+    ///
+    /// Not an atomic and not a lock, because it is written once by whichever instance built the
+    /// gathered side and read once at the end. Every other instance of that operator finds the
+    /// table already built and has nothing to say that the first one did not.
+    joined: OnceLock<Joined>,
     /// One clock and one byte count per [`Stage`], in the order [`Stage::ALL`] lists them.
     ///
     /// Only a scan fills these in. Everything else reports a row of zeroes, which costs nothing to
@@ -80,6 +87,7 @@ impl Counters {
             bytes_spilled: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
             high_water: AtomicU64::new(0),
+            joined: OnceLock::new(),
             fallbacks: [const { AtomicU64::new(0) }; Cause::ALL.len()],
             stages: [const { AtomicU64::new(0) }; Stage::ALL.len()],
             stage_bytes: [const { AtomicU64::new(0) }; Stage::ALL.len()],
@@ -214,6 +222,20 @@ impl Counters {
         }
     }
 
+    /// What a join chose, what it did not choose and what the gathered side came to.
+    ///
+    /// Called by the operator rather than by the shim around it, for the reason the byte counts
+    /// are: a wrapper sees chunks going past and cannot see which of two inputs one came from,
+    /// let alone which algorithm read it. Called where the table is built, because that is the one
+    /// line in the engine where all four of these numbers are settled and in hand.
+    ///
+    /// The first call wins and the rest are dropped. Every instance of the operator runs this
+    /// code and exactly one of them builds the table, so the ones that arrive afterwards would be
+    /// repeating what the first said.
+    pub fn joining(&self, joined: Joined) {
+        let _ = self.joined.set(joined);
+    }
+
     /// What this operator holds now, which also moves the high water mark when it is a new most.
     ///
     /// Reported rather than added, because memory is a level and not a total. An operator that
@@ -254,6 +276,7 @@ impl Counters {
             reserved: self.reserved.load(Ordering::Relaxed),
             high_water: self.high_water.load(Ordering::Relaxed),
         };
+        operator.joined = self.joined.get().cloned();
         operator
     }
 }
@@ -266,6 +289,7 @@ mod tests {
     use rudb_common::{Cause, Spent, Stage, Tally};
 
     use super::Counters;
+    use crate::document::{Algorithm, Declined, Joined};
 
     #[test]
     fn falling_back_adds_up_across_the_calls_and_comes_out_split_by_cause() {
@@ -363,6 +387,36 @@ mod tests {
         let operator = Counters::new(1, 0, "Limit").snapshot();
         assert!(operator.reference_impl);
         assert!(operator.implementations.is_empty());
+    }
+
+    #[test]
+    fn the_instance_that_built_the_table_is_the_one_that_says_what_the_join_did() {
+        let counters = Counters::new(0, 0, "Probe");
+        assert!(
+            counters.snapshot().joined.is_none(),
+            "an operator that is not a join says nothing"
+        );
+        counters.joining(Joined {
+            algorithm: Algorithm::Hash,
+            build_rows: 300,
+            build_bytes: 18_128,
+            declined: vec![Declined::new(Algorithm::Loop, "the condition holds an equality")],
+        });
+        // Every instance of the operator runs the same code and the ones that arrive after the
+        // table is built have nothing to add, so a second report is dropped rather than averaged
+        // or summed into a number that is neither of the two.
+        counters.joining(Joined {
+            algorithm: Algorithm::Loop,
+            build_rows: 9,
+            build_bytes: 9,
+            declined: Vec::new(),
+        });
+        let joined = counters.snapshot().joined.expect("a join reported");
+        assert_eq!(joined.algorithm, Algorithm::Hash);
+        assert_eq!(joined.build_rows, 300);
+        assert_eq!(joined.build_bytes, 18_128);
+        assert_eq!(joined.declined.len(), 1);
+        assert_eq!(joined.declined[0].algorithm, Algorithm::Loop);
     }
 
     #[test]

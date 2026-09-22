@@ -1669,6 +1669,7 @@ impl<'a> Building<'a, '_> {
                     let schema = mark.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Mark", None);
                     let reading = Arc::clone(&counters);
+                    let mark = mark.watched(Arc::clone(&counters));
                     left.after.push(gathering);
                     self.close(left, pipeline, Arc::new(Watched::new(mark, counters)));
                     let reader = Arc::new(Watched::new(out, reading));
@@ -1687,6 +1688,7 @@ impl<'a> Building<'a, '_> {
                     // plan line above it already says which outer join this is and what a reader
                     // of a profile wants to know here is which of the two operators ran.
                     let counters = self.watch(reference, id, pipeline, "Pad", None);
+                    let pad = pad.watched(Arc::clone(&counters));
                     left.after.push(gathering);
                     return Ok(left.then(Arc::new(Watched::new(pad, counters)), schema));
                 }
@@ -1697,6 +1699,7 @@ impl<'a> Building<'a, '_> {
                     arm(probe.sideways());
                     let schema = probe.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Probe", None);
+                    let probe = probe.watched(Arc::clone(&counters));
                     left.after.push(gathering);
                     return Ok(left.then(Arc::new(Watched::new(probe, counters)), schema));
                 }
@@ -1706,6 +1709,7 @@ impl<'a> Building<'a, '_> {
                 let schema = join.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Join", None);
                 let reading = Arc::clone(&counters);
+                let join = join.watched(Arc::clone(&counters));
                 left.after.push(gathering);
                 self.close(left, pipeline, Arc::new(Watched::new(join, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)

@@ -258,6 +258,26 @@ impl Document {
                         });
                     }
                     out.flag("reference_impl", operator.reference_impl);
+                    // Only a join has one, and the rest of the plan is most of the plan, so this
+                    // is a key that is there when it says something and absent when it does not.
+                    if let Some(joined) = &operator.joined {
+                        out.key("join");
+                        out.object(|out| {
+                            out.words("algorithm", joined.algorithm.name());
+                            out.count("build_rows", joined.build_rows);
+                            out.count("build_bytes", joined.build_bytes);
+                            out.key("declined");
+                            out.array(|out| {
+                                for declined in &joined.declined {
+                                    out.item();
+                                    out.object(|out| {
+                                        out.words("algorithm", declined.algorithm.name());
+                                        out.words("reason", &declined.reason);
+                                    });
+                                }
+                            });
+                        });
+                    }
                 });
             }
         });
@@ -678,6 +698,87 @@ pub struct Operator {
     /// A row built by hand rather than measured starts false, because a document assembled in a
     /// test has made no claim either way and a warning about it would be a warning about the test.
     pub reference_impl: bool,
+    /// What a join did, for an operator that is one, and nothing for everything else.
+    ///
+    /// A join is the one operator in the engine with two inputs and one row in this list, so the
+    /// row's own [`Operator::rows_in`] is the driving side alone and the gathered side is
+    /// unaccounted for without this. See [`Joined`].
+    pub joined: Option<Joined>,
+}
+
+/// How a join found the rows one row matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Algorithm {
+    /// A table over the gathered side, read once per driving row.
+    Hash,
+    /// Every driving row against every gathered row, which is the answer for a condition with no
+    /// equality in it.
+    Loop,
+    /// The nth row of one side with the nth of the other, which is not a search at all.
+    Positional,
+}
+
+impl Algorithm {
+    /// What it is called in the document.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hash => "hash",
+            Self::Loop => "nested loop",
+            Self::Positional => "positional",
+        }
+    }
+}
+
+/// What a join did, beside the rows and the time every operator reports.
+///
+/// Reported once, by whichever instance of the operator built the gathered side, and reported as
+/// one record rather than a number at a time because the algorithm, the reasons and the two build
+/// numbers are all settled within a few lines of each other. A record assembled from four calls is
+/// a record that can be found half written.
+///
+/// What is not here is the driving side and the answer. Those are [`Operator::rows_in`] and
+/// [`Operator::rows_out`] on the same row, they are counted by the shim around every operator
+/// rather than by the join, and a second copy of them here would be a second copy that can
+/// disagree with the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Joined {
+    /// How the rows were matched.
+    pub algorithm: Algorithm,
+    /// Rows of the gathered side, which is the side the table is built from.
+    ///
+    /// Zero says the gathered side was empty, which is worth telling apart from a join that
+    /// produced nothing because nothing matched.
+    pub build_rows: u64,
+    /// What the table and the copy of the side under it are charged.
+    ///
+    /// Not the whole of what the gathered side costs. The chunks it arrived in are charged to the
+    /// operator that gathered them, which is a row of its own in this list, and charging them
+    /// again here would say the join holds twice what it holds.
+    pub build_bytes: u64,
+    /// The algorithms this join did not use, each with the reason it did not.
+    ///
+    /// The point of recording a road not taken is that a join running the wrong algorithm is the
+    /// most expensive single thing a plan can do, and the number in front of somebody reading this
+    /// says only what happened. Empty where there was nothing else in the running.
+    pub declined: Vec<Declined>,
+}
+
+/// One algorithm a join did not use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declined {
+    /// What was not used, in the same words [`Algorithm::name`] uses.
+    pub algorithm: Algorithm,
+    /// Why not, in a sentence.
+    pub reason: String,
+}
+
+impl Declined {
+    /// One road not taken.
+    #[must_use]
+    pub fn new(algorithm: Algorithm, reason: &str) -> Self {
+        Self { algorithm, reason: reason.to_string() }
+    }
 }
 
 /// What one operator picked at one seam.
@@ -717,6 +818,7 @@ impl Operator {
             memory: Memory::default(),
             implementations: Vec::new(),
             reference_impl: false,
+            joined: None,
         }
     }
 
@@ -742,7 +844,10 @@ mod tests {
     use rudb_common::stat::{Class, Direction, Provenance};
     use rudb_common::{Cause, Spent, Stage, Tally};
 
-    use super::{Document, Engine, Implementation, Machine, Operator, Outcome, Pipeline, Strategy};
+    use super::{
+        Algorithm, Declined, Document, Engine, Implementation, Joined, Machine, Operator, Outcome,
+        Pipeline, Strategy,
+    };
 
     /// A document with every part of it filled in, which is what the golden file holds.
     fn sample() -> Document {
@@ -830,6 +935,24 @@ mod tests {
             name: "unchained".to_string(),
             is_reference: false,
         });
+        let mut probe = Operator::new(6, 0, "Probe");
+        probe.detail = Some("hits.ClientIP = banned.ClientIP".to_string());
+        probe.rows_in = 99_997_497;
+        probe.rows_out = 41_983_110;
+        probe.estimated_rows = Some(99_997_497);
+        probe.estimate_class = Some(Class::Estimated);
+        probe.estimate_provenance = Some(Provenance::Default);
+        probe.wall_ns = 210_000_000;
+        probe.cpu_ns = 1_400_000_000;
+        probe.joined = Some(Joined {
+            algorithm: Algorithm::Hash,
+            build_rows: 4096,
+            build_bytes: 262_144,
+            declined: vec![Declined::new(
+                Algorithm::Loop,
+                "the condition holds an equality, so a driving row's matches are one lookup",
+            )],
+        });
         let mut sort = Operator::new(7, 1, "Sort");
         sort.rows_in = 41_983_110;
         sort.rows_out = 10;
@@ -846,10 +969,10 @@ mod tests {
             is_reference: true,
         });
         sort.reference_impl = true;
-        for operator in [&read, &group, &sort] {
+        for operator in [&read, &group, &probe, &sort] {
             metrics.estimates.record_class(operator.estimate_class);
         }
-        metrics.operators.extend([read, group, sort]);
+        metrics.operators.extend([read, group, probe, sort]);
         metrics
     }
 
