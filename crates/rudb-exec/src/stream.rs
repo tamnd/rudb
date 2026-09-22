@@ -317,7 +317,7 @@ impl Limit {
 
 impl Edge {
     #[must_use]
-    fn in_session(self, session: &Session) -> Self {
+    pub(crate) fn in_session(self, session: &Session) -> Self {
         match self {
             Self::Read(prepared) => Self::Read(prepared.in_session(session)),
             settled => settled,
@@ -325,7 +325,7 @@ impl Edge {
     }
 
     /// Working space sized for this end, which is nothing at all unless it is read off the rows.
-    fn scratch(&self) -> Scratch {
+    pub(crate) fn scratch(&self) -> Scratch {
         match self {
             Self::Read(prepared) => prepared.scratch(),
             Self::All | Self::Rows(_) => Scratch::default(),
@@ -336,7 +336,12 @@ impl Edge {
     ///
     /// `None` is every row, which only a count answers. A null reads as every row too, because
     /// `LIMIT (SELECT NULL)` is every row on the pin, the same as `LIMIT NULL` written out.
-    fn rows(&self, chunk: &Chunk, scratch: &mut Scratch, clause: &str) -> Result<Option<u64>> {
+    pub(crate) fn rows(
+        &self,
+        chunk: &Chunk,
+        scratch: &mut Scratch,
+        clause: &str,
+    ) -> Result<Option<u64>> {
         match self {
             Self::All => Ok(None),
             Self::Rows(rows) => Ok(Some(*rows)),

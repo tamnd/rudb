@@ -16,7 +16,9 @@
 //!
 //! A percentage is the same evaluation with a different cast at the end of it and a different node
 //! under it. The value goes to `DOUBLE`, the row count is a share of the input rounded down, and
-//! the offset is applied after the share rather than to it.
+//! the offset is applied after the share rather than to it. Both of its ends go down the second
+//! path too, so `LIMIT (SELECT 30)% OFFSET (SELECT 2)` reads two values off the rows, and the share
+//! is the one value whose range is checked where it turns up rather than always in the binder.
 
 use rudb::Database;
 use rudb_common::Value;
@@ -295,14 +297,114 @@ fn a_row_count_read_while_the_query_runs_does_not_become_a_top_n() {
     assert!(!plan.contains("TopN"), "{sql} planned as {plan}");
 }
 
-/// A share written as a subquery is the one shape left over, because the node holds a number.
+/// Both ends of a share can be a subquery, and each is read off the rows the way a row count is.
+///
+/// Only the `%` sign can hold one. `LIMIT (SELECT 30) PERCENT` is a syntax error in both engines,
+/// because the grammar will not put the word after a closing bracket, so the sign is the spelling
+/// every case here uses for the share itself.
 #[test]
-fn a_share_holding_a_subquery_says_so() {
+fn a_share_and_its_offset_can_both_be_a_subquery() {
     let database = database();
-    for sql in
-        ["SELECT i FROM t LIMIT (SELECT 30)%", "SELECT i FROM t LIMIT 30 PERCENT OFFSET (SELECT 2)"]
-    {
-        let message = refused(&database, sql);
-        assert!(message.contains("subquery"), "{sql}: {message}");
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT 30)%"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT 30)% OFFSET 1"), vec![1, 2, 3]);
+    let sql = "SELECT i FROM t LIMIT (SELECT 30)% OFFSET (SELECT 1)";
+    assert_eq!(numbers(&database, sql), vec![1, 2, 3]);
+    let sql = "SELECT i FROM t LIMIT 30 PERCENT OFFSET (SELECT 2)";
+    assert_eq!(numbers(&database, sql), vec![2, 3, 4]);
+    let sql = "SELECT i FROM t LIMIT 30 PERCENT OFFSET (SELECT count(*) FROM t WHERE i < 3)";
+    assert_eq!(numbers(&database, sql), vec![3, 4, 5]);
+    let sql = "SELECT i FROM t LIMIT 100 PERCENT OFFSET (SELECT 20)";
+    assert_eq!(numbers(&database, sql), Vec::<i32>::new());
+}
+
+/// The column either end is read out of is no more a column of the answer than a row count's is.
+#[test]
+fn the_column_a_share_is_read_out_of_is_not_a_column_of_the_answer() {
+    let database = database();
+    for sql in [
+        "SELECT * FROM t LIMIT (SELECT 30)%",
+        "SELECT * FROM t LIMIT 30 PERCENT OFFSET (SELECT 0)",
+        "SELECT * FROM t LIMIT (SELECT 30)% OFFSET (SELECT 0)",
+    ] {
+        let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        assert_eq!(result.width(), 1, "{sql} answered an extra column");
+        assert_eq!(numbers(&database, sql), vec![0, 1, 2]);
     }
+}
+
+/// A share read while the query runs goes through the same cast a written one does.
+///
+/// The cast is to `DOUBLE` and not to `BIGINT`, so `(SELECT true)%` is one percent and not one row,
+/// and a share that is not a whole number is a share rather than a rounding of one.
+#[test]
+fn a_share_read_while_the_query_runs_is_cast_the_way_a_written_one_is() {
+    let database = database();
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT '30')%"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT 35.5)%"), vec![0, 1, 2]);
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT true)%"), Vec::<i32>::new());
+    let message = refused(&database, "SELECT i FROM t LIMIT (SELECT 'abc')%");
+    assert!(message.contains("Could not convert string 'abc' to DOUBLE"), "{message}");
+}
+
+/// A share that answers no row or a null is no limit at all, the same as a written null.
+#[test]
+fn a_share_that_answers_nothing_or_null_leaves_every_row() {
+    let database = database();
+    assert_eq!(numbers(&database, "SELECT i FROM t LIMIT (SELECT NULL)%").len(), 10);
+    let sql = "SELECT i FROM t LIMIT (SELECT i FROM t WHERE false)%";
+    assert_eq!(numbers(&database, sql).len(), 10);
+}
+
+/// The range is checked where the value turns up, and the pin has two sentences for the two ends.
+///
+/// A share above a hundred is the out of range one a written share gets. A negative one names the
+/// value and says a percentage cannot be negative, which is a sentence nothing else says and is not
+/// what `LIMIT -1%` written out answers. Both were read off the pin rather than chosen.
+#[test]
+fn a_share_read_while_the_query_runs_is_checked_against_the_same_range() {
+    let database = database();
+    for sql in [
+        "SELECT i FROM t LIMIT (SELECT 101)%",
+        "SELECT i FROM t LIMIT (SELECT 100.5)%",
+        "SELECT i FROM t LIMIT (SELECT 'nan'::DOUBLE)%",
+    ] {
+        let message = refused(&database, sql);
+        assert!(message.contains("Limit percent out of range"), "{sql}: {message}");
+    }
+    let message = refused(&database, "SELECT i FROM t LIMIT (SELECT -1)%");
+    assert!(message.contains("Percentage value(-1.000000) can't be negative"), "{message}");
+    let message = refused(&database, "SELECT i FROM t LIMIT (SELECT -0.5)%");
+    assert!(message.contains("Percentage value(-0.500000) can't be negative"), "{message}");
+}
+
+/// An input with no rows in it never reads either end, so a share it would refuse is not refused.
+///
+/// There is nothing to read the value off and no rows to take a share of, so the answer does not
+/// depend on the value. The pin answers nothing here rather than raising the error the same query
+/// over a table with rows in it raises.
+#[test]
+fn a_share_over_no_rows_at_all_is_not_read_and_not_refused() {
+    let database = database();
+    for sql in [
+        "SELECT i FROM t WHERE false LIMIT (SELECT -1)%",
+        "SELECT i FROM t WHERE false LIMIT (SELECT 101)%",
+        "SELECT i FROM t WHERE false LIMIT 30 PERCENT OFFSET (SELECT -1)",
+    ] {
+        assert_eq!(numbers(&database, sql), Vec::<i32>::new(), "{sql}");
+    }
+}
+
+/// A sort under a share stays a sort, which it would have done anyway.
+///
+/// A share is never a top n, because the count is a share of an input nobody has counted yet, so
+/// this holds whether or not the share was one the binder could work out. The pin plans it the same
+/// way.
+#[test]
+fn a_share_read_while_the_query_runs_does_not_become_a_top_n() {
+    let database = database();
+    let sql = "SELECT i FROM t ORDER BY i DESC LIMIT (SELECT 30)%";
+    assert_eq!(numbers(&database, sql), vec![9, 8, 7]);
+    let plan = database.plan(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert!(plan.contains("Sort"), "{sql} planned as {plan}");
+    assert!(!plan.contains("TopN"), "{sql} planned as {plan}");
 }

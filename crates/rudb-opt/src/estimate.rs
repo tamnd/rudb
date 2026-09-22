@@ -532,8 +532,10 @@ pub fn rows_stat_into(
         // A share of an unknown number of rows is still unknown, which is the difference from the
         // arm above: a row count is a ceiling whatever feeds it and a percentage is not.
         Node::LimitPercent { input, percent, offset } => of(input).map(|n| {
-            let share = percent / 100.0 * n as f64;
-            (share as u64).saturating_sub(offset)
+            // A share or an offset read off the rows is a number nobody has yet, and the widest
+            // one it could be is the honest guess, so the estimate stays an upper bound.
+            let share = percent.percent().unwrap_or(100.0) / 100.0 * n as f64;
+            (share as u64).saturating_sub(offset.rows().unwrap_or(0))
         }),
         Node::TopN { input, count, offset, .. } => match of(input) {
             Stat::Unknown => {
