@@ -44,7 +44,7 @@ use crate::rows;
 use crate::schema::Schema;
 use crate::signed::SignedBlock;
 use crate::spill::{Reader, Spill};
-use crate::table::{Probe, Table, Walk};
+use crate::table::{Origin, Probe, Table, Walk};
 
 /// One aggregate call, taken apart once when the operator is built.
 #[derive(Debug, Clone)]
@@ -1262,6 +1262,7 @@ impl<'a> Aggregate<'a> {
             // empty until a chunk arrives that it can answer, and kept across the chunks of a row
             // group, which is the whole point of holding them here.
             coded_on: Vec::new(),
+            coded_places: Vec::new(),
             coded_map: Vec::new(),
             missing: Vec::new(),
             same: Vec::new(),
@@ -1315,6 +1316,7 @@ impl<'a> Aggregate<'a> {
             slots,
             walk,
             coded_on,
+            coded_places,
             coded_map,
             missing,
             same,
@@ -1373,9 +1375,10 @@ impl<'a> Aggregate<'a> {
                 coded_map.clear();
                 coded_map.resize(codes.combos(), NOWHERE);
             }
+            codes.places(*length, coded_places);
             missing.clear();
             for (row, slot) in slots.iter_mut().enumerate() {
-                let found = coded_map[codes.at(row)];
+                let found = coded_map[coded_places[row]];
                 if found == NOWHERE {
                     missing.push(row);
                 } else {
@@ -1404,9 +1407,9 @@ impl<'a> Aggregate<'a> {
         // The rows the map had nothing for, which are the first row of each combination and no
         // others. They go through the probe and the insert every row used to go through, and what
         // comes back is written into the map so that the rest of the row group skips both.
-        if let Some(codes) = &direct {
+        if direct.is_some() {
             for &row in missing.iter() {
-                let index = codes.at(row);
+                let index = coded_places[row];
                 // Two rows of one chunk can be the first two of one combination, and the first of
                 // them filled the map on its way past.
                 if coded_map[index] != NOWHERE {
@@ -3128,13 +3131,15 @@ pub(crate) struct Building {
     slots: Vec<usize>,
     /// What the batched probe walks with, kept so that a chunk allocates nothing for it.
     walk: Walk,
-    /// The dictionaries `coded_map` was filled against, which is what says it still means anything.
+    /// What `coded_map` was filled against, which is what says it still means anything.
     ///
     /// Empty when the last chunk was not one the direct map could answer, so the map is rebuilt
     /// rather than read. See [`Coded`](crate::table::Coded).
-    coded_on: Vec<Arc<Vector>>,
+    coded_on: Vec<Origin>,
     /// One slot per combination of codes, or [`NOWHERE`] where that combination has not been seen.
     coded_map: Vec<usize>,
+    /// Which combination each row of the last chunk is, worked out one key column at a time.
+    coded_places: Vec<usize>,
     /// The rows of the last chunk the map had no slot for, in row order.
     missing: Vec<usize>,
     /// One flag per row of the last chunk, true where the row's key is the key of the row before.

@@ -31,7 +31,7 @@
 //! fold and by the comparison that follows the probe.
 
 use rudb_common::{Error, Result, Value, interval_micros};
-use rudb_vector::{Data, Vector};
+use rudb_vector::{Data, Packed, Vector};
 use std::sync::Arc;
 
 use crate::key::{canonical, mix, same, spread};
@@ -545,13 +545,49 @@ const KEYS: usize = 4;
 /// row group still has to pay for one.
 const COMBOS: usize = 2048;
 
-/// One key column of a chunk, read as codes into the dictionary they point at.
+/// Where one key column's place in the combined index comes from.
+///
+/// Two forms rather than one, because a stored column of small integers is not a dictionary and does
+/// not need to become one to be read this way. A bit packed run already holds each value as the
+/// value minus a base, in as many bits as the widest value on the page needs, so its code is a place
+/// in exactly the way a dictionary code is and its span is `1 << width` rather than the length of
+/// anything. `l_linenumber` takes seven values and the native file stores it in three bits, and a
+/// group by on it was hashing six million rows to find one of seven answers.
+#[derive(Debug, Clone, Copy)]
+enum Places<'a> {
+    /// Codes into a dictionary, whose identity is the dictionary they point at.
+    Codes {
+        /// This chunk's code per row, already cut to the rows being asked about.
+        codes: &'a [u32],
+        /// The dictionary those codes point into, kept for its identity rather than its values.
+        values: &'a Arc<Vector>,
+    },
+    /// A packed run, whose identity is the base and width that turn a code back into a value.
+    Bits {
+        /// The words and what they mean, which is all a code needs to be read.
+        packed: Packed<'a>,
+    },
+}
+
+/// What a direct map's places were built from, so a chunk under different ones rebuilds it.
+///
+/// A place only means a value against the thing it was read out of. Two pages of one column can
+/// hold different dictionaries, or pack their values against different bases, and a map carried
+/// from the first into the second would answer a row with some other row's group. This is what the
+/// caller holds beside the map so that it can tell.
+#[derive(Debug, Clone)]
+pub(crate) enum Origin {
+    /// A dictionary, kept by identity rather than by value.
+    Dictionary(Arc<Vector>),
+    /// A packed run's base and width, which are all a code needs in order to mean a value.
+    Bits(i128, u32),
+}
+
+/// One key column of a chunk, read as places into a map of every combination.
 #[derive(Debug, Clone, Copy)]
 struct CodedColumn<'a> {
-    /// This chunk's code per row, already cut to the rows being asked about.
-    codes: &'a [u32],
-    /// The dictionary those codes point into, kept for its identity rather than its values.
-    values: &'a Arc<Vector>,
+    /// Where this column's place per row comes from.
+    places: Places<'a>,
     /// What this column's place is multiplied by, which is the spans of the columns before it.
     stride: usize,
     /// The place a null row takes, which is one past the last code.
@@ -569,12 +605,52 @@ struct CodedColumn<'a> {
 }
 
 impl CodedColumn<'_> {
-    /// Where this column puts a row in the combined index.
-    fn place(&self, row: usize) -> usize {
-        if self.nullable && self.column.is_null_at(row) {
-            return self.nothing;
+    /// Adds what this column contributes to every row's place, in one pass over the column.
+    ///
+    /// A pass per column rather than a column loop per row, which is the same argument the hash
+    /// beside it is written on. The form of the column and whether it has any null in it are both
+    /// settled before the loop starts, so the loop itself is a load, a multiply and an add, and
+    /// neither question is asked six million times. Doing it the other way round cost seven
+    /// instructions a row on `GROUP BY l_returnflag, l_linestatus` the moment there were two forms
+    /// to tell apart, which is more than the whole probe it saves.
+    fn add_into(&self, into: &mut [usize]) {
+        let stride = self.stride;
+        if self.nullable {
+            let nothing = self.nothing;
+            let column = self.column;
+            match self.places {
+                Places::Codes { codes, .. } => {
+                    for (row, place) in into.iter_mut().enumerate() {
+                        let code =
+                            if column.is_null_at(row) { nothing } else { codes[row] as usize };
+                        *place += code * stride;
+                    }
+                }
+                Places::Bits { packed } => {
+                    for (row, place) in into.iter_mut().enumerate() {
+                        let code = if column.is_null_at(row) {
+                            nothing
+                        } else {
+                            packed.code(row) as usize
+                        };
+                        *place += code * stride;
+                    }
+                }
+            }
+            return;
         }
-        self.codes[row] as usize
+        match self.places {
+            Places::Codes { codes, .. } => {
+                for (row, place) in into.iter_mut().enumerate() {
+                    *place += codes[row] as usize * stride;
+                }
+            }
+            Places::Bits { packed } => {
+                for (row, place) in into.iter_mut().enumerate() {
+                    *place += packed.code(row) as usize * stride;
+                }
+            }
+        }
     }
 }
 
@@ -607,45 +683,57 @@ impl<'a> Coded<'a> {
         self.combos
     }
 
-    /// The index in the map of the key at `row`.
-    pub(crate) fn at(&self, row: usize) -> usize {
-        let mut index = 0;
+    /// Fills `places` with the index in the map of each row's key, one pass per key column.
+    pub(crate) fn places(&self, rows: usize, places: &mut Vec<usize>) {
+        places.clear();
+        places.resize(rows, 0);
         for column in self.columns.iter().flatten() {
-            index += column.place(row) * column.stride;
+            column.add_into(places);
         }
-        index
     }
 
-    /// Whether these are the same dictionaries `held` was filled from, so the map still means what
-    /// it meant.
-    pub(crate) fn same_as(&self, held: &[Arc<Vector>]) -> bool {
+    /// Whether these are the same things `held` was filled from, so the map still means what it
+    /// meant.
+    pub(crate) fn same_as(&self, held: &[Origin]) -> bool {
         let mut at = 0;
         for column in self.columns.iter().flatten() {
-            match held.get(at) {
-                Some(dictionary) if Arc::ptr_eq(dictionary, column.values) => at += 1,
-                _ => return false,
+            let same = match (held.get(at), column.places) {
+                (Some(Origin::Dictionary(dictionary)), Places::Codes { values, .. }) => {
+                    Arc::ptr_eq(dictionary, values)
+                }
+                (Some(Origin::Bits(base, width)), Places::Bits { packed }) => {
+                    *base == packed.base() && *width == packed.width()
+                }
+                _ => false,
+            };
+            if !same {
+                return false;
             }
+            at += 1;
         }
         at == held.len()
     }
 
-    /// Records which dictionaries the map about to be built belongs to.
-    pub(crate) fn hold(&self, into: &mut Vec<Arc<Vector>>) {
+    /// Records what the map about to be built reads its places out of.
+    pub(crate) fn hold(&self, into: &mut Vec<Origin>) {
         into.clear();
         for column in self.columns.iter().flatten() {
-            into.push(Arc::clone(column.values));
+            into.push(match column.places {
+                Places::Codes { values, .. } => Origin::Dictionary(Arc::clone(values)),
+                Places::Bits { packed } => Origin::Bits(packed.base(), packed.width()),
+            });
         }
     }
 }
 
-/// Reads a chunk's key columns as codes, when every one of them arrives as a small dictionary.
+/// Reads a chunk's key columns as places, when every one of them takes few enough of them.
 ///
-/// `None` the moment any part of that is not true, which is a key column that is not a dictionary, a
-/// dictionary large enough that the map would cost more than the probe, or a code outside the
-/// dictionary it points into. The last of those is not a shape anything builds, and the pass that
-/// rules it out is a run of `u32` against a constant, which is cheaper than being wrong about it
-/// once: a code out of range would index the map as some other combination and answer a group that
-/// is not the row's own.
+/// `None` the moment any part of that is not true, which is a key column in a form that has no
+/// places to read, one with a span large enough that the map would cost more than the probe it
+/// replaces, or a code outside the dictionary it points into. The last of those is not a shape
+/// anything builds, and the pass that rules it out is a run of `u32` against a constant, which is
+/// cheaper than being wrong about it once: a code out of range would index the map as some other
+/// combination and answer a group that is not the row's own.
 pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
     if keys.is_empty() || keys.len() > KEYS {
         return None;
@@ -653,30 +741,51 @@ pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
     let mut columns = [None; KEYS];
     let mut combos: usize = 1;
     for (at, key) in keys.iter().enumerate() {
-        let (codes, values) = key.shared_dictionary_parts()?;
-        let codes = codes.get(..rows)?;
-        let span = values.len().checked_add(1)?;
+        let (places, span, nullable) = places_of(key, rows)?;
         if combos.checked_mul(span)? > COMBOS {
             return None;
         }
-        if codes.iter().any(|&code| code as usize >= values.len()) {
-            return None;
-        }
         columns[at] = Some(CodedColumn {
-            codes,
-            values,
+            places,
             stride: combos,
-            nothing: values.len(),
-            // A pass over the dictionary and not over the chunk, which is at most the two thousand
-            // entries `COMBOS` allows and is usually three. What it buys is the row loop below
-            // skipping the null question entirely on the columns that have no null in them.
-            nullable: key.validity().has_nulls(rows)
-                || (0..values.len()).any(|at| values.is_null_at(at)),
+            // The last place of the span, which is the one no value of the column can take.
+            nothing: span - 1,
+            nullable,
             column: key,
         });
         combos *= span;
     }
     Some(Coded { columns, combos })
+}
+
+/// One key column read as places, with how many it can take and whether a row of it can be null.
+///
+/// The span counts the place a null takes as well as the places the values take, so it is one more
+/// than the column has distinct values it could hold.
+fn places_of(key: &Vector, rows: usize) -> Option<(Places<'_>, usize, bool)> {
+    if let Some((codes, values)) = key.shared_dictionary_parts() {
+        let codes = codes.get(..rows)?;
+        if codes.iter().any(|&code| code as usize >= values.len()) {
+            return None;
+        }
+        // A pass over the dictionary and not over the chunk, which is at most the two thousand
+        // entries `COMBOS` allows and is usually three. What it buys is the row loop skipping the
+        // null question entirely on the columns that have no null in them.
+        let nullable =
+            key.validity().has_nulls(rows) || (0..values.len()).any(|at| values.is_null_at(at));
+        return Some((Places::Codes { codes, values }, values.len().checked_add(1)?, nullable));
+    }
+    let packed = key.packed_parts()?;
+    if key.len() < rows {
+        return None;
+    }
+    // The width is the whole of the span, and it is on the page rather than in the data, so a column
+    // of small integers is known to be a small key before a single row of it has been looked at.
+    // Refused here rather than by the multiply above so that the shift cannot be what overflows.
+    let span = 1_usize.checked_shl(packed.width()).filter(|&span| span <= COMBOS)?;
+    // A packed run keeps its nulls in the vector's own validity rather than in what it points at,
+    // so unlike a dictionary there is nothing else to ask.
+    Some((Places::Bits { packed }, span.checked_add(1)?, key.validity().has_nulls(rows)))
 }
 
 /// One key column in its common physical width.
@@ -1050,7 +1159,7 @@ impl Column {
         here: &[Step],
         seen: &[u64],
         same: &mut [bool],
-        packed: &rudb_vector::Packed<'_>,
+        packed: &Packed<'_>,
         nulled: impl Fn(usize) -> bool,
         code: impl Fn(usize) -> usize,
     ) -> bool {
@@ -1604,7 +1713,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
 /// for the same number, since the same column is a packed run in one chunk and something else in
 /// the next, and the base plus the code is that number.
 fn fold_packed(
-    packed: &rudb_vector::Packed<'_>,
+    packed: &Packed<'_>,
     wide: bool,
     rows: usize,
     hashes: &mut [u64],
@@ -2359,6 +2468,13 @@ mod tests {
             .expect("a dictionary of those letters")
     }
 
+    /// Every row's place in the map, which is what the caller reads once per chunk.
+    fn placed(coded: &Coded<'_>, rows: usize) -> Vec<usize> {
+        let mut places = Vec::new();
+        coded.places(rows, &mut places);
+        places
+    }
+
     /// The pair TPC-H q1 groups by, and the six places their codes take between them.
     #[test]
     fn two_small_dictionaries_give_every_row_the_place_its_codes_say() {
@@ -2369,10 +2485,7 @@ mod tests {
         // Four codes in the first column and three in the second, one of each being the place a
         // null takes, which is twelve between them.
         assert_eq!(coded.combos(), 12);
-        assert_eq!(coded.at(0), 0);
-        assert_eq!(coded.at(1), 1 + 4);
-        assert_eq!(coded.at(2), 2 + 4);
-        assert_eq!(coded.at(3), 0);
+        assert_eq!(placed(&coded, 4), [0, 1 + 4, 2 + 4, 0]);
     }
 
     /// Rows that are null take one place between them however they came to be null, because the
@@ -2390,18 +2503,103 @@ mod tests {
         let keys = [column];
         let coded = coded(&keys, 3).expect("one small dictionary is read as codes");
         assert_eq!(coded.combos(), 3);
-        assert_eq!(coded.at(0), 0);
         // The second row's code points at a null and the third row's own bit says it is one, and
         // both of them are the same group.
-        assert_eq!(coded.at(1), 2);
-        assert_eq!(coded.at(2), 2);
+        assert_eq!(placed(&coded, 3), [0, 2, 2]);
     }
 
-    /// Every form that is not a dictionary goes the long way, since there are no codes to read.
+    /// A flat column goes the long way, since it says nothing about what it can be holding and
+    /// finding out would be the pass this exists to avoid.
     #[test]
     fn a_flat_column_is_not_read_as_codes() {
         let keys = [flat(LogicalType::Integer, &[Value::Integer(1), Value::Integer(2)])];
         assert!(coded(&keys, 2).is_none());
+    }
+
+    /// A packed column of small integers, which is the form the native file stores `l_linenumber`
+    /// in, built at a width rather than measured into one so that the test says what it means.
+    fn packed_numbers(values: &[i64], width: u32, base: i128) -> Vector {
+        let bits = width as usize;
+        let mut words = vec![0_u64; (values.len() * bits).div_ceil(u64::BITS as usize) + 1];
+        for (row, &value) in values.iter().enumerate() {
+            let code =
+                u64::try_from(i128::from(value) - base).expect("a value at or above the base");
+            let at = row * bits;
+            let (word, offset) = (at / 64, at % 64);
+            words[word] |= code << offset;
+            if offset + bits > 64 {
+                words[word + 1] |= code >> (64 - offset);
+            }
+        }
+        Vector::packed(LogicalType::Integer, words, width, base, values.len())
+            .expect("a packed column of those values")
+    }
+
+    /// A stored integer column with a small domain is read the way a dictionary is. That is the case
+    /// `l_linenumber` is in: seven values, three bits, and no dictionary anywhere, so a group by on
+    /// it used to hash six million rows to find one of seven answers.
+    #[test]
+    fn a_packed_column_is_read_as_codes_at_its_own_width() {
+        let keys = [packed_numbers(&[1, 2, 7, 1], 3, 1)];
+        let coded = coded(&keys, 4).expect("a narrow packed column is read as codes");
+        // The eight codes three bits can take, and one more for the place a null takes.
+        assert_eq!(coded.combos(), 9);
+        assert_eq!(placed(&coded, 4), [0, 1, 6, 0]);
+    }
+
+    /// A packed column beside a dictionary, since a key is read this way only when every column of
+    /// it can be and the two forms have to agree on what a place is.
+    #[test]
+    fn a_packed_column_and_a_dictionary_share_one_map() {
+        let keys = [packed_numbers(&[1, 2, 1], 2, 1), coded_letters(vec![0, 1, 0], &["A", "N"])];
+        let coded = coded(&keys, 3).expect("both columns are read as places");
+        // Five places for the numbers, being the four codes and a null, times three for the letters.
+        assert_eq!(coded.combos(), 15);
+        assert_eq!(placed(&coded, 3), [0, 1 + 5, 0]);
+    }
+
+    /// A null row of a packed column takes the place past the last code, the way a dictionary's
+    /// does, because the table holds one group for every null however it arose.
+    #[test]
+    fn a_null_row_of_a_packed_column_takes_the_place_past_the_last_code() {
+        let column = packed_numbers(&[1, 2, 1], 3, 1).with_validity(rudb_vector::Validity::Mask({
+            let mut mask = rudb_vector::Bitmap::all_valid(3);
+            mask.set(1, false);
+            mask
+        }));
+        let keys = [column];
+        let coded = coded(&keys, 3).expect("one narrow packed column is read as codes");
+        assert_eq!(coded.combos(), 9);
+        assert_eq!(placed(&coded, 3), [0, 8, 0]);
+    }
+
+    /// And a packed column wide enough that the map would cost more than the probe it replaces,
+    /// which is where a key like `l_suppkey` lands.
+    #[test]
+    fn a_packed_column_wider_than_the_map_allows_is_refused() {
+        let keys = [packed_numbers(&[0, 1], 12, 0)];
+        assert!(coded(&keys, 2).is_none());
+    }
+
+    /// A code only means a value against the base and width it was packed against, so those are
+    /// what the caller holds. Unlike a dictionary, which is held by identity, a page packed the same
+    /// way as the one before it is one the map can be carried into.
+    #[test]
+    fn a_chunk_packed_against_another_base_does_not_keep_the_map() {
+        let first = [packed_numbers(&[1, 2], 3, 1)];
+        let over_first = coded(&first, 2).expect("codes");
+        let mut held = Vec::new();
+        over_first.hold(&mut held);
+        assert!(over_first.same_as(&held));
+
+        let again = [packed_numbers(&[1, 2], 3, 1)];
+        assert!(coded(&again, 2).expect("codes").same_as(&held), "the same base and width");
+        let rebased = [packed_numbers(&[9, 10], 3, 9)];
+        assert!(!coded(&rebased, 2).expect("codes").same_as(&held), "another base");
+        let widened = [packed_numbers(&[1, 2], 4, 1)];
+        assert!(!coded(&widened, 2).expect("codes").same_as(&held), "another width");
+        let letters = [coded_letters(vec![0, 1], &["A", "N"])];
+        assert!(!coded(&letters, 2).expect("codes").same_as(&held), "another form entirely");
     }
 
     /// And a dictionary large enough that the map would cost more than the probe it replaces.
