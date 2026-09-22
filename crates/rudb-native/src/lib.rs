@@ -770,7 +770,8 @@ impl Writer {
     /// # Errors
     ///
     /// If the file has no valid committed directory, is not this build's format, repeats the name
-    /// of a table already in it, has a field with no scalar encoding, or cannot be written.
+    /// of a table already in it that holds rows, has a field with no scalar encoding, or cannot be
+    /// written.
     pub fn open(
         path: impl AsRef<Path>,
         name: impl Into<String>,
@@ -782,9 +783,22 @@ impl Writer {
         let name = name.into();
         let path = path.as_ref();
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
-        let closed = decode_catalog(&bytes, size)?;
-        if closed.iter().any(|held| held.name == name) {
-            return Err(invalid("two tables in one native file have the same name"));
+        let mut closed = decode_catalog(&bytes, size)?;
+        // A table already in the file under this name is only in the way if it holds rows. One that
+        // holds none has no pages for this generation to carry and no reader that could lose
+        // anything, so the table being started here takes its place in the catalog rather than
+        // colliding with it, and `finish` writes the new entry where the old one was.
+        //
+        // That is not a corner. It is the shape every loading script writes: the schema goes in one
+        // statement and the rows go in the next, and a checkpoint between them commits the empty
+        // table. Before this, the second statement had to build the whole table in memory because
+        // the first had already put the name in the file, which is how a load of a table larger
+        // than memory became a load that needed memory the size of the table.
+        if let Some(at) = closed.iter().position(|held| held.name == name) {
+            if closed[at].rows > 0 {
+                return Err(invalid("two tables in one native file have the same name"));
+            }
+            closed.remove(at);
         }
         // The generation of the slot whose bytes checksummed, and not the highest number in the
         // header. A slot torn across a write can hold any number at all, and taking that one would
@@ -2592,6 +2606,16 @@ impl Catalog {
     /// The tables in the file, in the order they were written.
     pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
         self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
+    /// The same tables with how many rows each of them holds.
+    ///
+    /// The names alone answer which tables the file has, which is what a checkpoint needs to know.
+    /// A load asks a second question: whether a table already in the file is really in the way of
+    /// the one it wants to write. A table with no rows is not, because it has no pages the next
+    /// generation would have to carry, so the count has to come out of the catalog beside the name.
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = (&str, usize)> {
+        self.entries.iter().map(|entry| (entry.name.as_str(), entry.rows))
     }
 
     /// How many tables the file holds.
@@ -6419,6 +6443,39 @@ mod tests {
         writer.finish().expect("commit");
         let catalog = Catalog::open(&path).expect("the file opens again");
         assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items"]);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A committed table with no rows is a name the next generation takes over, and one with rows
+    /// is a name it refuses.
+    ///
+    /// The refusal is what it always was and it is load bearing: carrying a table that holds rows
+    /// forward means reading and rewriting its pages, and a writer that quietly wrote a second
+    /// entry under the same name would leave a file with two tables a reader cannot tell apart. An
+    /// empty one has no pages and no reader, so there is nothing to carry and nothing to lose, and
+    /// taking its place is what lets a schema committed by an earlier session be loaded by a stream
+    /// instead of through memory.
+    #[test]
+    fn a_committed_empty_table_gives_up_its_name_and_one_with_rows_does_not() {
+        let path = path("empty-name");
+        let field = || vec![Field::required("id", LogicalType::Integer)];
+        Writer::create(&path, "items", field()).expect("new file").finish().expect("commit");
+        let catalog = Catalog::open(&path).expect("the file opens");
+        assert_eq!(catalog.rows().collect::<Vec<_>>(), vec![("items", 0)]);
+
+        let mut writer = Writer::open(&path, "items", field()).expect("the empty name is free");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        let catalog = Catalog::open(&path).expect("the file opens again");
+        // One entry and not two. The generation replaced the empty table rather than joining it.
+        assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items"]);
+        let held = catalog.rows().collect::<Vec<_>>();
+        assert_eq!(held.len(), 1);
+        assert!(held[0].1 > 0, "the rows that were appended are the ones the catalog counts");
+
+        // The same call against the same name now that it holds rows, which is still refused.
+        let error = Writer::open(&path, "items", field()).expect_err("a name with rows is taken");
+        assert!(error.to_string().contains("same name"), "{error}");
         fs::remove_file(&path).expect("clean up");
     }
 

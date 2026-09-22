@@ -6296,6 +6296,100 @@ fn a_file_backed_insert_streams_into_a_snapshot_that_a_new_process_can_read() {
     std::fs::remove_file(path).expect("the temporary native database is removed");
 }
 
+/// A schema committed by an earlier session is still loaded as a stream rather than through memory.
+///
+/// What says whether a table already in the file is in the way of the one being written is how many
+/// rows it holds, and one that holds none is not in the way: the generation being written takes its
+/// place in the catalog. Before that was asked, the name alone was enough to refuse, so a schema
+/// created in one session and loaded in the next took the in-memory path and the load needed memory
+/// the size of the table. That is not a corner. `CREATE TABLE` in one statement and `INSERT INTO
+/// ... SELECT` in the next is what every loading script writes, ClickBench's included.
+///
+/// Native rather than in memory is the observable, and it is the whole of the difference. A load
+/// that streamed has its rows in the file the moment the statement returns and nothing of the table
+/// in memory. A load that did not is holding all of them and reaches the file at the next
+/// checkpoint.
+#[test]
+fn an_insert_into_a_committed_empty_table_streams_into_the_file() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-native-empty-reload-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the new native database opens");
+    database.execute("CREATE TABLE hits (id INTEGER, name VARCHAR)").expect("the table is made");
+    database.execute("CHECKPOINT").expect("the empty table is committed on its own");
+    drop(database);
+
+    let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the committed empty table reopens");
+    reopened
+        .execute("INSERT INTO hits VALUES (1, 'one'), (2, NULL), (3, 'three')")
+        .expect("the rows are inserted");
+    assert!(reopened.with_catalog(|catalog| {
+        let name = rudb_catalog::QualifiedName::new("memory", "main", "hits");
+        catalog.table(&name).expect("the table is there").rows().is_native()
+    }));
+    drop(reopened);
+
+    let again = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the appended generation reopens");
+    assert_eq!(
+        rows(&again, "SELECT count(*), sum(id), min(name) FROM hits"),
+        vec![vec![Value::BigInt(3), Value::HugeInt(6), Value::Varchar("one".into())]]
+    );
+    std::fs::remove_file(path).expect("the temporary native database is removed");
+}
+
+/// The same load with a table beside it in the file, whose rows the new generation carries forward.
+///
+/// The generation being written names every table the file will hold, so the ones it is not writing
+/// are carried by their directory pointer and their pages are not read. The check that they are all
+/// there is what keeps a table with rows only in memory from being dropped by a generation that
+/// never knew about it, and taking the empty target out of the file's side of that comparison is
+/// the part of this that could go wrong quietly.
+#[test]
+fn a_committed_empty_table_streams_beside_a_table_that_holds_rows() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-native-empty-neighbour-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the new native database opens");
+    database.execute("CREATE TABLE kept (id INTEGER)").expect("the neighbour is made");
+    database.execute("INSERT INTO kept VALUES (7), (8)").expect("the neighbour gets rows");
+    database.execute("CREATE TABLE hits (id INTEGER, name VARCHAR)").expect("the target is made");
+    database.execute("CHECKPOINT").expect("both tables are committed");
+    drop(database);
+
+    let reopened = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the committed pair reopens");
+    reopened.execute("INSERT INTO hits VALUES (1, 'one'), (2, 'two')").expect("the rows go in");
+    assert!(reopened.with_catalog(|catalog| {
+        let name = rudb_catalog::QualifiedName::new("memory", "main", "hits");
+        catalog.table(&name).expect("the table is there").rows().is_native()
+    }));
+    drop(reopened);
+
+    let again = Database::open(path.to_str().expect("a UTF-8 temporary path"))
+        .expect("the appended generation reopens");
+    assert_eq!(rows(&again, "SELECT count(*) FROM hits"), vec![vec![Value::BigInt(2)]]);
+    // The neighbour is the half that a wrong carry would lose, and it is still all there.
+    assert_eq!(
+        rows(&again, "SELECT count(*), sum(id) FROM kept"),
+        vec![vec![Value::BigInt(2), Value::HugeInt(15)]]
+    );
+    std::fs::remove_file(path).expect("the temporary native database is removed");
+}
+
 /// A temporary table never reaches the file, so reopening the file does not find one.
 ///
 /// This is the part that would be quietly wrong rather than loudly wrong: a checkpoint that wrote

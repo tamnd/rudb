@@ -1,6 +1,6 @@
 //! The handle everything else hangs off.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -561,11 +561,19 @@ fn rename(temporary: &Path, path: &Path) -> Result<()> {
 /// `None`, because the caller's other answer is to write the whole file, and writing over something
 /// that might be somebody else's is worse than refusing.
 fn committed(path: &Path) -> Result<Option<BTreeSet<String>>> {
+    Ok(held_rows(path)?.map(|held| held.into_keys().collect()))
+}
+
+/// The same tables with the row count the committed catalog records for each of them.
+///
+/// Only one caller needs the counts and it needs them for one question, which is whether a table
+/// already in the file would be in the way of a load streaming into it. See [`appendable`].
+fn held_rows(path: &Path) -> Result<Option<BTreeMap<String, usize>>> {
     if !path.exists() {
         return Ok(None);
     }
     let held = rudb_native::Catalog::open(path)?;
-    Ok(Some(held.names().map(str::to_string).collect()))
+    Ok(Some(held.rows().map(|(name, rows)| (name.to_string(), rows)).collect()))
 }
 
 /// The same set of names, taken from the catalog instead.
@@ -646,10 +654,19 @@ fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Resu
 /// The target is counted out of both sides rather than assumed to be in the catalog, because a
 /// `CREATE TABLE AS SELECT` asks this before it has made the entry.
 fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<bool> {
-    let Some(held) = committed(path)? else { return Ok(false) };
-    if held.contains(&target.table) {
+    let Some(held) = held_rows(path)? else { return Ok(false) };
+    // A committed table of this name with rows in it is one the writer would collide with, because
+    // carrying those rows forward means reading and rewriting its pages. One with no rows is not:
+    // the generation being written takes its place. That is what lets a schema created and
+    // committed by an earlier statement still be loaded by a stream instead of through memory.
+    if held.get(&target.table).is_some_and(|rows| *rows > 0) {
         return Ok(false);
     }
+    // Everything the new generation carries forward, which is the file's tables without the one
+    // being written. It has to match the catalog's other tables exactly for the same reason it
+    // always did: a table in one and not the other is rows this generation would not carry.
+    let carried =
+        held.keys().filter(|name| *name != &target.table).cloned().collect::<BTreeSet<_>>();
     let others = catalog.stored_tables().filter(|table| table.name() != target).count();
     let native = catalog
         .stored_tables()
@@ -658,7 +675,7 @@ fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<
         .collect::<BTreeSet<_>>();
     // The count as well as the set, because a table that is in neither is a table with rows in
     // memory that this generation would not carry.
-    Ok(held == native && others == native.len())
+    Ok(carried == native && others == native.len())
 }
 
 /// One pipeline instance's place in the source, and the run of chunks it is holding.
