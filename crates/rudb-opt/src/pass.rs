@@ -64,6 +64,9 @@ pub trait Pass {
 pub struct Context {
     disabled: Vec<&'static str>,
     facts: std::sync::Arc<crate::estimate::Facts>,
+    /// The relationships a link join may be planned over, which is empty for almost every
+    /// statement and is the whole of what the graph layer adds to this type.
+    links: std::sync::Arc<Vec<crate::link::Linked>>,
 }
 
 impl Context {
@@ -186,6 +189,21 @@ impl Context {
     #[must_use]
     pub fn facts(&self) -> &crate::estimate::Facts {
         &self.facts
+    }
+
+    /// Hands the optimizer the relationships the files already hold a link for.
+    ///
+    /// The same seam [`Self::measure`] is, and a fact of the same kind: an entry here says the
+    /// link is in the file and was built against the parent this names, which is something only
+    /// the layer that can open the file knows. A declaration nobody verified never reaches here.
+    pub fn relate(&mut self, links: std::sync::Arc<Vec<crate::link::Linked>>) {
+        self.links = links;
+    }
+
+    /// The relationships a link join may be planned over, empty unless a caller filled them.
+    #[must_use]
+    pub fn links(&self) -> &[crate::link::Linked] {
+        &self.links
     }
 }
 

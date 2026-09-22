@@ -27,6 +27,7 @@ pub mod fromkey;
 pub mod keys;
 pub mod late;
 pub mod limit;
+pub mod link;
 pub mod nulls;
 pub mod order;
 pub mod pass;
@@ -160,7 +161,17 @@ pub const RANK: u8 = 11;
 /// does running either of them twice, because each round the two of them trade moves one more level
 /// of a nested query, so the number of rounds it takes is how deeply the query is nested. What fixes
 /// it is filter pushdown crossing the limits itself, which is described where it does that.
-pub static PASSES: [&(dyn Pass + Sync); 19] = [
+///
+/// Reading a link instead of building a hash table is last of all, after the build side has been
+/// chosen. It replaces a join outright, so a pass that ran after it would have to know about a
+/// second kind of join to say anything about one, and there is nothing any of them want to say:
+/// the join it leaves behind has the same inputs, the same condition and the same kind. It also
+/// needs the plan to have stopped moving, because what it asks about the parent is how many rows
+/// reach it and what it asks about the child is whether the rows are still the table's own, and
+/// both of those are questions about a plan somebody is going to run rather than a draft of one.
+/// Running after the build side costs nothing, because the side a link join builds is neither of
+/// them.
+pub static PASSES: [&(dyn Pass + Sync); 20] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -180,6 +191,7 @@ pub static PASSES: [&(dyn Pass + Sync); 19] = [
     &topn::TopN,
     &late::LateMaterialization,
     &sides::BuildSideProbeSide,
+    &link::LinkJoinRewrite,
 ];
 
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
