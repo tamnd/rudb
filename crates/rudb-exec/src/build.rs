@@ -457,8 +457,13 @@ struct NativeFrequencies {
 ///
 /// A filter between the grouping and the table is allowed when it names the same column being
 /// grouped, because then it only decides which of the groups survive and never splits or merges one.
-/// That is the whole of `WHERE AdvEngineID <> 0 GROUP BY AdvEngineID`, and it needs the complete
-/// synopsis for the same reason the unbounded case does.
+/// That is the whole of `WHERE AdvEngineID <> 0 GROUP BY AdvEngineID`. Without a `top` bound it
+/// needs the complete synopsis for the same reason the unbounded case does; with one it needs only
+/// the prefix, because [`CertainFilter::kept_top`] proves the boundary against the bound the
+/// synopsis carries on everything it left out. That second case is the one that matters at scale:
+/// it is `WHERE Referer <> '' GROUP BY Referer ORDER BY count(*) DESC LIMIT 10`, a column with
+/// nineteen million distinct values that will never have a complete synopsis, answered from five
+/// hundred entries of directory without reading a row.
 fn native_frequencies(
     plan: &Plan,
     catalog: &Catalog,
@@ -510,7 +515,10 @@ fn native_frequencies(
     let entries = match certain {
         // A filter over some other column would decide rows inside a group rather than whole groups,
         // and the synopsis of the grouping column says nothing about which of its rows those are.
-        Some(certain) if certain.column == column => certain.kept(),
+        Some(certain) if certain.column == column => match top {
+            Some(top) => certain.kept_top(top),
+            None => certain.kept(),
+        },
         Some(_) => return Ok(None),
         None => match top {
             Some(top) => table.rows().top_frequencies(column, top)?,
@@ -647,13 +655,20 @@ fn grouped_column<'a>(
 /// A filter over a stored table whose rows the file can count without reading any of them.
 ///
 /// The shape is one equality or inequality against a constant, over a column the file wrote a
-/// complete frequency synopsis for. That synopsis is every distinct value of the column with an
-/// exact count, so which values the predicate keeps and how many rows hold them are both already
-/// known, and the whole of `WHERE AdvEngineID <> 0` is a walk over fourteen entries rather than a
-/// million.
+/// frequency synopsis for. That synopsis is the leading distinct values of the column with an exact
+/// count each and a bound on every value it left out, so which values the predicate keeps and how
+/// many rows hold them are both already known for the values it lists, and the whole of
+/// `WHERE AdvEngineID <> 0` is a walk over fourteen entries rather than a million.
+///
+/// How much of that is usable depends on `omitted_max`. A bound of zero says the list is the whole
+/// column and every question below is answerable. Above zero the list is a prefix, so a count of
+/// the surviving rows is not available at all and a grouping is available only for a bounded number
+/// of leading groups, which is what [`CertainFilter::kept_top`] proves.
 struct CertainFilter {
-    /// Every value of the column the predicate names, with its exact row count.
+    /// The leading values of the column the predicate names, with their exact row counts.
     entries: Vec<(Value, u64)>,
+    /// How many rows any value outside `entries` can hold, and zero when there are none.
+    omitted_max: u64,
     /// Which column of the stored table the predicate names.
     column: usize,
     /// The constant the predicate compares against, never null.
@@ -664,7 +679,13 @@ struct CertainFilter {
 
 impl CertainFilter {
     /// How many rows the predicate keeps, or `None` if any entry cannot be decided.
+    ///
+    /// Needs the complete list. A value the synopsis left out is a value whose rows are missing
+    /// from this sum, and a row count that is quietly short is worse than no row count at all.
     fn rows(&self) -> Option<u64> {
+        if self.omitted_max != 0 {
+            return None;
+        }
         let mut kept = 0_u64;
         for (value, count) in &self.entries {
             if self.keeps(value)? {
@@ -678,8 +699,50 @@ impl CertainFilter {
     ///
     /// One entry is one distinct value, and a grouping of the column it came from puts every row
     /// holding that value in one group, so the surviving entries are the answer to a grouped count
-    /// and not just an input to one.
+    /// and not just an input to one. Needs the complete list, since a grouping asked for without a
+    /// bound has to produce every group and a prefix is not every group.
     fn kept(&self) -> Option<Vec<(Value, u64)>> {
+        if self.omitted_max != 0 {
+            return None;
+        }
+        self.survivors()
+    }
+
+    /// The entries the predicate keeps, when the leading `top` of them are provably the leading
+    /// `top` of the filtered column.
+    ///
+    /// This is the case the complete list is not needed for, and it is the shape half of ClickBench
+    /// asks: filter a column, group by that same column, order by the count and keep ten. The
+    /// synopsis lists the leading values of the column with exact counts and bounds every value it
+    /// left out by `omitted_max`. The filter names the column being grouped, so it decides whole
+    /// values and never splits one or merges two: an entry it keeps keeps all of its rows, and an
+    /// omitted value it keeps still holds at most `omitted_max` rows because filtering cannot add
+    /// any. So if the `top`th surviving entry outranks that bound, nothing left out can reach the
+    /// answer and the leading `top` survivors are exact.
+    ///
+    /// Returned with the tail still on, the way [`Reader::top_frequencies`] returns it, so that a
+    /// later `TopN` can break a tie on the boundary with another ordering key.
+    ///
+    /// `None` when the proof does not go through, which is when fewer than `top` values survive the
+    /// filter or when the `top`th of them does not beat the bound. Then the caller reads the rows,
+    /// and the cost of having asked is a walk over a few hundred entries.
+    ///
+    /// [`Reader::top_frequencies`]: rudb_native::Reader::top_frequencies
+    fn kept_top(&self, top: usize) -> Option<Vec<(Value, u64)>> {
+        if top == 0 {
+            return None;
+        }
+        let out = self.survivors()?;
+        // Count descending is how the synopsis is stored and dropping entries does not reorder it,
+        // so the boundary is where it is without a sort.
+        if out.get(top - 1).is_some_and(|&(_, count)| count > self.omitted_max) {
+            return Some(out);
+        }
+        None
+    }
+
+    /// Every entry the predicate keeps, in the order the synopsis stored them.
+    fn survivors(&self) -> Option<Vec<(Value, u64)>> {
         let mut out = Vec::with_capacity(self.entries.len());
         for (value, count) in &self.entries {
             if self.keeps(value)? {
@@ -738,8 +801,9 @@ fn certain_filter(plan: &Plan, catalog: &Catalog, node: NodeRef) -> Result<Optio
     let Some(column) = stored_column(plan, table, index, columns, binding) else {
         return Ok(None);
     };
-    let Some(entries) = table.rows().exact_frequencies(column)? else { return Ok(None) };
-    Ok(Some(CertainFilter { entries, column, against, differs }))
+    let Some(prefix) = table.rows().frequency_prefix(column)? else { return Ok(None) };
+    let (entries, omitted_max) = (prefix.entries, prefix.omitted_max);
+    Ok(Some(CertainFilter { entries, omitted_max, column, against, differs }))
 }
 
 /// How many rows a node produces, when that can be known without producing them.

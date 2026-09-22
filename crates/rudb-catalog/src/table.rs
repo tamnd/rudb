@@ -5,7 +5,9 @@ use std::sync::Arc;
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value};
-use rudb_native::{Common, FrequencyOccurrences, Reader as NativeReader, StoredPart, Stripes};
+use rudb_native::{
+    Common, FrequencyOccurrences, FrequencyPrefix, Reader as NativeReader, StoredPart, Stripes,
+};
 use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
 
@@ -124,6 +126,34 @@ impl Rows {
             Self::Native(reader) => reader.top_frequencies(column, top),
             // A count descending prefix of the file is not one of the table, because a value the
             // rows in memory hold a hundred of can be anywhere in the file's list or absent from it.
+            Self::Grown(_, _) => Ok(None),
+        }
+    }
+
+    /// Exact leading value frequencies with a bound on every value left out of them.
+    ///
+    /// The same list [`top_frequencies`] proves a prefix of, handed over with the bound instead of
+    /// the proof, so that a caller holding a predicate can do the proving itself. A filter naming
+    /// the column being grouped removes whole values from the list and can never split one or merge
+    /// two, so the bound on what the list left out survives the filter unchanged and the proof is
+    /// the same comparison against a shorter list. A caller without a predicate wants the method
+    /// above, which already makes it.
+    ///
+    /// A table in memory carries a bound of zero or no list at all, because its tally holds every
+    /// value of the column or it holds nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema or a stored value does not fit its declared type.
+    ///
+    /// [`top_frequencies`]: Self::top_frequencies
+    pub fn frequency_prefix(&self, column: usize) -> Result<Option<FrequencyPrefix>> {
+        match self {
+            Self::Memory(rows) => Ok(rows
+                .frequencies(column)?
+                .map(|entries| FrequencyPrefix { entries, omitted_max: 0 })),
+            Self::Native(reader) => reader.frequency_prefix(column),
+            // Neither half holds the other's rows, so neither the list nor the bound is the table's.
             Self::Grown(_, _) => Ok(None),
         }
     }
