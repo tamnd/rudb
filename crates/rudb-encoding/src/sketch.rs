@@ -306,6 +306,37 @@ impl Sketch {
         self.held == 0
     }
 
+    /// The same column sketched at a smaller k, which is the bottom k of the hashes this holds.
+    ///
+    /// Exact, and that is worth the sentence because the opposite direction is not. A bottom-k
+    /// sketch holds the k smallest hashes of everything it saw, so the 256 smallest of the 4096
+    /// smallest are the 256 smallest, full stop. Nothing is approximated and the result is
+    /// indistinguishable from a sketch of 256 built over the same column from the start. Going the
+    /// other way, pouring small sketches into a larger one, gives a sketch that never fills and so
+    /// claims to be exact about a column it only saw a slice of, which is the failure
+    /// `rudb_stats::Sketches` is arranged around.
+    ///
+    /// This is how a column that is sketched once at the default k gets written down per stripe at
+    /// the smaller k a stripe sketch keeps, without the column being hashed a second time.
+    ///
+    /// # Errors
+    ///
+    /// If `k` is not one a sketch can be built with, or if it is larger than this sketch's own,
+    /// which is the direction above that does not work.
+    pub fn narrowed(&self, k: usize) -> Result<Self> {
+        if k > self.k {
+            return Err(Error::internal(format!(
+                "a sketch of {} hashes cannot be widened to {k}",
+                self.k
+            )));
+        }
+        // For the bounds check on k, whose answer is thrown away because `holding` below builds the
+        // sketch from a list rather than by adding to this one.
+        Self::new(k)?;
+        let bottom = self.bottom();
+        Ok(Self::holding(k, &bottom[..bottom.len().min(k)]))
+    }
+
     /// Whether the sketch saw fewer than k distinct values, in which case it holds all of them and
     /// every count it gives is exact rather than estimated.
     #[must_use]
@@ -686,6 +717,41 @@ mod tests {
         let right = values(300_000, "right-");
         let union = Sketch::of(&borrow(&left)).union(&Sketch::of(&borrow(&right))).unwrap();
         assert!(within(union.distinct(), 600_000.0, 0.03), "{:.0}", union.distinct());
+    }
+
+    #[test]
+    fn narrowing_a_sketch_gives_what_sketching_the_column_at_that_k_would_have() {
+        // The property the per stripe writer leans on, and it is an equality rather than a
+        // tolerance: a bottom-k of a bottom-k is a bottom-k, so the narrowed sketch holds the same
+        // hashes as one built over the same column from the start, and both estimate the same
+        // number off them.
+        let column = values(100_000, "value-");
+        let wide = Sketch::of(&borrow(&column));
+        let narrow = wide.narrowed(256).unwrap();
+        let direct = {
+            let mut sketch = Sketch::new(256).unwrap();
+            for value in &column {
+                sketch.add(value);
+            }
+            sketch
+        };
+        assert_eq!(narrow.bottom(), direct.bottom());
+        assert_eq!(narrow.k(), 256);
+        assert!(!narrow.is_exact(), "a hundred thousand values fill a sketch of 256");
+        assert_eq!(narrow.distinct(), direct.distinct());
+    }
+
+    #[test]
+    fn narrowing_a_sketch_that_never_filled_keeps_it_exact() {
+        // A column under the smaller k is held entire either way, so narrowing cannot turn an exact
+        // count into an estimate. The other direction is the one that lies, and it is refused.
+        let column = values(100, "value-");
+        let sketch = Sketch::of(&borrow(&column));
+        let narrow = sketch.narrowed(256).unwrap();
+        assert!(narrow.is_exact());
+        assert_eq!(narrow.distinct(), 100.0);
+        assert!(narrow.narrowed(DEFAULT_K).is_err(), "narrowing does not widen");
+        assert!(sketch.narrowed(0).is_err());
     }
 
     #[test]

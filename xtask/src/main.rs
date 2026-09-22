@@ -34,6 +34,7 @@ mod seams;
 mod sha256;
 mod smoke;
 mod source;
+mod stats;
 mod style;
 mod timing;
 mod vendor;
@@ -100,6 +101,7 @@ fn main() -> ExitCode {
         // What a key map costs to build and to keep, which is G1's exit measurement. Not under
         // `native` above, because that one reads a directory and this one writes to the file.
         Some("graph") => graph::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        Some("stats") => stats::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("conform") => conform::run(&root()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
@@ -171,6 +173,19 @@ fn usage() {
         "           percent budget of spec/graph/03-the-file-format.md section 3.7. it writes"
     );
     println!("           to the file, and a map the budget turned away is printed with its size");
+    println!(
+        "  stats <file.db> <table>...  builds a summary and a sketch for every column of each"
+    );
+    println!("           named table and prints what each cost, against the two percent budget of");
+    println!(
+        "           spec/stats/03-the-file-format.md section 3.8. it writes to the file, and a"
+    );
+    println!("           column the budget turned away is printed with what it would have cost");
+    println!(
+        "           --stripes promotes every column to per stripe sketches, which is the case"
+    );
+    println!("           section 3.8 says does not fit, so the run prints the number the rule for");
+    println!("           promoting only the columns that get read exists because of");
     println!("  native <file.db>       where a native file's bytes went, per column and per kind");
     println!("           of byte, out of the committed directory alone, so it costs the same on");
     println!("           a 45 GB table as on an empty one. --all prints every column, not 20");

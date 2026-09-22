@@ -27,13 +27,22 @@
 //! computes every field of the summary and the sketch from it, so the cost of statistics on a write
 //! is the cost of one more read of each column asked for, and no column is read twice.
 //!
-//! # What is deliberately not here yet
+//! # The per stripe rule
 //!
-//! Per stripe sketches. Section 3.8's rule is that per stripe structures are written only for the
-//! columns that get read, and which columns those are comes out of document 06's observation log at
-//! the next checkpoint. So every sketch this builds is a merged one and [`Sketches::stripes`] is
-//! empty, which is not a degraded state but the state the rule says most columns are in. The
-//! promotion path is the next piece of work and it does not change any byte written here.
+//! Section 3.8 says per stripe structures are written only for the columns that get read, and the
+//! arithmetic behind that is not close: sixteen `lineitem` columns at SF100, sketched per stripe
+//! even at the small k a stripe sketch keeps, come to several hundred megabytes against a budget of
+//! two percent. So the default is a merged sketch and nothing else, and [`Sketches::stripes`] being
+//! empty is the state the rule says most columns are in rather than a degraded one.
+//!
+//! [`read_columns`] is what this build promotes a column with. It reads the promoted set off the
+//! file, which today means the columns that already carry a key map or a forward link, because
+//! those are the columns something has declared a relationship or a key over and section 3.8 names
+//! them directly. Document 06's observation log is the other source the spec names and it is not
+//! built yet, so when it arrives it adds columns to this list and changes nothing else here.
+//!
+//! Promotion costs no extra hashing. The column is read once and hashed once either way, and what
+//! changes is where the counting is reset. [`build_summary_for`] has the argument.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -42,8 +51,8 @@ use std::time::{Duration, Instant};
 use rudb_common::bounds::{self, Bound};
 use rudb_common::stat::Class;
 use rudb_common::{LogicalType, Result, Value};
-use rudb_encoding::sketch::Sketch;
-use rudb_stats::{Order, Sketches, Summary, sketches::HEADER_BYTES as SKETCH_HEADER};
+use rudb_encoding::sketch::{DEFAULT_K, Sketch};
+use rudb_stats::{Order, STRIPE_K, Sketches, Summary, sketches::HEADER_BYTES as SKETCH_HEADER};
 use rudb_storage::count::{Counts, countable};
 use rudb_vector::Vector;
 
@@ -83,6 +92,9 @@ pub struct Built {
     pub summary_bytes: usize,
     /// What the sketches section takes in the file.
     pub sketch_bytes: usize,
+    /// How many per stripe sketches went in it, which is zero for a column the per stripe rule did
+    /// not promote and is most of them.
+    pub stripes: usize,
     /// What the column takes in the file, which is what the budget is a share of.
     pub column_bytes: u64,
     /// Whether the sections were kept. False means they were built, measured, and found to cost more
@@ -119,6 +131,30 @@ pub struct Stats {
 /// interval and the nested ones, a summary of one would carry a distinct count of zero that nothing
 /// could tell from a column of nulls, and none of TPC-H or ClickBench has one.
 pub fn build_summary(reader: &Reader, column: usize) -> Result<Stats> {
+    build_summary_for(reader, column, false)
+}
+
+/// The same, keeping a sketch per stripe as well as the merged one when `per_stripe` is set.
+///
+/// Whether to set it is section 3.8's rule and not a caller's taste: per stripe structures are
+/// written only for the columns that get read, because sixteen `lineitem` columns at SF100 come to
+/// several hundred megabytes of them against a budget of two percent. [`read_columns`] is what this
+/// build answers that question with.
+///
+/// The extra sketches cost no extra hashing. Each stripe is counted into its own [`Counts`] at the
+/// column's k, the merged sketch is the union of those, which is exact because they are all at the
+/// same k, and each one is written down at [`rudb_stats::STRIPE_K`] through [`Sketch::narrowed`],
+/// which is exact because a bottom-k of a bottom-k is a bottom-k. So the column is read once and
+/// hashed once either way, and the difference between a promoted column and an ordinary one is
+/// where the counting is reset and how much of it is written.
+///
+/// # Errors
+///
+/// If the column cannot be read, is past the end of the table, or is of a type with no hash rule.
+/// The last one is refused by name rather than approximated: the types without a rule are the
+/// interval and the nested ones, a summary of one would carry a distinct count of zero that nothing
+/// could tell from a column of nulls, and none of TPC-H or ClickBench has one.
+pub fn build_summary_for(reader: &Reader, column: usize, per_stripe: bool) -> Result<Stats> {
     let fields = reader.table().fields();
     let Some(field) = fields.get(column) else {
         return Err(invalid(&format!(
@@ -133,30 +169,47 @@ pub fn build_summary(reader: &Reader, column: usize) -> Result<Stats> {
             field.name, field.ty
         )));
     }
-
-    let mut counts = Counts::new(1);
-    let mut pass = Pass::new(&field.ty, reader.table().generation());
-    for stripe in reader.stripe_parts() {
-        pass.open_stripe();
-        for part in stripe {
-            let chunk = reader.read(part, &[column])?;
-            counts.add(&chunk);
-            pass.scan(chunk.column(0)?);
-        }
-        pass.close_stripe();
-    }
-    let Some(sketch) = counts.sketch(0) else {
+    let blind = || {
         // A blind column: a form `rudb_storage::count` has no arm for turned up, so its sketch is
         // missing rows and says nothing about which. A distinct count that is too low is the one
         // error an estimator has no defence against, so the column gets no summary at all rather
         // than a summary with a number in it nothing can check.
-        return Err(invalid(&format!(
+        invalid(&format!(
             "column {} of {} holds a form with no hash rule, so it has no sketch",
             field.name,
             reader.table().name()
-        )));
+        ))
     };
-    Ok(pass.finish(sketch))
+
+    let mut whole = Counts::new(1);
+    let mut stripes = Vec::new();
+    let mut pass = Pass::new(&field.ty, reader.table().generation());
+    for stripe in reader.stripe_parts() {
+        pass.open_stripe();
+        let mut counted = per_stripe.then(|| Counts::new(1));
+        for part in stripe {
+            let chunk = reader.read(part, &[column])?;
+            match counted.as_mut() {
+                Some(counted) => counted.add(&chunk),
+                None => whole.add(&chunk),
+            }
+            pass.scan(chunk.column(0)?);
+        }
+        pass.close_stripe();
+        if let Some(counted) = counted {
+            stripes.push(counted.sketch(0).ok_or_else(blind)?);
+        }
+    }
+    if !per_stripe {
+        return Ok(pass.finish(whole.sketch(0).ok_or_else(blind)?, Vec::new()));
+    }
+    let mut merged = Sketch::new(DEFAULT_K)?;
+    for stripe in &stripes {
+        merged = merged.union(stripe)?;
+    }
+    let narrowed =
+        stripes.iter().map(|stripe| stripe.narrowed(STRIPE_K)).collect::<Result<Vec<_>>>()?;
+    Ok(pass.finish(merged, narrowed))
 }
 
 /// One scan of one column, in `rid` order, for everything the sketch does not answer.
@@ -318,7 +371,7 @@ impl Pass {
         }
     }
 
-    fn finish(self, sketch: Sketch) -> Stats {
+    fn finish(self, sketch: Sketch, stripes: Vec<Sketch>) -> Stats {
         let present = self.rows - self.nulls;
         // The one rule the module doc names. An exact distinct count is one the sketch never had to
         // throw a value away to keep, and everything downstream of the count follows from this
@@ -368,7 +421,18 @@ impl Pass {
             widest: self.widest,
             newest: self.generation,
         };
-        Stats { summary, sketches: Sketches::merged(sketch) }
+        // `new` rather than `merged` even for the empty case, because the two differ only in
+        // whether the list is checked and an empty list passes. A stripe sketch that is not at
+        // STRIPE_K is a bug in this file and is worth hearing about here rather than at the read.
+        let sketches = match Sketches::new(sketch.clone(), stripes) {
+            Ok(sketches) => sketches,
+            // Unreachable, since every stripe sketch above came out of `narrowed(STRIPE_K)` and a
+            // table cannot hold a million stripes. The merged sketch alone is the answer anyway:
+            // per stripe sketches are an optimization over a summary that is complete without
+            // them, so losing them costs a skipped stripe and never an answer.
+            Err(_) => Sketches::merged(sketch),
+        };
+        Stats { summary, sketches }
     }
 }
 
@@ -438,6 +502,36 @@ pub fn build_stats(path: &Path, table: &str, columns: &[usize]) -> Result<Vec<Bu
     build_stats_within(path, table, columns, BUDGET_SHARE)
 }
 
+/// The columns of this table the per stripe rule promotes, in column order.
+///
+/// Section 3.8's default set: the columns something has declared a relationship or a key over. What
+/// this build has to go on for that is the file itself, so the answer is the columns that already
+/// carry a graph section, which is a key map or a forward link. That is not a proxy for the
+/// question, it is the same question asked of the only party that has been told the answer: a key
+/// map exists on a column because something declared it a key.
+///
+/// Empty is the ordinary answer and it is the right one. A table nothing has declared anything over
+/// gets table level summaries and no per stripe sketches, which is what section 3.8 says and what
+/// keeps SF100 inside two percent.
+///
+/// The other source the spec names is document 06's observation log, which promotes a column that
+/// queries turned out to read at the next checkpoint. It is not built yet. When it is, it adds
+/// columns here and nothing else in this file changes.
+#[must_use]
+pub fn read_columns(reader: &Reader) -> Vec<usize> {
+    let generation = reader.table().generation();
+    let mut promoted = reader
+        .table()
+        .sections()
+        .iter()
+        .filter(|held| held.among(section::GRAPH_KINDS) && held.usable(generation))
+        .filter_map(|held| usize::try_from(held.id).ok())
+        .collect::<Vec<_>>();
+    promoted.sort_unstable();
+    promoted.dedup();
+    promoted
+}
+
 /// The same, against a budget of `share` percent of the table's stored column bytes.
 ///
 /// The budget is over the table rather than over a column, and when it binds the cheapest columns
@@ -459,6 +553,30 @@ pub fn build_stats_within(
     columns: &[usize],
     share: u64,
 ) -> Result<Vec<Built>> {
+    let promoted = read_columns(&Catalog::open(path)?.table(table)?);
+    build_stats_for(path, table, columns, &promoted, share)
+}
+
+/// The same, with the per stripe set named rather than read off the file.
+///
+/// For a caller that knows something this build does not, which today is the measurement harness and
+/// tomorrow is whatever reads document 06's observation log. [`build_stats_within`] is the ordinary
+/// entry point and it asks [`read_columns`].
+///
+/// A column in `per_stripe` that is not in `columns` is ignored rather than refused, because the two
+/// lists answer different questions and a caller that names a promoted column it is not building is
+/// not making a mistake worth stopping for.
+///
+/// # Errors
+///
+/// If the file cannot be opened, a column cannot be summarized, or the attach fails.
+pub fn build_stats_for(
+    path: &Path,
+    table: &str,
+    columns: &[usize],
+    per_stripe: &[usize],
+    share: u64,
+) -> Result<Vec<Built>> {
     let reader = Catalog::open(path)?.table(table)?;
     let column_bytes = reader.layout().columns_total();
     let allowance = (column_bytes.saturating_mul(share) / 100).max(BUDGET_FLOOR);
@@ -467,7 +585,7 @@ pub fn build_stats_within(
     let mut payloads = Vec::with_capacity(columns.len());
     for &column in columns {
         let start = Instant::now();
-        let stats = build_summary(&reader, column)?;
+        let stats = build_summary_for(&reader, column, per_stripe.contains(&column))?;
         let mut summary = Vec::new();
         stats.summary.encode(&mut summary)?;
         let mut sketches = Vec::new();
@@ -480,6 +598,7 @@ pub fn build_stats_within(
             order: stats.summary.order,
             summary_bytes: summary.len(),
             sketch_bytes: sketches.len(),
+            stripes: stats.sketches.stripes.len(),
             column_bytes,
             built: false,
             build: start.elapsed(),
@@ -527,16 +646,24 @@ pub fn build_stats_within(
     Ok(report)
 }
 
-/// What the table's existing sections cost, leaving out the statistics this build is replacing.
+/// What the table's existing statistics sections cost, leaving out the ones this build is replacing.
 ///
-/// Every section counts, the graph ones included, because the file is one file. The two budgets are
-/// separate shares of the same column bytes and each is checked against what is already spent, which
-/// is how one layer overrunning is visible to the other rather than silently doubling the total.
+/// Statistics sections only. The two percent of section 3.8 and the graph layer's ten percent are
+/// separate shares of the same column bytes, and separate means each counts only what it owns. A
+/// TPC-H SF10 file's key maps are 7.7 MB against a two percent allowance of 54 MB, so counting them
+/// here would hand a seventh of the statistics budget to sections that already have one of their
+/// own, and a table would lose summaries for a reason that has nothing to do with summaries.
+///
+/// Reading the extent tables is what this costs, which is one small read per section and not a read
+/// of a payload. A section whose extent table does not checksum is counted as nothing, because it
+/// is a section that is already not there.
 fn held_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
     let mut total = 0;
     for held in reader.table().sections() {
-        let mine = held.kind == *section::SUMMARY || held.kind == *section::SKETCHES;
-        let replaced = mine && replacing.iter().any(|&column| u64::try_from(column) == Ok(held.id));
+        if !held.among(section::STATISTICS_KINDS) {
+            continue;
+        }
+        let replaced = replacing.iter().any(|&column| u64::try_from(column) == Ok(held.id));
         if replaced || !held.usable(reader.table().generation()) {
             continue;
         }
@@ -611,6 +738,26 @@ mod tests {
         let mut writer =
             Writer::create(&path, "t", vec![Field::new("v", LogicalType::BigInt)]).expect("new");
         for part in values.chunks(1000) {
+            let held =
+                part.iter().map(|v| v.map_or(Value::Null, Value::BigInt)).collect::<Vec<_>>();
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("values")])
+                    .expect("one column");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+        path
+    }
+
+    /// The same, with the part size named, for a test that needs more than one stripe.
+    ///
+    /// A stripe is up to `STRIPE_PARTS` parts, so small parts are how a test crosses a stripe
+    /// boundary without writing a hundred and thirty thousand rows to do it.
+    fn table_of_parts(label: &str, values: &[Option<i64>], per_part: usize) -> PathBuf {
+        let path = path(label);
+        let mut writer =
+            Writer::create(&path, "t", vec![Field::new("v", LogicalType::BigInt)]).expect("new");
+        for part in values.chunks(per_part) {
             let held =
                 part.iter().map(|v| v.map_or(Value::Null, Value::BigInt)).collect::<Vec<_>>();
             let chunk =
@@ -732,6 +879,71 @@ mod tests {
         assert_eq!(summary.low, Some(Bound::Int(0)));
         assert_eq!(summary.high, Some(Bound::Int(1999)));
 
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_column_something_declared_a_key_over_is_sketched_per_stripe_and_a_plain_one_is_not() {
+        // Section 3.8's rule, both halves of it. Nothing has declared anything over this column, so
+        // the first build gives it the table level summary and no per stripe sketches, which is the
+        // state most columns are in and is what keeps SF100 inside two percent. A key map is then
+        // built over it, which is something declaring it a key, and the next build promotes it.
+        let values = (1..=19_200_i64).map(Some).collect::<Vec<_>>();
+        let path = table_of_parts("promoted", &values, 100);
+
+        let plain = build_stats(&path, "t", &[0]).expect("build");
+        assert_eq!(plain[0].stripes, 0, "nothing has declared anything over this column yet");
+
+        crate::graph::build_key_maps(&path, "t", &[0]).expect("a key map declares it a key");
+        let promoted = build_stats(&path, "t", &[0]).expect("rebuild");
+        assert!(promoted[0].stripes > 1, "{} stripes, wanted more than one", promoted[0].stripes);
+        assert!(promoted[0].built, "and they fit");
+        // The equality rather than a tolerance. The merged sketch of a promoted column is the union
+        // of its stripe sketches at the column's own k, and a union of bottom-k sketches at one k
+        // is the bottom-k of everything they saw, so it holds the same hashes as the single sketch
+        // the plain build made. Promotion changes where the counting is reset and nothing else.
+        assert_eq!(promoted[0].distinct, plain[0].distinct, "the merged count did not move");
+
+        let reader = reopen(&path);
+        let sketches = sketches(&reader, 0).expect("the sketches came back");
+        assert_eq!(sketches.stripes.len(), promoted[0].stripes);
+        assert!(
+            sketches.stripes.iter().all(|stripe| stripe.k() == STRIPE_K),
+            "a stripe sketch is written down at the smaller k"
+        );
+        let floor = sketches.floor(0, sketches.stripes.len()).expect("a floor over every stripe");
+        let actual = 19_200.0;
+        assert!(
+            (floor - actual).abs() / actual < 0.25,
+            "{floor:.0} over every stripe against {actual:.0}"
+        );
+
+        drop(reader);
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn the_graph_sections_do_not_count_against_the_statistics_budget() {
+        // The direction of box 4 that costs more, because the two percent is the smaller share. A
+        // TPC-H SF10 file's key maps are 7.7 MB against an allowance of 54 MB, so a statistics
+        // build that counted them would start a seventh of the way through a budget it was given
+        // all of, and columns at the far end of a wide table would go unsummarized for a reason
+        // that has nothing to do with summaries.
+        let values = (1..=3000_i64).map(Some).collect::<Vec<_>>();
+        let path = table_of("apart", &values);
+        crate::graph::build_key_maps(&path, "t", &[0]).expect("a key map first");
+
+        let reader = reopen(&path);
+        let graph = reader
+            .table()
+            .sections()
+            .iter()
+            .filter(|held| held.among(section::GRAPH_KINDS))
+            .count();
+        assert_eq!(graph, 1, "the key map is in the file");
+        assert_eq!(held_bytes(&reader, &[0]).expect("held"), 0, "and it is not the statistics'");
+
+        drop(reader);
         fs::remove_file(&path).expect("clean up");
     }
 
