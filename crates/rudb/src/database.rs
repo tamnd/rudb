@@ -1193,7 +1193,13 @@ impl Shared {
         Arc::clone(&held.2)
     }
 
-    /// Every declared relationship the files answer for, read once.
+    /// Every declared relationship, with whether the files answer for it, read once.
+    ///
+    /// The ones no file answers for are kept rather than dropped. Only a built one licenses a
+    /// rewrite, and the planner is careful about that, but a declaration whose link was never built
+    /// is exactly the case somebody wants explained: it looks from the outside like a relationship
+    /// nobody declared, and `spec/graph/06-the-optimizer.md` section 6.7 asks for the two to be told
+    /// apart in the plan output.
     ///
     /// A declaration this cannot parse contributes nothing, which is the same silence
     /// `rudb_links()` gives it: a setting the parser refused is one no build acted on either, so
@@ -1207,18 +1213,17 @@ impl Shared {
             else {
                 continue;
             };
-            if stored_link(
+            let built = stored_link(
                 catalog,
                 (&link.child.table, child_key),
                 (&link.parent.table, parent_key),
-            ) {
-                found.push(rudb_opt::link::Linked::new(
-                    &link.child.table,
-                    child_key,
-                    &link.parent.table,
-                    parent_key,
-                ));
-            }
+            );
+            let sides = (&link.child.table, child_key, &link.parent.table, parent_key);
+            found.push(if built {
+                rudb_opt::link::Linked::built(sides.0, sides.1, sides.2, sides.3)
+            } else {
+                rudb_opt::link::Linked::declared(sides.0, sides.1, sides.2, sides.3)
+            });
         }
         found
     }
@@ -1842,7 +1847,7 @@ fn explaining(
     let facts = context.facts();
     let statistics = asked.statistics();
     if !asked.analyze {
-        let text = rudb_opt::explain::explain_with(plan, facts, seams, statistics);
+        let text = rudb_opt::explain::explain_with(plan, context, seams, statistics);
         return explained("logical_plan", &text);
     }
     // `EXPLAIN ANALYZE` is the one place a person reads these numbers with their own eyes rather
@@ -1860,7 +1865,7 @@ fn explaining(
         Under::new(budget, facts, seams.settings(), &profiled, Rows::ForACaller).after(planning);
     let result = run(sql, plan, catalog, cancel, under)?;
     let measured = result.metrics().expect("a query that ran reports what it did");
-    let text = rudb_opt::explain::analyzed(plan, facts, seams, measured, statistics);
+    let text = rudb_opt::explain::analyzed(plan, context, seams, measured, statistics);
     explained("analyzed_plan", &text)
 }
 

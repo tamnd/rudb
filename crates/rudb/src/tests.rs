@@ -5752,12 +5752,26 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
         Value::Varchar(text) => text,
         other => panic!("the plan came back as {other:?}"),
     };
-    assert!(!explained(&db, sql).contains("LinkJoin"), "four thousand customers were worth a link");
+    let plan = explained(&db, sql);
+    assert!(!plan.contains("LinkJoin"), "four thousand customers were worth a link");
+    // Section 6.7. The reason is on the line, with the two numbers the rule read, so a reader who
+    // expected a link join finds out it was the size of the parent and not a missing link.
+    assert!(
+        plan.contains(
+            "[builds a hash table, because the parent is 4000 rows and 16000 bytes \
+             projected, which fits in cache]"
+        ),
+        "the plan does not say why it built a hash table:\n{plan}"
+    );
 
     db.execute("SET graph_cache_bytes = 1").unwrap();
     assert_eq!(db.setting("graph_cache_bytes").unwrap(), "1 bytes");
     let plan = explained(&db, sql);
     assert!(plan.contains("LinkJoin"), "the join was not planned as a link join:\n{plan}");
+    assert!(
+        plan.contains("[reads the link, because the parent does not fit in cache"),
+        "the plan does not say why it read the link:\n{plan}"
+    );
 
     // The whole of section 3.1: the sections change the time and not the answer. The control is
     // the same query in the same process with the pass turned off.

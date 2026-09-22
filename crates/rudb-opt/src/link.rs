@@ -46,9 +46,23 @@
 //!
 //! The optimizer cannot see the catalog, by design: what it gets is a set of facts read once per
 //! statement, and [`Context`] is the seam. A relationship is one more fact, and it has to be one
-//! rather than a declaration because a declaration is what an author believes. What this pass is
-//! told is that the child's file holds a link for that relationship, which is only true when the
-//! build verified the parent side was unique. Nothing here trusts a `SET`.
+//! rather than a declaration because a declaration is what an author believes. So a [`Linked`]
+//! carries both: what somebody declared, and whether the child's file holds a link for it, which is
+//! only true when the build verified the parent side was unique. A rewrite reads the second one and
+//! nothing here trusts a `SET`.
+//!
+//! # Why the reasons are a type rather than an early return
+//!
+//! Section 6.7 asks the plan output to say, per join, which algorithm was chosen and why the other
+//! one was not, and gives the argument: this layer's failure mode is silence. A hash join that is
+//! slow is visibly a hash join, and a link that went unread because a projection two nodes up
+//! dropped the row id looks from the outside exactly like a link that was never built.
+//!
+//! So [`decided`] hands back a [`Why`] for every join it looks at, the rewrite acts on the ones
+//! that say yes, and [`why`] is what `EXPLAIN` asks afterwards. One implementation and two callers,
+//! because two walks that both worked out why a join is a hash join would agree on the day they
+//! were written and disagree some time after, and the one that would be wrong is the one somebody
+//! reads when they are trying to find out why a query is slow.
 
 use rudb_common::{Field, LogicalType, Result};
 use rudb_functions::FILE_ROW_NUMBER;
@@ -98,10 +112,14 @@ impl Default for Sizes {
     }
 }
 
-/// A relationship the child's file holds a readable forward link for.
+/// A relationship somebody declared, and whether the child's file holds a link for it.
 ///
-/// Not a declaration. An entry here says the link is in the file, which means the build read the
-/// parent side and found it unique, so a plan may rely on a child row having at most one parent.
+/// The two are separate on purpose. A declaration is what an author believes and a link is what the
+/// build found, and only the second one licenses a rewrite: a link is written once the build has
+/// read the parent side and found it unique, so a plan that reads one may rely on a child row
+/// having at most one parent. What the declaration alone is good for is the plan output, because
+/// section 6.7's complaint is that a relationship nobody built and a relationship nobody declared
+/// look identical from the outside, and a reader who declared one wants to be told which it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Linked {
     /// The many side's table, as the catalog holds it.
@@ -112,11 +130,23 @@ pub struct Linked {
     pub parent: String,
     /// The one side's key column.
     pub parent_column: String,
+    /// Whether the child's file holds a readable forward link for it.
+    pub built: bool,
 }
 
 impl Linked {
-    /// A relationship over one column each.
-    pub fn new(
+    /// A relationship the file holds a link for, which is the one a rewrite may read.
+    pub fn built(
+        child: impl Into<String>,
+        child_column: impl Into<String>,
+        parent: impl Into<String>,
+        parent_column: impl Into<String>,
+    ) -> Self {
+        Self { built: true, ..Self::declared(child, child_column, parent, parent_column) }
+    }
+
+    /// A relationship somebody declared and no file holds a link for.
+    pub fn declared(
         child: impl Into<String>,
         child_column: impl Into<String>,
         parent: impl Into<String>,
@@ -127,6 +157,7 @@ impl Linked {
             child_column: child_column.into(),
             parent: parent.into(),
             parent_column: parent_column.into(),
+            built: false,
         }
     }
 
@@ -139,6 +170,158 @@ impl Linked {
             && self.child_column.eq_ignore_ascii_case(child.1)
             && self.parent.eq_ignore_ascii_case(parent.0)
             && self.parent_column.eq_ignore_ascii_case(parent.1)
+    }
+}
+
+/// What was decided about one join, in the words section 6.7 asks `EXPLAIN` to print.
+///
+/// Section 6.7's argument for having this at all is that the failure mode of this layer is silence.
+/// A hash join that is slow is visibly a hash join, and a link that went unread because a projection
+/// two nodes up dropped the row id looks exactly like a link that was never built. So every reason
+/// this pass can decline for is a variant here rather than an early return with nothing said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// A forward link answers neither a right nor a full join, because both want the parent rows
+    /// nothing pointed at and a link is only ever read from the child.
+    Kind,
+    /// Not one equality over two plain columns, so there is no single column a link is indexed by.
+    Key,
+    /// Nobody declared a relationship between the two columns the join equates.
+    None,
+    /// Declared, and the child's file holds no link for it.
+    NotBuilt,
+    /// The parent side is not a stored table read whole, so a gather by row id would read rows the
+    /// plan had already restricted.
+    ParentNotStored,
+    /// The child's scan is behind something that moves a row, so its row id no longer names a row.
+    ChildNotStored,
+    /// Built, and the rows arriving at the join are no longer rows of the child table.
+    RowIdGone,
+    /// The row id the link join carries would reach somewhere that counts its input's columns.
+    ColumnWouldShow,
+    /// The parent fits in cache after projection, so the build costs less than the gathers.
+    Fits {
+        /// The rows the parent was estimated at.
+        rows: u64,
+        /// What those rows take after projection.
+        bytes: u64,
+    },
+    /// The parent does not fit, and its projection is wide enough that the build pays for itself.
+    Wide {
+        /// The projected parent's width in bytes.
+        width: usize,
+        /// The width the build starts paying for itself at.
+        narrow: usize,
+    },
+    /// Chosen: the parent does not fit and its projection is narrow.
+    Narrow {
+        /// The projected parent's width in bytes.
+        width: usize,
+        /// The width the build starts paying for itself at.
+        narrow: usize,
+    },
+    /// Chosen: a semi or an anti join is a sentinel test and never reads the parent at all.
+    NeverRead,
+}
+
+impl Why {
+    /// Whether this is a reason to read the link rather than a reason not to.
+    #[must_use]
+    pub const fn chosen(self) -> bool {
+        matches!(self, Self::Narrow { .. } | Self::NeverRead)
+    }
+
+    /// How far the pass got before this was the answer.
+    ///
+    /// An inner join is tried both ways round and only one of the two can be the relationship, so
+    /// one side always fails at the first question. Reporting that one would tell a reader the join
+    /// has no relationship when it has one and something later declined it, which is the sentence
+    /// section 6.7 exists to prevent. The further of the two is the one that says something.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Kind | Self::Key | Self::None => 0,
+            Self::ParentNotStored | Self::ChildNotStored => 1,
+            Self::NotBuilt => 2,
+            Self::RowIdGone => 3,
+            Self::ColumnWouldShow => 4,
+            Self::Fits { .. } | Self::Wide { .. } => 5,
+            Self::Narrow { .. } | Self::NeverRead => 6,
+        }
+    }
+
+    /// The further on of two answers about the same join.
+    fn or(self, other: Self) -> Self {
+        if other.rank() > self.rank() { other } else { self }
+    }
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Kind => write!(out, "a forward link does not answer a right or a full join"),
+            Self::Key => write!(out, "the join is not one equality over two columns"),
+            Self::None => write!(out, "no relationship is declared between those two columns"),
+            Self::NotBuilt => {
+                write!(out, "the relationship is declared and its link is not in the file")
+            }
+            Self::ParentNotStored => {
+                write!(out, "the parent side is not a stored table read whole")
+            }
+            Self::ChildNotStored => write!(out, "the child side is not a stored table"),
+            Self::RowIdGone => write!(
+                out,
+                "the link is in the file and the rows here are no longer rows of the child table"
+            ),
+            Self::ColumnWouldShow => {
+                write!(out, "the row id would reach an operator that counts its input's columns")
+            }
+            Self::Fits { rows, bytes } => write!(
+                out,
+                "the parent is {rows} rows and {bytes} bytes projected, which fits in cache"
+            ),
+            Self::Wide { width, narrow } => write!(
+                out,
+                "the parent does not fit in cache and its projection is {width} bytes, \
+                 which is not under {narrow}"
+            ),
+            Self::Narrow { width, narrow } => write!(
+                out,
+                "the parent does not fit in cache and its projection is {width} bytes, \
+                 which is under {narrow}"
+            ),
+            Self::NeverRead => write!(out, "a semi or an anti join never reads the parent"),
+        }
+    }
+}
+
+/// What the planner decided about one join, for whoever asks after the fact.
+///
+/// `None` for anything that is not a join, which is most of a plan. Read on the finished plan, so a
+/// join that is still a [`Node::Join`] is one this pass declined and a [`Node::LinkJoin`] is one it
+/// took. Both answers come out of the same code the decision was made with, because two walks that
+/// agreed on the day they were written are two walks that disagree afterwards, and the one that
+/// would be wrong is the one somebody reads when a query is slow.
+#[must_use]
+pub fn why(plan: &Plan, at: NodeRef, context: &Context) -> Option<Why> {
+    match *plan.node(at) {
+        Node::Join { .. } => {
+            let carried = rids_of(plan);
+            let consumers = consumers(plan);
+            Some(decided(plan, at, &carried, &consumers, context).0)
+        }
+        // Already taken, so the question is which bullet of section 6.4 took it. A semi or an anti
+        // is the bullet that does not size anything, and everything else got here through the width.
+        Node::LinkJoin { parent, kind, .. } => Some(match kind {
+            JoinKind::Semi | JoinKind::Anti => Why::NeverRead,
+            _ => match *plan.node(parent) {
+                Node::Get { columns, .. } => {
+                    let sizes = context.sizes();
+                    Why::Narrow { width: width(plan, columns), narrow: sizes.narrow_bytes }
+                }
+                _ => Why::ParentNotStored,
+            },
+        }),
+        _ => None,
     }
 }
 
@@ -176,14 +359,43 @@ fn rewrite(
     consumers: &[Option<NodeRef>],
     context: &Context,
 ) {
-    let Node::Join { left, right, kind, conditions, .. } = *plan.node(at) else {
-        return;
-    };
-    if !absorbed(plan, consumers, at) {
+    let (why, taken) = decided(plan, at, carried, consumers, context);
+    if !why.chosen() {
         return;
     }
-    let Some([first, second]) = equated_pair(plan, conditions) else {
+    let Some(taken) = taken else { return };
+    let Some(binding) = number(plan, taken.scan) else {
         return;
+    };
+    let rid = plan.add_expr(Expr::Column(binding), LogicalType::BigInt);
+    let Node::Join { kind, conditions, .. } = *plan.node(at) else { return };
+    *plan.node_mut(at) =
+        Node::LinkJoin { child: taken.child, parent: taken.parent, kind, conditions, rid };
+}
+
+/// Which two inputs a link would be read between, once it is worth reading one.
+#[derive(Debug, Clone, Copy)]
+struct Taken {
+    child: NodeRef,
+    parent: NodeRef,
+    /// The child's scan, which is the node the row id column is added to.
+    scan: NodeRef,
+}
+
+/// Section 6.4 over one join, without changing anything.
+///
+/// The pair rather than an answer alone, because the rewrite needs the sides it settled on and the
+/// plan output needs the sentence, and working either of them out twice is how the two come to
+/// disagree.
+fn decided(
+    plan: &Plan,
+    at: NodeRef,
+    carried: &[Carried],
+    consumers: &[Option<NodeRef>],
+    context: &Context,
+) -> (Why, Option<Taken>) {
+    let Node::Join { left, right, kind, conditions, .. } = *plan.node(at) else {
+        return (Why::Key, None);
     };
     // Which input is the many side is not a free choice. An inner join is symmetric and may be read
     // either way round. A left join keeps the rows of its left input, and the link join keeps the
@@ -192,22 +404,32 @@ fn rewrite(
     let sides: &[(NodeRef, NodeRef)] = match kind {
         JoinKind::Inner => &[(left, right), (right, left)],
         JoinKind::Left | JoinKind::Semi | JoinKind::Anti => &[(left, right)],
-        _ => return,
+        _ => return (Why::Kind, None),
     };
+    let Some(keys) = equated_pair(plan, conditions) else {
+        return (Why::Key, None);
+    };
+    let mut worst = Why::None;
     for &(child, parent) in sides {
-        let Some(found) = matched(plan, child, parent, [first, second], carried, context) else {
-            continue;
+        let found = match matched(plan, child, parent, keys, carried, context) {
+            Ok(found) => found,
+            Err(why) => {
+                worst = worst.or(why);
+                continue;
+            }
         };
-        if !worth_it(plan, parent, kind, &found, context) {
-            continue;
+        let why = worth_it(plan, parent, kind, &found, context);
+        // Asked after the rest of it on purpose. What is above a join is the same whichever way
+        // round its sides are read, so asking first would report a shape complaint for a join that
+        // has no relationship at all and bury the reason that was actually in the way.
+        let why =
+            if why.chosen() && !absorbed(plan, consumers, at) { Why::ColumnWouldShow } else { why };
+        worst = worst.or(why);
+        if why.chosen() {
+            return (why, Some(Taken { child, parent, scan: found.scan }));
         }
-        let Some(binding) = number(plan, found.scan) else {
-            continue;
-        };
-        let rid = plan.add_expr(Expr::Column(binding), LogicalType::BigInt);
-        *plan.node_mut(at) = Node::LinkJoin { child, parent, kind, conditions, rid };
-        return;
     }
+    (worst, None)
 }
 
 /// Which node reads each node's output, or nothing for the root and for anything orphaned.
@@ -270,6 +492,11 @@ struct Match {
 }
 
 /// Whether this pairing of the two inputs is a relationship the file holds a link for.
+///
+/// The questions are asked in the order a reader wants them answered rather than in the order that
+/// is cheapest. Whether the row id survived is only interesting once there is a relationship for it
+/// to have survived for, so the relationship is looked up first even though it is the dearer of the
+/// two, and a join over two unrelated columns is never told that its row id went missing.
 fn matched(
     plan: &Plan,
     child: NodeRef,
@@ -277,75 +504,83 @@ fn matched(
     keys: [ColumnBinding; 2],
     carried: &[Carried],
     context: &Context,
-) -> Option<Match> {
+) -> std::result::Result<Match, Why> {
     // A gather by row id reads the parent's stored rows, so the parent has to be the stored table
     // and nothing else. See the note at the top about what a filter here would mean.
     let Node::Get { table: parent_name, index: parent_index, columns: projected, .. } =
         *plan.node(parent)
     else {
-        return None;
+        return Err(Why::ParentNotStored);
     };
     let [child_key, parent_key] =
         match (keys[0].table == parent_index, keys[1].table == parent_index) {
             (false, true) => [keys[0], keys[1]],
             (true, false) => [keys[1], keys[0]],
-            _ => return None,
+            _ => return Err(Why::None),
         };
-    // Section 5.1's rule, and the only thing between this pass and a wrong answer. A link is
-    // indexed by a row of the child table, so it may only be read where every row reaching the join
-    // is still a row of that table.
-    if !carried.get(child as usize)?.has(child_key.table) {
-        return None;
-    }
-    let scan = scan_under(plan, child, child_key.table)?;
+    let scan = scan_under(plan, child, child_key.table).ok_or(Why::ChildNotStored)?;
     let Node::Get { table: child_name, columns: child_columns, .. } = *plan.node(scan) else {
-        return None;
+        return Err(Why::ChildNotStored);
     };
-    let child_column = plan.field_list(child_columns).get(child_key.column as usize)?;
-    let parent_column = plan.field_list(projected).get(parent_key.column as usize)?;
+    let child_column =
+        plan.field_list(child_columns).get(child_key.column as usize).ok_or(Why::None)?;
+    let parent_column =
+        plan.field_list(projected).get(parent_key.column as usize).ok_or(Why::None)?;
     let relationship = (
         (plan.string(child_name), child_column.name.as_str()),
         (plan.string(parent_name), parent_column.name.as_str()),
     );
-    if !context.links().iter().any(|link| link.between(relationship.0, relationship.1)) {
-        return None;
+    let declared = context
+        .links()
+        .iter()
+        .find(|link| link.between(relationship.0, relationship.1))
+        .ok_or(Why::None)?;
+    if !declared.built {
+        return Err(Why::NotBuilt);
     }
-    Some(Match { scan, projected })
+    // Section 5.1's rule, and the only thing between this pass and a wrong answer. A link is
+    // indexed by a row of the child table, so it may only be read where every row reaching the join
+    // is still a row of that table.
+    if !carried.get(child as usize).is_some_and(|rids| rids.has(child_key.table)) {
+        return Err(Why::RowIdGone);
+    }
+    Ok(Match { scan, projected })
 }
 
 /// Section 6.4, which is the whole of the choice.
-fn worth_it(
-    plan: &Plan,
-    parent: NodeRef,
-    kind: JoinKind,
-    found: &Match,
-    context: &Context,
-) -> bool {
+fn worth_it(plan: &Plan, parent: NodeRef, kind: JoinKind, found: &Match, context: &Context) -> Why {
     // Never touches the parent, so none of the rest of it applies. A semi join over a relationship
     // the file has verified is a sentinel test per child row, and there is no size at which a hash
     // table beats that.
     if matches!(kind, JoinKind::Semi | JoinKind::Anti) {
-        return true;
+        return Why::NeverRead;
     }
-    let width: usize =
-        plan.field_list(found.projected).iter().map(|field| field.ty.physical().size()).sum();
+    let width = width(plan, found.projected);
     let sizes = context.sizes();
-    let rows = estimate::rows(plan, parent, context.facts());
+    let bytes = |rows: u64| rows.saturating_mul(u64::try_from(width).unwrap_or(u64::MAX));
     // A parent nobody has counted is planned as one that does not fit, which is the answer that
     // stays right as a table grows: a hash join over a parent this pass declined is the plan that
     // ran before there were links at all.
-    let fits = rows.is_some_and(|rows| {
-        rows.saturating_mul(u64::try_from(width).unwrap_or(u64::MAX)) <= sizes.cache_bytes
-    });
-    if fits {
-        return false;
+    if let Some(rows) = estimate::rows(plan, parent, context.facts())
+        && bytes(rows) <= sizes.cache_bytes
+    {
+        return Why::Fits { rows, bytes: bytes(rows) };
     }
     // The second bullet of section 6.4, which is the one this pass cannot ask yet: whether the
     // child is stored in the parent's row id order is a property of how the file was written and
     // nothing records it. A clustered child is the case the link join wins by the most, so what
     // this costs is some of the win rather than any of the correctness, and until it is recorded
     // every parent that does not fit is decided by the width below.
-    width < sizes.narrow_bytes
+    if width < sizes.narrow_bytes {
+        Why::Narrow { width, narrow: sizes.narrow_bytes }
+    } else {
+        Why::Wide { width, narrow: sizes.narrow_bytes }
+    }
+}
+
+/// What one row of a projection takes, which is what a gather moves per child row.
+fn width(plan: &Plan, columns: Slice) -> usize {
+    plan.field_list(columns).iter().map(|field| field.ty.physical().size()).sum()
 }
 
 /// The two columns one equality holds equal, when that is what the conditions are.
@@ -405,13 +640,13 @@ mod tests {
 
     use rudb_plan::{Node, Plan};
 
-    use super::{LinkJoinRewrite, Linked};
+    use super::{LinkJoinRewrite, Linked, Why};
     use crate::estimate::Facts;
     use crate::pass::{Context, Pass};
 
     /// The relationship every test here declares, which is TPC-H's largest one.
     fn declared() -> Arc<Vec<Linked>> {
-        Arc::new(vec![Linked::new("lineitem", "l_orderkey", "orders", "o_orderkey")])
+        Arc::new(vec![Linked::built("lineitem", "l_orderkey", "orders", "o_orderkey")])
     }
 
     /// A context that knows the relationship and how large the two tables are.
@@ -491,7 +726,7 @@ mod tests {
     fn the_relationship_has_to_be_the_way_round_it_was_declared() {
         let mut plan = joined("INNER");
         let mut context = context(1_500_000);
-        context.relate(Arc::new(vec![Linked::new(
+        context.relate(Arc::new(vec![Linked::built(
             "orders",
             "o_orderkey",
             "lineitem",
@@ -519,7 +754,7 @@ mod tests {
     fn a_left_join_may_only_read_the_link_in_the_direction_that_keeps_its_rows() {
         let mut plan = joined("LEFT");
         let mut context = context(1_500_000);
-        context.relate(Arc::new(vec![Linked::new(
+        context.relate(Arc::new(vec![Linked::built(
             "orders",
             "o_orderkey",
             "lineitem",
@@ -558,5 +793,109 @@ mod tests {
         let once = rewritten(&mut plan, &context);
         let twice = rewritten(&mut plan, &context);
         assert_eq!(once, twice, "the pass does not settle");
+    }
+
+    /// What the pass says about the one join of a plan, before and after it runs.
+    fn about(plan: &Plan, context: &Context) -> Why {
+        (0..u32::try_from(plan.node_count()).expect("a small plan"))
+            .find_map(|node| super::why(plan, node, context))
+            .expect("the plan has a join in it")
+    }
+
+    #[test]
+    fn a_join_that_read_the_link_says_which_bullet_chose_it() {
+        let mut plan = joined("INNER");
+        let context = context(1_500_000);
+        rewritten(&mut plan, &context);
+        let why = about(&plan, &context);
+        assert!(why.chosen(), "{why}");
+        assert_eq!(
+            why.to_string(),
+            "the parent does not fit in cache and its projection is 8 bytes, which is under 32"
+        );
+    }
+
+    #[test]
+    fn a_semi_join_says_it_never_read_the_parent_rather_than_quoting_a_width() {
+        let mut plan = joined("SEMI");
+        let context = context(25);
+        rewritten(&mut plan, &context);
+        let why = about(&plan, &context);
+        assert!(why.chosen(), "{why}");
+        assert_eq!(why.to_string(), "a semi or an anti join never reads the parent");
+    }
+
+    #[test]
+    fn a_parent_that_fits_says_how_large_it_was_rather_than_only_that_it_fitted() {
+        // The two numbers are the whole point. A reader who is told a parent fits and not what it
+        // was measured at cannot tell a small table from a setting somebody turned up.
+        let mut plan = joined("INNER");
+        let context = context(25);
+        rewritten(&mut plan, &context);
+        let why = about(&plan, &context);
+        assert!(!why.chosen(), "{why}");
+        assert_eq!(
+            why.to_string(),
+            "the parent is 25 rows and 200 bytes projected, which fits in cache"
+        );
+    }
+
+    /// The plan the pass has finished with, told about those relationships and nothing else.
+    fn over(kind: &str, links: Vec<Linked>) -> (Plan, Context) {
+        let mut plan = joined(kind);
+        let mut context = context(1_500_000);
+        context.relate(Arc::new(links));
+        rewritten(&mut plan, &context);
+        (plan, context)
+    }
+
+    #[test]
+    fn a_relationship_nobody_built_says_the_link_is_missing_rather_than_the_relationship() {
+        // Half of the pair section 6.7 exists for. This sentence sends a reader to the checkpoint
+        // and the one in the test below sends them to the setting, and before this they read the
+        // same.
+        let (plan, context) =
+            over("INNER", vec![Linked::declared("lineitem", "l_orderkey", "orders", "o_orderkey")]);
+        assert_eq!(
+            about(&plan, &context).to_string(),
+            "the relationship is declared and its link is not in the file"
+        );
+    }
+
+    #[test]
+    fn a_relationship_over_other_columns_says_there_is_none_over_these_ones() {
+        let (plan, context) =
+            over("INNER", vec![Linked::built("orders", "o_totalprice", "nation", "n_name")]);
+        assert_eq!(
+            about(&plan, &context).to_string(),
+            "no relationship is declared between those two columns"
+        );
+    }
+
+    #[test]
+    fn a_join_whose_row_id_would_reach_the_answer_says_that_and_not_that_there_is_no_link() {
+        // The failure mode section 6.7 names outright: without this sentence, a join declined for
+        // the shape of the plan above it reads exactly like a join over a relationship nobody has.
+        let text = "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n  \
+             Get memory.main.lineitem AS lineitem #0 [l_orderkey::BIGINT]\n  \
+             Get memory.main.orders AS orders #1 [o_orderkey::BIGINT]\n";
+        let mut plan = Plan::parse(text).expect("the plan parses");
+        let context = context(1_500_000);
+        rewritten(&mut plan, &context);
+        assert_eq!(
+            about(&plan, &context).to_string(),
+            "the row id would reach an operator that counts its input's columns"
+        );
+    }
+
+    #[test]
+    fn a_right_join_says_the_link_points_the_other_way() {
+        let mut plan = joined("RIGHT");
+        let context = context(1_500_000);
+        rewritten(&mut plan, &context);
+        assert_eq!(
+            about(&plan, &context).to_string(),
+            "a forward link does not answer a right or a full join"
+        );
     }
 }
