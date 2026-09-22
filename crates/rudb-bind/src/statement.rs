@@ -15,10 +15,10 @@
 //! loop over chunks.
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
-use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
+use rudb_common::{Clustering, Error, Field, LogicalType, Result, Session, Value, Width};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
-use rudb_plan::{Expr, ExprRef, Node, Plan};
+use rudb_plan::{Expr, ExprRef, Node, Plan, SortKey};
 
 use crate::binder::Binder;
 use crate::parameters::Parameters;
@@ -410,6 +410,67 @@ fn setting(
     Ok(Bound::Setting(Setting { name, scope: written.scope, value, pragma: written.pragma }))
 }
 
+/// Sorts an insert's rows into the order the target table declared.
+///
+/// Returns the input unchanged when the statement supplies none of the declared columns, because
+/// every one of them is then a constant null and sorting on a constant is a sort that buys nothing
+/// and costs a pass. A statement that supplies some of them sorts on those: the declaration is
+/// about the order the rows are written in, and the columns that are there still order them.
+///
+/// The leading key carries the width. `date_trunc('month', d)` and `d` sort the same rows into the
+/// same fragments for any predicate a month wide or wider, and the difference is what happens
+/// inside a month: bucketed, the second key orders the whole month, which is the key locality the
+/// joins want and the reason the width is part of the declaration at all.
+fn clustered(
+    binder: &mut Binder<'_>,
+    input: rudb_plan::NodeRef,
+    scope: &crate::scope::Scope,
+    clustering: &Clustering,
+    targets: &[usize],
+    fields: &[Field],
+) -> Result<rudb_plan::NodeRef> {
+    let mut keys: Vec<SortKey> = Vec::with_capacity(clustering.columns().len());
+    for (at, &column) in clustering.columns().iter().enumerate() {
+        let Some(from) = targets.iter().position(|&target| target == column as usize) else {
+            continue;
+        };
+        let source = &scope.columns[from];
+        let expr = binder.plan_mut().add_expr(Expr::Column(source.binding), source.ty.clone());
+        // Cast to the column's own type before bucketing, since the source of a load is a file
+        // whose date column can arrive as a timestamp and `date_trunc` gives back the type it was
+        // handed. Sorting on a different type than the column stores would still be an order, but
+        // it would not be the order the declaration names.
+        let expr = binder.checked_cast_to(expr, &fields[column as usize].ty, false)?;
+        let expr =
+            if at == 0 { bucketed(binder, expr, clustering.width(), fields, column) } else { expr };
+        keys.push(SortKey { expr, descending: false, nulls_first: false });
+    }
+    if keys.is_empty() {
+        return Ok(input);
+    }
+    let keys = binder.plan_mut().add_sort_keys(&keys);
+    Ok(binder.plan_mut().add_node(Node::Sort { input, keys }))
+}
+
+/// Wraps a sort key in the calendar bucket its declaration asked for.
+fn bucketed(
+    binder: &mut Binder<'_>,
+    expr: ExprRef,
+    width: Width,
+    fields: &[Field],
+    column: u32,
+) -> ExprRef {
+    if width == Width::Exact {
+        return expr;
+    }
+    let unit = binder.plan_mut().add_value(Value::Varchar(width.to_string().to_lowercase()));
+    let unit = binder.plan_mut().add_expr(Expr::Constant(unit), LogicalType::Varchar);
+    let args = binder.plan_mut().add_expr_list(&[unit, expr]);
+    let name = binder.plan_mut().intern("date_trunc");
+    let ty = fields[column as usize].ty.clone();
+    binder.plan_mut().add_expr(Expr::Function { name, args }, ty)
+}
+
 fn insert(
     ast: &Ast,
     catalog: &Catalog,
@@ -425,7 +486,9 @@ fn insert(
         // an updatable view is a rule about rewriting the insert that neither database has.
         return Err(Error::catalog(format!("{} is not an table", name.table)));
     }
-    let fields: Vec<Field> = catalog.table(&name)?.columns().to_vec();
+    let target = catalog.table(&name)?;
+    let fields: Vec<Field> = target.columns().to_vec();
+    let clustering = target.clustering().cloned();
 
     // Which table column each source column lands in. Without a column list that is the first n
     // columns in order, and with one it is whatever the list says, which is also the check that
@@ -463,6 +526,16 @@ fn insert(
             scope.len()
         )));
     }
+
+    // A table that declared what order its rows go in gets the sort here, under the projection
+    // rather than over it, because a projection does not reorder rows and the bindings the sort
+    // keys need are the ones the query just produced. This is the whole of the loader honouring
+    // the declaration: the rows arrive at the writer in order and the per fragment ranges, which
+    // are built from whatever order arrives, come out narrow instead of each covering the table.
+    let root = match &clustering {
+        None => root,
+        Some(clustering) => clustered(&mut binder, root, &scope, clustering, &targets, &fields)?,
+    };
 
     // The projection that makes the source look exactly like the table. Every column the statement
     // did not name becomes a null of the column's own type, so the append never has to know that a

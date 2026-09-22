@@ -391,7 +391,12 @@ fn a_declared_row_order_survives_a_checkpoint_and_a_reopen() {
     // the order stops pruning and no output says why. This is the record that stops that.
     let path = std::env::temp_dir().join(format!("rudb-api-cluster-{}.rudb", std::process::id()));
     let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
-    let stage_zero = Clustering::new(vec![2, 0, 1], Width::Month, 3).expect("valid");
+    let columns = [
+        Field::new("l_orderkey", LogicalType::BigInt),
+        Field::new("l_linenumber", LogicalType::Integer),
+        Field::new("l_shipdate", LogicalType::Date),
+    ];
+    let stage_zero = Clustering::new(vec![2, 0, 1], Width::Month, &columns).expect("valid");
 
     let database = Database::open(&name).expect("a file name starts a native database");
     database
@@ -442,7 +447,8 @@ fn declaring_an_order_after_a_checkpoint_gets_the_file_rewritten() {
     // file agrees about the order as well as about which tables there are.
     let path = std::env::temp_dir().join(format!("rudb-api-recluster-{}.rudb", std::process::id()));
     let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
-    let asked = Clustering::new(vec![1], Width::Year, 2).expect("valid");
+    let columns = [Field::new("a", LogicalType::Integer), Field::new("d", LogicalType::Date)];
+    let asked = Clustering::new(vec![1], Width::Year, &columns).expect("valid");
 
     let database = Database::open(&name).expect("a file name starts a native database");
     database.execute("CREATE TABLE t (a INTEGER, d DATE)").expect("creates");
