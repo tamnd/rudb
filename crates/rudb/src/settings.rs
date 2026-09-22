@@ -28,6 +28,15 @@
 //! the same idea for the stored graph sections. None of the ten is a DuckDB setting either, so none
 //! of them is in the settings catalog and `duckdb_settings()` does not list them.
 //!
+//! `cluster_by` is an exception of a third kind, and the interesting one. It is not a DuckDB
+//! setting either, but unlike the seams and the rules it keeps nothing here at all. What it writes
+//! is the clustering on the tables the text names, and what it reads is those same declarations
+//! built back into text by [`clustering`]. A copy in the session would be a second answer that goes
+//! wrong the moment a database is opened on a file whose tables already carry declarations nobody
+//! in this session set. The declaration arrives as a setting rather than as a `CLUSTER BY` clause
+//! because the grammar is DuckDB's and has no such clause, which is the same reason
+//! `SET graph_links` looks the way it does.
+//!
 //! Every setting the engine reads is global, which is the scope DuckDB gives it, and for those
 //! `SET LOCAL` is refused with the sentence the binary prints and `SET SESSION` with the one it
 //! prints for a global setting, which is a different sentence and says which of the two the writer
@@ -44,9 +53,10 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{
-    DefaultNullOrder, Error, IdentifierCase, Memory, Result, Rules, Session, ShowBehavior, Value,
-    human, looks_like_rule, rule_names,
+    Clustering, Declared, DefaultNullOrder, Error, IdentifierCase, Memory, Result, Rules, Session,
+    ShowBehavior, Value, human, looks_like_rule, parse_clustering, rule_names,
 };
 use rudb_functions::{Behaviour, LOCAL, SETTINGS, SettingEntry};
 use rudb_parse::ast::Scope;
@@ -223,6 +233,7 @@ impl Settings {
         &self,
         memory: &Memory,
         pool: &Pool,
+        catalog: &mut Catalog,
         name: &str,
         scope: Scope,
         value: Option<&Value>,
@@ -267,6 +278,13 @@ impl Settings {
             rudb_graph::parse_links(&written)?;
             *self.links.write().unwrap_or_else(|held| held.into_inner()) = written;
             return Ok(());
+        }
+        if is_clustering(name) {
+            // Nothing is kept here. The declarations live on the tables, which is where a
+            // checkpoint reads them and where an open puts the ones the file holds, so a copy in
+            // the session would be a second answer that goes stale the moment a file is opened.
+            // [`clustering`] is the read, and it builds the text back out of the catalog.
+            return declare(catalog, &value.map_or_else(String::new, text_of));
         }
         if is_rule(name) {
             // `RESET stats.presize` puts the rule back where a fresh database has it, which is on
@@ -874,6 +892,95 @@ fn is_links(name: &str) -> bool {
     name.eq_ignore_ascii_case("graph_links") || name.eq_ignore_ascii_case("graph.links")
 }
 
+/// Whether this name is the row order declaration setting.
+///
+/// The same shape as [`is_seam`] and for the same reason. DuckDB has no setting of either name
+/// today, and if it ever takes one then the compatible answer wins and this loses its spelling.
+pub(crate) fn is_clustering(name: &str) -> bool {
+    if rudb_functions::setting_named(name).is_some() {
+        return false;
+    }
+    name.eq_ignore_ascii_case("cluster_by") || name.eq_ignore_ascii_case("rudb.cluster_by")
+}
+
+/// Moves the catalog to exactly the declarations `written` names, and no others.
+///
+/// A write of the whole set rather than of one table, which is what makes it a setting rather than
+/// a statement. `SET cluster_by = ''` and `RESET cluster_by` therefore take every declaration off
+/// every table, which is what they look like they mean and is the only reading that leaves the
+/// setting able to be read back as what it is.
+///
+/// Everything is resolved before anything is written. A setting naming three tables where the third
+/// column name is a typo has to leave the catalog as it found it, because a partly applied
+/// declaration is a layout nobody asked for and nothing left behind would say so.
+fn declare(catalog: &mut Catalog, written: &str) -> Result<()> {
+    let asked = parse_clustering(written)?;
+    let mut wanted = Vec::with_capacity(asked.len());
+    for declared in &asked {
+        wanted.push(resolved(catalog, declared)?);
+    }
+    let cleared = catalog
+        .tables()
+        .filter(|table| table.clustering().is_some())
+        .map(|table| table.name().clone())
+        .collect::<Vec<_>>();
+    for name in cleared {
+        catalog.table_mut(&name)?.cluster_by(None)?;
+    }
+    for (name, clustering) in wanted {
+        catalog.table_mut(&name)?.cluster_by(Some(clustering))?;
+    }
+    Ok(())
+}
+
+/// Every declaration the catalog holds, in the spelling [`declare`] takes.
+///
+/// The read half of the setting, and the reason nothing about it is kept in the session. A file
+/// carries the declarations of the tables in it, so a database opened on one has declarations that
+/// no `SET` in this session made, and a session copy would answer that there are none. Built out of
+/// the catalog, the answer is the same whichever way the declaration got there.
+pub(crate) fn clustering(catalog: &Catalog) -> String {
+    catalog
+        .tables()
+        .filter_map(|table| {
+            let names = table.columns().iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+            let clustering = table.clustering()?;
+            Some(format!("{}({})", table.name().table, clustering.describe(&names)))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One written declaration as the table it names and the clustering over that table's columns.
+fn resolved(catalog: &Catalog, declared: &Declared) -> Result<(QualifiedName, Clustering)> {
+    let name = catalog.resolve(&parts(declared.table()))?;
+    let fields = catalog.table(&name)?.columns();
+    let mut columns = Vec::with_capacity(declared.columns().len());
+    for column in declared.columns() {
+        let at = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column));
+        let at = at.ok_or_else(|| {
+            Error::catalog(format!(
+                "Table \"{}\" does not have a column named \"{column}\"",
+                declared.table()
+            ))
+        })?;
+        columns.push(u32::try_from(at).map_err(|_| Error::internal("a column past four billion"))?);
+    }
+    // A width the text named is taken as written and checked against the column's type, and a text
+    // that named none leaves the width to the leading column, which is the whole of the difference
+    // between the two constructors.
+    let clustering = match declared.width() {
+        Some(width) => Clustering::new(columns, width, fields)?,
+        None => Clustering::over(columns, fields)?,
+    };
+    Ok((name, clustering))
+}
+
+/// A written table name cut at its dots, so a schema in front of it reaches the right table.
+fn parts(table: &str) -> Vec<&str> {
+    table.split('.').map(str::trim).collect()
+}
+
 /// Whether this name is one of the rule switches rather than a setting DuckDB has.
 ///
 /// The same shape as [`is_seam`] and for the same reason. A DuckDB setting wins, so the day one of
@@ -1043,7 +1150,7 @@ fn bytes_of(text: &str) -> Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, bytes_of};
+    use super::{Catalog, Settings, bytes_of};
     use crate::config::Config;
     use rudb_common::{Memory, Value};
     use rudb_parse::ast::Scope;
@@ -1077,12 +1184,26 @@ mod tests {
         assert_eq!(memory.limit(), None);
         let value = Value::Varchar("1GiB".into());
         settings
-            .apply(&memory, &Pool::default(), "memory_limit", Scope::Unwritten, Some(&value))
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "memory_limit",
+                Scope::Unwritten,
+                Some(&value),
+            )
             .expect("a size");
         assert_eq!(memory.limit(), Some(1 << 30));
         assert_eq!(settings.value("memory_limit").expect("a setting"), "1.0 GiB");
         settings
-            .apply(&memory, &Pool::default(), "memory_limit", Scope::Unwritten, None)
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "memory_limit",
+                Scope::Unwritten,
+                None,
+            )
             .expect("a reset");
         assert_eq!(memory.limit(), None, "reset goes back to what the database was opened with");
     }
@@ -1092,7 +1213,14 @@ mod tests {
         let (settings, memory) = settings();
         let value = Value::Varchar("bogus".into());
         let error = settings
-            .apply(&memory, &Pool::default(), "disabled_optimizers", Scope::Unwritten, Some(&value))
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "disabled_optimizers",
+                Scope::Unwritten,
+                Some(&value),
+            )
             .expect_err("not a pass");
         assert_eq!(error.code().duckdb_name(), "Parser Error");
         assert_eq!(settings.disabled_optimizers(), "", "a refused set changed nothing");
@@ -1102,12 +1230,19 @@ mod tests {
     fn a_name_that_is_not_a_setting_says_so_and_offers_the_nearest_ones() {
         let (settings, memory) = settings();
         let error = settings
-            .apply(&memory, &Pool::default(), "bogus", Scope::Unwritten, None)
+            .apply(&memory, &Pool::default(), &mut Catalog::new(), "bogus", Scope::Unwritten, None)
             .expect_err("not a setting");
         assert_eq!(error.code().duckdb_name(), "Catalog Error");
         assert_eq!(error.message(), "unrecognized configuration parameter \"bogus\"");
         let error = settings
-            .apply(&memory, &Pool::default(), "memory_limitt", Scope::Unwritten, None)
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "memory_limitt",
+                Scope::Unwritten,
+                None,
+            )
             .expect_err("not a setting");
         assert!(error.message().contains("\"memory_limit\""), "{}", error.message());
     }
@@ -1117,21 +1252,35 @@ mod tests {
         let (settings, memory) = settings();
         let value = Value::BigInt(2);
         let error = settings
-            .apply(&memory, &Pool::default(), "threads", Scope::Local, Some(&value))
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "threads",
+                Scope::Local,
+                Some(&value),
+            )
             .expect_err("no local scope");
         assert_eq!(error.message(), "SET LOCAL is not implemented.");
         let error = settings
-            .apply(&memory, &Pool::default(), "threads", Scope::Session, Some(&value))
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "threads",
+                Scope::Session,
+                Some(&value),
+            )
             .expect_err("no session copy");
         assert_eq!(error.message(), "option \"threads\" cannot be set locally");
         // The word changes with the statement, because a writer who wrote `RESET` should not read a
         // sentence about `SET`.
         let error = settings
-            .apply(&memory, &Pool::default(), "threads", Scope::Local, None)
+            .apply(&memory, &Pool::default(), &mut Catalog::new(), "threads", Scope::Local, None)
             .expect_err("no local scope");
         assert_eq!(error.message(), "RESET LOCAL is not implemented.");
         let error = settings
-            .apply(&memory, &Pool::default(), "threads", Scope::Session, None)
+            .apply(&memory, &Pool::default(), &mut Catalog::new(), "threads", Scope::Session, None)
             .expect_err("no session copy");
         assert_eq!(error.message(), "option \"threads\" cannot be reset locally");
     }
@@ -1147,6 +1296,7 @@ mod tests {
             .apply(
                 &memory,
                 &pool,
+                &mut Catalog::new(),
                 "enable_http_metadata_cache",
                 Scope::Global,
                 Some(&Value::Boolean(true)),
@@ -1155,21 +1305,42 @@ mod tests {
         assert_eq!(settings.value("enable_http_metadata_cache").expect("a setting"), "true");
         // A `RESET` puts back the default, which here is forgetting rather than writing.
         settings
-            .apply(&memory, &pool, "enable_http_metadata_cache", Scope::Global, None)
+            .apply(
+                &memory,
+                &pool,
+                &mut Catalog::new(),
+                "enable_http_metadata_cache",
+                Scope::Global,
+                None,
+            )
             .expect("a knob resets");
         assert_eq!(settings.value("enable_http_metadata_cache").expect("a setting"), "false");
         // The type is checked even though nothing reads the value, so the mistake lands on the
         // statement that made it.
         let text = Value::Varchar("blue".to_string());
         let error = settings
-            .apply(&memory, &pool, "enable_http_metadata_cache", Scope::Global, Some(&text))
+            .apply(
+                &memory,
+                &pool,
+                &mut Catalog::new(),
+                "enable_http_metadata_cache",
+                Scope::Global,
+                Some(&text),
+            )
             .expect_err("not a boolean");
         assert_eq!(
             error.message(),
             "Failed to cast value: Could not convert string 'blue' to BOOL"
         );
         let error = settings
-            .apply(&memory, &pool, "partitioned_write_max_open_files", Scope::Global, Some(&text))
+            .apply(
+                &memory,
+                &pool,
+                &mut Catalog::new(),
+                "partitioned_write_max_open_files",
+                Scope::Global,
+                Some(&text),
+            )
             .expect_err("not a number");
         assert_eq!(
             error.message(),
@@ -1188,6 +1359,7 @@ mod tests {
             .apply(
                 &memory,
                 &pool,
+                &mut Catalog::new(),
                 "preserve_insertion_order",
                 Scope::Global,
                 Some(&Value::Boolean(true)),
@@ -1197,6 +1369,7 @@ mod tests {
             .apply(
                 &memory,
                 &pool,
+                &mut Catalog::new(),
                 "preserve_insertion_order",
                 Scope::Global,
                 Some(&Value::Boolean(false)),
@@ -1206,7 +1379,14 @@ mod tests {
         assert!(error.message().contains("rudb behaves as if"), "{error}");
         // A reset is always fine, since it is asking for what it already is.
         settings
-            .apply(&memory, &pool, "preserve_insertion_order", Scope::Global, None)
+            .apply(
+                &memory,
+                &pool,
+                &mut Catalog::new(),
+                "preserve_insertion_order",
+                Scope::Global,
+                None,
+            )
             .expect("a reset asks for the default");
     }
 
@@ -1219,7 +1399,14 @@ mod tests {
         let renderer = Value::Varchar("json".to_string());
         for scope in [Scope::Global, Scope::Session, Scope::Local, Scope::Unwritten] {
             settings
-                .apply(&memory, &pool, "profiling_renderer_settings", scope, Some(&renderer))
+                .apply(
+                    &memory,
+                    &pool,
+                    &mut Catalog::new(),
+                    "profiling_renderer_settings",
+                    scope,
+                    Some(&renderer),
+                )
                 .expect("a local setting takes every scope");
         }
         assert_eq!(settings.value("profiling_renderer_settings").expect("a setting"), "json");
@@ -1238,9 +1425,13 @@ mod tests {
         ];
         for (written, other, value) in pairs {
             let held = Value::Varchar(value.to_string());
-            settings.apply(&memory, &pool, written, Scope::Global, Some(&held)).expect("a setting");
+            settings
+                .apply(&memory, &pool, &mut Catalog::new(), written, Scope::Global, Some(&held))
+                .expect("a setting");
             assert_eq!(settings.value(other).expect("a setting"), value, "{written}");
-            settings.apply(&memory, &pool, other, Scope::Global, None).expect("a setting");
+            settings
+                .apply(&memory, &pool, &mut Catalog::new(), other, Scope::Global, None)
+                .expect("a setting");
             assert_eq!(
                 settings.value(written).expect("a setting"),
                 settings.value(other).expect("a setting"),
@@ -1254,17 +1445,38 @@ mod tests {
         let (settings, memory) = settings();
         let pool = Pool::new(1);
         settings
-            .apply(&memory, &pool, "threads", Scope::Global, Some(&Value::BigInt(4)))
+            .apply(
+                &memory,
+                &pool,
+                &mut Catalog::new(),
+                "threads",
+                Scope::Global,
+                Some(&Value::BigInt(4)),
+            )
             .expect("four threads");
         assert_eq!(settings.value("threads").expect("a setting"), "4");
         assert_eq!(pool.threads(), 4, "the setting reached the thing that hands out threads");
         let error = settings
-            .apply(&memory, &Pool::default(), "threads", Scope::Global, Some(&Value::BigInt(0)))
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "threads",
+                Scope::Global,
+                Some(&Value::BigInt(0)),
+            )
             .expect_err("no threads at all");
         assert_eq!(error.message(), "Must have at least 1 thread!");
         let text = Value::Varchar("abc".into());
         let error = settings
-            .apply(&memory, &Pool::default(), "threads", Scope::Global, Some(&text))
+            .apply(
+                &memory,
+                &Pool::default(),
+                &mut Catalog::new(),
+                "threads",
+                Scope::Global,
+                Some(&text),
+            )
             .expect_err("not a number");
         assert_eq!(
             error.message(),

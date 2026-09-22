@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGua
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, QualifiedName, View};
 use rudb_common::stat::Provenance;
-use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
+use rudb_common::{Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Session, Value};
 use rudb_metrics::{Document, Report, Span};
 use rudb_parse::ast::Ast;
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
@@ -161,6 +161,12 @@ impl Database {
     ///
     /// For a name that is not a setting, with the names there are.
     pub fn setting(&self, name: &str) -> Result<String> {
+        // The row order declarations are read off the catalog rather than out of the settings,
+        // because that is where they live. Handled here rather than a layer down for the plain
+        // reason that a `Settings` cannot see a catalog and this can.
+        if crate::settings::is_clustering(name) {
+            return Ok(crate::settings::clustering(&self.shared.read()));
+        }
         self.shared.inner.settings.value(name)
     }
 
@@ -815,6 +821,24 @@ struct NativePlace {
     held: Vec<((u64, u64), Chunk)>,
 }
 
+/// A writer that has been told what order the rows it is about to take are meant to be in.
+///
+/// The declaration has to go down with the table the sink writes, and not only at a checkpoint that
+/// rewrites the file. A streaming load is the path a table of any size takes, the rows arriving at
+/// it are already sorted because the binder put the sort there, and without this the file would hold
+/// the right rows in the right order with nothing saying so. The table is then rebound to what the
+/// file says, so the declaration would be gone from the catalog as well, on the statement that
+/// honoured it.
+fn declared(
+    writer: rudb_native::Writer,
+    clustering: Option<Clustering>,
+) -> Result<rudb_native::Writer> {
+    match clustering {
+        None => Ok(writer),
+        Some(clustering) => writer.declare(clustering),
+    }
+}
+
 /// The root of a file-backed initial insert.
 #[derive(Debug)]
 struct NativeSink {
@@ -830,12 +854,18 @@ struct NativeSink {
 }
 
 impl NativeSink {
-    fn create(target: &Path, name: String, fields: Vec<Field>) -> Result<Self> {
+    fn create(
+        target: &Path,
+        name: String,
+        fields: Vec<Field>,
+        clustering: Option<Clustering>,
+    ) -> Result<Self> {
         let temporary = target.with_extension(format!("{}.tmp", std::process::id()));
         if temporary.exists() {
             std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
         }
         let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?;
+        let writer = declared(writer, clustering)?;
         Ok(Self {
             writer: Mutex::new(Some(writer)),
             temporary: Some(temporary),
@@ -847,8 +877,14 @@ impl NativeSink {
 
     /// The same sink against a file that is already a database, as the generation after the one it
     /// holds.
-    fn open(target: &Path, name: String, fields: Vec<Field>) -> Result<Self> {
+    fn open(
+        target: &Path,
+        name: String,
+        fields: Vec<Field>,
+        clustering: Option<Clustering>,
+    ) -> Result<Self> {
         let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?;
+        let writer = declared(writer, clustering)?;
         Ok(Self {
             writer: Mutex::new(Some(writer)),
             temporary: None,
@@ -1216,6 +1252,7 @@ impl Shared {
                 self.inner.settings.apply(
                     &self.inner.memory,
                     &self.inner.pool,
+                    &mut catalog,
                     &setting.name,
                     setting.scope,
                     value,
@@ -1256,10 +1293,12 @@ impl Shared {
                         rudb_opt::optimize_with(plan, &context)?;
                         let table = create.name.table.clone();
                         let fields = create.columns.clone();
+                        // No declaration to carry. The table is being created by this statement, so
+                        // there is nowhere a declaration could have come from yet.
                         let sink = Arc::new(if alone {
-                            NativeSink::create(path, table.clone(), fields)?
+                            NativeSink::create(path, table.clone(), fields, None)?
                         } else {
-                            NativeSink::open(path, table.clone(), fields)?
+                            NativeSink::open(path, table.clone(), fields, None)?
                         });
                         let query = rudb_exec::build_measured_into(
                             plan,
@@ -1331,10 +1370,15 @@ impl Shared {
                     if empty && (alone || appendable(path, &catalog, &insert.name)?) {
                         let table = target.name().table.clone();
                         let fields = target.columns().to_vec();
+                        // The declaration the target already carries, which is the one the binder
+                        // put the sort in for. The rows reaching the sink are in this order and the
+                        // file has to say so, because the table is rebound to what the file says as
+                        // soon as this returns.
+                        let clustering = target.clustering().cloned();
                         let sink = Arc::new(if alone {
-                            NativeSink::create(path, table.clone(), fields)?
+                            NativeSink::create(path, table.clone(), fields, clustering)?
                         } else {
-                            NativeSink::open(path, table.clone(), fields)?
+                            NativeSink::open(path, table.clone(), fields, clustering)?
                         });
                         let query = rudb_exec::build_measured_into(
                             &insert.source,

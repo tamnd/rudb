@@ -207,6 +207,89 @@ fn a_declaration_that_names_no_width_buckets_by_the_quarter() {
     let _ = std::fs::remove_file(path);
 }
 
+/// The declaration is reachable from SQL, and what it declares survives a reopen.
+///
+/// Everything above builds the declaration through `Table::cluster_by`, which is a Rust call, so
+/// until this test the whole layout was invisible to anybody driving the engine through SQL. The
+/// pin's grammar has no `CLUSTER BY` clause and the parser here is the pin's parser, so the
+/// declaration arrives the way a relationship does, as a setting.
+///
+/// Three things are asserted and each one fails on its own kind of mistake. The setting reads back
+/// as what was written, which a declaration that was applied and not recorded would fail. The file
+/// prunes after a reopen, which a declaration that was recorded and not applied would fail, and
+/// which is also what says the checkpoint wrote it down. And the answer is the one the undeclared
+/// table gives, because a layout that changed an answer would be worse than no layout.
+#[test]
+fn a_clustering_declared_through_the_setting_reaches_the_file_and_survives_a_reopen() {
+    let path =
+        std::env::temp_dir().join(format!("rudb-clustered-setting-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let declaration = "lineitem(quarter(l_shipdate), l_orderkey, l_linenumber)";
+    let query = format!("SELECT count(*), sum(l_orderkey) FROM lineitem {QUARTER}");
+
+    let wanted = {
+        let database = Database::open(name).expect("a file name starts a native database");
+        database.execute("SET threads = 1").expect("sets the thread count");
+        database.execute(&format!("CREATE TABLE lineitem {SHAPE}")).expect("creates");
+        database
+            .execute(&format!("SET cluster_by = '{declaration}'"))
+            .expect("declares the order the rows are stored in");
+        assert_eq!(
+            database.setting("cluster_by").expect("a setting"),
+            declaration,
+            "the setting reads back as what was written"
+        );
+        database.execute(&format!("INSERT INTO lineitem {ROWS}")).expect("loads");
+        database.execute("CHECKPOINT").expect("commits");
+        rows(&database, &query)
+    };
+
+    // A second handle on the same file, which has none of the first one's session state. The only
+    // thing it can know about the order is what the checkpoint wrote into the file.
+    let reopened = Database::open(name).expect("the file opens again");
+    reopened.execute("SET threads = 1").expect("sets the thread count");
+    assert_eq!(rows(&reopened, &query), wanted, "the same rows out of the reopened file");
+    let line = scan_line(&reopened, &query);
+    assert!(line.contains("parts skipped"), "a declared order should prune: {line}");
+    // Read back out of the file in the session that never set it, which is the whole argument for
+    // the setting being a view of the catalog rather than something the session remembers.
+    assert_eq!(reopened.setting("cluster_by").expect("a setting"), declaration);
+
+    // A column the table does not have is refused with the table and the column named, and the
+    // catalog is left alone, which is what says the resolve happens before anything is written.
+    let complaint = reopened
+        .execute("SET cluster_by = 'lineitem(l_shipdate, l_nosuchcolumn)'")
+        .expect_err("no such column")
+        .message()
+        .to_string();
+    assert!(complaint.contains("l_nosuchcolumn"), "{complaint}");
+    assert!(scan_line(&reopened, &query).contains("parts skipped"), "the file still prunes");
+
+    // A reset takes the declaration off the table it was on. Read through the catalog rather than
+    // through a query, because the rows in the file are already in that order and a scan would go
+    // on pruning whether the declaration were there or not, which is the whole difference between
+    // what a table is declared to be and what it happens to be.
+    assert!(
+        reopened.with_catalog_mut(|catalog| {
+            let table = catalog.resolve(&["lineitem"]).expect("resolves");
+            catalog.table(&table).expect("the table is there").clustering().is_some()
+        }),
+        "the declaration is on the table before the reset"
+    );
+    reopened.execute("RESET cluster_by").expect("clears the declaration");
+    assert_eq!(reopened.setting("cluster_by").expect("a setting"), "");
+    assert!(
+        reopened.with_catalog_mut(|catalog| {
+            let table = catalog.resolve(&["lineitem"]).expect("resolves");
+            catalog.table(&table).expect("the table is there").clustering().is_none()
+        }),
+        "and off it afterwards"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn a_load_into_a_table_that_declared_nothing_is_left_in_the_order_it_arrived() {
     // The sort is only ever added because a declaration asked for it, so the ordinary insert has
