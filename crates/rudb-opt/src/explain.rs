@@ -359,7 +359,21 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
         }
     };
     let after = if filtered { " after the filter above" } else { "" };
-    format!("  [{} rows{after}, {}{memory}{slow}]", operator.rows_out, duration(operator.wall_ns))
+    // A scan that pruned nothing says nothing, because a reader who sees "0 of 5861 parts skipped"
+    // on every scan of every query stops reading the clause. A scan that pruned something is the
+    // whole reason this number is on the line, since a predicate that prunes and a predicate that
+    // matches nothing produce the same row count and want different work.
+    let parts = operator.parts_read.saturating_add(operator.parts_pruned);
+    let skipped = if operator.parts_pruned == 0 {
+        String::new()
+    } else {
+        format!(", {} of {parts} parts skipped", operator.parts_pruned)
+    };
+    format!(
+        "  [{} rows{after}, {}{skipped}{memory}{slow}]",
+        operator.rows_out,
+        duration(operator.wall_ns)
+    )
 }
 
 /// The operator row with this id.

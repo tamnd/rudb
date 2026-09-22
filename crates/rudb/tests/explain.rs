@@ -266,3 +266,39 @@ fn the_explain_options_this_answers_reach_the_output_and_can_be_asked_for_togeth
     assert!(both.contains("\nStatistics\n"), "{both}");
     assert!(both.contains(", read to decide]"), "{both}");
 }
+
+#[test]
+fn a_scan_says_how_many_parts_its_statistics_ruled_out() {
+    // Two tables with the same rows in them and one of them in order. The predicate keeps the same
+    // hundred rows either way, so the row count on the scan line cannot tell them apart and the
+    // part count is the only thing that can.
+    let database = Database::new();
+    database.execute("CREATE TABLE sorted (a INTEGER)").expect("creates");
+    database
+        .execute("INSERT INTO sorted SELECT r::INTEGER FROM range(200000) AS s(r)")
+        .expect("inserts in order");
+    database.execute("CREATE TABLE shuffled (a INTEGER)").expect("creates");
+    database
+        .execute(
+            "INSERT INTO shuffled SELECT ((r * 7919) % 200000)::INTEGER FROM range(200000) AS s(r)",
+        )
+        .expect("inserts out of order");
+
+    let ordered = explained(&database, "EXPLAIN ANALYZE SELECT a FROM sorted WHERE a < 100");
+    let scan = tree(&ordered)
+        .into_iter()
+        .find(|line| line.contains("Get "))
+        .expect("the scan is on the tree");
+    assert!(scan.contains("parts skipped"), "an ordered column prunes and should say so: {scan}");
+    assert!(scan.contains("100 rows"), "{scan}");
+
+    // The same predicate over the same values in no particular order rules nothing out, and the
+    // clause is left off rather than printed as a zero.
+    let scattered = explained(&database, "EXPLAIN ANALYZE SELECT a FROM shuffled WHERE a < 100");
+    let scan = tree(&scattered)
+        .into_iter()
+        .find(|line| line.contains("Get "))
+        .expect("the scan is on the tree");
+    assert!(!scan.contains("parts skipped"), "nothing was ruled out here: {scan}");
+    assert!(scan.contains("100 rows"), "{scan}");
+}
