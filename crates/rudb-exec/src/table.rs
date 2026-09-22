@@ -587,6 +587,17 @@ enum Places<'a> {
         /// The words and what they mean, which is all a code needs to be read.
         packed: Packed<'a>,
     },
+    /// A packed run behind a list of rows, which is the shape a filter leaves on a packed column.
+    ///
+    /// The same identity as [`Self::Bits`], because it is the same run and a code means a value
+    /// against the base and the width and nothing else. That is what lets one map serve a chunk
+    /// the filter cut and the next chunk of the same page whole.
+    CodedBits {
+        /// The row of the run each row of the chunk reads, which is the filter's selection.
+        at: &'a [u32],
+        /// The run those rows are read out of.
+        packed: Packed<'a>,
+    },
 }
 
 /// What a direct map's places were built from, so a chunk under different ones rebuilds it.
@@ -656,6 +667,16 @@ impl CodedColumn<'_> {
                         *place += code * stride;
                     }
                 }
+                Places::CodedBits { at, packed } => {
+                    for (row, place) in into.iter_mut().enumerate() {
+                        let code = if column.is_null_at(row) {
+                            nothing
+                        } else {
+                            packed.code(at[row] as usize) as usize
+                        };
+                        *place += code * stride;
+                    }
+                }
             }
             return;
         }
@@ -668,6 +689,11 @@ impl CodedColumn<'_> {
             Places::Bits { packed } => {
                 for (row, place) in into.iter_mut().enumerate() {
                     *place += packed.code(row) as usize * stride;
+                }
+            }
+            Places::CodedBits { at, packed } => {
+                for (row, place) in into.iter_mut().enumerate() {
+                    *place += packed.code(at[row] as usize) as usize * stride;
                 }
             }
         }
@@ -727,9 +753,10 @@ impl<'a> Coded<'a> {
                 (Some(Origin::Dictionary(dictionary)), Places::Codes { values, .. }) => {
                     Arc::ptr_eq(dictionary, values)
                 }
-                (Some(Origin::Bits(base, width)), Places::Bits { packed }) => {
-                    *base == packed.base() && *width == packed.width()
-                }
+                (
+                    Some(Origin::Bits(base, width)),
+                    Places::Bits { packed } | Places::CodedBits { packed, .. },
+                ) => *base == packed.base() && *width == packed.width(),
                 _ => false,
             };
             if !same {
@@ -746,7 +773,9 @@ impl<'a> Coded<'a> {
         for column in self.columns.iter().flatten() {
             into.push(match column.places {
                 Places::Codes { values, .. } => Origin::Dictionary(Arc::clone(values)),
-                Places::Bits { packed } => Origin::Bits(packed.base(), packed.width()),
+                Places::Bits { packed } | Places::CodedBits { packed, .. } => {
+                    Origin::Bits(packed.base(), packed.width())
+                }
             });
         }
     }
@@ -792,6 +821,35 @@ pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
 /// The span counts the place a null takes as well as the places the values take, so it is one more
 /// than the column has distinct values it could hold.
 fn places_of(key: &Vector, rows: usize, room: usize) -> Option<(Places<'_>, usize, bool)> {
+    // A dictionary whose values are a packed run, which is what a filter leaves behind on a column
+    // our own format packed. The codes are the rows that got through and the payload is the whole
+    // page, so the place is the packed code under the row rather than the row number itself.
+    //
+    // Before this, the branch below took this shape, because a selection is a dictionary as far as
+    // the form goes. It read the payload's length as the span, which is the rows of the page and
+    // not the values the column takes, and it keyed the map on the row number. So a group by on a
+    // column of eleven discounts built a map of one entry per row of the page, and rebuilt it for
+    // every chunk, because each filtered chunk points at a payload of its own and a map held by the
+    // payload's identity cannot outlive it. Read this way the span is the width's, which is
+    // sixteen, and the map's identity is the page's, so the chunk after this one reuses it.
+    if let Some((at, values)) = key.dictionary_parts() {
+        if let Some(packed) = values.packed_parts() {
+            let at = at.get(..rows)?;
+            if at.iter().any(|&code| code as usize >= values.len()) {
+                return None;
+            }
+            let span = 1_usize.checked_shl(packed.width())?.checked_add(1)?;
+            if span > room {
+                return None;
+            }
+            // A packed run keeps its nulls in the vector's own validity, and a row here reads that
+            // vector at the code rather than at the row, so the question is whether the page has a
+            // null anywhere in it rather than whether this chunk does.
+            let nullable =
+                key.validity().has_nulls(rows) || values.validity().has_nulls(values.len());
+            return Some((Places::CodedBits { at, packed }, span, nullable));
+        }
+    }
     if let Some((codes, values)) = key.shared_dictionary_parts() {
         let codes = codes.get(..rows)?;
         let span = values.len().checked_add(1)?;
@@ -2959,6 +3017,63 @@ mod tests {
         let coded = coded(&keys, 3).expect("one narrow packed column is read as codes");
         assert_eq!(coded.combos(), 9);
         assert_eq!(placed(&coded, 3), [0, 8, 0]);
+    }
+
+    /// The shape a filter leaves on a packed column: the rows that got through, as codes into the
+    /// whole page.
+    ///
+    /// The place has to be the packed code the row names and not the row number, because the row
+    /// number says nothing about what the row holds. Read the other way the span would be the rows
+    /// of the page rather than the values the column takes, and the map would be one entry per row
+    /// of a page that no second chunk can reuse.
+    #[test]
+    fn a_filtered_packed_column_is_read_at_the_width_of_the_page_it_came_from() {
+        let page = packed_numbers(&[1, 2, 7, 1, 2, 7], 3, 1);
+        let kept = Vector::dictionary(vec![4, 0, 2], page).expect("the rows a filter kept");
+        let keys = [kept];
+        let coded = coded(&keys, 3).expect("a filtered narrow packed column is read as codes");
+        // The eight codes three bits can take and one more for a null, and not the six rows of the
+        // page behind them.
+        assert_eq!(coded.combos(), 9);
+        assert_eq!(placed(&coded, 3), [1, 0, 6]);
+    }
+
+    /// And the map it builds is the page's, so the chunk after it reuses the same one.
+    ///
+    /// This is the half that pays. A filter hands out a chunk at a time and every one of them
+    /// points at a payload of its own, so a map held by the payload's identity is thrown away and
+    /// rebuilt on every chunk of the scan. Held by the base and the width it is built once for the
+    /// page, whether the chunk arrived whole or cut.
+    #[test]
+    fn a_filtered_chunk_and_a_whole_one_off_the_same_page_keep_one_map() {
+        let page = || packed_numbers(&[1, 2, 7, 1, 2, 7], 3, 1);
+        let first = [Vector::dictionary(vec![0, 1], page()).expect("the rows a filter kept")];
+        let over_first = coded(&first, 2).expect("codes");
+        let mut held = Vec::new();
+        over_first.hold(&mut held);
+
+        let next = [Vector::dictionary(vec![3, 5], page()).expect("another chunk of the same page")];
+        assert!(coded(&next, 2).expect("codes").same_as(&held), "the same page, cut again");
+        let whole = [page()];
+        assert!(coded(&whole, 2).expect("codes").same_as(&held), "the same page, not cut at all");
+        let elsewhere = [Vector::dictionary(vec![0, 1], packed_numbers(&[9, 10], 3, 9))
+            .expect("a chunk of another page")];
+        assert!(!coded(&elsewhere, 2).expect("codes").same_as(&held), "another base");
+    }
+
+    /// A null in the page a filter cut is a null at the row that names it, which is the one thing
+    /// reading through a code rather than by row can get wrong.
+    #[test]
+    fn a_null_in_the_page_behind_a_filter_takes_the_place_past_the_last_code() {
+        let page = packed_numbers(&[1, 2, 7], 3, 1).with_validity(rudb_vector::Validity::Mask({
+            let mut mask = rudb_vector::Bitmap::all_valid(3);
+            mask.set(1, false);
+            mask
+        }));
+        let keys = [Vector::dictionary(vec![2, 1, 0], page).expect("the rows a filter kept")];
+        let coded = coded(&keys, 3).expect("codes");
+        assert_eq!(coded.combos(), 9);
+        assert_eq!(placed(&coded, 3), [6, 8, 0]);
     }
 
     /// And a packed column wide enough that the map would cost more than the probe it replaces,
