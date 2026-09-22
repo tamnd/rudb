@@ -7,6 +7,7 @@
 //! own business, and the four here mean four different things by it, which is why the type carries
 //! numbers and not rows.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -391,6 +392,38 @@ pub(crate) struct Filters<'a> {
     pub(crate) cutoff: Option<Arc<Cutoff>>,
 }
 
+/// How many readers can hold working space for a pushed filter without ever waiting on each other.
+///
+/// Sixty four, the way the radix partitions are sixty four. It is more threads than any machine the
+/// engine runs a single pipeline on, and few enough slots that a scan can make them all up front.
+/// A machine with more threads than this wraps and two of its readers share a slot, which is still
+/// correct and is slow in exactly the way one shared free list was.
+const SLOTS: usize = 64;
+
+/// The next reader number to hand out, counted across the process rather than per query.
+static READERS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// This thread's reader number, assigned the first time it asks for one and kept for its life.
+    ///
+    /// A thread identifier that turned into a small index would do instead and `ThreadId` is not
+    /// one. Pool threads are made once and run every query, so this is assigned once per thread for
+    /// the life of the process and read out of a `Cell` after that.
+    static READER: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Which slot the calling thread takes its working space out of.
+fn reader() -> usize {
+    READER.with(|reader| {
+        let mut at = reader.get();
+        if at == usize::MAX {
+            at = READERS.fetch_add(1, Ordering::Relaxed);
+            reader.set(at);
+        }
+        at % SLOTS
+    })
+}
+
 /// The filter a scan applies itself, once it has been prepared against the scan's own columns.
 #[derive(Debug)]
 struct Pushed {
@@ -407,17 +440,26 @@ struct Pushed {
     ///
     /// [`Zone::certain`]: rudb_storage::Zone::certain
     probes: Option<Vec<Probe>>,
-    /// Working space handed back after each chunk rather than made for each one.
+    /// Working space kept per reader rather than in one free list they all queue for.
     ///
     /// A [`Source`] has no per instance state to keep this in, which a [`Stream`] does, so the scan
-    /// keeps a free list and every reader takes one and returns it. That is a lock per chunk that
-    /// really matters, which is every chunk the comparison runs on, and nothing at all on the ones
-    /// the zone waves through. Uncontended it is tens of nanoseconds against a comparison over two
-    /// thousand rows, and the alternative of building the slots per chunk is two allocations of a
-    /// vector per step that a scan does a hundred thousand times.
+    /// keeps the slots itself and each reader goes to the one its thread was given. It was a single
+    /// free list behind a single lock to begin with, and that is a lock taken twice per chunk by
+    /// every thread in the pipeline, on every chunk the comparison runs on. Uncontended that is tens
+    /// of nanoseconds against a comparison over a thousand rows and it does not matter. Contended it
+    /// is the query: moving the ClickBench filters into the scan put nineteen of them onto this path
+    /// and three came out slower on ten threads and faster on one, which is the shape of a lock and
+    /// not the shape of extra work.
+    ///
+    /// The lock stays because a slot can still be shared, on a machine with more threads than
+    /// [`SLOTS`]. The point is not that there is no lock, it is that taking it never waits.
+    ///
+    /// Building the working space per chunk instead would be simpler than either, and it is two
+    /// allocations of a vector per step of the predicate on a call a scan makes a hundred thousand
+    /// times.
     ///
     /// [`Stream`]: rudb_pipeline::Stream
-    spare: Mutex<Vec<Working>>,
+    spare: Vec<Mutex<Option<Working>>>,
 }
 
 /// One reader's share of what a pushed filter mutates.
@@ -458,28 +500,28 @@ impl Pushed {
             compaction,
             passes: later_passes(plan, pushdown.node),
             probes: (whole && probes.len() == wanted).then_some(probes),
-            spare: Mutex::new(Vec::new()),
+            spare: (0..SLOTS).map(|_| Mutex::new(None)).collect(),
         })
     }
 
-    /// One reader's working space, out of the free list or newly made.
-    fn take(&self) -> Working {
-        let waiting = self.spare.lock().ok().and_then(|mut spare| spare.pop());
+    /// One reader's working space, out of its own slot or newly made.
+    fn take(&self, slot: usize) -> Working {
+        let waiting = self.spare[slot].lock().ok().and_then(|mut spare| spare.take());
         waiting.unwrap_or_else(|| Working {
             scratch: self.predicate.scratch(),
             gauge: Gauge::new(self.passes),
         })
     }
 
-    /// The working space back, for whichever reader asks next.
+    /// The working space back into the slot it came out of.
     ///
     /// A lock this cannot take is a lock somebody panicked holding, and the answer to that is to drop
     /// the working space rather than to fail the scan: the next reader builds one and the query
-    /// finishes. The gain function loses the counts this instance had gathered, which costs a
+    /// finishes. The gain function loses the counts this thread had gathered, which costs a
     /// compaction decision made on less evidence and costs no rows.
-    fn give(&self, working: Working) {
-        if let Ok(mut spare) = self.spare.lock() {
-            spare.push(working);
+    fn give(&self, slot: usize, working: Working) {
+        if let Ok(mut spare) = self.spare[slot].lock() {
+            *spare = Some(working);
         }
     }
 }
@@ -589,12 +631,13 @@ impl<'a> Scan<'a> {
         }
         // Taken and given back rather than built here. An empty free list means every other reader
         // is holding one, which is a reader that has not had a turn yet rather than an error.
-        let mut working = pushed.take();
+        let slot = reader();
+        let mut working = pushed.take(slot);
         let kept = pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?;
         if kept.len() != chunk.len() {
             narrow(pushed.compaction, chunk, &kept, &mut working.gauge)?;
         }
-        pushed.give(working);
+        pushed.give(slot, working);
         Ok(())
     }
 
