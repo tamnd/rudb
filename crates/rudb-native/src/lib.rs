@@ -801,6 +801,12 @@ pub struct Writer {
     order: Vec<((u64, u64), (u64, u64))>,
     next_order: u64,
     dictionaries: Vec<Option<GlobalDictionary>>,
+    /// One per column, folding the rows into a summary and a sketch as they go past.
+    ///
+    /// `None` for a column with no hash rule, which is the interval and the nested types. See
+    /// [`stats::Gather`] for why the statistics are built here rather than by reading the file back
+    /// once it is committed.
+    gathers: Vec<Option<stats::Gather>>,
     pending: Vec<PendingChunk>,
     /// The tables already closed in this generation, in the order they were written.
     closed: Vec<Entry>,
@@ -978,6 +984,7 @@ impl Writer {
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
                 .collect(),
+            gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
@@ -1025,6 +1032,7 @@ impl Writer {
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
                 .collect(),
+            gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, 1)).collect(),
             table: Table {
                 name: name.into(),
                 dictionaries: vec![None; fields.len()],
@@ -1122,6 +1130,7 @@ impl Writer {
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
                 .collect(),
+            gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
@@ -1390,6 +1399,26 @@ impl Writer {
     /// would be the whole stripe and the other workers would be waiting on it. The queue is sorted
     /// so the expensive ones are taken first, which is the classic answer to a last job that runs
     /// longer than everything after it.
+    /// One column of one stripe: the pages it encodes to, and the statistics it folds into.
+    ///
+    /// The two together rather than in two passes, because the stripe's rows are in memory once and
+    /// this is the moment they are. Reading them back afterwards is what `stats::build_summary`
+    /// does and what [`stats::Gather`] exists to avoid.
+    ///
+    /// A column whose vector the chunk cannot produce is skipped rather than refused, because
+    /// `encode_column` below is about to fail on the same chunk and its message is the better one.
+    fn encode_one(
+        index: usize,
+        held: &[PendingChunk],
+        dictionary: &mut Option<GlobalDictionary>,
+        gather: &mut Option<stats::Gather>,
+    ) -> Result<ColumnStripe> {
+        if let Some(gather) = gather {
+            gather.stripe(held.iter().filter_map(|pending| pending.chunk.column(index).ok()));
+        }
+        Self::encode_column(index, held, dictionary)
+    }
+
     fn encode_columns(&mut self, held: &[PendingChunk]) -> Result<Vec<ColumnStripe>> {
         let width = self.table.fields.len();
         let workers = std::thread::available_parallelism()
@@ -1400,16 +1429,26 @@ impl Writer {
             return self
                 .dictionaries
                 .iter_mut()
+                .zip(self.gathers.iter_mut())
                 .enumerate()
-                .map(|(index, dictionary)| Self::encode_column(index, held, dictionary))
+                .map(|(index, (dictionary, gather))| {
+                    Self::encode_one(index, held, dictionary, gather)
+                })
                 .collect();
         }
         // The dictionaries are moved out and back rather than borrowed, because a worker that takes
         // the next column off a queue cannot be holding a borrow of the vector the queue came from.
-        let mut jobs: Vec<(usize, Option<GlobalDictionary>)> =
-            std::mem::take(&mut self.dictionaries).into_iter().enumerate().collect();
+        // The gathers ride along with them for the same reason and so that one column's statistics
+        // are folded on the thread that is already walking that column.
+        let mut jobs: Vec<(usize, Option<GlobalDictionary>, Option<stats::Gather>)> =
+            std::mem::take(&mut self.dictionaries)
+                .into_iter()
+                .zip(std::mem::take(&mut self.gathers))
+                .enumerate()
+                .map(|(index, (dictionary, gather))| (index, dictionary, gather))
+                .collect();
         // Popped from the back, so the expensive columns go last in the vector.
-        jobs.sort_by_key(|(index, _)| weight(&self.table.fields[*index].ty));
+        jobs.sort_by_key(|(index, _, _)| weight(&self.table.fields[*index].ty));
         let queue = Mutex::new(jobs);
         let pieces = std::thread::scope(|scope| {
             (0..workers)
@@ -1421,9 +1460,10 @@ impl Writer {
                                 .lock()
                                 .map_err(|_| Error::internal("a native encode worker panicked"))?
                                 .pop();
-                            let Some((index, mut dictionary)) = taken else { break };
-                            let encoded = Self::encode_column(index, held, &mut dictionary)?;
-                            mine.push((index, dictionary, encoded));
+                            let Some((index, mut dictionary, mut gather)) = taken else { break };
+                            let encoded =
+                                Self::encode_one(index, held, &mut dictionary, &mut gather)?;
+                            mine.push((index, dictionary, gather, encoded));
                         }
                         Ok(mine)
                     })
@@ -1436,14 +1476,17 @@ impl Writer {
                 .collect::<Result<Vec<_>>>()
         })?;
         let mut dictionaries: Vec<Option<GlobalDictionary>> = (0..width).map(|_| None).collect();
+        let mut gathers: Vec<Option<stats::Gather>> = (0..width).map(|_| None).collect();
         let mut encoded: Vec<Option<ColumnStripe>> = (0..width).map(|_| None).collect();
         for piece in pieces {
-            for (index, dictionary, stripe) in piece {
+            for (index, dictionary, gather, stripe) in piece {
                 dictionaries[index] = dictionary;
+                gathers[index] = gather;
                 encoded[index] = Some(stripe);
             }
         }
         self.dictionaries = dictionaries;
+        self.gathers = gathers;
         encoded
             .into_iter()
             .map(|stripe| stripe.ok_or_else(|| Error::internal("a column was never encoded")))
@@ -1847,6 +1890,7 @@ impl Writer {
                 hash: checksum(&encoded.index),
             });
         }
+        self.write_stats()?;
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
@@ -1864,6 +1908,74 @@ impl Writer {
                 hash: checksum(&directory),
             },
         })
+    }
+
+    /// Writes the statistics sections for the table being closed, as far as the budget reaches.
+    ///
+    /// Called from [`Self::close`] after the last stripe and after the dictionaries, which is the
+    /// first moment the table's column bytes are final and the last moment before the directory is
+    /// encoded. Both halves matter: the budget is a share of the column bytes, and a section that
+    /// went in after the directory would be a section the directory does not name.
+    ///
+    /// Nothing here can fail the write. A column whose gather came back blind gets no sections, a
+    /// column the budget could not reach gets none, and section 3.1 says both of those plan the way
+    /// they planned before statistics existed. The two errors that are returned are an encode
+    /// failure and a section count past the bound, and neither is a thing a column can cause.
+    fn write_stats(&mut self) -> Result<()> {
+        let gathers = std::mem::take(&mut self.gathers);
+        let rows = self.table.rows as u64;
+        let mut payloads = Vec::new();
+        for (column, gather) in gathers.into_iter().enumerate() {
+            let Some(gather) = gather else { continue };
+            // A gather that saw a different number of rows than the table committed is a gather
+            // that missed some, and a distinct count over some of a column is the one error an
+            // estimator cannot see coming. This has no way of happening today, since a table is
+            // written once and every chunk goes through `flush_pending`, and that is exactly why it
+            // is worth a line: it stays true only while that stays true.
+            if gather.rows() != rows {
+                continue;
+            }
+            let Some(stats) = gather.finish() else { continue };
+            let mut summary = Vec::new();
+            stats.summary.encode(&mut summary)?;
+            let mut sketches = Vec::new();
+            stats.sketches.encode(&mut sketches)?;
+            payloads.push((column, summary, sketches));
+        }
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let costs = payloads
+            .iter()
+            .map(|(_, summary, sketches)| summary.len() + sketches.len())
+            .collect::<Vec<_>>();
+        let allowance = stats::allowance(stats::column_bytes(&self.table), stats::BUDGET_SHARE);
+        // Nothing is spent yet. A table this writer is closing is one it wrote from nothing, so the
+        // only statistics sections it can have are the ones about to go in.
+        let keep = stats::within(&costs, allowance, 0);
+        for ((column, summary, sketches), _) in
+            payloads.iter().zip(&keep).filter(|&(_, &keep)| keep)
+        {
+            let id = u64::try_from(*column).map_err(|_| invalid("column index overflow"))?;
+            for (kind, bytes, header_bytes) in [
+                // A summary is a header the whole way down: there is nothing behind it a reader
+                // could decide not to read.
+                (*section::SUMMARY, summary, summary.len() as u32),
+                (*section::SKETCHES, sketches, rudb_stats::sketches::HEADER_BYTES),
+            ] {
+                let written = write_section(
+                    &self.file,
+                    &mut self.at,
+                    &section::Attachment { kind, id, flags: 0, header_bytes, bytes },
+                    self.generation,
+                )?;
+                self.table.sections.push(written);
+            }
+        }
+        if self.table.sections.len() > MAX_SECTIONS {
+            return Err(invalid("the table would name more sections than the bound allows"));
+        }
+        Ok(())
     }
 
     /// Commits every table this writer has written and syncs the file before publishing its header
@@ -7112,6 +7224,16 @@ mod tests {
         std::env::temp_dir().join(format!("rudb-native-{label}-{}-{stamp}.rdb", std::process::id()))
     }
 
+    /// The sections a test put in the table, which is every one the writer did not.
+    ///
+    /// A table now carries a summary and a sketch per column out of the write itself, and a test
+    /// about the section table is not about those. Filtering by kind rather than by count, so a
+    /// table that turns out to have no room for its summaries does not quietly change what these
+    /// tests are asserting over.
+    fn attached(table: &Table) -> Vec<&Section> {
+        table.sections().iter().filter(|held| !held.among(section::STATISTICS_KINDS)).collect()
+    }
+
     /// A read names the offset it wants, so a cursor somebody else moved cannot reach it.
     #[test]
     fn a_read_at_an_offset_ignores_where_another_thread_left_the_cursor() {
@@ -7431,7 +7553,11 @@ mod tests {
 
         let reader = Reader::open(&path).expect("a format 22 file opens unchanged");
         assert_eq!(reader.table().rows(), 3);
-        assert!(reader.table().sections().is_empty());
+        // The rows and not the section table, because the section block is found by the magic at
+        // the end of the directory rather than by the number in the header, so stamping the header
+        // back does not take away the summaries this writer put there. What the test is about is
+        // that the version check accepts 22, and the rows coming back is what says it did.
+        assert_eq!(reader.read(0, &[0]).expect("the part still reads").len(), 3);
 
         // And a format this build has never written is still refused, so the accept set is a list
         // and not an absence of a check.
@@ -7542,10 +7668,10 @@ mod tests {
             }],
         )
         .expect("attach a key map");
-        assert_eq!(table.sections().len(), 1);
+        assert_eq!(attached(&table).len(), 1);
 
         let reader = Reader::open(&path).expect("reopen after the attach");
-        let held = reader.table().sections();
+        let held = attached(reader.table());
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].kind, *section::KEY_MAP);
         assert_eq!(held[0].flags, 2, "the form a reader must not have to guess");
@@ -7555,8 +7681,8 @@ mod tests {
         // table added to this file later would not make it stale.
         assert_eq!(held[0].generation, 1);
         assert!(held[0].usable(reader.table().generation()));
-        assert_eq!(reader.payload(&held[0]).expect("read the payload"), payload);
-        assert_eq!(reader.extents(&held[0]).expect("extent table").len(), 1);
+        assert_eq!(reader.payload(held[0]).expect("read the payload"), payload);
+        assert_eq!(reader.extents(held[0]).expect("extent table").len(), 1);
 
         fs::remove_file(&path).expect("clean up");
     }
@@ -7623,9 +7749,9 @@ mod tests {
         attach(&path, "items", &[entry(&two)]).expect("rebuild");
 
         let reader = Reader::open(&path).expect("reopen");
-        let held = reader.table().sections();
+        let held = attached(reader.table());
         assert_eq!(held.len(), 1, "one map per column and not one per build");
-        assert_eq!(reader.payload(&held[0]).expect("payload"), two);
+        assert_eq!(reader.payload(held[0]).expect("payload"), two);
 
         fs::remove_file(&path).expect("clean up");
     }
@@ -7664,7 +7790,7 @@ mod tests {
         .expect("attach beside it");
 
         let reader = Reader::open(&path).expect("reopen");
-        let held = reader.table().sections();
+        let held = attached(reader.table());
         assert_eq!(held.len(), 2, "the unfamiliar entry survived a directory rewrite");
         let unknown = held.iter().find(|one| !one.known()).expect("the unfamiliar one");
         assert_eq!(reader.payload(unknown).expect("its bytes are still there"), payload);
@@ -7689,12 +7815,12 @@ mod tests {
         .expect("record a link that did not fit the budget");
 
         let reader = Reader::open(&path).expect("reopen");
-        let held = reader.table().sections();
+        let held = attached(reader.table());
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].extents, 0);
         assert_eq!(held[0].extent_page, 0, "an entry that names no bytes points at none");
-        assert!(reader.extents(&held[0]).expect("no extent table").is_empty());
-        assert!(reader.payload(&held[0]).expect("no payload").is_empty());
+        assert!(reader.extents(held[0]).expect("no extent table").is_empty());
+        assert!(reader.payload(held[0]).expect("no payload").is_empty());
 
         fs::remove_file(&path).expect("clean up");
     }
@@ -7720,15 +7846,15 @@ mod tests {
         .expect("attach a payload past the bound");
 
         let reader = Reader::open(&path).expect("reopen");
-        let held = reader.table().sections();
-        let extents = reader.extents(&held[0]).expect("extent table");
+        let held = attached(reader.table());
+        let extents = reader.extents(held[0]).expect("extent table");
         assert_eq!(extents.len(), 2, "one byte past the bound is two extents");
         assert_eq!(extents[0].length, section::MAX_EXTENT);
         assert_eq!(extents[1].length, 1);
         assert_eq!(extents[1].first, u64::from(section::MAX_EXTENT));
         // And the extent the caller wants is readable on its own, which is the point of the split.
         assert_eq!(reader.extent(&extents[1]).expect("the last extent"), vec![0x5a]);
-        assert_eq!(reader.payload(&held[0]).expect("the whole payload").len(), payload.len());
+        assert_eq!(reader.payload(held[0]).expect("the whole payload").len(), payload.len());
 
         fs::remove_file(&path).expect("clean up");
     }

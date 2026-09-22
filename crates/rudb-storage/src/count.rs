@@ -148,22 +148,42 @@ impl Counts {
     /// than skipping it, for the same reason a form with no arm does: a sketch that missed a chunk
     /// counts too few distinct values and says nothing about having done so.
     pub fn add(&mut self, chunk: &Chunk) {
-        for (at, column) in self.columns.iter_mut().enumerate() {
-            if column.blind {
-                continue;
-            }
-            let walked = chunk.column(at).is_ok_and(|vector| {
-                walk(vector, &mut Sink::of(&mut column.sketch, &mut column.tally))
-            });
-            if !walked {
-                column.blind = true;
-                // The hashes taken so far describe some of the rows and no question is going to be
-                // answered from them, so they are dropped rather than carried. The tally forgets
-                // rather than gives up, because there is no sketch left for it to hand anything to.
-                column.sketch = Sketch::of(&[]);
-                column.tally.forget();
+        for at in 0..self.columns.len() {
+            match chunk.column(at) {
+                Ok(vector) => self.add_column(at, vector),
+                Err(_) => self.blind(at),
             }
         }
+    }
+
+    /// Counts one vector into one column, for a caller that has the columns and not the chunk.
+    ///
+    /// The native writer is that caller. It buffers a stripe as chunks and then hands one column of
+    /// all of them to each encode worker, so a worker has a vector and a column number and no chunk
+    /// whose column numbering matches this counter's. Going through [`Self::add`] would mean giving
+    /// every worker the whole chunk and a counter as wide as the table, and then every worker would
+    /// walk every column and throw away all but one of them.
+    ///
+    /// Out of range is ignored rather than blinding anything, because there is no column to blind.
+    pub fn add_column(&mut self, at: usize, vector: &Vector) {
+        let Some(column) = self.columns.get_mut(at) else { return };
+        if column.blind {
+            return;
+        }
+        if !walk(vector, &mut Sink::of(&mut column.sketch, &mut column.tally)) {
+            self.blind(at);
+        }
+    }
+
+    /// Gives up on a column, which is what a form with no hash rule leaves behind.
+    fn blind(&mut self, at: usize) {
+        let Some(column) = self.columns.get_mut(at) else { return };
+        column.blind = true;
+        // The hashes taken so far describe some of the rows and no question is going to be answered
+        // from them, so they are dropped rather than carried. The tally forgets rather than gives
+        // up, because there is no sketch left for it to hand anything to.
+        column.sketch = Sketch::of(&[]);
+        column.tally.forget();
     }
 
     /// How many distinct non-null values one column holds, when that number is exact.

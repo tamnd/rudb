@@ -46,6 +46,7 @@
 
 use std::cmp::Ordering;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rudb_common::bounds::{self, Bound};
@@ -54,7 +55,7 @@ use rudb_common::{LogicalType, Result, Value};
 use rudb_encoding::sketch::{DEFAULT_K, Sketch};
 use rudb_stats::{Order, STRIPE_K, Sketches, Summary, sketches::HEADER_BYTES as SKETCH_HEADER};
 use rudb_storage::count::{Counts, countable};
-use rudb_vector::Vector;
+use rudb_vector::{Data, Form, Validity, Vector};
 
 use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid};
@@ -222,6 +223,7 @@ pub fn build_summary_for(reader: &Reader, column: usize, per_stripe: bool) -> Re
 /// The distinct count is not here. That is `rudb_storage::count::Counts`, which walks a vector by
 /// its form rather than a row at a time and which a column of a million runs costs one hash. Doing
 /// it twice would double the expensive half of the build and the budget is ten percent of the write.
+#[derive(Debug)]
 struct Pass {
     rows: u64,
     nulls: u64,
@@ -252,6 +254,8 @@ struct Pass {
     /// The scale of a decimal column, so that an integer read out of a vector becomes the bound the
     /// column's other writers would have written for the same value.
     scale: Option<u8>,
+    /// The last dictionary this pass read, so that a column whose vectors share one reads it once.
+    coded: Option<Coded>,
 }
 
 impl Pass {
@@ -274,17 +278,231 @@ impl Pass {
             stripes: Vec::new(),
             fixed: fixed_width(ty),
             scale: bounds::scale_of(ty),
+            coded: None,
         }
     }
 
-    /// One vector of the column, typed rather than a value at a time where the type allows it.
-    ///
-    /// `signed_at` and `bytes_at` between them cover every integer, date, timestamp, decimal, string
-    /// and blob column, which is all sixteen of TPC-H `lineitem` and all but a handful of
-    /// ClickBench. Both are a load against a slice. The fall back below builds a `Value`, and it is
-    /// there for the float columns and for the forms the two fast paths cannot read, not as the
-    /// ordinary path.
+    /// One vector of the column, a vector at a time where the layout allows it and a row at a time
+    /// where it does not.
     fn scan(&mut self, vector: &Vector) {
+        if self.scan_flat(vector) || self.scan_dictionary(vector) {
+            return;
+        }
+        self.scan_rows(vector);
+    }
+
+    /// One vector of a flat signed column, with the layout matched on once instead of once a row.
+    ///
+    /// `false` if the vector is not one of those, and the caller falls back to [`Self::scan_rows`].
+    ///
+    /// This is where the build's time went. [`Self::scan_rows`] asks `Vector::signed_at` for every
+    /// row, and that is a validity test, a match over the body forms and a second match over the
+    /// dozen layouts, and then the answer is wrapped in a [`Bound`] and compared through
+    /// [`Bound::order`], which is another match, four times. Measured on TPC-H SF1 that came to
+    /// about 355 instructions for a value whose whole job is three comparisons: 53.4 G instructions
+    /// of the 60.8 G the statistics added to the write, against 7.9 G for the sketch that hashes
+    /// every one of the same values. The sketch was never the expensive half.
+    ///
+    /// Matched once, the loop underneath is a validity bit and three integer compares. The layouts
+    /// are the signed group and not the unsigned one, because `Vector::signed_at` reads the signed
+    /// group and this has to agree with the path it is replacing rather than be better than it.
+    fn scan_flat(&mut self, vector: &Vector) -> bool {
+        if vector.form() != Form::Flat {
+            return false;
+        }
+        let Some(data) = vector.data() else { return false };
+        let rows = vector.len();
+        let validity = vector.validity();
+        macro_rules! signed {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match data {
+                    $(Data::$variant(held) => {
+                        let held: &[$native] = held;
+                        if held.len() < rows {
+                            return false;
+                        }
+                        let spread = spread(rows, validity, |row| i128::from(held[row]));
+                        let width = self.fixed.unwrap_or(8);
+                        self.fold(Reduced {
+                            rows: spread.rows,
+                            nulls: spread.nulls,
+                            values: spread.values,
+                            bytes: width.saturating_mul(spread.values),
+                            widest: if spread.values > 0 { width } else { 0 },
+                            ascents: spread.ascents,
+                            descents: spread.descents,
+                            ends: (spread.values > 0).then(|| Ends {
+                                low: self.bound(spread.low),
+                                high: self.bound(spread.high),
+                                first: self.bound(spread.first),
+                                last: self.bound(spread.last),
+                            }),
+                        });
+                        return true;
+                    })+
+                    _ => false,
+                }
+            };
+        }
+        rudb_vector::for_each_layout!(signed, signed)
+    }
+
+    /// One vector of a dictionary column, with the values compared once each instead of once a row.
+    ///
+    /// `false` if the vector is not one, or if the dictionary is too big for this to be worth it, or
+    /// if its entries turn out not to be orderable against each other.
+    ///
+    /// A dictionary vector is where the rest of the build's time went, and it is most of what a load
+    /// hands the writer: on a TPC-H SF1 `lineitem` about seven vectors in ten arrive dictionary
+    /// coded, the five string columns among them. Reading one a row at a time costs a code lookup
+    /// and then all the work the flat path was doing, and for a string column it costs a byte
+    /// comparison against the value before it, for a column whose whole point is that it holds a few
+    /// dozen distinct values.
+    ///
+    /// So the dictionary is read once and then the rows are read against what it came to. See
+    /// [`Coded`] for what that is and [`Self::read_dictionary`] for how it is built.
+    fn scan_dictionary(&mut self, vector: &Vector) -> bool {
+        let Some((codes, values)) = vector.shared_dictionary_parts() else { return false };
+        let rows = vector.len();
+        if codes.len() < rows {
+            return false;
+        }
+        let held = match self.coded.take() {
+            Some(held) if Arc::ptr_eq(&held.values, values) => held,
+            // A dictionary this pass has not read. Wider than the vector it codes means reading it
+            // costs more than the rows it is about are worth, so that one goes back to the row at a
+            // time pass rather than being read at all.
+            _ => {
+                if values.len() > rows {
+                    return false;
+                }
+                match self.read_dictionary(values) {
+                    Some(read) => read,
+                    None => return false,
+                }
+            }
+        };
+        let out = held.reduce(codes, rows, vector.validity());
+        self.coded = Some(held);
+        self.fold(out);
+        true
+    }
+
+    /// Reads a dictionary into the positions and the widths its codes stand for.
+    ///
+    /// `None` for a dictionary holding a value with no ordered bound, or a pair this build cannot
+    /// order against each other. Either way the vector goes back to [`Self::scan_rows`], which has
+    /// the rule for what a value like that does to a column's ends and is the one place it lives.
+    ///
+    /// Every entry is ordered against every other, which is one sort of a few dozen things, and then
+    /// each code carries the position its value holds in that order. Entries that order equal share
+    /// a position, so a dictionary that happens to hold one value twice says what the row at a time
+    /// pass says rather than seeing a step between the two copies of it.
+    fn read_dictionary(&self, values: &Arc<Vector>) -> Option<Coded> {
+        let mut entries = Vec::with_capacity(values.len());
+        // row at a time: these are a dictionary's entries rather than a column's rows, and there are
+        // a few dozen of them behind the thousands of rows that code against them. The third arm
+        // builds a `Value` and is the one the checker is looking for, and it runs for a float
+        // dictionary and for nothing else.
+        for at in 0..values.len() {
+            if values.is_null_at(at) {
+                entries.push(None);
+                continue;
+            }
+            // Derived the way `scan_rows` derives it, arm for arm, because the two have to agree on
+            // what bound a value has. A date read as a signed integer and a date read through
+            // `Bound::of_value` are not required to be the same bound, and a column whose vectors
+            // took different paths would be comparing one against the other.
+            let entry = match values.signed_at(at) {
+                Some(signed) => Some((self.bound(signed), self.fixed.unwrap_or(8))),
+                None => match values.bytes_at(at) {
+                    Some(bytes) => Some((Bound::Bytes(bytes.to_vec()), bytes.len() as u64)),
+                    None => {
+                        let value = values.value_at(at);
+                        let wide = self.fixed.unwrap_or_else(|| width(&value));
+                        Bound::of_value(&value).map(|bound| (bound, wide))
+                    }
+                },
+            };
+            entries.push(Some(entry?));
+        }
+        let mut order = (0..entries.len()).filter(|&at| entries[at].is_some()).collect::<Vec<_>>();
+        order.sort_by(|&one, &other| {
+            bound_of(&entries, one).order(bound_of(&entries, other)).unwrap_or(Ordering::Equal)
+        });
+        // The walk that hands out the positions is also what checks the sort meant anything: a pair
+        // this build cannot order sorted to wherever it happened to sit, so an unordered pair here
+        // is the whole dictionary going back to the row at a time pass.
+        let mut codes = vec![None; entries.len()];
+        let mut bounds = Vec::new();
+        for (at, &code) in order.iter().enumerate() {
+            if at > 0 {
+                match bound_of(&entries, order[at - 1]).order(bound_of(&entries, code)) {
+                    Some(Ordering::Less) => bounds.push(bound_of(&entries, code).clone()),
+                    Some(Ordering::Equal) => {}
+                    Some(Ordering::Greater) | None => return None,
+                }
+            } else {
+                bounds.push(bound_of(&entries, code).clone());
+            }
+            let width = entries[code].as_ref().map_or(0, |(_, width)| *width);
+            codes[code] = Some(((bounds.len() - 1) as u32, width));
+        }
+        Some(Coded { values: Arc::clone(values), codes, bounds })
+    }
+
+    /// Folds what one vector came to into the pass, which is where the sequential half is settled.
+    ///
+    /// The order flags and the run count are a question about adjacent rows, so a vector at a time
+    /// pass cannot answer them alone. It can answer them about its own rows and hand back the two
+    /// ends of itself, and then one comparison against the value before the vector joins the two
+    /// halves. That is what this does, and it is the whole of the sequential dependency.
+    fn fold(&mut self, one: Reduced) {
+        self.rows += one.rows;
+        self.nulls += one.nulls;
+        self.bytes = self.bytes.saturating_add(one.bytes);
+        self.widest = self.widest.max(one.widest);
+        let Some(ends) = one.ends else { return };
+        match self.previous.take() {
+            None => self.runs = 1,
+            Some(previous) => self.run(Some(previous.order(&ends.first))),
+        }
+        self.runs += one.descents;
+        if one.descents > 0 {
+            self.ascending = false;
+        }
+        if one.ascents > 0 {
+            self.descending = false;
+        }
+        if takes(&self.low, &ends.low, Ordering::Less) {
+            self.low = Some(ends.low.clone());
+        }
+        if takes(&self.stripe_low, &ends.low, Ordering::Less) {
+            self.stripe_low = Some(ends.low);
+        }
+        if takes(&self.high, &ends.high, Ordering::Greater) {
+            self.high = Some(ends.high.clone());
+        }
+        if takes(&self.stripe_high, &ends.high, Ordering::Greater) {
+            self.stripe_high = Some(ends.high);
+        }
+        self.previous = Some(ends.last);
+    }
+
+    /// The bound this column writes for a signed value, which a decimal column spells differently.
+    fn bound(&self, signed: i128) -> Bound {
+        match self.scale {
+            Some(scale) => Bound::Scaled { unscaled: signed, scale },
+            None => Bound::Int(signed),
+        }
+    }
+
+    /// One vector, a row at a time, for every column the fast path above does not read.
+    ///
+    /// The floats, the unsigned widths, the strings, and every form that is not flat. A string
+    /// column is here rather than in the fast path because its values are not a slice of one width
+    /// and its ends are byte comparisons, and `bytes_value` is already written to not allocate.
+    fn scan_rows(&mut self, vector: &Vector) {
         // row at a time: the run count and the order flags are a sequential dependency. Whether this
         // value is below the one before it is a question about a pair of adjacent rows, so there is
         // no shape of this loop that answers it a vector at a time, and the two typed accessors
@@ -501,6 +719,183 @@ impl Pass {
 /// `want` is [`Ordering::Less`] for a low end and [`Ordering::Greater`] for a high one. An end that
 /// is not there yet takes any value. A pair this build cannot order leaves the end alone, which is
 /// what [`Bound::smaller`] does across domains and which a column of one type cannot reach anyway.
+/// A dictionary the pass has read, and the positions and widths its codes stand for.
+///
+/// Kept from one vector to the next, and kept by the identity of the values it was read from rather
+/// than by a guess about what the caller is doing. One Parquet dictionary page serves every data
+/// page of its column chunk, so a load hands over a hundred vectors that share a dictionary, and
+/// reading it once instead of a hundred times is most of what this arm is worth. The `Arc` is held
+/// rather than its address noted, because a freed allocation's address is one a later dictionary can
+/// be handed and a cache keyed on that would read the wrong values and never know.
+#[derive(Debug)]
+struct Coded {
+    values: Arc<Vector>,
+    /// Position and width per code, `None` for a code whose entry is null.
+    codes: Vec<Option<(u32, u64)>>,
+    /// The distinct bounds in ascending order, which is what a position indexes.
+    bounds: Vec<Bound>,
+}
+
+impl Coded {
+    /// One vector of codes, reduced against this dictionary.
+    ///
+    /// The loop this whole arm is for. A code lookup, a bounds check and an integer comparison, for
+    /// a column whose row at a time path was comparing byte strings.
+    fn reduce(&self, codes: &[u32], rows: usize, validity: &Validity) -> Reduced {
+        let nullable = validity.has_nulls(rows);
+        let mut out = Reduced::empty(rows as u64);
+        let (mut low, mut high, mut first, mut last) = (0_u32, 0_u32, 0_u32, 0_u32);
+        for (row, &code) in codes.iter().take(rows).enumerate() {
+            let entry = if nullable && !validity.is_valid(row) {
+                None
+            } else {
+                self.codes.get(code as usize).copied().flatten()
+            };
+            let Some((position, width)) = entry else {
+                out.nulls += 1;
+                continue;
+            };
+            out.bytes = out.bytes.saturating_add(width);
+            out.widest = out.widest.max(width);
+            if out.values == 0 {
+                low = position;
+                high = position;
+                first = position;
+            } else if position < last {
+                out.descents += 1;
+            } else if position > last {
+                out.ascents += 1;
+            }
+            low = low.min(position);
+            high = high.max(position);
+            last = position;
+            out.values += 1;
+        }
+        let at = |position: u32| self.bounds[position as usize].clone();
+        out.ends = (out.values > 0).then(|| Ends {
+            low: at(low),
+            high: at(high),
+            first: at(first),
+            last: at(last),
+        });
+        out
+    }
+}
+
+/// What one vector came to, in the terms the pass folds rather than in the terms it was read in.
+///
+/// The two fast arms read a vector very differently and reduce it to the same nine numbers, so the
+/// folding is written once. Everything here is about the vector alone: nothing in it depends on the
+/// vector before, which is the half [`Pass::fold`] settles.
+#[derive(Debug)]
+struct Reduced {
+    rows: u64,
+    nulls: u64,
+    /// Non-null values, which is what says whether `ends` means anything.
+    values: u64,
+    bytes: u64,
+    widest: u64,
+    /// Adjacent non-null pairs where the later value is the larger, which rules out a descending
+    /// column, and where it is the smaller, which starts a run.
+    ascents: u64,
+    descents: u64,
+    ends: Option<Ends>,
+}
+
+impl Reduced {
+    fn empty(rows: u64) -> Self {
+        Self { rows, nulls: 0, values: 0, bytes: 0, widest: 0, ascents: 0, descents: 0, ends: None }
+    }
+}
+
+/// The four values of a vector the pass needs by name: its two ends, and its two edges.
+#[derive(Debug)]
+struct Ends {
+    low: Bound,
+    high: Bound,
+    /// The first and last non-null values, for joining to the vectors either side.
+    first: Bound,
+    last: Bound,
+}
+
+/// The bound of a dictionary entry that [`Pass::scan_dictionary`] has already found is not null.
+fn bound_of(entries: &[Option<(Bound, u64)>], at: usize) -> &Bound {
+    match &entries[at] {
+        Some((bound, _)) => bound,
+        // Unreachable: every index handed here came out of the filter that dropped the nulls. The
+        // low bound is the answer that costs a wider range rather than a wrong one, if it ever is.
+        None => &Bound::Int(i128::MIN),
+    }
+}
+
+/// What one vector of a flat signed column came to, computed without building a single [`Bound`].
+///
+/// Everything a [`Pass`] needs from a vector that is not about the vector before it. The two ends,
+/// the two rows at the edges so that the joining comparison can be made, and the counts.
+#[derive(Debug)]
+struct Spread {
+    /// Rows in the vector, nulls included.
+    rows: u64,
+    nulls: u64,
+    /// The ends, meaningless when `values` is zero.
+    low: i128,
+    high: i128,
+    /// The first and last non-null values, for joining to the vectors either side.
+    first: i128,
+    last: i128,
+    /// Adjacent non-null pairs where the later value is the smaller, which is what starts a run.
+    descents: u64,
+    /// And where it is the larger, which is what rules out a descending column.
+    ascents: u64,
+    /// Non-null values, which is what the byte total is a multiple of.
+    values: u64,
+}
+
+/// One pass over a vector's non-null values, reading them through `get`.
+///
+/// Generic over the reader rather than over the element type, so that the caller can widen a layout
+/// into an `i128` at the call site and this gets compiled once per layout with the widening inlined.
+fn spread(rows: usize, validity: &Validity, get: impl Fn(usize) -> i128) -> Spread {
+    let mut out = Spread {
+        rows: rows as u64,
+        nulls: 0,
+        low: 0,
+        high: 0,
+        first: 0,
+        last: 0,
+        descents: 0,
+        ascents: 0,
+        values: 0,
+    };
+    let nullable = validity.has_nulls(rows);
+    // row at a time: this is the loop the whole fast path is, and it is a row at a time because the
+    // ascents and the descents are about adjacent rows. No `Value` is built here and none can be:
+    // `get` hands back an `i128` read out of a typed slice.
+    for row in 0..rows {
+        if nullable && !validity.is_valid(row) {
+            out.nulls += 1;
+            continue;
+        }
+        let value = get(row);
+        if out.values == 0 {
+            out.low = value;
+            out.high = value;
+            out.first = value;
+        } else {
+            if value < out.last {
+                out.descents += 1;
+            } else if value > out.last {
+                out.ascents += 1;
+            }
+            out.low = out.low.min(value);
+            out.high = out.high.max(value);
+        }
+        out.last = value;
+        out.values += 1;
+    }
+    out
+}
+
 fn takes(held: &Option<Bound>, bound: &Bound, want: Ordering) -> bool {
     match held {
         None => true,
@@ -584,6 +979,126 @@ fn width(value: &Value) -> u64 {
         // `countable`.
         _ => 8,
     }
+}
+
+/// One column's statistics built as the rows go past on their way into the file.
+///
+/// # Why this exists beside [`build_summary`]
+///
+/// Section 3.7 gives the build ten percent of the native write time, and [`build_summary`] cannot
+/// fit inside that however tight its inner loop gets, because it starts by reading the file back. A
+/// second full read of a committed table, decode included, is not ten percent of the first one. It
+/// is most of it: on a TPC-H SF1 `lineitem` the standalone build is 11.4 seconds against a write of
+/// 20.0 seconds of processor time, and the read is the bulk of the 11.4.
+///
+/// The writer has the vectors already. It buffers a stripe as chunks and hands one column of all of
+/// them to each encode worker, so every value is in memory, in `rid` order, on a thread that is
+/// about to walk it anyway. What is left of the build once the read is taken out is the hashing and
+/// the comparisons, and those do fit. So this is the same [`Pass`] and the same [`Counts`] driven
+/// from the write rather than from a reader, and [`build_summary`] stays as the path for a file
+/// that was written before any of this existed.
+///
+/// # No per stripe sketches here
+///
+/// Section 3.8 promotes a column when something has declared a relationship or a key over it, and
+/// [`read_columns`] reads that off the file. A table being written for the first time has no
+/// sections at all, so the promoted set is empty by construction and there is nothing for this to
+/// decide. A later checkpoint that declares a key is what promotes the column, and that goes through
+/// [`build_stats_for`] with the file in front of it.
+#[derive(Debug)]
+pub(crate) struct Gather {
+    pass: Pass,
+    counts: Counts,
+}
+
+impl Gather {
+    /// One for a column that can be summarized, and nothing for one that cannot.
+    ///
+    /// `None` rather than an error, because a table with an interval column in it still gets
+    /// summaries for its other fifteen and section 3.1 says the interval column plans the way it
+    /// planned before.
+    pub(crate) fn new(ty: &LogicalType, generation: u64) -> Option<Self> {
+        countable(ty).then(|| Self { pass: Pass::new(ty, generation), counts: Counts::new(1) })
+    }
+
+    /// Folds one whole stripe of this column, in part order.
+    ///
+    /// A stripe at a time and not a part at a time, because the stripe is the unit the pass opens
+    /// and closes its ends over and a caller that fed it parts would have to know that.
+    pub(crate) fn stripe<'a>(&mut self, parts: impl Iterator<Item = &'a Vector>) {
+        self.pass.open_stripe();
+        for vector in parts {
+            self.counts.add_column(0, vector);
+            self.pass.scan(vector);
+        }
+        self.pass.close_stripe();
+    }
+
+    /// How many rows went past, which is what the caller checks against the table's own count.
+    pub(crate) fn rows(&self) -> u64 {
+        self.pass.rows
+    }
+
+    /// The summary and the merged sketch, or nothing if the column turned out to be blind.
+    ///
+    /// Blind means a form `rudb_storage::count` has no arm for turned up, so the sketch is missing
+    /// rows and cannot say which. A distinct count that is too low is the one error an estimator has
+    /// no defence against, so the column gets no sections rather than sections with a number in them
+    /// nothing can check.
+    pub(crate) fn finish(self) -> Option<Stats> {
+        let sketch = self.counts.sketch(0)?;
+        Some(self.pass.finish(sketch, Vec::new()))
+    }
+}
+
+/// Everything the columns of a table being written cost so far, which is what the budget is a share
+/// of.
+///
+/// The same sum [`crate::Layout::columns_total`] takes, off the table rather than off a reader,
+/// because the writer has no reader and the file it would open is not committed yet. Every stripe's
+/// pages are written by the time this is asked and so are the dictionaries, so the two agree.
+pub(crate) fn column_bytes(table: &crate::Table) -> u64 {
+    (0..table.fields.len())
+        .map(|at| {
+            crate::sum(table.stripes.iter().map(|stripe| crate::span_bytes(&stripe.pages, at)))
+                .saturating_add(crate::sum(
+                    table.stripes.iter().map(|stripe| crate::page_bytes(&stripe.memberships, at)),
+                ))
+                .saturating_add(crate::sum(
+                    table.stripes.iter().map(|stripe| crate::page_bytes(&stripe.sieves, at)),
+                ))
+                .saturating_add(crate::sum(
+                    table.stripes.iter().map(|stripe| crate::page_bytes(&stripe.part_ranges, at)),
+                ))
+                .saturating_add(crate::page_bytes(&table.dictionaries, at))
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// Which of these payloads fit the allowance, smallest first.
+///
+/// Smallest first so that a budget that cannot hold everything holds as many columns as it can. The
+/// alternative is column order, which would give the summaries to whichever columns the schema
+/// happened to list early, and there is nothing about being the first column that makes a summary
+/// worth more.
+pub(crate) fn within(costs: &[usize], allowance: u64, spent: u64) -> Vec<bool> {
+    let mut order = (0..costs.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&at| costs[at]);
+    let mut spent = spent;
+    let mut keep = vec![false; costs.len()];
+    for at in order {
+        let cost = costs[at] as u64;
+        if spent.saturating_add(cost) <= allowance {
+            spent += cost;
+            keep[at] = true;
+        }
+    }
+    keep
+}
+
+/// What the allowance is for a table whose columns come to this many bytes.
+pub(crate) fn allowance(column_bytes: u64, share: u64) -> u64 {
+    (column_bytes.saturating_mul(share) / 100).max(BUDGET_FLOOR)
 }
 
 /// Builds the statistics for each of these columns and attaches them all in one commit.
@@ -675,8 +1190,8 @@ pub fn build_stats_for(
 ) -> Result<Vec<Built>> {
     let reader = Catalog::open(path)?.table(table)?;
     let column_bytes = reader.layout().columns_total();
-    let allowance = (column_bytes.saturating_mul(share) / 100).max(BUDGET_FLOOR);
-    let mut spent = held_bytes(&reader, columns)?;
+    let allowance = allowance(column_bytes, share);
+    let spent = held_bytes(&reader, columns)?;
     let mut report = Vec::with_capacity(columns.len());
     let mut payloads = Vec::with_capacity(columns.len());
     for &column in columns {
@@ -701,16 +1216,10 @@ pub fn build_stats_for(
         });
         payloads.push((column, summary, sketches));
     }
-    let mut order = (0..payloads.len()).collect::<Vec<_>>();
-    order.sort_by_key(|&at| report[at].bytes());
-    let mut keep = vec![false; payloads.len()];
-    for at in order {
-        let cost = report[at].bytes() as u64;
-        if spent.saturating_add(cost) <= allowance {
-            spent += cost;
-            keep[at] = true;
-            report[at].built = true;
-        }
+    let costs = report.iter().map(Built::bytes).collect::<Vec<_>>();
+    let keep = within(&costs, allowance, spent);
+    for (one, &keep) in report.iter_mut().zip(&keep) {
+        one.built = keep;
     }
     // The reader holds the file open and the attach opens it again to write, so it is dropped first
     // for the reason `graph` drops it: the moment the file is written is a moment nothing else in
@@ -813,6 +1322,7 @@ pub fn summarizable(ty: &LogicalType) -> bool {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rudb_common::Field;
@@ -859,6 +1369,183 @@ mod tests {
             let chunk =
                 Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("values")])
                     .expect("one column");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+        path
+    }
+
+    /// The vector at a time pass says exactly what the row at a time pass says.
+    ///
+    /// [`Pass::scan_flat`] and [`Pass::scan_dictionary`] took the ordinary columns off
+    /// [`Pass::scan_rows`] and they are why the build fits inside its share of the write. What they
+    /// have to be is not fast but identical, so each is driven here over the same vectors in the
+    /// same stripes as the row at a time pass and the two summaries are compared whole.
+    ///
+    /// Six shapes and five types. The shapes, because the fields that differ between them are the
+    /// order flags and the run count, and those are what a vector at a time pass has to rejoin by
+    /// hand. The types, because the two arms read a value in three different ways between them and
+    /// a bound that came out of one has to be the bound that came out of another.
+    #[test]
+    fn the_vector_at_a_time_pass_says_what_the_row_at_a_time_pass_says() {
+        // Coprime with the length, so this visits every value once and every part spans the range.
+        let shuffled = (0..500_i64).map(|at| Some(1 + at * 307 % 500)).collect::<Vec<_>>();
+        let shapes: [(&str, Vec<Option<i64>>); 7] = [
+            ("ascending", (1..=500_i64).map(Some).collect()),
+            ("descending", (1..=500_i64).rev().map(Some).collect()),
+            ("constant", vec![Some(7); 500]),
+            ("shuffled", shuffled),
+            ("every third null", (1..=500_i64).map(|at| (at % 3 != 0).then_some(at)).collect()),
+            ("all nulls", vec![None; 500]),
+            ("twenty values over and over", (0..500_i64).map(|at| Some(at * 7 % 20)).collect()),
+        ];
+        let types = [
+            LogicalType::SmallInt,
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::Decimal { width: 18, scale: 2 },
+            LogicalType::Varchar,
+        ];
+        for (label, values) in &shapes {
+            for ty in &types {
+                // Sixty rows to a vector and five vectors to a stripe, so the stripe ends and the
+                // overlap answer are in the comparison rather than left where they started.
+                let held = values
+                    .chunks(60)
+                    .map(|part| {
+                        let values = part.iter().map(|value| one(ty, *value)).collect::<Vec<_>>();
+                        Vector::from_values(ty.clone(), &values).expect("values")
+                    })
+                    .collect::<Vec<_>>();
+                // The same rows again as a dictionary of the twenty distinct values a vector holds,
+                // in an order that is not the sorted one, so that the positions the arm hands out
+                // are doing work rather than agreeing with the codes by accident.
+                let coded = values
+                    .chunks(60)
+                    .map(|part| {
+                        let mut distinct = part.to_vec();
+                        distinct.sort_unstable();
+                        distinct.dedup();
+                        distinct.reverse();
+                        let values =
+                            distinct.iter().map(|value| one(ty, *value)).collect::<Vec<_>>();
+                        let codes = part
+                            .iter()
+                            .map(|value| {
+                                distinct.iter().position(|held| held == value).expect("a code")
+                                    as u32
+                            })
+                            .collect::<Vec<_>>();
+                        Vector::dictionary(
+                            codes,
+                            Vector::from_values(ty.clone(), &values).expect("values"),
+                        )
+                        .expect("a dictionary")
+                    })
+                    .collect::<Vec<_>>();
+                let flat = drive(ty, &held, |pass, vector| {
+                    assert!(pass.scan_flat(vector) || *ty == LogicalType::Varchar, "{label} {ty}");
+                    if *ty == LogicalType::Varchar {
+                        pass.scan_rows(vector);
+                    }
+                });
+                let dictionary = drive(ty, &coded, |pass, vector| {
+                    assert!(pass.scan_dictionary(vector), "{label} {ty} is dictionary coded");
+                });
+                let rows = drive(ty, &held, Pass::scan_rows);
+                assert_eq!(flat.summary, rows.summary, "flat: {label} {ty}");
+                assert_eq!(dictionary.summary, rows.summary, "dictionary: {label} {ty}");
+                // And again over one dictionary that every vector shares, which is what a Parquet
+                // load hands over and what the pass keeps its last dictionary for. Only for the
+                // shapes narrow enough to have one, since a dictionary wider than the vector it
+                // codes is one this arm turns down.
+                let Some(shared) = shared(ty, values) else { continue };
+                let coded = values
+                    .chunks(60)
+                    .map(|part| {
+                        let codes = part.iter().map(|value| code(values, *value)).collect();
+                        Vector::dictionary_over(codes, Arc::clone(&shared)).expect("a dictionary")
+                    })
+                    .collect::<Vec<_>>();
+                let held = drive(ty, &coded, |pass, vector| {
+                    assert!(pass.scan_dictionary(vector), "{label} {ty} is dictionary coded");
+                });
+                assert_eq!(held.summary, rows.summary, "one dictionary: {label} {ty}");
+            }
+        }
+    }
+
+    /// The distinct values of a column as one dictionary, or nothing if there are too many of them
+    /// for [`Pass::scan_dictionary`] to take it.
+    fn shared(ty: &LogicalType, values: &[Option<i64>]) -> Option<Arc<Vector>> {
+        let mut distinct = values.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        // Wider than the sixty rows a vector holds is what the arm turns down, and a test that fed
+        // it one would be asserting over the row at a time pass twice.
+        if distinct.len() > 60 {
+            return None;
+        }
+        // Reversed, so the positions the arm hands out are doing work rather than agreeing with the
+        // codes by accident.
+        distinct.reverse();
+        let held = distinct.iter().map(|value| one(ty, *value)).collect::<Vec<_>>();
+        Some(Arc::new(Vector::from_values(ty.clone(), &held).expect("values")))
+    }
+
+    /// Where a value sits in the dictionary [`shared`] builds.
+    fn code(values: &[Option<i64>], value: Option<i64>) -> u32 {
+        let mut distinct = values.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        distinct.reverse();
+        distinct.iter().position(|held| *held == value).expect("a code") as u32
+    }
+
+    /// One value of this type, or a null, for the equivalence test above.
+    fn one(ty: &LogicalType, value: Option<i64>) -> Value {
+        let Some(value) = value else { return Value::Null };
+        match ty {
+            LogicalType::SmallInt => Value::SmallInt(value as i16),
+            LogicalType::Integer => Value::Integer(value as i32),
+            LogicalType::BigInt => Value::BigInt(value),
+            LogicalType::Varchar => Value::Varchar(format!("v{value:04}")),
+            _ => Value::Decimal { unscaled: i128::from(value), width: 18, scale: 2 },
+        }
+    }
+
+    /// A whole pass over these vectors, five to a stripe, read by whichever arm the caller names.
+    fn drive(ty: &LogicalType, held: &[Vector], mut scan: impl FnMut(&mut Pass, &Vector)) -> Stats {
+        let mut pass = Pass::new(ty, 1);
+        for stripe in held.chunks(5) {
+            pass.open_stripe();
+            for vector in stripe {
+                scan(&mut pass, vector);
+            }
+            pass.close_stripe();
+        }
+        pass.finish(Sketch::of(&[]), Vec::new())
+    }
+
+    /// A one column table of intervals, which is a type with no hash rule and so a table this
+    /// build writes no statistics section for.
+    ///
+    /// The only way left to make a file whose table names no sections, now that an ordinary write
+    /// writes them. See the criterion 3 test for why stamping the version back onto a file that has
+    /// them does not do it.
+    fn table_of_intervals(label: &str, months: &[i32]) -> PathBuf {
+        let path = path(label);
+        let mut writer =
+            Writer::create(&path, "t", vec![Field::new("v", LogicalType::Interval)]).expect("new");
+        for part in months.chunks(1000) {
+            let held = part
+                .iter()
+                .map(|months| Value::Interval { months: *months, days: 0, micros: 0 })
+                .collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Interval, &held).expect("values"),
+            ])
+            .expect("one column");
             writer.append(&chunk).expect("a part");
         }
         writer.finish().expect("commit");
@@ -1043,15 +1730,19 @@ mod tests {
         // does not checksum*, because both are answered by planning the query the way it was
         // planned before statistics existed.
         //
-        // The older file is this build's file with the version stamped back and nothing attached,
-        // for the reason the format 22 test in `lib.rs` gives: the two formats differ only in a
-        // trailing directory block, so a file that never had one is a format 22 file already and
-        // the stamp is the only thing left to change. No fixture to go stale and no second encoder
-        // to drift.
-        let values = (1..=3000_i64).map(Some).collect::<Vec<_>>();
-        let current = table_of("with_sections", &values);
-        let older = table_of("before_sections", &values);
-        build_stats(&current, "t", &[0]).expect("this build states what its columns hold");
+        // The older file is a table of a type with no hash rule, with its version stamped back. A
+        // build before section 3.8 wrote no section block at all, and a table this build writes no
+        // sections for is that file on disk, so there is no fixture to go stale and no second
+        // encoder to drift.
+        //
+        // The obvious construction, stamping the version back onto a file that does carry
+        // summaries, does not work and is worth saying why. The section block is found by a magic
+        // at the end of the directory rather than by the number in the header, so a stamped file
+        // with sections in it is a file with sections in it, and the test would be asserting
+        // nothing.
+        let months = (1..=3000_i32).collect::<Vec<_>>();
+        let older = table_of_intervals("before_sections", &months);
+        let current = table_of("with_sections", &(1..=3000_i64).map(Some).collect::<Vec<_>>());
 
         let file = fs::OpenOptions::new().write(true).open(&older).expect("reopen to patch");
         crate::write_at(&file, 8, &22_u32.to_le_bytes()).expect("stamp the older format");
@@ -1065,7 +1756,12 @@ mod tests {
         assert!(summary(&old, 0).is_none(), "and so says nothing about its columns");
         assert!(sketches(&old, 0).is_none());
         assert!(read_columns(&old).is_empty(), "nor promotes any of them");
-        assert_eq!(rows_of(&old), rows_of(&new), "and answers what the newer file answers");
+        assert_eq!(old.table().rows(), 3000, "and reads every row it holds");
+        assert_eq!(
+            rows_of(&old).first(),
+            Some(&Value::Interval { months: 1, days: 0, micros: 0 }),
+            "with the values it was written with"
+        );
 
         drop(new);
         drop(old);
