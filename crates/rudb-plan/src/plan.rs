@@ -91,6 +91,15 @@ pub struct Plan {
     /// every later pass is allowed to move, and the table index is the one name an aggregate keeps
     /// from the binder to the executor.
     presized: BTreeMap<u32, u64>,
+    /// The range an aggregate's single integer grouping key is known to lie inside, by the same
+    /// table index, as the smallest value and how many values the range covers.
+    ///
+    /// Beside `presized` and for the same reasons. This one is also a decision and not a fact: an
+    /// aggregate that never hears it groups the way it always did, and an aggregate that hears it
+    /// keeps the hash table anyway and uses this as a shortcut to the slot. What it is not allowed
+    /// to be is narrower than the column, which is why the pass that writes it takes nothing but an
+    /// exact pair of ends.
+    dense: BTreeMap<u32, (i128, u64)>,
 }
 
 impl Default for Plan {
@@ -134,6 +143,7 @@ impl Plan {
             zones: BTreeMap::new(),
             frequencies: BTreeMap::new(),
             presized: BTreeMap::new(),
+            dense: BTreeMap::new(),
         }
     }
 
@@ -275,6 +285,27 @@ impl Plan {
     #[must_use]
     pub fn presized_count(&self) -> usize {
         self.presized.len()
+    }
+
+    /// Records the range the single integer grouping key of the aggregate at `index` lies inside.
+    ///
+    /// `low` is the smallest value the column can hold and `values` is how many values the range
+    /// covers, so the largest is `low + values - 1`. Written by one pass, `rudb_opt`'s `dense`, and
+    /// only from a pair of ends a store really looked at.
+    pub fn densify(&mut self, index: u32, low: i128, values: u64) {
+        self.dense.insert(index, (low, values));
+    }
+
+    /// The range that aggregate's grouping key lies inside, where anybody said.
+    #[must_use]
+    pub fn dense(&self, index: u32) -> Option<(i128, u64)> {
+        self.dense.get(&index).copied()
+    }
+
+    /// How many aggregates carry a key range, which is what a test about this asks.
+    #[must_use]
+    pub fn dense_count(&self) -> usize {
+        self.dense.len()
     }
 
     /// How many nodes are in the arena, reachable or not.

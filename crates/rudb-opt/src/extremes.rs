@@ -52,10 +52,10 @@
 //! [`Stat`]: rudb_common::Stat
 //! [`Zones::extreme`]: rudb_common::bounds::Zones::extreme
 
-use rudb_common::bounds::End;
+use rudb_common::bounds::{Bound, End};
 use rudb_common::stat::Use;
 use rudb_common::{Field, LogicalType, Result, Value};
-use rudb_plan::{Expr, Node, NodeRef, Plan};
+use rudb_plan::{ColumnBinding, Expr, Node, NodeRef, Plan};
 
 use crate::pass::{Context, Pass};
 
@@ -170,6 +170,61 @@ fn extreme(
     let stat = zones.extreme(zones.column(&name)?, end);
     stat.read(EXTREME)?.into_value(ty)
 }
+
+/// The two ends of the integer column a binding names, as a range its values are inside of.
+///
+/// The other reading of the same bounds, and the difference from [`extreme`] above is the whole
+/// reason it is a separate function. That one is answering the query and has to be looking at
+/// exactly the rows the query asked about, so a filter between the aggregate and the scan stops it.
+/// This one is sizing a structure and wants a range nothing falls outside of, so a filter is fine
+/// and so is a join: neither can put a value in the column that the column does not hold.
+///
+/// That is why the scan is found by its table index anywhere in the plan rather than by walking down
+/// from a node. The index is what the binding names, and whatever sits in between only ever removes
+/// rows or carries them through. A projection of a plain column reference is followed because that
+/// is a rename. A cast is not, since a narrowing one moves both ends. An expression is not, since
+/// the ends of `c + 1` are not the ends of `c`.
+///
+/// Integers only, which is [`Bound::Int`] and so covers the integer types, `BOOLEAN` and `DATE`. A
+/// real and a decimal have ends too and neither has the property a caller of this wants, which is
+/// that the values between the ends are countable.
+///
+/// `None` unless both ends read [`Use::Decide`]. A caller sizes with this and never answers from it,
+/// so a bound that is wider than the column costs room and a bound that is narrower would be a
+/// wrong answer, and the classes that can be narrower are the ones this refuses.
+pub(crate) fn span(plan: &Plan, binding: ColumnBinding, depth: u32) -> Option<(i128, i128)> {
+    let depth = depth.checked_sub(1)?;
+    for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        match *plan.node(at) {
+            Node::Get { index, columns, .. } if index == binding.table => {
+                let name = &plan.field_list(columns).get(binding.column as usize)?.name;
+                let zones = plan.zones(index)?;
+                let column = zones.column(name)?;
+                let low = zones.extreme(column, End::Low);
+                let high = zones.extreme(column, End::High);
+                return match (low.read(SPAN)?, high.read(SPAN)?) {
+                    (&Bound::Int(low), &Bound::Int(high)) if low <= high => Some((low, high)),
+                    _ => None,
+                };
+            }
+            Node::Project { index, exprs, .. } if index == binding.table => {
+                let &carried = plan.expr_list(exprs).get(binding.column as usize)?;
+                let &Expr::Column(carried) = plan.expr(carried) else { return None };
+                return span(plan, carried, depth);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What a zone map bound is read for when it is sizing a structure rather than answering.
+///
+/// [`Use::Decide`], which is the weakest of the three and is the right one here for the reason
+/// section 5.1.1 gives: the number changes no row of the answer. A caller that got a range wider
+/// than the column takes room it does not fill, and a caller that got no range at all does what it
+/// did before there were any ranges.
+const SPAN: Use = Use::Decide;
 
 /// The scan's table index and the name that column has in it, walking down from `at`.
 ///
