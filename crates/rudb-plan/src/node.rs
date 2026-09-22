@@ -479,7 +479,7 @@ pub enum Node {
         ///
         /// Named here rather than looked for by the builder, the same way [`Self::Fetch`] names
         /// its ordinal. The rule that writes this node is the one thing that has proved the row id
-        /// survives to here, by way of [`crate::rid`], and a builder that went looking for the
+        /// survives to here, by way of [`crate::rids_of`], and a builder that went looking for the
         /// column by name afterwards would be trusting a name where the rule trusted an analysis.
         rid: ExprRef,
     },
