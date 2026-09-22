@@ -32,6 +32,11 @@ pub struct Counters {
     /// shim reads it twice per chunk. See [`Span`](crate::Span) for what that came to. Not an atomic
     /// because it is decided when the operator is built and read on every thread afterwards.
     charges_cpu: bool,
+    /// The operator this one's rows go into, and nothing for the one that produces the answer.
+    ///
+    /// Not an atomic for the same reason the id is not: it is a fact about the shape of the plan,
+    /// known when the operator is built and unchanged for as long as it runs.
+    parent: Option<u32>,
     rows_in: AtomicU64,
     rows_out: AtomicU64,
     wall_ns: AtomicU64,
@@ -76,6 +81,7 @@ impl Counters {
             estimated_rows: None,
             implementations: Vec::new(),
             charges_cpu: false,
+            parent: None,
             rows_in: AtomicU64::new(0),
             rows_out: AtomicU64::new(0),
             wall_ns: AtomicU64::new(0),
@@ -117,6 +123,17 @@ impl Counters {
     #[must_use]
     pub fn charging_cpu(mut self, charges: bool) -> Self {
         self.charges_cpu = charges;
+        self
+    }
+
+    /// Says which operator this one's rows go into.
+    ///
+    /// Taken from the plan's shape rather than worked out here, because the operator tree is not
+    /// quite the plan tree and the crate that knows the difference is the one that numbered the
+    /// operators. See [`Operator::parent`](crate::Operator::parent).
+    #[must_use]
+    pub fn under(mut self, parent: Option<u32>) -> Self {
+        self.parent = parent;
         self
     }
 
@@ -250,6 +267,7 @@ impl Counters {
     #[must_use]
     pub fn snapshot(&self) -> Operator {
         let mut operator = Operator::new(self.id, self.pipeline, &self.kind);
+        operator.parent = self.parent;
         operator.detail.clone_from(&self.detail);
         operator.estimated_rows = self.estimated_rows;
         operator.implementations.clone_from(&self.implementations);

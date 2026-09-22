@@ -5775,6 +5775,88 @@ fn a_join_no_lookup_answers_says_so_in_the_profile() {
     );
 }
 
+/// The one edge in the document. Without it a reader can add up what a query moved and cannot
+/// check that any of it adds up, because the check is an operator's input against what fed it.
+#[test]
+fn every_operator_but_the_one_that_answers_names_what_consumed_its_rows() {
+    let db = database();
+    let result = db.query("SELECT sum(x) FROM (SELECT x FROM t WHERE x > 1) ORDER BY 1").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let roots: Vec<u32> = metrics
+        .operators
+        .iter()
+        .filter(|operator| operator.parent.is_none())
+        .map(|operator| operator.id)
+        .collect();
+    assert_eq!(roots, vec![0], "one operator produces the answer and it is the first one");
+    for operator in &metrics.operators {
+        let Some(parent) = operator.parent else { continue };
+        let parent = metrics
+            .operators
+            .iter()
+            .find(|other| other.id == parent)
+            .expect("a parent is an operator in the same document");
+        assert!(parent.id < operator.id, "a parent is numbered before everything under it");
+    }
+}
+
+/// A parent id pointing at an operator with no row is worse than no parent id, because a reader
+/// walking up the chain stops there and reports a gap it cannot tell from a missing measurement.
+/// A node folded into another is what puts a hole in the numbering, so the shapes below are the
+/// ones where that happens: a filter taken into a scan, a join, a set operation, a materialised
+/// `WITH` and a window.
+#[test]
+fn no_operator_hangs_under_a_row_that_is_not_there() {
+    let db = database();
+    for sql in [
+        "SELECT x FROM t WHERE x > 1",
+        "SELECT sum(x) FROM t WHERE x > 1 GROUP BY s ORDER BY 1",
+        "SELECT t.x FROM t JOIN t AS u ON t.x = u.x WHERE t.x > 1",
+        "SELECT t.x FROM t LEFT JOIN t AS u ON t.x = u.x",
+        "SELECT x FROM t WHERE x IN (SELECT x FROM t WHERE x > 1)",
+        "SELECT x FROM t UNION SELECT x FROM t",
+        "WITH c AS MATERIALIZED (SELECT x FROM t WHERE x > 1) SELECT x FROM c ORDER BY 1",
+        "SELECT x, count(*) OVER (PARTITION BY s) FROM t",
+        "SELECT x FROM t ORDER BY 1 LIMIT 2",
+        "SELECT a.x FROM t AS a, t AS b WHERE a.x > b.x",
+    ] {
+        let result = db.query(sql).unwrap_or_else(|error| panic!("{sql} did not run: {error}"));
+        let metrics = result.metrics().expect("a query that ran has metrics");
+        // A materialisation is filled and read back rather than handed upwards, so it is an
+        // operator with nothing above it and a query holding one has two.
+        let held = metrics.operators.iter().filter(|one| one.kind.contains("CTE")).count();
+        let roots = metrics.operators.iter().filter(|one| one.parent.is_none()).count();
+        assert_eq!(roots, 1 + held, "{sql} has one operator the answer is read from");
+        for one in &metrics.operators {
+            let Some(parent) = one.parent else { continue };
+            assert!(
+                metrics.operators.iter().any(|other| other.id == parent),
+                "{sql}: operator {} hangs under {parent}, which has no row",
+                one.id
+            );
+        }
+    }
+}
+
+/// The gathered side feeds the operator that holds it, which is the one place the operator tree is
+/// a different shape than the plan. A reader that walked the plan instead would compare the join's
+/// input against rows the join never saw.
+#[test]
+fn the_side_a_join_gathers_hangs_under_the_operator_that_holds_it() {
+    let db = database();
+    let result = db.query("SELECT t.x FROM t JOIN t AS u ON t.x = u.x").unwrap();
+    let metrics = result.metrics().expect("a query that ran has metrics");
+    let gather = operator(metrics, "Gather");
+    let probe = operator(metrics, "Probe");
+    assert_eq!(gather.parent, Some(probe.id), "the held side is handed to the join");
+    let held = metrics
+        .operators
+        .iter()
+        .find(|other| other.parent == Some(gather.id))
+        .expect("something fills the gather");
+    assert_eq!(held.rows_out, gather.rows_in, "and what it produced is what the gather took");
+}
+
 /// A join is the one operator with two inputs and one row in the document, so its own row counts
 /// the driving side alone. Without this the gathered side, which is the half of the query most of
 /// the memory and most of the surprises are in, is not in the document at all.
