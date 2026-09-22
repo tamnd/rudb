@@ -738,6 +738,7 @@ dependencies = [
  "rudb-io",
  "rudb-kernels",
  "rudb-native",
+ "rudb-parquet",
  "rudb-parse",
  "rudb-plan",
  "rudb-vector",
