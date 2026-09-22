@@ -6,6 +6,14 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at the handover, because a version number cannot go backwards. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1, and M2 was open when the F series took the number over. The M series is the v1 engine plan and the F series is the v2 one, and `notes/Spec/2140/engine-v2/00-README.md` is explicit that the second is a plan running beside the first rather than a replacement for it. Two plans cannot both own one version number, so one of them has it and the other does not, and work that lands against an M milestone still ships in whatever release it lands in.
 
+## 0.3.83
+
+A patch release of one pull request, and it is the third of the three that make a database on a file behave like one. A table that is already in the file can be added to, so the second run of a session that loads a table and inserts into it is no longer an error. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
+
+A committed table takes an append, in #1235. An `INSERT` into a table that had been written down used to refuse with "appending to a committed native table", and every table is a committed table the next time its file is opened, so a database on a file was writable exactly once in its life. A table is now allowed to be a committed file and a buffer of rows at once, with the file's parts numbered first, so everything that reads a part by number subtracts the file's part count and reads whichever half the number lands in. Nothing above the catalog had to learn about it, because a scan asks for parts and gets all of them.
+
+The statistics are where it gives something up, on purpose. A file answers most of them exactly out of what its writer stored and the rows that arrived since are not in there, so the ones that cannot be combined without reading the column now say nothing at all rather than reporting the file's answer as though it were the table's. The null count and the integer sum do add up and are added up. The planner sees a table in this state as a sketch and leaves its columns out of the summary. A checkpoint rewrites the file rather than carrying the table forward, because the file and the catalog disagree about a table that grew, so the cost of committing one is the size of the table rather than the size of what changed. Appending a stripe to an existing table's directory is the follow up.
+
 ## 0.3.82
 
 A patch release of two pull requests, both about a database being a file rather than a session. A table created in one run is now there in the next one without anybody saying `CHECKPOINT`, which is what DuckDB does. The storage format version is unchanged at 9 and the native directory format is unchanged at 22.
