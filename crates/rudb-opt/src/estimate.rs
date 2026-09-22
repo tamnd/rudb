@@ -256,7 +256,7 @@ const GUESSED: Class = Class::Estimated;
 /// [`Provenance::Default`] and not [`Provenance::Propagation`], because the guess is the constant
 /// and the propagation only carried it. The point of printing the provenance in `EXPLAIN` is to
 /// find the place where nobody had a number, and this is that place.
-const FROM_A_CONSTANT: Provenance = Provenance::Default;
+pub(crate) const FROM_A_CONSTANT: Provenance = Provenance::Default;
 
 /// The class of a number that is a proven ceiling with nothing under it.
 ///
@@ -699,15 +699,7 @@ fn kept(
     let mut source: Option<Provenance> = None;
     let mut pending = Vec::new();
     for conjunct in conjuncts(plan, predicate) {
-        // The synopsis first, because where it answers it is a count of the rows that pass and the
-        // distinct count is a guess about them. Where it does not, nothing has been spent: it is a
-        // lookup in a list the store already has parsed.
-        let answer = missing(plan, input, conjunct, reads)
-            .or_else(|| common(plan, input, conjunct, stats, reads))
-            .or_else(|| {
-                values(plan, conjunct, stats, reads).map(|(v, from)| (1.0 / widened(v), from))
-            });
-        match answer {
+        match counted_by(plan, input, conjunct, stats, reads) {
             Some((share, from)) => {
                 fraction *= share;
                 counted += 1;
@@ -765,6 +757,57 @@ fn kept(
 fn spread(plan: &Plan, input: NodeRef, conjuncts: &[ExprRef]) -> Option<Spread> {
     let (zones, tests) = asked(plan, input, conjuncts)?;
     zones.spread(&tests)
+}
+
+/// What fraction of a scan's rows one condition keeps, where somebody counted rather than guessed.
+///
+/// The three counted answers in the order they are worth asking in. The synopsis first, because
+/// where it answers it is a count of the rows that pass and the distinct count is a guess about
+/// them. Where it does not, nothing has been spent: it is a lookup in a list the store already has
+/// parsed. `None` where none of the three could read the condition, which leaves the caller to
+/// decide between the bounds and the constant.
+fn counted_by(
+    plan: &Plan,
+    input: NodeRef,
+    conjunct: ExprRef,
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> Option<(f64, Provenance)> {
+    missing(plan, input, conjunct, reads)
+        .or_else(|| common(plan, input, conjunct, stats, reads))
+        .or_else(|| values(plan, conjunct, stats, reads).map(|(v, from)| (1.0 / widened(v), from)))
+}
+
+/// What fraction of a scan's rows one condition keeps, with the constant where nothing could say.
+///
+/// [`kept`] asks the same question about a whole predicate and answers with one number for the lot,
+/// which is what a cardinality is. A caller ordering the conditions against each other needs them
+/// apart, because the whole of what it is deciding is which of two conditions throws more away.
+///
+/// The bounds are asked for one condition at a time here and for all of them at once there, and the
+/// difference is deliberate rather than an oversight. Two range conditions on one column are one
+/// interval and a cardinality wants them intersected. An ordering wants to know what each of them
+/// does on its own, since they are going to run one after the other and the second one runs on the
+/// rows the first one left.
+///
+/// The provenance comes back beside the fraction so that a caller can tell a measurement from the
+/// constant. A condition nobody could read gets [`KEPT_BY_A_CONDITION`] and says
+/// [`FROM_A_CONSTANT`], and a caller that reorders on the strength of it would be reordering on the
+/// strength of the same number twice.
+pub(crate) fn kept_by(
+    plan: &Plan,
+    input: NodeRef,
+    conjunct: ExprRef,
+    stats: &Facts,
+) -> (f64, Provenance) {
+    let mut reads = Vec::new();
+    if let Some(answer) = counted_by(plan, input, conjunct, stats, &mut reads) {
+        return answer;
+    }
+    match spread(plan, input, std::slice::from_ref(&conjunct)) {
+        Some(spread) if spread.read > 0 => (spread.fraction, Provenance::ZoneMap),
+        _ => (KEPT_BY_A_CONDITION, FROM_A_CONSTANT),
+    }
 }
 
 /// The conditions a predicate is made of, capped.

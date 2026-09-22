@@ -5645,7 +5645,7 @@ fn a_pass_duckdb_has_and_rudb_has_not_built_is_taken_and_does_nothing() {
     // absence changes no answer.
     let db = Database::new();
     let folded = db.plan("SELECT 1 + 2").unwrap();
-    for name in ["compressed_materialization", "join_filter_pushdown", "reorder_filter"] {
+    for name in ["compressed_materialization", "join_filter_pushdown", "common_subexpressions"] {
         db.execute(&format!("SET disabled_optimizers = '{name}'")).expect(name);
         assert_eq!(db.setting("disabled_optimizers").unwrap(), name);
         assert_eq!(db.plan("SELECT 1 + 2").unwrap(), folded, "{name} turned something off");
@@ -7253,4 +7253,34 @@ fn a_join_a_certificate_says_changes_nothing_is_deleted_and_the_row_counts_agree
 
     drop(db);
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_conjunct_the_statistics_call_selective_runs_first_and_the_answer_does_not_change() {
+    // A thousand distinct keys over two thousand rows, so `k = 7` keeps a thousandth, and a string
+    // function over a varchar is the dearest thing in the predicate. The order that puts the
+    // equality first asks the function about two rows instead of about two thousand.
+    let db = Database::new();
+    db.execute("CREATE TABLE t (k INTEGER, s VARCHAR)").unwrap();
+    db.execute("INSERT INTO t SELECT i % 1000, 'row' || i FROM range(0, 2000) AS r(i)").unwrap();
+
+    let query = "SELECT count(*) FROM t WHERE upper(s) = 'ROW7' AND k = 7";
+    let plan = db.plan(query).unwrap();
+    let filter = plan.lines().find(|line| line.contains("Filter")).expect("a filter is planned");
+    let (first, second) = filter.split_once(" AND ").expect("two conjuncts are printed");
+    assert!(first.contains("#0.0"), "the counted equality goes in front:\n{plan}");
+    assert!(second.contains("upper"), "and the string function goes behind it:\n{plan}");
+
+    // The control. Reordering a conjunction is a rewrite that has to answer the same question, and
+    // the switch is what lets the same query be asked both ways.
+    let answer = rows(&db, query);
+    db.execute("SET stats_filter_order = false").unwrap();
+    let unordered = db.plan(query).unwrap();
+    let written = unordered.lines().find(|line| line.contains("Filter")).expect("still a filter");
+    assert!(
+        written.split_once(" AND ").expect("two conjuncts").0.contains("upper"),
+        "with the rule off the predicate is in the order it was written:\n{unordered}"
+    );
+    assert_eq!(rows(&db, query), answer, "the order the conjuncts run in is not an answer");
+    assert_eq!(answer, vec![vec![Value::BigInt(1)]]);
 }
