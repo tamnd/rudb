@@ -94,10 +94,10 @@ fn variants(text: &str) -> Vec<String> {
         }
         let opens = line.matches('{').count() as i32;
         let closes = line.matches('}').count() as i32;
-        if depth == 1
-            && let Some(name) = variant(line)
-        {
-            found.push(name);
+        // `extend` over the option rather than a `let` chain, because a chain in this position is
+        // stable well past the version the msrv step still builds the workspace against.
+        if depth == 1 {
+            found.extend(variant(line));
         }
         depth += opens - closes;
         if depth <= 0 {
