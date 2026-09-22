@@ -21,6 +21,8 @@ An earlier revision of this section claimed that the evidence above does not hol
 
 The mechanism does hold at benchmark scale. Document 15 measures 100,000,000 rows in the native format: Q34 falls from 37.71 seconds to 0.51 and Q35 from 45.84 to 0.45, factors of 73.9x and 101.9x over the same engine reading the same data out of Parquet. The 100,000-row evidence quoted above still should not be cited as a full-scale result, but the full-scale result exists and agrees with it.
 
+Document 18 measures the mechanism directly rather than through a query that benefits from it. Grouping 8,682,923 rows of `Referer` into 2,719,020 distinct groups costs 0.28 seconds of aggregate CPU, because the group key never leaves the code space this document defines and the hash table is one of integers. That is the strongest single result this specification has. It also comes with the boundary: document 18 finds the same grouping costs 4.5 seconds when one scalar function stands between the column and the aggregate, since the function returns a plain string column and the codes are gone. The codes are global and stable in storage, and they do not currently survive evaluation.
+
 ## Dictionary page
 
 The version 7 dictionary page contains:

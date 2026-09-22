@@ -21,6 +21,8 @@ Twenty of the 43 queries finish in under half a second and together account for 
 
 Five queries containing a substring or regular expression match are 41.1% of rudb's time, and they are the class where its lead is smallest by a wide margin. Twenty one grouping queries are 43.3% of the time and rudb is already 3.03x ahead on them.
 
+**That table sorts whole queries by the mechanism their text suggests, which is the same method this document criticises document 15 for, and document 18 replaces it with a sum over operators now that there is a column worth summing.** Measured rather than classified, three operator kinds are 97.8% of the suite: `Aggregate` 60.8%, `Scan` 19.3%, `Filter` 17.7%, with the loop that drives the pipelines taking 2%. The grouping share above is too high because `Aggregate` absorbs any function folded into a group expression, and the largest single entry in the suite turns out to be one query rather than a class, Q29 at 35% of all CPU.
+
 ## What document 15 attributed wrongly
 
 Document 15 lists the nine queries rudb loses on the quiet host and writes that what is left after removing two sub-second entries is `COUNT(DISTINCT UserID)` three times and `GROUP BY` on a near-unique key four times, and that this is document 14's O1.
