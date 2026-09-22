@@ -128,6 +128,12 @@ pub(crate) struct Aggregate<'a> {
     /// Constant output group values, aligned with `groups`.
     constants: Vec<Option<Value>>,
     calls: Vec<Call>,
+    /// The state a new group starts in, one per call, or nothing if a call has no accumulator.
+    ///
+    /// Reading an aggregate's name and return type to decide what its state is does not depend on
+    /// the group, so doing it per group was a six way string match a million times over to reach a
+    /// million equal answers. It is one clone from here instead.
+    template: Option<Vec<Accumulator>>,
     inputs: Prepared,
     schema: Schema,
     /// Whether there are no group expressions, so every row goes to the one slot.
@@ -694,6 +700,12 @@ impl<'a> Aggregate<'a> {
             && calls[0].filter.is_none();
         let by_vector: Vec<bool> =
             calls.iter().map(|call| alone && !call.distinct && call.filter.is_none()).collect();
+        // Every group of one operator starts from the same accumulator per call, so the one a group
+        // starts with is worked out here rather than once per group. A call this cannot build is one
+        // `fresh` raises on, and it still raises there rather than here, so a plan that never opens a
+        // group answers the way it always did.
+        let template: Option<Vec<Accumulator>> =
+            calls.iter().map(|call| Accumulator::new(&call.name, &call.returns).ok()).collect();
         let out = Buffered::new();
         let aggregate = Self {
             plan,
@@ -719,6 +731,7 @@ impl<'a> Aggregate<'a> {
             by_vector,
             groups,
             calls,
+            template,
             inputs,
             schema,
             memory: memory.clone(),
@@ -2858,6 +2871,10 @@ impl<'a> Aggregate<'a> {
         }
         if self.compact_numeric {
             compact.push(CompactNumeric::default());
+            return Ok(());
+        }
+        if let Some(template) = &self.template {
+            states.extend_from_slice(template);
             return Ok(());
         }
         for call in &self.calls {
