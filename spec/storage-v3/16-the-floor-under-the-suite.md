@@ -97,12 +97,26 @@ One quantity in document 14's cost model is untouched by every mechanism the ser
 
 Reducing `R(Q)` for these queries means deciding, without reading a chunk's codes, that the chunk holds no row the predicate can pass. rudb's zone maps hold ends, which decide a range predicate and cannot decide a substring one, because the dictionary is rank ordered and the values containing `google` are scattered through the whole rank order rather than gathered into an interval of it. Deciding a substring predicate per chunk needs a per chunk summary over codes rather than over ends.
 
-Whether that pays is an open question and this document does not close it. The one measurement taken here argues against the coarse version: at 10,000,000 rows, `URL LIKE '%google%'` matches 646 rows spread across 18 of the 112 `CounterID` values, and those 18 counters cover 9,260,180 rows, so pruning at counter granularity would skip 7.4% of the table. Chunk granularity is finer than that by orders of magnitude and was not measured, and measuring it is the next thing this line of work needs. A structure that skips nothing is a structure that has added load time and removed no query time.
+Whether that pays was measured rather than argued, and the answer is that it does not at any chunk size a column store would choose. The 646 rows `URL LIKE '%google%'` matches in 10,000,000 were bucketed by row position at five granularities.
 
-That trade is the one place the series has room, and it is worth naming plainly. rudb's load takes 1372.10 seconds against DuckDB's 395.21, which document 15 reports as its clearest deficit. Load is paid once and queries are paid 43 times, so moving work across that line runs in the direction rudb is already losing and settles cheaply. A load that is 4x slower than DuckDB's instead of 3.47x, in exchange for a query pass that reads a fraction of the file, trades the number the benchmark counts once for the number it counts forty three times.
+| rows per chunk | chunks | chunks holding a match | table skipped |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 9,766 | 404 | 95.9% |
+| 8,192 | 1,221 | 320 | 73.8% |
+| 65,536 | 153 | 123 | 19.6% |
+| 122,880 | 81 | 78 | 3.7% |
+| 1,000,000 | 10 | 10 | 0% |
+
+Placing 646 matches at random into 9,766 chunks would touch about 625 of them, so 404 is clustering and not noise, but it is mild clustering and it has decayed to nothing by the time a chunk is large enough to be worth reading as a unit. The file is ordered by `CounterID` and `EventTime`, and nothing in that order gathers the URLs that contain a particular substring. Pruning at 65,536 rows per chunk skips a fifth of the table for this predicate, which is a fifth of a term that is two thirds of the cost of eight queries, and that is not the missing 4.78x.
+
+This is also the friendly case. `URL LIKE '%google%'` matches 0.0065% of the rows. `Referer LIKE '%google%'` matches 659,778 of the 10,000,000, which at every granularity in that table would touch every chunk, and a `SearchPhrase <> ''` gate of the kind Q21 through Q23 carry is not selective at all.
+
+So the coarse version of the remaining direction is closed, and what it leaves is the expensive version: not a per chunk summary that lets a chunk be skipped, but a posting list that maps a dictionary value straight to the rows holding it, so that a substring predicate resolves to matching codes and then to row positions without a pass over the column. That makes the query cost `O(K(Q))` and it is the only structure discussed here that does. It also costs, at load, an index over 18.3 million values covering 100,000,000 row positions, which is a second copy of the column in a different shape.
+
+That trade is the one place the series has room, and it is worth naming plainly. rudb's load takes 1372.10 seconds against DuckDB's 395.21, which document 15 reports as its clearest deficit, and its file is 1.82x smaller, which document 15 reports as one of its three exact wins. An index of this kind spends both of them. Load is paid once and queries are paid 43 times, so the direction is right, but the size of the payment has to be stated before it is made rather than discovered after, and this document does not propose making it.
 
 ## What this document does not claim
 
-It does not claim the target is reachable. It claims the opposite about one whole category of approach, and it offers one direction that is not yet ruled out rather than one that is shown to work. The measurements here are operator timings from a single pass at a tenth of benchmark size, on a host document 15 shows cannot support per query wall times to two significant figures. They are used only for ratios within one pass, between operators measured side by side in the same process, and for a lower bound whose direction of error is known.
+It does not claim the target is reachable. It claims the opposite about one whole category of approach, and the one direction it leaves open it also prices rather than recommends. The measurements here are operator timings from a single pass at a tenth of benchmark size, on a host document 15 shows cannot support per query wall times to two significant figures. They are used only for ratios within one pass, between operators measured side by side in the same process, for counts of rows and chunks that are exact, and for a lower bound whose direction of error is known.
 
 The obligation this suggests adding is not a fifth alongside the four, because it subsumes them. A mechanism that makes a pass cheaper must state what fraction of the suite's floor it removes, and the floor is the scan. Document 14's four obligations are all statements about the cost of touching a row, and this document is the measurement showing that touching the rows is the cost.
