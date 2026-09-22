@@ -862,8 +862,10 @@ fn sorted(keys: &[Option<i128>], base: i128, rows: u64) -> Result<(Body, bool)> 
     let mut rid_bytes = Vec::new();
     let key_values: Vec<u64> = pairs.iter().map(|pair| pair.0).collect();
     let rid_values: Vec<u64> = pairs.iter().map(|pair| pair.1).collect();
-    bitpack::pack_tail(&key_values, key_width, &mut key_bytes)?;
-    bitpack::pack_tail(&rid_values, rid_width, &mut rid_bytes)?;
+    // The linear packer and not the tail one, because a tail is bounded at a thousand values and a
+    // parent key column is not. The layout is the same and `tail_at` reads either.
+    bitpack::pack_linear(&key_values, key_width, &mut key_bytes)?;
+    bitpack::pack_linear(&rid_values, rid_width, &mut rid_bytes)?;
     Ok((
         Body::Sorted { base, key_width, keys: key_bytes, rid_width, perm: rid_bytes, count: rows },
         distinct,
@@ -948,6 +950,19 @@ mod tests {
         assert_eq!(map.form(), Form::Sorted);
         resolves(&column, &map);
         assert_eq!(map.lookup(500).expect("lookup"), None);
+    }
+
+    #[test]
+    fn the_sorted_form_is_not_bounded_by_a_packed_unit() {
+        // The sorted form packs its keys and its permutation sequentially, and the sequential
+        // packer a column uses is for the remainder past the last transposed unit, so it refuses a
+        // thousand and twenty four values. A parent key column is sixty times that at SF1 and
+        // fifteen thousand times it at SF10, so the form would exist only for toy tables. This is
+        // the smallest column that would have hit it.
+        let column = keys(&(0..5000).map(|value| (value * 7919) % 100_003).collect::<Vec<i128>>());
+        let map = KeyMap::build(&column).expect("build");
+        assert_eq!(map.form(), Form::Sorted);
+        resolves(&column, &map);
     }
 
     #[test]

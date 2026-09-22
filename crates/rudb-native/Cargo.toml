@@ -15,6 +15,7 @@ readme.workspace = true
 [dependencies]
 rudb-common.workspace = true
 rudb-encoding.workspace = true
+rudb-graph.workspace = true
 rudb-storage.workspace = true
 rudb-vector.workspace = true
 

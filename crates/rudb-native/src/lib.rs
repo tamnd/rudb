@@ -51,6 +51,7 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
+pub mod graph;
 pub mod section;
 mod zones;
 
