@@ -5827,6 +5827,11 @@ fn a_join_over_a_built_relationship_is_planned_as_a_link_join_and_answers_the_sa
     // `rudb_common::rules`. The checkpoint above wrote the link either way, which is the point of
     // the default: a file carries the section and a session decides whether anything reads it.
     db.execute("SET graph_sections = 'on'").unwrap();
+    // Every order here has a customer, so the relationship carries both certificates and the join
+    // below reads no customer column, which is exactly the join the elimination pass deletes. This
+    // test is about which algorithm answers a join, so it turns that pass off and keeps one. The
+    // elimination has its own test, and its own switch, which is what section 9.2 asks for.
+    db.execute("SET stats_join_elimination = false").unwrap();
 
     // Four thousand customers fit in any cache there is, so the rule declines them, which is the
     // rule working rather than the pass failing. The setting is what a test uses to ask about the
@@ -7015,4 +7020,80 @@ fn a_native_frequency_synopsis_answers_count_topn() {
     );
     drop(database);
     std::fs::remove_file(path).expect("the temporary native database is removed");
+}
+
+#[test]
+fn a_join_a_certificate_says_changes_nothing_is_deleted_and_the_row_counts_agree() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-graph-eliminate-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("CREATE TABLE customer (c_custkey INTEGER, c_name VARCHAR)").unwrap();
+    db.execute("CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER)").unwrap();
+    db.execute("CREATE TABLE returns (r_orderkey INTEGER, r_custkey INTEGER)").unwrap();
+    db.execute("INSERT INTO customer SELECT i, 'c' || i FROM range(1, 4001) AS r(i)").unwrap();
+    db.execute("INSERT INTO orders SELECT i, 1 + i % 4000 FROM range(1, 10001) AS r(i)").unwrap();
+    // The same, and then one row whose customer does not exist, which is what costs a relationship
+    // its totality certificate and so its licence to have its join deleted.
+    db.execute("INSERT INTO returns SELECT i, 1 + i % 4000 FROM range(1, 10001) AS r(i)").unwrap();
+    db.execute("INSERT INTO returns VALUES (99999, 99999)").unwrap();
+    db.execute(
+        "SET graph_links = 'orders(o_custkey) -> customer(c_custkey), \
+         returns(r_custkey) -> customer(c_custkey)'",
+    )
+    .unwrap();
+    db.execute("CHECKPOINT").unwrap();
+    db.execute("SET graph_sections = 'on'").unwrap();
+
+    let explained = |sql: &str| match db
+        .query(&format!("EXPLAIN {sql}"))
+        .expect("the explain ran")
+        .value_at(0, 1)
+    {
+        Value::Varchar(text) => text,
+        other => panic!("the plan came back as {other:?}"),
+    };
+
+    // Every order has a customer and this reads no column of one, so the join is doing nothing at
+    // all to the row set and the plan says so by not having one.
+    let counted = "SELECT count(*), sum(o_orderkey) FROM orders \
+                   JOIN customer ON o_custkey = c_custkey";
+    assert!(!explained(counted).contains("Join"), "{}", explained(counted));
+    let answer = rows(&db, counted);
+    assert_eq!(answer, vec![vec![Value::BigInt(10000), Value::HugeInt(50_005_000)]]);
+    // The control, which is the same query in the same process with the rule off. This is the row
+    // count that says the rewrite changed nothing, and it is the one G4's fifth exit criterion
+    // asks for.
+    db.execute("SET stats_join_elimination = false").unwrap();
+    assert!(explained(counted).contains("Join"), "the rule is still on");
+    assert_eq!(answer, rows(&db, counted), "the join was doing something after all");
+    db.execute("SET stats_join_elimination = true").unwrap();
+
+    // One unmatched child row, so the join drops it and deleting the join would not. Which rows a
+    // join drops is the thing a certificate is about, and this relationship has no certificate for
+    // it, so the join stays.
+    let partial = "SELECT count(*) FROM returns JOIN customer ON r_custkey = c_custkey";
+    assert!(explained(partial).contains("Join"), "{}", explained(partial));
+    assert_eq!(rows(&db, partial), vec![vec![Value::BigInt(10000)]], "the stray row is dropped");
+
+    // And the outer join over the total relationship is an inner join, which is a cheaper operator
+    // answering the same question. The parent's column is read here, so the join stays and only
+    // its kind changes.
+    let outer = "SELECT count(c_name) FROM orders LEFT JOIN customer ON o_custkey = c_custkey";
+    let plan = explained(outer);
+    assert!(plan.contains("Join INNER"), "nothing was padded, so nothing was preserved:\n{plan}");
+    assert_eq!(rows(&db, outer), vec![vec![Value::BigInt(10000)]]);
+    // The one that is not total keeps its left join, and the difference in the answer is the row
+    // the left join pads and the inner join would have dropped.
+    let partial_outer = "SELECT count(*) FROM returns LEFT JOIN customer ON r_custkey = c_custkey";
+    assert!(explained(partial_outer).contains("Join LEFT"), "{}", explained(partial_outer));
+    assert_eq!(rows(&db, partial_outer), vec![vec![Value::BigInt(10001)]]);
+
+    drop(db);
+    std::fs::remove_file(&path).ok();
 }

@@ -193,11 +193,22 @@ impl Linked {
         }
     }
 
+    /// Whether the file has certified that a child row has exactly one parent row.
+    ///
+    /// Both certificates, which is what `../stats/07-graph-statistics.md` section 7.3 says licenses
+    /// deleting an operator rather than accelerating one. It is a method rather than two field reads
+    /// at each call site because "exactly one" is the thing being asked about, and a rewrite that
+    /// spelled it out would be one `&&` away from asking for one certificate and acting on two.
+    #[must_use]
+    pub fn exactly_one(&self) -> bool {
+        self.built && self.total
+    }
+
     /// Whether this is the relationship between those two columns.
     ///
     /// Names are matched without regard to case, the same way the catalog resolves one.
     #[must_use]
-    fn between(&self, child: (&str, &str), parent: (&str, &str)) -> bool {
+    pub(crate) fn between(&self, child: (&str, &str), parent: (&str, &str)) -> bool {
         self.child.eq_ignore_ascii_case(child.0)
             && self.child_column.eq_ignore_ascii_case(child.1)
             && self.parent.eq_ignore_ascii_case(parent.0)
@@ -469,7 +480,7 @@ fn decided(
 /// A node is read once. That is a property of how this plan is built rather than of plans in
 /// general, and where it does not hold the second reader overwrites the first, which is a node this
 /// pass then declines for whichever answer it ended up with. Declining is the safe direction.
-fn consumers(plan: &Plan) -> Vec<Option<NodeRef>> {
+pub(crate) fn consumers(plan: &Plan) -> Vec<Option<NodeRef>> {
     let mut consumers = vec![None; plan.node_count()];
     for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         for child in plan.node(node).children().into_iter().flatten() {
@@ -488,7 +499,7 @@ fn consumers(plan: &Plan) -> Vec<Option<NodeRef>> {
 /// the root, because the root's width is the answer's width, and at any operator that reads all of
 /// its input's columns or matches them up by position, because for one of those a column nobody
 /// asked for is a different answer rather than a wider one.
-fn absorbed(plan: &Plan, consumers: &[Option<NodeRef>], at: NodeRef) -> bool {
+pub(crate) fn absorbed(plan: &Plan, consumers: &[Option<NodeRef>], at: NodeRef) -> bool {
     let mut at = at;
     // The plan is a tree, so this terminates, and the bound is the belt to that brace.
     for _ in 0..plan.node_count() {
