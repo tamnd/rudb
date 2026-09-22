@@ -42,7 +42,7 @@ use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rudb_common::bounds::{Bound, Op, scaled_as};
+use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
 use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_storage::sieve::Sieve;
@@ -4582,26 +4582,13 @@ impl<'a> Cursor<'a> {
         }
         Err(invalid("frequency ordinal varint is too long"))
     }
+    /// A zone map's end, in the layout `rudb_common::bounds` defines.
+    ///
+    /// The bytes are the ones this directory has written since format 10 and the codec moved to
+    /// rank zero rather than being copied, because a column summary now writes the same two ends
+    /// and two encodings of one type is how the two quietly stop agreeing.
     fn bound(&mut self) -> Result<Option<Bound>> {
-        Ok(match self.u8()? {
-            0 => None,
-            1 => Some(Bound::Int(i128::from_le_bytes(
-                self.take(16)?.try_into().expect("sixteen bytes"),
-            ))),
-            2 => Some(Bound::Real(f64::from_le_bytes(
-                self.take(8)?.try_into().expect("eight bytes"),
-            ))),
-            3 => {
-                let length = self.u32()? as usize;
-                Some(Bound::Bytes(self.take(length)?.to_vec()))
-            }
-            4 => {
-                let unscaled =
-                    i128::from_le_bytes(self.take(16)?.try_into().expect("sixteen bytes"));
-                Some(Bound::Scaled { unscaled, scale: self.u8()? })
-            }
-            _ => return Err(invalid("bound tag differs")),
-        })
+        bounds::get(self.bytes, &mut self.at)
     }
     fn text(&mut self) -> Result<String> {
         let len = self.u16()? as usize;
@@ -4974,29 +4961,9 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     })
 }
 
+/// A zone map's end, in the layout `rudb_common::bounds` defines. See [`Cursor::bound`].
 fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
-    match bound {
-        None => out.push(0),
-        Some(Bound::Int(value)) => {
-            out.push(1);
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        Some(Bound::Real(value)) => {
-            out.push(2);
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        Some(Bound::Bytes(value)) => {
-            out.push(3);
-            put_u32(out, u32::try_from(value.len()).map_err(|_| invalid("bound length overflow"))?);
-            out.extend_from_slice(value);
-        }
-        Some(Bound::Scaled { unscaled, scale }) => {
-            out.push(4);
-            out.extend_from_slice(&unscaled.to_le_bytes());
-            out.push(*scale);
-        }
-    }
-    Ok(())
+    bounds::put(out, bound)
 }
 
 /// Which cascades are worth trying on a run of dictionary codes.

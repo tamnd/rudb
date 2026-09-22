@@ -68,6 +68,7 @@ rudb-pipeline = { version = "=0.4.0", path = "crates/rudb-pipeline" }
 rudb-plan = { version = "=0.4.0", path = "crates/rudb-plan" }
 rudb-regex = { version = "=0.4.0", path = "crates/rudb-regex" }
 rudb-seam = { version = "=0.4.0", path = "crates/rudb-seam" }
+rudb-stats = { version = "=0.4.0", path = "crates/rudb-stats" }
 rudb-storage = { version = "=0.4.0", path = "crates/rudb-storage" }
 rudb-txn = { version = "=0.4.0", path = "crates/rudb-txn" }
 rudb-vector = { version = "=0.4.0", path = "crates/rudb-vector" }

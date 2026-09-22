@@ -44,10 +44,14 @@
 //!
 //! ## The hash
 //!
-//! Values are hashed with a multiply and fold over 8 byte words. This is a sketching hash and not a
-//! persisted one: nothing on disk depends on it, so it can be replaced with something faster
-//! without a format version. What it does have to be is uniform, because every estimate here
-//! assumes it is, and the tests measure that rather than asserting it.
+//! Values are hashed with a multiply and fold over 8 byte words. It has to be uniform, because
+//! every estimate here assumes it is, and the tests measure that rather than asserting it.
+//!
+//! It is now a persisted hash. A sketch is a section of a rudb file, so replacing the function
+//! changes [`HASH_IDENTITY`], which every stored sketch carries and every reader checks, and the
+//! sketches written by the old one are declined and rebuilt rather than merged into the new ones.
+//! That is the ordinary stale-section path and it costs a rebuild. Merging across two hashes would
+//! cost an answer, which is why the identity is in the bytes rather than in a comment.
 
 use rudb_common::{Error, Result};
 
@@ -251,6 +255,51 @@ impl Sketch {
         self.held.min(self.k)
     }
 
+    /// How many hashes it keeps, which is the `k` it was built with.
+    #[must_use]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// The bottom k hashes, smallest first.
+    ///
+    /// This is the whole of what a sketch knows. Everything else on it, the distinct estimate, the
+    /// exactness flag, the Jaccard, is computed from this list and the `k` beside it, which is why
+    /// writing one down is writing this list down and nothing more.
+    #[must_use]
+    pub fn hashes(&self) -> Vec<u64> {
+        self.bottom()
+    }
+
+    /// The sketch that holds exactly these hashes.
+    ///
+    /// The inverse of [`Sketch::hashes`], and the two of them are what a stored sketch is read back
+    /// through. `full`, and so [`Sketch::is_exact`], is recovered from the count rather than stored
+    /// beside it: a sketch holding fewer than `k` hashes saw fewer than `k` distinct values, which
+    /// is the same thing the add path means by not being full. Storing the flag as well would be
+    /// storing something derivable, and the two could then disagree.
+    ///
+    /// # Errors
+    ///
+    /// If `k` is not one a sketch can be built with, or if more than `k` hashes are handed over,
+    /// which is not a bottom-k set of that `k` and would make every estimate off it wrong.
+    pub fn from_hashes(k: usize, hashes: &[u64]) -> Result<Self> {
+        if hashes.len() > k {
+            return Err(Error::internal(format!(
+                "{} hashes are more than the {k} a sketch of that size keeps",
+                hashes.len()
+            )));
+        }
+        let mut sketch = Self::new(k)?;
+        for hash in hashes {
+            sketch.add_hash(*hash);
+        }
+        // The add path sets `full` the moment the kth distinct hash arrives, and a stored sketch of
+        // exactly k hashes is one that was full when it was written. Anything short of k was not,
+        // and the adds above have already left it that way.
+        Ok(sketch)
+    }
+
     /// Whether nothing has been added.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -452,11 +501,37 @@ fn mix(left: u64, right: u64) -> u64 {
     (wide as u64) ^ ((wide >> 64) as u64)
 }
 
+/// The string [`HASH_IDENTITY`] is the hash of.
+///
+/// Public so that the identity is checkable rather than asserted: anyone holding this crate can
+/// compute `hash64(HASH_PROBE)` and get the number a file carries.
+pub const HASH_PROBE: &[u8] = b"rudb sketch hash 1";
+
+/// Which hash a stored sketch was built with.
+///
+/// `spec/stats/03-the-file-format.md` section 3.4 asks for this to be written into every persisted
+/// sketch, and the reason is that a sketch built by one hash and merged with a sketch built by
+/// another is silently wrong. Not an error, not a worse estimate: a union of two bottom-k sets
+/// drawn from two different orderings of the same values, which answers confidently and wrongly.
+/// So a reader compares this against what the file says and declines the sketch when they differ,
+/// which is the ordinary missing-statistic case rather than a failure.
+///
+/// The value is [`hash64`] of [`HASH_PROBE`] rather than a number somebody picked, and a test holds it
+/// there. That is what makes it an identity and not a comment: changing the hash without changing
+/// this is the mistake it exists to catch, and a constant that had to be remembered would not
+/// catch it.
+pub const HASH_IDENTITY: u64 = 0x565d_3caf_6ae8_c2b5;
+
 /// The hash used by every sketch here.
 ///
-/// Nothing on disk depends on this, so it can be replaced with something faster without a format
-/// version. What it has to be is uniform, because every estimate in this module assumes the hashes
-/// are spread evenly over the range.
+/// It has to be uniform, because every estimate in this module assumes the hashes are spread evenly
+/// over the range.
+///
+/// It used to say that nothing on disk depended on this so it could be replaced freely. That stopped
+/// being true when sketches became a section of the file. It can still be replaced, but the
+/// replacement changes [`HASH_IDENTITY`], and every sketch written by the old one stops being
+/// readable and gets rebuilt at the next checkpoint, which is the ordinary path for a stale section
+/// and costs a rebuild rather than an answer.
 #[must_use]
 pub fn hash64(value: &[u8]) -> u64 {
     let mut state = SEEDS[0] ^ mix(value.len() as u64, SEEDS[1]);
@@ -743,5 +818,47 @@ mod tests {
             let value = step.wrapping_mul(0x9e37_79b9_7f4a_7c15_1234_5678_9abc_def1);
             assert_eq!(hash128(value), hash64(&value.to_le_bytes()), "for {value}");
         }
+    }
+
+    #[test]
+    fn the_stored_identity_is_what_this_hash_actually_answers() {
+        // The one test that makes `HASH_IDENTITY` an identity rather than a note. Changing the hash
+        // and forgetting the constant is the mistake that merges two incompatible sketches without
+        // saying anything, and this is where it stops: the constant has to move with the function,
+        // and moving it is what makes every stored sketch declined and rebuilt.
+        assert_eq!(hash64(HASH_PROBE), HASH_IDENTITY);
+    }
+
+    #[test]
+    fn a_sketch_survives_being_taken_apart_and_put_back_together() {
+        // What a stored sketch is: the bottom k and the k beside it, and nothing else. If this
+        // round trip lost anything then persisting one would lose it too.
+        for count in [0usize, 1, 10, DEFAULT_K - 1, DEFAULT_K, DEFAULT_K * 10] {
+            let values = values(count, "row");
+            let sketch = Sketch::of(&borrow(&values));
+            let back = Sketch::from_hashes(sketch.k(), &sketch.hashes()).expect("rebuild");
+            assert_eq!(back, sketch, "at {count} values");
+            assert_eq!(back.k(), sketch.k());
+            assert_eq!(back.len(), sketch.len());
+            assert_eq!(back.is_exact(), sketch.is_exact(), "at {count} values");
+            assert!((back.distinct() - sketch.distinct()).abs() < 1e-6, "at {count} values");
+        }
+    }
+
+    #[test]
+    fn the_hashes_come_back_smallest_first_and_there_are_never_more_than_k() {
+        let values = values(100_000, "row");
+        let sketch = Sketch::of(&borrow(&values));
+        let hashes = sketch.hashes();
+        assert_eq!(hashes.len(), DEFAULT_K, "a column past k holds exactly k");
+        assert!(hashes.windows(2).all(|pair| pair[0] < pair[1]), "sorted and distinct");
+    }
+
+    #[test]
+    fn more_hashes_than_k_is_refused_rather_than_truncated() {
+        // Truncating would build a sketch that looks like a bottom-k set of a smaller k and is not
+        // one, and every estimate off it would be wrong by the amount that was dropped.
+        assert!(Sketch::from_hashes(4, &[1, 2, 3, 4, 5]).is_err());
+        assert!(Sketch::from_hashes(0, &[]).is_err(), "a sketch of no hashes estimates nothing");
     }
 }

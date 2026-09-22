@@ -52,6 +52,12 @@ rudb-storage = 5
 # round. A key map that could see the format would be a key map that could only be tested through
 # one.
 rudb-graph = 5
+# The statistics layer's payloads, per spec/stats/03-the-file-format.md. Rank 5 for the same reason
+# `rudb-graph` is: a column summary and a sketch are facts about a table's own columns, this crate
+# knows what they say and how two of them fold together, and it deliberately does not know what a
+# file or a plan is. `rudb-native` at rank 6 is what puts one on disk and `rudb-opt` at rank 11 is
+# what reads one to choose a plan.
+rudb-stats = 5
 rudb-native = 6
 rudb-arrow = 5
 rudb-csv = 5
