@@ -27,4 +27,8 @@ The rewrite keeps the existing late-materialization limits:
 
 On 1 million ClickBench rows, native Query 24 fell from 76.3 ms to 20.5 ms. DuckDB native took 43.0 ms. rudb CPU time fell from 1.03 seconds to 169 ms and peak RSS fell from 79.3 MiB to 33.3 MiB.
 
-**That 2.1x win is a 2.26x loss at benchmark scale**, and Q25 through Q27 are worse; document 13 has the measurement and document 14 argues that the eligibility rule above is the reason. The rule was written for `SELECT *`, so requiring eight deferred columns excludes every top-N query in the suite except Q24. The quantity that should be bounded is the number of values materialized, `|F| * R + |P| * K`, and for a query that projects one string column and orders by another that is `R` keys and `K` strings regardless of how few columns were deferred.
+An earlier revision of this section called that win a 2.26x loss at benchmark scale, on the strength of document 13. Document 13 measures rudb reading Parquet, where there are no native stripes to defer and this rewrite cannot fire, so it could not have tested the mechanism and the claim was wrong.
+
+At 100,000,000 rows in the native format, document 15 measures Q24 at 1.38 seconds against 14.15 in Parquet, Q25 at 0.21 against 7.85, Q26 at 0.70 against 5.63 and Q27 at 0.58 against 4.91. The rewrite fires and it holds its advantage at scale.
+
+The eligibility rule is still worth revisiting on its own terms rather than on a refutation. It requires at least eight deferred columns, which was written for `SELECT *` and excludes every top-N query in the suite except Q24, so Q25 through Q27 reach those timings without it. The quantity that should be bounded is the number of values materialized, `|F| * R + |P| * K`, and for a query that projects one string column and orders by another that is `R` keys and `K` strings regardless of how few columns were deferred. That is a widening, not a fix.
