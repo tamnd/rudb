@@ -90,6 +90,24 @@ impl Page {
                     )
                 })?;
                 let codes = codes(&self.body, at, valid, &levels, total, dictionary.len())?;
+                // `dictionary_over` and not `stable_dictionary`, and the difference is most of what
+                // the Parquet quadrant costs. A Parquet dictionary belongs to one column chunk, so
+                // code 7 here and code 7 in the next row group are different strings, and the
+                // `Arc::ptr_eq` guard in `rudb-exec`'s group operator exists to stop an aggregate
+                // treating them as one. Marking these stable would give wrong answers.
+                //
+                // What it costs is measured in `spec/storage-v3/23`. Every fast path in that
+                // operator gates on the flag, so grouping a string column read from Parquet hashes
+                // one string per row where the native reader hashes one per dictionary entry and
+                // then counts into a dense array. On `Referer` at ClickBench scale that is 81.0 M
+                // hashes against 19.7 M, and the grouping measures 33.9 times the CPU of the same
+                // grouping over the same rows out of the native file.
+                //
+                // The fix is not the flag: it is to canonicalise each row group's dictionary into
+                // one code space per column as it is read, which for that file is about 21.3 M
+                // entries across 226 row groups against 19.7 M globally distinct, so a canonical
+                // space is barely larger than the sum of the parts. Document 23 estimates two to
+                // four times on the grouping and says plainly that it is a model, not a measurement.
                 Ok(Vector::dictionary_over(codes, Arc::clone(dictionary))?.with_validity(validity))
             }
             Encoding::DeltaBinaryPacked

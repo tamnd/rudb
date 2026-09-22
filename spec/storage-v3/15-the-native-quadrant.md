@@ -6,6 +6,8 @@ Document 13 measured rudb against DuckDB with both engines reading the same Parq
 
 Three of those refutations were wrong, and they were wrong for a reason worth recording rather than quietly fixing. Documents 06 and 09 specify mechanisms of the native format: stable global string codes, and late materialization over native stripes. A Parquet-to-Parquet measurement cannot test either of them, because when rudb reads Parquet it has no dictionary of its own to trust and no stripe of its own to defer. Document 13 measured those mechanisms switched off and reported that they had failed.
 
+Document 23 puts a number on "switched off" and confirms document 13's 2.30x from a different direction. The flag is `stable` on a dictionary vector, the Parquet reader cannot set it because a Parquet dictionary belongs to one row group, and on one high cardinality string column at this scale the grouping costs 33.9 times the CPU it costs over the native file. That document also finds rudb 2.83x behind DuckDB on the same query reading the same Parquet, so document 13's number was right about the quadrant even though it was wrong about the mechanisms.
+
 This document is the same suite at the same size with the mechanisms switched on.
 
 ## How it was measured, and what went wrong twice
