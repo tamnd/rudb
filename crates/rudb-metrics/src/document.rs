@@ -465,6 +465,19 @@ pub struct Resource {
     /// pipelines are inside of, and that is what the cross check in `rudb-bench` compares against.
     pub build_cpu_ns: u64,
     /// The high water mark of memory the engine accounted for.
+    ///
+    /// "Accounted for" is the whole of the claim and is narrower than it reads. What is counted is
+    /// what an operator registers, which in practice is hash aggregate group tables and sort
+    /// buffers, and what is not counted is string materialisation, decode buffers and the reader's
+    /// page cache. So this is a lower bound on the process and on some query shapes it is a very
+    /// loose one: `spec/storage-v3/21` measures ClickBench q23 at 712 MiB resident while this field
+    /// reports 0.4 MiB for the same statement, and the suite's peak resident set exceeds the
+    /// maximum of this field across the run by 774 MiB.
+    ///
+    /// Read it as "memory the operators asked for" and never as "memory the process used". Document
+    /// 19 of that series built an argument about the resource half of the project's target on this
+    /// field and named the wrong four queries, which is why the caveat is here rather than only
+    /// there.
     pub peak_bytes: u64,
     /// Bytes read at the point of the system call.
     pub bytes_read: u64,
