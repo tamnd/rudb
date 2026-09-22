@@ -4,7 +4,7 @@
 
 Document 14 states four obligations and document 15 reports that three are satisfied in the native format and one, O1, is not. Both were written from the outside: from query wall times and from query texts, without reading the engine that produced them. This document reads the engine, measures its operators one at a time, and reaches three conclusions that the outside view could not reach.
 
-The first is that document 15 attributes rudb's remaining deficit to the wrong mechanism. The second is that both mechanisms document 14 prescribes are already built, tuned, and measured in the repository, so there is no missing mechanism of the kind those obligations ask for. The third is the one that matters: the target this series is aimed at is below the cost of reading the columns the queries name, so no obligation stated in terms of execution can reach it.
+The first is that document 15 attributes rudb's remaining deficit to the wrong mechanism. The second is that both mechanisms document 14 prescribes are already built, tuned, and measured in the repository, so there is no missing mechanism of the kind those obligations ask for. The third is the one that matters: the target this series is aimed at sits at roughly the cost of scanning the columns the queries name, which prices every remaining execution improvement at once and leaves no room for any of them to be partial.
 
 ## Where the time actually is
 
@@ -64,36 +64,44 @@ The estimator cannot see the difference either. Every one of these filters is es
 
 ## The floor
 
-The eight queries that are 75.5% of the suite, each measured at the scan alone, with the operators above it excluded. Same 10,000,000 row database, same quiet host.
+The eight queries that are 75.5% of the suite, each profiled on the same 10,000,000 row database on the same quiet host. The scan column is the `Get` operator alone and the total is the whole query. Both are CPU summed across threads, which is what `EXPLAIN ANALYZE` reports and what `crates/rudb-metrics/src/counters.rs` accumulates, so the two are in the same units and their ratio is the only thing read off them here. Neither is a wall time and neither is comparable to one.
 
-| query | columns read | scan |
-| --- | ---: | ---: |
-| Q22 | 2 | 1.229 s |
-| Q23 | 4 | 1.049 s |
-| Q19 | 3 | 872.984 ms |
-| Q33 | 4 | 737.433 ms |
-| Q17 | 2 | 548.142 ms |
-| Q10 | 4 | 505.104 ms |
-| Q29 | 1 | 431.773 ms |
-| Q21 | 1 | 346.321 ms |
+| query | scan CPU | query CPU | scan share |
+| --- | ---: | ---: | ---: |
+| Q33 | 1.386 s | 2.564 s | 54.1% |
+| Q19 | 595.421 ms | 1.927 s | 30.9% |
+| Q10 | 410.834 ms | 1.353 s | 30.4% |
+| Q17 | 352.262 ms | 1.391 s | 25.3% |
+| Q23 | 1.059 s | 5.412 s | 19.6% |
+| Q22 | 580.252 ms | 2.966 s | 19.6% |
+| Q21 | 310.243 ms | 2.392 s | 13.0% |
+| Q29 | 674.618 ms | 13.709 s | 4.9% |
 
-Those eight scans total 5.720 seconds at 10,000,000 rows. Scaled linearly they are 57.20 seconds at 100,000,000, against the 88.09 seconds those eight queries actually cost, so roughly two thirds of the suite's dominant block is already the scan and not the work above it.
+Across the eight the scan is 5.368 seconds of 31.714, which is 16.9%. The floor is real but it is low, and the interesting entry is the last row: Q29, the single largest query in rudb's native suite at 20.58 seconds, spends 95.1% of its CPU on a regular expression and 4.9% on reading the column it applies it to.
 
-Document 13's rule forbids closing a question on a measurement taken below benchmark size, and this one is taken ten times below it, so 57.20 seconds is not an estimate of the floor. It is a lower bound on it, and the direction of the error is known rather than guessed: per row scan cost rises with table size as the working set leaves cache, and it does not fall. The 10,000,000 row prefix is also a prefix and not a sample, holding 112 distinct `CounterID`, so its per column cardinalities are lower than the full file's and its dictionaries are correspondingly cheaper to walk.
+So the eight queries that are three quarters of this suite would run about 5.9 times faster if every operator above the scan cost nothing. That is the ceiling on execution work, measured rather than assumed, and it is not the foreclosure an earlier draft of this section claimed. It is a budget.
 
-Set that against the target. DuckDB answers this suite in 244.12 seconds, so ten times better is 24.41 seconds. rudb takes 116.63. The floor under the eight queries that are three quarters of the suite is at least 57.20 seconds, which is 2.3x the entire budget for all 43.
+## What the budget buys
 
-## What this forecloses
+rudb takes 116.63 seconds and DuckDB takes 244.12, so ten times better is 24.41 seconds and rudb needs 4.78x more than it has.
 
-No improvement to any operator above the scan reaches the target. Grouping, distinct counting, substring matching, top-N and late materialisation could all become free, on every one of the 43 queries at once, and the suite would still finish outside the budget, because the budget is less than half of what it costs to read the columns the queries name.
+Give the top eight the whole 5.9x, which is grouping, distinct counting, substring matching, regular expressions, top-N and materialisation all reduced to zero on the dominant three quarters of the suite at once. Those eight fall from 88.09 seconds to about 14.89, the other 35 stay at 28.54, and the suite lands at 43.43 seconds. That is 5.62x against DuckDB, and it is short of the target by a factor of 1.78.
 
-That is a statement about arithmetic and not about effort, and it settles a question this series has been circling since document 13. Document 14 ranks an order of work. Document 15 records that nine queries stand between a 2.09x lead and a larger one. Both are asking which execution mechanism to build next, and the answer is that the choice does not matter at this target, because the sum of all of them is bounded below by a quantity none of them touch.
+The remaining 1.78x has to come from the 35 queries outside the top eight, which cost 28.54 seconds between them and 20 of which already finish in under half a second each. Reaching 24.41 seconds requires the top eight at their scan floor *and* the tail cut to about a third of what it is.
 
-It also explains why document 13 found zone maps to be the one mechanism whose advantage grew with the data. Zone maps are the only mechanism in the series whose benefit is rows never read. Everything else in the series makes a pass over the data cheaper, and a cheaper pass is still a pass.
+That is the arithmetic, and the conclusion it supports is narrower than foreclosure and more useful. The target is not out of reach, but it sits at roughly the cost of scanning the columns the queries name. There is no version of it that an operator gets to by being twice as good. Every operator in the engine has to stop costing anything measurable, on every query, which is not optimisation of the work but removal of it.
+
+It also explains why document 13 found zone maps to be the one mechanism whose advantage grew with the data. Zone maps are the only mechanism in the series whose benefit is rows never read. Everything else in the series makes a pass over the data cheaper, and at a target set near the price of the pass, a cheaper pass is still a pass.
 
 ## What it leaves
 
-One quantity in document 14's cost model is untouched by every mechanism the series has built: `S(Q)`, the stripes that survive pruning, and through it `R(Q)`, the rows in those stripes. Every obligation stated so far takes `R(Q)` as given and argues about the cost per row. The floor above is what that assumption costs.
+Two things, and the measurements above rank them.
+
+The first is the one this suite actually spends its time on. Q29 is 95.1% regular expression and Q21 is 87.0% substring match, and the five string matching queries are 41.1% of the suite against a 1.38x lead. Document 14's O2 is satisfied on all of them, at one evaluation per distinct value, and the section above shows what satisfying it leaves on the table. This is where the budget is, and it is a question about evaluating a pattern against a dictionary, not about scanning.
+
+The second is the quantity no obligation in document 14's cost model touches: `S(Q)`, the stripes that survive pruning, and through it `R(Q)`, the rows in those stripes. Every obligation stated so far takes `R(Q)` as given and argues about the cost per row.
+
+Reducing `R(Q)` for these queries means deciding, without reading a chunk's codes, that the chunk holds no row the predicate can pass. rudb's zone maps hold ends, which decide a range predicate and cannot decide a substring one, because the dictionary is rank ordered and the values containing `google` are scattered through the whole rank order rather than gathered into an interval of it. Deciding a substring predicate per chunk needs a per chunk summary over codes rather than over ends.
 
 Reducing `R(Q)` for these queries means deciding, without reading a chunk's codes, that the chunk holds no row the predicate can pass. rudb's zone maps hold ends, which decide a range predicate and cannot decide a substring one, because the dictionary is rank ordered and the values containing `google` are scattered through the whole rank order rather than gathered into an interval of it. Deciding a substring predicate per chunk needs a per chunk summary over codes rather than over ends.
 
@@ -107,7 +115,7 @@ Whether that pays was measured rather than argued, and the answer is that it doe
 | 122,880 | 81 | 78 | 3.7% |
 | 1,000,000 | 10 | 10 | 0% |
 
-Placing 646 matches at random into 9,766 chunks would touch about 625 of them, so 404 is clustering and not noise, but it is mild clustering and it has decayed to nothing by the time a chunk is large enough to be worth reading as a unit. The file is ordered by `CounterID` and `EventTime`, and nothing in that order gathers the URLs that contain a particular substring. Pruning at 65,536 rows per chunk skips a fifth of the table for this predicate, which is a fifth of a term that is two thirds of the cost of eight queries, and that is not the missing 4.78x.
+Placing 646 matches at random into 9,766 chunks would touch about 625 of them, so 404 is clustering and not noise, but it is mild clustering and it has decayed to nothing by the time a chunk is large enough to be worth reading as a unit. rudb's chunk is 120,000 rows, recorded in `crates/rudb-pipeline/src/root.rs`, so the row of that table that describes this engine is the 122,880 one: 78 of 81 chunks hold a match and pruning skips 3.7% of the table. The file is ordered by `CounterID` and `EventTime`, and nothing in that order gathers the URLs that contain a particular substring.
 
 This is also the friendly case. `URL LIKE '%google%'` matches 0.0065% of the rows. `Referer LIKE '%google%'` matches 659,778 of the 10,000,000, which at every granularity in that table would touch every chunk, and a `SearchPhrase <> ''` gate of the kind Q21 through Q23 carry is not selective at all.
 
