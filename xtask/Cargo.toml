@@ -21,6 +21,7 @@ rudb-exec.workspace = true
 rudb-io.workspace = true
 rudb-kernels.workspace = true
 rudb-native.workspace = true
+rudb-parquet.workspace = true
 rudb-parse.workspace = true
 rudb-plan.workspace = true
 rudb-vector.workspace = true

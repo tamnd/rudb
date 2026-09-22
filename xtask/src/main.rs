@@ -37,6 +37,7 @@ mod source;
 mod stats;
 mod style;
 mod timing;
+mod topcount;
 mod vendor;
 mod version;
 
@@ -102,6 +103,7 @@ fn main() -> ExitCode {
         // `native` above, because that one reads a directory and this one writes to the file.
         Some("graph") => graph::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("stats") => stats::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        Some("topcount") => topcount::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("conform") => conform::run(&root()),
         Some("smoke") => smoke::run(),
         Some("ci") => ci(std::env::args().nth(2).as_deref() == Some("--full")),
