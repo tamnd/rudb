@@ -826,6 +826,12 @@ impl Column {
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
+        // A borrowed dictionary run only holds while the rows keep arriving under the dictionary it
+        // was read from. A value being handed over rather than a row being taken where it lies says
+        // that has stopped, so the run ends here and the arms below carry on over bytes this column
+        // owns. Without it a column that had started a run had no arm at all for the value and said
+        // so as an internal error, which is what a null row read back from a file used to raise.
+        self.end_the_run()?;
         let present = !matches!(value, Value::Null);
         match (&mut self.data, value) {
             (StoredData::TinyInt(values), Value::TinyInt(value)) => values.push(value),
@@ -848,6 +854,31 @@ impl Column {
             }
         }
         self.valid.push(present);
+        Ok(())
+    }
+
+    /// Ends a borrowed dictionary run, copying what it holds into bytes this column owns.
+    ///
+    /// The codes mean something only next to the dictionary they were read from, so a row arriving
+    /// under a different dictionary, or under none at all, cannot join the run and there is nowhere
+    /// to put it. What happens instead is that the run ends: every slot already in it is read back
+    /// through the dictionary it came from and pushed into an ordinary string column, and the row
+    /// that ended it goes in after. A null slot copies nothing, which is the same stand in a null
+    /// takes everywhere else a string column is built. Nothing but the space is lost by this, since
+    /// a run is a way of holding the same bytes rather than a different set of them.
+    fn end_the_run(&mut self) -> Result<()> {
+        let StoredData::StableText { dictionary, codes } = &self.data else {
+            return Ok(());
+        };
+        let mut owned = StringColumn::default();
+        for (slot, &code) in codes.iter().enumerate() {
+            let bytes = match self.valid.get(slot) {
+                Some(true) => dictionary.bytes_at(code as usize).unwrap_or_default(),
+                _ => Default::default(),
+            };
+            owned.push(bytes)?;
+        }
+        self.data = StoredData::Varchar(owned);
         Ok(())
     }
 
@@ -876,6 +907,24 @@ impl Column {
             }
         }
         if column.is_null_at(row) {
+            // A null does not end a run. Both sides keep their nulls in the validity beside the
+            // codes rather than in a code of their own, so the row is stored the way every other
+            // row of the run is and the validity says what it is. Nothing reads the code back,
+            // because everything that reads a slot asks the validity first, but it still has to be
+            // a code the dictionary has, since the vector handed back at the end is built from the
+            // whole run at once and a code past the end of a dictionary is refused there.
+            if let StoredData::StableText { dictionary, codes } = &mut self.data {
+                if let Some((incoming, values)) = column.stable_dictionary_parts() {
+                    if Arc::ptr_eq(dictionary, values) {
+                        let code = *incoming
+                            .get(row)
+                            .ok_or_else(|| Error::internal("a stable dictionary row is missing"))?;
+                        codes.push(code);
+                        self.valid.push(false);
+                        return Ok(0);
+                    }
+                }
+            }
             return self.push(Value::Null).map(|()| 0);
         }
         /// One signed run taking the row where it lies, when the value fits the run's width.
@@ -920,10 +969,15 @@ impl Column {
         // A form that does not hand its rows over where they lie, which is the packed one and the
         // compressed one, or a type wider than the three runs above. The row becomes a value and
         // the general path takes it.
+        // Whether the column keeps the payload is asked after the push rather than before it,
+        // because a push is the one thing that can change the answer: a column that was reading a
+        // dictionary run owns nothing until the run ends, and the push is what ends it. Asking
+        // first would charge the string to the table and then charge it again to the column that
+        // now holds it.
         let value = column.value_at(row);
-        let owned = if self.stores_payload() { 0 } else { rows::owned(&value) };
+        let owned = rows::owned(&value);
         self.push(value)?;
-        Ok(owned)
+        Ok(if self.stores_payload() { 0 } else { owned })
     }
 
     fn footprint(&self) -> usize {
@@ -2698,5 +2752,103 @@ mod tests {
         assert_eq!(same, [false, false, false, false]);
         assert_eq!(repeats(keys, 4, 1, &mut same), 1);
         assert_eq!(repeats(&[], 0, 0, &mut same), 0);
+    }
+
+    /// The same values as a stable dictionary, which is the form a `VARCHAR` column read back out of
+    /// a native file arrives in and the one form a key column borrows rather than copies. The nulls
+    /// are in the validity beside the codes and not in the values, the same as on the page.
+    fn stable_letters(codes: Vec<u32>, seen: &[&str], nulls: &[usize]) -> Vector {
+        let values: Vec<Value> = seen.iter().map(|word| Value::Varchar((*word).into())).collect();
+        let rows = codes.len();
+        let vector =
+            Vector::stable_dictionary(codes, Arc::new(flat(LogicalType::Varchar, &values)))
+                .expect("a stable dictionary of those values");
+        vector.with_validity(rudb_vector::Validity::from_iter(rows, |row| !nulls.contains(&row)))
+    }
+
+    /// #1265. A null row does not end a run, because a run keeps its nulls the way the page it came
+    /// from does, in the validity beside the codes. Before this the null was handed to the general
+    /// push, which had no arm for a column that was reading a run and said so as an internal error
+    /// naming the value's type, which is what a nullable `VARCHAR` read back from a file raised.
+    #[test]
+    fn a_null_row_of_a_stable_dictionary_stays_in_the_run() {
+        let column = stable_letters(vec![0, 0, 1], &["a", "bb"], &[1]);
+        let mut key = Column::new(&LogicalType::Varchar);
+        for row in 0..3 {
+            key.push_from(&column, row).expect("every row goes in");
+        }
+        assert!(matches!(key.data, StoredData::StableText { .. }), "a null did not end the run");
+        assert_eq!(
+            key.values(0..3),
+            [Value::Varchar("a".into()), Value::Null, Value::Varchar("bb".into()),]
+        );
+        // Read back out as a vector as well, since that is built from the whole run at once and a
+        // code past the end of the dictionary is refused there rather than where it was stored.
+        let vector = key.vector(&LogicalType::Varchar, 0..3).expect("the run comes back");
+        assert!(vector.is_null_at(1));
+        assert_eq!(vector.bytes_at(2), Some(b"bb".as_slice()));
+    }
+
+    /// And a run that starts on a null, which is the row the column has nothing to compare against.
+    #[test]
+    fn a_run_that_starts_on_a_null_holds_the_rows_after_it() {
+        let column = stable_letters(vec![0, 0, 1], &["a", "bb"], &[0]);
+        let mut key = Column::new(&LogicalType::Varchar);
+        for row in 0..3 {
+            key.push_from(&column, row).expect("every row goes in");
+        }
+        assert_eq!(
+            key.values(0..3),
+            [Value::Null, Value::Varchar("a".into()), Value::Varchar("bb".into()),]
+        );
+    }
+
+    /// A code means something only next to the dictionary it was read from, so a row under another
+    /// one ends the run. What it must not do is lose the rows the run was already holding.
+    #[test]
+    fn a_row_under_another_dictionary_ends_the_run_and_keeps_what_it_held() {
+        let first = stable_letters(vec![0, 1, 0], &["a", "bb"], &[1]);
+        let second = stable_letters(vec![1], &["a", "cc"], &[]);
+        let mut key = Column::new(&LogicalType::Varchar);
+        for row in 0..3 {
+            key.push_from(&first, row).expect("every row goes in");
+        }
+        key.push_from(&second, 0).expect("the row under the other dictionary goes in too");
+        assert!(matches!(key.data, StoredData::Varchar(_)), "the run ended");
+        assert_eq!(
+            key.values(0..4),
+            [
+                Value::Varchar("a".into()),
+                Value::Null,
+                Value::Varchar("a".into()),
+                Value::Varchar("cc".into()),
+            ]
+        );
+    }
+
+    /// The same thing said where the operator above can see it. A column handed over as a run and
+    /// the same column handed over flat have to put the same rows in the same groups in the same
+    /// order, because a table read back from a file hands its strings over the first way and a
+    /// table still in memory hands them over the second.
+    #[test]
+    fn a_stable_dictionary_groups_the_same_as_the_flat_column_it_stands_for() {
+        let values = [
+            Value::Varchar("a".into()),
+            Value::Null,
+            Value::Varchar("a".into()),
+            Value::Varchar(String::new()),
+            Value::Null,
+            Value::Varchar("bb".into()),
+        ];
+        let types = [LogicalType::Varchar];
+        let run = [stable_letters(vec![0, 0, 0, 1, 0, 2], &["a", "", "bb"], &[1, 4])];
+        let plain = [flat(LogicalType::Varchar, &values)];
+        let (over_run, run_slots) = one_at_a_time(&run, values.len(), &types);
+        let (over_plain, plain_slots) = one_at_a_time(&plain, values.len(), &types);
+        assert_eq!(run_slots, plain_slots);
+        assert_eq!(over_run.len(), over_plain.len());
+        let (batched, batched_slots) = a_batch_at_a_time(&run, values.len(), &types);
+        assert_eq!(batched_slots, plain_slots);
+        assert_eq!(batched.len(), over_plain.len());
     }
 }
