@@ -22,10 +22,32 @@
 //!
 //! The rows arriving are the other bound, because a group needs a row in it.
 //!
-//! The smaller of two ceilings is a ceiling, which is what this takes. What it deliberately does not
-//! take is [`estimate::rows`] of the aggregate itself, which is the modelled group count: that
-//! number is a guess about how the keys landed, it is [`rudb_common::Class::Estimated`] wherever it
-//! comes from, and sizing an allocation from a guess is the mistake section 5.1 names.
+//! What it deliberately does not take is [`estimate::rows`] of the aggregate itself, which is the
+//! modelled group count: that number is a guess about how the keys landed, it is
+//! [`rudb_common::Class::Estimated`] wherever it comes from, and sizing an allocation from a guess is
+//! the mistake section 5.1 names.
+//!
+//! # Only where the key is the smaller of the two bounds
+//!
+//! The smaller of two ceilings is a ceiling, but the two are not equally good sizes, and taking the
+//! smaller one regardless was part of a three percent regression on TPC-H. The pass takes the key's
+//! ceiling and refuses when the rows arriving are the smaller bound.
+//!
+//! The reason is that the two numbers say different things. A counted key column's distinct count is
+//! how many groups there will be, exactly so where nothing filtered underneath and near enough where
+//! something did. The rows arriving say nothing at all about how many groups there are: a `GROUP BY`
+//! that turns six million rows into fifty seven of them has six million as its row bound, and the
+//! room that asks for is six million buckets for fifty seven groups.
+//!
+//! So where the product of the key's counts is above the rows, the honest reading is that this pass
+//! has learned nothing about this key and the table should start where it always started. That is
+//! also what happens to a key of several columns, because the product of five distinct counts is a
+//! ceiling nothing ever approaches. TPC-H q18 groups on five columns of a join of several million
+//! rows and produces fifty seven of them, and sizing that aggregate from the rows was 0.34 G of
+//! instructions on its own, most of it the kernel clearing pages for buckets no row was ever written
+//! into. The larger part of what q18 lost was the other aggregate in it, and that one was the
+//! executor reading the number for tables that never hold the groups, which `rudb_exec`'s `Share`
+//! is about.
 //!
 //! # Why a ceiling is the safe end of the range here
 //!
@@ -46,6 +68,9 @@
 //! A key column nobody counted, which is a column of a table with no dictionary, no sketch and no
 //! footer entry. There is no ceiling to take and the honest answer is the size the table always
 //! started at.
+//!
+//! An input whose rows nobody can say, since the test above is against that number and a test that
+//! cannot be run is a test that has not passed.
 //!
 //! A ceiling that is already inside the first bucket array, because a table that was never going to
 //! grow has nothing to save.
@@ -120,10 +145,13 @@ fn size(plan: &mut Plan, stats: &Facts) {
     }
 }
 
-/// The most groups the aggregate over `input` keyed on `keys` could possibly produce.
+/// The most groups the aggregate over `input` keyed on `keys` could possibly produce, when that
+/// number is the key's own and not the row count wearing a ceiling's clothes.
 ///
 /// `None` when nothing bounds it, which is the ordinary answer for a key that is an expression and
-/// for a column of a table nobody counted.
+/// for a column of a table nobody counted, and `None` again when the rows arriving are the smaller
+/// of the two bounds. The second one is the whole of the rule and the reason is in the module
+/// documentation above.
 fn ceiling(
     plan: &Plan,
     input: rudb_plan::NodeRef,
@@ -135,12 +163,9 @@ fn ceiling(
     for binding in bindings {
         values = values.saturating_mul(bounded(estimate::stated(plan, binding, stats))?);
     }
-    // A group needs a row in it, so the rows arriving bound the groups too. Unknown leaves the key
-    // ceiling standing on its own, which is still a ceiling.
-    Some(match estimate::rows(plan, input, stats) {
-        Some(rows) => values.min(rows),
-        None => values,
-    })
+    // A group needs a row in it, so the rows arriving bound the groups too, and where they are the
+    // smaller bound this pass has learned nothing about the key and asks for nothing.
+    (values <= estimate::rows(plan, input, stats)?).then_some(values)
 }
 
 /// The distinct count read as a ceiling, or `None` when it is not one.
@@ -209,22 +234,43 @@ mod tests {
     }
 
     #[test]
-    fn the_rows_arriving_are_the_other_ceiling() {
+    fn a_key_the_rows_bound_more_tightly_than_its_count_does_is_left_alone() {
         // More distinct values than there are rows, which a fold across parts can say. The rows
-        // are the smaller ceiling and the smaller of two ceilings is the one to take.
+        // are the smaller of the two bounds, so this pass has learned nothing about the key and
+        // asks for nothing. Taking the rows instead is how a group by that makes fifty seven
+        // groups out of millions of rows asked for room for millions of them.
         let mut plan = grouped(None);
         run(&mut plan, &counted(4_000, 50_000));
-        assert_eq!(plan.presized(1), Some(4_000));
+        assert_eq!(plan.presized_count(), 0);
     }
 
     #[test]
     fn a_filter_underneath_does_not_raise_the_ceiling() {
         // The filter's own estimate is below the row count and the key ceiling is unchanged by it,
-        // because removing rows never adds a group. Whichever is smaller, the answer is a ceiling.
+        // because removing rows never adds a group. Either the key is still the smaller bound and
+        // is what gets taken, or the filter has cut the rows below it and nothing gets taken, and
+        // neither one can name a number above the key's own count.
         let mut plan = grouped(Some("(#0.0::INTEGER > 10::INTEGER)::BOOLEAN"));
         run(&mut plan, &counted(1_000_000, 50_000));
-        let sized = plan.presized(1).expect("an aggregate with a ceiling");
+        let sized = plan.presized(1).unwrap_or(0);
         assert!(sized <= 50_000, "{sized} is above the key's own ceiling");
+    }
+
+    #[test]
+    fn a_key_of_several_columns_is_left_alone_because_the_product_is_not_a_size() {
+        // Two counted columns of a table with far fewer rows than their product. The product is a
+        // real ceiling and a useless size, which is the shape every wide group by in TPC-H has.
+        let text = "Aggregate #1 groups=[#0.0::INTEGER, #0.1::INTEGER] aggregates=[]\n  Get \
+                    memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n";
+        let mut plan = Plan::parse(text).expect("a plan that parses");
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "t", 1_000_000);
+        facts.record_distinct("memory", "main", "t", "a", 50_000, Provenance::Dictionary);
+        facts.record_distinct("memory", "main", "t", "b", 50_000, Provenance::Dictionary);
+        let mut context = Context::new();
+        context.measure(std::sync::Arc::new(facts));
+        run(&mut plan, &context);
+        assert_eq!(plan.presized_count(), 0);
     }
 
     #[test]
@@ -259,6 +305,18 @@ mod tests {
         let mut plan = grouped(None);
         run(&mut plan, &counted(u64::MAX, u64::MAX));
         assert_eq!(plan.presized(1), Some(MOST));
+    }
+
+    #[test]
+    fn an_input_whose_rows_nobody_can_say_is_left_alone() {
+        // The table's count is not on record, so the test the key has to pass cannot be run.
+        let mut plan = grouped(None);
+        let mut facts = Facts::new();
+        facts.record_distinct("memory", "main", "t", "a", 50_000, Provenance::Dictionary);
+        let mut context = Context::new();
+        context.measure(std::sync::Arc::new(facts));
+        run(&mut plan, &context);
+        assert_eq!(plan.presized_count(), 0);
     }
 
     #[test]
