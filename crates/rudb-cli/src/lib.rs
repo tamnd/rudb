@@ -69,7 +69,8 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
         Action::Run(options) => {
             // The library decides what a database name means, here and behind `.open`, so there is
             // one rule about it rather than a copy of the rule in the shell.
-            let database = match Database::open(&options.database) {
+            let config = Config::default().with_read_only(options.readonly);
+            let database = match Database::open_with(&options.database, config) {
                 Ok(database) => database,
                 Err(problem) => {
                     let _ = writeln!(err, "rudb: {}", problem.message());
@@ -88,7 +89,7 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             if options.fallbacks {
                 shell.print_fallbacks();
             }
-            if shell.failed() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+            if shell.close() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
     }
 }

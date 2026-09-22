@@ -6,7 +6,7 @@
 
 use std::thread;
 
-use rudb::Database;
+use rudb::{Config, Database};
 use rudb_common::{Clustering, Field, LogicalType, Value, Width};
 
 #[test]
@@ -343,6 +343,102 @@ fn the_last_table_can_be_dropped_and_the_file_says_so() {
     let again = Database::open(&name).expect("the native database reopens");
     assert_eq!(again.value("SELECT sum(x) FROM u").expect("the new table"), Value::HugeInt(2));
     drop(again);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+/// A table created in one run is there in the next one without anybody saying `CHECKPOINT`.
+///
+/// What a program embedding a database expects of it, and what DuckDB does. Without this every
+/// session that forgot the checkpoint threw its work away at the end, which is a database that
+/// silently is not one.
+#[test]
+fn a_database_on_a_file_is_written_when_the_last_handle_goes_away() {
+    let path = std::env::temp_dir().join(format!("rudb-api-close-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    // Two tables and then the rows, which is the shape that keeps them in memory until the write
+    // below. One table and a load goes straight to the file as it runs, and a test over that would
+    // pass whether the database wrote anything on the way out or not.
+    database.execute("CREATE TABLE t (x INTEGER)").expect("creates");
+    database.execute("CREATE TABLE u (y INTEGER)").expect("creates the second");
+    // A second handle and a connection, because the write is the last one going away and not the
+    // first. A database written when the first handle drops is one that loses everything the
+    // handles still open do after it.
+    let second = database.clone();
+    let connection = database.connect();
+    drop(database);
+    connection.execute("INSERT INTO t VALUES (7), (5)").expect("inserts");
+    assert!(!path.exists(), "nothing is on the disk yet, because nobody said CHECKPOINT");
+    drop(connection);
+    assert!(!path.exists(), "a handle going away while others are open writes nothing");
+    drop(second);
+    assert!(path.exists(), "the last handle going away is what writes the file");
+
+    let reopened = Database::open(&name).expect("the native database reopens");
+    assert_eq!(
+        reopened.value("SELECT sum(x) FROM t").expect("both rows are in the file"),
+        Value::HugeInt(12)
+    );
+    reopened.execute("SELECT * FROM u").expect("the empty table was written too");
+    drop(reopened);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+/// `close` is the same write with the error handed back, and it is safe to call and then drop.
+#[test]
+fn close_writes_the_file_and_says_whether_it_worked() {
+    let path = std::env::temp_dir().join(format!("rudb-api-explicit-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database.execute("CREATE TABLE t (x INTEGER)").expect("creates");
+    database.execute("CREATE TABLE u (y INTEGER)").expect("creates the second");
+    database.execute("INSERT INTO t VALUES (3)").expect("inserts");
+    assert!(!path.exists(), "nothing is on the disk until the close below");
+    database.close().expect("the file is written and nothing went wrong");
+    assert!(path.exists(), "the file is there as soon as close returns");
+
+    let reopened = Database::open(&name).expect("the native database reopens");
+    assert_eq!(reopened.value("SELECT sum(x) FROM t").expect("the row"), Value::HugeInt(3));
+    // Closing a database that is already on the disk is the checkpoint that finds nothing to do.
+    reopened.close().expect("closing a second time writes nothing and works");
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+/// A read only database does not write its file, on the way out or on a `CHECKPOINT`.
+///
+/// `CHECKPOINT` succeeding and writing nothing is what the pinned DuckDB does, measured. What it
+/// also does and this does not yet is refuse the statements by name, which is #1225, so the create
+/// below is expected to succeed here and to be gone at the next open rather than to be refused.
+#[test]
+fn a_read_only_database_leaves_the_file_alone() {
+    let path = std::env::temp_dir().join(format!("rudb-api-frozen-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database.execute("CREATE TABLE t AS SELECT 1 AS x").expect("creates");
+    database.close().expect("writes the file");
+    let written = std::fs::metadata(&path).expect("the file is there").len();
+
+    let frozen = Database::open_with(&name, Config::default().with_read_only(true))
+        .expect("the file opens read only");
+    assert!(frozen.config().read_only(), "the setting is what it was opened with");
+    // A create with rows behind it, which is the statement that writes the file as it runs on a
+    // database that is allowed to. Here it has to take the path that keeps the rows in memory.
+    frozen.execute("CREATE TABLE u AS SELECT 2 AS y").expect("the statement is not refused yet");
+    assert_eq!(frozen.value("SELECT sum(y) FROM u").expect("the rows"), Value::HugeInt(2));
+    frozen.execute("CHECKPOINT").expect("a checkpoint on a read only database does nothing");
+    frozen.close().expect("closing writes nothing");
+    assert_eq!(std::fs::metadata(&path).expect("the file").len(), written, "the file is untouched");
+
+    let reopened = Database::open(&name).expect("the native database reopens");
+    assert_eq!(
+        reopened.value("SELECT sum(x) FROM t").expect("the file is what it was"),
+        Value::HugeInt(1)
+    );
+    assert!(
+        reopened.execute("SELECT * FROM u").is_err(),
+        "the table written under it is not there"
+    );
+    drop(reopened);
     std::fs::remove_file(path).expect("removes the temporary database");
 }
 
