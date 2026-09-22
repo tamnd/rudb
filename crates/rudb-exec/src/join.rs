@@ -2216,12 +2216,23 @@ fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
                 columns(plan, child, found);
             }
         }
-        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+        Expr::Aggregate { args, filter, .. } => {
             for &arg in plan.expr_list(args) {
                 columns(plan, arg, found);
             }
             if let Some(inner) = filter {
                 columns(plan, inner, found);
+            }
+        }
+        Expr::Window { args, filter, order, .. } => {
+            for &arg in plan.expr_list(args) {
+                columns(plan, arg, found);
+            }
+            if let Some(inner) = filter {
+                columns(plan, inner, found);
+            }
+            for key in plan.sort_key_list(order) {
+                columns(plan, key.expr, found);
             }
         }
         Expr::Case { arms, otherwise } => {

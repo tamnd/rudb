@@ -142,6 +142,9 @@ pub(crate) struct WindowCall<'a> {
     pub(crate) filter: ast::ExprRef,
     /// Whether `IGNORE NULLS` was written inside the parens, which is where DuckDB puts it.
     pub(crate) ignore_nulls: bool,
+    /// The `ORDER BY` written inside the parens, which says what order the call reads the rows of
+    /// its frame in and is a different clause from the one in the `OVER`.
+    pub(crate) order: ast::Slice,
     /// The `OVER`, which the parser has already resolved against any `WINDOW` clause.
     pub(crate) spec: ast::WindowRef,
 }
@@ -154,6 +157,9 @@ struct WindowParts {
     partition: Vec<ExprRef>,
     /// The order within a partition.
     order: Vec<SortKey>,
+    /// The order the call reads the rows of its frame in, which is the `ORDER BY` written inside
+    /// the brackets rather than the one in the `OVER` and is empty far more often than not.
+    inner: Vec<SortKey>,
     /// The frame, with both ends and the exclusion.
     frame: WindowFrame,
 }
@@ -2806,7 +2812,7 @@ impl<'a> Binder<'a> {
         written: &WindowCall<'_>,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let WindowCall { name, args, distinct, filter, ignore_nulls, spec } = *written;
+        let WindowCall { name, args, distinct, filter, ignore_nulls, spec, .. } = *written;
         if self.in_aggregate {
             return Err(Error::binder(
                 "aggregate function calls cannot contain window function calls",
@@ -2845,7 +2851,7 @@ impl<'a> Binder<'a> {
 
         let held = ast.window(spec);
         self.in_window = true;
-        let parts = self.window_parts(ast, args, held, scope);
+        let parts = self.window_parts(ast, written, args, held, scope);
         // The predicate goes last here, which is the other way round from an ordinary aggregate and
         // is again the order the messages come out in upstream. It is still inside the window, so a
         // window in it is a nested window, while an aggregate in it is an ordinary aggregate over
@@ -2888,16 +2894,40 @@ impl<'a> Binder<'a> {
                 "FILTER is not implemented for the window function \"\"{name}\"\""
             )));
         }
+        // An `ORDER BY` inside the brackets puts the rows of the frame in a different order for
+        // this one call to read them in, which is a question every aggregate and the three that
+        // count through the frame have an answer to. The rest of the window functions read
+        // something other than the frame, and what the reference binary does with them under an
+        // order of their own is a different reading again, so they are turned down rather than
+        // guessed at. The exclusion is refused first and in the reference binary's own sentence,
+        // because that is the one it reaches for when both apply. Per #1204.
+        if !parts.inner.is_empty() && kind_of(resolved.name) == Some(FunctionKind::Window) {
+            let counts = matches!(resolved.name, "first_value" | "last_value" | "nth_value");
+            if !counts {
+                if parts.frame.exclude != WindowExclude::NoOthers {
+                    return Err(Error::binder(format!(
+                        "EXCLUDE is not supported for the window function \"\"{}\"\"",
+                        resolved.name
+                    )));
+                }
+                return Err(Error::not_implemented(format!(
+                    "ORDER BY inside the arguments of the window function \"{}\"",
+                    resolved.name
+                )));
+            }
+        }
         let mut cast = Vec::with_capacity(parts.args.len());
         for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
         }
         let args = self.plan.add_expr_list(&cast);
+        let order = self.plan.add_sort_keys(&parts.inner);
         let name = self.plan.intern(resolved.name);
         let ty = resolved.returns;
-        let call = self
-            .plan
-            .add_expr(Expr::Window { name, args, distinct, filter, ignore_nulls }, ty.clone());
+        let call = self.plan.add_expr(
+            Expr::Window { name, args, distinct, filter, ignore_nulls, order },
+            ty.clone(),
+        );
 
         let at = self.window_run(parts.partition, parts.order, parts.frame, call);
         let index = self.windows.last().expect("the run was just filed").index;
@@ -2951,6 +2981,7 @@ impl<'a> Binder<'a> {
     fn window_parts(
         &mut self,
         ast: &Ast,
+        written: &WindowCall<'_>,
         args: &[ast::ExprRef],
         held: ast::WindowSpec,
         scope: &Scope,
@@ -2959,6 +2990,15 @@ impl<'a> Binder<'a> {
         for &arg in args {
             let expr = self.bind_expr(ast, arg, scope)?;
             bound.push(self.over_aggregate(expr, scope)?);
+        }
+        // The keys inside the brackets are bound against the same rows the arguments are, because
+        // that is what they sort: the call reads its frame in this order, and the frame is made of
+        // the operator's input rows.
+        let mut inner = Vec::new();
+        for item in ast.order_list(written.order).to_vec() {
+            let expr = self.bind_expr(ast, item.expr, scope)?;
+            let expr = self.over_aggregate(expr, scope)?;
+            inner.push(self.sort_key(expr, item));
         }
         let mut partition = Vec::new();
         for &key in ast.expr_list(held.partition) {
@@ -2986,7 +3026,7 @@ impl<'a> Binder<'a> {
                 ast::WindowExclude::Ties => WindowExclude::Ties,
             },
         };
-        Ok(WindowParts { args: bound, partition, order, frame })
+        Ok(WindowParts { args: bound, partition, order, inner, frame })
     }
 
     /// One end of a frame, with its offset bound where it has one.
@@ -3474,6 +3514,7 @@ fn same_expr(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
                 distinct: left_distinct,
                 filter: left_filter,
                 ignore_nulls: left_nulls,
+                order: left_order,
             },
             Expr::Window {
                 name: right_name,
@@ -3481,11 +3522,22 @@ fn same_expr(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
                 distinct: right_distinct,
                 filter: right_filter,
                 ignore_nulls: right_nulls,
+                order: right_order,
             },
         ) => {
+            // The keys inside the brackets are compared, unlike the ones in the `OVER`, because two
+            // calls in the same run can still read their frame in different orders.
+            let left_keys = plan.sort_key_list(*left_order);
+            let right_keys = plan.sort_key_list(*right_order);
             plan.string(*left_name) == plan.string(*right_name)
                 && left_distinct == right_distinct
                 && left_nulls == right_nulls
+                && left_keys.len() == right_keys.len()
+                && left_keys.iter().zip(right_keys).all(|(left, right)| {
+                    left.descending == right.descending
+                        && left.nulls_first == right.nulls_first
+                        && same_expr(plan, left.expr, right.expr)
+                })
                 && match (left_filter, right_filter) {
                     (None, None) => true,
                     (Some(left), Some(right)) => same_expr(plan, *left, *right),

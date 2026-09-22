@@ -628,7 +628,14 @@ fn limited(
     let name = plan.intern("row_number");
     let args = plan.add_expr_list(&[]);
     let call = plan.add_expr_at(
-        Expr::Window { name, args, distinct: false, filter: None, ignore_nulls: false },
+        Expr::Window {
+            name,
+            args,
+            distinct: false,
+            filter: None,
+            ignore_nulls: false,
+            order: Slice::EMPTY,
+        },
         LogicalType::BigInt,
         span,
     );

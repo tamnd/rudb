@@ -57,7 +57,7 @@ impl Binder<'_> {
             ast::Expr::Function { name, args, distinct, filter } => {
                 self.bind_call(ast, name, args, distinct, filter, scope)
             }
-            ast::Expr::Window { name, args, distinct, filter, ignore_nulls, spec } => {
+            ast::Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec } => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
                 let args = ast.expr_list(args).to_vec();
                 let call = WindowCall {
@@ -66,6 +66,7 @@ impl Binder<'_> {
                     distinct,
                     filter,
                     ignore_nulls,
+                    order,
                     spec,
                 };
                 self.bind_window(ast, &call, scope)
@@ -1008,9 +1009,10 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         // A window call is not an aggregate and is evaluated after the grouping rather than by it,
         // but what it is given to read can be one: `sum(count(x)) OVER ()` aggregates the block.
         // The partition and the order keys count for the same reason.
-        ast::Expr::Window { args, spec, .. } => {
+        ast::Expr::Window { args, spec, order, .. } => {
             let held = ast.window(spec);
             ast.expr_list(args).iter().any(|&arg| has_aggregate(ast, arg))
+                || ast.order_list(order).iter().any(|item| has_aggregate(ast, item.expr))
                 || ast.expr_list(held.partition).iter().any(|&key| has_aggregate(ast, key))
                 || ast.order_list(held.order).iter().any(|item| has_aggregate(ast, item.expr))
         }

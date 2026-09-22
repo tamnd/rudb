@@ -24,7 +24,7 @@
 
 use rudb_common::LogicalType;
 use rudb_plan::{
-    Arm, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, WindowBound,
+    Arm, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, SortKey, WindowBound,
 };
 
 use crate::fold::VOLATILE;
@@ -278,15 +278,24 @@ pub(crate) fn rebuild(
                 )
             }
         }
-        Expr::Window { name, args, distinct, filter, ignore_nulls } => {
+        Expr::Window { name, args, distinct, filter, ignore_nulls, order } => {
             let rewritten_args = list(plan, args, child);
             let rewritten_filter = filter.map(|inner| child(plan, inner));
-            if rewritten_args.is_none() && rewritten_filter == filter {
+            let rewritten_order = keys(plan, order, child);
+            if rewritten_args.is_none() && rewritten_filter == filter && rewritten_order.is_none() {
                 expr
             } else {
                 let args = rewritten_args.unwrap_or(args);
+                let order = rewritten_order.unwrap_or(order);
                 plan.add_expr_at(
-                    Expr::Window { name, args, distinct, filter: rewritten_filter, ignore_nulls },
+                    Expr::Window {
+                        name,
+                        args,
+                        distinct,
+                        filter: rewritten_filter,
+                        ignore_nulls,
+                        order,
+                    },
                     ty,
                     span,
                 )
@@ -321,6 +330,21 @@ pub(crate) fn list(
     let held = plan.expr_list(slice).to_vec();
     let rewritten: Vec<ExprRef> = held.iter().map(|&expr| child(plan, expr)).collect();
     (rewritten != held).then(|| plan.add_expr_list(&rewritten))
+}
+
+/// The same for a run of sort keys, of which a window call carries one.
+///
+/// Only the expression moves. The direction and the null placement belong to the key and not to
+/// what it sorts on, so a rewrite that replaced a column with another one leaves both alone.
+pub(crate) fn keys(
+    plan: &mut Plan,
+    slice: Slice,
+    child: &mut impl FnMut(&mut Plan, ExprRef) -> ExprRef,
+) -> Option<Slice> {
+    let held = plan.sort_key_list(slice).to_vec();
+    let rewritten: Vec<SortKey> =
+        held.iter().map(|key| SortKey { expr: child(plan, key.expr), ..*key }).collect();
+    (rewritten != held).then(|| plan.add_sort_keys(&rewritten))
 }
 
 /// Calls `found` for every column `expr` reads.
@@ -433,8 +457,13 @@ pub(crate) fn volatile(plan: &Plan, expr: ExprRef) -> bool {
         Expr::Function { name, args } => {
             VOLATILE.contains(&plan.string(name)) || any_volatile(plan, args)
         }
-        Expr::Aggregate { args, filter, .. } | Expr::Window { args, filter, .. } => {
+        Expr::Aggregate { args, filter, .. } => {
             any_volatile(plan, args) || filter.is_some_and(|inner| volatile(plan, inner))
+        }
+        Expr::Window { args, filter, order, .. } => {
+            any_volatile(plan, args)
+                || filter.is_some_and(|inner| volatile(plan, inner))
+                || plan.sort_key_list(order).iter().any(|key| volatile(plan, key.expr))
         }
         Expr::Case { arms, otherwise } => {
             plan.arm_list(arms)
