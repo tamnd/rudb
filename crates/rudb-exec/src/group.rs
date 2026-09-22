@@ -173,6 +173,13 @@ pub(crate) struct Aggregate<'a> {
     having_count: Option<(usize, i64)>,
     /// The most groups an unordered limit above this operator can observe.
     max_groups: Option<usize>,
+    /// How many groups to take room for before the first row arrives, where the planner said.
+    ///
+    /// A capacity and never a count. The table holds whatever the keys put in it and this changes
+    /// only how many times it has to grow on the way there, so a number that is wrong costs the
+    /// growing it was meant to save and costs nothing else. `rudb_opt`'s `presize` pass is where it
+    /// comes from and where the reasoning about which numbers are worth acting on lives.
+    presize: Option<u64>,
     /// The groups a pushed down limit keeps, agreed once and used by every instance.
     agreed: Mutex<Option<Agreed>>,
     /// Whether [`Agreed::keys`] is filled in, so the fold can ask without taking the lock.
@@ -726,6 +733,7 @@ impl<'a> Aggregate<'a> {
             top_counts: None,
             having_count: None,
             max_groups: None,
+            presize: None,
             agreed: Mutex::new(None),
             settled: AtomicBool::new(false),
             by_vector,
@@ -759,6 +767,17 @@ impl<'a> Aggregate<'a> {
     /// Stops opening groups once an unordered limit above this aggregate cannot observe another.
     pub(crate) fn limit_groups(mut self, max_groups: usize) -> Self {
         self.max_groups = Some(max_groups);
+        self
+    }
+
+    /// Takes room for that many groups in each instance's table before any row arrives.
+    ///
+    /// Half of `spec/stats/05-every-query.md` section 5.4's first rule, the other half being the
+    /// pass that works out the number. Per instance, because the tables are per instance: a
+    /// partitioned aggregate on sixteen threads takes sixteen of these, which is the reason the pass
+    /// has a ceiling at all.
+    pub(crate) fn presize(mut self, groups: u64) -> Self {
+        self.presize = Some(groups);
         self
     }
 
@@ -1251,9 +1270,14 @@ impl<'a> Aggregate<'a> {
             // rows and outlive the table. `charged` and this one are the same arrangement over two
             // reservations.
             charged_keys: 0,
-            table: Table::new(
-                &self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect::<Vec<_>>(),
-            ),
+            table: {
+                let types: Vec<_> =
+                    self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+                match self.presize {
+                    Some(groups) => Table::with_groups(&types, groups),
+                    None => Table::new(&types),
+                }
+            },
             states: Vec::new(),
             counts: Vec::new(),
             compact: Vec::new(),

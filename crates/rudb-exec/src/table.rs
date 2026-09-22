@@ -148,8 +148,34 @@ pub(crate) enum Probe {
 impl Table {
     /// An empty table over a key of `columns` columns.
     pub(crate) fn new(types: &[rudb_common::LogicalType]) -> Self {
+        Self::sized(types, FIRST)
+    }
+
+    /// An empty table with room for `groups` groups already taken.
+    ///
+    /// The doubling in [`Table::insert`] is what this exists to skip. A table that ends with a
+    /// million groups doubles fifteen times on the way there and each doubling rewrites every bucket
+    /// it already had, so most of the bucket writes a group by does are writes of groups that were
+    /// already in it. Asking for the room once is one allocation and no rewrites.
+    ///
+    /// The count is a number the planner is willing to stand behind rather than a guess, which is
+    /// `rudb_opt`'s `presize` pass and the reasoning in its module documentation. A table that is
+    /// given too small a number grows the way it always did, and nothing here depends on the number
+    /// being right for the answer to be right: it is a capacity and the keys decide everything else.
+    pub(crate) fn with_groups(types: &[rudb_common::LogicalType], groups: u64) -> Self {
+        // Half full is where `insert` grows, so the room for `groups` of them is twice that many
+        // buckets, rounded up to the power of two the mask needs. `FIRST` is the floor because a
+        // table smaller than the one every other table starts at is not an optimization.
+        let wanted = usize::try_from(groups.saturating_mul(2)).unwrap_or(usize::MAX);
+        // Halved before the rounding rather than after, so that the rounding cannot carry it past
+        // the most slots a `u32` can address.
+        Self::sized(types, wanted.clamp(FIRST, LIMIT / 2).next_power_of_two())
+    }
+
+    /// An empty table with `buckets` buckets, which is a power of two at or above [`FIRST`].
+    fn sized(types: &[rudb_common::LogicalType], buckets: usize) -> Self {
         Self {
-            buckets: vec![VACANT; FIRST],
+            buckets: vec![VACANT; buckets],
             columns: types.iter().map(Column::new).collect(),
             hashes: Vec::new(),
             owned: 0,

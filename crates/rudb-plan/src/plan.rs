@@ -81,6 +81,16 @@ pub struct Plan {
     /// synopsis is per column and the planner wants one number out of it per equality, so the
     /// question goes to the store.
     frequencies: BTreeMap<u32, Arc<dyn Frequencies>>,
+    /// How many groups the optimizer is willing to say an aggregate will produce, by the table
+    /// index the aggregate binds its output to.
+    ///
+    /// Beside the pools for the reason `measured` is, and the reason is sharper here: this is a
+    /// decision and not a fact, it changes no answer, and a plan that lost it on the way to the
+    /// executor is the same plan run slightly slower. Keyed by the aggregate's own table index
+    /// rather than by a node reference because a node reference is a position in an arena that
+    /// every later pass is allowed to move, and the table index is the one name an aggregate keeps
+    /// from the binder to the executor.
+    presized: BTreeMap<u32, u64>,
 }
 
 impl Default for Plan {
@@ -123,6 +133,7 @@ impl Plan {
             distincts: BTreeMap::new(),
             zones: BTreeMap::new(),
             frequencies: BTreeMap::new(),
+            presized: BTreeMap::new(),
         }
     }
 
@@ -241,6 +252,29 @@ impl Plan {
     #[must_use]
     pub fn frequencies_count(&self) -> usize {
         self.frequencies.len()
+    }
+
+    /// Records how many groups the aggregate binding its output to `index` is expected to produce.
+    ///
+    /// Written by one pass, `rudb_opt`'s `presize`, and only for an aggregate whose count it got
+    /// from a statistic it is willing to stand behind. An aggregate with no entry reads back `None`
+    /// and its table grows the way it always did, which is the behaviour this whole entry is an
+    /// optimization of.
+    pub fn presize(&mut self, index: u32, groups: u64) {
+        self.presized.insert(index, groups);
+    }
+
+    /// How many groups the aggregate binding its output to `index` is expected to produce, where
+    /// anybody said.
+    #[must_use]
+    pub fn presized(&self, index: u32) -> Option<u64> {
+        self.presized.get(&index).copied()
+    }
+
+    /// How many aggregates carry a group count, which is what a test about this asks.
+    #[must_use]
+    pub fn presized_count(&self) -> usize {
+        self.presized.len()
     }
 
     /// How many nodes are in the arena, reachable or not.
