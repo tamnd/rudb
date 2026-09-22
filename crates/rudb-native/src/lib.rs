@@ -6845,7 +6845,7 @@ fn settle_shape(sample: &[Vec<&[u8]>]) -> Result<chooser::Settled> {
     let mut best: Option<(chooser::Settled, usize)> = None;
     for shape in payload_shapes() {
         let mut size = 0;
-        for block in &sample {
+        for block in sample {
             size += string::encode_with(block, &shape)?.len();
         }
         if best.as_ref().is_none_or(|(_, smallest)| size < *smallest) {
