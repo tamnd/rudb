@@ -1157,6 +1157,8 @@ impl<'a> Building<'a, '_> {
                     sideways: self.sideways.take(),
                     cutoff: self.cutoff.take(),
                 };
+                let counters =
+                    self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));
                 let scan = Scan::new(
                     plan,
                     self.catalog.table(&name)?,
@@ -1165,10 +1167,9 @@ impl<'a> Building<'a, '_> {
                     filters,
                     self.seams,
                     self.session,
-                )?;
+                )?
+                .watched(counters.clone());
                 let schema = scan.schema().clone();
-                let counters =
-                    self.watch(reference, id, pipeline, "Scan", Some(plan.string(table)));
                 Segment::new(Arc::new(Watched::new(scan, counters)), schema)
             }
             Node::Dummy => {
