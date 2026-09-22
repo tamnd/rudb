@@ -17,8 +17,9 @@ The ClickBench evidence at 100k rows is:
 | Q34 | 16.00 ms | 1.56 ms |
 | Q35 | 19.00 ms | 1.52 ms |
 
-**That evidence does not hold at benchmark scale.** At 100,000,000 rows rudb loses Q34 by 2.72x and
-Q35 by 3.85x; document 13 has the measurement. The reversal is not an argument against stable codes, whose reasoning above stands on its own. It means this document has never been tested at the size that decides it, and the tenfold win quoted here must not be cited as though it had been.
+An earlier revision of this section claimed that the evidence above does not hold at benchmark scale, citing Q34 losing by 2.72x and Q35 by 3.85x at 100,000,000 rows. That citation was from document 13, which measures both engines reading Parquet. Reading Parquet, rudb has no dictionary of its own and this document's mechanism is not running at all, so the number tested something else and the claim was wrong.
+
+The mechanism does hold at benchmark scale. Document 15 measures 100,000,000 rows in the native format: Q34 falls from 37.71 seconds to 0.51 and Q35 from 45.84 to 0.45, factors of 73.9x and 101.9x over the same engine reading the same data out of Parquet. The 100,000-row evidence quoted above still should not be cited as a full-scale result, but the full-scale result exists and agrees with it.
 
 ## Dictionary page
 
