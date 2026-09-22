@@ -30,6 +30,7 @@
 //! tag is a constant, and two key columns of different types are told apart by their position in the
 //! fold and by the comparison that follows the probe.
 
+use rudb_common::bounds::Bound;
 use rudb_common::{Error, Result, Value, interval_micros};
 use rudb_vector::{Data, Packed, Vector};
 use std::sync::Arc;
@@ -130,6 +131,99 @@ pub(crate) struct Table {
     hashes: Vec<u64>,
     /// What the stored keys own away from themselves, which is the strings and blobs among them.
     owned: u64,
+    /// The slot of each value in a key range, where the planner said the key has one.
+    ///
+    /// A shortcut to the buckets beside it and never a replacement for them. Every group is in both,
+    /// and a row this cannot answer is answered by the buckets the way it always was.
+    direct: Option<Direct>,
+}
+
+/// One slot per value of a key that is one integer column inside a known range.
+///
+/// The hash table answers which group a row belongs to with two trips to memory, one for the bucket
+/// and one for the stored key the bucket pointed at, and the second address is only known once the
+/// first has landed. When the key is one integer and the range it lies in is known, the value is the
+/// address: subtract the smallest and read the cell. One trip, no salt, no key comparison and no
+/// collisions.
+///
+/// # Why the buckets stay
+///
+/// Because a range is a statistic and a wrong answer is not an acceptable failure for one. The range
+/// comes from the two ends a store wrote, through `rudb_opt`'s `dense` pass, and every link in that
+/// chain is a place a range could come out narrower than the column. So this is only ever consulted
+/// as a shortcut: a value with no cell for it, a key column in a form this cannot read, and a batch
+/// with anything unusual in it all fall back to the buckets, and the buckets hold every group either
+/// way. The cost of that promise is one array write per group, which happens once per group.
+#[derive(Debug)]
+struct Direct {
+    /// The slot of the group whose key is this cell's value, [`EMPTY`] where there is no such group.
+    ///
+    /// Cell zero is the null key, so the value `v` is in cell `v - base + 1` and the array is one
+    /// longer than the range. A null in a grouping key is a group of its own, which is what
+    /// [`Column::holds`] says about a stored null, so it needs a cell like every other key.
+    cells: Vec<u32>,
+    /// The smallest value the range covers.
+    base: i128,
+}
+
+impl Direct {
+    /// The cell the value at `row` of a one column key belongs in, if the range has one.
+    ///
+    /// `None` for a value outside the range and for a key this cannot read as one integer, both of
+    /// which send the caller back to the buckets.
+    fn cell(&self, keys: &[Vector], row: usize) -> Option<usize> {
+        let [column] = keys else { return None };
+        if !column.validity().is_valid(row) {
+            return Some(0);
+        }
+        let Bound::Int(value) = Bound::of_value(&column.value_at(row))? else {
+            return None;
+        };
+        self.of(value)
+    }
+
+    /// The cell that value belongs in, if the range has one.
+    fn of(&self, value: i128) -> Option<usize> {
+        let step = value.checked_sub(self.base)?.checked_add(1)?;
+        usize::try_from(step).ok().filter(|&cell| cell < self.cells.len())
+    }
+
+    /// What this has taken from the allocator, capacity rather than length for the reason
+    /// [`Table::footprint`] gives.
+    fn footprint(&self) -> usize {
+        self.cells.capacity() * size_of::<u32>()
+    }
+}
+
+/// Whether a key of this type can be read as the same integer by both sides of the direct index.
+///
+/// [`Table::insert`] writes a group's cell from a `Value`, through [`Bound::of_value`], because it
+/// has to work for a key column in any form. [`Table::direct_at`] reads a batch off the stored run,
+/// because reading a `Value` per row is most of what it exists to avoid. Those are two different
+/// ways of getting to the same number and they only agree for some types: a `TIMESTAMP` and a
+/// `DECIMAL` are both stored in an `i64` that `direct_at` could read happily, and both come back
+/// from `of_value` as `Bound::Scaled` rather than `Bound::Int`, so the insert would write no cell
+/// where the probe would read one. Every group would then look missing and be inserted twice.
+///
+/// Nothing in the planner can ask for a range over either of them today, because the pass that
+/// writes one takes nothing but a pair of `Bound::Int` ends. This is here so that the table does not
+/// depend on that: the disagreement is between two functions in this file and the check belongs
+/// beside them.
+fn addressable(ty: &rudb_common::LogicalType) -> bool {
+    use rudb_common::LogicalType as Type;
+    matches!(
+        ty,
+        Type::Boolean
+            | Type::TinyInt
+            | Type::SmallInt
+            | Type::Integer
+            | Type::BigInt
+            | Type::UTinyInt
+            | Type::USmallInt
+            | Type::UInteger
+            | Type::UBigInt
+            | Type::Date
+    )
 }
 
 /// What a probe found, which is either a group or the bucket a new one goes in.
@@ -179,7 +273,36 @@ impl Table {
             columns: types.iter().map(Column::new).collect(),
             hashes: Vec::new(),
             owned: 0,
+            direct: None,
         }
+    }
+
+    /// The same table with a direct index over a key that lies in a known range.
+    ///
+    /// `low` is the smallest value the key column can hold and `values` is how many values the range
+    /// covers. Nothing about the table changes except that a probe of a value in the range can read
+    /// its slot instead of walking to it, which is why this is a builder on top of the two
+    /// constructors rather than a third one: a table that takes this and a table that does not hold
+    /// the same groups in the same slots and answer the same rows.
+    ///
+    /// Ignored for a key of anything other than one column, for a key whose type is not
+    /// [`addressable`], and for a range that will not fit in memory as a `Vec<u32>`, all of which
+    /// leave the table exactly as it arrived.
+    pub(crate) fn over_range(
+        mut self,
+        low: i128,
+        values: u64,
+        ty: &rudb_common::LogicalType,
+    ) -> Self {
+        if self.columns.len() != 1 || !addressable(ty) {
+            return self;
+        }
+        // One longer than the range, for the null key in cell zero.
+        let Ok(cells) = usize::try_from(values.saturating_add(1)) else {
+            return self;
+        };
+        self.direct = Some(Direct { cells: vec![EMPTY; cells], base: low });
+        self
     }
 
     /// How many groups are in it.
@@ -218,7 +341,8 @@ impl Table {
         let buckets = self.buckets.capacity() * size_of::<u64>();
         let hashes = self.hashes.capacity() * size_of::<u64>();
         let keys: usize = self.columns.iter().map(Column::footprint).sum();
-        u64::try_from(buckets + hashes + keys).unwrap_or(u64::MAX)
+        let direct = self.direct.as_ref().map_or(0, Direct::footprint);
+        u64::try_from(buckets + hashes + keys + direct).unwrap_or(u64::MAX)
     }
 
     /// Looks for the key that `keys` holds at `row`.
@@ -317,6 +441,9 @@ impl Table {
     ) {
         let mask = self.buckets.len() - 1;
         walk.pending.clear();
+        if self.direct_at(keys, rows, slots, walk) {
+            return;
+        }
         if self.buckets.len() <= HOT {
             for (out, found) in slots.iter_mut().enumerate().take(rows.len()) {
                 let row = rows.at(out);
@@ -372,6 +499,74 @@ impl Table {
         walk.pending.sort_unstable();
     }
 
+    /// The batch answered off the direct index, or `false` if it could not be.
+    ///
+    /// The whole batch or none of it. A row whose value has no cell would have to fall back to the
+    /// buckets on its own, and a batch split between two paths is two passes over the same rows with
+    /// a branch per row deciding which, which is most of what the batched probe exists to avoid. So
+    /// the cells are worked out first, into a buffer, and one value the range does not cover sends
+    /// the whole batch to the hash path. Nothing has been written to `slots` by then.
+    ///
+    /// The reasons it can answer nothing at all are the ordinary ones: no direct index, a key that
+    /// is not one column, a key column in a form with no run of values to read, and a type that is
+    /// not stored as an integer. Every one of them is decided once for the batch.
+    fn direct_at(
+        &self,
+        keys: &[Vector],
+        rows: Rows<'_>,
+        slots: &mut [usize],
+        walk: &mut Walk,
+    ) -> bool {
+        let Some(direct) = self.direct.as_ref() else { return false };
+        let [column] = keys else { return false };
+        let Some(data) = column.data() else { return false };
+        let validity = column.validity();
+        walk.cells.clear();
+        /// One pass over a run of fixed width values, each place reading its own row's place in it.
+        macro_rules! cells {
+            ($values:expr) => {{
+                let values = $values.as_slice();
+                for out in 0..rows.len() {
+                    let row = rows.at(out);
+                    let cell = if !validity.is_valid(row) {
+                        0
+                    } else {
+                        let Some(&value) = values.get(row) else { return false };
+                        let Some(cell) = direct.of(i128::from(value)) else { return false };
+                        cell
+                    };
+                    walk.cells.push(direct.cells[cell]);
+                }
+            }};
+        }
+        match data {
+            Data::Int8(values) => cells!(values),
+            Data::Int16(values) => cells!(values),
+            Data::Int32(values) => cells!(values),
+            Data::Int64(values) => cells!(values),
+            Data::UInt8(values) => cells!(values),
+            Data::UInt16(values) => cells!(values),
+            Data::UInt32(values) => cells!(values),
+            Data::UInt64(values) => cells!(values),
+            // `Int128` and `UInt128` are left out and not because they cannot be read. A `HUGEINT`
+            // key whose range is small enough to address is a key somebody stored in the widest
+            // integer there is and then used a hundred values of, and carrying two more arms for it
+            // is carrying them for nobody.
+            _ => return false,
+        }
+        // Written only once every cell is known, so a batch that gave up above left `slots` alone
+        // and the caller's own idea of what an unfilled slot means is what survives. In place order,
+        // which is row order for both kinds of batch, so `pending` comes out sorted without sorting.
+        for (out, &slot) in walk.cells.iter().enumerate() {
+            if slot == EMPTY {
+                walk.pending.push(out);
+            } else {
+                slots[out] = slot as usize;
+            }
+        }
+        true
+    }
+
     /// Adds the key that `keys` holds at `row` in the bucket a probe of the same row left vacant.
     ///
     /// # Errors
@@ -395,6 +590,14 @@ impl Table {
         }
         self.hashes.push(hash);
         self.buckets[bucket] = bucket_of(salt_of(hash), slot);
+        // The direct index beside the buckets, so the two hold the same groups. Worked out before
+        // the write because the read of the key needs the key columns and the write needs the index,
+        // and a value the range does not cover simply has no cell and lives in the buckets alone.
+        // Once per group and never per row, which is what makes keeping both cheap.
+        let cell = self.direct.as_ref().and_then(|direct| direct.cell(keys, row));
+        if let (Some(direct), Some(cell)) = (self.direct.as_mut(), cell) {
+            direct.cells[cell] = u32::try_from(slot).unwrap_or(EMPTY);
+        }
         // Half full rather than the seven eighths a `HashMap` allows, because this probes linearly
         // and a linear probe at seven eighths walks a run of about eight buckets to find a miss.
         // The buckets are eight bytes each, so the room the other half costs is small next to the
@@ -544,6 +747,11 @@ pub(crate) struct Walk {
     same: Vec<bool>,
     /// The rows of the last batch whose key was not in the table, in row order.
     pending: Vec<usize>,
+    /// The slot each place of the last batch read straight out of the direct index.
+    ///
+    /// Its own buffer rather than writing into `slots`, because the direct path answers the whole
+    /// batch or none of it and a batch it gave up on has to leave `slots` as it found it.
+    cells: Vec<u32>,
 }
 
 impl Walk {
@@ -2348,6 +2556,138 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(was.len(), now.len());
         assert!(now.buckets.len() > HOT, "the test has to reach the batched path");
+    }
+
+    /// The same fill again over a table given a direct index, so the two can be compared.
+    fn over_a_range(
+        keys: &[Vector],
+        rows: usize,
+        types: &[LogicalType],
+        low: i128,
+        values: u64,
+    ) -> (Table, Vec<usize>) {
+        let mut table = Table::new(types).over_range(low, values, &types[0]);
+        let mut hashes = Vec::new();
+        hash(keys, rows, &mut hashes, Across::OneInput);
+        let mut slots = vec![usize::MAX; rows];
+        let mut walk = Walk::default();
+        let mut from = 0;
+        while from < rows {
+            let upto = (from + BATCH).min(rows);
+            table.probe_run(&hashes, keys, from, upto, &mut slots, &mut walk);
+            from = upto;
+            for &row in walk.pending() {
+                slots[row] = match table.probe(hashes[row], keys, row) {
+                    Probe::Found(slot) => slot,
+                    Probe::Vacant(bucket) => {
+                        table.insert(bucket, hashes[row], keys, row).expect("room for this group")
+                    }
+                };
+            }
+        }
+        (table, slots)
+    }
+
+    /// The whole of what the direct index has to promise, which is the same promise the batch makes:
+    /// the same groups in the same slots. It is a shortcut to a slot and never a second opinion about
+    /// which rows group together, so a table that has one and a table that does not are the same
+    /// table, and this is the test that says so.
+    ///
+    /// Nulls among the values, because the null key has cell zero rather than no cell, and a range
+    /// wider than the values actually used, because that is what a zone map hands over.
+    #[test]
+    fn a_direct_index_finds_the_same_groups_in_the_same_slots() {
+        let values: Vec<Value> = (0..40_000)
+            .map(|row: i64| match row % 97 {
+                0 => Value::Null,
+                _ => Value::BigInt((row * 7919) % 12_007),
+            })
+            .collect();
+        let keys = [flat(LogicalType::BigInt, &values)];
+        let types = [LogicalType::BigInt];
+        let (was, before) = a_batch_at_a_time(&keys, values.len(), &types);
+        let (now, after) = over_a_range(&keys, values.len(), &types, 0, 12_007);
+        assert!(now.direct.is_some(), "the test has to reach the direct path");
+        assert_eq!(before, after);
+        assert_eq!(was.len(), now.len());
+    }
+
+    /// A range that starts below zero, which is the ordinary case for anything signed and the one an
+    /// off by one in the base would show up in.
+    #[test]
+    fn a_range_below_zero_addresses_the_same_way() {
+        let values: Vec<Value> =
+            (0..4_000).map(|row: i32| Value::Integer((row % 601) - 300)).collect();
+        let keys = [flat(LogicalType::Integer, &values)];
+        let types = [LogicalType::Integer];
+        let (_, before) = a_batch_at_a_time(&keys, values.len(), &types);
+        let (now, after) = over_a_range(&keys, values.len(), &types, -300, 601);
+        assert!(now.direct.is_some());
+        assert_eq!(before, after);
+        assert_eq!(now.len(), 601);
+    }
+
+    /// A value the range does not cover sends the whole batch to the buckets, and the answer is the
+    /// answer either way. This is the case a store that wrote a narrow pair of ends produces, which
+    /// is the failure this path is built to survive.
+    #[test]
+    fn a_value_outside_the_range_is_answered_by_the_buckets() {
+        let values: Vec<Value> = (0..2_000).map(|row: i64| Value::BigInt(row % 500)).collect();
+        let keys = [flat(LogicalType::BigInt, &values)];
+        let types = [LogicalType::BigInt];
+        let (_, before) = a_batch_at_a_time(&keys, values.len(), &types);
+        // Ten values wide, so all but the first ten are outside it.
+        let (now, after) = over_a_range(&keys, values.len(), &types, 0, 10);
+        assert_eq!(before, after);
+        assert_eq!(now.len(), 500);
+    }
+
+    /// A key column in a form with no run to read falls back the same way, and a chunk of each form
+    /// in turn is what a parquet scan hands over.
+    #[test]
+    fn a_dictionary_key_is_answered_by_the_buckets() {
+        let seen = [Value::Integer(3), Value::Integer(7), Value::Null];
+        let values: Vec<Value> =
+            (0..300).map(|row: usize| seen[row % seen.len()].clone()).collect();
+        let codes: Vec<u32> = (0..300).map(|row| (row % seen.len()) as u32).collect();
+        let keys = [dictionary_of(LogicalType::Integer, &seen, codes, &values)];
+        let types = [LogicalType::Integer];
+        let plain = [flat(LogicalType::Integer, &values)];
+        let (_, before) = a_batch_at_a_time(&plain, values.len(), &types);
+        let (now, after) = over_a_range(&keys, values.len(), &types, 0, 16);
+        assert!(now.direct.is_some(), "the index is built and simply not read from");
+        assert_eq!(before, after);
+        assert_eq!(now.len(), 3);
+    }
+
+    /// A type stored as an integer that does not come back from `Bound::of_value` as one gets no
+    /// index at all, because the insert and the probe would disagree about it. See `addressable`.
+    #[test]
+    fn a_type_the_two_sides_read_differently_gets_no_index() {
+        let scaled = LogicalType::Decimal { width: 18, scale: 2 };
+        assert!(
+            Table::new(std::slice::from_ref(&scaled)).over_range(0, 100, &scaled).direct.is_none()
+        );
+        assert!(
+            Table::new(&[LogicalType::Timestamp])
+                .over_range(0, 100, &LogicalType::Timestamp)
+                .direct
+                .is_none()
+        );
+        assert!(
+            Table::new(&[LogicalType::Date])
+                .over_range(0, 100, &LogicalType::Date)
+                .direct
+                .is_some()
+        );
+    }
+
+    /// A key of more than one column has no one value to address by, and asking for a range over one
+    /// leaves the table as it arrived rather than indexing the first column of it.
+    #[test]
+    fn a_key_of_two_columns_gets_no_index() {
+        let types = [LogicalType::Integer, LogicalType::Integer];
+        assert!(Table::new(&types).over_range(0, 100, &types[0]).direct.is_none());
     }
 
     /// The values as a dictionary of `seen`, with the nulls in the validity beside the codes rather
