@@ -57,9 +57,11 @@ The correction notes in documents 06, 08 and 09 asserted that evidence for a nat
 
 On the quiet host rudb loses nine of the 43: Q10, Q9, Q5, Q27, Q22, Q21, Q19, Q40 and Q17.
 
-Strip out the two sub-second entries and what is left is `COUNT(DISTINCT UserID)` three times, and `GROUP BY` on a key close to unique per row four times. Every other pass of this measurement agrees on the shape even where it disagrees on the seconds. This is document 14's O1, and it is the only obligation of the four that the native format does not satisfy.
+Strip out the two sub-second entries and what is left is `COUNT(DISTINCT UserID)` three times, and `GROUP BY` on a key close to unique per row four times. Every other pass of this measurement agrees on the shape even where it disagrees on the seconds.
 
-The margin is small in absolute terms, which is the point rather than a reassurance. These nine are what stands between a 2.09x lead and a much larger one, and they are all the same mechanism.
+**The sentence that followed here said this is document 14's O1 and the only obligation of the four the native format does not satisfy, and it was read off the query texts rather than measured.** Q21 is `SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'`, with no `GROUP BY` and no `DISTINCT` anywhere in it, and it is the second largest of the nine at 9.10 seconds. Q22 and Q23 do group, and document 16 measures their `LIKE` costing several times what sits above it. Three of the nine are substring matching, not grouping, and the largest query in this whole suite, Q29 at 20.58 seconds, is a regular expression over `Referer` that rudb wins by 1.86x and that O1 does not describe. Document 16 sorts all 43 by measured operator cost and finds the suite split roughly evenly between grouping, where rudb leads 3.03x, and string matching, where it leads 1.38x.
+
+The margin is small in absolute terms, which is the point rather than a reassurance. What these nine are not is the distance to a much larger lead. Document 16 profiles the eight queries that are three quarters of this suite and finds that reducing every operator above their scans to zero, on all eight at once, would take the suite to 5.62x against DuckDB rather than to 10x. The gap this section describes is inside that budget, not additional to it.
 
 ## Replication, and what this host can and cannot support
 
