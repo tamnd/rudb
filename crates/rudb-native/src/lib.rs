@@ -2083,7 +2083,10 @@ fn write_section(
     one: &section::Attachment<'_>,
     generation: u64,
 ) -> Result<Section> {
-    if one.header_bytes as usize > one.bytes.len() {
+    // A payload of nothing is the exception, and it is not a special case so much as a different
+    // reading of the same field: an entry with no bytes has no header to be longer than them, and
+    // `header_bytes` is what the structure would have cost. See `Section::refused`.
+    if !one.bytes.is_empty() && one.header_bytes as usize > one.bytes.len() {
         return Err(invalid("a section's header is longer than its payload"));
     }
     let mut extents = Vec::new();
@@ -3898,7 +3901,9 @@ impl Reader {
             }
             bytes.extend_from_slice(&self.extent(one)?);
         }
-        if of.header_bytes as usize > bytes.len() {
+        // The same exception `write_section` makes: a budget record has no bytes, so its
+        // `header_bytes` is a size rather than a header and there is nothing for it to run past.
+        if !bytes.is_empty() && of.header_bytes as usize > bytes.len() {
             return Err(invalid("a section's header is longer than its payload"));
         }
         Ok(bytes)

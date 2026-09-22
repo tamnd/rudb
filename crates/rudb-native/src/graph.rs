@@ -262,17 +262,20 @@ pub fn build_key_maps_within(
     // not required by any platform we build for, and it is done anyway so that the moment the
     // file is being written is a moment nothing else in this function is reading it.
     drop(reader);
+    // Every column that was asked for gets an entry, and a column whose map was not kept gets one
+    // with no bytes. That is section 3.7's budget record: what it would have cost is in the entry
+    // rather than in a payload, so `rudb_links()` reports a number instead of a silence and the
+    // file grows by fifty six bytes for the columns it decided against.
     let attachments = payloads
         .iter()
         .zip(&keep)
-        .filter(|&(_, &keep)| keep)
-        .map(|((column, payload), _)| {
+        .map(|((column, payload), &keep)| {
             Ok(Attachment {
                 kind: *section::KEY_MAP,
                 id: u64::try_from(*column).map_err(|_| invalid("column index overflow"))?,
                 flags: payload.flags,
-                header_bytes: payload.header_bytes,
-                bytes: &payload.bytes,
+                header_bytes: if keep { payload.header_bytes } else { cost(payload.bytes.len()) },
+                bytes: if keep { &payload.bytes } else { &[] },
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -488,20 +491,29 @@ fn links_of_one_table(
             Some((built.edge.child_column, bytes))
         })
         .collect::<Vec<_>>();
+    // A relationship whose link was built gets the link. One that was measured and then turned away
+    // gets an entry with no bytes, holding the form it would have taken and what it would have cost,
+    // which is section 3.7's budget record and is what exit criterion 3 of G3 reads. One that could
+    // not be built at all gets nothing, because there is no size to report: the note on the report
+    // is the whole of what is known about it.
     let mut attachments = report
         .iter()
         .zip(&payloads)
-        .filter(|(built, payload)| built.built && payload.is_some())
+        .filter(|(_, payload)| payload.is_some())
         .map(|(built, payload)| {
-            let bytes = payload.as_ref().expect("filtered to the built");
+            let bytes = payload.as_ref().expect("filtered to the measured");
             Ok(Attachment {
                 kind: *section::FORWARD_LINK,
                 id: u64::try_from(built.edge.child_column)
                     .map_err(|_| invalid("column index overflow"))?,
                 flags: built.form.map_or(0, |form| u32::from(form.tag())),
-                header_bytes: u32::try_from(binding_bytes(&built.edge.parent))
-                    .map_err(|_| invalid("a parent name longer than a section header"))?,
-                bytes,
+                header_bytes: if built.built {
+                    u32::try_from(binding_bytes(&built.edge.parent))
+                        .map_err(|_| invalid("a parent name longer than a section header"))?
+                } else {
+                    cost(bytes.len())
+                },
+                bytes: if built.built { bytes } else { &[] },
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -587,6 +599,15 @@ fn one_link(
         },
         bytes,
     ))
+}
+
+/// What a structure that did not fit is recorded as having cost.
+///
+/// Saturating rather than erroring, because the number is a budget record and not a length: a
+/// structure past four gigabytes did not fit any budget this project sets, and refusing to write the
+/// record would turn a relationship that is merely too big into a build that fails.
+fn cost(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
 /// Bytes of binding in front of a link's payload: which parent table, column and generation.
@@ -679,6 +700,38 @@ pub fn stored_degrees(child: &Reader, child_column: usize) -> Option<Degrees> {
         return None;
     }
     Degrees::read(&child.payload(held).ok()?).ok()
+}
+
+/// What a key map over this column would have cost, when a build measured one and did not keep it.
+///
+/// This and [`key_map`] are exclusive: an entry either holds a map or records the absence of one,
+/// and which it is comes off the entry rather than out of a payload, so asking this costs nothing.
+/// Both answer `None` for a column no build has looked at, which is the third state and is the one
+/// where `rudb_links()` should say nothing rather than zero.
+#[must_use]
+pub fn refused_key_map(reader: &Reader, column: usize) -> Option<(Form, u64)> {
+    let (form, bytes) = refused(reader, *section::KEY_MAP, column)?;
+    Some((Form::from_tag(form).ok()?, bytes))
+}
+
+/// What a forward link for this column would have cost, when a build measured one and did not keep
+/// it. The counterpart of [`stored_link`], the way [`refused_key_map`] is the counterpart of
+/// [`key_map`].
+#[must_use]
+pub fn refused_link(child: &Reader, child_column: usize) -> Option<(link::Form, u64)> {
+    let (form, bytes) = refused(child, *section::FORWARD_LINK, child_column)?;
+    Some((link::Form::from_tag(form).ok()?, bytes))
+}
+
+/// The form tag and the size out of a budget record, when the table holds one for this id.
+fn refused(reader: &Reader, kind: [u8; 8], id: usize) -> Option<(u8, u64)> {
+    let table = reader.table();
+    let id = u64::try_from(id).ok()?;
+    let held = table.sections().iter().find(|section| section.kind == kind && section.id == id)?;
+    if !held.usable(table.generation()) {
+        return None;
+    }
+    Some((u8::try_from(held.flags).ok()?, held.refused()?))
 }
 
 /// What the table's sections of one kind cost, leaving out the ids this build is replacing.
@@ -844,8 +897,15 @@ mod tests {
         assert!(built[0].bytes > 0, "what it would have cost is still reported");
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
-        assert!(key_map(&reader, 0).is_none(), "nothing was written to read back");
-        assert!(graph_sections(&reader).is_empty());
+        assert!(key_map(&reader, 0).is_none(), "no map was written to read back");
+        // What is written is the entry that says so, with no bytes behind it. Section 3.7 wants the
+        // size to survive the build that decided against it, and fifty six bytes of entry is the
+        // whole of what a refusal costs.
+        let (form, bytes) = refused_key_map(&reader, 0).expect("the record of what it would cost");
+        assert_eq!(form, built[0].form);
+        assert_eq!(bytes, built[0].bytes as u64);
+        assert_eq!(graph_sections(&reader).len(), 1, "one entry, and no payload");
+        assert_eq!(graph_sections(&reader)[0].extents, 0);
 
         fs::remove_file(&path).expect("clean up");
     }
@@ -1010,8 +1070,11 @@ mod tests {
         assert!(built[0].bytes as u64 > built[0].column_bytes, "{built:?}");
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
-        assert!(graph_sections(&reader).is_empty(), "and nothing was written");
-        assert!(key_map(&reader, 0).is_none());
+        assert!(key_map(&reader, 0).is_none(), "and no map was written");
+        // The record of what it would have cost is what somebody raising `graph_budget` reads, and
+        // it is the number the build reported rather than a rounding of it.
+        assert_eq!(refused_key_map(&reader, 0), Some((Form::Dense, built[0].bytes as u64)));
+        assert_eq!(held_bytes(&reader, &[]).expect("held"), 0, "a record costs the budget nothing");
         drop(reader);
 
         // The same build against a budget that allows it keeps it, which is what `graph_budget`
@@ -1267,6 +1330,9 @@ mod tests {
         // file cannot follow describes a plan nobody can make.
         assert!(report[0].degrees.is_some(), "it was measured");
         assert!(stored_degrees(&child, 0).is_none(), "and not written");
+        // What does survive is the size and the form, which is exit criterion 3 of G3: somebody
+        // deciding whether to raise `graph_budget` reads this rather than rebuilding to find out.
+        assert_eq!(refused_link(&child, 0), Some((link::Form::Packed, report[0].bytes as u64)));
 
         fs::remove_file(&path).expect("clean up");
     }

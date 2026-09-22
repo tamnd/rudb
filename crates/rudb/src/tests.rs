@@ -5952,6 +5952,65 @@ fn a_checkpoint_builds_a_key_map_over_the_parent_of_every_declared_relationship(
 }
 
 #[test]
+fn rudb_links_says_what_a_structure_it_decided_against_would_have_cost() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-graph-refused-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("CREATE TABLE customer (c_custkey INTEGER)").unwrap();
+    db.execute("CREATE TABLE orders (o_custkey INTEGER)").unwrap();
+    // The keys run one to four thousand twice over, so every customer key has a second row with
+    // the same key and the parent side is not a key at all. The build encodes the map before it
+    // finds that out, because finding it out is what encoding it is, and then keeps nothing.
+    db.execute("INSERT INTO customer SELECT 1 + i % 4000 FROM range(0, 8000) AS r(i)").unwrap();
+    db.execute("INSERT INTO orders SELECT 1 + i % 4000 FROM range(0, 10000) AS r(i)").unwrap();
+    db.execute("SET graph_links = 'orders(o_custkey) -> customer(c_custkey)'").unwrap();
+    db.execute("CHECKPOINT").unwrap();
+
+    let listed = rows(
+        &db,
+        "SELECT cardinality, key_map, key_map_bytes > 0, link, link_bytes, note FROM rudb_links()",
+    );
+    assert_eq!(
+        listed,
+        vec![vec![
+            Value::Varchar("unverified".into()),
+            Value::Null,
+            Value::Boolean(true),
+            Value::Null,
+            Value::Null,
+            Value::Varchar(
+                "the key map was measured and not kept, so key_map_bytes is what it would cost"
+                    .into()
+            ),
+        ]],
+        "a structure that is not there has no form and still has a size"
+    );
+    // The size is the point of the row: somebody reading it is deciding whether the structure is
+    // worth having, and a null would leave them building it to find out. It is the payload the
+    // build actually encoded and not an estimate of one, which for eight thousand unsorted keys is
+    // a few bytes each.
+    let Value::BigInt(bytes) = rows(&db, "SELECT key_map_bytes FROM rudb_links()")[0][0] else {
+        panic!("a size");
+    };
+    assert!(bytes > 8000, "eight thousand keys do not encode in {bytes} bytes");
+
+    // And the join answers the same question it would have with the map, which is section 3.1.
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM orders o JOIN customer c ON o.o_custkey = c.c_custkey"),
+        vec![vec![Value::BigInt(20000)]]
+    );
+
+    drop(db);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_seam_is_set_and_read_back_through_the_statement_everything_else_goes_through() {
     let db = Database::new();
     assert_eq!(db.setting("seam.hash.table").unwrap(), "default");
