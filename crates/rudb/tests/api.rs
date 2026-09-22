@@ -7,7 +7,7 @@
 use std::thread;
 
 use rudb::Database;
-use rudb_common::{Field, LogicalType, Value};
+use rudb_common::{Clustering, Field, LogicalType, Value, Width};
 
 #[test]
 fn a_database_opens_by_name_and_two_spellings_mean_memory() {
@@ -381,4 +381,84 @@ fn the_catalog_is_readable_and_writable_for_the_call_and_no_longer() {
         catalog.drop_table(&name).expect("drops");
     });
     assert!(database.table_names().is_empty());
+}
+
+#[test]
+fn a_declared_row_order_survives_a_checkpoint_and_a_reopen() {
+    // The declaration is the only thing about a table that a rewrite destroys without anybody
+    // noticing. The per fragment ranges prune on whatever order the rows arrived in, so a table
+    // loaded sorted prunes today, and the same table after a checkpoint that did not know to keep
+    // the order stops pruning and no output says why. This is the record that stops that.
+    let path = std::env::temp_dir().join(format!("rudb-api-cluster-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let stage_zero = Clustering::new(vec![2, 0, 1], Width::Month, 3).expect("valid");
+
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database
+        .execute("CREATE TABLE lineitem (l_orderkey BIGINT, l_linenumber INTEGER, l_shipdate DATE)")
+        .expect("creates");
+    database
+        .execute("INSERT INTO lineitem VALUES (1, 1, DATE '1995-09-02'), (2, 1, DATE '1995-09-03')")
+        .expect("inserts");
+    database.execute("CREATE TABLE nation (n_nationkey INTEGER)").expect("creates");
+    database.execute("INSERT INTO nation VALUES (1)").expect("inserts");
+    database.with_catalog_mut(|catalog| {
+        let table = catalog.resolve(&["lineitem"]).expect("resolves");
+        catalog
+            .table_mut(&table)
+            .expect("the table is there")
+            .cluster_by(Some(stage_zero.clone()))
+            .expect("the columns are the table's");
+    });
+    database.execute("CHECKPOINT").expect("commits");
+    drop(database);
+
+    let reopened = Database::open(&name).expect("the native database reopens");
+    reopened.with_catalog(|catalog| {
+        let table = catalog.resolve(&["lineitem"]).expect("resolves");
+        assert_eq!(
+            catalog.table(&table).expect("the table is there").clustering(),
+            Some(&stage_zero),
+            "the order the table was declared with came back out of the file"
+        );
+        let plain = catalog.resolve(&["nation"]).expect("resolves");
+        assert_eq!(
+            catalog.table(&plain).expect("the table is there").clustering(),
+            None,
+            "and a table nobody declared one for did not pick one up"
+        );
+    });
+    assert_eq!(
+        reopened.value("SELECT sum(l_orderkey) FROM lineitem").expect("reads"),
+        Value::HugeInt(3)
+    );
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+#[test]
+fn declaring_an_order_after_a_checkpoint_gets_the_file_rewritten() {
+    // Everything is already in the file, so the checkpoint's own test for having nothing to do
+    // says there is nothing to do, and the declaration would go nowhere. It has to ask whether the
+    // file agrees about the order as well as about which tables there are.
+    let path = std::env::temp_dir().join(format!("rudb-api-recluster-{}.rudb", std::process::id()));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let asked = Clustering::new(vec![1], Width::Year, 2).expect("valid");
+
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database.execute("CREATE TABLE t (a INTEGER, d DATE)").expect("creates");
+    database.execute("INSERT INTO t VALUES (1, DATE '2020-01-01')").expect("inserts");
+    database.execute("CHECKPOINT").expect("commits once, with no declaration");
+    database.with_catalog_mut(|catalog| {
+        let table = catalog.resolve(&["t"]).expect("resolves");
+        catalog.table_mut(&table).expect("there").cluster_by(Some(asked.clone())).expect("valid");
+    });
+    database.execute("CHECKPOINT").expect("commits again, for the declaration alone");
+    drop(database);
+
+    let reopened = Database::open(&name).expect("the native database reopens");
+    reopened.with_catalog(|catalog| {
+        let table = catalog.resolve(&["t"]).expect("resolves");
+        assert_eq!(catalog.table(&table).expect("there").clustering(), Some(&asked));
+    });
+    std::fs::remove_file(path).expect("removes the temporary database");
 }
