@@ -551,11 +551,15 @@ fn appended(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Resu
 /// dropped would come back, and a table the catalog holds that the file does not name would be left
 /// out of the generation this commits and would only reach the file at the next rewrite, which is a
 /// rewrite this was meant to avoid.
+///
+/// The target is counted out of both sides rather than assumed to be in the catalog, because a
+/// `CREATE TABLE AS SELECT` asks this before it has made the entry.
 fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<bool> {
     let Some(held) = committed(path)? else { return Ok(false) };
     if held.contains(&target.table) {
         return Ok(false);
     }
+    let others = catalog.tables().filter(|table| table.name() != target).count();
     let native = catalog
         .tables()
         .filter(|table| table.name() != target && table.rows().is_native())
@@ -563,7 +567,7 @@ fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<
         .collect::<BTreeSet<_>>();
     // The count as well as the set, because a table that is in neither is a table with rows in
     // memory that this generation would not carry.
-    Ok(held == native && catalog.tables().count() == native.len() + 1)
+    Ok(held == native && others == native.len())
 }
 
 /// One pipeline instance's place in the source, and the run of chunks it is holding.
@@ -986,7 +990,48 @@ impl Shared {
                 }
                 Ok(QueryResult::empty())
             }
-            Bound::CreateTable(create) => {
+            Bound::CreateTable(mut create) => {
+                // A `CREATE TABLE AS SELECT` into a file-backed database is the same write as an
+                // `INSERT` into a table that was just created, so it takes the same sink and the
+                // rows reach the file without the whole table being held in memory first. Without
+                // this the statement builds the answer twice over, once in the root queue and once
+                // as the table, and neither copy is charged against the memory limit.
+                //
+                // Only for a name the catalog does not have. `OR REPLACE` and `IF NOT EXISTS` both
+                // have to decide what happens to the old table, and `CREATE OR REPLACE TABLE t AS
+                // SELECT * FROM t` reads the table it is about to replace, so neither can have the
+                // entry made before the query runs. Making it afterwards is also what leaves no
+                // table behind when the query fails.
+                if let Some(path) = &self.inner.path {
+                    let fresh = create.source.is_some() && catalog.table(&create.name).is_err();
+                    let alone = fresh && !path.exists() && catalog.tables().count() == 0;
+                    if fresh && (alone || appendable(path, &catalog, &create.name)?) {
+                        let plan = create.source.as_mut().expect("a source, asked for above");
+                        rudb_opt::optimize_with(plan, &context)?;
+                        let table = create.name.table.clone();
+                        let fields = create.columns.clone();
+                        let sink = Arc::new(if alone {
+                            NativeSink::create(path, table.clone(), fields)?
+                        } else {
+                            NativeSink::open(path, table.clone(), fields)?
+                        });
+                        let query = rudb_exec::build_measured_into(
+                            plan,
+                            &catalog,
+                            cancel,
+                            &self.inner.memory,
+                            &seams,
+                            &session,
+                            sink,
+                        )?;
+                        query.run(cancel, &self.inner.pool)?;
+                        drop(query);
+                        let reader = rudb_native::Catalog::open(path)?.table(&table)?;
+                        catalog.create_table(create.name.clone(), create.columns)?;
+                        catalog.table_mut(&create.name)?.commit_native(reader)?;
+                        return Ok(QueryResult::empty());
+                    }
+                }
                 create_table(
                     sql,
                     create,
