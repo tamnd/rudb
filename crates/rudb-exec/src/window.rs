@@ -687,6 +687,13 @@ impl Window {
             rudb_kernels::cast_value(offset, &moved.offset, false)?,
         ];
         let wanted = rudb_kernels::call_values(moved.name, &args, &moved.returns, None)?;
+        // The arithmetic can answer in a wider type than the key it was handed, and a date key with
+        // an interval distance is that case: `DATE + INTERVAL` is a timestamp in both engines, so
+        // the place being looked for is a timestamp while every key in the partition is a date. The
+        // keys are read in the answer's type rather than the answer being read in theirs, because
+        // casting the place back to a date would throw away the part of the distance smaller than a
+        // day and `RANGE BETWEEN INTERVAL '36' HOUR PRECEDING` would land on the wrong row.
+        let widened = moved.key != moved.returns;
         // Half open on both ends: the start is the first row that is not before the place, and the
         // end is the first row that is past it, so a frame covering nothing comes out empty rather
         // than inverted.
@@ -694,7 +701,14 @@ impl Window {
         let mut high = rows.len();
         while low < high {
             let middle = low + (high - low) / 2;
-            let held = &rows[middle].0[self.partitions];
+            let here = &rows[middle].0[self.partitions];
+            let cast;
+            let held = if widened {
+                cast = rudb_kernels::cast_value(here, &moved.returns, false)?;
+                &cast
+            } else {
+                here
+            };
             let ordering = crate::sort::rank(held, &wanted, sort)?;
             let before =
                 if after { ordering != Ordering::Greater } else { ordering == Ordering::Less };
