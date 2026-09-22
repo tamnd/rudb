@@ -54,6 +54,16 @@ pub const FORWARD_LINK: &[u8; 8] = b"RUDBFL1\0";
 /// A backward adjacency list, per section 3.5.
 pub const ADJACENCY: &[u8; 8] = b"RUDBAJ1\0";
 
+/// A column summary, per `spec/stats/03-the-file-format.md` section 3.3.
+///
+/// The first kind here that is not from the graph document, which is the point of the mechanism
+/// rather than a complication of it. A statistics section is carried, stamped, split and ignored by
+/// exactly the rules above, and adding it took two constants and one arm below.
+pub const SUMMARY: &[u8; 8] = b"RUDBCS1\0";
+
+/// A column's sketches, per `spec/stats/03-the-file-format.md` section 3.4.
+pub const SKETCHES: &[u8; 8] = b"RUDBSK1\0";
+
 /// One entry in a table's section table.
 ///
 /// The payload is not here. This is the entry that says where the payload is, what it is, and
@@ -154,13 +164,14 @@ impl Section {
 
     /// Whether this build understands this section's kind.
     ///
-    /// The three it knows are the three section 3.2 names. Everything else is a section a later
-    /// build wrote, and the answer is to leave it alone: the entry is carried through a rewrite so
-    /// that opening a file with an old build and closing it does not silently discard work, and the
+    /// The five it knows are the three the graph document's section 3.2 names and the two the
+    /// statistics document's sections 3.3 and 3.4 name. Everything else is a section a later build
+    /// wrote, and the answer is to leave it alone: the entry is carried through a rewrite so that
+    /// opening a file with an old build and closing it does not silently discard work, and the
     /// payload is never read.
     #[must_use]
     pub fn known(&self) -> bool {
-        matches!(&self.kind, KEY_MAP | FORWARD_LINK | ADJACENCY)
+        matches!(&self.kind, KEY_MAP | FORWARD_LINK | ADJACENCY | SUMMARY | SKETCHES)
     }
 
     /// Whether this section was built against this table generation.
@@ -383,11 +394,24 @@ mod tests {
     }
 
     #[test]
-    fn the_three_kinds_section_three_two_names_are_known() {
-        for kind in [KEY_MAP, FORWARD_LINK, ADJACENCY] {
+    fn the_kinds_the_two_documents_name_are_known() {
+        for kind in [KEY_MAP, FORWARD_LINK, ADJACENCY, SUMMARY, SKETCHES] {
             let mut section = entry();
             section.kind = *kind;
             assert!(section.known(), "{}", String::from_utf8_lossy(kind));
+        }
+    }
+
+    #[test]
+    fn no_two_kinds_share_a_tag() {
+        // Worth a test now that two documents assign them. A collision would mean one kind's payload
+        // read by the other's decoder, which is the one thing an opaque payload cannot defend
+        // against by itself.
+        let all = [KEY_MAP, FORWARD_LINK, ADJACENCY, SUMMARY, SKETCHES];
+        for (at, one) in all.iter().enumerate() {
+            for other in &all[at + 1..] {
+                assert_ne!(one, other, "{}", String::from_utf8_lossy(*one));
+            }
         }
     }
 

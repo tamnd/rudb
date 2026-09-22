@@ -250,6 +250,37 @@ impl Counts {
         held.tally.extremes()
     }
 
+    /// One column's sketch, as a structure that can be written down.
+    ///
+    /// `None` for a blind column, which is a column whose sketch is missing rows and says nothing
+    /// about it. That is the same answer [`Counts::distinct`] gives and for the same reason.
+    ///
+    /// A column still being tallied is answered by building a sketch out of the tally's hashes,
+    /// rather than by handing back the sketch beside it, because that one is empty: while the tally
+    /// is counting, it is the tally that has the column's hashes and the sketch has never seen it.
+    /// Handing back the empty one would write a column of six values down as a column of none, and
+    /// the failure would be invisible because an empty sketch is exact.
+    ///
+    /// The copy is why this returns a `Sketch` and not a `&Sketch`. It happens once a column at a
+    /// checkpoint and never on the append path.
+    #[must_use]
+    pub fn sketch(&self, column: usize) -> Option<Sketch> {
+        let held = self.columns.get(column)?;
+        if held.blind {
+            return None;
+        }
+        match held.tally.hashes() {
+            Some(hashes) => {
+                let mut sketch = Sketch::new(DEFAULT_K).ok()?;
+                for hash in hashes {
+                    sketch.add_hash(hash);
+                }
+                Some(sketch)
+            }
+            None => Some(held.sketch.clone()),
+        }
+    }
+
     /// How many columns this is counting.
     #[must_use]
     pub fn width(&self) -> usize {
@@ -674,7 +705,7 @@ pub fn countable(ty: &LogicalType) -> bool {
 #[cfg(test)]
 mod tests {
     use rudb_common::{LogicalType, Value};
-    use rudb_encoding::sketch::DEFAULT_K;
+    use rudb_encoding::sketch::{DEFAULT_K, Sketch};
     use rudb_vector::{Chunk, Form, Vector};
 
     use super::{Counts, countable, hash_value};
@@ -698,6 +729,49 @@ mod tests {
         let mut counts = Counts::new(1);
         counts.add(&Chunk::new(vec![vector]).expect("a chunk"));
         counts.frequencies(0)
+    }
+
+    /// The sketch of the same one column, for the writer that has to put one on disk.
+    fn sketched(vector: Vector) -> Option<Sketch> {
+        let mut counts = Counts::new(1);
+        counts.add(&Chunk::new(vec![vector]).expect("a chunk"));
+        counts.sketch(0)
+    }
+
+    #[test]
+    fn a_narrow_column_gives_a_sketch_of_its_values_and_not_an_empty_one() {
+        // The trap `Counts::sketch` is written around. While the tally is counting, the sketch
+        // beside it has never seen the column, so handing that one back would write six values down
+        // as none, and an empty sketch is exact and so says nothing about being empty.
+        let values: Vec<i32> = (0..600).map(|n| n % 6).collect();
+        let sketch = sketched(flat(&values)).expect("a sketch");
+        assert!(sketch.is_exact());
+        assert_eq!(sketch.len(), 6, "six values, however many rows hold them");
+        #[expect(clippy::float_cmp, reason = "an exact sketch answers its own length")]
+        {
+            assert_eq!(sketch.distinct(), 6.0);
+        }
+    }
+
+    #[test]
+    fn a_column_past_the_tally_gives_the_sketch_that_took_it_over() {
+        let values: Vec<i32> = (0..(TALLY_VALUES as i32 * 4)).collect();
+        let sketch = sketched(flat(&values)).expect("a sketch");
+        assert_eq!(
+            sketch.len() as u64,
+            count(flat(&values)).expect("a count").0,
+            "the sketch a writer stores is the one the count came out of"
+        );
+    }
+
+    #[test]
+    fn a_blind_column_has_no_sketch_to_store() {
+        // The same answer `distinct` gives, and for the same reason: a sketch missing rows counts
+        // too few distinct values and says nothing about having done so, and storing one would make
+        // that permanent.
+        let held = [Value::Interval { months: 1, days: 0, micros: 0 }];
+        let vector = Vector::from_values(LogicalType::Interval, &held).expect("a column");
+        assert_eq!(sketched(vector), None);
     }
 
     /// The property the module doc promises: the form is how the rows are written down and the
