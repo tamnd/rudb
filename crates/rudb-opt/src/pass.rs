@@ -69,6 +69,14 @@ pub struct Context {
     links: std::sync::Arc<Vec<crate::link::Linked>>,
     /// The two numbers section 6.4 chooses between a link join and a hash join with.
     sizes: crate::link::Sizes,
+    /// Which of the per rule switches are on.
+    ///
+    /// Beside the pass names rather than folded into them, because the two are switches over
+    /// different things. A pass name turns off a whole rewrite and is DuckDB's, so a corpus file
+    /// that names one is asking for the behaviour the binary has without it. A rule is one decision
+    /// inside a pass, and `../stats/09-measurement.md` section 9.2 wants it off on its own so that
+    /// the per rule table can say what that decision alone earned.
+    rules: rudb_common::rules::Rules,
 }
 
 impl Context {
@@ -206,6 +214,21 @@ impl Context {
     #[must_use]
     pub fn links(&self) -> &[crate::link::Linked] {
         &self.links
+    }
+
+    /// Hands the optimizer the per rule switches as the session has left them.
+    ///
+    /// A context nobody tells gets the defaults, which is every statistics rule on. That is right
+    /// for the optimizer's own tests, where the point of the test is the rewrite rather than the
+    /// switch, and it is the same answer a fresh database gives.
+    pub fn govern(&mut self, rules: rudb_common::rules::Rules) {
+        self.rules = rules;
+    }
+
+    /// Whether one rule may fire, which is its own switch and its master's.
+    #[must_use]
+    pub fn allows(&self, rule: rudb_common::rules::Rule) -> bool {
+        self.rules.enabled(rule)
     }
 
     /// Sets the two numbers the link join rule is decided by.
