@@ -3383,6 +3383,48 @@ fn the_pragma_statement_answers_what_the_function_of_that_name_answers() {
     }
 }
 
+/// `CALL f(...)` is the table function in a `FROM` clause with the clause left off.
+///
+/// It is the spelling DuckDB's own extensions are driven with, so a client written against the pin
+/// reaches for it, and every table function here was already reachable the long way round. The
+/// cases below are one of each shape an argument list comes in rather than a list of functions,
+/// since what is being tested is the transform and not the functions, which have their own tests.
+#[test]
+fn a_call_runs_the_table_function_the_same_query_over_it_would() {
+    let db = database();
+    for (call, query) in [
+        ("CALL pragma_version()", "SELECT * FROM pragma_version()"),
+        ("CALL range(3)", "SELECT * FROM range(3)"),
+        ("CALL range(1, 7, 2)", "SELECT * FROM range(1, 7, 2)"),
+        ("CALL pragma_table_info('t')", "SELECT * FROM pragma_table_info('t')"),
+        // A schema in front of the name and the name written in another case, both of which the
+        // function form takes and neither of which this spelling has any reason to treat its own
+        // way, since it reads the name with the same rule.
+        ("CALL main.range(3)", "SELECT * FROM main.range(3)"),
+        ("call RANGE(3)", "SELECT * FROM range(3)"),
+    ] {
+        assert_eq!(rows(&db, call), rows(&db, query), "{call}");
+    }
+    // One plan, which is the argument for building the query rather than a second path to the same
+    // rows: two paths would be two places for the planner to be told something different.
+    assert_eq!(rows(&db, "EXPLAIN CALL range(3)"), rows(&db, "EXPLAIN SELECT * FROM range(3)"));
+    // A name that is not a table function gets the catalog's words about it, the same ones the
+    // other spelling gets, rather than anything this transform says on its own.
+    assert_eq!(
+        failure(&db, "CALL nope()"),
+        "Table Function with name nope does not exist!",
+        "the catalog answers for the name"
+    );
+    assert_eq!(failure(&db, "CALL abs(1)"), failure(&db, "SELECT * FROM abs(1)"));
+    // The rule has no room for an alias, on the pin as well, so this is a parser error on both and
+    // not a clause that is read and dropped.
+    assert!(
+        failure(&db, "CALL range(3) AS r").starts_with("syntax error at or near \"AS\""),
+        "{}",
+        failure(&db, "CALL range(3) AS r")
+    );
+}
+
 /// `PRAGMA name = value` is a `SET` written another way and it moves the same setting.
 #[test]
 fn a_pragma_with_an_equals_sign_sets_the_setting_a_plain_set_would() {
