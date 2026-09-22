@@ -37,9 +37,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rudb_common::Value;
-use rudb_common::bounds::{Op, Spread, Test, Zones};
+use rudb_common::bounds::{Bound, Spread, Test, Zones};
 use rudb_common::stat::{Class, Direction, Provenance, Stat, Use};
+use rudb_common::{Field, Value};
 use rudb_plan::{
     ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
     SetOpKind, Slice,
@@ -774,6 +774,60 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
     parts.into_iter().filter(|&part| !walk::constant(plan, part)).take(8).collect()
 }
 
+/// The columns a scan produces, in the order the plan numbers them.
+///
+/// `None` unless the filter sits straight on a scan. Straight on, with no projection in between,
+/// because a projection renames columns and the name is what a store is asked by, and following one
+/// through would be a second place that has to agree with the first about what a column is called.
+fn scanned_fields(plan: &Plan, input: NodeRef) -> Option<&[Field]> {
+    match *plan.node(input) {
+        Node::Get { columns, .. } | Node::TableFunction { columns, .. } => {
+            Some(plan.field_list(columns))
+        }
+        _ => None,
+    }
+}
+
+/// How many rows of the scan's column at `position` are null, as the store that keeps bounds says.
+///
+/// The position is the plan's and the name is what the store is asked by, for the reason
+/// [`scanned_fields`] gives. `None` for a filter that is not straight on a scan, a store that keeps
+/// no bounds, and a column the store does not have.
+fn nulls_at(plan: &Plan, input: NodeRef, position: usize) -> Option<Stat<u64>> {
+    let index = bounds::scanned(plan, input)?;
+    let zones = plan.zones(index)?;
+    let name = &scanned_fields(plan, input)?.get(position)?.name;
+    Some(zones.nulls(zones.column(name)?))
+}
+
+/// One equality or inequality between a column of the scan numbered `index` and a constant.
+///
+/// Written either way round, because the optimizer does not normalise which side the constant sits
+/// on, and an equality reads the same reversed. `None` for anything else, which includes a null
+/// constant: [`Bound::of_value`] refuses it, and a comparison against null is null rather than a
+/// question about a value.
+///
+/// [`Bound::of_value`]: rudb_common::bounds::Bound::of_value
+fn compared(plan: &Plan, index: u32, conjunct: ExprRef) -> Option<(CompareOp, usize, Bound)> {
+    let Expr::Compare { op, left, right } = *plan.expr(conjunct) else {
+        return None;
+    };
+    if !matches!(op, CompareOp::Equal | CompareOp::NotEqual) {
+        return None;
+    }
+    let (binding, value) = match (plan.expr(left), plan.expr(right)) {
+        (&Expr::Column(binding), &Expr::Constant(value))
+        | (&Expr::Constant(value), &Expr::Column(binding)) => (binding, value),
+        _ => return None,
+    };
+    // The column has to belong to the scan this filter sits on. A binding naming anything else is a
+    // column from somewhere below, and the store's counts are not about it.
+    if binding.table != index {
+        return None;
+    }
+    Some((op, binding.column as usize, Bound::of_value(plan.value(value))?))
+}
+
 /// What fraction of a scan's rows `IS NULL` keeps, where the store counted its nulls.
 ///
 /// The one filter whose answer a store can simply state. Every store that keeps bounds per part
@@ -817,25 +871,16 @@ fn missing(
         _ => return None,
     };
     let index = bounds::scanned(plan, input)?;
-    // The column has to belong to the scan this filter sits on. A binding naming anything else is
-    // a column from somewhere below, and the store's null counts are not about it.
     if binding.table != index {
         return None;
     }
-    let zones = plan.zones(index)?;
-    let names = match *plan.node(input) {
-        Node::Get { columns, .. } | Node::TableFunction { columns, .. } => plan.field_list(columns),
-        _ => return None,
-    };
-    let name = &names.get(binding.column as usize)?.name;
-    let column = zones.column(name)?;
-    let stat = zones.nulls(column);
+    let stat = nulls_at(plan, input, binding.column as usize)?;
     // Recorded before it is read and recorded when it is unknown, for the reason [`values`] gives.
     reads.push(stat);
     let nulls = stat.read(NULLS).copied()?;
     // The store's own total and not the plan's, so the fraction is two numbers out of one store.
     // With no tests at all this is every row the store holds, per `Zones::surviving`.
-    let rows = zones.surviving(&[])?;
+    let rows = plan.zones(index)?.surviving(&[])?;
     if rows == 0 {
         return None;
     }
@@ -845,16 +890,26 @@ fn missing(
     Some((share(held, rows), Provenance::NullCount))
 }
 
-/// What fraction of a scan's rows an equality keeps, where the store counted that value's rows.
+/// What fraction of a scan's rows a test against a constant keeps, where the store counted values.
 ///
 /// The number the uniformity assumption is guessing at. `o_orderstatus = 'F'` over TPC-H's orders
 /// keeps 729,413 rows of 1,500,000, and a column of three values divided by three calls it 500,000.
 /// A synopsis that lists all three says the first number, and says it as a count rather than as an
 /// estimate, because a complete synopsis accounts for every row of the column.
 ///
-/// Only `=` and only against a constant, for the reasons [`values`] is. A range is about order and
-/// the bounds answer it better, `<>` is the complement and wants the rows the synopsis does not
-/// account for as well, and the two distinctness operators are about nulls.
+/// Three shapes, all of them the same counts added up differently.
+///
+/// `c = k` is the count for `k`, or none at all when a complete list does not hold `k`.
+///
+/// `c <> k` is every row the column has except the ones holding `k` and except the nulls, because
+/// `<>` against a null is null and a null row does not pass. So this one needs the null count as
+/// well and gives up without it, which costs nothing in practice: a store that counted its values
+/// per column kept bounds per part too.
+///
+/// `c IN (j, k)` binds to an `OR` of equalities and is the counts summed. Only when every branch is
+/// an equality on the same column against a constant, because that is the shape an `IN` list makes
+/// and anything else is a disjunction this has no arithmetic for. Two branches naming the same value
+/// would double count, and the sum is capped at the rows for that reason rather than checked for it.
 ///
 /// `None` where the scan's store keeps no synopsis, where the column's is incomplete, where the
 /// constant does not compare against what the synopsis holds, and where the store says it has no
@@ -868,28 +923,61 @@ fn common(
 ) -> Option<(f64, Provenance)> {
     let index = bounds::scanned(plan, input)?;
     let frequencies = plan.frequencies(index)?;
-    let names = match *plan.node(input) {
-        Node::Get { columns, .. } | Node::TableFunction { columns, .. } => plan.field_list(columns),
-        _ => return None,
-    };
-    // One test and an equality. A conjunct is one comparison, so more than one test out of it is a
-    // shape this does not understand and should not be guessing the meaning of.
-    let tests = bounds::of(plan, input, conjunct);
-    let [(position, Op::Equal, value)] = tests.as_slice() else {
-        return None;
-    };
-    let name = &names.get(*position)?.name;
-    let column = frequencies.column(name)?;
+    let fields = scanned_fields(plan, input)?;
     let rows = frequencies.rows();
-    let stat = frequencies.rows_with(column, value);
-    // Recorded before it is read and recorded when it is unknown, for the reason [`values`] gives:
-    // a read that found nothing is still a read, and the misses are the interesting half of what
-    // `EXPLAIN (STATISTICS)` prints.
-    reads.push(stat);
     if rows == 0 {
         return None;
     }
-    let held = stat.read(COMMON).copied()?;
+    // One read of the synopsis per value asked about, recorded whether it answered or not for the
+    // reason [`values`] gives: the misses are the interesting half of what `EXPLAIN (STATISTICS)`
+    // prints.
+    let mut counted = |position: usize, value: &Bound| {
+        let column = frequencies.column(&fields.get(position)?.name)?;
+        let stat = frequencies.rows_with(column, value);
+        reads.push(stat);
+        stat.read(COMMON).copied()
+    };
+    let held = match *plan.expr(conjunct) {
+        Expr::Conjunction { op: ConjunctionOp::Or, children } => {
+            let branches = plan.expr_list(children);
+            // Capped for the reason [`conjuncts`] caps: a list written by a generator can be
+            // thousands long, each branch is a walk of the synopsis, and past a handful the sum has
+            // stopped telling anybody anything the whole column's count would not.
+            if branches.is_empty() || branches.len() > 32 {
+                return None;
+            }
+            let mut column = None;
+            let mut total: u64 = 0;
+            for &branch in branches {
+                let (CompareOp::Equal, position, value) = compared(plan, index, branch)? else {
+                    return None;
+                };
+                // Every branch on one column. Two columns is a disjunction over two things and
+                // adding their counts would be arithmetic about neither.
+                if *column.get_or_insert(position) != position {
+                    return None;
+                }
+                total = total.checked_add(counted(position, &value)?)?;
+            }
+            total.min(rows)
+        }
+        _ => {
+            let (op, position, value) = compared(plan, index, conjunct)?;
+            let counted = counted(position, &value)?;
+            match op {
+                CompareOp::Equal => counted,
+                // Not the complement of the count but the complement inside the rows that are not
+                // null, since `c <> k` is null for a null row and a null row does not pass. The
+                // null count is the other store's and the total is this one's, so both subtractions
+                // saturate: on one table they are the same reader, and two readers disagreeing
+                // about the rows is no reason to report a filter that grows its input.
+                _ => {
+                    let nulls = nulls_at(plan, input, position)?.read(NULLS).copied()?;
+                    rows.saturating_sub(nulls).saturating_sub(counted)
+                }
+            }
+        }
+    };
     Some((share(held, rows), Provenance::FrequencySynopsis))
 }
 
@@ -2571,6 +2659,95 @@ mod tests {
         let text = format!("Filter (#0.0::INTEGER = 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
         let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
         assert_eq!(common_stat(&text, 3, &held).value(), Some(&1));
+    }
+
+    /// The same as [`common_stat`] for a table that also kept bounds, and so also a null count.
+    ///
+    /// Both stores, because `<>` is the one shape here that needs a number out of each of them.
+    fn common_stat_of(text: &str, held: &Arc<Counted>, nulls: u64) -> Stat<u64> {
+        let stats = facts(&[("t", 1_500_000)]);
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        plan.set_frequencies(0, Arc::clone(held) as Arc<dyn Frequencies>);
+        plan.set_zones(0, Stub::counting(1_500_000, nulls) as Arc<dyn Zones>);
+        plan.measure_distinct(0, "a", Stat::exact(3, Provenance::Dictionary));
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    /// One equality on the plan's column `column` against `value`, as the plan printer writes it.
+    fn equals(column: u32, value: i64) -> String {
+        format!("(#0.{column}::INTEGER = {value}::INTEGER)::BOOLEAN")
+    }
+
+    /// A filter over an `OR` of the given branches, which is the shape an `IN` list binds to.
+    fn any_of(branches: &[String]) -> String {
+        format!("Filter ({})::BOOLEAN\n  {}", branches.join(" OR "), bounded_scan())
+    }
+
+    /// A filter over an `IN` list of `values` on the plan's column `column`.
+    fn one_of(column: u32, values: &[i64]) -> String {
+        let branches: Vec<String> = values.iter().map(|value| equals(column, *value)).collect();
+        any_of(&branches)
+    }
+
+    #[test]
+    fn an_inequality_on_a_counted_column_is_the_rows_less_that_value_and_less_the_nulls() {
+        // The complement, and not of the count alone. `o_orderstatus <> 'F'` is null for a row whose
+        // status is null, and a null does not pass a filter, so the rows that pass are the ones the
+        // synopsis did not count under `F` minus the ones that hold nothing at all.
+        let text = format!("Filter (#0.0::INTEGER <> 3::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 26_543)]));
+        assert_eq!(
+            common_stat_of(&text, &held, 12_000),
+            Stat::estimated(758_587, Provenance::FrequencySynopsis)
+        );
+    }
+
+    #[test]
+    fn an_inequality_gives_up_where_the_store_states_no_null_count() {
+        // Without the null count there is no honest complement, since the rows that pass are the
+        // ones that are neither the value nor null and one of those two numbers is missing. So this
+        // keeps the flat fifth, which is what a `<>` got before any of this: the distinct count says
+        // how many rows hold one value and nothing about how many hold anything else.
+        let text = format!("Filter (#0.0::INTEGER <> 3::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
+        assert_eq!(common_stat(&text, 3, &held), Stat::estimated(300_000, Provenance::Default));
+    }
+
+    #[test]
+    fn a_list_of_values_on_a_counted_column_is_the_counts_added_up() {
+        // `o_orderstatus IN ('F', 'P')` binds to an `OR` of two equalities, and two counts out of
+        // one synopsis add. The uniform guess has no arithmetic for a disjunction at all and gives
+        // the whole thing the flat fifth, which here is under half the truth.
+        let text = one_of(0, &[3, 5]);
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
+        assert_eq!(
+            common_stat_of(&text, &held, 0),
+            Stat::estimated(767_956, Provenance::FrequencySynopsis)
+        );
+    }
+
+    #[test]
+    fn a_disjunction_across_two_columns_is_not_a_list_and_is_not_added_up() {
+        // `a = 3 OR b = 4` is not an `IN` list. The rows that pass are somewhere between the larger
+        // count and the sum of the two, and which depends on how the columns go together, which no
+        // per column synopsis says. So this keeps the flat fifth rather than guessing confidently.
+        let text = any_of(&[equals(0, 3), equals(1, 4)]);
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
+        assert_eq!(common_stat_of(&text, &held, 0), Stat::estimated(300_000, Provenance::Default));
+    }
+
+    #[test]
+    fn a_list_longer_than_the_cap_is_left_to_the_constant() {
+        // A generated list can be thousands long, and each value is a walk of the synopsis. Past a
+        // handful the sum has stopped saying anything the column's own count would not, so the cap
+        // is where the reading stops rather than something to pay for.
+        let values: Vec<i64> = (0..33).collect();
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
+        assert_eq!(
+            common_stat_of(&one_of(0, &values), &held, 0),
+            Stat::estimated(300_000, Provenance::Default)
+        );
     }
 
     #[test]
