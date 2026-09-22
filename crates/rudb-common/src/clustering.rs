@@ -33,7 +33,10 @@ use crate::types::{Field, LogicalType};
 /// sorted exactly, 0.898 at a quarter, 0.899 at a year and 0.917 at a month, because the narrower
 /// the bucket the more often a join key's hash entry is revisited and the wider the delta the sort
 /// key encodes to, while the pruning a narrow bucket buys stops mattering above a quarter. So a
-/// declaration that names no width gets [`Width::DEFAULT`], which is the quarter.
+/// declaration that names no width gets [`Width::Auto`], which picks from the data and lands on the
+/// quarter at the scale that table was measured at. Note how little separates the middle three on
+/// that suite and how much separates them on the queries with a narrow date predicate in them,
+/// which is why the rule that picks is written the way it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Width {
     /// The value itself, which is an ordinary `ORDER BY` on the column.
@@ -45,17 +48,91 @@ pub enum Width {
     Quarter,
     /// The calendar year the value falls in.
     Year,
+    /// The month or the quarter, whichever the data asks for, decided when the rows are in front
+    /// of us.
+    ///
+    /// This is a declaration and not a bucket, which is the whole of the difference. Nothing sorts
+    /// by it and nothing writes a sort key from it: [`Width::for_span`] turns it into a real one at
+    /// the load, with the row count and the column's range in hand, and it is that answer the rows
+    /// are put in order by. A declaration that still says this after a load is a table saying it
+    /// wants whatever fits, not a table saying its rows are in no order.
+    ///
+    /// Only two of the four are reachable this way. The exact width and the year both have to be
+    /// asked for by name, for reasons [`Width::for_span`] gives.
+    Auto,
 }
 
 impl Width {
-    /// The bucket a date or a timestamp gets when nobody says which, measured rather than picked.
+    /// The bucket a date or a timestamp gets when nobody says which and nothing can be counted.
     ///
     /// Not [`Default::default`], which stays the exact value: that one is the width of a column
     /// with no calendar in it, and a struct deriving `Default` has no column to look at. This is
-    /// the answer to a different question, which is what a loader should do with a date column
-    /// when the declaration is silent, and the answer only makes sense with the column in hand.
-    /// [`Clustering::over`] is where the two meet.
+    /// the fallback for [`Width::for_span`] when the row count or the range is not there to read,
+    /// and it is the quarter because that is what SF1 measured at, in `14-the-partition-width.md`.
     pub const DEFAULT: Self = Self::Quarter;
+
+    /// How many rows a partition should hold.
+    ///
+    /// The number the whole of [`Width::for_span`] turns on, and the one thing in this file that is
+    /// a constant fitted to a measurement rather than a fact. Section 14.6 of
+    /// `14-the-partition-width.md` says a partition of a few hundred thousand rows is the shape
+    /// that measured well, and this is the bottom of that range.
+    ///
+    /// Two hundred thousand because of what it has to separate. SF1 lineitem is six million rows
+    /// over about seven years, so a month there is seventy thousand rows a partition and a quarter
+    /// is two hundred and fourteen thousand, and the quarter is the width that suite measured best.
+    /// Any target between those two numbers reproduces that answer. SF10 lineitem is ten times the
+    /// rows over the same seven years, so a month there is seven hundred thousand, which clears the
+    /// target comfortably, and that is the case the rule exists for.
+    pub const TARGET: u64 = 200_000;
+
+    /// The width for a table of `rows` rows whose leading column runs across `days`.
+    ///
+    /// The month when a month's worth of rows clears [`Width::TARGET`] and the quarter otherwise.
+    /// Two candidates and not four, and which two is the part that was measured rather than
+    /// reasoned.
+    ///
+    /// The month is what the row count is for. A narrow partition prunes better and costs locality:
+    /// the more partitions the leading column is cut into, the more often a join key's hash entry is
+    /// revisited and the wider the deltas the sort key encodes to. Section 14.5 measured both sides
+    /// and the crossing point is a partition size rather than a calendar unit, which is the entire
+    /// reason this is a function and not a constant. At SF1 a month is under the target and loses,
+    /// at SF10 it is three times over it and the same calendar word is a different proposition.
+    ///
+    /// The year is not a candidate, and the first cut of this rule had it as one. It measured 0.899
+    /// of the unsorted file at SF1 against the quarter's 0.898, so it was never winning anything,
+    /// and letting it in cost real numbers: with the year available the rule cut `orders` yearly at
+    /// SF1, because orders is a quarter of lineitem's size and falls under the target at every
+    /// calendar width, and q4 went from 0.879 to 0.914, q10 from 0.825 to 0.841 and q3 from 0.686
+    /// to 0.701. Those three read `o_orderdate` through a predicate a quarter wide, and no
+    /// partition wider than the predicate can prune inside it however many rows it holds. That is
+    /// the limit of the row count as a rule: it says how fine to cut before locality starts costing
+    /// and it says nothing about how coarse is too coarse, because that end is set by the width of
+    /// the predicates and nothing at load time knows those.
+    ///
+    /// The exact width is not a candidate either, for a different reason. It measured two tenths of
+    /// a percent better than the quarter on SF1 and it is still the wrong answer, because it throws
+    /// away the run length layer on the join key and costs eight times the bytes on `l_orderkey`,
+    /// which loses on any workload without TPC-H's date predicates in it. Somebody who wants either
+    /// of the two can write `exact(...)` or `year(...)` and get it, and this is about what to do
+    /// when nobody said.
+    ///
+    /// `days` is the span of the column and not the number of distinct values in it, because what
+    /// matters is how many buckets the range is cut into. A table whose dates are seven years apart
+    /// and has three of them still has seven years of buckets to write down.
+    ///
+    /// A row count or a span of zero gets [`Width::DEFAULT`]. There is nothing to divide and an
+    /// empty table has no shape to fit.
+    #[must_use]
+    pub fn for_span(rows: u64, days: u64) -> Self {
+        if rows == 0 || days == 0 {
+            return Self::DEFAULT;
+        }
+        // Thirty days, which is all the arithmetic needs: the answer is how many partitions a range
+        // is cut into and a long month either way cannot move that across the target.
+        let partitions = days / 30 + 1;
+        if rows / partitions >= Self::TARGET { Self::Month } else { Self::Quarter }
+    }
 
     /// The byte this is written as in a native file directory. Never reordered, only appended to.
     #[must_use]
@@ -65,6 +142,7 @@ impl Width {
             Self::Month => 1,
             Self::Quarter => 2,
             Self::Year => 3,
+            Self::Auto => 4,
         }
     }
 
@@ -76,6 +154,7 @@ impl Width {
             1 => Some(Self::Month),
             2 => Some(Self::Quarter),
             3 => Some(Self::Year),
+            4 => Some(Self::Auto),
             _ => None,
         }
     }
@@ -88,6 +167,7 @@ impl fmt::Display for Width {
             Self::Month => "MONTH",
             Self::Quarter => "QUARTER",
             Self::Year => "YEAR",
+            Self::Auto => "AUTO",
         })
     }
 }
@@ -153,10 +233,16 @@ impl Clustering {
 
     /// A declaration over `columns` that leaves the width to the leading column's type.
     ///
-    /// A date or a timestamp is bucketed at [`Width::DEFAULT`] and anything else is taken exactly,
-    /// which is the only width an integer or a string has. This is what a loader clustering a
-    /// table it was handed should call, since the alternative is every caller writing the same two
-    /// line match and the constant living in as many places as there are callers.
+    /// A date or a timestamp gets [`Width::Auto`] and anything else is taken exactly, which is the
+    /// only width an integer or a string has. This is what a loader clustering a table it was
+    /// handed should call, since the alternative is every caller writing the same two line match
+    /// and the constant living in as many places as there are callers.
+    ///
+    /// [`Width::Auto`] and not a fixed bucket because a fixed bucket is a constant fitted at one
+    /// scale and applied at every other. A quarter of SF1 lineitem is a quarter of a million rows
+    /// and a quarter of SF100 is twenty four million, and there is no reason the second one lands
+    /// anywhere near the first on the curve section 14.5 measured. [`Clustering::fitted`] is where
+    /// the declaration meets the row count and turns into a bucket.
     ///
     /// # Errors
     ///
@@ -165,12 +251,38 @@ impl Clustering {
     pub fn over(columns: Vec<u32>, fields: &[Field]) -> Result<Self> {
         let leading = columns.first().and_then(|&at| fields.get(at as usize));
         let width = match leading.map(|field| &field.ty) {
-            Some(LogicalType::Date | LogicalType::Timestamp) => Width::DEFAULT,
+            Some(LogicalType::Date | LogicalType::Timestamp) => Width::Auto,
             // Including the column list that is empty or out of range, which has no type to look
             // at and is about to be refused for that rather than for its width.
             _ => Width::Exact,
         };
         Self::new(columns, width, fields)
+    }
+
+    /// This declaration with [`Width::Auto`] turned into the bucket `rows` and `days` ask for.
+    ///
+    /// The one place an automatic width becomes a real one, and the reason it is a method rather
+    /// than something the loader does inline: the sort key is built from the width, so a width of
+    /// [`Width::Auto`] reaching the sort would be a `date_trunc` by a unit no calendar has. Whoever
+    /// is about to sort calls this first and what comes back can be sorted by.
+    ///
+    /// A width somebody wrote down is left exactly as they wrote it. `exact(l_shipdate)` stays
+    /// exact on a table of any size, because the declaration is what the table is asked to be and
+    /// a loader quietly widening it would make the setting a suggestion.
+    ///
+    /// `rows` is how many rows are about to be written and `days` is the span of the leading column
+    /// across them, both as well as the caller can tell. Neither has to be right: they pick between
+    /// three layouts that hold the same rows and answer the same queries, so being wrong costs some
+    /// pruning or some locality and cannot cost an answer. A caller that cannot tell at all passes
+    /// zero and gets [`Width::DEFAULT`].
+    #[must_use]
+    pub fn fitted(&self, rows: u64, days: u64) -> Self {
+        match self.width {
+            Width::Auto => {
+                Self { columns: self.columns.clone(), width: Width::for_span(rows, days) }
+            }
+            _ => self.clone(),
+        }
     }
 
     /// The columns, outermost first, as indexes into the table's column list.
@@ -246,7 +358,7 @@ impl Declared {
 /// declaration read back out of a table can be pasted straight back into the setting.
 ///
 /// A leading column with no wrapper around it leaves the width to the column's type, which is
-/// [`Clustering::over`], so `lineitem(l_shipdate, l_orderkey)` gets [`Width::DEFAULT`] and
+/// [`Clustering::over`], so `lineitem(l_shipdate, l_orderkey)` gets [`Width::Auto`] and
 /// `orders(o_orderkey)` gets the exact value. Whitespace between tokens is free and a trailing
 /// comma is allowed, for the reason the relationship grammar allows one: a setting long enough to
 /// want a line per table is a setting somebody will edit.
@@ -347,12 +459,13 @@ fn split_width(leading: &str) -> Result<(Option<Width>, String)> {
         return Err(malformed(format!("`{leading}` names no column")));
     }
     let word = word.trim();
-    let width = [Width::Exact, Width::Month, Width::Quarter, Width::Year]
+    let width = [Width::Exact, Width::Month, Width::Quarter, Width::Year, Width::Auto]
         .into_iter()
         .find(|width| width.to_string().eq_ignore_ascii_case(word))
         .ok_or_else(|| {
             malformed(format!(
-                "`{word}` is not a partition width, which is one of exact, month, quarter or year"
+                "`{word}` is not a partition width, which is one of exact, month, quarter, year or \
+                 auto"
             ))
         })?;
     Ok((Some(width), column.to_owned()))
@@ -401,16 +514,12 @@ mod tests {
         );
     }
 
-    /// A declaration that names no width gets the quarter on a date and the exact value elsewhere.
-    ///
-    /// The quarter is the measurement in `14-the-partition-width.md` and not a preference, and the
-    /// number is asserted here rather than read off the constant, because a test that compared the
-    /// constant to itself would still pass the day somebody changed it back to the month.
+    /// A declaration that names no width leaves it to the data on a date, and is exact elsewhere.
     #[test]
     fn a_declaration_with_no_width_takes_the_quarter_on_a_date_and_nothing_elsewhere() {
         let fields = lineitem();
         let dated = Clustering::over(vec![2, 0, 1], &fields).expect("a date leads");
-        assert_eq!(dated.width(), Width::Quarter, "the width the suite measured at 0.898");
+        assert_eq!(dated.width(), Width::Auto, "nobody said, so the rows will say");
         assert_eq!(dated.columns(), [2, 0, 1], "the columns are the ones asked for, in order");
         // A bigint has no quarters, so the same call on one has to come back exact rather than
         // come back an error, which is the whole reason the width is picked from the column.
@@ -423,10 +532,55 @@ mod tests {
 
     #[test]
     fn every_width_survives_its_byte() {
-        for width in [Width::Exact, Width::Month, Width::Quarter, Width::Year] {
+        for width in [Width::Exact, Width::Month, Width::Quarter, Width::Year, Width::Auto] {
             assert_eq!(Width::from_tag(width.tag()), Some(width), "{width}");
         }
-        assert_eq!(Width::from_tag(4), None, "a tag from a build that knows more than this one");
+        assert_eq!(Width::from_tag(5), None, "a tag from a build that knows more than this one");
+    }
+
+    /// The rule picks a different calendar width at two scale factors of the same table.
+    ///
+    /// The whole point of the rule, and the thing a constant cannot do. Both rows are TPC-H
+    /// lineitem over the same seven years of ship dates, six million rows at SF1 and sixty million
+    /// at SF10, and the numbers are the ones `dbgen` actually produces rather than round figures.
+    ///
+    /// SF1 lands on the quarter, which is what `14-the-partition-width.md` measured best there.
+    /// SF10 lands on the month, because a month of SF10 holds seven hundred thousand rows, which is
+    /// three times what SF1's quarter held: the width that was too narrow at one scale is
+    /// comfortable at the next one up, and the calendar word never moved.
+    #[test]
+    fn the_same_table_at_two_scales_gets_two_widths() {
+        let span = 2525;
+        assert_eq!(Width::for_span(6_001_215, span), Width::Quarter, "SF1");
+        assert_eq!(Width::for_span(59_986_052, span), Width::Month, "SF10");
+        // Smaller than SF1 does not go on getting coarser. A tenth of the rows is a long way under
+        // the target at every width, and the answer is still the quarter, because what is under the
+        // target is the case for not cutting finer and says nothing about cutting coarser.
+        assert_eq!(Width::for_span(600_572, span), Width::Quarter, "SF0.1");
+        // SF1 orders is the row that made the year a mistake. A quarter of lineitem's size over the
+        // same span, under the target at every width, and measured best on a quarter all the same.
+        assert_eq!(Width::for_span(1_500_000, span), Width::Quarter, "SF1 orders");
+        // Nothing to divide. An empty table and a table whose dates are all the same day both have
+        // no shape to fit, so both get the measured default.
+        assert_eq!(Width::for_span(0, span), Width::DEFAULT);
+        assert_eq!(Width::for_span(6_001_215, 0), Width::DEFAULT);
+    }
+
+    /// An automatic width becomes a real one and a written one is left alone.
+    #[test]
+    fn fitting_a_declaration_resolves_the_automatic_width_and_only_that_one() {
+        let fields = lineitem();
+        let auto = Clustering::over(vec![2, 0, 1], &fields).expect("a date leads");
+        assert_eq!(auto.width(), Width::Auto);
+        let fitted = auto.fitted(6_001_215, 2525);
+        assert_eq!(fitted.width(), Width::Quarter, "the rows decided");
+        assert_eq!(fitted.columns(), auto.columns(), "and nothing else moved");
+        // Written down is written down. A table of any size declared exact stays exact, because the
+        // declaration is what the table is asked to be rather than a hint the loader may improve on.
+        for width in [Width::Exact, Width::Month, Width::Quarter, Width::Year] {
+            let asked = Clustering::new(vec![2, 0, 1], width, &fields).expect("valid");
+            assert_eq!(asked.fitted(59_986_052, 2525), asked, "{width}");
+        }
     }
 
     /// The two tables the stage 0 measurement clusters, written the way the setting takes them.
@@ -455,18 +609,19 @@ mod tests {
 
     /// What a declaration reads back as is what the setting takes, so one can be pasted into it.
     ///
-    /// The three calendar widths round trip. The exact one does not, and that is worth a test of
-    /// its own rather than a carve out in a loop: [`Clustering::describe`] prints no wrapper for
-    /// it, the parse of a bare leading column names no width, and a bare date column then gets the
-    /// quarter. So pasting an exactly sorted date declaration back into the setting gives a
-    /// quarterly one. Whoever wants the exact value back says `exact(...)`, which is why that word
-    /// is in the grammar at all given that no printer produces it.
+    /// The three calendar widths and the automatic one round trip. The exact one does not, and that
+    /// is worth a test of its own rather than a carve out in a loop: [`Clustering::describe`] prints
+    /// no wrapper for it, the parse of a bare leading column names no width, and a bare date column
+    /// then gets the automatic width. So pasting an exactly sorted date declaration back into the
+    /// setting gives one that leaves the width to the data. Whoever wants the exact value back says
+    /// `exact(...)`, which is why that word is in the grammar at all given that no printer produces
+    /// it.
     #[test]
     fn what_a_declaration_describes_itself_as_parses_back_into_the_same_declaration() {
         let fields = lineitem();
         let names = fields.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
         let at = |name: &String| names.iter().position(|it| it == name).expect("a column") as u32;
-        for width in [Width::Month, Width::Quarter, Width::Year] {
+        for width in [Width::Month, Width::Quarter, Width::Year, Width::Auto] {
             let asked = Clustering::new(vec![2, 0, 1], width, &fields).expect("valid");
             let written = format!("lineitem({})", asked.describe(&names));
             let read = parse_clustering(&written).expect("parse");
@@ -483,8 +638,8 @@ mod tests {
         let columns: Vec<u32> = read[0].columns().iter().map(at).collect();
         assert_eq!(
             Clustering::over(columns, &fields).expect("valid").width(),
-            Width::Quarter,
-            "and a silent date declaration is a quarterly one"
+            Width::Auto,
+            "and a silent date declaration leaves the width to the data"
         );
     }
 
