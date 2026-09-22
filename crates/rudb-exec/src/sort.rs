@@ -53,8 +53,29 @@
 //! several it is the shape that makes the sort possible at all, and having it now is why F4 changes
 //! no operator.
 //!
-//! The finished chunks go into a [`Buffered`], which is a separate source rather than something
+//! The finished chunks go into a [`Sorted`], which is a separate source rather than something
 //! `finalize` hands back, for the reason [`Sink::finalize`] gives.
+//!
+//! # When it does not fit
+//!
+//! Everything above is about a sort that fits, and a sort that does not used to die at the
+//! allocator. What it does now is spill: when an instance is holding more than its share of the
+//! memory limit, it sorts what it has, writes it out as a sorted run, and starts again empty. At
+//! the end the runs are merged, by [`Sorted`] rather than here, as the rows downstream are asked
+//! for.
+//!
+//! The merge is over there and not here for the reason section 15.6 of `tenx/15-the-partitioned-write.md`
+//! gives. A sink's peak is inside its own `finalize`, holding what is left of the input and the
+//! output it is building from it, so an operator that spills on the way in and then assembles the
+//! whole answer on the way out has bounded nothing. The answer has to be produced as it is read,
+//! which is the one thing a `finalize` cannot do.
+//!
+//! What a run carries beside its rows is one forty byte column, the row's normalized key and then
+//! its arrival, in an encoding whose byte order is the sort order. That is what lets the merge be a
+//! byte comparison with no key expressions in it, and it is why only the normalized path spills:
+//! the valued path has no fixed width bytes to write. Every clustering declaration the loader takes
+//! is fixed width, so that covers the case this was built for, and a string key on a table that
+//! does not fit is still #1301.
 //!
 //! # Giving the input back while the output is being built
 //!
@@ -76,16 +97,18 @@
 
 use std::cmp::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{Assembly, Chunk, VECTOR_SIZE, Vector};
 
-use crate::buffer::Buffered;
+use crate::merged::{ORDER, Sorted, order_of, ordering};
 use crate::normal::{self, Normal};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
+use crate::runs::Runs;
 use crate::schema::Schema;
 
 /// One row on its way through a sort: the values of its keys, where it arrived, and where it is.
@@ -141,8 +164,17 @@ pub(crate) struct Sort {
     /// once the sorted chunks have been charged instead.
     charged: Mutex<Vec<Reservation>>,
     /// What the sorted chunks are charged, held for as long as they are readable.
+    ///
+    /// Nothing is charged here when the sort spilled, because then the chunks are read back one at
+    /// a time and what is resident is a chunk a run rather than the answer.
     held: Mutex<Reservation>,
-    out: Buffered,
+    /// The sorted runs the instances wrote, once they have combined.
+    runs: Mutex<Vec<Runs>>,
+    /// How many instances of this sort there are, which decides what share of the limit each gets.
+    ///
+    /// Every instance is made before any row moves, so this stops changing before it is first read.
+    instances: AtomicUsize,
+    out: Sorted,
 }
 
 /// Every instance's rows after they have been handed over, in one lock rather than two.
@@ -246,6 +278,24 @@ impl Keyed {
         }
     }
 
+    /// The bytes each row is ordered by, in the order the sort put them.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::Internal`](rudb_common::ErrorCode::Internal) on the valued arm, which has no
+    /// fixed width bytes to give and is never asked, because [`Sort::tight`] only ever says yes on
+    /// the other one.
+    fn orders(&self) -> Result<Vec<[u8; ORDER]>> {
+        match self {
+            Self::Normal(rows) => {
+                Ok(rows.iter().map(|(key, arrival, _)| order_of(key, *arrival)).collect())
+            }
+            Self::Valued(_) => {
+                Err(Error::internal("a sort holding its keys as values cannot spill"))
+            }
+        }
+    }
+
     /// What these rows were charged when they were taken in, so that dropping them can give it back.
     ///
     /// Counted again rather than carried, because the valued arm's rows are not all the same size
@@ -270,6 +320,8 @@ pub(crate) struct Gathered {
     charged: Reservation,
     /// The morsel this instance is reading and how many of its rows have arrived.
     place: Place,
+    /// The sorted runs this instance has written, each one a batch that did not fit.
+    runs: Vec<Runs>,
 }
 
 /// How far through a morsel an instance is, which is the second half of an [`Arrival`].
@@ -314,11 +366,11 @@ impl Sort {
         input: &Schema,
         keys: Slice,
         memory: &Memory,
-    ) -> Result<(Self, Buffered)> {
+    ) -> Result<(Self, Sorted)> {
         let keys = plan.sort_key_list(keys).to_vec();
         let exprs: Vec<_> = keys.iter().map(|key| key.expr).collect();
         let types: Vec<_> = exprs.iter().map(|&expr| plan.expr_type(expr).clone()).collect();
-        let out = Buffered::new();
+        let out = Sorted::new();
         let widths = normal::layout(&types);
         let rows =
             if widths.is_some() { Keyed::Normal(Vec::new()) } else { Keyed::Valued(Vec::new()) };
@@ -331,9 +383,97 @@ impl Sort {
             gathered: Mutex::new(Combined { chunks: Vec::new(), rows }),
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
+            runs: Mutex::new(Vec::new()),
+            instances: AtomicUsize::new(0),
             out: out.clone(),
         };
         Ok((sort, out))
+    }
+
+    /// Whether this instance is holding more than it should be.
+    ///
+    /// Half the limit shared between the instances. Half rather than all of it because the sort is
+    /// not the only thing charging the budget: the scan below it holds pages, the writer above it
+    /// holds fragments, and the run this spill is about to write costs an assembly of everything
+    /// being spilled while it is written. A sort that waits until the limit is in sight to start
+    /// spilling has nothing left to spill with.
+    ///
+    /// No limit is no spilling, which is the right answer and not a missing case. A database opened
+    /// without one is one whose answer to running out of memory is the allocator's, and a sort that
+    /// started writing files anyway would be choosing for it.
+    fn tight(&self, local: &Gathered) -> bool {
+        if self.widths.is_none() {
+            return false;
+        }
+        let Some(limit) = self.memory.limit() else { return false };
+        let instances = self.instances.load(Atomic::Relaxed).max(1) as u64;
+        let share = (limit / 2) / instances;
+        share > 0 && local.charged.bytes() >= share
+    }
+
+    /// Sorts what this instance is holding, writes it out as a run, and leaves it empty.
+    ///
+    /// The instance's whole reservation goes in and comes back out, because everything it is
+    /// charged for is what is being spilled: the chunks that arrived and the rows pointing into
+    /// them. What is left in it afterwards is whatever rounding the give back did not account for,
+    /// and it carries on from there.
+    fn spill(&self, local: &mut Gathered) -> Result<()> {
+        let empty = Combined { chunks: Vec::new(), rows: local.held.rows.empty() };
+        let Combined { chunks, rows } = std::mem::replace(&mut local.held, empty);
+        let mut charged = vec![std::mem::replace(&mut local.charged, self.memory.reservation())];
+        let file = self.run(chunks, rows, &mut charged)?;
+        if let Some(left) = charged.pop() {
+            local.charged = left;
+        }
+        local.runs.push(file);
+        Ok(())
+    }
+
+    /// One sorted run: these rows in order, in a file, with the bytes they are ordered by beside
+    /// them.
+    ///
+    /// Everything up to the write is what [`Sink::finalize`] does to a sort that fits, in the same
+    /// order and for the same reasons, so a run is a small sort that went to a file instead of to
+    /// the source. The assembly it builds is charged to a reservation that lives for as long as
+    /// this call does, since the chunks are written and dropped rather than held.
+    ///
+    /// # Errors
+    ///
+    /// If the rows hold their keys as values, if there are more of them than a sort addresses, or
+    /// if the file cannot be written.
+    fn run(
+        &self,
+        chunks: Vec<Chunk>,
+        mut rows: Keyed,
+        charged: &mut Vec<Reservation>,
+    ) -> Result<Runs> {
+        rows.sort(&self.keys)?;
+        let total = rows.len();
+        if u32::try_from(total).is_err() {
+            return Err(too_many());
+        }
+        let orders = rows.orders()?;
+        let at = places(&chunks, &rows)?;
+        let taken = rows.footprint();
+        drop(rows);
+        give(charged, taken);
+        let mut held = self.memory.reservation();
+        let out = gathered(&self.types, chunks, &at, total, &mut held, charged)?;
+        let mut types = self.types.clone();
+        types.push(LogicalType::Blob);
+        let mut file = Runs::new("sort", types)?;
+        let mut start = 0usize;
+        for chunk in out {
+            let rows = chunk.len();
+            let Some(orders) = orders.get(start..start + rows) else {
+                return Err(Error::internal("a sorted run with fewer keys in it than rows"));
+            };
+            let mut columns = chunk.into_columns();
+            columns.push(ordering(orders)?);
+            file.write(&Chunk::with_rows(columns, rows)?)?;
+            start += rows;
+        }
+        Ok(file)
     }
 }
 
@@ -346,11 +486,13 @@ impl Sink for Sort {
         } else {
             Keyed::Valued(Vec::new())
         };
+        self.instances.fetch_add(1, Atomic::Relaxed);
         Gathered {
             held: Combined { chunks: Vec::new(), rows },
             scratch: self.exprs.scratch(),
             charged: self.memory.reservation(),
             place: Place::default(),
+            runs: Vec::new(),
         }
     }
 
@@ -401,10 +543,14 @@ impl Sink for Sort {
         local.held.chunks.push(chunk.clone());
         local.place.past(chunk.len());
         local.charged.grow(taken)?;
+        if self.tight(local) {
+            self.spill(local)?;
+        }
         Ok(Progress::More)
     }
 
     fn combine(&self, local: Gathered) -> Result<()> {
+        self.runs.lock().map_err(poisoned)?.extend(local.runs);
         let mut gathered = self.gathered.lock().map_err(poisoned)?;
         // Appended rather than merged, because the sort has not happened yet. The order the
         // instances combine in does not decide anything, since every row carries where it arrived
@@ -422,10 +568,21 @@ impl Sink for Sort {
             let empty = Combined { chunks: Vec::new(), rows: gathered.rows.empty() };
             std::mem::replace(&mut *gathered, empty)
         };
-        rows.sort(&self.keys)?;
         // What the instances took, moved out so that it can be given back a column at a time rather
         // than all at once when this returns. Dropping what is left of it is what releases the rest.
         let mut charged = std::mem::take(&mut *self.charged.lock().map_err(poisoned)?);
+        let mut files = std::mem::take(&mut *self.runs.lock().map_err(poisoned)?);
+        if !files.is_empty() {
+            // Something spilled, so what is left here is the last batch and it becomes the last
+            // run. No chunks are built and nothing is held: the answer is produced by the merge as
+            // the rows are read, which is the whole point and is why this returns before the path
+            // below rather than sharing it.
+            if rows.len() > 0 {
+                files.push(self.run(chunks, rows, &mut charged)?);
+            }
+            return self.out.merge(files, self.types.clone());
+        }
+        rows.sort(&self.keys)?;
         let total = rows.len();
         if u32::try_from(total).is_err() {
             return Err(too_many());
@@ -438,7 +595,7 @@ impl Sink for Sort {
         give(&mut charged, taken);
         let mut held = self.held.lock().map_err(poisoned)?;
         let out = gathered(&self.types, chunks, &at, total, &mut held, &mut charged)?;
-        self.out.fill(out)?;
+        self.out.hold(out)?;
         Ok(())
     }
 }
