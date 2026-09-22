@@ -25,7 +25,7 @@
 //!
 //! One pass over a column is one hash a value, and the hash is what the pass costs. So the frequency
 //! tally in `tally.rs` rides along on this one rather than making a pass of its own: every arm below
-//! hands the hash it computed to a [`Sink`], which is the sketch and the tally together.
+//! hands the hash it computed to a `Sink`, which is the sketch and the tally together.
 //!
 //! Together, but only one of them at a time. The tally holds every distinct value of a column it is
 //! still counting, so it is that column's exact distinct count and the sketch is not read at all
