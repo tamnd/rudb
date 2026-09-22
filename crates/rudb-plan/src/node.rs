@@ -441,6 +441,48 @@ pub enum Node {
         /// the executor honours whatever it finds here.
         build: BuildSide,
     },
+    /// A join answered by reading a stored forward link rather than by building a hash table.
+    ///
+    /// spec/graph/05-execution.md section 5.2. The condition is `child.fk = parent.pk` for a
+    /// declared relationship whose forward link is stored, and the child side reaches the join
+    /// with its row id intact. Where a [`Self::Join`] builds one side and probes it with the
+    /// other, this reads one link value beside the child's own columns and emits the parent's
+    /// projected columns as gathers into the parent's column vectors. There is no build side,
+    /// no hash table, no probe and no materialization of the parent per child row.
+    ///
+    /// It is a node of its own rather than a flag on [`Self::Join`] because the two are different
+    /// operators with different shapes: this one has a driving side and no gathered side, so the
+    /// pipeline under it is one pipeline rather than two, and a reader of an explain output that
+    /// saw `Join` with a flag would have to know the flag to know what ran.
+    ///
+    /// Nothing produces this unless the graph sections are on. Section 3.1 says deleting every
+    /// graph section from a file must change no answer, only the time, so every plan holding one
+    /// of these is a plan the optimizer could have written as a [`Self::Join`] over the same two
+    /// inputs, and the rule that rewrites it says so by construction.
+    LinkJoin {
+        /// The child input, whose rows carry the row id the link is indexed by.
+        child: NodeRef,
+        /// The parent input.
+        ///
+        /// Never scanned as a pipeline. It is here so that the column bindings above this node
+        /// keep naming the scan they named, so that the projection pushdown pass can still see
+        /// which of the parent's columns are wanted, and so that dropping back to a hash join is
+        /// a change of node rather than a re-plan.
+        parent: NodeRef,
+        /// Inner, left, semi or anti. Section 5.2 handles no others: right and full need the
+        /// parent rows nothing pointed at, which is the backward direction.
+        kind: JoinKind,
+        /// The join condition, into the expression list pool. Exactly one equality, which is what
+        /// makes this shape recognizable at all.
+        conditions: Slice,
+        /// The child column holding the row id the link is indexed by, which has to be `BIGINT`.
+        ///
+        /// Named here rather than looked for by the builder, the same way [`Self::Fetch`] names
+        /// its ordinal. The rule that writes this node is the one thing that has proved the row id
+        /// survives to here, by way of [`crate::rid`], and a builder that went looking for the
+        /// column by name afterwards would be trusting a name where the rule trusted an analysis.
+        rid: ExprRef,
+    },
     /// A join whose right input can refer to columns produced by its left input.
     ///
     /// Binding emits this for a correlated subquery. The unnesting pass has to replace every one
@@ -543,6 +585,7 @@ impl Node {
             Self::TableFetch { .. } => "TableFetch",
             Self::Distinct { .. } => "Distinct",
             Self::Join { .. } => "Join",
+            Self::LinkJoin { .. } => "LinkJoin",
             Self::DependentJoin { .. } => "DependentJoin",
             Self::CrossProduct { .. } => "CrossProduct",
             Self::MaterializedCte { .. } => "MaterializedCte",
@@ -576,7 +619,8 @@ impl Node {
             | Self::TableFetch { input, .. }
             | Self::Distinct { input, .. }
             | Self::LateralFunction { input, .. } => [Some(input), None],
-            Self::Join { left, right, .. }
+            Self::LinkJoin { child: left, parent: right, .. }
+            | Self::Join { left, right, .. }
             | Self::DependentJoin { left, right, .. }
             | Self::CrossProduct { left, right }
             | Self::SetOp { left, right, .. } => [Some(left), Some(right)],

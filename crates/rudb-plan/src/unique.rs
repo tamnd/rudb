@@ -373,6 +373,33 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Keys]) -> Keys {
             // there. Saying nothing is the only sound answer without a null aware key.
             JoinKind::Left | JoinKind::Right | JoinKind::Full => Keys::unknown(),
         },
+        // The same rules as the join above it, over the same two sides, which it has to be: the
+        // rewrite that produced this node is only allowed to produce it where a hash join over
+        // these two inputs would have answered the same rows. A link join's kinds are the four
+        // section 5.2 names, and `Left` is the only one of them that pads.
+        Node::LinkJoin { child, parent, kind, conditions, rid: _ } => match kind {
+            JoinKind::Inner => {
+                let (child, parent) = (below(child), below(parent));
+                let mut keys = child.product(&parent);
+                for (from, onto) in [(&child, &parent), (&parent, &child)] {
+                    if onto.covers(&equated(plan, conditions)) {
+                        for set in &from.sets {
+                            keys.add(set.clone());
+                        }
+                    }
+                }
+                keys
+            }
+            JoinKind::Semi | JoinKind::Anti => below(child),
+            JoinKind::Left => Keys::unknown(),
+            // Refused by `Plan::check`, so this is unreachable rather than a decision. Saying
+            // nothing is the sound answer for a plan that should not exist.
+            JoinKind::Right
+            | JoinKind::Full
+            | JoinKind::Mark
+            | JoinKind::Single
+            | JoinKind::Positional => Keys::unknown(),
+        },
         Node::CrossProduct { left, right } => below(left).product(&below(right)),
 
         // A materialisation produces what the query reading it produces.

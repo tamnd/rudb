@@ -1614,6 +1614,13 @@ impl<'a> Building<'a, '_> {
                 self.close(below, pipeline, Arc::new(Watched::new(distinct, counters)));
                 Segment::reading(Arc::new(Watched::new(out, reading)), schema, pipeline)
             }
+            // The operator is the second half of G3 and is not written yet, so a plan holding one
+            // of these is a plan nothing in the tree can produce. Refused here rather than left to
+            // a catch all, so that the arm has to be replaced when the operator lands instead of
+            // quietly answering as something else.
+            Node::LinkJoin { .. } => {
+                return Err(Error::internal("a link join reached the builder without an operator"));
+            }
             Node::Join { left, right, kind, conditions, build } => {
                 // One side runs first, because no row of the other one can be answered until every
                 // row it might match has been seen. That is the dependency edge, and it is the same

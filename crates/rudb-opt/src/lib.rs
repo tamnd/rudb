@@ -39,7 +39,7 @@ pub mod unnest;
 mod walk;
 
 use rudb_common::{Error, Result};
-use rudb_plan::{Node, NodeRef, Plan};
+use rudb_plan::{JoinKind, Node, NodeRef, Plan};
 
 use crate::pass::{Context, Pass};
 
@@ -360,6 +360,12 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         | Node::CrossProduct { left, right } => {
             output_columns(plan, left) + output_columns(plan, right)
         }
+        // A semi or anti link join never touches the parent, so its width is the child's. The
+        // other two put the gathered parent columns after the child's and are as wide as both.
+        Node::LinkJoin { child, parent, kind, .. } => match kind {
+            JoinKind::Semi | JoinKind::Anti => output_columns(plan, child),
+            _ => output_columns(plan, child) + output_columns(plan, parent),
+        },
     }
 }
 

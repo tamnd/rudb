@@ -178,6 +178,19 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Carried]) -> Carried {
         Node::Join { left, right, kind, build, .. } => {
             joined(&below(left), &below(right), kind, build)
         }
+
+        // The child, and only the child. This is the one join in the engine whose streaming side
+        // is not a choice: section 5.2 scans the child and reads the link beside its columns, so
+        // the child's rows arrive in order and a selection is all that happens to them, which is
+        // the same argument the probe side of a hash join gets. The parent's rows are gathered
+        // through the link, and a gathered row carries no row id of its own however the gather
+        // was worked out.
+        //
+        // An inner join drops the child rows whose link is the no parent sentinel and a semi or
+        // anti join tests that sentinel, both of which are selections. A left join keeps them and
+        // gathers null, which pads the parent side rather than the child side, so the child's
+        // row ids survive all four kinds and the padding rule of `joined` never bites.
+        Node::LinkJoin { child, .. } => below(child),
     }
 }
 
