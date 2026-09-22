@@ -15,12 +15,14 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod held;
 pub mod name;
 pub mod system;
 pub mod table;
 pub mod view;
 
 pub use catalog::{Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema};
+pub use held::Held;
 pub use name::{QualifiedName, same_name};
 pub use system::{INFORMATION_SCHEMA, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG};
 pub use table::{Table, duplicate_check};

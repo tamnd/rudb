@@ -15,6 +15,12 @@
 //! alternative is a Rust parser in the task runner, and the heuristic found every one of the twelve
 //! loops this repository had when it was written and nothing that was not one.
 //!
+//! One shape is not one and is spelled out here rather than waved through with a marker: a call
+//! passed as a closure, as in `sink.add(hash, 1, || vector.value_at(row))`. The row loop reaches the
+//! line and the callee decides whether to run the closure, which in that case is once per value it
+//! has not seen before rather than once per row. The whole reason to write it that way is to not
+//! build the value, so a checker reading the position as the cost would argue against the fix.
+//!
 //! A loop header looks like it runs once per row when it is a range, an iterator or an enumeration,
 //! and either its source names a count of rows or its binding names a row. Both halves are needed.
 //! Without the first, every `for` in the workspace is a row loop. Without the second, a loop over
@@ -143,10 +149,10 @@ pub(crate) fn is_row_loop(code: &str) -> bool {
 
 /// What the line does that a loop over rows should not, if it does anything.
 fn builds_a_value(code: &str) -> Option<&'static str> {
-    if code.contains(".value_at(") {
+    if eagerly(code, ".value_at(") {
         return Some("a call to value_at");
     }
-    if code.contains("from_values(") {
+    if eagerly(code, "from_values(") {
         return Some("a call to from_values");
     }
     if constructs_a_value(code) {
@@ -155,17 +161,53 @@ fn builds_a_value(code: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether `pattern` is somewhere in `code` that the loop itself would reach.
+fn eagerly(code: &str, pattern: &str) -> bool {
+    let mut from = 0;
+    while let Some(found) = code[from..].find(pattern) {
+        let at = from + found;
+        if !behind_a_closure(code, at) {
+            return true;
+        }
+        from = at + pattern.len();
+    }
+    false
+}
+
+/// Whether what is at `at` is inside a closure this line hands to somebody else.
+///
+/// `sink.add(hash, 1, || vector.value_at(row))` reads one value per value the callee has not seen
+/// before and not one per row, which is the point of writing it that way. Passing a closure is the
+/// one shape where the position of a call says nothing about how often it runs, so it is worth
+/// telling apart from the rest, and a bare `||` is the only closure that can hide a whole expression
+/// behind a callee's decision.
+///
+/// Told apart from a boolean or by what comes before it: an argument closure follows a comma or an
+/// open bracket, where the `||` of an or follows its left operand.
+fn behind_a_closure(code: &str, at: usize) -> bool {
+    let mut rest = &code[..at];
+    while let Some(bar) = rest.rfind("||") {
+        let before = rest[..bar].trim_end();
+        if before.ends_with(',') || before.ends_with('(') {
+            return true;
+        }
+        rest = &rest[..bar];
+    }
+    false
+}
+
 /// `Value::Something(`, which is a construction, as opposed to `Value::Something =>`, which is a
 /// pattern, or `Value::Null`, which is a constant the compiler hoists.
 fn constructs_a_value(code: &str) -> bool {
-    let mut rest = code;
-    while let Some(at) = rest.find("Value::") {
-        let after = &rest[at + "Value::".len()..];
+    let mut from = 0;
+    while let Some(found) = code[from..].find("Value::") {
+        let at = from + found;
+        from = at + "Value::".len();
+        let after = &code[from..];
         let name: String = after.chars().take_while(char::is_ascii_alphanumeric).collect();
-        if !name.is_empty() && after[name.len()..].starts_with('(') {
+        if !name.is_empty() && after[name.len()..].starts_with('(') && !behind_a_closure(code, at) {
             return true;
         }
-        rest = &rest[at + "Value::".len()..];
     }
     false
 }
@@ -245,6 +287,24 @@ mod tests {
     fn the_test_module_is_not_checked() {
         let text = "fn f() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        for row in 0..rows {\n            assert_eq!(v.value_at(row), Value::Integer(1));\n        }\n    }\n}\n";
         assert!(check_one("t.rs", text).0.is_empty());
+    }
+
+    /// The whole point of a closure there is that the value is not built, so a checker that counted
+    /// it would be arguing for the slower code.
+    #[test]
+    fn a_value_passed_as_a_closure_is_not_built_per_row() {
+        let text = "fn f() {\n    for row in 0..rows {\n        sink.add(hash, 1, || vector.value_at(row));\n    }\n}\n";
+        assert!(check_one("t.rs", text).0.is_empty());
+        let built = "fn f() {\n    for row in 0..rows {\n        sink.add(hash, 1, Value::Integer(row));\n    }\n}\n";
+        assert_eq!(check_one("t.rs", built).0.len(), 1);
+    }
+
+    /// The `||` of a boolean or is not a closure, and a line that has one before a value it really
+    /// does build has to stay caught.
+    #[test]
+    fn a_boolean_or_does_not_hide_a_value() {
+        let text = "fn f() {\n    for row in 0..rows {\n        if nullable || row > 0 { out.push(v.value_at(row)); }\n    }\n}\n";
+        assert_eq!(check_one("t.rs", text).0.len(), 1);
     }
 
     /// A brace in a character literal would put the depth out by one for the rest of the file, which

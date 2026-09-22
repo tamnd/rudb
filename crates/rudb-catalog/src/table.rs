@@ -10,6 +10,7 @@ use rudb_storage::{MemoryTable, Probe};
 use rudb_vector::{Chunk, Form, Vector};
 
 use crate::catalog::DETACHED;
+use crate::held::Held;
 use crate::name::{QualifiedName, same_name};
 
 /// Refuses a column list that names the same column twice.
@@ -46,23 +47,27 @@ pub enum Rows {
 }
 
 impl Rows {
-    /// Exact leading value frequencies from a committed native snapshot.
+    /// Exact leading value frequencies, most common first.
     ///
-    /// In-memory tables have no persisted synopsis and return `None`.
+    /// A file proves a count descending prefix out of its stored synopsis. A table in memory has no
+    /// prefix to prove: the list the tally built is every value of the column or it is nothing, so
+    /// the leading `top` of it are the leading `top` of the column however short the list is, and a
+    /// list of three values is the whole answer to a request for five.
     pub fn top_frequencies(&self, column: usize, top: usize) -> Result<Option<Vec<(Value, u64)>>> {
         match self {
-            Self::Memory(_) => Ok(None),
+            Self::Memory(rows) => rows.frequencies(column),
             Self::Native(reader) => reader.top_frequencies(column, top),
         }
     }
 
-    /// Every value of one column with its exact row count, when the persisted synopsis is complete.
+    /// Every value of one column with its exact row count, when something has all of them.
     ///
-    /// Only ever an answer for a column with few enough distinct values that the synopsis never had
-    /// to drop one. In-memory tables have no persisted synopsis and return `None`.
+    /// Only ever an answer for a column with few enough distinct values. A file answers when the
+    /// synopsis its writer stored never had to drop a value. A table in memory answers when the tally
+    /// it built as the rows arrived stayed under its cap, which is `rudb_storage::TALLY_VALUES`.
     pub fn exact_frequencies(&self, column: usize) -> Result<Option<Vec<(Value, u64)>>> {
         match self {
-            Self::Memory(_) => Ok(None),
+            Self::Memory(rows) => rows.frequencies(column),
             Self::Native(reader) => reader.exact_frequencies(column),
         }
     }
@@ -444,8 +449,9 @@ impl Rows {
 
     /// How many rows hold each value, for the planner to ask about one of them.
     ///
-    /// `None` for a table in memory, which keeps no frequency synopsis at all yet. That is #1103
-    /// and not a decision: the file side is where the synopsis exists, so it is where this starts.
+    /// The file half only. A table in memory has the lists too, but reaching them needs the column
+    /// names and those are in the catalog entry rather than here, so [`Table::frequencies`] is what
+    /// the binder asks and this is half of what it answers with.
     #[must_use]
     pub fn frequencies(&self) -> Option<Arc<dyn Frequencies>> {
         match self {
@@ -565,6 +571,21 @@ impl Table {
     #[must_use]
     pub fn rows(&self) -> &Rows {
         &self.rows
+    }
+
+    /// How many rows hold each value of each column, named, for the planner to ask.
+    ///
+    /// Here rather than on [`Rows`] for the reason [`Table::distincts`] is: half of it needs the
+    /// column names and a table in memory keeps only its types.
+    ///
+    /// A file answers out of the synopsis its writer stored, which for a wide column is the leading
+    /// values and a bound on the rest. A table in memory answers out of the tally `rudb_storage`
+    /// built as the rows arrived, which is every value of a narrow column and nothing for a wide one.
+    /// The two are different shapes of the same fact and the estimator reads them through one trait.
+    #[must_use]
+    pub fn frequencies(&self) -> Option<Arc<dyn Frequencies>> {
+        let Rows::Memory(rows) = &self.rows else { return self.rows.frequencies() };
+        Held::of(rows, &self.columns).map(|held| Arc::new(held) as Arc<dyn Frequencies>)
     }
 
     /// How many distinct values each column holds, named, for the columns something can say.
