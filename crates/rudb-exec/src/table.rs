@@ -3052,7 +3052,8 @@ mod tests {
         let mut held = Vec::new();
         over_first.hold(&mut held);
 
-        let next = [Vector::dictionary(vec![3, 5], page()).expect("another chunk of the same page")];
+        let next =
+            [Vector::dictionary(vec![3, 5], page()).expect("another chunk of the same page")];
         assert!(coded(&next, 2).expect("codes").same_as(&held), "the same page, cut again");
         let whole = [page()];
         assert!(coded(&whole, 2).expect("codes").same_as(&held), "the same page, not cut at all");
