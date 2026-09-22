@@ -2441,16 +2441,30 @@ impl<'a> Binder<'a> {
     ///
     /// One string is one pattern and a list is one pattern an item, which is DuckDB's pair of
     /// overloads. A null is a different sentence in each of them, both of them measured.
+    ///
+    /// The argument is folded rather than required to be a literal. A list is a call to `list_value`
+    /// as of the work on #467, so requiring a literal here would have turned every `read_parquet`
+    /// over a list into the message about a name that is not a constant, and the sentence this
+    /// comment used to carry about folding being picked up for free was the plan for exactly that.
+    /// What it buys beyond keeping the list working is `read_parquet('a' || '.parquet')`, which the
+    /// pin answers and which used to be refused here.
     fn file_patterns(&self, expr: ExprRef, name: &str) -> Result<Vec<String>> {
-        let Expr::Constant(reference) = *self.plan.expr(expr) else {
+        let Some(value) = fold::value_of(&self.plan, expr)? else {
             return Err(Error::not_implemented(
                 "a table function file name that is not a constant",
             ));
         };
-        match self.plan.value(reference) {
-            Value::Varchar(path) => Ok(vec![path.clone()]),
+        match value {
+            Value::Varchar(path) => Ok(vec![path]),
             // DuckDB's own wording, which says list because its other overload takes one.
             Value::Null => Err(Error::parser(format!("{name} cannot take NULL list as parameter"))),
+            // An empty list reaches the reader rather than failing to bind, because `[]` carries an
+            // element type of the untyped null and a null promotes to VARCHAR, so the call resolves.
+            // The pin says this, and it says it as an IO error rather than as a binder one, since
+            // the list was a fine list and the objection is that there is no file in it.
+            Value::List { values, .. } if values.is_empty() => {
+                Err(Error::io(format!("\"{name}\" needs at least one file to read")))
+            }
             Value::List { values, .. } => values
                 .iter()
                 .map(|value| match value {

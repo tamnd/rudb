@@ -1435,6 +1435,89 @@ fn a_list_column_keeps_an_empty_list_and_a_null_apart() {
     );
 }
 
+/// A list literal is a call to `list_value`. Per #467.
+///
+/// Which is what lets a column go inside one, and what makes the rule that decides the element type
+/// of `[a, b]` the same rule that decides it for `list_value(a, b)`, written once.
+#[test]
+fn a_list_can_be_written_over_columns_and_not_only_over_constants() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT [x, 2] FROM t WHERE x = 3"), vec![vec![list(&[3, 2])]]);
+    // Every element promotes to one type, so a list of an integer and a double holds doubles rather
+    // than being refused or holding two types.
+    assert_eq!(
+        rows(&db, "SELECT typeof([x, 2.5::DOUBLE]) FROM t WHERE x = 3"),
+        vec![vec![text("DOUBLE[]")]]
+    );
+    // Nothing to promote is the list of the untyped null, which is the pin's answer for `[]` and is
+    // not a guess at what somebody meant to put in it.
+    assert_eq!(rows(&db, "SELECT typeof([])"), vec![vec![text("\"NULL\"[]")]]);
+    // The same function under its other name.
+    assert_eq!(rows(&db, "SELECT list_pack(1, 2)"), vec![vec![list(&[1, 2])]]);
+}
+
+/// A list cast is a cast of every element. Per #467.
+#[test]
+fn a_list_casts_by_casting_every_element_of_it() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT CAST([1, 2] AS BIGINT[])"),
+        vec![vec![Value::List {
+            element: LogicalType::BigInt,
+            values: vec![Value::BigInt(1), Value::BigInt(2)],
+        }]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT [1, 2]::VARCHAR[]"),
+        vec![vec![Value::List {
+            element: LogicalType::Varchar,
+            values: vec![text("1"), text("2")]
+        }]]
+    );
+    // The element type comes from the target, so an empty list arrives as the thing it was asked to
+    // be rather than staying the list of untyped nulls it was written as.
+    assert_eq!(rows(&db, "SELECT CAST([] AS INTEGER[])"), vec![vec![list(&[])]]);
+    // A depth of two is the same rule again, because the element of a list of lists is a list.
+    assert_eq!(
+        rows(&db, "SELECT CAST([[1], [2]] AS VARCHAR[][])"),
+        vec![vec![Value::List {
+            element: LogicalType::list(LogicalType::Varchar),
+            values: vec![
+                Value::List { element: LogicalType::Varchar, values: vec![text("1")] },
+                Value::List { element: LogicalType::Varchar, values: vec![text("2")] },
+            ],
+        }]]
+    );
+}
+
+/// `TRY_CAST` over a list nulls the element that would not go and keeps the list. Per #467.
+#[test]
+fn a_try_cast_of_a_list_keeps_the_elements_that_went() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT TRY_CAST(['x', '2'] AS INTEGER[])"),
+        vec![vec![Value::List {
+            element: LogicalType::Integer,
+            values: vec![Value::Null, integer(2)],
+        }]]
+    );
+    // Without the TRY it is the element's own failure, reported in the element's types rather than
+    // in the list's.
+    assert_eq!(
+        failure(&db, "SELECT CAST(['x'] AS INTEGER[])"),
+        "Could not convert string 'x' to INT32"
+    );
+    assert_eq!(
+        failure(&db, "SELECT CAST([1, 2] AS BLOB[])"),
+        "Unimplemented type for cast (INTEGER -> BLOB)"
+    );
+    // A list going somewhere that is not a list is the whole list's failure and names the list.
+    assert_eq!(
+        failure(&db, "SELECT CAST([1, 2] AS INTEGER)"),
+        "Unimplemented type for cast (INTEGER[] -> INTEGER)"
+    );
+}
+
 /// What the struct vector changes that a query can see today. Per #594.
 ///
 /// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put

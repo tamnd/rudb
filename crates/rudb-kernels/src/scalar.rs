@@ -2326,6 +2326,16 @@ pub fn call_values(
         let found = args.iter().find(|value| !value.is_null());
         return Ok(found.cloned().unwrap_or(Value::Null));
     }
+    // `list_value` is above the null rule because a null argument is an element of the list rather
+    // than an answer for the whole call. `[1, NULL]` is a list of two things on the pin and not null,
+    // and the difference between a null list and a list holding a null is the difference this whole
+    // family of types exists to keep.
+    if name == "list_value" {
+        let LogicalType::List(element) = returns else {
+            return Err(Error::internal(format!("list_value returning {returns}")));
+        };
+        return Ok(Value::List { element: (**element).clone(), values: args.to_vec() });
+    }
     // `nullif` is above the null rule for the same reason `coalesce` is. It is
     // `CASE WHEN a = b THEN NULL ELSE a END`, and `a = NULL` is null rather than true, so a null on
     // the right hands back the left value instead of blanking it: `nullif(1, NULL)` is 1 upstream.

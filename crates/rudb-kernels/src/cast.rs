@@ -652,6 +652,10 @@ fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
 /// Null casts to null of the target type, which is not a special case so much as the only sensible
 /// reading: there is no value to convert and no conversion can fail.
 ///
+/// A list going to a list is handled here rather than in [`convert`] because `try_cast` has to
+/// reach the elements. `TRY_CAST(['x', '2'] AS INTEGER[])` is `[NULL, 2]` upstream and not `NULL`,
+/// so the element that will not go is the one that becomes null and the list around it survives.
+///
 /// # Errors
 ///
 /// If the value cannot be represented in the target type and `try_cast` is false, or if the pair
@@ -662,6 +666,9 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     }
     if &value.logical_type() == target {
         return Ok(value.clone());
+    }
+    if let (LogicalType::List(wanted), Value::List { values, .. }) = (target, value) {
+        return to_list(values, wanted, try_cast);
     }
     match convert(value, target) {
         Ok(converted) => Ok(converted),
@@ -729,6 +736,27 @@ pub fn percentage(value: &Value) -> Result<f64> {
 /// swallows the same way. Nothing else in this file raises one.
 fn recoverable(error: &Error) -> bool {
     matches!(error.code(), ErrorCode::Conversion | ErrorCode::OutOfRange | ErrorCode::InvalidInput)
+}
+
+/// A list cast one element at a time, into a list of the target's element type.
+///
+/// The element type comes from the target and not from what the elements turned out to be, so an
+/// empty list arrives as an empty list of the type that was asked for. That is what makes
+/// `CAST([] AS INTEGER[])` an empty `INTEGER[]` rather than an empty list of the untyped null, and
+/// it is the case that reaches here most often, because `[]` written in a query is a
+/// `"NULL"[]` until something says otherwise.
+///
+/// A failure is the element's failure and names the element's types, so `CAST([1, 2] AS BLOB[])`
+/// reports `INTEGER -> BLOB` and not `INTEGER[] -> BLOB[]`, which is how upstream reports it.
+///
+/// The recursion is what handles a list of lists, and the depth is the depth of the type written in
+/// the query.
+fn to_list(values: &[Value], wanted: &LogicalType, try_cast: bool) -> Result<Value> {
+    let mut elements = Vec::with_capacity(values.len());
+    for value in values {
+        elements.push(cast_value(value, wanted, try_cast)?);
+    }
+    Ok(Value::List { element: wanted.clone(), values: elements })
 }
 
 fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
