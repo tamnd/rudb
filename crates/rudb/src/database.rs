@@ -432,9 +432,6 @@ impl Database {
 /// be kept alive by every checkpoint for as long as the database is open.
 fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     let names = catalog.stored_tables().map(|table| table.name().clone()).collect::<Vec<_>>();
-    if names.is_empty() {
-        return Err(Error::not_implemented("a native database with no table"));
-    }
     // Nothing to write is every table already in the file and the file holding no other. The second
     // half is what a drop leaves behind: every table that is left is still native, and without
     // asking the file which tables it names the checkpoint would decide there was nothing to do and
@@ -448,13 +445,19 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     if clean && committed(path)?.is_some_and(|held| held == wanted(&names)) {
         return Ok(());
     }
+    // A database with no table in it is still a database, and the file has to say so or the tables
+    // that were dropped out of it are all still there the next time it is opened. There is nothing
+    // to append in that case and nothing to carry forward either, so it goes straight to the
+    // rewrite below it, written as an empty file and renamed over whatever was there.
+    if names.is_empty() {
+        let temporary = scratch(path)?;
+        rudb_native::Writer::empty(&temporary)?;
+        return rename(&temporary, path);
+    }
     if appended(path, catalog, &names)? {
         return rebind(path, catalog, &names);
     }
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    if temporary.exists() {
-        std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
-    }
+    let temporary = scratch(path)?;
     let mut writer: Option<rudb_native::Writer> = None;
     for name in &names {
         let table = catalog.table(name)?;
@@ -474,8 +477,27 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     }
     let writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
     writer.finish()?;
-    std::fs::rename(&temporary, path).map_err(|error| Error::io(error.to_string()))?;
+    rename(&temporary, path)?;
     rebind(path, catalog, &names)
+}
+
+/// A path beside the database for the file being built, with anything left there removed first.
+///
+/// Named after the process, so two processes checkpointing the same database do not write over one
+/// another's half finished file. What is left there by a process that died is this process's to
+/// remove, because the name says it was this process's, and a build that refused would be a build
+/// that never checkpoints again after one crash.
+fn scratch(path: &Path) -> Result<PathBuf> {
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    if temporary.exists() {
+        std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
+    }
+    Ok(temporary)
+}
+
+/// Publishes the file that was built beside the database, which is what makes a rewrite atomic.
+fn rename(temporary: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(temporary, path).map_err(|error| Error::io(error.to_string()))
 }
 
 /// Which tables the committed file names, or `None` for a path nothing has been written to yet.
