@@ -106,4 +106,4 @@ pub use progress::{Blocked, BlockedReason, BufferId, IoToken, MemoryToken, Pipel
 pub use root::{RootPlace, RootReader, RootSink, root, root_in_order};
 pub use serial::run_serial;
 pub use traits::{Sink, Source, Stream};
-pub use watch::Watched;
+pub use watch::{Resumed, Watched};

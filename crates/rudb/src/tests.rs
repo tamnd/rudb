@@ -5838,6 +5838,50 @@ fn no_operator_hangs_under_a_row_that_is_not_there() {
     }
 }
 
+/// The check the harness runs, run here so that a shape which stops adding up is a failing test
+/// rather than a suite that refuses to publish a number weeks later.
+///
+/// Every row an operator was handed came out of the operators under it, so the two counts are the
+/// same rows counted at the two ends of one handover and there is no tolerance on it. The shapes
+/// that have broken it are the two the operator tree is not the plan tree in: a join whose build
+/// side the optimizer turned around, and a cross product, which is called again with what is left of
+/// its own output and would otherwise count that as input.
+#[test]
+fn what_an_operator_was_handed_is_what_the_operators_under_it_produced() {
+    let db = database();
+    for sql in [
+        "SELECT x FROM t WHERE x > 1",
+        "SELECT sum(x) FROM t WHERE x > 1 GROUP BY s ORDER BY 1",
+        "SELECT t.x FROM t JOIN t AS u ON t.x = u.x WHERE t.x > 1",
+        "SELECT t.x FROM t LEFT JOIN t AS u ON t.x = u.x",
+        "SELECT t.x FROM t JOIN t AS u ON t.x > u.x AND t.x < u.x + 5",
+        "SELECT x FROM t WHERE x IN (SELECT x FROM t WHERE x > 1)",
+        "SELECT x FROM t UNION SELECT x FROM t",
+        "WITH c AS MATERIALIZED (SELECT x FROM t WHERE x > 1) SELECT x FROM c ORDER BY 1",
+        "SELECT x, count(*) OVER (PARTITION BY s) FROM t",
+        "SELECT a.x FROM t AS a, t AS b WHERE a.x > b.x",
+    ] {
+        let result = db.query(sql).unwrap_or_else(|error| panic!("{sql} did not run: {error}"));
+        let metrics = result.metrics().expect("a query that ran has metrics");
+        for one in &metrics.operators {
+            let below: u64 = metrics
+                .operators
+                .iter()
+                .filter(|other| other.parent == Some(one.id))
+                .map(|other| other.rows_out)
+                .sum();
+            if !metrics.operators.iter().any(|other| other.parent == Some(one.id)) {
+                continue;
+            }
+            assert_eq!(
+                one.rows_in, below,
+                "{sql}: operator {} ({}) was handed {} rows and the operators under it made {below}",
+                one.id, one.kind, one.rows_in
+            );
+        }
+    }
+}
+
 /// The gathered side feeds the operator that holds it, which is the one place the operator tree is
 /// a different shape than the plan. A reader that walked the plan instead would compare the join's
 /// input against rows the join never saw.

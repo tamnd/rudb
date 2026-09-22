@@ -93,11 +93,25 @@ impl<S: Source> Source for Watched<S> {
     }
 }
 
+/// One instance of a watched stream, and whether the chunk it is handed next is input.
+///
+/// An operator that answers [`Progress::Again`] is called back with the chunk it just produced, once
+/// everything below it has had that chunk, so what is in it on the next call is what is left of its
+/// own output rather than rows anybody gave it. Counting those charges the operator for a share of
+/// its own answer as if it were input, and the input count is the one number a reader uses to check
+/// an operator against what the operators under it produced.
+#[derive(Debug)]
+pub struct Resumed<L> {
+    inner: L,
+    /// Whether the last call said it had more output in the input it already had.
+    resuming: bool,
+}
+
 impl<S: Stream> Stream for Watched<S> {
-    type Local = S::Local;
+    type Local = Resumed<S::Local>;
 
     fn local(&self) -> Self::Local {
-        self.inner.local()
+        Resumed { inner: self.inner.local(), resuming: false }
     }
 
     fn parallel(&self) -> bool {
@@ -143,11 +157,14 @@ impl<S: Stream> Stream for Watched<S> {
         // A stream transforms in place, so the rows it was given have to be counted before the call
         // and the rows it produced after it. A filter that keeps a tenth of its input is the
         // difference between those two numbers and nothing else records it.
-        let taken = rows(chunk);
+        //
+        // Nothing to count on a call that carries on where the last one stopped. See [`Resumed`].
+        let taken = if local.resuming { 0 } else { rows(chunk) };
         let measure = Measure::start(&self.counters);
-        let progress = self.inner.push(chunk, local);
+        let progress = self.inner.push(chunk, &mut local.inner);
         measure.stop(&self.counters);
         if progress.is_ok() {
+            local.resuming = matches!(progress, Ok(Progress::Again));
             self.counters.took(taken);
             self.counters.made(rows(chunk));
         }
