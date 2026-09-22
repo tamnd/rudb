@@ -32,6 +32,9 @@ const SHAPE: &str = "(l_orderkey BIGINT, l_linenumber INTEGER, l_shipdate DATE)"
 /// One calendar month of shipping dates, which is about one row in eighty of the table.
 const MONTH: &str = "WHERE l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'";
 
+/// The calendar quarter that month falls in, which is three times as many rows.
+const QUARTER: &str = "WHERE l_shipdate >= DATE '1995-07-01' AND l_shipdate < DATE '1995-10-01'";
+
 /// The three columns of the cut down lineitem these tests load.
 fn fields() -> Vec<Field> {
     vec![
@@ -162,6 +165,43 @@ fn the_rows_are_bucketed_by_the_declared_width_rather_than_sorted_on_the_column(
         !dates.windows(2).all(|pair| pair[0] <= pair[1]),
         "the dates should not be in order inside the bucket, which is what makes the width a month \
          and not a day"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A declaration that names no width buckets by the quarter, end to end and out of the file.
+///
+/// The width is the one thing about the layout that is a number rather than a shape, and
+/// `14-the-partition-width.md` measured all four of them on SF1 in one sitting: 0.917 of the
+/// unsorted file's instructions at a month against 0.898 at a quarter, because a narrow bucket
+/// costs key locality and delta width and stops buying pruning above a quarter. So the width a
+/// silent declaration gets is a quarter, and this asserts it the way the width is visible from
+/// outside rather than by reading the constant back.
+///
+/// What makes it visible is the second key. Bucketed by quarter, `l_orderkey` runs in order across
+/// a whole quarter. At the month this file used to default to, the same three months are three
+/// runs of keys with a reset at each boundary, so the assertion below fails on a monthly default
+/// and passes on a quarterly one.
+#[test]
+fn a_declaration_that_names_no_width_buckets_by_the_quarter() {
+    let asked = Clustering::over(vec![2, 0, 1], &fields()).expect("a date leads the declaration");
+    assert_eq!(asked.width(), Width::Quarter, "the width the suite measured at 0.898");
+    let (database, path) = loaded("silent", Some(asked));
+
+    let quarter =
+        rows(&database, &format!("SELECT l_shipdate, l_orderkey FROM lineitem {QUARTER}"));
+    assert!(quarter.len() > 3000, "a quarter should be thousands of rows, not {}", quarter.len());
+    let keys: Vec<i64> = quarter
+        .iter()
+        .map(|row| match row[1] {
+            Value::BigInt(key) => key,
+            ref other => panic!("l_orderkey came back as {other:?}"),
+        })
+        .collect();
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the keys should run in order across the whole quarter, which they do not at a month"
     );
 
     let _ = std::fs::remove_file(path);
