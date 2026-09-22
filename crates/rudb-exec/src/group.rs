@@ -179,6 +179,9 @@ pub(crate) struct Aggregate<'a> {
     /// only how many times it has to grow on the way there, so a number that is wrong costs the
     /// growing it was meant to save and costs nothing else. `rudb_opt`'s `presize` pass is where it
     /// comes from and where the reasoning about which numbers are worth acting on lives.
+    ///
+    /// Groups for the whole aggregate, so a table built for a radix partition takes its [`Share`]
+    /// of this rather than all of it.
     presize: Option<u64>,
     /// The groups a pushed down limit keeps, agreed once and used by every instance.
     agreed: Mutex<Option<Agreed>>,
@@ -551,6 +554,32 @@ struct Partition {
 /// halves and the scatter does not move enough to take it back.
 const RADIX_PARTITIONS: usize = 64;
 const DENSE_PARTITIONS: usize = 4;
+
+/// How much of an aggregate's groups one table is being built for.
+///
+/// A presize is a number of groups for the whole aggregate and a table is built per instance and
+/// then per radix partition, so the number has to be read differently depending on which one is
+/// asking. Nothing here changes an answer: a table takes whatever the keys put in it either way and
+/// this only says how much room to take before the first row arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Share {
+    /// Every group the aggregate will produce, which is what an instance sees before it partitions.
+    Whole,
+    /// The groups one of [`RADIX_PARTITIONS`] holds, which is the hash spreading them evenly.
+    Partition,
+}
+
+impl Share {
+    /// The groups to take room for, out of `groups` for the whole aggregate.
+    fn of(self, groups: u64) -> u64 {
+        match self {
+            Self::Whole => groups,
+            // At least one, because a partition that ends up with a group still wants a table and
+            // rounding a small aggregate down to nothing would give it the smallest one twice.
+            Self::Partition => (groups / RADIX_PARTITIONS as u64).max(1),
+        }
+    }
+}
 
 /// How many groups an instance holds before it stops keeping them to itself.
 ///
@@ -1231,7 +1260,7 @@ impl<'a> Aggregate<'a> {
         held: &mut Reservation,
     ) -> Result<Option<Spill>> {
         let mut spilled = Spilled::new(file.read()?, self.spilled_types());
-        let mut local = self.start();
+        let mut local = self.partition();
         if let Some(error) = local.failure.take() {
             return Err(error);
         }
@@ -1254,6 +1283,22 @@ impl<'a> Aggregate<'a> {
     /// aggregate name nothing implements, and [`Sink::local`] has nowhere to put an error, so the
     /// failure is carried in the instance and reported by the first call that can report it.
     fn start(&self) -> Building {
+        self.starting(Share::Whole)
+    }
+
+    /// What one radix partition starts with, which is the same thing over a share of the groups.
+    ///
+    /// There are [`RADIX_PARTITIONS`] of these to an instance and the presize is a number of groups
+    /// for the whole aggregate, so taking room for all of them in each of them takes room for the
+    /// groups sixty four times over. A partition is split by hash bits and the hash spreads, so it
+    /// holds about that many times fewer groups and wants room for about that many times fewer.
+    /// Being wrong here costs a grow and never an answer, which is what lets the share be a
+    /// division rather than a measurement.
+    fn partition(&self) -> Building {
+        self.starting(Share::Partition)
+    }
+
+    fn starting(&self, share: Share) -> Building {
         let calls = self.calls.len();
         let mut local = Building {
             // The keys and the rows made out of them, given back when this pass ends, because by
@@ -1273,7 +1318,7 @@ impl<'a> Aggregate<'a> {
             table: {
                 let types: Vec<_> =
                     self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
-                match self.presize {
+                match self.presize.map(|groups| share.of(groups)) {
                     Some(groups) => Table::with_groups(&types, groups),
                     None => Table::new(&types),
                 }
@@ -2171,7 +2216,7 @@ impl<'a> Aggregate<'a> {
                 }
                 let mut held = self.merged[at].lock().map_err(poisoned)?;
                 let Partition { table, carried, .. } = &mut *held;
-                let into = table.get_or_insert_with(|| self.start());
+                let into = table.get_or_insert_with(|| self.partition());
                 if into.over.is_none() {
                     let grown =
                         self.fold_slots(&mut coming, &source, &keys, start, &buckets[at], into)?;
@@ -2193,7 +2238,7 @@ impl<'a> Aggregate<'a> {
                 }
                 let grown = self.fold_slots(&mut coming, &source, &keys, start, &here, into)?;
                 charge(into, grown)?;
-                let waiting = carried.get_or_insert_with(|| self.start());
+                let waiting = carried.get_or_insert_with(|| self.partition());
                 let grown = self.fold_slots(&mut coming, &source, &keys, start, &late, waiting)?;
                 charge(waiting, grown)?;
             }
@@ -2700,7 +2745,7 @@ impl<'a> Aggregate<'a> {
         let ready = self.split(rows, spreading)?;
         for (partition, selected) in ready.iter().enumerate() {
             let Some(selected) = selected else { continue };
-            let table = own[partition].get_or_insert_with(|| self.start());
+            let table = own[partition].get_or_insert_with(|| self.partition());
             if let Some(error) = table.failure.take() {
                 return Err(error);
             }
@@ -2769,7 +2814,7 @@ impl<'a> Aggregate<'a> {
                 if bucket.is_empty() {
                     continue;
                 }
-                let into = own[at].get_or_insert_with(|| self.start());
+                let into = own[at].get_or_insert_with(|| self.partition());
                 let grown = self.fold_slots(&mut coming, &source, &keys, start, bucket, into)?;
                 charge(into, grown)?;
             }
@@ -2813,7 +2858,7 @@ impl<'a> Aggregate<'a> {
             let Some(selected) = &ready[partition] else { continue };
             match self.merged[partition].try_lock() {
                 Ok(mut held) => {
-                    let table = held.table.get_or_insert_with(|| self.start());
+                    let table = held.table.get_or_insert_with(|| self.partition());
                     self.fold(selected, table, Some(&keyed[partition]))?;
                 }
                 Err(TryLockError::WouldBlock) => waiting.push(partition),
@@ -2824,7 +2869,7 @@ impl<'a> Aggregate<'a> {
             let selected =
                 ready[partition].as_ref().expect("only a filled partition was put aside");
             let mut held = self.merged[partition].lock().map_err(poisoned)?;
-            let table = held.table.get_or_insert_with(|| self.start());
+            let table = held.table.get_or_insert_with(|| self.partition());
             self.fold(selected, table, Some(&keyed[partition]))?;
         }
         Ok(())
@@ -5583,7 +5628,8 @@ mod tests {
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
         EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition, FixedRecord,
-        FixedRuns, Signed, bigint_distinct_partition, encoded_count_partition, fixed_partition,
+        FixedRuns, RADIX_PARTITIONS, Share, Signed, bigint_distinct_partition,
+        encoded_count_partition, fixed_partition,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -6634,5 +6680,25 @@ mod tests {
             ]
         );
         assert_eq!(size_of::<FixedRecord>(), 16);
+    }
+
+    #[test]
+    fn an_instance_takes_room_for_every_group() {
+        assert_eq!(Share::Whole.of(8 << 20), 8 << 20);
+        assert_eq!(Share::Whole.of(1), 1);
+    }
+
+    #[test]
+    fn a_partition_takes_room_for_its_share() {
+        let groups = 8 << 20;
+        assert_eq!(Share::Partition.of(groups), groups / RADIX_PARTITIONS as u64);
+        assert_eq!(Share::Partition.of(6400), 100);
+    }
+
+    #[test]
+    fn a_partition_of_a_small_aggregate_still_gets_a_group() {
+        for groups in 0..RADIX_PARTITIONS as u64 {
+            assert_eq!(Share::Partition.of(groups), 1, "{groups} groups");
+        }
     }
 }
