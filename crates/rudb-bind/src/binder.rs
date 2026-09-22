@@ -1927,7 +1927,7 @@ impl<'a> Binder<'a> {
             .map(|(&expr, ty)| self.checked_cast_to(expr, ty, false))
             .collect::<Result<_>>()?;
 
-        if resolved.function.takes_a_name() {
+        if resolved.function.answered_when_bound() {
             let Columns::Fixed(fields) = resolved.columns else {
                 return Err(Error::internal("a pragma that resolved to a file"));
             };

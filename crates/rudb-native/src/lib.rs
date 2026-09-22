@@ -521,6 +521,42 @@ impl Layout {
     }
 }
 
+/// How one part of one column is stored, which is one row of `pragma_storage_info`.
+///
+/// Everything here is read off the file rather than worked out from the schema, because the whole
+/// question this answers is what the encoder chose, and the encoder chooses per part. Two files
+/// holding the same rows in a different order give different answers and that difference is the
+/// reason to ask.
+///
+/// The encoding costs a read of the column's page, so this is not free the way [`Layout`] is. It is
+/// one read per column per stripe rather than one per part, because a part is a few kilobytes out
+/// of a page that is a quarter of a megabyte.
+#[derive(Debug, Clone)]
+pub struct StoredPart {
+    /// Which stripe the part belongs to.
+    pub stripe: usize,
+    /// Which part of that stripe it is, counting from zero inside the stripe.
+    pub part: usize,
+    /// The table wide row number the part starts at.
+    pub row: usize,
+    /// How many rows it holds.
+    pub rows: usize,
+    /// What the encoder made of it, as a line of text like `DICT(PACKED, PACKED)`.
+    pub encoding: String,
+    /// The stored bytes of the part, which is what it costs in the file.
+    pub bytes: u64,
+    /// Where in the file the column page holding this part starts.
+    pub page: u64,
+    /// Where in that page the part starts.
+    pub offset: u64,
+    /// The smallest value the part holds, when the stored ranges say.
+    pub low: Option<Value>,
+    /// The largest, same.
+    pub high: Option<Value>,
+    /// How many of its rows are null, when the stored ranges say.
+    pub nulls: Option<usize>,
+}
+
 /// Appends pages and commits a new directory for one table.
 #[derive(Debug)]
 struct GlobalDictionary {
@@ -2811,6 +2847,63 @@ impl Reader {
             directory: self.directory,
             header: HEADER,
         }
+    }
+
+    /// What every part of one column is stored as, which is what `pragma_storage_info` reports.
+    ///
+    /// Unlike [`Self::layout`] this reads the data, because the encoder's choice is in the page and
+    /// nowhere else. The directory says how many bytes a column took and says nothing about what
+    /// shape they are in, and the shape is the question worth asking: the same rows in a different
+    /// order come back bit packed on one file and plain on another, and that is the difference a
+    /// clustered load makes to a scan.
+    ///
+    /// One read per stripe rather than one per part. A part is a few kilobytes out of a page that
+    /// is a quarter of a megabyte, so asking part by part would read the same page sixty four
+    /// times. Nothing is put in the page cache, because a caller asking what a file looks like is
+    /// not about to scan it and evicting the pages a real query wants would be a poor trade.
+    ///
+    /// # Errors
+    ///
+    /// If the column is outside the schema, or a page, index section or checksum is invalid.
+    pub fn stored(&self, column: usize) -> Result<Vec<StoredPart>> {
+        let field = self
+            .table
+            .fields
+            .get(column)
+            .ok_or_else(|| invalid("stored column index out of range"))?;
+        let mut stored = Vec::with_capacity(self.places.len());
+        let mut row = 0;
+        for (at, stripe) in self.table.stripes.iter().enumerate() {
+            let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
+            let index = read_index(&self.file, stripe, column)?;
+            let mut bytes = vec![0; page.length as usize];
+            read_at(&self.file, page.offset, &mut bytes)?;
+            let ranges = self.stripe_part_ranges(at, column);
+            for (part, &rows) in stripe.parts.iter().enumerate() {
+                let span = *index.get(part).ok_or_else(|| invalid("part index out of range"))?;
+                let held = part_bytes(&bytes, span)?;
+                let range = ranges.and_then(|held| held.get(part));
+                stored.push(StoredPart {
+                    stripe: at,
+                    part,
+                    row,
+                    rows: rows as usize,
+                    encoding: page_encoding(&field.ty, rows as usize, held),
+                    bytes: span.length as u64,
+                    page: page.offset,
+                    offset: span.start as u64,
+                    low: range
+                        .and_then(|range| range.low.clone())
+                        .and_then(|bound| bound.into_value(&field.ty)),
+                    high: range
+                        .and_then(|range| range.high.clone())
+                        .and_then(|bound| bound.into_value(&field.ty)),
+                    nulls: range.map(|range| range.nulls),
+                });
+                row += rows as usize;
+            }
+        }
+        Ok(stored)
     }
 
     /// How many parts the table has, which is how many chunks a scan of it reads.
@@ -5784,6 +5877,48 @@ fn open_global_dictionary(
     )
 }
 
+/// What a stored page is, without decoding a value out of it.
+///
+/// Two layers, and both of them belong in the answer. The codec byte at the front of every page is
+/// the format's own choice, and it is what says whether the column came back as codes into a table
+/// wide dictionary, as a bit packed page, as an encoding cascade or as the bytes themselves. Under
+/// the cascade codecs there is a second choice the encoder made per chunk, and that is what
+/// [`integer::describe`] and [`string::describe`] already write out as `DICT(PACKED, PACKED)`.
+///
+/// This mirrors the tags [`decode`] reads and has to be kept beside it. A page whose header this
+/// cannot walk comes back as text rather than as an error, because a caller asking what a file
+/// looks like is usually asking because something is wrong with it, and a report that stops at the
+/// first bad page is a report that says nothing about the other nine hundred.
+fn page_encoding(ty: &LogicalType, rows: usize, bytes: &[u8]) -> String {
+    /// The page header is the codec, the validity tag and, for a page that stores a mask, the mask.
+    fn cascade_at(rows: usize, bytes: &[u8]) -> Result<(u8, usize)> {
+        let mut cur = Cursor { bytes, at: 0 };
+        let codec = cur.u8()?;
+        if cur.u8()? == 2 {
+            cur.take(rows.div_ceil(8))?;
+        }
+        Ok((codec, cur.at))
+    }
+    let Ok((codec, at)) = cascade_at(rows, bytes) else {
+        return "UNREADABLE".to_string();
+    };
+    let tail = &bytes[at..];
+    let described = |described: Result<String>| described.unwrap_or_else(|_| "UNREADABLE".into());
+    match codec {
+        0 => match ty {
+            LogicalType::Varchar | LogicalType::Blob => "PLAIN".to_string(),
+            _ => "FIXED".to_string(),
+        },
+        1 => "DICT(PLAIN)".to_string(),
+        2 => "FOR+BITPACK".to_string(),
+        3 => "TABLE DICT".to_string(),
+        4 => format!("TABLE DICT({})", described(integer::describe(tail))),
+        5 => described(integer::describe(tail)),
+        6 => described(string::describe(tail)),
+        other => format!("CODEC {other}"),
+    }
+}
+
 fn decode(
     ty: &LogicalType,
     rows: usize,
@@ -6806,6 +6941,95 @@ mod tests {
         assert_eq!(shortened(Some(Bound::Bytes(long.clone())), true), None);
         let low = shortened(Some(Bound::Bytes(long)), false).expect("a low end is still a prefix");
         assert_eq!(low, Bound::Bytes(vec![u8::MAX; PART_BOUND_BYTES]));
+    }
+
+    /// What a column is stored as, asked of two files holding the same rows in a different order.
+    ///
+    /// This is the question the report exists to answer and it is the one the directory cannot. The
+    /// two files have the same rows, the same schema and the same number of parts, and the column
+    /// comes out four times smaller in one of them, because ascending keys delta encode to a few
+    /// bits a row and shuffled ones do not. Nothing about the file's shape says so. The page header
+    /// says so, and reading it is what this does.
+    ///
+    /// It is q18 on TPC-H in miniature: clustering lineitem by ship date leaves `l_orderkey`
+    /// ascending inside a partition but sparse, its deltas go from six bits to twelve, and the scan
+    /// pays for the wider ones.
+    #[test]
+    fn what_a_column_is_stored_as_follows_the_order_the_rows_were_written_in() {
+        let parts = 4;
+        let per_part = 1024;
+        let rows = parts * per_part;
+        let written = |name: &str, keys: &[i64]| {
+            let path = path(name);
+            let fields = vec![Field::required("key", LogicalType::BigInt)];
+            let mut writer = Writer::create(&path, "keys", fields).expect("new file");
+            for part in 0..parts {
+                let values: Vec<Value> = keys[part * per_part..(part + 1) * per_part]
+                    .iter()
+                    .map(|key| Value::BigInt(*key))
+                    .collect();
+                let chunk = Chunk::new(vec![
+                    Vector::from_values(LogicalType::BigInt, &values).expect("numbers"),
+                ])
+                .expect("one column");
+                writer.append(&chunk).expect("one part");
+            }
+            writer.finish().expect("commit");
+            path
+        };
+        // Ascending with a small irregular step, which is what a key column in arrival order looks
+        // like: an order has one to seven line items, so the key repeats and then moves on by one.
+        let climbing = |step: &dyn Fn(usize) -> i64| {
+            let mut key = 0;
+            (0..rows)
+                .map(|row| {
+                    key += step(row);
+                    key
+                })
+                .collect::<Vec<i64>>()
+        };
+        let ascending = climbing(&|row| (row % 3) as i64);
+        // The same rows in the same direction over a range a thousand times wider, which is what a
+        // partition of a clustered table holds: still ascending, and far enough apart that the
+        // deltas no longer fit in a handful of bits.
+        let sparse = climbing(&|row| ((row * 2_654_435_761) % 4096) as i64);
+        let near_path = written("stored-near", &ascending);
+        let far_path = written("stored-far", &sparse);
+
+        let one = Reader::open(&near_path).expect("reopen from disk");
+        let other = Reader::open(&far_path).expect("reopen from disk");
+        let near = one.stored(0).expect("the column is stored");
+        let far = other.stored(0).expect("the column is stored");
+        assert_eq!(near.len(), parts, "one row per part");
+        assert_eq!(far.len(), parts);
+        // The bytes are the same bytes the directory totals, which is the check that this is
+        // reading the pages the file really holds rather than some other pages.
+        let total = |stored: &[StoredPart]| stored.iter().map(|part| part.bytes).sum::<u64>();
+        assert_eq!(total(&near), one.layout().columns[0].pages);
+        assert_eq!(total(&far), other.layout().columns[0].pages);
+        assert!(
+            total(&near) * 2 < total(&far),
+            "the sparse keys cost more, {} against {}",
+            total(&far),
+            total(&near)
+        );
+        // Every part accounted for, in order, with the row it starts at following the one before.
+        for (at, part) in near.iter().enumerate() {
+            assert_eq!(part.part, at);
+            assert_eq!(part.row, at * per_part);
+            assert_eq!(part.rows, per_part);
+            let held = &ascending[at * per_part..(at + 1) * per_part];
+            assert_eq!(part.low, Some(Value::BigInt(held[0])));
+            assert_eq!(part.high, Some(Value::BigInt(held[per_part - 1])));
+            assert_eq!(part.nulls, Some(0));
+        }
+        // And the encoding is a line of text that names what the encoder chose, which is the whole
+        // point. Both are a cascade over deltas and the widths inside them are what differ.
+        assert!(near[0].encoding.contains("DELTA"), "{}", near[0].encoding);
+        assert!(far[0].encoding.contains("DELTA"), "{}", far[0].encoding);
+        assert_ne!(near[0].encoding, far[0].encoding);
+        fs::remove_file(near_path).expect("remove scratch file");
+        fs::remove_file(far_path).expect("remove scratch file");
     }
 
     /// A sieve bigger than the part it indexes is not written, and one smaller than it still is.

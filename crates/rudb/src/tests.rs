@@ -3298,6 +3298,70 @@ fn the_size_pragma_reports_the_attached_database_and_the_live_memory_budget() {
     assert_eq!(after[0], rows(&db, "SELECT current_setting('memory_limit')").remove(0)[0]);
 }
 
+/// The storage pragma answers in the pin's sixteen columns, and says nothing about rows that have
+/// not been written down.
+///
+/// Both halves matter. The width is the contract a client reads, so it is spelled out here rather
+/// than taken from the builder the implementation uses, which would agree with itself whatever it
+/// said. The empty answer is the honest one for a table living in memory: the encoder has not run
+/// on those rows and will not until a checkpoint, so there is no encoding to report and a row
+/// claiming the chunk is stored plain would be a lie. What a real file says is in
+/// `tests/storage.rs`, which needs a file to say it.
+#[test]
+fn the_storage_pragma_answers_in_sixteen_columns_and_leaves_unwritten_rows_out() {
+    let db = database();
+    let result = db.query("SELECT * FROM pragma_storage_info('t')").expect("the pragma ran");
+    assert_eq!(
+        result.names(),
+        [
+            "row_group_id",
+            "column_name",
+            "column_id",
+            "column_path",
+            "segment_id",
+            "segment_type",
+            "start",
+            "count",
+            "compression",
+            "stats",
+            "has_updates",
+            "persistent",
+            "block_id",
+            "block_offset",
+            "segment_info",
+            "additional_block_ids",
+        ]
+    );
+    assert_eq!(
+        result.types(),
+        [
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::Boolean,
+            LogicalType::Boolean,
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::list(LogicalType::BigInt),
+        ]
+    );
+    assert_eq!(result.len(), 0, "nothing is on disk here, so nothing is stored in any form");
+    // The name goes through the catalog like any other, so a table that is not there says what the
+    // catalog says and not something of this function's own.
+    assert_eq!(
+        failure(&db, "SELECT * FROM pragma_storage_info('nope')"),
+        "Table with name nope does not exist!"
+    );
+}
+
 /// `PRAGMA name` is the call it stands for, so the statement form answers what the function does.
 #[test]
 fn the_pragma_statement_answers_what_the_function_of_that_name_answers() {

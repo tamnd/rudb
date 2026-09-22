@@ -221,6 +221,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbGrammarExtensions,
     TableFunction::PragmaTableInfo,
     TableFunction::PragmaShow,
+    TableFunction::PragmaStorageInfo,
     TableFunction::PragmaVersion,
     TableFunction::PragmaPlatform,
     TableFunction::PragmaUserAgent,
@@ -238,7 +239,8 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::PragmaTableInfo
-        | TableFunction::PragmaShow => vec![1],
+        | TableFunction::PragmaShow
+        | TableFunction::PragmaStorageInfo => vec![1],
         TableFunction::RudbStrategies
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
@@ -269,7 +271,8 @@ const fn positional_type(function: TableFunction) -> &'static str {
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::PragmaTableInfo
-        | TableFunction::PragmaShow => "VARCHAR",
+        | TableFunction::PragmaShow
+        | TableFunction::PragmaStorageInfo => "VARCHAR",
         _ => "BIGINT",
     }
 }
