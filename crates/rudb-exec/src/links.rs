@@ -7,16 +7,17 @@
 //! mixed: section 2.3 of spec/graph/02-the-data-model.md says a declaration is what somebody
 //! believes and a build is what is true.
 //!
-//! A reader asks this one of three questions. Is my relationship known at all, which is whether it
+//! A reader asks this one of four questions. Is my relationship known at all, which is whether it
 //! has a row. Was it verified, which is the cardinality column and is the difference between a join
-//! that can use a structure and one that has to hash. And what does it cost, which is the bytes,
-//! filled whether or not the structure was kept so that section 3.7's budget is a number somebody
-//! can act on rather than a silence.
+//! that can use a structure and one that has to hash. What does it cost, which is the bytes, filled
+//! whether or not the structure was kept so that section 3.7's budget is a number somebody can act
+//! on rather than a silence. And what shape did it turn out to have, which is the degree columns
+//! and is the only group here that says something about the data rather than about the file.
 
 use rudb_catalog::{Catalog, Rows, Table};
 use rudb_common::{Result, Session, Value};
 use rudb_functions::link_fields;
-use rudb_graph::{Cardinality, Relationship, Side, parse_links};
+use rudb_graph::{Cardinality, Degrees, Relationship, Side, parse_links};
 use rudb_native::graph::Edge;
 use rudb_plan::{Plan, Slice};
 
@@ -50,6 +51,7 @@ pub(crate) fn links(
 fn row(catalog: &Catalog, link: &Relationship) -> Vec<Value> {
     let stored = key_map_of(catalog, &link.parent);
     let held = forward_link_of(catalog, link);
+    let shape = degrees_of(catalog, link);
     let (cardinality, note) = verdict(catalog, link, stored.as_ref(), held.as_ref());
     vec![
         text(&link.name()),
@@ -66,8 +68,23 @@ fn row(catalog: &Catalog, link: &Relationship) -> Vec<Value> {
         held.as_ref().map_or(Value::Null, |held| {
             Value::BigInt(i64::try_from(held.bytes()).unwrap_or(i64::MAX))
         }),
+        shape.as_ref().map_or(Value::Null, |shape| Value::Double(shape.mean())),
+        shape.as_ref().map_or(Value::Null, |shape| Value::BigInt(clamp(shape.highest()))),
+        shape.as_ref().map_or(Value::Null, |shape| Value::BigInt(clamp(shape.percentile(0.99)))),
+        shape.as_ref().and_then(Degrees::locality).map_or(Value::Null, Value::Double),
+        shape.as_ref().map_or(Value::Null, |shape| Value::Boolean(shape.unique())),
+        shape.as_ref().map_or(Value::Null, |shape| Value::Boolean(shape.total())),
         note.map_or(Value::Null, text),
     ]
+}
+
+/// A degree that fits in the signed integer the column is.
+///
+/// A degree past nine quintillion is one this codebase will not meet, and saturating is the right
+/// answer for the one place it could come from: the last histogram bucket's bound, which is already
+/// a bound rather than a count.
+fn clamp(degree: u64) -> i64 {
+    i64::try_from(degree).unwrap_or(i64::MAX)
 }
 
 /// A key map found in a table, reduced to what the table reports.
@@ -118,6 +135,19 @@ fn forward_link_of(catalog: &Catalog, link: &Relationship) -> Option<rudb_graph:
         parent_column: parent.column_index(parent_key)?,
     };
     rudb_native::graph::stored_link(child_rows, parent_rows, &edge)
+}
+
+/// What the link build measured of a relationship's shape, when the child table carries it.
+///
+/// This asks the child table alone, because a degree section is about the child column and has no
+/// parent binding to check. There is no separate check that the link is stored, and there does not
+/// need to be: the build attaches the two together under the same id and stamps them with the same
+/// generation, so a file cannot hold one of them current without the other.
+fn degrees_of(catalog: &Catalog, link: &Relationship) -> Option<Degrees> {
+    let [child_key] = &link.child.columns[..] else { return None };
+    let child = table_named(catalog, &link.child.table)?;
+    let Rows::Native(rows) = child.rows() else { return None };
+    rudb_native::graph::stored_degrees(rows, child.column_index(child_key)?)
 }
 
 /// The first table of that name in any schema of any database.

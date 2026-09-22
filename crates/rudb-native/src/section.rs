@@ -64,10 +64,22 @@ pub const SUMMARY: &[u8; 8] = b"RUDBCS1\0";
 /// A column's sketches, per `spec/stats/03-the-file-format.md` section 3.4.
 pub const SKETCHES: &[u8; 8] = b"RUDBSK1\0";
 
+/// A relationship's degree distribution and certificates, per `spec/stats/07-graph-statistics.md`.
+///
+/// Written by the graph layer, because it comes out of the pass the forward link build is already
+/// making, and owned by the statistics document, because nothing in it is needed to resolve a
+/// relationship. Its id is the child column, the same as the forward link it describes, so the two
+/// are found the same way and a rebuild replaces both.
+pub const DEGREES: &[u8; 8] = b"RUDBGD1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
 /// The kinds the statistics document owns, which share its two percent.
+///
+/// Ownership here is about which budget pays, not about which builder writes. [`DEGREES`] is
+/// written by the link build and is on this list, because it is a planning hint that a reader can
+/// drop without losing a relationship, which is the line the two documents are divided along.
 ///
 /// Two lists rather than one because the two budgets are separate, and separate means each counts
 /// only what it owns. A statistics build that counted the key maps as already spent would be a
@@ -79,7 +91,7 @@ pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 /// better answer available, since this build cannot know which document invented it, and charging
 /// it to both would make every budget here tighter than the document says by an amount that depends
 /// on what some other build did.
-pub const STATISTICS_KINDS: &[&[u8; 8]] = &[SUMMARY, SKETCHES];
+pub const STATISTICS_KINDS: &[&[u8; 8]] = &[SUMMARY, SKETCHES, DEGREES];
 
 /// One entry in a table's section table.
 ///
@@ -188,7 +200,7 @@ impl Section {
     /// payload is never read.
     #[must_use]
     pub fn known(&self) -> bool {
-        matches!(&self.kind, KEY_MAP | FORWARD_LINK | ADJACENCY | SUMMARY | SKETCHES)
+        matches!(&self.kind, KEY_MAP | FORWARD_LINK | ADJACENCY | SUMMARY | SKETCHES | DEGREES)
     }
 
     /// Whether this section's kind is one of these, which is how a budget finds what it owns.
