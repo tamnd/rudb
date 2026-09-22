@@ -97,6 +97,45 @@ impl Bound {
     }
 }
 
+/// The share a `LIMIT` written as a percentage names.
+///
+/// The two arms are the two things somebody can write. `LIMIT 30 PERCENT` and `LIMIT 30%` are a
+/// number the binder works out, and the check that it is between nought and a hundred happens while
+/// the query is bound. `LIMIT (SELECT 30)%` is a number nobody has before the query runs, so it
+/// arrives as a column of the input exactly the way a [`Bound::Read`] count does, and the range
+/// check moves to where the value turns up.
+///
+/// A share the query wrote as a subquery is always written with the sign rather than the word,
+/// because the grammar refuses `PERCENT` after a closing bracket, in both engines. That is a rule
+/// about spelling and not about what the node can hold.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Share {
+    /// A percentage the binder worked out, from nought to a hundred.
+    Percent(f64),
+    /// A column of the input holding the percentage, the same in every row.
+    Read(ExprRef),
+}
+
+impl Share {
+    /// The percentage, when it is one already.
+    #[must_use]
+    pub fn percent(self) -> Option<f64> {
+        match self {
+            Self::Percent(percent) => Some(percent),
+            Self::Read(_) => None,
+        }
+    }
+
+    /// The column this reads, when it reads one.
+    #[must_use]
+    pub fn read(self) -> Option<ExprRef> {
+        match self {
+            Self::Read(expr) => Some(expr),
+            Self::Percent(_) => None,
+        }
+    }
+}
+
 /// One logical operator.
 ///
 /// Children are the inputs, in the order [`Node::children`] returns them, which is the order they
@@ -295,17 +334,22 @@ pub enum Node {
     /// the sort has finished. And the pin builds a separate `Limit Percent` operator for it, which
     /// is the same split one layer down.
     ///
-    /// The percentage is between nought and a hundred inclusive, checked while the query is bound,
-    /// because that is where the pin refuses `LIMIT 101 PERCENT` too. The offset is applied after
-    /// the share has been worked out, so `LIMIT 30 PERCENT OFFSET 2` over ten rows is three rows
-    /// starting at the third.
+    /// A share the binder worked out is between nought and a hundred inclusive, checked while the
+    /// query is bound, because that is where the pin refuses `LIMIT 101 PERCENT` too. The offset is
+    /// applied after the share has been worked out, so `LIMIT 30 PERCENT OFFSET 2` over ten rows is
+    /// three rows starting at the third.
+    ///
+    /// Both fields can be read off the rows instead of being a number written down here, for the
+    /// same reason a plain limit's count can. `LIMIT (SELECT 30)% OFFSET (SELECT 2)` holds two
+    /// numbers nobody has before the query runs, so each arrives as a column of the input and is
+    /// read off the first chunk. See [`Share`] and [`Bound`].
     LimitPercent {
         /// The input.
         input: NodeRef,
         /// The share of the input to emit, from nought to a hundred.
-        percent: f64,
-        /// How many rows to skip first.
-        offset: u64,
+        percent: Share,
+        /// How many rows to skip first. Never [`Bound::All`], which is not an offset.
+        offset: Bound,
     },
     /// A sort with a limit over it, which never holds more rows than the limit can emit.
     ///
@@ -745,7 +789,7 @@ mod tests {
             Node::Aggregate { input: 0, index: 0, groups: Slice::EMPTY, aggregates: Slice::EMPTY },
             Node::Sort { input: 0, keys: Slice::EMPTY },
             Node::Limit { input: 0, count: Bound::All, offset: Bound::Rows(0) },
-            Node::LimitPercent { input: 0, percent: 50.0, offset: 0 },
+            Node::LimitPercent { input: 0, percent: Share::Percent(50.0), offset: Bound::Rows(0) },
             Node::Distinct { input: 0, on: Slice::EMPTY },
             Node::Join {
                 left: 0,

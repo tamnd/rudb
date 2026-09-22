@@ -23,12 +23,12 @@ use rudb_functions::{
     Columns, FILE_ROW_NUMBER, FunctionKind, Given, Resolved, TableFunction, csv_fields, csv_given,
     files, is_file, is_pattern, kind_of, parquet_footers, resolve, resolve_pragma, resolve_table,
 };
-use rudb_kernels::{cast_value, row_count};
+use rudb_kernels::{percentage, row_count};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
 use rudb_plan::{
     Bound, BuildSide, ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
-    SetOpKind, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    SetOpKind, Share, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 use crate::expr::{describe, has_aggregate};
@@ -1397,32 +1397,55 @@ impl<'a> Binder<'a> {
     ) -> Result<NodeRef> {
         let waiting = self.scalar_subqueries.len();
         if query.limit_percent {
-            let percent = self.constant_percent(ast, query.limit)?;
-            let offset = self.count_bound(ast, query.offset, "OFFSET")?;
-            let offset = self.settled(offset, "OFFSET")?;
-            return Ok(match percent {
-                Some(percent) => self.add_node(Node::LimitPercent { input, percent, offset }),
+            let percent = self.share(ast, query.limit)?;
+            let offset = self.skipped(ast, query.offset)?;
+            let node = |binder: &mut Self, input| match percent {
+                Some(percent) => binder.add_node(Node::LimitPercent { input, percent, offset }),
                 // A null share is no limit at all, the same as a null row count, so what is left
                 // is whatever the offset asked for.
-                None => self.limited(input, Bound::All, Bound::Rows(offset)),
-            });
+                None => binder.limited(input, Bound::All, offset),
+            };
+            return self.over_subqueries(waiting, input, scope, node);
         }
         let count = self.count_bound(ast, query.limit, "LIMIT")?;
-        // An offset the query left off is nought rows skipped, where a limit it left off is every
-        // row emitted, so the two clauses read the same word differently.
-        let offset = match self.count_bound(ast, query.offset, "OFFSET")? {
+        let offset = self.skipped(ast, query.offset)?;
+        let node = |binder: &mut Self, input| binder.limited(input, count, offset);
+        self.over_subqueries(waiting, input, scope, node)
+    }
+
+    /// The offset a query wrote, as nought rows skipped when it wrote none.
+    ///
+    /// An offset the query left off is nought rows skipped, where a limit it left off is every row
+    /// emitted, so the two clauses read the same word differently.
+    fn skipped(&mut self, ast: &Ast, written: ast::ExprRef) -> Result<Bound> {
+        Ok(match self.count_bound(ast, written, "OFFSET")? {
             Bound::All => Bound::Rows(0),
             named => named,
-        };
+        })
+    }
+
+    /// Builds a limit node over `input`, joining in whatever queries its bounds turned out to need.
+    ///
+    /// A bound the binder could not work out reads its number off a column, and that column comes
+    /// from a query joined in underneath. The join puts a column in the rows nobody asked for, so a
+    /// projection over the limit drops it again and the scope is told to read that projection. When
+    /// no query had to be joined in there is nothing to drop and the limit stands on its own.
+    fn over_subqueries(
+        &mut self,
+        waiting: usize,
+        input: NodeRef,
+        scope: &mut Scope,
+        node: impl FnOnce(&mut Self, NodeRef) -> NodeRef,
+    ) -> Result<NodeRef> {
         let joined = self.scalar_subqueries.split_off(waiting);
         if joined.is_empty() {
-            return Ok(self.limited(input, count, offset));
+            return Ok(node(self, input));
         }
         let mut input = input;
         for pending in joined {
             input = self.attach_subquery(input, pending);
         }
-        let limit = self.add_node(Node::Limit { input, count, offset });
+        let limit = node(self, input);
         Ok(self.reproject(limit, scope))
     }
 
@@ -1433,21 +1456,6 @@ impl<'a> Binder<'a> {
             return input;
         }
         self.add_node(Node::Limit { input, count, offset })
-    }
-
-    /// The number a bound holds, for the one caller that has nowhere to put a column.
-    ///
-    /// A share of the input reads its offset through this, because `LIMIT 30 PERCENT` builds a
-    /// node that takes a number and not a [`Bound`], and a share written as a subquery is refused
-    /// a few lines above this anyway.
-    fn settled(&self, bound: Bound, clause: &str) -> Result<u64> {
-        match bound {
-            Bound::Rows(rows) => Ok(rows),
-            Bound::All => Ok(0),
-            Bound::Read(_) => Err(Error::not_implemented(format!(
-                "{clause} holding a subquery beside a LIMIT written as a percentage"
-            ))),
-        }
     }
 
     /// A projection over `node` handing back exactly the columns `scope` names.
@@ -1481,7 +1489,13 @@ impl<'a> Binder<'a> {
     /// `EXPLAIN` on the pinned binary, so it is refused while the query is planned and not when it
     /// is run, and a `NAN` is outside the range like any other value that is not between nought and
     /// a hundred.
-    fn constant_percent(&mut self, ast: &Ast, written: ast::ExprRef) -> Result<Option<f64>> {
+    ///
+    /// What the binder cannot work out is a subquery and a call that answers differently every
+    /// time, the same two things a row count cannot work out, and those become a [`Share::Read`]
+    /// over the expression. The value is checked where it turns up instead, which is the executor.
+    /// Only the sign can be written that way, because the grammar refuses `PERCENT` after a closing
+    /// bracket, but nothing below here depends on which of the two was typed.
+    fn share(&mut self, ast: &Ast, written: ast::ExprRef) -> Result<Option<Share>> {
         if written == NONE {
             return Ok(None);
         }
@@ -1489,24 +1503,18 @@ impl<'a> Binder<'a> {
         let scope = Scope::empty();
         let bound = self.bind_expr(ast, written, &scope)?;
         let Some(value) = fold::value_of(&self.plan, bound)? else {
-            return Err(Error::not_implemented("a LIMIT holding a subquery"));
+            return Ok(Some(Share::Read(bound)));
         };
         if value.is_null() {
             return Ok(None);
         }
-        let cast = cast_value(&value, &LogicalType::Double, false)?;
-        let Value::Double(percent) = cast else {
-            return Err(Error::binder(format!(
-                "LIMIT takes a percentage, not a value of type {}",
-                value.logical_type()
-            )));
-        };
+        let percent = percentage(&value)?;
         if !(0.0..=100.0).contains(&percent) {
             return Err(Error::out_of_range(
                 "Limit percent out of range, should be between 0% and 100%",
             ));
         }
-        Ok(Some(percent))
+        Ok(Some(Share::Percent(percent)))
     }
 
     /// The row count a `LIMIT` or an `OFFSET` names.

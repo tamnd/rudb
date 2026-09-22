@@ -10,7 +10,8 @@
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
     Arm, Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
-    NodeRef, Plan, SetOpKind, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    NodeRef, Plan, SetOpKind, Share, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame,
+    WindowUnit,
 };
 
 /// Print, read, print, and insist the two dumps agree. Returns the dump so a test can also assert
@@ -365,12 +366,43 @@ fn a_percentage_limit_survives_the_round_trip() {
     ] {
         let mut plan = Plan::new();
         let scan = get(&mut plan, "a", 0, &[("x", LogicalType::Integer)]);
-        let limit = plan.add_node(Node::LimitPercent { input: scan, percent, offset });
+        let limit = plan.add_node(Node::LimitPercent {
+            input: scan,
+            percent: Share::Percent(percent),
+            offset: Bound::Rows(offset),
+        });
         plan.set_root(limit);
 
         let dump = round_trips(&plan);
         assert!(dump.contains(printed), "{printed} is not in\n{dump}");
     }
+}
+
+/// A share that is read off a column rather than written out, which `LIMIT (SELECT 30)%` leaves.
+///
+/// It prints where the number would have printed and the `%` still ends it, so this is the case
+/// that would catch a reader taking the sign for part of the expression.
+#[test]
+fn a_percentage_read_off_a_column_survives_the_round_trip() {
+    let mut plan = Plan::new();
+    let scan = get(
+        &mut plan,
+        "a",
+        0,
+        &[("x", LogicalType::Integer), ("n", LogicalType::Double), ("m", LogicalType::BigInt)],
+    );
+    let share = column(&mut plan, 0, 1, LogicalType::Double);
+    let offset = column(&mut plan, 0, 2, LogicalType::BigInt);
+    let limit = plan.add_node(Node::LimitPercent {
+        input: scan,
+        percent: Share::Read(share),
+        offset: Bound::Read(offset),
+    });
+    plan.set_root(limit);
+
+    let dump = round_trips(&plan);
+    let printed = "LimitPercent #0.1::DOUBLE% offset #0.2::BIGINT";
+    assert!(dump.contains(printed), "{printed} is not in\n{dump}");
 }
 
 /// A limit that reads its ends off a column rather than holding numbers.

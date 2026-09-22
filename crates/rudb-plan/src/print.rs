@@ -19,7 +19,9 @@ use rudb_common::LogicalType;
 use rudb_common::Value;
 
 use crate::expr::Expr;
-use crate::node::{Bound, BuildSide, Node, WindowBound, WindowExclude, WindowFrame, WindowUnit};
+use crate::node::{
+    Bound, BuildSide, Node, Share, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+};
 use crate::plan::Plan;
 use crate::{ExprRef, NodeRef, Slice};
 
@@ -182,7 +184,15 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
         }
         // The percentage prints through `Display` for a `f64`, which is the shortest text that
         // reads back as the same number, so the reader in `parse.rs` gets the bits it was given.
-        Node::LimitPercent { percent, offset, .. } => write!(out, " {percent}% offset {offset}"),
+        Node::LimitPercent { percent, offset, .. } => {
+            out.write_str(" ")?;
+            match percent {
+                Share::Percent(percent) => write!(out, "{percent}")?,
+                Share::Read(expr) => write_expr(plan, out, expr)?,
+            }
+            out.write_str("% offset ")?;
+            write_bound(plan, out, offset)
+        }
         Node::TopN { keys, count, offset, .. } => {
             write!(out, " {count} offset {offset} ")?;
             write_sort_keys(plan, out, keys)

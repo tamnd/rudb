@@ -41,7 +41,7 @@
 //! left in it is not rebuilt, which is where the binary does it too.
 
 use rudb_common::{Field, Result};
-use rudb_plan::{Bound, Expr, ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_plan::{Bound, Expr, ExprRef, Node, NodeRef, Plan, Share, Slice};
 
 use crate::pass::{Context, Pass};
 
@@ -106,8 +106,12 @@ fn empty(plan: &Plan, at: NodeRef) -> bool {
         Node::Values { rows, .. } => plan.row_list(rows).is_empty(),
         Node::Filter { input, predicate } => never(plan, predicate) || empty(plan, input),
         Node::Limit { input, count, .. } => count == Bound::Rows(0) || empty(plan, input),
-        // A zero share of anything is nothing, which is the same rule one line up.
-        Node::LimitPercent { input, percent, .. } => percent == 0.0 || empty(plan, input),
+        // A zero share of anything is nothing, which is the same rule one line up. A share read
+        // off the rows is not nought as far as anybody here knows, so it falls through to the
+        // input the way any other share does.
+        Node::LimitPercent { input, percent, .. } => {
+            percent == Share::Percent(0.0) || empty(plan, input)
+        }
         Node::TopN { input, count, .. } => count == 0 || empty(plan, input),
         Node::Sort { input, .. } | Node::Distinct { input, .. } | Node::Project { input, .. } => {
             empty(plan, input)
