@@ -730,6 +730,39 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
     }
 }
 
+/// Whether shifting a clock by an interval takes it out of the day it started in.
+///
+/// [`shift`] brings a time round at midnight and throws away the whole days, because a time is a
+/// clock and not a point in history, and that is the answer both engines give for the subtraction
+/// written on its own. A window frame bound wants the other reading of the same distance. `RANGE
+/// BETWEEN INTERVAL '2' HOUR PRECEDING` on a row at half past midnight is asking for everything
+/// back to the start of the day, not for everything after half past ten at night, and the reference
+/// binary holds the bound at the end of the range rather than letting it come round.
+///
+/// A frame cannot tell the two apart from the answer alone. A distance of more than a day comes
+/// round far enough to land on the believable side again, so `TIME '23:00:00' - INTERVAL '25' HOUR`
+/// is ten at night and looks like an ordinary bound while the distance it was asked for reaches
+/// back past the start of the day twice over. So the question is asked here, where the interval is
+/// still in front of us, rather than guessed at from what came back.
+///
+/// The whole days and the months count towards the distance here even though [`shift`] drops them,
+/// which is the reference binary's behaviour for a frame and not an oversight: `RANGE BETWEEN
+/// INTERVAL '1' DAY PRECEDING` over a time key covers the whole day up to the row. A month is
+/// counted as the shortest one there is, since any whole month is longer than the day a clock holds
+/// and so takes the bound off the end of the range whichever month it lands in.
+pub fn came_round(when: &Value, interval: &Value, subtract: bool) -> bool {
+    let (Value::Time(clock) | Value::TimeTz(clock)) = when else {
+        return false;
+    };
+    let Value::Interval { months, days, micros } = interval else {
+        return false;
+    };
+    let day = i128::from(MICROS_PER_DAY);
+    let sign = if subtract { -1 } else { 1 };
+    let distance = i128::from(*months) * 28 * day + i128::from(*days) * day + i128::from(*micros);
+    !(0..day).contains(&(i128::from(*clock) + distance * i128::from(sign)))
+}
+
 /// The day an interval's months and days land on, which is where both of the date range failures
 /// are and where upstream has a different sentence for each of them.
 fn shifted_days(day: i32, months: i64, days: i64) -> Result<i32> {
@@ -1256,6 +1289,32 @@ mod tests {
         assert_eq!(shown(&late, &every(0, 0, MICROS_PER_HOUR), false), "00:30:00");
         let early = Value::Time(30 * MICROS_PER_MINUTE);
         assert_eq!(shown(&early, &every(0, 0, MICROS_PER_HOUR), true), "23:30:00");
+    }
+
+    /// The same distances again, asked the way a window frame asks them.
+    ///
+    /// The pairs worth reading together are the last two. Taking twenty five hours off eleven at
+    /// night comes round to ten at night, which is an ordinary looking time earlier in the day than
+    /// the row it came from, so nothing about the answer says the distance reached back past
+    /// midnight. Taking a day off it comes round to the same eleven at night, because the whole days
+    /// go nowhere in the subtraction, and that one does not look like a distance at all. Both are
+    /// bounds the reference binary holds at the start of the day.
+    #[test]
+    fn a_clock_says_when_a_distance_reaches_out_of_its_day() {
+        let ten = Value::Time(10 * MICROS_PER_HOUR);
+        assert!(!came_round(&ten, &every(0, 0, MICROS_PER_HOUR), false));
+        assert!(!came_round(&ten, &every(0, 0, MICROS_PER_HOUR), true));
+        assert!(!came_round(&ten, &every(0, 0, 10 * MICROS_PER_HOUR), true));
+        assert!(came_round(&ten, &every(0, 0, 11 * MICROS_PER_HOUR), true));
+        assert!(came_round(&ten, &every(0, 0, 14 * MICROS_PER_HOUR), false));
+        // A date and a timestamp have room for any of these, so the question is only ever about a
+        // clock and the answer for the rest is no.
+        assert!(!came_round(&Value::Date(0), &every(0, 0, 11 * MICROS_PER_HOUR), true));
+        assert!(!came_round(&Value::Timestamp(0), &every(0, 1000, 0), true));
+        let late = Value::Time(23 * MICROS_PER_HOUR);
+        assert!(came_round(&late, &every(0, 0, 25 * MICROS_PER_HOUR), true));
+        assert!(came_round(&late, &every(0, 1, 0), true));
+        assert!(came_round(&late, &every(1, 0, 0), true));
     }
 
     /// Three ways out of range and three sentences, which are upstream's three.

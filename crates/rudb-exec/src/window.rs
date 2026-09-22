@@ -686,6 +686,23 @@ impl Window {
             rudb_kernels::cast_value(key, &moved.key, false)?,
             rudb_kernels::cast_value(offset, &moved.offset, false)?,
         ];
+        // A clock only holds a day, so a distance can ask for a place outside one, and then the
+        // answer the arithmetic gives is not the place the frame wants. The reference binary holds
+        // a frame bound at the end of the range instead of letting it come round at midnight, so a
+        // start that reaches back past the beginning of the day covers from the first row of the
+        // partition and an end that reaches past the last moment of it covers to the last row.
+        //
+        // The bound is held by answering with one end of the partition rather than by naming the
+        // first or the last moment of a day, because the rows are already sorted by this key and
+        // the two come to the same row. Which end it is follows from the way the bound was written
+        // and not from the way it was worked out: a bound written PRECEDING that ran off is at the
+        // beginning of the partition under either order, since the direction the arithmetic runs in
+        // was taken from that order to begin with.
+        let written = if after { self.frame.end } else { self.frame.start };
+        let back = matches!(written, WindowBound::Preceding(_));
+        if rudb_kernels::came_round(&args[0], &args[1], moved.name == "-") {
+            return Ok(if back { 0 } else { rows.len() });
+        }
         let wanted = rudb_kernels::call_values(moved.name, &args, &moved.returns, None)?;
         // The arithmetic can answer in a wider type than the key it was handed, and a date key with
         // an interval distance is that case: `DATE + INTERVAL` is a timestamp in both engines, so
