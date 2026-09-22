@@ -11,6 +11,11 @@
 //! carries nothing but its groups and its aggregates upward, so the projection could not read the
 //! column even if the rule let it through. Over the grouping both problems go away.
 //!
+//! A correlated one goes over the grouping too when what it correlates to is a column the block
+//! groups by, since that column is the group's own column up there and every row of the group
+//! agreed on its value. A correlation on anything else has no answer over the grouping and is the
+//! missing `GROUP BY` it looks like.
+//!
 //! The cases are grouped by which clause wrote the query and by what kind of join it wants, since
 //! those are the two things that decide which code path carries it.
 
@@ -216,20 +221,99 @@ fn a_subquery_in_an_ungrouped_select_list_still_answers() {
     );
 }
 
-/// A correlated one still goes underneath, because what it correlates to is a column of the rows
-/// going into the grouping and there is nothing over the grouping to read. Underneath is where the
-/// aggregate cannot carry its column up, so this is refused, and what is asserted is the sentence:
-/// the column belongs to no table anybody wrote, so asking for it in a `GROUP BY` names nothing.
-/// That is #1032.
+/// A correlated one goes over the grouping as well when what it correlates to is a column the block
+/// groups by. Above the aggregate that column is the group's own column, holding the same value the
+/// rows of the group all agreed on, so the query is joined against the groups and answers once per
+/// group. That is #1032.
 #[test]
-fn a_subquery_correlated_to_the_group_key_says_what_it_cannot_do() {
+fn a_subquery_correlated_to_the_group_key_answers() {
+    let database = database();
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT k, (SELECT max(v) FROM u WHERE u.k = t.k) FROM t GROUP BY k ORDER BY k"
+        ),
+        vec![ints(&[1, 10]), ints(&[2, 40])]
+    );
+}
+
+/// The group key inside an expression rather than on its own, on both sides of the query's body,
+/// because the rewrite walks the whole subtree of the query and a reference in a `WHERE` and a
+/// reference in a select list are two different nodes of it. The second query also has a group with
+/// nothing to match, which is the `NULL` a single join produces and not a missing row.
+#[test]
+fn the_group_key_is_rewritten_wherever_the_subquery_reads_it() {
+    let database = database();
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT k, (SELECT max(v) + t.k FROM u WHERE u.k = t.k) FROM t GROUP BY k ORDER BY k"
+        ),
+        vec![ints(&[1, 11]), ints(&[2, 42])]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT k, (SELECT max(v) FROM u WHERE u.k = t.k + 1) FROM t GROUP BY k ORDER BY k"
+        ),
+        vec![ints(&[1, 40]), vec![Value::Integer(2), Value::Null]]
+    );
+}
+
+/// The same query written in the other two clauses that are bound over the grouping, since each one
+/// calls the lift separately and a `HAVING` reads the answer through a filter rather than through a
+/// projection. The `EXISTS` and the `IN` are there because a mark join carries its comparison over
+/// the outer rows and that comparison is rewritten in a second pass.
+#[test]
+fn a_correlated_subquery_over_the_group_key_works_in_having_and_order_by() {
+    let database = database();
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT k, sum(w) FROM t GROUP BY k HAVING sum(w) > (SELECT max(v) FROM u WHERE u.k = t.k) \
+             ORDER BY k"
+        ),
+        vec![
+            vec![Value::Integer(1), Value::HugeInt(300)],
+            vec![Value::Integer(2), Value::HugeInt(300)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT k FROM t GROUP BY k ORDER BY (SELECT max(v) FROM u WHERE u.k = t.k) DESC"
+        ),
+        vec![ints(&[2]), ints(&[1])]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT k FROM t GROUP BY k HAVING EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.v > 30) \
+             ORDER BY k"
+        ),
+        vec![ints(&[2])]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT k FROM t GROUP BY k HAVING k IN (SELECT u.k FROM u WHERE u.v > t.k * 10) ORDER BY k"
+        ),
+        vec![ints(&[2])]
+    );
+}
+
+/// A correlation on a column this block neither groups by nor aggregates is a different question
+/// with a different answer, so it is still refused, and the message names the column the query reads
+/// rather than the column the query produces. The one the query produces belongs to no table
+/// anybody wrote and asking for it in a `GROUP BY` would name nothing.
+#[test]
+fn a_subquery_correlated_to_an_ungrouped_column_is_refused_by_name() {
     let database = database();
     let message = refused(
         &database,
-        "SELECT k, (SELECT max(v) FROM u WHERE u.k = t.k) FROM t GROUP BY k ORDER BY k",
+        "SELECT k, (SELECT max(v) FROM u WHERE u.k = t.w) FROM t GROUP BY k ORDER BY k",
     );
-    assert!(message.contains("a correlated subquery over a grouped query"), "{message}");
-    assert!(!message.contains("a column must appear"), "{message}");
+    assert!(message.contains("column \"w\" must appear in the GROUP BY clause"), "{message}");
 }
 
 /// A column of the grouped table that is neither grouped nor aggregated is still refused and the
@@ -240,4 +324,19 @@ fn an_ungrouped_column_is_still_refused_by_name() {
     let database = database();
     let message = refused(&database, "SELECT k, w, (SELECT 1) FROM t GROUP BY k");
     assert!(message.contains("column \"w\" must appear in the GROUP BY clause"), "{message}");
+}
+
+/// Two group keys with the query correlated to one of them, because the rewrite has to point the
+/// reference at the group's position in the aggregate's output and not at the column's position in
+/// the table. With one group key the two are the same number and a mistake there would not show.
+#[test]
+fn a_subquery_correlated_to_the_second_of_two_group_keys_answers() {
+    let database = database();
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT w, k, (SELECT max(v) FROM u WHERE u.k = t.k) FROM t GROUP BY w, k ORDER BY w, k"
+        ),
+        vec![ints(&[100, 1, 10]), ints(&[200, 1, 10]), ints(&[300, 2, 40])]
+    );
 }

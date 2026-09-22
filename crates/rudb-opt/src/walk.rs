@@ -23,9 +23,7 @@
 //! [`Plan::validate`]: rudb_plan::Plan::validate
 
 use rudb_common::LogicalType;
-use rudb_plan::{
-    Arm, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, SortKey, WindowBound,
-};
+use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, SortKey};
 
 use crate::fold::VOLATILE;
 
@@ -373,70 +371,14 @@ pub(crate) fn columns_at(
 ///
 /// The node on its own rather than the subtree, because the pass that wants this is asking where a
 /// column is read rather than whether it is read anywhere, and the walk down is its own business.
+/// The walk itself is [`Plan::node_columns`], because the binder asks the same question about the
+/// subtree of a query it is moving over a grouping.
 pub(crate) fn node_columns(
     plan: &Plan,
     at: NodeRef,
     found: &mut impl FnMut(ExprRef, ColumnBinding),
 ) {
-    match *plan.node(at) {
-        Node::Get { .. }
-        | Node::Dummy
-        | Node::CteScan { .. }
-        | Node::MaterializedCte { .. }
-        | Node::CrossProduct { .. }
-        | Node::SetOp { .. }
-        | Node::Limit { .. }
-        | Node::LimitPercent { .. } => {}
-        Node::Values { rows, .. } => {
-            for &row in plan.row_list(rows) {
-                each(plan, row, found);
-            }
-        }
-        Node::TableFunction { args, settings, .. }
-        | Node::LateralFunction { args, settings, .. } => {
-            each(plan, args, found);
-            each(plan, settings, found);
-        }
-        Node::Filter { predicate, .. } => columns_at(plan, predicate, found),
-        Node::Project { exprs, .. } => each(plan, exprs, found),
-        Node::Aggregate { groups, aggregates, .. } => {
-            each(plan, groups, found);
-            each(plan, aggregates, found);
-        }
-        Node::Window { partition, order, frame, expressions, .. } => {
-            each(plan, partition, found);
-            for key in plan.sort_key_list(order) {
-                columns_at(plan, key.expr, found);
-            }
-            for bound in [frame.start, frame.end] {
-                if let WindowBound::Preceding(offset) | WindowBound::Following(offset) = bound {
-                    columns_at(plan, offset, found);
-                }
-            }
-            each(plan, expressions, found);
-        }
-        Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
-            for key in plan.sort_key_list(keys) {
-                columns_at(plan, key.expr, found);
-            }
-        }
-        Node::Fetch { args, row, .. } => {
-            each(plan, args, found);
-            columns_at(plan, row, found);
-        }
-        Node::TableFetch { row, .. } => columns_at(plan, row, found),
-        Node::Distinct { on, .. } => each(plan, on, found),
-        Node::Join { conditions, .. } | Node::DependentJoin { conditions, .. } => {
-            each(plan, conditions, found);
-        }
-    }
-}
-
-/// The same walk over a run of expressions.
-fn each(plan: &Plan, slice: Slice, found: &mut impl FnMut(ExprRef, ColumnBinding)) {
-    for &expr in plan.expr_list(slice) {
-        columns_at(plan, expr, found);
-    }
+    plan.node_columns(at, found);
 }
 
 /// Whether asking for this expression twice can give two answers.
