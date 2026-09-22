@@ -28,10 +28,12 @@ use crate::types::{Field, LogicalType};
 /// inside each bucket, which is what the joins want. That trade is the whole reason this exists
 /// rather than the declaration being a plain column list.
 ///
-/// Stage 0 measured the month. `11-the-order.md` section 11.1 asks for the quarter and the year to
-/// be measured too, because four queries regressed at a month and nobody yet knows whether that is
-/// the lost key locality or something else. The widths are here so that the experiment has
-/// something to ask for.
+/// All four are measured, in `14-the-partition-width.md`. The month is the worst of them: five SF1
+/// files built by one loader in one sitting come out at 0.891 of the unsorted file's instructions
+/// sorted exactly, 0.898 at a quarter, 0.899 at a year and 0.917 at a month, because the narrower
+/// the bucket the more often a join key's hash entry is revisited and the wider the delta the sort
+/// key encodes to, while the pruning a narrow bucket buys stops mattering above a quarter. So a
+/// declaration that names no width gets [`Width::DEFAULT`], which is the quarter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Width {
     /// The value itself, which is an ordinary `ORDER BY` on the column.
@@ -46,6 +48,15 @@ pub enum Width {
 }
 
 impl Width {
+    /// The bucket a date or a timestamp gets when nobody says which, measured rather than picked.
+    ///
+    /// Not [`Default::default`], which stays the exact value: that one is the width of a column
+    /// with no calendar in it, and a struct deriving `Default` has no column to look at. This is
+    /// the answer to a different question, which is what a loader should do with a date column
+    /// when the declaration is silent, and the answer only makes sense with the column in hand.
+    /// [`Clustering::over`] is where the two meet.
+    pub const DEFAULT: Self = Self::Quarter;
+
     /// The byte this is written as in a native file directory. Never reordered, only appended to.
     #[must_use]
     pub fn tag(self) -> u8 {
@@ -140,6 +151,28 @@ impl Clustering {
         Ok(Self { columns, width })
     }
 
+    /// A declaration over `columns` that leaves the width to the leading column's type.
+    ///
+    /// A date or a timestamp is bucketed at [`Width::DEFAULT`] and anything else is taken exactly,
+    /// which is the only width an integer or a string has. This is what a loader clustering a
+    /// table it was handed should call, since the alternative is every caller writing the same two
+    /// line match and the constant living in as many places as there are callers.
+    ///
+    /// # Errors
+    ///
+    /// The ones [`Clustering::new`] gives, which this is checked by. The width it picks is legal
+    /// for the column it picked it for, so the type error is not one of them.
+    pub fn over(columns: Vec<u32>, fields: &[Field]) -> Result<Self> {
+        let leading = columns.first().and_then(|&at| fields.get(at as usize));
+        let width = match leading.map(|field| &field.ty) {
+            Some(LogicalType::Date | LogicalType::Timestamp) => Width::DEFAULT,
+            // Including the column list that is empty or out of range, which has no type to look
+            // at and is about to be refused for that rather than for its width.
+            _ => Width::Exact,
+        };
+        Self::new(columns, width, fields)
+    }
+
     /// The columns, outermost first, as indexes into the table's column list.
     #[must_use]
     pub fn columns(&self) -> &[u32] {
@@ -209,6 +242,26 @@ mod tests {
             Clustering::new(vec![0, 2], Width::Exact, &fields).is_ok(),
             "no bucket, no problem"
         );
+    }
+
+    /// A declaration that names no width gets the quarter on a date and the exact value elsewhere.
+    ///
+    /// The quarter is the measurement in `14-the-partition-width.md` and not a preference, and the
+    /// number is asserted here rather than read off the constant, because a test that compared the
+    /// constant to itself would still pass the day somebody changed it back to the month.
+    #[test]
+    fn a_declaration_with_no_width_takes_the_quarter_on_a_date_and_nothing_elsewhere() {
+        let fields = lineitem();
+        let dated = Clustering::over(vec![2, 0, 1], &fields).expect("a date leads");
+        assert_eq!(dated.width(), Width::Quarter, "the width the suite measured at 0.898");
+        assert_eq!(dated.columns(), [2, 0, 1], "the columns are the ones asked for, in order");
+        // A bigint has no quarters, so the same call on one has to come back exact rather than
+        // come back an error, which is the whole reason the width is picked from the column.
+        let keyed = Clustering::over(vec![0, 2], &fields).expect("a bigint leads");
+        assert_eq!(keyed.width(), Width::Exact);
+        // The checks are the ones a written out declaration gets, since it is the same call.
+        assert!(Clustering::over(Vec::new(), &fields).is_err(), "no column at all");
+        assert!(Clustering::over(vec![7], &fields).is_err(), "past the end");
     }
 
     #[test]
