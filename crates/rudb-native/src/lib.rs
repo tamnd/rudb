@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::bounds::{Bound, Op, scaled_as};
-use rudb_common::{Error, Field, LogicalType, PhysicalType, Result, Value};
+use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
 use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
@@ -64,6 +64,13 @@ const SLOT_BYTES: usize = 28;
 const MAX_PAGE: usize = 256 * 1024 * 1024;
 const MAX_DIRECTORY: usize = 128 * 1024 * 1024;
 const FREQUENCIES: &[u8; 8] = b"RUDBFQ2\0";
+/// The clustering declaration, written after the frequencies and only when there is one.
+///
+/// No format bump for this, which is the convention the frequency section set in #728: a new
+/// optional trailing section with its own magic leaves every file that does not use it byte for
+/// byte what it was, and the version is bumped for a change to a layout that already exists, as
+/// #1029 did. A file with no declaration is the same bytes this build wrote yesterday.
+const CLUSTERING: &[u8; 8] = b"RUDBCL1\0";
 const FREQUENCY_CANDIDATES: usize = 32_768;
 const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
@@ -368,6 +375,14 @@ pub struct Table {
     /// non-null rows that use each code while it builds the frequency summary, and the reader cannot
     /// work it out from the dictionary alone. So the writer settles it here.
     distincts: Vec<Option<u64>>,
+    /// The order the rows of this table are meant to be stored in, if anybody declared one.
+    ///
+    /// A declaration and not a measurement. Nothing here checks that the stripes actually arrived
+    /// in this order, and the reason it is worth storing anyway is that the order is the only thing
+    /// about a table that a rewrite destroys without anybody noticing. The fragment ranges prune on
+    /// whatever order the rows came in, so a table loaded sorted prunes and the same table after a
+    /// checkpoint that did not know to keep the order quietly stops pruning and nothing says why.
+    clustering: Option<Clustering>,
 }
 
 impl Table {
@@ -393,6 +408,12 @@ impl Table {
     #[must_use]
     pub fn stripes(&self) -> &[Stripe] {
         &self.stripes
+    }
+
+    /// The order the rows are meant to be stored in, if this table was declared with one.
+    #[must_use]
+    pub fn clustering(&self) -> Option<&Clustering> {
+        self.clustering.as_ref()
     }
 }
 
@@ -791,6 +812,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                clustering: None,
             },
             generation,
             order: Vec::new(),
@@ -834,6 +856,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                clustering: None,
             },
             generation: 1,
             order: Vec::new(),
@@ -881,11 +904,37 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                clustering: None,
             },
             order: Vec::new(),
             next_order: 0,
             pending: Vec::with_capacity(STRIPE_PARTS),
         })
+    }
+
+    /// Records the order this table's rows are meant to be stored in.
+    ///
+    /// The declaration goes in the table directory and comes back out of
+    /// [`Table::clustering`]. Nothing here sorts anything, and nothing here checks that the rows
+    /// handed to [`Writer::append`] arrive in the order this claims. That is deliberate for now:
+    /// the thing that was missing was a place to write the order down, and a loader that honours
+    /// the declaration is the next piece rather than this one.
+    ///
+    /// The declaration applies to the table the writer is currently on, so it is set after
+    /// [`Writer::next`] rather than once for the file.
+    ///
+    /// # Errors
+    ///
+    /// If the declaration names a column this table does not have.
+    pub fn declare(mut self, clustering: Clustering) -> Result<Self> {
+        // Rebuilt against this table's own column count rather than trusted, because the caller
+        // built it against a catalog entry and the two could have drifted.
+        self.table.clustering = Some(Clustering::new(
+            clustering.columns().to_vec(),
+            clustering.width(),
+            self.table.fields.len(),
+        )?);
+        Ok(self)
     }
 
     /// Appends bytes at the end of the file and moves the writer's own offset past them.
@@ -3895,6 +3944,23 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             previous = ordinal;
         }
     }
+    // Written only when there is a declaration, so that the common file is the same bytes it was
+    // and the section is not a byte of zero on every table in the world that never asked for one.
+    if let Some(clustering) = &table.clustering {
+        out.extend_from_slice(CLUSTERING);
+        out.push(clustering.width().tag());
+        put_u16(
+            &mut out,
+            u16::try_from(clustering.columns().len())
+                .map_err(|_| invalid("too many clustering columns"))?,
+        );
+        for &column in clustering.columns() {
+            put_u16(
+                &mut out,
+                u16::try_from(column).map_err(|_| invalid("clustering column index overflow"))?,
+            );
+        }
+    }
     Ok(out)
 }
 
@@ -4322,10 +4388,29 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
         }
         frequencies
     };
+    let clustering = if cur.at == bytes.len() {
+        None
+    } else {
+        if cur.take(8)? != CLUSTERING {
+            return Err(invalid("directory extension magic differs"));
+        }
+        let bucket =
+            Width::from_tag(cur.u8()?).ok_or_else(|| invalid("clustering width tag differs"))?;
+        let count = cur.u16()? as usize;
+        let mut columns = Vec::with_capacity(count.min(width));
+        for _ in 0..count {
+            columns.push(u32::from(cur.u16()?));
+        }
+        // Through the constructor and not built by hand, so that a file claiming a column the
+        // table does not have is caught at open rather than at the first scan that trusted it.
+        Some(Clustering::new(columns, bucket, width).map_err(|_| {
+            invalid("stored clustering declaration does not match the table it is on")
+        })?)
+    };
     if cur.at != bytes.len() {
         return Err(invalid("directory has trailing bytes"));
     }
-    Ok(Table { name, fields, stripes, rows, dictionaries, distincts, frequencies })
+    Ok(Table { name, fields, stripes, rows, dictionaries, distincts, frequencies, clustering })
 }
 
 fn put_bound(out: &mut Vec<u8>, bound: Option<&Bound>) -> Result<()> {
@@ -7876,6 +7961,7 @@ mod tests {
             dictionaries: vec![Some(dictionary)],
             distincts: vec![None],
             frequencies: vec![None],
+            clustering: None,
         };
         let directory = encode_directory(&table).expect("directory");
         let file_size = dictionary.offset + u64::from(dictionary.length) + 1;
@@ -8224,5 +8310,86 @@ mod tests {
             assert_eq!(checksum(&bytes[..length]), expected, "the checksum of {length} bytes");
         }
         assert_eq!(checksum(b"the quick brown fox jumps over the lazy dog"), 0xed71_4233_c5a9_a792);
+    }
+    /// A declared order survives the file, and a table that declared none stays as it was.
+    ///
+    /// The second half is the one worth a test. The clustering section is written only when there
+    /// is a declaration, so a file of two tables where one is clustered exercises both the present
+    /// and the absent branch of the decoder in one directory, which is where a length bug would
+    /// show up as one table reading the other's bytes.
+    #[test]
+    fn a_declared_order_comes_back_out_of_the_file() {
+        let path = path("clustered");
+        let shipped = vec![
+            Field::new("key", LogicalType::BigInt),
+            Field::new("line", LogicalType::Integer),
+            Field::new("shipdate", LogicalType::Date),
+        ];
+        let plain = vec![Field::new("a", LogicalType::Integer)];
+        let stage_zero =
+            Clustering::new(vec![2, 0, 1], Width::Month, shipped.len()).expect("valid");
+
+        let mut writer = Writer::create(&path, "lineitem", shipped)
+            .expect("new file")
+            .declare(stage_zero.clone())
+            .expect("the columns are the table's");
+        let column = |ty: LogicalType, values: &[Value]| {
+            Vector::from_values(ty, values).expect("the values match the type")
+        };
+        writer
+            .append(
+                &Chunk::new(vec![
+                    column(
+                        LogicalType::BigInt,
+                        &[Value::BigInt(0), Value::BigInt(1), Value::BigInt(2), Value::BigInt(3)],
+                    ),
+                    column(
+                        LogicalType::Integer,
+                        &[
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Integer(1),
+                            Value::Integer(1),
+                        ],
+                    ),
+                    column(
+                        LogicalType::Date,
+                        &[Value::Date(0), Value::Date(1), Value::Date(2), Value::Date(3)],
+                    ),
+                ])
+                .expect("three columns"),
+            )
+            .expect("four rows");
+        let mut writer = writer.next("nation", plain).expect("a second table");
+        writer
+            .append(
+                &Chunk::new(vec![column(LogicalType::Integer, &[Value::Integer(7)])])
+                    .expect("one column"),
+            )
+            .expect("one row");
+        writer.finish().expect("commit");
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let lineitem = catalog.table("lineitem").expect("the clustered table");
+        assert_eq!(lineitem.table().clustering(), Some(&stage_zero));
+        let nation = catalog.table("nation").expect("the plain table");
+        assert_eq!(nation.table().clustering(), None, "nobody declared one here");
+
+        // And the rows are still the rows, because the section goes on the end of the directory
+        // and the easy way to break that is to leave the cursor somewhere the next read trusts.
+        assert_eq!(lineitem.table().rows(), 4);
+        assert_eq!(nation.table().rows(), 1);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A declaration naming a column the table does not have is refused where it is made.
+    #[test]
+    fn a_declaration_off_the_end_of_the_table_never_reaches_the_file() {
+        let path = path("clustered-bad");
+        let writer = Writer::create(&path, "items", vec![Field::new("a", LogicalType::Integer)])
+            .expect("new file");
+        let wrong = Clustering::new(vec![3], Width::Exact, 4).expect("valid against four columns");
+        assert!(writer.declare(wrong).is_err(), "the table has one column, not four");
+        fs::remove_file(&path).ok();
     }
 }
