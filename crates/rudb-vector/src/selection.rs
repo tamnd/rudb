@@ -134,6 +134,12 @@ impl Selection {
     ///
     /// This is what a threaded `OR` narrows its work with. Each branch is given the rows no branch
     /// before it accepted, and the rows it accepts come out of that set for the branch after.
+    ///
+    /// The branch in the middle of this is one no processor can predict, since a disjunction whose
+    /// first branch takes about half the rows mispredicts on roughly every other one. Writing both
+    /// answers and moving the length by whether the row was kept gets rid of it, and was tried and
+    /// measured at no difference on ClickBench 40, so it is not here. The cost that looked like this
+    /// was the membership kernel reading a packed column a value at a time.
     #[must_use]
     pub fn without(&self, taken: &Self) -> Self {
         let mut indices = Vec::with_capacity(self.indices.len().saturating_sub(taken.len()));
@@ -155,6 +161,9 @@ impl Selection {
     ///
     /// The other half of a threaded `OR`. What the branches leave behind is the rows none of them
     /// accepted, and the rows the filter keeps are all the others.
+    ///
+    /// Writing the gaps between the positions instead, as runs of consecutive numbers with no branch
+    /// per row, is the same idea as above and measured the same way, so it is not here either.
     #[must_use]
     pub fn complement(&self, len: usize) -> Self {
         let mut indices = Vec::with_capacity(len.saturating_sub(self.indices.len()));
@@ -236,6 +245,46 @@ mod tests {
         assert_eq!(Selection::empty().complement(3), Selection::identity(3));
         assert!(Selection::identity(3).complement(3).is_empty());
         assert!(Selection::empty().complement(0).is_empty());
+    }
+
+    /// A position past the length asked about, which is not in the complement and does not stop the
+    /// positions after it being in it.
+    ///
+    /// The walk above never reaches such a position, so it gets this right without trying. Written
+    /// down because any faster way of doing this reads the positions rather than the length, and
+    /// then this is the case it has to be told about.
+    #[test]
+    fn a_position_past_the_length_is_not_in_the_complement_and_does_not_swallow_what_follows() {
+        let selection = Selection::from_indices(vec![1, 9]);
+        assert_eq!(selection.complement(4).indices(), &[0, 2, 3]);
+        assert_eq!(Selection::from_indices(vec![7]).complement(3), Selection::identity(3));
+    }
+
+    /// Both set operations against the obvious slow way of getting the same answer.
+    ///
+    /// A disjunction runs both of these on every chunk it touches, so they are the two functions
+    /// here most likely to be rewritten for speed, and the way that goes wrong is an off by one on a
+    /// boundary the handful of cases above happen not to cover. So the cases are generated instead:
+    /// every pattern of eight rows against every other one, checked against the answer a set gives.
+    #[test]
+    fn the_set_operations_agree_with_the_slow_way_of_working_them_out() {
+        const ROWS: u32 = 8;
+        for left in 0..1u32 << ROWS {
+            let live: Vec<u32> = (0..ROWS).filter(|bit| left >> bit & 1 == 1).collect();
+            let selection = Selection::from_indices(live.clone());
+            for len in 0..=ROWS as usize {
+                let wanted: Vec<u32> =
+                    (0..len as u32).filter(|index| !live.contains(index)).collect();
+                assert_eq!(selection.complement(len).indices(), wanted, "{live:?} under {len}");
+            }
+            for right in 0..1u32 << ROWS {
+                let taken: Vec<u32> = (0..ROWS).filter(|bit| right >> bit & 1 == 1).collect();
+                let wanted: Vec<u32> =
+                    live.iter().copied().filter(|index| !taken.contains(index)).collect();
+                let answered = selection.without(&Selection::from_indices(taken.clone()));
+                assert_eq!(answered.indices(), wanted, "{live:?} without {taken:?}");
+            }
+        }
     }
 
     #[test]
