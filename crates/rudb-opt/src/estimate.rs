@@ -493,10 +493,17 @@ pub fn rows_stat_into(
             if plan.expr_list(groups).is_empty() {
                 return Stat::exact(1, Provenance::RowCount);
             }
-            guess(of(input), KEPT_BY_A_GROUP_BY)
+            collapsed(plan, input, of(input), keyed(plan, plan.expr_list(groups)), stats, reads)
         }
         // The same shape as a group by on those columns, because that is what it is.
-        Node::Distinct { input, .. } => guess(of(input), KEPT_BY_A_GROUP_BY),
+        Node::Distinct { input, on } => {
+            let keys = plan.expr_list(on);
+            // Plain `DISTINCT` is every column of the row rather than a list of them, so the keys
+            // are whatever the input produces. A projection is the input that can be read from
+            // here, and it is also the input every `SELECT DISTINCT a, b` has.
+            let keys = if keys.is_empty() { produced(plan, input) } else { keyed(plan, keys) };
+            collapsed(plan, input, of(input), keys, stats, reads)
+        }
         Node::Limit { input, count, offset } => {
             let input = of(input);
             // An offset that is read off the rows while the query runs is a number nobody has
@@ -772,6 +779,157 @@ fn conjuncts(plan: &Plan, predicate: ExprRef) -> Vec<ExprRef> {
         _ => vec![predicate],
     };
     parts.into_iter().filter(|&part| !walk::constant(plan, part)).take(8).collect()
+}
+
+/// The columns a set of grouping expressions groups by, and `None` where one of them is not one.
+///
+/// Only a plain column reference. `GROUP BY lower(name)` has as many groups as there are distinct
+/// results of the function and nobody counted those, and `GROUP BY a + 1` has as many as `a` has but
+/// reading that off would be reasoning about which functions are injective, which is a bigger
+/// question than the one being answered. Either of them drops the whole grouping back to the
+/// constant rather than being left out of the product, because a key nobody can read is a key that
+/// can multiply the groups by any number at all.
+fn keyed(plan: &Plan, keys: &[ExprRef]) -> Option<Vec<ColumnBinding>> {
+    keys.iter()
+        .map(|&key| match *plan.expr(key) {
+            Expr::Column(binding) => Some(binding),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every column an operator produces, for a plain `DISTINCT`, which groups by all of them.
+///
+/// Only over a projection, which is what a `SELECT DISTINCT` of named columns is bound to. Anything
+/// else needs the output width of an arbitrary operator, and the one place that is written down is
+/// the binder. `None` leaves the grouping on the constant, which is where every one of them was.
+fn produced(plan: &Plan, input: NodeRef) -> Option<Vec<ColumnBinding>> {
+    let Node::Project { index, exprs, .. } = *plan.node(input) else {
+        return None;
+    };
+    let width = u32::try_from(plan.expr_list(exprs).len()).ok()?;
+    Some((0..width).map(|column| ColumnBinding { table: index, column }).collect())
+}
+
+/// How many rows a grouping leaves, where somebody counted the values of every column it groups by.
+///
+/// The operator where shape alone says the least. `GROUP BY user_id` over a log table is close to
+/// one row in one and `GROUP BY country` over the same table is a few hundred rows out of any
+/// number, and the constant is a tenth for both. Over TPC-H lineitem that tenth calls q1's
+/// `GROUP BY l_returnflag, l_linestatus` six hundred thousand rows, where the real answer is four.
+/// Everything planned above it is planned against that.
+///
+/// The counts are there to be read. A column with a stated distinct count says how many groups it
+/// can make on its own, several of them multiply, and the product is capped at the rows going in
+/// because a grouping cannot produce more rows than it consumes.
+///
+/// The product assumes the keys are independent of each other, which is the same assumption the
+/// joins here make and wrong in the same direction: `GROUP BY nation, region` counts 125 groups
+/// where a region is a nation's own and there are 25. Wrong by five is a different thing from wrong
+/// by a hundred thousand, and the cap keeps it from ever being wrong by more than the input.
+///
+/// Rows going in and not the table's rows, so a grouping under a selective filter is not given every
+/// group the column can make. That is [`landed_on`], and it is why the table's own row count is read
+/// here as well: how much of a column is left is what says how many of its values are still in it.
+fn collapsed(
+    plan: &Plan,
+    node: NodeRef,
+    input: Stat<u64>,
+    keys: Option<Vec<ColumnBinding>>,
+    stats: &Facts,
+    reads: &mut Vec<Stat<u64>>,
+) -> Stat<u64> {
+    let (Some(keys), Stat::Known { value: rows, .. }) = (keys, input) else {
+        return guess(input, KEPT_BY_A_GROUP_BY);
+    };
+    let Some(total) = scanned_rows(plan, node, stats).filter(|&total| total > 0) else {
+        return guess(input, KEPT_BY_A_GROUP_BY);
+    };
+    if keys.is_empty() || rows == 0 {
+        return guess(input, KEPT_BY_A_GROUP_BY);
+    }
+    let mut values: u64 = 1;
+    let mut source: Option<Provenance> = None;
+    for binding in keys {
+        // Recorded before it is read and recorded when it is unknown, for the reason [`values`]
+        // gives: a read that found nothing is still a read the planner made.
+        let stat = stated(plan, binding, stats);
+        reads.push(stat);
+        // A column with no values in it is empty or all nulls, and neither makes groups to count.
+        let Some(counted) = stat.read(DISTINCT).copied().filter(|&counted| counted > 0) else {
+            return guess(input, KEPT_BY_A_GROUP_BY);
+        };
+        values = values.saturating_mul(counted);
+        let from = stat.provenance().unwrap_or(FROM_A_CONSTANT);
+        source = match source {
+            None => Some(from),
+            Some(one) if one == from => Some(one),
+            // Two keys counted by different means. The number came from the arithmetic over them
+            // rather than from either, which is what `Propagation` is for elsewhere here too.
+            Some(_) => Some(Provenance::Propagation),
+        };
+    }
+    let groups = landed_on(values, rows, total);
+    guess_from(input, groups as f64 / rows as f64, source.unwrap_or(FROM_A_CONSTANT))
+}
+
+/// How many rows the table under an operator holds, for a subtree that reads exactly one.
+///
+/// Walks down the single input chain to the scan. `None` at a join, a set operation or anything else
+/// with two inputs, because two tables have two row counts and what the caller wants is the one the
+/// grouping's own columns came out of. `None` at a table function too, which states no count.
+///
+/// The budget is against a malformed plan rather than a deep one, the same as [`follow`]'s.
+fn scanned_rows(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<u64> {
+    let mut at = node;
+    for _ in 0..16 {
+        if matches!(*plan.node(at), Node::Get { .. }) {
+            return rows_stat(plan, at, stats).value().copied();
+        }
+        match plan.node(at).children() {
+            [Some(input), None] => at = input,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// How many of a column's `values` distinct values are left in `rows` of the `total` it started at.
+///
+/// Neither of the two obvious answers on its own. A column of three values over six million rows
+/// holds all three, and two rows of it hold at most two, so the answer is the values at one end and
+/// the rows at the other. Taking the smaller of the two is right at both ends and wrong in the
+/// middle, where it says a hundred rows of a hundred value column hold a hundred values, and rows
+/// start colliding long before that.
+///
+/// So this is how many of the values at least one surviving row still holds. A value has `total`
+/// over `values` rows on average, each of those rows survived with the probability the whole column
+/// did, and a value is gone when every one of them went. That is the whole formula, and the two ends
+/// fall out of it: nothing filtered leaves every value, and a filter down to a handful of rows
+/// leaves a handful of values.
+///
+/// It assumes a filter takes rows without regard to what they hold, which a real one does not. A
+/// filter on the grouping column itself leaves far fewer groups than this says, and a sorted column
+/// under any filter does too. That is above the truth rather than below it, which is the direction
+/// the rest of this module is wrong in as well.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a count of groups is a weight here and not an identity"
+)]
+fn landed_on(values: u64, rows: u64, total: u64) -> u64 {
+    let ceiling = values.min(rows).max(1);
+    if rows >= total {
+        // Nothing was filtered, so every value the column has is still in it. Reading the formula
+        // here instead would say a column of a thousand values over its own thousand rows holds six
+        // hundred of them, which is a statement about a sample and this is not one.
+        return ceiling;
+    }
+    let kept = rows as f64 / total as f64;
+    let each = total as f64 / values as f64;
+    let survives = 1.0 - (1.0 - kept).powf(each);
+    ((values as f64 * survives).round() as u64).clamp(1, ceiling)
 }
 
 /// The columns a scan produces, in the order the plan numbers them.
@@ -1585,6 +1743,104 @@ mod tests {
         let text = format!("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  {}", scan("t", 0));
         assert_eq!(estimate(&text, &[("t", 1000)]), Some(100));
         assert_eq!(estimate(&text, &[]), None);
+    }
+
+    /// A scan of two integer columns, for the tests that group by more than one of them.
+    fn wide_scan(table: &str, index: u32) -> String {
+        format!("Get memory.main.{table} AS {table} #{index} [a::INTEGER, b::INTEGER]\n")
+    }
+
+    #[test]
+    fn a_group_by_on_a_counted_column_produces_as_many_groups_as_the_column_has_values() {
+        // The constant said a tenth, which over a thousand rows is a hundred groups whether the
+        // column holds twenty five values or a million. It holds twenty five and the catalog said so.
+        let text = format!("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  {}", scan("t", 0));
+        assert_eq!(
+            counted_stat(&text, &[("t", 1000)], &[("t", "a", 25)]),
+            Stat::estimated(25, Provenance::Dictionary)
+        );
+        // Nothing was filtered, so every value of the column is still in it and the count is the
+        // answer rather than a share of it.
+        assert_eq!(counted(&text, &[("t", 1000)], &[("t", "a", 1000)]), Some(1000));
+    }
+
+    #[test]
+    fn two_group_keys_multiply_and_the_rows_going_in_cap_the_product() {
+        // The independence assumption, which is the one the joins here make as well. Twenty five
+        // values against five is a hundred and twenty five pairs where the two are unrelated, and
+        // fewer where they are not.
+        let text = format!(
+            "Aggregate #1 groups=[#0.0::INTEGER, #0.1::INTEGER] aggregates=[]\n  {}",
+            wide_scan("t", 0)
+        );
+        let keys = [("t", "a", 25), ("t", "b", 5)];
+        assert_eq!(counted(&text, &[("t", 100_000)], &keys), Some(125));
+        // And a grouping cannot produce more rows than it reads, whatever the product says.
+        assert_eq!(counted(&text, &[("t", 50)], &keys), Some(50));
+    }
+
+    #[test]
+    fn a_group_by_under_a_filter_gets_the_values_the_filter_left_rather_than_all_of_them() {
+        // The middle, which is where taking the smaller of the values and the rows goes wrong. A
+        // hundred values over a thousand rows is ten rows each, a filter down to two hundred rows
+        // keeps a fifth of them, and a value is gone only when all ten of its rows went, which
+        // happens to about a ninth of the values. So eighty nine groups: under the hundred the
+        // column holds and under the two hundred rows going in, and neither of those on its own.
+        let text = format!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  Filter (#0.0::INTEGER > \
+             1::INTEGER)::BOOLEAN\n    {}",
+            scan("t", 0)
+        );
+        assert_eq!(counted(&text, &[("t", 1000)], &[("t", "a", 100)]), Some(89));
+    }
+
+    #[test]
+    fn a_group_by_on_a_column_nobody_counted_is_the_constant_it_always_was() {
+        let text = format!("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  {}", scan("t", 0));
+        assert_eq!(
+            counted_stat(&text, &[("t", 1000)], &[]),
+            Stat::estimated(100, Provenance::Default)
+        );
+    }
+
+    #[test]
+    fn a_plain_distinct_groups_by_every_column_the_projection_under_it_produces() {
+        // `SELECT DISTINCT a, b` states no keys at all, so the keys are the row, and the row is
+        // whatever the projection emits. Reading it any other way leaves the commonest way anybody
+        // writes a grouping on the constant.
+        let text = format!(
+            "Distinct on=[]\n  Project #1 [#0.0::INTEGER AS a, #0.1::INTEGER AS b]\n    {}",
+            wide_scan("t", 0)
+        );
+        let keys = [("t", "a", 25), ("t", "b", 5)];
+        assert_eq!(counted(&text, &[("t", 100_000)], &keys), Some(125));
+    }
+
+    #[test]
+    fn a_distinct_on_some_columns_reads_the_columns_it_names() {
+        let text = format!(
+            "Distinct on=[#1.0::INTEGER]\n  Project #1 [#0.0::INTEGER AS a, #0.1::INTEGER AS \
+             b]\n    {}",
+            wide_scan("t", 0)
+        );
+        let keys = [("t", "a", 25), ("t", "b", 5)];
+        assert_eq!(counted(&text, &[("t", 100_000)], &keys), Some(25));
+    }
+
+    #[test]
+    fn a_group_by_over_a_join_keeps_the_constant_because_two_tables_have_two_row_counts() {
+        // The counts are per column of a table and the arithmetic here needs the rows that column
+        // started at. Over a join there are two of those and the grouping's columns can come from
+        // either, so this is a question about a shape rather than a number to be careful with.
+        let text = format!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  Join Inner on=[]\n    {}    {}",
+            scan("t", 0),
+            scan("u", 1)
+        );
+        assert_eq!(
+            counted_stat(&text, &[("t", 1000), ("u", 1000)], &[("t", "a", 25)]).provenance(),
+            Some(Provenance::Default)
+        );
     }
 
     #[test]
