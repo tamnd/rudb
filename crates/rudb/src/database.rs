@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGua
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, QualifiedName, View};
 use rudb_common::stat::Provenance;
-use rudb_common::{Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Session, Value};
+use rudb_common::{
+    Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Rule, Session, Value,
+};
 use rudb_metrics::{Document, Report, Span};
 use rudb_native::graph::Edge;
 use rudb_parse::ast::Ast;
@@ -1174,7 +1176,19 @@ impl Shared {
     /// something that was said.
     ///
     /// A poisoned lock is a cache that is not there, for the reason [`Self::facts`] says.
+    ///
+    /// `graph.sections` is read here and nowhere else, because this is the only place a stored
+    /// section reaches a plan. `spec/graph/09-measurement.md` section 9.2 asks for the whole layer
+    /// to be turnable off from a setting so that the suite can be run both ways and the two runs
+    /// compared byte for byte, and a switch that reached half the layer would make that comparison
+    /// say nothing. Returning nothing here is the whole of off: the optimizer is handed no
+    /// relationship, so no rewrite has anything to fire on, so no plan reads a link, so the
+    /// executor never opens one. The sections stay in the file and the checkpoint still writes
+    /// them, which is what section 3.1 says they are for, being ignorable rather than absent.
     fn relationships(&self, catalog: &Catalog) -> Arc<Vec<rudb_opt::link::Linked>> {
+        if !self.inner.settings.rules().enabled(Rule::GraphSections) {
+            return Arc::default();
+        }
         let declared = self.inner.settings.links();
         // The common case by a long way, and the one worth not taking a lock for: no relationship
         // is declared, so there is nothing to look for and nothing to cache.
