@@ -120,6 +120,12 @@ impl Default for Sizes {
 /// having at most one parent. What the declaration alone is good for is the plan output, because
 /// section 6.7's complaint is that a relationship nobody built and a relationship nobody declared
 /// look identical from the outside, and a reader who declared one wants to be told which it was.
+///
+/// What the build found comes in two parts, which `../stats/07-graph-statistics.md` section 7.3
+/// calls the uniqueness and totality certificates. They are separate because a rewrite that reads a
+/// link needs only the first and a rewrite that deletes an operator needs both, and a relationship
+/// can have the first without the second: a link is written for a child column some of whose rows
+/// match nothing, and it says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Linked {
     /// The many side's table, as the catalog holds it.
@@ -131,7 +137,19 @@ pub struct Linked {
     /// The one side's key column.
     pub parent_column: String,
     /// Whether the child's file holds a readable forward link for it.
+    ///
+    /// This is also the uniqueness certificate of `../stats/07-graph-statistics.md` section 7.3,
+    /// because a link only exists over a parent key the build read and found distinct. The two are
+    /// one field rather than two because nothing can make them disagree: there is no way to hold a
+    /// link and not hold the certificate that licensed writing it.
     pub built: bool,
+    /// The totality certificate: every child row found a parent, the unmatched count is zero.
+    ///
+    /// Separate from [`Self::built`] because a link exists for a relationship that is partial and
+    /// says so, where a key that repeats gets no link at all. False is the safe answer and is what
+    /// a relationship with no link gets, since totality is a fact about the children and the thing
+    /// that counted them is the link.
+    pub total: bool,
 }
 
 impl Linked {
@@ -143,6 +161,19 @@ impl Linked {
         parent_column: impl Into<String>,
     ) -> Self {
         Self { built: true, ..Self::declared(child, child_column, parent, parent_column) }
+    }
+
+    /// A relationship the file holds a link for whose every child row found a parent.
+    ///
+    /// Both certificates of section 7.3, which together are a foreign key that was verified rather
+    /// than declared, and which are what license removing an operator rather than accelerating one.
+    pub fn verified(
+        child: impl Into<String>,
+        child_column: impl Into<String>,
+        parent: impl Into<String>,
+        parent_column: impl Into<String>,
+    ) -> Self {
+        Self { total: true, ..Self::built(child, child_column, parent, parent_column) }
     }
 
     /// A relationship somebody declared and no file holds a link for.
@@ -158,6 +189,7 @@ impl Linked {
             parent: parent.into(),
             parent_column: parent_column.into(),
             built: false,
+            total: false,
         }
     }
 
@@ -897,5 +929,30 @@ mod tests {
             about(&plan, &context).to_string(),
             "a forward link does not answer a right or a full join"
         );
+    }
+
+    #[test]
+    fn the_three_constructors_are_three_steps_up_the_same_ladder() {
+        // What a rewrite is allowed to do grows with the certificates, so the three have to be
+        // ordered rather than merely different. A declaration licenses nothing, a link licenses
+        // reading it in place of a hash table, and a link over a total relationship licenses
+        // deleting the join. The ladder is what stops a rewrite that wanted the second one from
+        // firing on the first.
+        let declared = Linked::declared("lineitem", "l_orderkey", "orders", "o_orderkey");
+        assert!(!declared.built, "nobody built it");
+        assert!(!declared.total, "and nothing counted the children");
+
+        let built = Linked::built("lineitem", "l_orderkey", "orders", "o_orderkey");
+        assert!(built.built, "the parent side was read and found unique");
+        assert!(!built.total, "which says nothing about the children");
+
+        let verified = Linked::verified("lineitem", "l_orderkey", "orders", "o_orderkey");
+        assert!(verified.built && verified.total, "both certificates of section 7.3");
+
+        // The four names are the same in all three, which is what lets a pass match on the columns
+        // and then read the certificates rather than the other way round.
+        for link in [&declared, &built, &verified] {
+            assert!(link.between(("lineitem", "l_orderkey"), ("orders", "o_orderkey")));
+        }
     }
 }

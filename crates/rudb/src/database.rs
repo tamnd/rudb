@@ -1233,10 +1233,10 @@ impl Shared {
                 (&link.parent.table, parent_key),
             );
             let sides = (&link.child.table, child_key, &link.parent.table, parent_key);
-            found.push(if built {
-                rudb_opt::link::Linked::built(sides.0, sides.1, sides.2, sides.3)
-            } else {
-                rudb_opt::link::Linked::declared(sides.0, sides.1, sides.2, sides.3)
+            found.push(match built {
+                Some(true) => rudb_opt::link::Linked::verified(sides.0, sides.1, sides.2, sides.3),
+                Some(false) => rudb_opt::link::Linked::built(sides.0, sides.1, sides.2, sides.3),
+                None => rudb_opt::link::Linked::declared(sides.0, sides.1, sides.2, sides.3),
             });
         }
         found
@@ -1575,27 +1575,33 @@ fn planned(
     Ok(plan)
 }
 
-/// Whether the child's file holds a forward link for that relationship, built against that parent.
+/// Whether the child's file holds a forward link for that relationship, built against that parent,
+/// and whether every child row found a parent through it.
 ///
 /// The same question `rudb_links()` answers in its stored columns, asked here for one relationship
-/// at a time. Both tables have to be in the same file, because a row id is a position in a table and
-/// a link that named a parent in another file would only be resolvable by a reader that had both
-/// open and had checked that neither had moved. The binding check inside `stored_link` is what
-/// catches a parent that was rewritten since the link was built.
-fn stored_link(catalog: &Catalog, child: (&str, &str), parent: (&str, &str)) -> bool {
-    let Some(child_table) = table_named(catalog, child.0) else { return false };
-    let Some(parent_table) = table_named(catalog, parent.0) else { return false };
+/// at a time. `None` is no link, `Some(false)` is a link some of whose children matched nothing, and
+/// `Some(true)` is both certificates of `spec/stats/07-graph-statistics.md` section 7.3. Totality is
+/// read off the link rather than out of the degree section beside it, because the link counted the
+/// children on its way to being written and a file from before that section existed still answers.
+///
+/// Both tables have to be in the same file, because a row id is a position in a table and a link
+/// that named a parent in another file would only be resolvable by a reader that had both open and
+/// had checked that neither had moved. The binding check inside `stored_link` is what catches a
+/// parent that was rewritten since the link was built.
+fn stored_link(catalog: &Catalog, child: (&str, &str), parent: (&str, &str)) -> Option<bool> {
+    let child_table = table_named(catalog, child.0)?;
+    let parent_table = table_named(catalog, parent.0)?;
     let (
         rudb_catalog::table::Rows::Native(child_rows),
         rudb_catalog::table::Rows::Native(parent_rows),
     ) = (child_table.rows(), parent_table.rows())
     else {
-        return false;
+        return None;
     };
     let (Some(child_column), Some(parent_column)) =
         (child_table.column_index(child.1), parent_table.column_index(parent.1))
     else {
-        return false;
+        return None;
     };
     let edge = Edge {
         child: child_table.name().table.clone(),
@@ -1603,7 +1609,8 @@ fn stored_link(catalog: &Catalog, child: (&str, &str), parent: (&str, &str)) -> 
         parent: parent_table.name().table.clone(),
         parent_column,
     };
-    rudb_native::graph::stored_link(child_rows, parent_rows, &edge).is_some()
+    let held = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)?;
+    Some(held.linked() == held.children())
 }
 
 /// The first table of that name in any schema of any database.
@@ -2047,5 +2054,71 @@ mod tests {
                 assert_eq!(column.form(), Form::Flat, "column {at} came out encoded");
             }
         }
+    }
+
+    /// The two certificates of `spec/stats/07-graph-statistics.md` section 7.3, as the optimizer
+    /// receives them.
+    ///
+    /// `rudb_links()` already shows both in its own words, and this asks the same file the same
+    /// question through the path a rewrite reads. The reason it is worth a second test is that the
+    /// two paths get their answer from different places: the table reads the degree section, and
+    /// this reads the link, so a file written before that section existed answers here and not
+    /// there. Reading them off different things is the point, not an oversight, because the thing a
+    /// rewrite relies on is the structure it is about to use rather than a summary beside it.
+    #[test]
+    fn a_relationship_carries_both_certificates_only_when_every_child_row_found_a_parent() {
+        use super::Shared;
+
+        let path = std::env::temp_dir().join(format!(
+            "rudb-certificates-{}-{}.rdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock advances")
+                .as_nanos()
+        ));
+        let database =
+            Database::open(path.to_str().expect("a UTF-8 temporary path")).expect("a file");
+        database.execute("CREATE TABLE customer (c_custkey INTEGER)").unwrap();
+        database.execute("CREATE TABLE orders (o_custkey INTEGER)").unwrap();
+        database.execute("CREATE TABLE returns (r_custkey INTEGER)").unwrap();
+        database.execute("CREATE TABLE zones (z_key INTEGER)").unwrap();
+        database.execute("CREATE TABLE visits (v_zone INTEGER)").unwrap();
+        database.execute("INSERT INTO customer SELECT i FROM range(1, 4001) AS r(i)").unwrap();
+        // Three orders per customer, every one of them a customer that exists.
+        database
+            .execute("INSERT INTO orders SELECT 1 + (i - 1) / 3 FROM range(1, 10001) AS r(i)")
+            .unwrap();
+        // The same, plus one row whose key is past the last customer, which is all it takes.
+        database
+            .execute("INSERT INTO returns SELECT 1 + (i - 1) / 3 FROM range(1, 10001) AS r(i)")
+            .unwrap();
+        database.execute("INSERT INTO returns VALUES (9999)").unwrap();
+        // A parent key that repeats, which is not a key, so the build writes no link at all and
+        // the declaration arrives with neither certificate.
+        database
+            .execute("INSERT INTO zones SELECT 1 + i % 500 FROM range(0, 1000) AS r(i)")
+            .unwrap();
+        database
+            .execute("INSERT INTO visits SELECT 1 + i % 500 FROM range(0, 2000) AS r(i)")
+            .unwrap();
+        let declared = "orders(o_custkey) -> customer(c_custkey), \
+                        returns(r_custkey) -> customer(c_custkey), \
+                        visits(v_zone) -> zones(z_key)";
+        database.execute(&format!("SET graph_links = '{declared}'")).unwrap();
+        database.execute("CHECKPOINT").unwrap();
+
+        let shared = &database.shared;
+        let found = Shared::related(&shared.read(), declared);
+        let certificates: Vec<(&str, bool, bool)> =
+            found.iter().map(|link| (link.child.as_str(), link.built, link.total)).collect();
+        assert_eq!(
+            certificates,
+            vec![("orders", true, true), ("returns", true, false), ("visits", false, false)],
+            "one unmatched child row costs the relationship its totality and not its link"
+        );
+
+        drop(database);
+        std::fs::remove_file(&path).ok();
     }
 }
