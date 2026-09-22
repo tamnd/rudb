@@ -447,14 +447,18 @@ impl Table {
     }
 
     /// Selected groups of one key column, used when an aggregate can discard groups before emit.
+    ///
+    /// The same vector [`Self::column`] builds and for the same reason, for a list of groups rather
+    /// than a run of them. A bound that really does reject groups sends its answer out this way, so
+    /// this is the path the `ORDER BY ... LIMIT` shapes take and it was the one still going out
+    /// through a tagged value per group per key column.
     pub(crate) fn column_slots(
         &self,
         at: usize,
         ty: &rudb_common::LogicalType,
         slots: &[usize],
     ) -> Result<Vector> {
-        let values = self.columns[at].values_at(slots);
-        Vector::from_values(ty.clone(), &values)
+        self.columns[at].vector_at(ty, slots)
     }
 }
 
@@ -1255,6 +1259,58 @@ impl Column {
         if matches!(self.data, StoredData::Varchar(_)) { vector.shared_text() } else { Ok(vector) }
     }
 
+    /// The same vector as [`Self::vector`], for a list of slots rather than a run of them.
+    ///
+    /// It is a separate function and not a range turned into a list, because the arms differ only
+    /// in how they read the slot and every one of them is worth keeping. The reason it exists is
+    /// the reason [`Self::vector`] does: going out through a `Vec<Value>` cost an allocation, two
+    /// copies and a UTF-8 validation for every group in the answer, and the validation was of bytes
+    /// the scan had already validated.
+    ///
+    /// What is different here is the access pattern. A range is a copy of a contiguous run and this
+    /// is a gather, so the loads scatter. That is not a cost this adds, because the values path it
+    /// replaces gathered the same slots in the same order and then built a tagged value out of each
+    /// one on top of it.
+    fn vector_at(&self, ty: &rudb_common::LogicalType, slots: &[usize]) -> Result<Vector> {
+        let len = slots.len();
+        let data = match &self.data {
+            StoredData::TinyInt(values) => Data::Int8(gather(values, slots).into()),
+            StoredData::SmallInt(values) => Data::Int16(gather(values, slots).into()),
+            StoredData::Integer(values) => Data::Int32(gather(values, slots).into()),
+            StoredData::BigInt(values) => Data::Int64(gather(values, slots).into()),
+            StoredData::Varchar(values) => {
+                let mut out = rudb_vector::StringColumn::with_capacity(len);
+                // row at a time: a group key is a range of the packed bytes and the lengths differ,
+                // so there is no run of them to hand over in one piece. What this loop does per
+                // group is one copy, which is what the arm is for.
+                for &slot in slots {
+                    if self.valid[slot] {
+                        out.push_bytes(values.get(slot));
+                    } else {
+                        // The empty string, which the validity beside it says is not a string at
+                        // all. Same stand in the null takes everywhere else a vector is built.
+                        out.push("");
+                    }
+                }
+                Data::Varlen(out)
+            }
+            StoredData::StableText { dictionary, codes } => {
+                let vector =
+                    Vector::stable_dictionary(gather(codes, slots), Arc::clone(dictionary))?;
+                let valid = &self.valid;
+                let validity = rudb_vector::Validity::from_iter(len, |index| valid[slots[index]]);
+                return Ok(vector.with_validity(validity));
+            }
+            StoredData::Other(_) => {
+                return Vector::from_values(ty.clone(), &self.values_at(slots));
+            }
+        };
+        let valid = &self.valid;
+        let validity = rudb_vector::Validity::from_iter(len, |index| valid[slots[index]]);
+        let vector = Vector::flat(ty.clone(), data)?.with_validity(validity);
+        if matches!(self.data, StoredData::Varchar(_)) { vector.shared_text() } else { Ok(vector) }
+    }
+
     fn values(&self, range: std::ops::Range<usize>) -> Vec<Value> {
         range
             .map(|slot| {
@@ -1301,6 +1357,11 @@ impl Column {
     fn stores_payload(&self) -> bool {
         matches!(self.data, StoredData::Varchar(_))
     }
+}
+
+/// The elements at these slots, in the order the slots are given.
+fn gather<T: Copy>(values: &[T], slots: &[usize]) -> Vec<T> {
+    slots.iter().map(|&slot| values[slot]).collect()
 }
 
 /// UTF-8 group keys packed into one allocation, with one end offset per group.
