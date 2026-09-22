@@ -103,11 +103,15 @@ impl Page {
                 // hashes against 19.7 M, and the grouping measures 33.9 times the CPU of the same
                 // grouping over the same rows out of the native file.
                 //
-                // The fix is not the flag: it is to canonicalise each row group's dictionary into
-                // one code space per column as it is read, which for that file is about 21.3 M
-                // entries across 226 row groups against 19.7 M globally distinct, so a canonical
-                // space is barely larger than the sum of the parts. Document 23 estimates two to
-                // four times on the grouping and says plainly that it is a model, not a measurement.
+                // The fix is not the flag either, and `spec/storage-v3/24` measures why. Every
+                // `Referer` column chunk in that file is written `PLAIN_DICTIONARY, PLAIN, RLE,
+                // PLAIN`: the writer filled its megabyte dictionary page after about ten thousand
+                // of the row group's sixty thousand values and wrote the rest as plain bytes. So
+                // this arm carries about one row in eight of that column and the `Plain` arm above
+                // carries the other seven, and a code space canonicalised across row groups would
+                // never see them. A high cardinality string column is exactly the column a writer
+                // gives up dictionary encoding on, which is to say the grouping here has to be
+                // fast over flat strings and no amount of dictionary machinery substitutes.
                 Ok(Vector::dictionary_over(codes, Arc::clone(dictionary))?.with_validity(validity))
             }
             Encoding::DeltaBinaryPacked

@@ -1600,7 +1600,11 @@ impl Vector {
     /// a run keep their nulls in the values they stand for, so both levels have to say they have
     /// none. Every other form answers from its own mask. A false means only that the cheap answer
     /// was not available, so a caller that gets one still has to ask row by row.
-    fn never_null(&self) -> bool {
+    ///
+    /// Public because the alternative a caller has is a pass over the values, and on a dictionary
+    /// that is the size of a Parquet column chunk's that pass is the thing it was trying to avoid.
+    #[must_use]
+    pub fn never_null(&self) -> bool {
         if self.validity.has_nulls(self.len) {
             return false;
         }
