@@ -219,15 +219,15 @@ impl Frequencies for Common {
     }
 
     fn rows_with(&self, column: usize, value: &Bound) -> Stat<u64> {
-        // Only the complete synopsis, by asking for it. A synopsis that dropped anything still says
-        // something useful about the values it kept, but what it says about a value it does not
-        // list is the difference between nothing and a count, and telling those apart is a second
-        // question with a second answer shape. This one is the exact half.
-        let Ok(Some(entries)) = self.reader.exact_frequencies(column) else {
+        // The prefix and not only the complete list, because the counts in it are exact either way.
+        // The writer recounts the candidates that survive its pass, so what an incomplete synopsis
+        // lost is values rather than counts, and a value it kept is one of the leading values of the
+        // column, which is the one an equality would otherwise guess worst about.
+        let Ok(Some(prefix)) = self.reader.frequency_prefix(column) else {
             return Stat::Unknown;
         };
         let mut comparable = false;
-        for (held, count) in entries {
+        for (held, count) in prefix.entries {
             // A null entry is the column's nulls, and no equality matches a null. Skipping it is
             // both the right answer and the only one available, since a null has no bound.
             let Some(bound) = Bound::of_value(&held) else {
@@ -239,11 +239,17 @@ impl Frequencies for Common {
                 None => {}
             }
         }
-        // Nothing in the list was the value. That is a count of zero when the list and the constant
-        // were in the same domain, because a complete synopsis accounts for every row. Where not
-        // one entry would even compare, the constant is of another type and the zero would be an
+        // Nothing in the list was the value. That is a count of zero when the list left nothing out
+        // and the constant was in the same domain, because a complete synopsis accounts for every
+        // row. Where the list left something out, the value is somewhere between no rows and the
+        // bound the writer recorded, and a prefix has nothing to say about which. Where not one
+        // entry would even compare, the constant is of another type and the zero would be an
         // artefact of that rather than a fact about the rows.
-        if comparable { Stat::exact(0, Provenance::FrequencySynopsis) } else { Stat::Unknown }
+        if prefix.omitted_max == 0 && comparable {
+            Stat::exact(0, Provenance::FrequencySynopsis)
+        } else {
+            Stat::Unknown
+        }
     }
 }
 
