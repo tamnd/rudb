@@ -230,14 +230,12 @@ fn create_table(
     index: ast::CreateTableRef,
 ) -> Result<Bound> {
     let written = ast.create_table(index);
-    if written.temporary {
-        // A temporary table lives in the `temp` catalog and is dropped when the connection goes,
-        // and there is neither a `temp` catalog nor a connection yet. Making one in `memory` that
-        // never goes away would answer a later `SELECT` with rows DuckDB would not have.
-        return Err(Error::not_implemented("CREATE TEMPORARY TABLE"));
-    }
     let parts: Vec<&str> = ast.name(written.name).collect();
-    let name = catalog.resolve_for_create(&parts)?;
+    let name = if written.temporary {
+        catalog.resolve_for_create_temporary(&parts)?
+    } else {
+        catalog.resolve_for_create(&parts)?
+    };
     let defs = ast.column_defs(written.columns);
     let (columns, source) = if written.query == NONE {
         let mut columns = Vec::with_capacity(defs.len());
@@ -333,14 +331,12 @@ fn create_view(
     index: ast::CreateViewRef,
 ) -> Result<Bound> {
     let written = ast.create_view(index);
-    if written.temporary {
-        // Same reason as a temporary table: there is no `temp` catalog and no connection for one to
-        // belong to, and a view in `memory` that never goes away is not the thing that was asked
-        // for.
-        return Err(Error::not_implemented("CREATE TEMPORARY VIEW"));
-    }
     let parts: Vec<&str> = ast.name(written.name).collect();
-    let name = catalog.resolve_for_create(&parts)?;
+    let name = if written.temporary {
+        catalog.resolve_for_create_temporary(&parts)?
+    } else {
+        catalog.resolve_for_create(&parts)?
+    };
     let aliases: Vec<String> = ast.name(written.columns).map(str::to_string).collect();
 
     let mut binder = Binder::with(catalog, parameters, session);

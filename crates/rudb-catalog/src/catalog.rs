@@ -44,9 +44,13 @@ impl Database {
     /// Whether the engine made this one rather than a person.
     ///
     /// True for `system` and `temp` and false for everything a person attaches, which is the pin's
-    /// answer in the `internal` column of `duckdb_databases()`. Everything in an internal database
-    /// is internal too, so this is where the `internal` column of the table, view and column tables
-    /// is read from as well: there is no entry in `system` that somebody wrote.
+    /// answer in the `internal` column of `duckdb_databases()`.
+    ///
+    /// Not the same question as whether an entry inside it is internal. It is the same answer for
+    /// `memory`, where nobody but a person puts anything, and for `system`, where nobody but the
+    /// engine does. `temp` is the one that comes apart: the engine owns the database and every
+    /// table in it was written by somebody, so `duckdb_tables()` says false there while
+    /// `duckdb_databases()` says true. `rudb_exec`'s `entrynames` has that rule.
     #[must_use]
     pub fn internal(&self) -> bool {
         self.internal
@@ -390,7 +394,10 @@ impl Catalog {
 
     /// Removes whichever of the two the caller said it was dropping, refusing the other one.
     fn drop_entry(&mut self, name: &QualifiedName, wanted: Entry) -> Result<()> {
-        if self.database(&name.catalog)?.internal {
+        // `temp` is an internal database holding entries that are not internal, which is the one
+        // place those two answers come apart. A person wrote the temporary table and a person gets
+        // to drop it.
+        if !name.temporary() && self.database(&name.catalog)?.internal {
             return Err(Error::catalog(format!(
                 "Cannot drop internal catalog entry \"{}\"!",
                 name.table
@@ -530,7 +537,7 @@ impl Catalog {
     ///
     /// If the name has no parts or more than three, or if the schema it names is missing.
     pub fn resolve_for_create(&self, parts: &[&str]) -> Result<QualifiedName> {
-        let candidates = self.candidates(parts)?;
+        let candidates = self.written(parts)?;
         let mut first_error = None;
         for candidate in &candidates {
             match self.schema(&candidate.catalog, &candidate.schema) {
@@ -553,6 +560,67 @@ impl Catalog {
         }))
     }
 
+    /// The full name a `CREATE TEMPORARY` of this written name would make.
+    ///
+    /// Everything temporary goes in the `temp` database and nowhere else, so this is not a search
+    /// over a path the way the other two are. A bare name is `temp.main`, a two part name names a
+    /// schema inside `temp` unless it names `temp` itself, and a three part name has to say `temp`.
+    /// Anything else names a database that is not `temp` and is refused with the pin's own
+    /// sentence, asterisks included.
+    ///
+    /// A schema in `temp` other than `main` is a thing the pin cannot have either, because it
+    /// refuses `CREATE SCHEMA` there. So the two part form exists to let somebody write `main.t`
+    /// and get the temporary one, and to say which schema is missing when they write anything else.
+    ///
+    /// # Errors
+    ///
+    /// If the name has no parts or more than three, if it names a database other than `temp`, or if
+    /// the schema inside `temp` is missing.
+    pub fn resolve_for_create_temporary(&self, parts: &[&str]) -> Result<QualifiedName> {
+        let outside = || {
+            Error::parser(format!(
+                "TEMPORARY table names can *only* use the \"{TEMP_CATALOG}\" catalog"
+            ))
+        };
+        let name = match parts {
+            [table] => QualifiedName::new(TEMP_CATALOG, DEFAULT_SCHEMA, *table),
+            [first, table] if same_name(first, TEMP_CATALOG) => {
+                QualifiedName::new(TEMP_CATALOG, DEFAULT_SCHEMA, *table)
+            }
+            // A database that is attached is a database the writer meant, so naming it is the
+            // refusal rather than a schema of that name being missing.
+            [first, _] if self.database(first).is_ok() => return Err(outside()),
+            [first, table] => QualifiedName::new(TEMP_CATALOG, *first, *table),
+            [catalog, schema, table] if same_name(catalog, TEMP_CATALOG) => {
+                QualifiedName::new(TEMP_CATALOG, *schema, *table)
+            }
+            [catalog, _, _] if self.database(catalog).is_ok() => return Err(outside()),
+            // A three part name whose first part is no database at all is read the way the pin
+            // reads it, which is as a schema that is not there.
+            [catalog, _, _] => {
+                return Err(Error::catalog(format!("Schema with name {catalog} does not exist!")));
+            }
+            _ => {
+                return Err(Error::catalog(format!(
+                    "a name of {} parts, and a table name has one, two or three",
+                    parts.len()
+                )));
+            }
+        };
+        self.schema(&name.catalog, &name.schema)?;
+        Ok(name)
+    }
+
+    /// Every table a database file would hold, which is every table that is not temporary.
+    ///
+    /// A checkpoint writes what this returns and nothing else. A temporary table is gone when the
+    /// database closes, so writing it would leave rows in the file that the next open reports as a
+    /// table nobody asked for, and the questions the checkpoint asks about whether the file is
+    /// already up to date are asked over the same set or they would never agree.
+    pub fn stored_tables(&self) -> impl Iterator<Item = &Table> {
+        self.tables().filter(|table| !table.name().temporary())
+    }
+
     /// Every table, in creation order within a schema.
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
         self.databases
@@ -567,9 +635,35 @@ impl Catalog {
     /// and a bare `duckdb_views` find anything at all: neither is in the database a session creates
     /// in, and a name that is not found where it was written is looked for in `system` before it is
     /// reported missing. Upstream's path is `temp.main`, the current database's `main`, `system.main`
-    /// and `system.pg_catalog`, which `current_schemas(true)` prints, and the two that are added here
-    /// are the two that hold anything.
+    /// and `system.pg_catalog`, which `current_schemas(true)` prints.
+    ///
+    /// `temp.main` comes first, which is what makes a temporary table shadow a stored one of the
+    /// same name. Both exist at once and a bare name finds the temporary one, so `CREATE TABLE t`
+    /// after `CREATE TEMPORARY TABLE t` makes a second table rather than complaining, and the
+    /// `SELECT` that follows reads the temporary one. The catalog a bare `CREATE` writes into is
+    /// still the default one, so the two directions genuinely differ and the pin differs the same
+    /// way.
     fn candidates(&self, parts: &[&str]) -> Result<Vec<QualifiedName>> {
+        let mut readings = self.written(parts)?;
+        // Only a name that did not say which database it meant can land in `temp`, so a one part
+        // name gets the temporary schema in front and a two part name gets it as another schema to
+        // try. A three part name said the database out loud and is left alone.
+        match parts {
+            [table] => readings.insert(0, QualifiedName::new(TEMP_CATALOG, DEFAULT_SCHEMA, *table)),
+            [first, table] => readings.insert(0, QualifiedName::new(TEMP_CATALOG, *first, *table)),
+            _ => {}
+        }
+        Ok(readings)
+    }
+
+    /// The readings of a written name with the temporary schema left out, which is what a `CREATE`
+    /// wants.
+    ///
+    /// A bare `CREATE TABLE t` writes into the default database even when a temporary `t` is in
+    /// scope, so the list a create resolves against is the one that existed before `temp` held
+    /// anything. `CREATE TEMPORARY` does not come through here at all; it has
+    /// [`Catalog::resolve_for_create_temporary`].
+    fn written(&self, parts: &[&str]) -> Result<Vec<QualifiedName>> {
         match parts {
             [table] => Ok(vec![
                 QualifiedName::new(&self.default_catalog, &self.default_schema, *table),
@@ -970,6 +1064,93 @@ mod tests {
         let name = catalog.resolve(&["other", "main", "hits"]).expect("the other one");
         assert_eq!(name.catalog, "other");
         assert!(catalog.attach("OTHER").is_err(), "attaching it twice does not work");
+    }
+
+    /// Every way of writing a temporary name that the pin accepts lands in `temp.main`, and the
+    /// ones it refuses are refused with the sentence it uses.
+    #[test]
+    fn a_temporary_create_resolves_into_the_temp_database_or_is_refused() {
+        let mut catalog = Catalog::new();
+        catalog.attach("other").expect("a second database");
+        for parts in [
+            vec!["t"],
+            vec!["temp", "t"],
+            vec!["TEMP", "t"],
+            vec!["main", "t"],
+            vec!["temp", "main", "t"],
+        ] {
+            let name = catalog.resolve_for_create_temporary(&parts).expect("a temporary name");
+            assert!(
+                name.same_as(&QualifiedName::new("temp", "main", "t")),
+                "{parts:?} gave {name}"
+            );
+            assert!(name.temporary());
+        }
+
+        // Naming a database that is there is the writer saying where they meant, so it is the
+        // refusal rather than a schema of that name being looked for.
+        for parts in [vec!["other", "t"], vec!["memory", "main", "t"], vec!["other", "main", "t"]] {
+            let error =
+                catalog.resolve_for_create_temporary(&parts).expect_err("not the temp database");
+            assert!(error.to_string().contains("can *only* use"), "{parts:?} gave {error}");
+        }
+
+        // A first part that is no database at all reads as a schema, and `temp` holds only `main`.
+        let error = catalog.resolve_for_create_temporary(&["nope", "t"]).expect_err("no schema");
+        assert!(error.to_string().contains("nope"), "{error}");
+    }
+
+    /// The temporary reading of a name comes first when reading and is left out when writing, which
+    /// is how `CREATE TABLE t` makes a second `t` while `SELECT ... FROM t` still finds the first.
+    #[test]
+    fn a_read_tries_the_temp_database_first_and_a_create_does_not() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                QualifiedName::new("memory", "main", "t"),
+                vec![Field::new("n", LogicalType::Integer)],
+            )
+            .expect("a stored table");
+        assert_eq!(catalog.resolve(&["t"]).expect("the stored one").catalog, "memory");
+
+        catalog
+            .create_table(
+                catalog.resolve_for_create_temporary(&["t"]).expect("a temporary name"),
+                vec![Field::new("n", LogicalType::Integer)],
+            )
+            .expect("a temporary table");
+        assert_eq!(catalog.resolve(&["t"]).expect("the temporary one").catalog, "temp");
+        assert_eq!(
+            catalog.resolve(&["main", "t"]).expect("still the temporary one").catalog,
+            "temp"
+        );
+        assert_eq!(
+            catalog.resolve(&["memory", "main", "t"]).expect("the stored one").catalog,
+            "memory"
+        );
+
+        // The create still writes into `memory`, which is the direction that does not follow the
+        // read, and both tables exist at once.
+        let name = catalog.resolve_for_create(&["t"]).expect("a create name");
+        assert_eq!(name.catalog, "memory");
+        assert_eq!(catalog.tables().count(), 2);
+        assert_eq!(catalog.stored_tables().count(), 1);
+    }
+
+    /// A temporary table can be dropped even though the database holding it is the engine's, which
+    /// is the one place the guard on internal databases has to stand aside.
+    #[test]
+    fn a_temporary_table_can_be_dropped_and_a_system_one_cannot() {
+        let mut catalog = Catalog::new();
+        let name = catalog.resolve_for_create_temporary(&["t"]).expect("a temporary name");
+        catalog
+            .create_table(name.clone(), vec![Field::new("n", LogicalType::Integer)])
+            .expect("a temporary table");
+        catalog.drop_table(&name).expect("a person wrote it and a person drops it");
+        assert_eq!(catalog.tables().count(), 0);
+
+        let system = catalog.resolve(&["duckdb_tables"]).expect("a system table").clone();
+        assert!(catalog.drop_table(&system).is_err(), "the engine's own stays");
     }
 
     #[test]
