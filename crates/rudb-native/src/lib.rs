@@ -746,27 +746,21 @@ impl GlobalDictionary {
     /// back in order for anything that needs it, and it is separate from the codes so that getting
     /// it costs a sort of the distinct values at the end rather than a rewrite of every code page.
     ///
-    /// The sort compares the first eight bytes as one integer before it compares the values, which
-    /// settles almost every pair without touching the payload. Padding with zero on the right is
-    /// order preserving for byte strings, because a shorter value differs from a longer one that
-    /// starts the same way at a position where the shorter one has run out, and zero is below every
-    /// byte that could be there. A pair the head cannot settle falls through to the bytes.
+    /// The order is the byte order of the values and nothing else. The heads are attached after the
+    /// sort rather than sorted on, because padding with zero on the right is order preserving for
+    /// byte strings and so sorting by head and then by bytes lands in the same place as sorting by
+    /// bytes: a shorter value differs from a longer one that starts the same way at a position
+    /// where the shorter one has run out, and zero is below every byte that could be there.
     ///
-    /// The heads are kept rather than thrown away once the sort is over, because a reader searching
-    /// this order wants exactly the same comparison and for exactly the same reason. Eight bytes an
-    /// entry of file is what buys a binary search that reads no values at all in the ordinary case.
+    /// The heads are kept because a reader searching this order wants a comparison it can make out
+    /// of the index alone. What they buy there depends entirely on the column and is much less than
+    /// it looks on the columns that cost the most, which [`sort_by_value`] measures.
     fn ranked(&self) -> Vec<(u64, u32)> {
         let count = self.offsets.len() - 1;
-        let mut ranked = (0..count)
-            .map(|code| {
-                let code = code as u32;
-                (head(self.bytes(code).unwrap_or_default()), code)
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_unstable_by(|left, right| {
-            left.0.cmp(&right.0).then_with(|| self.bytes(left.1).cmp(&self.bytes(right.1)))
-        });
-        ranked
+        let mut codes = (0..count as u32).collect::<Vec<_>>();
+        let mut scratch = vec![0; codes.len()];
+        sort_by_value(&mut codes, &mut scratch, |code| self.bytes(code).unwrap_or_default());
+        codes.into_iter().map(|code| (head(self.bytes(code).unwrap_or_default()), code)).collect()
     }
 
     fn observe(&mut self, code: u32, null: bool) -> Result<()> {
@@ -6174,6 +6168,89 @@ struct EncodedDictionary {
     payload: Vec<Vec<u8>>,
 }
 
+/// How few codes a range has to be down to before the sort compares them instead of bucketing them.
+///
+/// A bucketing pass costs a kilobyte of counters and two reads of every code in the range whatever
+/// the range is, so below some size the counters cost more than the comparisons they save. Thirty
+/// two is where the two meet for values that are long enough to be worth a dictionary, and it is
+/// also small enough that the comparison it falls back to reads a cache line or two.
+const RADIX_SORT_SMALL: usize = 32;
+
+/// Which bucket a value falls in at this depth, with zero meaning the value has ended here.
+///
+/// A value that has run out sorts before every value that continues, which is the same rule the
+/// bytes follow, so the ended bucket goes first and never needs another pass: everything in it is
+/// the same value, and a dictionary holds a value once.
+fn radix_bucket(value: &[u8], depth: usize) -> usize {
+    value.get(depth).map_or(0, |byte| usize::from(*byte) + 1)
+}
+
+/// Sorts codes into the byte order of the values they name, one byte position at a time.
+///
+/// # Why this is not a comparison sort
+///
+/// It was one, and on the columns that matter it was the wrong algorithm by a wide margin. The
+/// reason is in the data. Take the eight million row `hits` and count how many distinct values each
+/// text column has against how many distinct first eight bytes they have between them:
+///
+/// ```text
+///   distinct   first 8   first 16   first 32   column
+///  2,266,417        50      8,892    232,630   URL
+///  2,346,025        49      8,534    204,060   Referer
+///  1,357,764    81,362    348,340    861,579   Title
+/// ```
+///
+/// Two and a quarter million URLs have fifty distinct first eight bytes, because they all begin
+/// `http://` and then the host, and there are not many hosts. A comparison sort of that does about
+/// twenty one comparisons a value and each one walks the shared prefix before it finds a byte that
+/// differs, so the work is the count times the depth of the agreement, and the agreement is deep.
+/// Widening the comparison does not fix it: thirty two bytes still leaves ninety percent of the
+/// values tied. `Title` is free text and separates at eight bytes, which is why the design looked
+/// right when it was written and why the column it was measured on was the wrong one.
+///
+/// Bucketing by one byte at a time never reads a byte twice. A range that agrees on its first
+/// thirty bytes has had those bytes read once each on the way down and is sorted on the thirty
+/// first. Deep agreement, which is what makes the comparison sort slow, is what makes this fast.
+///
+/// `scratch` is as long as `codes` and is where a pass lands its codes before they go back, so the
+/// whole sort allocates once for a column rather than once a range.
+fn sort_by_value<'a>(codes: &mut [u32], scratch: &mut [u32], values: impl Fn(u32) -> &'a [u8]) {
+    let mut work = vec![(0, codes.len(), 0)];
+    while let Some((from, to, depth)) = work.pop() {
+        let part = &mut codes[from..to];
+        if part.len() <= RADIX_SORT_SMALL {
+            part.sort_unstable_by(|left, right| {
+                values(*left)[depth..].cmp(&values(*right)[depth..])
+            });
+            continue;
+        }
+        let mut counts = [0_usize; 257];
+        for &code in part.iter() {
+            counts[radix_bucket(values(code), depth)] += 1;
+        }
+        let mut starts = [0_usize; 258];
+        let mut at = 0;
+        for (start, count) in starts.iter_mut().zip(counts.iter()) {
+            *start = at;
+            at += *count;
+        }
+        starts[257] = at;
+        let mut cursor = starts;
+        let landing = &mut scratch[from..to];
+        for &code in part.iter() {
+            let slot = radix_bucket(values(code), depth);
+            landing[cursor[slot]] = code;
+            cursor[slot] += 1;
+        }
+        part.copy_from_slice(landing);
+        for edges in starts.windows(2).skip(1) {
+            if edges[1] - edges[0] > 1 {
+                work.push((from + edges[0], from + edges[1], depth + 1));
+            }
+        }
+    }
+}
+
 /// The first eight bytes of a value as an integer that sorts the way the bytes sort.
 fn head(bytes: &[u8]) -> u64 {
     let mut word = [0; 8];
@@ -10205,5 +10282,67 @@ mod tests {
         let wrong = Clustering::new(vec![3], Width::Exact, &four).expect("valid against four");
         assert!(writer.declare(wrong).is_err(), "the table has one column, not four");
         fs::remove_file(&path).ok();
+    }
+
+    /// The sorted order is the byte order, whatever the values do before they differ.
+    ///
+    /// The values here are the shape the sort is built for and the shape a comparison sort is worst
+    /// at: a common scheme, a handful of hosts, and a path that only decides the pair thirty bytes
+    /// in. They also cover what the bucketing has to get right at the edges, which is a value that
+    /// has run out where another carries on, the empty value, and enough entries to take the range
+    /// down through several passes and out the bottom into the comparison that finishes it.
+    #[test]
+    fn the_dictionary_order_is_the_byte_order_however_deep_the_values_agree() {
+        let mut values = vec![String::new(), "http://".to_owned()];
+        for host in 0..7 {
+            for path in 0..30 {
+                values.push(format!("http://example{host}.test/page/{path:04}/index.html"));
+                values.push(format!("http://example{host}.test/page/{path:04}"));
+            }
+        }
+        values.push("http://example0.test/page/0000/index.htmlx".to_owned());
+
+        let mut dictionary = GlobalDictionary::new();
+        for value in &values {
+            dictionary.code(value).expect("a code for every value");
+        }
+        let ranked = dictionary.ranked();
+        assert_eq!(ranked.len(), values.len(), "one entry a distinct value");
+
+        let seen = ranked
+            .iter()
+            .map(|&(_, code)| {
+                String::from_utf8(dictionary.bytes(code).expect("a coded value").to_vec())
+                    .expect("text in, text out")
+            })
+            .collect::<Vec<_>>();
+        let mut wanted = values.clone();
+        wanted.sort_unstable();
+        assert_eq!(seen, wanted, "the order is the order the bytes give");
+
+        for &(carried, code) in &ranked {
+            let value = dictionary.bytes(code).expect("a coded value");
+            assert_eq!(carried, head(value), "the head belongs to the value it is filed with");
+        }
+    }
+
+    /// A dictionary too small to bucket, and one with nothing in it, come back in order too.
+    #[test]
+    fn a_short_dictionary_sorts_without_a_bucketing_pass() {
+        let empty = GlobalDictionary::new();
+        assert!(empty.ranked().is_empty(), "nothing in, nothing out");
+
+        let mut dictionary = GlobalDictionary::new();
+        for value in ["pear", "apple", "", "apples", "app"] {
+            dictionary.code(value).expect("a code for every value");
+        }
+        let seen = dictionary
+            .ranked()
+            .iter()
+            .map(|&(_, code)| dictionary.bytes(code).expect("a coded value").to_vec())
+            .collect::<Vec<_>>();
+        let wanted: Vec<Vec<u8>> =
+            [&b""[..], b"app", b"apple", b"apples", b"pear"].iter().map(|v| v.to_vec()).collect();
+        assert_eq!(seen, wanted, "shorter first where one runs out inside another");
     }
 }
