@@ -62,7 +62,7 @@ pub use zones::{Common, Stripes, distincts};
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
-const FORMAT: u32 = 25;
+const FORMAT: u32 = 26;
 
 /// Formats this build can open.
 ///
@@ -77,12 +77,15 @@ const FORMAT: u32 = 25;
 /// so nothing in an older file is a tag this build cannot read. What took it from 23 to 24 is the
 /// section table, which a file written before it simply does not have. What takes it from 24 to 25
 /// is the view section on the end of the catalog, which an older file does not have either, and a
-/// catalog that ends where the tables end reads as a catalog with no views in it.
+/// catalog that ends where the tables end reads as a catalog with no views in it. What takes it
+/// from 25 to 26 is that a global dictionary's payload blocks now say where they are, and a file
+/// written before that has them behind one another, which [`open_global_dictionary`] reads by
+/// turning the ends it finds into the same places the newer files name outright.
 ///
-/// This is not a general compatibility promise. Four formats are readable because there was a
+/// This is not a general compatibility promise. Five formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
 /// carrying.
-const READABLE: &[u32] = &[22, 23, 24, FORMAT];
+const READABLE: &[u32] = &[22, 23, 24, 25, FORMAT];
 
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
@@ -1870,8 +1873,8 @@ impl Writer {
             self.table.distincts[index] =
                 Some(dictionary.counts.iter().filter(|count| **count != 0).count() as u64);
             self.table.frequencies[index] = Some(code_frequency(&dictionary));
-            let encoded = encode_global_dictionary(dictionary, &order)?;
             let offset = self.at;
+            let encoded = encode_global_dictionary(dictionary, &order, offset, true)?;
             self.put(&encoded.index)?;
             self.put(&encoded.ranks)?;
             for block in &encoded.payload {
@@ -2405,10 +2408,14 @@ struct NativeText {
     /// only when something asks, which is a grouped min or max over this column and nothing else,
     /// and that reader was going to read the payload of this column once per row otherwise.
     code_ranks: OnceLock<Option<Vec<u32>>>,
-    payload: u64,
-    /// Where each block of the payload ends in the file, as a byte offset from `payload`. The
-    /// blocks are stored back to back, so a block starts where the one before it ended.
-    ends: Vec<u64>,
+    /// Where each block of the payload starts in the file, and how many stored bytes it is.
+    ///
+    /// Absolute rather than an offset from a base the blocks share, because a block is written the
+    /// moment it fills and what comes after it in the file is whatever the load wrote next. A file
+    /// old enough to have them back to back is read into these same two lists by adding the base to
+    /// the ends it carries, so nothing below here knows which kind of file it came from.
+    starts: Vec<u64>,
+    lengths: Vec<u64>,
     hashes: Vec<u64>,
     /// The payload, read and decoded a block at a time and kept after that.
     blocks: Vec<OnceLock<Result<Vec<u8>>>>,
@@ -2499,6 +2506,21 @@ const TEXT_OFFSET_RUN: usize = 512;
 /// holds, the block count and the bits an offset is packed at.
 const DICTIONARY_HEADER: usize = 16;
 
+/// Set beside the offset width in the fourth word of a global dictionary index, meaning each
+/// payload block says where in the file it starts and how long it is, rather than sitting directly
+/// behind the block before it.
+///
+/// In that word rather than in a word of its own because the width is at most 32 and lives in a
+/// `u32`, so the top of it has never been anything. A build old enough not to know the flag reads
+/// the file's format before it reads any of this and refuses it there, and if it somehow did get
+/// here it would find an offset width of two billion and say so.
+///
+/// The point of the flag is that a block written the moment it fills does not know what will be
+/// written after it, so the payload of a column cannot be one run of bytes unless the whole column
+/// is held until the file is closed. That is the memory the load cannot afford. What it costs is
+/// eight bytes a block, against the block being a thousand values.
+const DICTIONARY_SCATTERED: u32 = 1 << 31;
+
 /// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
 /// unit.
 ///
@@ -2544,18 +2566,14 @@ impl NativeText {
     /// [`Self::payload_block`] keeps it forever, which is what a point read wants and what a walk
     /// of the whole dictionary must not do. Both call this and they differ in nothing else.
     fn decode_block(&self, block: usize) -> Result<Vec<u8>> {
-        let start = if block == 0 { 0 } else { self.ends[block - 1] };
-        let end = self.ends[block];
-        let len = end
-            .checked_sub(start)
-            .ok_or_else(|| invalid("global dictionary block ends before it starts"))?;
+        let len = self.lengths[block];
         let mut stored = vec![
             0;
             usize::try_from(len).map_err(|_| invalid(
                 "global dictionary block does not fit in memory"
             ))?
         ];
-        read_at(&self.file, self.payload + start, &mut stored)?;
+        read_at(&self.file, self.starts[block], &mut stored)?;
         if checksum(&stored) != self.hashes[block] {
             return Err(invalid("global dictionary payload checksum differs"));
         }
@@ -2963,7 +2981,8 @@ impl TextSource for NativeText {
                 .sum::<usize>()
             + self.blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
             + self.hashes.capacity() * size_of::<u64>()
-            + self.ends.capacity() * size_of::<u64>()
+            + self.starts.capacity() * size_of::<u64>()
+            + self.lengths.capacity() * size_of::<u64>()
             + self
                 .blocks
                 .iter()
@@ -6427,9 +6446,22 @@ fn rankings(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<(u64, u
     Ok(orders)
 }
 
+/// One column's dictionary as the three runs of bytes a file holds it in.
+///
+/// `base` is where the index is going to land, which the caller knows because it is about to write
+/// it there. It is needed rather than worked out afterwards because with `scattered` set the index
+/// names the place of every payload block in the file, and the index is what stands between `base`
+/// and the first of them.
+///
+/// `scattered` false lays the blocks out the way a file written before format 26 has them, one
+/// behind the next with only the ends recorded. Nothing in the writer asks for that any more. It is
+/// kept because [`open_global_dictionary`] still reads those files and a reading path that nothing
+/// can produce is a reading path nothing tests.
 fn encode_global_dictionary(
     dictionary: GlobalDictionary,
     order: &[(u64, u32)],
+    base: u64,
+    scattered: bool,
 ) -> Result<EncodedDictionary> {
     let values = dictionary.offsets.len() - 1;
     if order.len() != values {
@@ -6443,9 +6475,15 @@ fn encode_global_dictionary(
     let (ranks, rank_ends) = encode_ranks(order, code_width(values))?;
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
     let offset_bits = offset_width(&dictionary.offsets);
-    let mut index = Vec::with_capacity(
-        DICTIONARY_HEADER + offset_bytes(values, offset_bits) + (blocks + rank_blocks) * 16,
-    );
+    // Worked out rather than measured at the end, because the places written into the index below
+    // are places in the file and the index is what stands between `base` and the first of them.
+    let payload_words = if scattered { 3 } else { 2 };
+    let index_len = DICTIONARY_HEADER
+        .checked_add(offset_bytes(values, offset_bits))
+        .and_then(|len| len.checked_add(blocks.checked_mul(payload_words * 8)?))
+        .and_then(|len| len.checked_add(rank_blocks.checked_mul(16)?))
+        .ok_or_else(|| invalid("global dictionary index length overflow"))?;
+    let mut index = Vec::with_capacity(index_len);
     put_u32(
         &mut index,
         u32::try_from(values).map_err(|_| invalid("global dictionary has too many values"))?,
@@ -6455,17 +6493,32 @@ fn encode_global_dictionary(
         &mut index,
         u32::try_from(blocks).map_err(|_| invalid("global dictionary has too many blocks"))?,
     );
-    put_u32(&mut index, offset_bits as u32);
+    let flag = if scattered { DICTIONARY_SCATTERED } else { 0 };
+    put_u32(&mut index, offset_bits as u32 | flag);
     encode_offsets(&dictionary.offsets, offset_bits, &mut index)?;
-    // Where each block ends, so a reader can find one. The stored blocks are shorter than the
-    // decoded ones and by a different amount each, so this is the one thing the offsets above no
-    // longer say.
-    let mut at = 0_u64;
+    // Where each block is and how long it is, so a reader can find one. The stored blocks are
+    // shorter than the decoded ones and by a different amount each, so their lengths are the one
+    // thing the offsets above no longer say, and where they start is no longer arithmetic on the
+    // block before once a block can be written the moment it fills.
+    let mut at = if scattered {
+        base.checked_add(index_len as u64)
+            .and_then(|at| at.checked_add(ranks.len() as u64))
+            .ok_or_else(|| invalid("global dictionary payload overflow"))?
+    } else {
+        0
+    };
     for block in &payload {
+        if scattered {
+            put_u64(&mut index, at);
+        }
         at = at
             .checked_add(block.len() as u64)
             .ok_or_else(|| invalid("global dictionary payload overflow"))?;
-        put_u64(&mut index, at);
+        if scattered {
+            put_u64(&mut index, block.len() as u64);
+        } else {
+            put_u64(&mut index, at);
+        }
     }
     for block in &payload {
         put_u64(&mut index, checksum(block));
@@ -6483,6 +6536,12 @@ fn encode_global_dictionary(
         let end = usize::try_from(*end).map_err(|_| invalid("global dictionary order overflow"))?;
         put_u64(&mut index, checksum(&ranks[at..end]));
         at = end;
+    }
+    // The places above were worked out from this length before a byte of it existed, so a mismatch
+    // here is every block offset in the file being wrong by the same amount, which is worth one
+    // comparison to find out about now rather than on the read.
+    if index.len() != index_len {
+        return Err(invalid("global dictionary index is not the length it was laid out for"));
     }
     Ok(EncodedDictionary { index, ranks, payload })
 }
@@ -6682,7 +6741,9 @@ fn open_global_dictionary(
     let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
     let per_block = u32::from_le_bytes(header[4..8].try_into().expect("four bytes")) as usize;
     let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
-    let offset_bits = u32::from_le_bytes(header[12..16].try_into().expect("four bytes")) as usize;
+    let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
+    let scattered = width & DICTIONARY_SCATTERED != 0;
+    let offset_bits = (width & !DICTIONARY_SCATTERED) as usize;
     if per_block != TEXT_PAYLOAD_VALUES {
         return Err(invalid("global dictionary block width differs"));
     }
@@ -6699,11 +6760,13 @@ fn open_global_dictionary(
     // search that most of them never make.
     let ranks = count;
     let rank_blocks = ranks.div_ceil(TEXT_RANK_BLOCK);
-    // Two words a payload block, one for where it ends in the file and one for its checksum, and the
-    // same two a rank block.
+    // Three words a payload block, for where it starts, how long it is and what it hashes to, or
+    // two of them on a file that has the blocks back to back and needs no start. Two a rank block
+    // either way, since those are still one run.
+    let payload_words = if scattered { 3 } else { 2 };
     let hash_len = blocks
-        .checked_add(rank_blocks)
-        .and_then(|words| words.checked_mul(16))
+        .checked_mul(payload_words * 8)
+        .and_then(|len| len.checked_add(rank_blocks.checked_mul(16)?))
         .ok_or_else(|| invalid("global dictionary block count overflow"))?;
     let index_len = DICTIONARY_HEADER
         .checked_add(offset_len)
@@ -6723,10 +6786,9 @@ fn open_global_dictionary(
         .chunks_exact(8)
         .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
         .collect::<Vec<_>>();
-    let mut hashes = words.split_off(blocks);
-    let mut rank_ends = hashes.split_off(blocks);
-    let rank_hashes = rank_ends.split_off(rank_blocks);
-    let ends = words;
+    let mut rest = words.split_off(blocks * payload_words);
+    let rank_hashes = rest.split_off(rank_blocks);
+    let rank_ends = rest;
     // A rank block packs its heads at whatever width its own values need, so its length is no longer
     // arithmetic on the block number and the reader has to be told where each one ends.
     if rank_ends.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -6740,12 +6802,39 @@ fn open_global_dictionary(
     if body_len > page.length as usize {
         return Err(invalid("global dictionary order exceeds its page"));
     }
-    // What the offsets bound is the decoded payload, and what the page holds is the stored one, so
-    // the last block end is the only thing that ties the index to the length of the page.
-    let stored_len = page.length as usize - body_len;
-    if ends.last().copied().unwrap_or_default() as usize != stored_len
-        || ends.windows(2).any(|pair| pair[0] > pair[1])
-    {
+    let hashes = words.split_off(blocks * (payload_words - 1));
+    let (starts, lengths) = if scattered {
+        let mut starts = Vec::with_capacity(blocks);
+        let mut lengths = Vec::with_capacity(blocks);
+        for pair in words.chunks_exact(2) {
+            starts.push(pair[0]);
+            lengths.push(pair[1]);
+        }
+        (starts, lengths)
+    } else {
+        // A file written before the blocks said where they were has them behind one another at the
+        // end of the page, so the base is where the sorted order stops and each end is the start of
+        // the one after it. Turning them round here is what lets everything below take one shape.
+        let base = page.offset + body_len as u64;
+        let mut starts = Vec::with_capacity(blocks);
+        let mut lengths = Vec::with_capacity(blocks);
+        let mut at = 0_u64;
+        for &end in &words {
+            let len = end
+                .checked_sub(at)
+                .ok_or_else(|| invalid("global dictionary block ends before it starts"))?;
+            starts.push(base + at);
+            lengths.push(len);
+            at = end;
+        }
+        (starts, lengths)
+    };
+    // What the offsets bound is the decoded payload, and what the page length counts is the stored
+    // one, so the block lengths adding up to the rest of it is the one thing that ties the index to
+    // the page. Adding up rather than reaching the end, because a block that says where it is need
+    // not be behind the one before it, and the weight is the part that still has to agree.
+    let stored_len = page.length as u64 - body_len as u64;
+    if lengths.iter().try_fold(0_u64, |sum, len| sum.checked_add(*len)) != Some(stored_len) {
         return Err(invalid("global dictionary blocks do not bound the payload"));
     }
     Vector::external_text(
@@ -6762,8 +6851,8 @@ fn open_global_dictionary(
             rank_blocks: (0..rank_blocks).map(|_| OnceLock::new()).collect(),
             code_bits: code_width(count),
             code_ranks: OnceLock::new(),
-            payload: page.offset + body_len as u64,
-            ends,
+            starts,
+            lengths,
             hashes,
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
             keep_budget,
@@ -7324,23 +7413,28 @@ mod tests {
     fn dictionary_index_len(header: &[u8; DICTIONARY_HEADER]) -> u64 {
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
-        let bits = u32::from_le_bytes(header[12..16].try_into().expect("four bytes")) as usize;
+        let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
+        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let payload_words = if width & DICTIONARY_SCATTERED == 0 { 2 } else { 3 };
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
         DICTIONARY_HEADER as u64
             + offset_bytes(count as usize, bits) as u64
-            + (blocks + rank_blocks) * 16
+            + blocks * payload_words * 8
+            + rank_blocks * 16
     }
 
     /// How long the sorted order is, which is where its last block ends.
     fn last_rank_end(file: &File, offset: u64, header: &[u8; DICTIONARY_HEADER]) -> u64 {
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
-        let bits = u32::from_le_bytes(header[12..16].try_into().expect("four bytes")) as usize;
+        let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
+        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let payload_words = if width & DICTIONARY_SCATTERED == 0 { 2 } else { 3 };
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
         let at = offset
             + DICTIONARY_HEADER as u64
             + offset_bytes(count as usize, bits) as u64
-            + blocks * 16
+            + blocks * payload_words * 8
             + (rank_blocks - 1) * 8;
         let mut end = [0; 8];
         read_at(file, at, &mut end).expect("the last rank block end");
@@ -9858,6 +9952,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Both block layouts come back as the same values in the same order.
+    ///
+    /// The scattered one is what every file this build writes holds. The other is what a file
+    /// written before format 26 holds, and nothing in the writer produces it any more, so the only
+    /// way to find out whether the reader still understands those files is to write one here. The
+    /// bytes go straight into a file with no directory around them, because what is under test is
+    /// [`open_global_dictionary`], which is handed a page and a file and asks the directory for
+    /// nothing.
+    ///
+    /// Three thousand values so that there are three payload blocks and a partial fourth, which is
+    /// what makes the last block the one place where a length and an end disagree about what they
+    /// are counting.
+    #[test]
+    fn a_dictionary_reads_the_same_whether_its_blocks_say_where_they_are() {
+        let spellings = (0..3_000)
+            .map(|index| format!("value {index:08} {}", "y".repeat(index % 40)))
+            .collect::<Vec<_>>();
+        let mut read = Vec::new();
+        for scattered in [true, false] {
+            let mut dictionary = GlobalDictionary::new();
+            for text in &spellings {
+                dictionary.code(text).expect("a code for every spelling");
+            }
+            let order = dictionary.ranked();
+            let encoded =
+                encode_global_dictionary(dictionary, &order, 0, scattered).expect("an encoding");
+            let mut bytes = encoded.index.clone();
+            bytes.extend_from_slice(&encoded.ranks);
+            for block in &encoded.payload {
+                bytes.extend_from_slice(block);
+            }
+            let path = path(if scattered { "blocks-scattered" } else { "blocks-behind" });
+            fs::write(&path, &bytes).expect("the dictionary is written on its own");
+            let file = Arc::new(File::open(&path).expect("it opens again"));
+            let page = Page {
+                offset: 0,
+                length: u32::try_from(bytes.len()).expect("a test dictionary is small"),
+                hash: checksum(&encoded.index),
+            };
+            let opened =
+                open_global_dictionary(file, page, &LogicalType::Varchar, TEXT_KEEP_BUDGET)
+                    .expect("a dictionary laid out either way opens");
+            let mut swept: Vec<Vec<u8>> = Vec::new();
+            let mut at = 0;
+            while at < opened.len() {
+                at = opened
+                    .sweep_text(at, opened.len(), &mut |_index: usize, text: &[u8]| {
+                        swept.push(text.to_vec());
+                        Ok(())
+                    })
+                    .expect("a sweep reads");
+            }
+            fs::remove_file(&path).expect("clean up");
+            read.push(swept);
+        }
+        let wanted =
+            spellings.iter().map(|text| text.as_bytes().to_vec()).collect::<Vec<Vec<u8>>>();
+        assert_eq!(read[0], wanted, "the blocks that say where they are hold the values");
+        assert_eq!(read[1], read[0], "the blocks behind one another hold the same values");
     }
 
     /// A dictionary at its budget sweeps without keeping, and still answers what it answered.
