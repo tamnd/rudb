@@ -6,7 +6,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rudb::{Connection, Database, Error, QueryResult, Span};
+use rudb::{Config, Connection, Database, Error, QueryResult, Span};
 
 use crate::args::{Command, Options};
 use crate::format::{Format, Settings, escaped, render};
@@ -57,6 +57,12 @@ pub struct Shell {
     /// catalog and that is a database call. Replaced whenever `.open` replaces the database, so the
     /// two never name different things.
     connection: Connection,
+    /// Whether `-readonly` was given, which `.open` has to know so the flag keeps meaning something.
+    ///
+    /// A shell started read only that opened a second database and wrote it would be a flag that
+    /// stops applying halfway through a session, so the database `.open` builds is opened the same
+    /// way the first one was.
+    read_only: bool,
     settings: Settings,
     out: Sink,
     err: Box<dyn Write>,
@@ -94,6 +100,7 @@ impl Shell {
         Self {
             connection: database.connect(),
             database,
+            read_only: options.readonly,
             settings: options.settings.clone(),
             out: Sink::Given(out),
             err,
@@ -110,6 +117,24 @@ impl Shell {
 
     /// Whether anything has failed since the shell started, which is what the exit code is.
     pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Ends the session, writing the database file, and answers with the exit code.
+    ///
+    /// The write happens either way, because dropping the last handle on a database writes it. This
+    /// exists so that a write which failed is a message and a failing exit code rather than a
+    /// session that looked fine and lost its tables. A run over `:memory:` has nothing to write and
+    /// this is the failure it already had.
+    pub fn close(mut self) -> bool {
+        // Another handle on the same database rather than the shell's own, because the shell still
+        // holds a connection and this has to happen while the session is intact. The handles left
+        // write again when they go, over a file that already holds what the catalog does, which
+        // costs a read of the catalog directory and writes nothing.
+        if let Err(problem) = self.database.clone().close() {
+            let _ = writeln!(self.err, "Error: {}", problem.message());
+            return true;
+        }
         self.failed
     }
 
@@ -379,8 +404,11 @@ impl Shell {
                 // The library decides what a name means, so `.open :memory:` is a new empty
                 // database here the same way it is for a program, and a file is the library's
                 // sentence about the format that is missing rather than a second one written here.
-                match Database::open(&argument(0)) {
+                let config = Config::default().with_read_only(self.read_only);
+                match Database::open_with(&argument(0), config) {
                     Ok(database) => {
+                        // The connection goes first, so that what is left of the database being
+                        // replaced is one handle and dropping it writes the file it was opened on.
                         self.connection = database.connect();
                         self.database = database;
                     }
