@@ -2019,6 +2019,14 @@ pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>, across: 
     if let ([column], Across::OneInput) = (keys, across) {
         if let Some((codes, _)) = column.stable_dictionary_parts() {
             let validity = column.validity();
+            // Two runs side by side when the column has no null in it, which is most columns, so
+            // the row is a load, a mix and a spread and not a validity read and a branch as well.
+            if let (false, Some(codes)) = (validity.has_nulls(rows), codes.get(..rows)) {
+                for (state, &code) in hashes.iter_mut().zip(codes) {
+                    *state = spread(mix(0, u64::from(code)));
+                }
+                return;
+            }
             for (row, state) in hashes.iter_mut().enumerate() {
                 let word = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
                 *state = spread(mix(0, word));
@@ -2161,6 +2169,15 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
     let validity = column.validity();
     if across == Across::OneInput {
         if let Some((codes, _)) = column.stable_dictionary_parts() {
+            // The same two runs side by side as in [`hash`], for the same reason.
+            if let (false, Some(codes), Some(hashes)) =
+                (validity.has_nulls(rows), codes.get(..rows), hashes.get_mut(..rows))
+            {
+                for (state, &code) in hashes.iter_mut().zip(codes) {
+                    *state = mix(*state, u64::from(code));
+                }
+                return;
+            }
             for (row, state) in hashes.iter_mut().enumerate().take(rows) {
                 let one = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
                 *state = mix(*state, one);
@@ -2180,12 +2197,23 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
         rudb_common::LogicalType::Decimal { width, .. } => wide_decimal(*width),
         _ => false,
     };
+    // Whether a row reads the place it sits in and is never nothing, which is the shape a column
+    // off our own format arrives in whenever the writer had no null to record. Asked once for the
+    // column, because a validity that says `AllValid` says it for the whole of it.
+    //
+    // It is what lets the two runs below drop the per row question entirely. Without it every row
+    // of every key column of every chunk paid a validity read, a branch, an `Option` and a bounds
+    // check to say what the column already said once, and hashing is nine to twelve percent of
+    // every query on the suite.
+    let straight = !validity.has_nulls(rows);
     if let Some(packed) = column.packed_parts() {
-        fold_packed(&packed, wide, rows, hashes, |row| validity.is_valid(row).then_some(row));
+        fold_packed(&packed, wide, rows, straight, hashes, |row| {
+            validity.is_valid(row).then_some(row)
+        });
         return;
     }
     if let Some(data) = column.data() {
-        if fold_data(data, rows, hashes, |row| validity.is_valid(row).then_some(row)) {
+        if fold_data(data, rows, hashes, straight, |row| validity.is_valid(row).then_some(row)) {
             return;
         }
     }
@@ -2211,7 +2239,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
                 let code = *at.get(row)? as usize;
                 inner.is_valid(code).then_some(code)
             };
-            if fold_data(data, rows, hashes, pick) {
+            if fold_data(data, rows, hashes, false, pick) {
                 return;
             }
         }
@@ -2225,7 +2253,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
         // building a `Value` per row to hash it.
         if let Some(packed) = values.packed_parts() {
             let inner = values.validity();
-            fold_packed(&packed, wide, rows, hashes, |row| {
+            fold_packed(&packed, wide, rows, false, hashes, |row| {
                 if !validity.is_valid(row) {
                     return None;
                 }
@@ -2263,14 +2291,32 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
 /// What this produces has to be what the value at a time path at the bottom of [`fold`] produces
 /// for the same number, since the same column is a packed run in one chunk and something else in
 /// the next, and the base plus the code is that number.
+///
+/// `straight` says every row reads its own place and no row is nothing, which is `pick` answering
+/// `Some(row)` for every row it will be asked about. It is the caller's for the same reason `wide`
+/// is: the caller holds the column and the column's validity says it once, where a closure can
+/// only be asked a row at a time. Saying it wrongly is a wrong answer and not a slow one, so the
+/// two call sites that read through codes say `false` rather than working out whether they could.
 fn fold_packed(
     packed: &Packed<'_>,
     wide: bool,
     rows: usize,
+    straight: bool,
     hashes: &mut [u64],
     pick: impl Fn(usize) -> Option<usize>,
 ) {
     let base = packed.base();
+    if straight {
+        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+            let value = base + i128::from(packed.code(row));
+            *state = if wide {
+                mix(mix(*state, value as u64), (value >> 64) as u64)
+            } else {
+                mix(*state, value as u64)
+            };
+        }
+        return;
+    }
     for (row, state) in hashes.iter_mut().enumerate().take(rows) {
         let Some(code) = pick(row) else {
             *state = mix(*state, NOTHING);
@@ -2292,10 +2338,15 @@ fn fold_packed(
 /// dictionary or a run length column picks the code, and the eleven arms below are written once.
 /// The answer is whether there was an arm for the data at all, which is `false` for the nested
 /// types and leaves the caller to fall through to whatever it has after this.
+///
+/// `straight` says every row reads its own place and no row is nothing, which is the shape a flat
+/// column with no nulls arrives in and is most of what a key column ever is. It has the same
+/// meaning and the same reason for being the caller's as it does in [`fold_packed`].
 fn fold_data(
     data: &Data,
     rows: usize,
     hashes: &mut [u64],
+    straight: bool,
     pick: impl Fn(usize) -> Option<usize>,
 ) -> bool {
     /// One pass over the rows, turning each into a word the same way the general path does.
@@ -2303,6 +2354,18 @@ fn fold_data(
         ($values:expr, $word:expr) => {{
             let values = $values.as_slice();
             let word = $word;
+            // The same pass with the row's own question taken out of it. Both ends are cut to the
+            // rows, so the walk is two runs side by side and there is no validity read, no branch,
+            // no `Option` and no bounds check left in the body. What is in it is the load, the
+            // widen and the mix, which is the work.
+            if straight {
+                if let (Some(values), Some(hashes)) = (values.get(..rows), hashes.get_mut(..rows)) {
+                    for (state, value) in hashes.iter_mut().zip(values) {
+                        *state = mix(*state, word(*value));
+                    }
+                    return true;
+                }
+            }
             for (row, state) in hashes.iter_mut().enumerate().take(rows) {
                 let one = match pick(row).and_then(|at| values.get(at)) {
                     Some(value) => word(*value),
@@ -2329,7 +2392,8 @@ fn fold_data(
         // is rather than as a null.
         Data::Varlen(strings) => {
             for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-                let one = match pick(row).and_then(|at| strings.bytes(at)) {
+                let at = if straight { Some(row) } else { pick(row) };
+                let one = match at.and_then(|at| strings.bytes(at)) {
                     Some(bytes) => bytes_word(bytes),
                     None => NOTHING,
                 };
@@ -2957,6 +3021,49 @@ mod tests {
         let (table, slots) = a_batch_at_a_time(&keys, values.len(), &types);
         assert_eq!(table.len(), 1);
         assert!(slots.iter().all(|&slot| slot == 0));
+    }
+
+    /// The pass that skips the per row null question has to answer what the pass that asks it
+    /// answers. A column with no null in it takes the first, a dictionary over the same values
+    /// takes the second because a code can point at a null the column itself does not have, and a
+    /// column with one null anywhere takes the second for all of its rows. All three are the same
+    /// values and all three have to hash the same, or the same key would land in two buckets
+    /// whenever a page with a null and a page without arrived one after the other.
+    #[test]
+    fn a_column_with_no_nulls_hashes_the_way_the_general_pass_hashes_it() {
+        let rows = 3_000usize;
+        for ty in [
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Date,
+            LogicalType::Decimal { width: 9, scale: 2 },
+        ] {
+            let of = |row: usize| match &ty {
+                LogicalType::Integer => Value::Integer(((row * 7919) % 5003) as i32),
+                LogicalType::BigInt => Value::BigInt(((row * 7919) % 5003) as i64),
+                LogicalType::Varchar => Value::Varchar(format!("k{}", (row * 7919) % 5003)),
+                LogicalType::Date => Value::Date(((row * 7919) % 5003) as i32),
+                _ => Value::Decimal { unscaled: ((row * 7919) % 5003) as i128, width: 9, scale: 2 },
+            };
+            let values: Vec<Value> = (0..rows).map(of).collect();
+            let plain = flat(ty.clone(), &values);
+            assert!(!plain.validity().has_nulls(rows), "{ty} has to have no nulls");
+            let want = hashed(&plain);
+
+            // The same values behind codes, which is the pass that asks about every row.
+            let coded = Vector::dictionary((0..rows as u32).collect(), flat(ty.clone(), &values))
+                .expect("a dictionary over those values");
+            assert_eq!(want, hashed(&coded), "{ty} through codes");
+
+            // And the same values with a null on the end, which puts every row of the run on the
+            // pass that asks. The rows before the null are the ones being compared.
+            let mut with_a_null = values.clone();
+            with_a_null.push(Value::Null);
+            let mixed = flat(ty.clone(), &with_a_null);
+            assert!(mixed.validity().has_nulls(rows + 1), "{ty} has to have a null");
+            assert_eq!(want, hashed(&mixed)[..rows], "{ty} beside a null");
+        }
     }
 
     /// A null is a word of its own rather than nothing at all, or a null would group with a zero.
