@@ -439,13 +439,17 @@ struct NativeFrequencies {
     column: usize,
 }
 
-/// Exact grouped counts already certified by a native file's frequency synopsis.
+/// Exact grouped counts already certified by the table's frequency synopsis.
 ///
-/// There are two ways the file can certify them. A `top` bound asks only for the leading groups, and
+/// There are two ways a table can certify them. A `top` bound asks only for the leading groups, and
 /// the synopsis answers that whenever the last one it would return beats the bound on everything it
 /// dropped, which is the usual case for a column with a long tail. With no bound the whole grouping
 /// has to come out of the synopsis, so it is only an answer when the synopsis is complete, which is
 /// what a column with few enough distinct values gives.
+///
+/// Either kind of table. A native file writes a synopsis at checkpoint and a table in memory counts
+/// one as the rows arrive, and the memory one is always either complete or absent, so it answers the
+/// unbounded case and the bounded one out of the same list. `rudb_storage::tally` has why.
 ///
 /// A filter between the grouping and the table is allowed when it names the same column being
 /// grouped, because then it only decides which of the groups survive and never splits or merges one.
@@ -532,10 +536,9 @@ fn edge(plan: &Plan, bound: rudb_plan::Bound, input: &Schema) -> Result<Edge> {
 /// nothing about it.
 ///
 /// Either kind of table, because both keep statistics now. A file has a directory per stripe and a
-/// table in memory has a zone map per chunk, and the questions below are asked of `Rows` rather than
-/// of one or the other, so a table that cannot answer one of them says so and the caller goes and
-/// reads the rows. What only a file answers is the questions that need a persisted synopsis, which
-/// are the distinct count and the frequencies.
+/// table in memory has a zone map per chunk and a sketch and a tally per column, and the questions
+/// below are asked of `Rows` rather than of one or the other, so a table that cannot answer one of
+/// them says so and the caller goes and reads the rows.
 fn whole_table<'a>(
     plan: &Plan,
     catalog: &'a Catalog,

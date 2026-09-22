@@ -1751,7 +1751,7 @@ impl<'a> Binder<'a> {
         if let Some(zones) = table.rows().zones() {
             self.plan.set_zones(index, zones);
         }
-        if let Some(frequencies) = table.rows().frequencies() {
+        if let Some(frequencies) = table.frequencies() {
             self.plan.set_frequencies(index, frequencies);
         }
         for (column, distinct) in table.distincts() {

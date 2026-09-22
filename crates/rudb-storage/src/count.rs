@@ -21,6 +21,23 @@
 //! two uses are `Stat::answer` and `Stat::decide` and the difference between them is the difference
 //! between a slow query and a wrong one.
 //!
+//! # And how many rows hold each of them, for a narrow column
+//!
+//! One pass over a column is one hash a value, and the hash is what the pass costs. So the frequency
+//! tally in `tally.rs` rides along on this one rather than making a pass of its own: every arm below
+//! hands the hash it computed to a [`Sink`], which is the sketch and the tally together.
+//!
+//! Together, but only one of them at a time. The tally holds every distinct value of a column it is
+//! still counting, so it is that column's exact distinct count and the sketch is not read at all
+//! while it lasts. It gives up at five hundred and twelve values and hands its hashes to the sketch
+//! on the way out, and from there the sketch reads the column as it always did. A narrow column
+//! therefore costs less than it used to rather than more, because the tally's slots are a kilobyte
+//! where the sketch's are sixty four.
+//!
+//! That is where `Rows::exact_frequencies` for a table in memory comes from. `tally.rs` has the
+//! argument for the cap and for why a memory table's list is complete or absent where a file's is
+//! allowed to be a prefix.
+//!
 //! # One value, one hash, whatever form it arrived in
 //!
 //! The same column arrives flat in one chunk and as a dictionary in the next, and a value counted
@@ -73,6 +90,8 @@ use rudb_common::{LogicalType, Value};
 use rudb_encoding::sketch::{DEFAULT_K, Sketch, hash64, hash128};
 use rudb_vector::{Chunk, Data, Form, Vector};
 
+use crate::tally::Tally;
+
 /// The distinct count of every column of one table, built as chunks are appended.
 #[derive(Debug, Clone)]
 pub struct Counts {
@@ -83,6 +102,11 @@ pub struct Counts {
 #[derive(Debug, Clone)]
 struct Column {
     sketch: Sketch,
+    /// How many rows hold each value, while the column has few enough values to say. See `tally.rs`.
+    ///
+    /// Here rather than in a pass of its own because the hash is what a pass over a column costs and
+    /// this one has already paid for it. Every arm below hands the hash it computed to both.
+    tally: Tally,
     /// Set by the first chunk this could not walk, and never cleared.
     ///
     /// A sketch that missed some of its rows is not a sketch of the column, and the failure it would
@@ -101,6 +125,7 @@ impl Counts {
                     // The default k is the only k here, so two of these can always be unioned. The
                     // constructor only fails on a k of zero.
                     sketch: Sketch::new(DEFAULT_K).unwrap_or_else(|_| Sketch::of(&[])),
+                    tally: Tally::new(),
                     blind: false,
                 })
                 .collect(),
@@ -118,11 +143,16 @@ impl Counts {
             if column.blind {
                 continue;
             }
-            if !chunk.column(at).is_ok_and(|vector| walk(vector, &mut column.sketch)) {
+            let walked = chunk.column(at).is_ok_and(|vector| {
+                walk(vector, &mut Sink::of(&mut column.sketch, &mut column.tally))
+            });
+            if !walked {
                 column.blind = true;
                 // The hashes taken so far describe some of the rows and no question is going to be
-                // answered from them, so they are dropped rather than carried.
+                // answered from them, so they are dropped rather than carried. The tally forgets
+                // rather than gives up, because there is no sketch left for it to hand anything to.
                 column.sketch = Sketch::of(&[]);
+                column.tally.forget();
             }
         }
     }
@@ -131,13 +161,19 @@ impl Counts {
     ///
     /// `None` when the sketch filled up, which means the column has at least [`DEFAULT_K`] distinct
     /// values and what is left is an estimate. This is the one a query result may be read out of.
+    ///
+    /// A column still being tallied is answered from the tally, because that is where its values
+    /// are. The sketch has not read such a column at all, so asking it would give an empty answer.
     #[must_use]
     pub fn exact(&self, column: usize) -> Option<u64> {
         let held = self.columns.get(column)?;
-        if held.blind || !held.sketch.is_exact() {
+        if held.blind {
             return None;
         }
-        Some(held.sketch.len() as u64)
+        if let Some(values) = held.tally.values() {
+            return Some(values as u64);
+        }
+        held.sketch.is_exact().then(|| held.sketch.len() as u64)
     }
 
     /// How many distinct non-null values one column holds, exactly or estimated, and which it is.
@@ -152,10 +188,40 @@ impl Counts {
         if held.blind {
             return None;
         }
+        if let Some(values) = held.tally.values() {
+            return Some((values as u64, true));
+        }
         if held.sketch.is_exact() {
             return Some((held.sketch.len() as u64, true));
         }
         Some((held.sketch.distinct().round() as u64, false))
+    }
+
+    /// Every non-null value of one column with the exact number of rows holding it.
+    ///
+    /// `None` for a column with more distinct values than `tally.rs` keeps, and for a blind one.
+    /// Most common value first. The null is not in here and the caller that wants it adds it from
+    /// the null count the zone maps keep, for the reason `tally.rs` gives.
+    #[must_use]
+    pub fn frequencies(&self, column: usize) -> Option<Vec<(Value, u64)>> {
+        let held = self.columns.get(column)?;
+        if held.blind {
+            return None;
+        }
+        held.tally.list()
+    }
+
+    /// How many distinct values one column's frequency list holds, without building it.
+    ///
+    /// `None` when there is no list, which is the same question [`Counts::frequencies`] answers and
+    /// is asked separately by a caller deciding whether the copy is worth making.
+    #[must_use]
+    pub fn frequency_values(&self, column: usize) -> Option<usize> {
+        let held = self.columns.get(column)?;
+        if held.blind {
+            return None;
+        }
+        held.tally.values()
     }
 
     /// How many columns this is counting.
@@ -165,13 +231,75 @@ impl Counts {
     }
 }
 
-/// Adds every non-null value of one vector to one sketch.
+/// Where one column's values go as a chunk is walked.
+///
+/// The distinct sketch and the frequency tally beside it both want the hash of the value and nothing
+/// else about it, so the pass computes it once and hands it on. That is the whole reason the tally
+/// is behind this rather than in a pass of its own: a second pass would pay a second hash a row,
+/// and the hash is what this pass costs.
+///
+/// One at a time rather than both at once. A tally that is still counting holds every distinct value
+/// of its column, so while it does the sketch has nothing to add and is not touched, and the moment
+/// it gives up it hands over what it had and the sketch takes over from there. See `tally.rs` for
+/// why that is faster than reading both, which is not the obvious way round.
+struct Sink<'a> {
+    sketch: &'a mut Sketch,
+    tally: &'a mut Tally,
+    /// Whether the tally is still counting, read once when this is built rather than once a row.
+    ///
+    /// A column that gave up in its first chunk is walked by every chunk after it, and what is left
+    /// of this for those rows should be one flag in a register and not a look inside the tally.
+    counting: bool,
+}
+
+impl<'a> Sink<'a> {
+    /// The sink for one column of one chunk.
+    fn of(sketch: &'a mut Sketch, tally: &'a mut Tally) -> Self {
+        Self { counting: tally.counting(), sketch, tally }
+    }
+
+    /// One value, however many rows hold it, with the value itself read only when it is new.
+    ///
+    /// The rows are for the tally alone. A sketch counts a value once however many rows arrived with
+    /// it, which is why every arm below that has a run or a dictionary entry can add it once.
+    fn add(&mut self, hash: u64, rows: u64, value: impl FnOnce() -> Value) {
+        if self.counting {
+            if self.tally.add(hash, rows, value) {
+                return;
+            }
+            self.counting = false;
+            self.hand_over();
+        }
+        self.sketch.add_hash(hash);
+    }
+
+    /// Gives the tally up, for an arm that counted every value but cannot trust the row counts.
+    ///
+    /// The distinct count survives what this is called for and the frequency list does not, so the
+    /// two halves part company here rather than the column losing both.
+    fn stop_counting(&mut self) {
+        self.tally.give_up();
+        self.counting = false;
+        self.hand_over();
+    }
+
+    /// Moves whatever the tally was holding into the sketch, once, on the way out of the tally.
+    fn hand_over(&mut self) {
+        if let Some(spilled) = self.tally.spilled() {
+            for held in spilled {
+                self.sketch.add_hash(held);
+            }
+        }
+    }
+}
+
+/// Adds every non-null value of one vector to the sketch and the tally behind `sink`.
 ///
 /// `false` means a form or a type with no arm here, which is what sets the column's `blind` flag.
 /// The caller has to treat a `false` as poisoning the whole column and not as skipping one chunk,
 /// because a sketch missing some of its rows counts too few distinct values and says nothing about
 /// having done so.
-fn walk(vector: &Vector, sketch: &mut Sketch) -> bool {
+fn walk(vector: &Vector, sink: &mut Sink<'_>) -> bool {
     match vector.form() {
         // One value repeated, so one hash for however many rows there are. A constant that is null
         // adds nothing, which is right: a distinct count does not count the null.
@@ -179,7 +307,17 @@ fn walk(vector: &Vector, sketch: &mut Sketch) -> bool {
             Some(Value::Null) | None => true,
             Some(value) => match hash_value(value) {
                 Some(hash) => {
-                    sketch.add_hash(hash);
+                    // A constant carries its value in the body and its nulls in the mask above it,
+                    // like every other form, so the rows holding the value are the valid ones rather
+                    // than all of them. Counted only when there are any, because the count is what
+                    // the tally needs and the mask of a constant is almost always empty.
+                    let validity = vector.validity();
+                    let rows = if validity.has_nulls(vector.len()) {
+                        (0..vector.len()).filter(|&row| validity.is_valid(row)).count()
+                    } else {
+                        vector.len()
+                    };
+                    sink.add(hash, rows as u64, || value.clone());
                     true
                 }
                 None => false,
@@ -196,7 +334,7 @@ fn walk(vector: &Vector, sketch: &mut Sketch) -> bool {
                         continue;
                     }
                     let value = i128::from(start) + i128::from(step) * row as i128;
-                    sketch.add_hash(hash_signed(value));
+                    sink.add(hash_signed(value), 1, || vector.value_at(row));
                 }
                 true
             }
@@ -211,14 +349,15 @@ fn walk(vector: &Vector, sketch: &mut Sketch) -> bool {
                     if nullable && !validity.is_valid(row) {
                         continue;
                     }
-                    sketch.add_hash(hash_signed(base + i128::from(packed.code(row))));
+                    let value = base + i128::from(packed.code(row));
+                    sink.add(hash_signed(value), 1, || vector.value_at(row));
                 }
                 true
             }
             None => false,
         },
         Form::Dictionary => match vector.dictionary_parts() {
-            Some((codes, values)) => coded(vector, codes, values, sketch),
+            Some((codes, values)) => coded(vector, codes, values, sink),
             None => false,
         },
         // One hash a run rather than one a row, because every row of a run holds the same value and
@@ -228,24 +367,37 @@ fn walk(vector: &Vector, sketch: &mut Sketch) -> bool {
         Form::Rle => match vector.run_parts() {
             Some((stops, values)) => {
                 if vector.validity().has_nulls(vector.len()) {
-                    return rows(vector, sketch);
+                    return rows(vector, sink);
                 }
                 let inner = values.validity();
-                for run in 0..stops.len().min(values.len()) {
+                // The ends are exclusive and increasing, so the rows of a run are the distance from
+                // the one before it, and the tally wants that distance rather than the run's number.
+                let mut start = 0_u32;
+                for (run, end) in stops.iter().take(values.len()).enumerate() {
+                    let stop = (*end).max(start);
+                    let held = u64::from(stop - start);
+                    start = stop;
                     if !inner.is_valid(run) {
                         continue;
                     }
                     match value_hash(values, run) {
-                        Some(hash) => sketch.add_hash(hash),
+                        Some(hash) => sink.add(hash, held, || values.value_at(run)),
                         None => return false,
                     }
+                }
+                // The runs are meant to end where the vector does. A distinct count survives them
+                // not doing so, because the values of the rows nobody walked are almost certainly
+                // values some run already had, but a row count does not: it would come back short
+                // and still call itself complete.
+                if start as usize != vector.len() {
+                    sink.stop_counting();
                 }
                 true
             }
             None => false,
         },
         Form::Flat => match vector.data() {
-            Some(data) => flat(vector, data, sketch),
+            Some(data) => flat(vector, data, sink),
             None => false,
         },
         // Strings that are not flat, read as bytes rather than as values so that a `URL` column is
@@ -258,7 +410,7 @@ fn walk(vector: &Vector, sketch: &mut Sketch) -> bool {
                     continue;
                 }
                 let Some(bytes) = vector.bytes_at(row) else { return false };
-                sketch.add_hash(hash64(bytes));
+                sink.add(hash64(bytes), 1, || vector.value_at(row));
             }
             true
         }
@@ -268,17 +420,18 @@ fn walk(vector: &Vector, sketch: &mut Sketch) -> bool {
     }
 }
 
-/// A dictionary column, hashed once per dictionary entry and added once per row.
+/// A dictionary column, counted once per row and hashed once per dictionary entry.
 ///
-/// The dictionary is hashed lazily into `seen`, because a dictionary a Parquet reader hands over
-/// covers a whole column chunk and can hold far more values than the rows being counted. Hashing it
-/// whole would be the slower of the two exactly when the dictionary is doing its job, and adding
-/// every entry would count values no row of this table points at.
-fn coded(vector: &Vector, codes: &[u32], values: &Vector, sketch: &mut Sketch) -> bool {
+/// The rows are the cheap pass: an add into a slot of `seen` per row, with no hash and no value. The
+/// dictionary is walked afterwards and only for the entries some row pointed at, because the
+/// dictionary a Parquet reader hands over covers a whole column chunk and can hold far more values
+/// than the rows being counted. Hashing it whole would be the slower of the two exactly when the
+/// dictionary is doing its job, and adding every entry would count values no row of this table has.
+fn coded(vector: &Vector, codes: &[u32], values: &Vector, sink: &mut Sink<'_>) -> bool {
     let validity = vector.validity();
     let nullable = validity.has_nulls(vector.len());
     let inner = values.validity();
-    let mut seen: Vec<Option<u64>> = vec![None; values.len()];
+    let mut seen: Vec<u64> = vec![0; values.len()];
     for row in 0..vector.len() {
         if nullable && !validity.is_valid(row) {
             continue;
@@ -291,15 +444,16 @@ fn coded(vector: &Vector, codes: &[u32], values: &Vector, sketch: &mut Sketch) -
             continue;
         }
         let Some(slot) = seen.get_mut(code) else { return false };
-        let hash = match *slot {
-            Some(hash) => hash,
-            None => {
-                let Some(hash) = value_hash(values, code) else { return false };
-                *slot = Some(hash);
-                hash
-            }
-        };
-        sketch.add_hash(hash);
+        *slot += 1;
+    }
+    for (code, held) in seen.iter().enumerate() {
+        if *held == 0 {
+            continue;
+        }
+        match value_hash(values, code) {
+            Some(hash) => sink.add(hash, *held, || values.value_at(code)),
+            None => return false,
+        }
     }
     true
 }
@@ -308,7 +462,7 @@ fn coded(vector: &Vector, codes: &[u32], values: &Vector, sketch: &mut Sketch) -
 ///
 /// The type is matched on once for the column rather than once for the value, which is what makes a
 /// million rows of `INTEGER` a multiply a row rather than a match and a `Value` a row.
-fn flat(vector: &Vector, data: &Data, sketch: &mut Sketch) -> bool {
+fn flat(vector: &Vector, data: &Data, sink: &mut Sink<'_>) -> bool {
     let validity = vector.validity();
     let nullable = validity.has_nulls(vector.len());
     let rows = vector.len();
@@ -320,7 +474,7 @@ fn flat(vector: &Vector, data: &Data, sketch: &mut Sketch) -> bool {
                     continue;
                 }
                 match ($body)(row) {
-                    Some(hash) => sketch.add_hash(hash),
+                    Some(hash) => sink.add(hash, 1, || vector.value_at(row)),
                     None => return false,
                 }
             }
@@ -379,15 +533,16 @@ fn value_hash(values: &Vector, at: usize) -> Option<u64> {
 ///
 /// For a run length column that carries nulls in the vector above the runs, where a run no longer
 /// says what a row holds.
-fn rows(vector: &Vector, sketch: &mut Sketch) -> bool {
+fn rows(vector: &Vector, sink: &mut Sink<'_>) -> bool {
     // row at a time: a run that the vector above it has nulls in no longer says what a row holds,
     // so the runs cannot be walked and there is no typed slice under them to walk instead.
     for row in 0..vector.len() {
         if vector.is_null_at(row) {
             continue;
         }
-        match hash_value(&vector.value_at(row)) {
-            Some(hash) => sketch.add_hash(hash),
+        let value = vector.value_at(row);
+        match hash_value(&value) {
+            Some(hash) => sink.add(hash, 1, || value),
             None => return false,
         }
     }
@@ -497,6 +652,7 @@ mod tests {
     use rudb_vector::{Chunk, Form, Vector};
 
     use super::{Counts, countable, hash_value};
+    use crate::tally::TALLY_VALUES;
 
     /// A flat `INTEGER` vector of `values`.
     fn flat(values: &[i32]) -> Vector {
@@ -509,6 +665,13 @@ mod tests {
         let mut counts = Counts::new(1);
         counts.add(&Chunk::new(vec![vector]).expect("a chunk"));
         counts.distinct(0)
+    }
+
+    /// How many rows the same one column holds of each of its values.
+    fn held(vector: Vector) -> Option<Vec<(Value, u64)>> {
+        let mut counts = Counts::new(1);
+        counts.add(&Chunk::new(vec![vector]).expect("a chunk"));
+        counts.frequencies(0)
     }
 
     /// The property the module doc promises: the form is how the rows are written down and the
@@ -546,6 +709,78 @@ mod tests {
         let one = Vector::constant(LogicalType::Integer, Value::Integer(7), 300);
         assert_eq!(one.form(), Form::Constant);
         assert_eq!(count(one), Some((1, true)));
+    }
+
+    /// The same property asked of the row counts, which are the half a wrong answer can be read out
+    /// of. A form that counted a run once instead of once a row would report a third of the rows.
+    #[test]
+    fn one_column_in_five_forms_gives_one_set_of_row_counts() {
+        let values: Vec<i32> = (0..300).map(|n| n / 3).collect();
+        let three: Vec<(Value, u64)> = (0..100).map(|n| (Value::Integer(n), 3)).collect();
+
+        assert_eq!(held(flat(&values)), Some(three.clone()));
+        assert_eq!(held(flat(&values).bit_packed().expect("a packing")), Some(three.clone()));
+        assert_eq!(held(flat(&values).run_encoded().expect("a run")), Some(three.clone()));
+
+        let codes: Vec<u32> = values.iter().map(|n| *n as u32).collect();
+        let entries: Vec<i32> = (0..100).collect();
+        let coded = Vector::dictionary(codes, flat(&entries)).expect("a dictionary");
+        assert_eq!(held(coded), Some(three));
+
+        // A sequence is a row each and a constant is every row at once, so these two are where a
+        // count that came from the form rather than from the rows would show up first. A sequence is
+        // a `BIGINT` column and its values come back as its own type rather than as the type of the
+        // column above, which is the same thing `Vector::value_at` would have said about it.
+        let one: Vec<(Value, u64)> = (0..100).map(|n| (Value::BigInt(n), 1)).collect();
+        assert_eq!(held(Vector::sequence(0, 1, 100)), Some(one));
+        let repeated = Vector::constant(LogicalType::Integer, Value::Integer(7), 300);
+        assert_eq!(held(repeated), Some(vec![(Value::Integer(7), 300)]));
+    }
+
+    /// A null takes no row of anybody's list, in the three places the mask is read differently.
+    #[test]
+    fn a_null_holds_no_value_and_takes_no_row_of_one() {
+        let held_by = |values: &[Option<i32>]| {
+            let owned: Vec<Value> =
+                values.iter().map(|v| v.map_or(Value::Null, Value::Integer)).collect();
+            held(Vector::from_values(LogicalType::Integer, &owned).expect("a column"))
+        };
+        assert_eq!(
+            held_by(&[Some(1), None, Some(2), None, Some(1)]),
+            Some(vec![(Value::Integer(1), 2), (Value::Integer(2), 1)])
+        );
+
+        // Through a dictionary, where the null is an entry every code pointing at it shares.
+        let entries = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(1), Value::Null, Value::Integer(2)],
+        )
+        .expect("a dictionary");
+        let coded = Vector::dictionary(vec![0, 1, 2, 1, 0], entries).expect("a dictionary column");
+        assert_eq!(held(coded), Some(vec![(Value::Integer(1), 2), (Value::Integer(2), 1)]));
+
+        // And a constant column that is nothing but nulls, which holds no value at all.
+        let nothing = Vector::constant(LogicalType::Integer, Value::Null, 40);
+        assert_eq!(held(nothing), Some(Vec::new()));
+    }
+
+    /// The cap, end to end. Under it the counts are an answer and over it there is nothing, because
+    /// a list of the first five hundred and twelve values would say the rest hold no rows.
+    #[test]
+    fn a_column_past_the_cap_has_no_frequencies_and_still_has_a_distinct_count() {
+        let under: Vec<i32> = (0..i32::try_from(TALLY_VALUES).expect("512 fits")).collect();
+        let mut counts = Counts::new(1);
+        counts.add(&Chunk::new(vec![flat(&under)]).expect("a chunk"));
+        assert_eq!(counts.frequency_values(0), Some(TALLY_VALUES));
+
+        let over: Vec<i32> = (0..i32::try_from(TALLY_VALUES).expect("512 fits") + 1).collect();
+        let mut counts = Counts::new(1);
+        counts.add(&Chunk::new(vec![flat(&over)]).expect("a chunk"));
+        assert_eq!(counts.frequencies(0), None);
+        // The sketch is nowhere near full at 513 values, so the column that stopped saying how many
+        // rows hold each value still says how many values there are. The two caps are different
+        // numbers for different questions.
+        assert_eq!(counts.exact(0), Some(TALLY_VALUES as u64 + 1));
     }
 
     /// A column arriving in pieces is one column, which is the reason the sketch is per table.
