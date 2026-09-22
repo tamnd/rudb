@@ -545,6 +545,26 @@ const KEYS: usize = 4;
 /// row group still has to pay for one.
 const COMBOS: usize = 2048;
 
+/// The most places the direct map covers when the whole key is one dictionary.
+///
+/// Larger than [`COMBOS`] by a factor of a hundred and twenty eight, and the reason is that one
+/// column's places are not a product. Every place in a one column map is a value that column's
+/// dictionary actually holds, so the map is never bigger than the distinct values the chunk's source
+/// could hand over. Put two columns together and the map is their product, most of which no row will
+/// ever land in, which is what [`COMBOS`] is small for.
+///
+/// What it buys is measured in `spec/storage-v3/24`. A Parquet reader hands `Referer` over as a
+/// dictionary of about a hundred and twenty eight thousand entries covering a row group of four
+/// hundred and forty two thousand rows, and the rows a thread sees under one of those repeat a value
+/// three times over. Under [`COMBOS`] that key was hashed, probed and compared once a row; a map
+/// this wide answers two rows in three from a load, and the profile in that document has the probe
+/// and the comparison it replaces at 21.5% of the query.
+///
+/// Two hundred and sixty two thousand places is a megabyte of `u32` per thread, which is the bound
+/// worth stating: the map is per thread and is not charged against the memory budget, so this is a
+/// number about what the engine may hold quietly rather than about what any chunk needs.
+const WIDE_COMBOS: usize = 1 << 18;
+
 /// Where one key column's place in the combined index comes from.
 ///
 /// Two forms rather than one, because a stored column of small integers is not a dictionary and does
@@ -672,6 +692,12 @@ impl CodedColumn<'_> {
 /// holds those dictionaries beside the map and throws the map away when a chunk arrives under
 /// different ones. A Parquet dictionary covers a column chunk, so that happens once a row group
 /// rather than once a chunk.
+///
+/// That last sentence is also why the map is worth having on a key nobody would call low
+/// cardinality. `Referer` arrives out of a row group as a dictionary of about a hundred and twenty
+/// eight thousand entries covering four hundred and forty two thousand rows, and the thirty two
+/// thousand row morsel a thread takes out of that holds ten thousand distinct values, so two rows in
+/// three are a value the map has already answered. See [`WIDE_COMBOS`].
 pub(crate) struct Coded<'a> {
     columns: [Option<CodedColumn<'a>>; KEYS],
     combos: usize,
@@ -738,11 +764,14 @@ pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
     if keys.is_empty() || keys.len() > KEYS {
         return None;
     }
+    // One column's places are the values it holds and several columns' places are their product,
+    // which is why the two get different room. See [`WIDE_COMBOS`].
+    let room = if keys.len() == 1 { WIDE_COMBOS } else { COMBOS };
     let mut columns = [None; KEYS];
     let mut combos: usize = 1;
     for (at, key) in keys.iter().enumerate() {
-        let (places, span, nullable) = places_of(key, rows)?;
-        if combos.checked_mul(span)? > COMBOS {
+        let (places, span, nullable) = places_of(key, rows, room)?;
+        if combos.checked_mul(span)? > room {
             return None;
         }
         columns[at] = Some(CodedColumn {
@@ -762,18 +791,33 @@ pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
 ///
 /// The span counts the place a null takes as well as the places the values take, so it is one more
 /// than the column has distinct values it could hold.
-fn places_of(key: &Vector, rows: usize) -> Option<(Places<'_>, usize, bool)> {
+fn places_of(key: &Vector, rows: usize, room: usize) -> Option<(Places<'_>, usize, bool)> {
     if let Some((codes, values)) = key.shared_dictionary_parts() {
         let codes = codes.get(..rows)?;
+        let span = values.len().checked_add(1)?;
+        if span > room {
+            return None;
+        }
         if codes.iter().any(|&code| code as usize >= values.len()) {
             return None;
         }
-        // A pass over the dictionary and not over the chunk, which is at most the two thousand
-        // entries `COMBOS` allows and is usually three. What it buys is the row loop skipping the
-        // null question entirely on the columns that have no null in them.
-        let nullable =
-            key.validity().has_nulls(rows) || (0..values.len()).any(|at| values.is_null_at(at));
-        return Some((Places::Codes { codes, values }, values.len().checked_add(1)?, nullable));
+        // Whether any row here can be null at all, asked once for the chunk. The cheap answer comes
+        // from the two validities and covers the ordinary column, which has no null anywhere in it.
+        //
+        // The expensive answer is a pass over the dictionary. That was the only answer until the map
+        // grew wide enough to cover a Parquet column chunk's dictionary, and at that width it is a
+        // pass over a hundred and twenty eight thousand entries for every chunk of a few thousand
+        // rows, which costs more than the probe the whole map exists to replace. So a dictionary too
+        // large to scan and not known to be free of nulls gives the map up rather than paying for it
+        // once a chunk, and such a key is hashed the way it was before.
+        let nullable = if key.never_null() {
+            false
+        } else if values.len() > COMBOS {
+            return None;
+        } else {
+            key.validity().has_nulls(rows) || (0..values.len()).any(|at| values.is_null_at(at))
+        };
+        return Some((Places::Codes { codes, values }, span, nullable));
     }
     let packed = key.packed_parts()?;
     if key.len() < rows {
@@ -2656,14 +2700,57 @@ mod tests {
         assert!(!coded(&letters, 2).expect("codes").same_as(&held), "another form entirely");
     }
 
+    /// A dictionary of `entries` values, of which the chunk uses the first two.
+    fn wide_dictionary(entries: usize) -> Vector {
+        let values: Vec<Value> = (0..entries as i32).map(Value::Integer).collect();
+        Vector::dictionary(vec![0, 1], flat(LogicalType::Integer, &values))
+            .expect("a dictionary of that many values")
+    }
+
     /// And a dictionary large enough that the map would cost more than the probe it replaces.
     #[test]
     fn a_dictionary_wider_than_the_map_allows_is_refused() {
-        let values: Vec<Value> = (0..COMBOS as i32).map(Value::Integer).collect();
-        let column = Vector::dictionary(vec![0, 1], flat(LogicalType::Integer, &values))
-            .expect("a dictionary of that many values");
-        let keys = [column];
+        let keys = [wide_dictionary(WIDE_COMBOS)];
         assert!(coded(&keys, 2).is_none());
+    }
+
+    /// The width a Parquet column chunk's dictionary arrives at, which is past [`COMBOS`] and well
+    /// inside [`WIDE_COMBOS`], and which is the whole point of the second bound.
+    #[test]
+    fn one_dictionary_the_size_of_a_row_groups_is_read_as_codes() {
+        let keys = [wide_dictionary(128_000)];
+        let coded = coded(&keys, 2).expect("one wide dictionary is read as codes");
+        assert_eq!(coded.combos(), 128_001);
+        assert_eq!(placed(&coded, 2), [0, 1]);
+    }
+
+    /// Two of them are not, because two columns' places are a product and most of it stays empty.
+    #[test]
+    fn two_dictionaries_that_wide_are_refused_even_though_one_would_not_be() {
+        let keys = [wide_dictionary(128_000), wide_dictionary(4)];
+        assert!(coded(&keys, 2).is_none());
+        let narrow = [wide_dictionary(100), wide_dictionary(4)];
+        assert!(coded(&narrow, 2).is_some(), "their product is still inside the small bound");
+    }
+
+    /// A wide dictionary the cheap null question cannot answer is given up rather than scanned,
+    /// because that scan is a pass over the dictionary for every chunk of a few thousand rows.
+    #[test]
+    fn a_wide_dictionary_that_might_hold_a_null_is_refused() {
+        let column = wide_dictionary(128_000).with_validity(rudb_vector::Validity::Mask({
+            let mut mask = rudb_vector::Bitmap::all_valid(2);
+            mask.set(1, false);
+            mask
+        }));
+        assert!(coded(&[column], 2).is_none());
+        let narrow = wide_dictionary(100).with_validity(rudb_vector::Validity::Mask({
+            let mut mask = rudb_vector::Bitmap::all_valid(2);
+            mask.set(1, false);
+            mask
+        }));
+        let keys = [narrow];
+        let coded = coded(&keys, 2).expect("a narrow one is still scanned");
+        assert_eq!(placed(&coded, 2), [0, 100], "the null row takes the place past the last code");
     }
 
     /// The map only means anything against the dictionaries it was filled from, which is what the
