@@ -104,9 +104,15 @@ impl Rows {
 
     /// The smallest and the largest value of one string column, when the rows are stored somewhere
     /// that already knows.
+    ///
+    /// A file reads the two ends of the sorted order beside its dictionary. A table in memory reads
+    /// the two ends of the values its tally holds, which is an answer while the column is under
+    /// `rudb_storage::TALLY_VALUES` distinct values. Both are the case the zone maps cannot cover:
+    /// a string column's ends are allowed to be wider than its rows, so `exact_extremes` refuses
+    /// them and what is left is reading every row.
     pub fn text_extremes(&self, column: usize) -> Result<Option<(Value, Value)>> {
         match self {
-            Self::Memory(_) => Ok(None),
+            Self::Memory(rows) => rows.text_extremes(column),
             Self::Native(reader) => reader.text_extremes(column),
         }
     }
@@ -130,6 +136,15 @@ impl Rows {
     }
 
     /// Sparse numeric frequency candidate rows from a committed native snapshot.
+    ///
+    /// A file only, and deliberately. What this reports is the row ordinals a bounded candidate set
+    /// covers, so a caller can fetch those rows rather than the column, together with a bound on
+    /// the values that did not make the set. A table in memory has neither half to give. It keeps
+    /// no ordinals per value, and keeping them would mean a row list per value, which grows with
+    /// the rows and is the one thing the cap in `rudb_storage::tally` exists to rule out. It also
+    /// has no values that did not make the set: its list is every value the column holds or it is
+    /// nothing at all, so the bound would always be zero and a caller wanting what this is for
+    /// wants [`Rows::exact_frequencies`], which answers it outright.
     pub fn frequency_occurrences(&self, column: usize) -> Result<Option<FrequencyOccurrences>> {
         match self {
             Self::Memory(_) => Ok(None),

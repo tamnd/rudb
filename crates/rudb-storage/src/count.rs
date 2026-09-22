@@ -224,6 +224,23 @@ impl Counts {
         held.tally.values()
     }
 
+    /// The smallest and the largest non-null value of one column, when the tally holds them all.
+    ///
+    /// `None` for a column over the cap and for a blind one, the same two cases the list has. What
+    /// this is for is the column whose zone maps cannot answer its ends: a string column that
+    /// arrived as a dictionary narrower than its chunk gets ends that are a superset of its rows,
+    /// because `zone::stringy` reads whichever of the rows and the values is shorter and the values
+    /// can hold more than the rows point at. A tally that is still counting has only what the rows
+    /// hold, so it answers where the zone gives up.
+    #[must_use]
+    pub fn extremes(&self, column: usize) -> Option<(Value, Value)> {
+        let held = self.columns.get(column)?;
+        if held.blind {
+            return None;
+        }
+        held.tally.extremes()
+    }
+
     /// How many columns this is counting.
     #[must_use]
     pub fn width(&self) -> usize {

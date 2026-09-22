@@ -66,9 +66,10 @@
 //!
 //! [`count::walk`]: crate::count
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 
 use rudb_common::Value;
+use rudb_common::bounds::Bound;
 
 /// How many distinct values one column may hold before this stops counting it.
 ///
@@ -310,6 +311,34 @@ impl Tally {
         Some(held)
     }
 
+    /// The smallest and the largest value of the column, in the order its type is compared in.
+    ///
+    /// `None` when the column gave up, and also when a value in it is of a type the comparison
+    /// order has no reading for, because ends that left one of the values out would be ends some
+    /// row of the column sits outside of.
+    ///
+    /// Exact for the reason [`Tally::list`] is: a column that is still counting holds every value
+    /// it has, so the two ends of what is here are the two ends of the column. Nulls do not come
+    /// into it. One never reaches here, and a `MIN` or a `MAX` skips them anyway.
+    #[must_use]
+    pub fn extremes(&self) -> Option<(Value, Value)> {
+        if self.full {
+            return None;
+        }
+        let mut low: Option<(&Value, Bound)> = None;
+        let mut high: Option<(&Value, Bound)> = None;
+        for (_, value) in &self.held {
+            let bound = Bound::of_value(value)?;
+            if low.as_ref().is_none_or(|(_, held)| bound.order(held) == Some(Ordering::Less)) {
+                low = Some((value, bound.clone()));
+            }
+            if high.as_ref().is_none_or(|(_, held)| bound.order(held) == Some(Ordering::Greater)) {
+                high = Some((value, bound));
+            }
+        }
+        Some((low?.0.clone(), high?.0.clone()))
+    }
+
     /// Whether this is still counting, which is whether the sketch beside it has anything to do.
     ///
     /// Asked once a chunk a column rather than once a row, because the answer only ever changes the
@@ -464,5 +493,42 @@ mod tests {
         add(&mut tally, 1, 3);
         tally.add(7, 1, || Value::Null);
         assert_eq!(tally.list(), None);
+    }
+
+    #[test]
+    fn the_ends_of_a_counted_column_are_the_ends_of_its_values_and_not_of_their_hashes() {
+        // Arrived out of order and out of hash order, which is the only way to tell the two apart:
+        // a walk that compared the hashes would answer whichever pair hashed smallest and largest.
+        let mut tally = Tally::new();
+        for value in [40, 7, 900, 12] {
+            add(&mut tally, value, 1);
+        }
+        assert_eq!(tally.extremes(), Some((Value::BigInt(7), Value::BigInt(900))));
+    }
+
+    #[test]
+    fn one_value_is_both_ends_and_a_column_that_gave_up_has_neither() {
+        let mut tally = Tally::new();
+        add(&mut tally, 5, 100);
+        assert_eq!(tally.extremes(), Some((Value::BigInt(5), Value::BigInt(5))));
+        // An empty tally has nothing to be the ends of, which reads the same as giving up: the
+        // caller has to go to the rows either way.
+        assert_eq!(Tally::new().extremes(), None);
+        tally.give_up();
+        assert_eq!(tally.extremes(), None);
+    }
+
+    #[test]
+    fn strings_come_back_in_string_order() {
+        let mut tally = Tally::new();
+        for value in ["pear", "apple", "quince"] {
+            let held = Value::Varchar(value.to_string());
+            let hash = crate::count::hash_value(&held).expect("a string has a rule");
+            tally.add(hash, 1, || held);
+        }
+        assert_eq!(
+            tally.extremes(),
+            Some((Value::Varchar("apple".into()), Value::Varchar("quince".into())))
+        );
     }
 }
