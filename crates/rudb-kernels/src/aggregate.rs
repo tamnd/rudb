@@ -1374,6 +1374,7 @@ fn total_into<M: Fn(usize) -> usize>(
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match run.data {
                 $(Data::$variant(values) => {
+                    let values = values.as_slice();
                     for row in 0..run.rows {
                         if !run.nulls.is_valid(row) {
                             continue;
@@ -1417,6 +1418,7 @@ fn whole_into<M: Fn(usize) -> usize>(
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match run.data {
                 $(Data::$variant(values) => {
+                    let values = values.as_slice();
                     for row in 0..run.rows {
                         if !run.nulls.is_valid(row) {
                             continue;
@@ -1601,7 +1603,7 @@ fn real_into<M: Fn(usize) -> usize>(
             }
         };
         (@run $values:expr, $convert:expr) => {{
-            let values = $values;
+            let values = $values.as_slice();
             let convert = $convert;
             for row in 0..run.rows {
                 if !run.nulls.is_valid(row) {
@@ -1650,6 +1652,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match run.data {
                 $(Data::$variant(values) => {
+                    let values = values.as_slice();
                     // row at a time: a scatter is per row by definition, since two adjacent rows
                     // are usually two different groups and there is nothing to reduce before it.
                     // The `Value` below is built on a win rather than on a row, which is the part
