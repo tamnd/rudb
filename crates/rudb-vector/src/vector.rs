@@ -3442,10 +3442,10 @@ pub(crate) const NOWHERE: usize = usize::MAX;
 /// The row id of a row that is not in the source, which reads as null.
 ///
 /// Public because whoever builds a [`Form::Gathered`] vector has to write it, and it is `u32::MAX`
-/// for the reason [`NOWHERE`] is `usize::MAX`: a bounds check the reader is doing anyway rejects it,
-/// where an `Option<u32>` would be eight bytes a row instead of four and a second branch beside the
-/// one already there. It costs the last row of a four billion row source, which is a source no
-/// column in this engine has.
+/// for the reason the crate's own offset sentinel is `usize::MAX`: a bounds check the reader is
+/// doing anyway rejects it, where an `Option<u32>` would be eight bytes a row instead of four and a
+/// second branch beside the one already there. It costs the last row of a four billion row source,
+/// which is a source no column in this engine has.
 pub const NO_ROW: u32 = u32::MAX;
 
 /// Which source row a gathered row names, and `None` when it names none.
