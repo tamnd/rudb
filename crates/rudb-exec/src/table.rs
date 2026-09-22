@@ -851,9 +851,76 @@ enum StoredData {
     SmallInt(Vec<i16>),
     Integer(Vec<i32>),
     BigInt(Vec<i64>),
+    /// A type whose value is one signed integer that is not one of the four widths above.
+    ///
+    /// A `DATE` is a day count, a `TIME` and a `TIMESTAMP` are microsecond counts, and a `DECIMAL`
+    /// and a `HUGEINT` are integers that can want all 128 bits. Every one of them is stored as a
+    /// signed integer in the column it came from and compares the way that integer does, which is
+    /// the same grouping [`rudb_vector::Vector::signed_at`] already makes and the same one
+    /// `rudb_kernels::aggregate` makes for a grouped `min`. Without this arm they went to
+    /// [`StoredData::Other`], and the comparison that runs once per input row per probe step built
+    /// a tagged value on each side of it. Over a packed column that is worse than it sounds: a
+    /// packed row has no value to hand over, so building one allocates. See
+    /// [`../../../spec/perf/16-a-key-that-is-not-an-integer.md`].
+    Wide {
+        ty: rudb_common::LogicalType,
+        values: Vec<i128>,
+    },
     Varchar(StringColumn),
     StableText { dictionary: Arc<Vector>, codes: Vec<u32> },
     Other(Vec<Stored>),
+}
+
+/// Whether a key of this type is one signed integer, so that [`StoredData::Wide`] can hold it.
+///
+/// Asked of the type rather than of the value because the run is chosen before the first row
+/// arrives. The unsigned integers are left out even though four of the five fit, because
+/// [`rudb_vector::Vector::signed_at`] does not read them and a run whose reader always answers
+/// `None` is a slower way of reaching the same fallback. A `UHUGEINT` does not fit at all.
+fn one_integer(ty: &rudb_common::LogicalType) -> bool {
+    matches!(
+        ty,
+        rudb_common::LogicalType::HugeInt
+            | rudb_common::LogicalType::Decimal { .. }
+            | rudb_common::LogicalType::Date
+            | rudb_common::LogicalType::Time
+            | rudb_common::LogicalType::Timestamp
+    )
+}
+
+/// The integer a value of one of [`one_integer`]'s types is, and `None` for anything else.
+///
+/// A decimal keeps its width and scale in the type rather than beside every value, so the unscaled
+/// integer is the whole of what has to be stored. Two decimals of different scale never reach one
+/// key column, because the column's type is the type the plan gave it.
+fn one_integer_of(value: &Value) -> Option<i128> {
+    match *value {
+        Value::HugeInt(held) | Value::Decimal { unscaled: held, .. } => Some(held),
+        Value::Date(days) => Some(i128::from(days)),
+        Value::Time(micros) | Value::Timestamp(micros) => Some(i128::from(micros)),
+        _ => None,
+    }
+}
+
+/// The value that integer is, read back under the type it was stored as.
+///
+/// The turn round of [`one_integer_of`], for the group key on its way out into the answer. A value
+/// that does not fit the narrower types saturates rather than wrapping, which cannot happen for a
+/// key that came in through [`one_integer_of`] and is the harmless answer if it ever did.
+fn one_integer_as(ty: &rudb_common::LogicalType, held: i128) -> Value {
+    match ty {
+        rudb_common::LogicalType::Date => {
+            Value::Date(i32::try_from(held).unwrap_or(i32::MAX))
+        }
+        rudb_common::LogicalType::Time => Value::Time(i64::try_from(held).unwrap_or(i64::MAX)),
+        rudb_common::LogicalType::Timestamp => {
+            Value::Timestamp(i64::try_from(held).unwrap_or(i64::MAX))
+        }
+        rudb_common::LogicalType::Decimal { width, scale } => {
+            Value::Decimal { unscaled: held, width: *width, scale: *scale }
+        }
+        _ => Value::HugeInt(held),
+    }
 }
 
 impl Column {
@@ -864,6 +931,7 @@ impl Column {
             rudb_common::LogicalType::Integer => StoredData::Integer(Vec::new()),
             rudb_common::LogicalType::BigInt => StoredData::BigInt(Vec::new()),
             rudb_common::LogicalType::Varchar => StoredData::Varchar(StringColumn::default()),
+            ty if one_integer(ty) => StoredData::Wide { ty: ty.clone(), values: Vec::new() },
             _ => StoredData::Other(Vec::new()),
         };
         Self { valid: Vec::new(), data }
@@ -890,6 +958,15 @@ impl Column {
                 values.push(value.as_bytes())?
             }
             (StoredData::Varchar(values), Value::Null) => values.push(&[])?,
+            (StoredData::Wide { values, .. }, Value::Null) => values.push(0),
+            (StoredData::Wide { values, .. }, value) => match one_integer_of(&value) {
+                Some(held) => values.push(held),
+                None => {
+                    return Err(Error::internal(format!(
+                        "a group key column was given a value of the wrong type: {value:?}"
+                    )));
+                }
+            },
             (StoredData::Other(values), value) => values.push(Stored::from(value)),
             (_, value) => {
                 return Err(Error::internal(format!(
@@ -988,6 +1065,15 @@ impl Column {
             StoredData::SmallInt(values) => signed!(values, i16),
             StoredData::Integer(values) => signed!(values, i32),
             StoredData::BigInt(values) => signed!(values, i64),
+            // No `try_from` here because the run is already the widest signed integer there is, so
+            // the only thing that can turn this down is a form that does not read as one.
+            StoredData::Wide { values, .. } => match column.signed_at(row) {
+                Some(value) => {
+                    values.push(value);
+                    true
+                }
+                None => false,
+            },
             StoredData::Varchar(values) => match column.bytes_at(row) {
                 Some(bytes) => {
                     values.push(bytes)?;
@@ -1030,6 +1116,7 @@ impl Column {
             StoredData::SmallInt(values) => values.capacity() * size_of::<i16>(),
             StoredData::Integer(values) => values.capacity() * size_of::<i32>(),
             StoredData::BigInt(values) => values.capacity() * size_of::<i64>(),
+            StoredData::Wide { values, .. } => values.capacity() * size_of::<i128>(),
             StoredData::Varchar(values) => values.footprint(),
             StoredData::StableText { codes, .. } => codes.capacity() * size_of::<u32>(),
             StoredData::Other(values) => values.capacity() * size_of::<Stored>(),
@@ -1062,6 +1149,10 @@ impl Column {
             StoredData::BigInt(values) => match column.signed_at(row) {
                 Some(value) => value == i128::from(values[slot]),
                 None => same(&Value::BigInt(values[slot]), &column.value_at(row)),
+            },
+            StoredData::Wide { ty, values } => match column.signed_at(row) {
+                Some(value) => value == values[slot],
+                None => same(&one_integer_as(ty, values[slot]), &column.value_at(row)),
             },
             StoredData::Varchar(values) => column.bytes_at(row).map_or_else(
                 || same(&Value::Varchar(values.string(slot)), &column.value_at(row)),
@@ -1219,11 +1310,45 @@ impl Column {
                 return true;
             }};
         }
+        /// The same pass where the run and the stored column are two different widths.
+        ///
+        /// One type reaches this at more than one width. A `DECIMAL(9, 2)` is four bytes a value
+        /// and a `DECIMAL(30, 2)` is sixteen, and both are stored here as the `i128` the wider of
+        /// them is, so the comparison widens the run's side. The widening is a move against a probe
+        /// step that would otherwise build a value on each side.
+        macro_rules! wide {
+            ($stored:expr, $values:expr) => {{
+                let stored = $stored;
+                let values = $values.as_slice();
+                for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                    if !*flag {
+                        continue;
+                    }
+                    let slot = slot_of(bucket) as usize;
+                    *flag = match values.get(code(step.row)) {
+                        _ if !self.valid[slot] => nulled(step.row),
+                        Some(value) => !nulled(step.row) && i128::from(*value) == stored[slot],
+                        None => self.holds(slot, column, step.row),
+                    };
+                }
+                return true;
+            }};
+        }
         match (&self.data, data) {
             (StoredData::TinyInt(stored), Data::Int8(values)) => run!(stored, values),
             (StoredData::SmallInt(stored), Data::Int16(values)) => run!(stored, values),
             (StoredData::Integer(stored), Data::Int32(values)) => run!(stored, values),
             (StoredData::BigInt(stored), Data::Int64(values)) => run!(stored, values),
+            // The layouts a `DATE`, a `TIME`, a `TIMESTAMP`, a `DECIMAL` or a `HUGEINT` is stored
+            // in. A decimal takes whichever of them holds its width, so a `DECIMAL(4, 2)` is two
+            // bytes a value and a `DECIMAL(30, 2)` is sixteen, which is why the narrower ones are
+            // here and not just the widest. The one byte arm is not reached by any type today and
+            // is here so that a narrower physical form than the run's cannot fall back silently.
+            (StoredData::Wide { values: stored, .. }, Data::Int128(values)) => run!(stored, values),
+            (StoredData::Wide { values: stored, .. }, Data::Int8(values)) => wide!(stored, values),
+            (StoredData::Wide { values: stored, .. }, Data::Int16(values)) => wide!(stored, values),
+            (StoredData::Wide { values: stored, .. }, Data::Int32(values)) => wide!(stored, values),
+            (StoredData::Wide { values: stored, .. }, Data::Int64(values)) => wide!(stored, values),
             (StoredData::Varchar(stored), Data::Varlen(strings)) => {
                 for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
                     if !*flag {
@@ -1283,11 +1408,37 @@ impl Column {
                 return true;
             }};
         }
+        /// The same pass where the stored run is already the width the comparison is done in.
+        macro_rules! held {
+            ($stored:expr) => {{
+                let stored = $stored;
+                let base = packed.base();
+                for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                    if !*flag {
+                        continue;
+                    }
+                    let slot = slot_of(bucket) as usize;
+                    let missing = nulled(step.row);
+                    *flag = if !self.valid[slot] {
+                        missing
+                    } else if missing {
+                        false
+                    } else {
+                        base + i128::from(packed.code(code(step.row))) == stored[slot]
+                    };
+                }
+                return true;
+            }};
+        }
         match &self.data {
             StoredData::TinyInt(stored) => run!(stored),
             StoredData::SmallInt(stored) => run!(stored),
             StoredData::Integer(stored) => run!(stored),
             StoredData::BigInt(stored) => run!(stored),
+            // The arm this whole change is for. A `DATE` column read out of a native file behind a
+            // filter arrives as a dictionary over a packed run, and without this the probe step
+            // under it built a value on each side, which for a packed row means an allocation.
+            StoredData::Wide { values, .. } => held!(values),
             _ => false,
         }
     }
@@ -1343,7 +1494,11 @@ impl Column {
                 let validity = rudb_vector::Validity::from_iter(len, |index| valid[start + index]);
                 return Ok(vector.with_validity(validity));
             }
-            StoredData::Other(_) => {
+            // Through values, like the arm below it and unlike the four runs above. A group key on
+            // its way out is one row per group where everything else here is one row per input row,
+            // so the width the answer is built in is not worth a second copy of the mapping from a
+            // type to the layout it is stored in.
+            StoredData::Wide { .. } | StoredData::Other(_) => {
                 return Vector::from_values(ty.clone(), &self.values(range));
             }
         };
@@ -1364,6 +1519,7 @@ impl Column {
                     StoredData::SmallInt(values) => Value::SmallInt(values[slot]),
                     StoredData::Integer(values) => Value::Integer(values[slot]),
                     StoredData::BigInt(values) => Value::BigInt(values[slot]),
+                    StoredData::Wide { ty, values } => one_integer_as(ty, values[slot]),
                     StoredData::Varchar(values) => Value::Varchar(values.string(slot)),
                     StoredData::StableText { dictionary, codes } => {
                         dictionary.value_at(codes[slot] as usize)
@@ -1386,6 +1542,7 @@ impl Column {
                     StoredData::SmallInt(values) => Value::SmallInt(values[slot]),
                     StoredData::Integer(values) => Value::Integer(values[slot]),
                     StoredData::BigInt(values) => Value::BigInt(values[slot]),
+                    StoredData::Wide { ty, values } => one_integer_as(ty, values[slot]),
                     StoredData::Varchar(values) => Value::Varchar(values.string(slot)),
                     StoredData::StableText { dictionary, codes } => {
                         dictionary.value_at(codes[slot] as usize)
@@ -1721,12 +1878,15 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across) {
     // What the unpacked integer is read as, decided once for the column rather than once for every
     // row of it. The match was inside the loop, which made a pass over a packed column a logical
     // type comparison per row on top of the unpack.
-    let wide = matches!(
-        column.logical_type(),
-        rudb_common::LogicalType::HugeInt
-            | rudb_common::LogicalType::UHugeInt
-            | rudb_common::LogicalType::Decimal { .. }
-    );
+    //
+    // A decimal is wide only when its width says it is stored in 128 bits. It used to be wide at
+    // every width, so a `DECIMAL(9, 2)` column hashed as two words when it was packed and as one
+    // when it was flat, and the same value landed in two buckets.
+    let wide = match column.logical_type() {
+        rudb_common::LogicalType::HugeInt | rudb_common::LogicalType::UHugeInt => true,
+        rudb_common::LogicalType::Decimal { width, .. } => wide_decimal(*width),
+        _ => false,
+    };
     if let Some(packed) = column.packed_parts() {
         fold_packed(&packed, wide, rows, hashes, |row| validity.is_valid(row).then_some(row));
         return;
@@ -1888,6 +2048,20 @@ fn fold_data(
     }
 }
 
+/// Whether a decimal of this width is kept in 128 bits rather than in 64 or fewer.
+///
+/// The one place the hash asks, so that the run over a flat column, the pass over a packed one and
+/// the value at a time fallback all take the same side of it. It is asked of the width rather than
+/// of the type because a `Value` carries the width and not the type it was read out of, and it is
+/// answered by [`rudb_common::LogicalType::physical`] rather than by a second copy of the digit
+/// ranges so that the two cannot drift apart.
+fn wide_decimal(width: u8) -> bool {
+    matches!(
+        rudb_common::LogicalType::Decimal { width, scale: 0 }.physical(),
+        rudb_common::PhysicalType::Int128
+    )
+}
+
 /// Folds one value into a running hash, for the forms and types that have no run to walk.
 ///
 /// The nested types go through `Display`, which is slow and is the same honest answer `key.rs`
@@ -1916,9 +2090,17 @@ fn fold_value(state: u64, value: &Value) -> u64 {
         // Two words, low first, the way the 128 bit layouts are read. The width and the scale of a
         // decimal are not mixed, because they are the column's and not the value's, and a flat
         // decimal column is a run of integers with no room to keep them.
-        Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => {
-            mix(mix(state, *x as u64), (*x >> 64) as u64)
-        }
+        Value::HugeInt(x) => mix(mix(state, *x as u64), (*x >> 64) as u64),
+        // A decimal is hashed as the layout its width puts it in and not always as a `HUGEINT`,
+        // because a `DECIMAL(9, 2)` column is a run of `i32` and the run above hashes it as one
+        // word. Hashing the value as two here and the run as one put the same value in two buckets
+        // whenever the same column arrived flat in one chunk and packed in the next, which our own
+        // format does page by page. The width is the column's, so every form of one column takes
+        // the same side of this.
+        Value::Decimal { unscaled: x, width, .. } => match wide_decimal(*width) {
+            true => mix(mix(state, *x as u64), (*x >> 64) as u64),
+            false => mix(state, *x as u64),
+        },
         Value::UHugeInt(x) => mix(mix(state, *x as u64), (*x >> 64) as u64),
         // The one length the three counts add up to, read as two words the same way, because a
         // day and twenty four hours are one group and a hash that told them apart would put that
@@ -2230,6 +2412,112 @@ mod tests {
         assert_eq!(hashed(&flatly[1]), hashed(&coded[1]));
         let (_, through) = a_batch_at_a_time(&coded, numbers.len(), &types);
         assert_eq!(before, through);
+    }
+
+    /// The three paths the hash has for one column, over a decimal narrow enough to be stored in
+    /// fewer than 128 bits.
+    ///
+    /// A `DECIMAL(9, 2)` is four bytes a value. The run over a flat column read it as one word, the
+    /// pass over a packed one read it as two, and the value at a time fallback read it as two, so
+    /// the same value hashed one way when the column arrived flat and another when it arrived
+    /// packed. Our own format decides packing page by page, so that is one column of one table, and
+    /// the group by would have returned the same decimal twice.
+    #[test]
+    fn a_decimal_narrower_than_a_hugeint_hashes_the_same_in_every_form() {
+        for width in [4u8, 9, 18, 30] {
+            let ty = LogicalType::Decimal { width, scale: 2 };
+            let of = |unscaled: i128| Value::Decimal { unscaled, width, scale: 2 };
+            let values: Vec<Value> = (0..600).map(of).collect();
+            let plain = flat(ty.clone(), &values);
+            let packed = plain.bit_packed().expect("a packed run of those values");
+            assert_eq!(packed.form(), rudb_vector::Form::BitPacked, "DECIMAL({width}) has to pack");
+            assert_eq!(hashed(&plain), hashed(&packed), "DECIMAL({width}) packed against flat");
+
+            // A constant column is the value at a time path, which is the third reader of the same
+            // column and has to agree with the other two.
+            let one = Vector::constant(ty.clone(), of(7), 4);
+            let same = flat(ty.clone(), &vec![of(7); 4]);
+            assert_eq!(hashed(&one), hashed(&same), "DECIMAL({width}) constant against flat");
+        }
+    }
+
+    /// One key column of the given type in the three forms a scan hands one over in, checked
+    /// against the row at a time path and against the keys the table gives back.
+    ///
+    /// Flat is what a chunk built in memory looks like, packed is what a native file hands over,
+    /// and a dictionary over a packed run is what the same file hands over behind a filter. The
+    /// grouping has to come out the same in all three, and the keys the table hands back on the way
+    /// out have to be the values that went in, under the type they went in as.
+    fn a_key_of_every_form(ty: &LogicalType, of: impl Fn(i64) -> Value) {
+        let rows = 30_000i64;
+        let number = |row: i64| (row * 7919) % 5003;
+        let values: Vec<Value> =
+            (0..rows).map(|row| if row % 61 == 0 { Value::Null } else { of(number(row)) }).collect();
+        let types = [ty.clone()];
+        let flatly = [flat(ty.clone(), &values)];
+        let (was, before) = one_at_a_time(&flatly, values.len(), &types);
+        assert!(was.buckets.len() > HOT, "{ty} has to reach the batched path");
+        let (now, after) = a_batch_at_a_time(&flatly, values.len(), &types);
+        assert_eq!(before, after, "{ty} flat");
+        assert_eq!(was.len(), now.len(), "{ty} flat");
+
+        // The keys on the way out, which is the half of this a grouping check cannot see. A slot is
+        // the order a group was first seen in, so the first row that reached a slot holds its key.
+        let mut want = vec![Value::Null; now.len()];
+        let mut filled = vec![false; now.len()];
+        for (row, &slot) in after.iter().enumerate() {
+            if !std::mem::replace(&mut filled[slot], true) {
+                want[slot] = values[row].clone();
+            }
+        }
+        let out = now.column(0, ty, 0..now.len()).expect("the keys of every group");
+        let got: Vec<Value> = (0..out.len()).map(|slot| out.value_at(slot)).collect();
+        assert_eq!(want, got, "{ty} keys on the way out");
+
+        let packed = [flatly[0].bit_packed().expect("a packed run of those values")];
+        assert_eq!(packed[0].form(), rudb_vector::Form::BitPacked, "{ty} has to pack");
+        assert_eq!(hashed(&flatly[0]), hashed(&packed[0]), "{ty} packed");
+        let (_, through_packed) = a_batch_at_a_time(&packed, values.len(), &types);
+        assert_eq!(before, through_packed, "{ty} packed");
+
+        let distinct: Vec<Value> = (0..5003).map(&of).collect();
+        let held =
+            flat(ty.clone(), &distinct).bit_packed().expect("a packed run of the distinct values");
+        let valid =
+            rudb_vector::Validity::from_iter(values.len(), |row| values[row] != Value::Null);
+        let coded = [Vector::dictionary((0..rows).map(|row| number(row) as u32).collect(), held)
+            .expect("a dictionary over that packed run")
+            .with_validity(valid)];
+        assert_eq!(hashed(&flatly[0]), hashed(&coded[0]), "{ty} coded");
+        let (_, through_coded) = a_batch_at_a_time(&coded, values.len(), &types);
+        assert_eq!(before, through_coded, "{ty} coded");
+    }
+
+    /// The types that are one signed integer without being one of the four integer types, which is
+    /// what [`StoredData::Wide`] is for.
+    ///
+    /// A `DATE` behind a filter arrives as a dictionary over a packed run, and before there was a
+    /// run for it the compare built a tagged value on each side of every probe step, which over a
+    /// packed row means an allocation. What is checked here is the answer rather than the cost: the
+    /// new runs have to group the rows exactly as the row at a time path does, in every form, and
+    /// hand the keys back unchanged. The two decimals are two different physical widths, four bytes
+    /// and sixteen, so both the widening compare and the same width one are covered.
+    #[test]
+    fn a_key_that_is_one_integer_without_being_an_integer_groups_the_same_in_every_form() {
+        a_key_of_every_form(&LogicalType::Date, |code| Value::Date(code as i32));
+        a_key_of_every_form(&LogicalType::Time, |code| Value::Time(code * 1_000));
+        a_key_of_every_form(&LogicalType::Timestamp, |code| Value::Timestamp(code * 1_000_000));
+        a_key_of_every_form(&LogicalType::HugeInt, |code| Value::HugeInt(i128::from(code)));
+        a_key_of_every_form(&LogicalType::Decimal { width: 9, scale: 2 }, |code| Value::Decimal {
+            unscaled: i128::from(code),
+            width: 9,
+            scale: 2,
+        });
+        a_key_of_every_form(&LogicalType::Decimal { width: 30, scale: 2 }, |code| Value::Decimal {
+            unscaled: i128::from(code),
+            width: 30,
+            scale: 2,
+        });
     }
 
     /// The reason a vacancy cannot be filled inside the batch. Every row of this batch is the first
