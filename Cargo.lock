@@ -536,6 +536,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-stats"
+version = "0.4.0"
+dependencies = [
+ "rudb-common",
+ "rudb-encoding",
+]
+
+[[package]]
 name = "rudb-storage"
 version = "0.4.0"
 dependencies = [
