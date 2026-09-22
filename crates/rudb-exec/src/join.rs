@@ -89,6 +89,7 @@ use rudb_common::{
     Cancel, Error, LogicalType, Memory, Reservation, Result, Session, SessionTimeZone, Value,
 };
 use rudb_kernels::{Connective, combine, is_true};
+use rudb_metrics::{Algorithm, Counters, Declined, Joined};
 use rudb_pipeline::{Lease, Progress, Sink, Stream};
 use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Plan, Slice};
 use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
@@ -100,6 +101,24 @@ use crate::lookup::{Lookup, MISS, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::side::{Build, PAD, laid_out};
+
+/// Why a join that found a key did not walk every pair, for the metrics document.
+const KEYED: &str = "a conjunct of the condition is an equality with one side's columns on each \
+                     side of it, so a driving row's matches are one lookup rather than a pass over \
+                     the gathered side";
+
+/// Why a join that found no key had to walk every pair.
+///
+/// This is the sentence worth finding in a slow query. A nested loop over two sides of any size is
+/// the two multiplied, and the fix is almost always a condition the binder could not see an
+/// equality in rather than anything about the data.
+const UNKEYED: &str = "no conjunct of the condition is an equality with one side's columns on each \
+                       side of it, so there is no key to build a table on";
+
+/// Why a mark join with a key still walked every pair.
+const MARK_IS_NARROW: &str = "a mark join is answered from a table only when its condition is one \
+                              equality with nothing left over, because its answer has to tell a \
+                              miss apart from a pair nobody could decide";
 
 /// A join with a condition.
 #[derive(Debug)]
@@ -138,6 +157,8 @@ pub(crate) struct Join<'a> {
     out: Buffered,
     /// The parsed zone used by casts in join conditions.
     time_zone: SessionTimeZone,
+    /// Where the build side is reported. See [`Probe::counters`].
+    counters: Option<Arc<Counters>>,
 }
 
 /// The side of a join that is finished before the other one starts.
@@ -218,6 +239,7 @@ impl<'a> Join<'a> {
             held: Mutex::new(memory.reservation()),
             out: out.clone(),
             time_zone: SessionTimeZone::default(),
+            counters: None,
         };
         (join, out)
     }
@@ -229,9 +251,44 @@ impl<'a> Join<'a> {
         self
     }
 
+    /// Reports the build side and the algorithm. See [`Probe::watched`].
+    #[must_use]
+    pub(crate) fn watched(mut self, counters: Arc<Counters>) -> Self {
+        self.counters = Some(counters);
+        self
+    }
+
     /// What this operator produces, which is both sides' columns unless the kind throws one away.
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// What this operator did, for the row it gets in the metrics document.
+    ///
+    /// The kinds that stay on this operator are the ones a lookup cannot answer on its own, so the
+    /// nested loop is the usual answer here and a reader of a slow query wants to be told that
+    /// rather than left to work it out from the time. See [`Counters::joining`].
+    fn reporting(&self, algorithm: Algorithm, build_rows: usize, build_bytes: u64) {
+        let Some(counters) = &self.counters else {
+            return;
+        };
+        let declined = match algorithm {
+            Algorithm::Hash => vec![Declined::new(Algorithm::Loop, KEYED)],
+            Algorithm::Loop if self.kind == JoinKind::Mark => {
+                vec![Declined::new(Algorithm::Hash, MARK_IS_NARROW)]
+            }
+            Algorithm::Loop => vec![Declined::new(Algorithm::Hash, UNKEYED)],
+            // Nothing else was ever in the running. A positional join pairs the nth row of one
+            // side with the nth of the other, which is not a search for anything, so there is no
+            // algorithm here to have preferred.
+            Algorithm::Positional => Vec::new(),
+        };
+        counters.joining(Joined {
+            algorithm,
+            build_rows: u64::try_from(build_rows).unwrap_or(u64::MAX),
+            build_bytes,
+            declined,
+        });
     }
 
     /// The joined rows, before they are turned back into chunks.
@@ -255,6 +312,7 @@ impl<'a> Join<'a> {
         scratch.grow(right.footprint())?;
         let right_rows = right.rows();
         if self.kind == JoinKind::Positional {
+            self.reporting(Algorithm::Positional, right_rows, scratch.bytes());
             let rows: Vec<Vec<Value>> = (0..right_rows).map(|at| right.row(at as u32)).collect();
             return Ok(positional(left_rows, &rows, left_types.len(), right_types.len()));
         }
@@ -284,6 +342,16 @@ impl<'a> Join<'a> {
             )?),
             None => None,
         };
+        // Here rather than when the operator was built, because what decides the algorithm is
+        // whether the condition holds an equality this can key on, and that question is answered
+        // on the two lines above. Deciding it a second time in the code that builds the operator
+        // would be a second answer that can disagree with this one.
+        let keyed = index.is_some() || marks.is_some();
+        self.reporting(
+            if keyed { Algorithm::Hash } else { Algorithm::Loop },
+            right_rows,
+            scratch.bytes(),
+        );
         // The driving side looked up up front rather than one row at a time inside the loop,
         // because the lookup works on a chunk and the loop below works on a row. What it costs is
         // one `usize` per driving row held while the join runs, which is the price of keeping the
@@ -787,6 +855,12 @@ pub(crate) struct Probe<'a> {
     held: Mutex<Reservation>,
     /// The parsed zone used by casts in the key expressions.
     time_zone: SessionTimeZone,
+    /// Where the build side is reported, for a query somebody is measuring.
+    ///
+    /// Nothing outside this operator can see the gathered side: the shim that counts rows sees the
+    /// driving chunks going past and the row this operator gets in the document would otherwise
+    /// have one of its two inputs missing from it. See [`Counters::joining`].
+    counters: Option<Arc<Counters>>,
 }
 
 /// The gathered side and the table that finds rows in it.
@@ -1079,6 +1153,7 @@ impl<'a> Probe<'a> {
             built: OnceLock::new(),
             held: Mutex::new(memory.reservation()),
             time_zone: SessionTimeZone::default(),
+            counters: None,
         })
     }
 
@@ -1086,6 +1161,13 @@ impl<'a> Probe<'a> {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.time_zone = session.session_time_zone();
+        self
+    }
+
+    /// Reports the build side into the same row the shim counts the driving side into.
+    #[must_use]
+    pub(crate) fn watched(mut self, counters: Arc<Counters>) -> Self {
+        self.counters = Some(counters);
         self
     }
 
@@ -1238,6 +1320,14 @@ impl<'a> Probe<'a> {
                 // same bytes twice would be a limit half the size it says it is.
                 let rows = Build::new(&self.right_types, &chunks, threads)?;
                 charged.grow(rows.footprint())?;
+                if let Some(counters) = &self.counters {
+                    counters.joining(Joined {
+                        algorithm: Algorithm::Hash,
+                        build_rows: u64::try_from(rows.rows()).unwrap_or(u64::MAX),
+                        build_bytes: charged.bytes(),
+                        declined: vec![Declined::new(Algorithm::Loop, KEYED)],
+                    });
+                }
                 Ok(Arc::new(Built { rows, index, undecided }))
             })
             .clone()
@@ -1530,6 +1620,13 @@ impl<'a> Marking<'a> {
         self
     }
 
+    /// Reports the build side, which the probe inside this one does. See [`Probe::watched`].
+    #[must_use]
+    pub(crate) fn watched(mut self, counters: Arc<Counters>) -> Self {
+        self.probe = self.probe.watched(counters);
+        self
+    }
+
     /// What this operator produces, which is the gathered side's columns and nothing else.
     ///
     /// The gathered side is the plan's left input here, because that is what turning the join
@@ -1778,6 +1875,13 @@ impl<'a> Padding<'a> {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.probe = self.probe.in_session(session);
+        self
+    }
+
+    /// Reports the build side, which the probe inside this one does. See [`Probe::watched`].
+    #[must_use]
+    pub(crate) fn watched(mut self, counters: Arc<Counters>) -> Self {
+        self.probe = self.probe.watched(counters);
         self
     }
 
