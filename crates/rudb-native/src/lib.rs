@@ -5971,7 +5971,7 @@ mod tests {
 
     use rudb_common::Stat;
     use rudb_common::Value;
-    use rudb_common::bounds::{Frequencies, Op, Zones};
+    use rudb_common::bounds::{Frequencies, Op, Remainder, Zones};
     use rudb_common::stat::Provenance;
 
     use super::*;
@@ -6208,6 +6208,9 @@ mod tests {
         // A constant of another domain against an integer column. Nothing in the list compares
         // with it, so the zero above would be an artefact of the mismatch rather than a fact.
         assert_eq!(common.rows_with(column, &Bound::Bytes(b"four".to_vec())), Stat::Unknown);
+        // A complete list has no remainder. Answering one of no rows over no values would hand the
+        // caller a division to special case, and the counts above already answer this column.
+        assert_eq!(common.remainder(column), None);
         fs::remove_file(&path).expect("clean up");
     }
 
@@ -6262,6 +6265,12 @@ mod tests {
         // Not in the file at all, and still nothing rather than a zero. A prefix cannot tell the
         // two apart, which is the whole of what it gives up.
         assert_eq!(common.rows_with(column, &Bound::Int(9_999)), Stat::Unknown);
+        // What the prefix left out, which is what turns the unknown above into a number. The 512
+        // entries account for 15,110 rows, so 890 are left for the 89 values the writer dropped,
+        // and 890 over 89 is the ten rows each of them really holds.
+        let remainder = common.remainder(column).expect("the list is a prefix");
+        assert_eq!(remainder, Remainder { rows: 890, listed: 512, most: 10 });
+        assert_eq!(remainder.rows / (601 - remainder.listed), 10);
         fs::remove_file(&path).expect("clean up");
     }
 

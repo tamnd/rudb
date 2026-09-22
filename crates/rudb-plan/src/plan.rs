@@ -1463,6 +1463,10 @@ mod tests {
         fn rows_with(&self, _column: usize, _value: &rudb_common::bounds::Bound) -> Stat<u64> {
             Stat::exact(7, rudb_common::stat::Provenance::FrequencySynopsis)
         }
+
+        fn remainder(&self, _column: usize) -> Option<rudb_common::bounds::Remainder> {
+            None
+        }
     }
 
     #[test]
