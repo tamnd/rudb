@@ -15,7 +15,11 @@
 //! loop over chunks.
 
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
-use rudb_common::{Clustering, Error, Field, LogicalType, Result, Session, Value, Width};
+use rudb_common::bounds::End;
+use rudb_common::{
+    Bound as ColumnBound, Clustering, Error, Field, LogicalType, Result, Session, Stat, Value,
+    Width,
+};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
 use rudb_plan::{Expr, ExprRef, Node, Plan, SortKey};
@@ -448,6 +452,75 @@ fn clustered(
     Ok(binder.plan_mut().add_node(Node::Sort { input, keys }))
 }
 
+/// The declaration with an automatic width turned into the bucket the incoming rows ask for.
+///
+/// A declaration that named no width says the bucket should come from how many rows a partition
+/// would hold, and this is the only place that number is in reach. The rows are the source's, not
+/// the target's: a load into an empty table has a target with nothing to count, and the whole case
+/// the rule exists for is the first load of a big table. So the count and the range come off the
+/// source's own zones, which is the Parquet footer for a file and the directory for a table, and
+/// both are already on the plan because the estimator wanted them.
+///
+/// Everything about this is best effort and that is by design. The three widths hold the same rows
+/// and answer the same queries, so guessing wrong costs some pruning or some key locality and
+/// cannot cost an answer. A source that is a join, a group by or a values list has no zones to read
+/// and gets [`Width::DEFAULT`], which is what the fixed default was before the rule existed.
+fn fitted(
+    binder: &Binder<'_>,
+    scope: &crate::scope::Scope,
+    clustering: &Clustering,
+    targets: &[usize],
+) -> Clustering {
+    if clustering.width() != Width::Auto {
+        return clustering.clone();
+    }
+    let Some(from) = targets.iter().position(|&target| target == clustering.partition() as usize)
+    else {
+        return clustering.fitted(0, 0);
+    };
+    let source = &scope.columns[from];
+    let Some(zones) = binder.plan().sole_zones() else {
+        return clustering.fitted(0, 0);
+    };
+    // By name, and off whichever store the plan reads rather than off the one this column is bound
+    // to. The binding points at the projection over the scan, since a load is a projection into the
+    // target's types, and following a binding back through a projection is the optimizer's job. A
+    // load reads one table or one file, so the store with bounds on it is the store the name is in.
+    let Some(at) = zones.column(&source.name) else {
+        return clustering.fitted(0, 0);
+    };
+    let rows = zones.surviving(&[]).unwrap_or(0);
+    let days = span(&zones.extreme(at, End::Low), &zones.extreme(at, End::High)).unwrap_or(0);
+    clustering.fitted(rows, days)
+}
+
+/// How many days a column covers, from the smallest and largest values in it.
+///
+/// `None` wherever the two do not make a span, which is a column that is entirely null, a store
+/// that could not fold its parts into one answer, and a pair of bounds that are not the same shape.
+/// All of them mean the same thing here, which is that there is nothing to divide the row count by.
+fn span(low: &Stat<ColumnBound>, high: &Stat<ColumnBound>) -> Option<u64> {
+    let (Stat::Known { value: low, .. }, Stat::Known { value: high, .. }) = (low, high) else {
+        return None;
+    };
+    let days = match (low, high) {
+        // A date is a day count already, which is the common case and the only exact one.
+        (ColumnBound::Int(low), ColumnBound::Int(high)) => high.checked_sub(*low)?,
+        // A timestamp is a count of seconds at whichever unit the column keeps, so the span is that
+        // difference divided by a day's worth of them. A scale wide enough to overflow the divisor
+        // is a column no calendar covers and falls out as no span at all.
+        (
+            ColumnBound::Scaled { unscaled: low, scale: at },
+            ColumnBound::Scaled { unscaled: high, scale: to },
+        ) if at == to => {
+            let day = 86_400_i128.checked_mul(10_i128.checked_pow(u32::from(*at))?)?;
+            high.checked_sub(*low)? / day
+        }
+        _ => return None,
+    };
+    u64::try_from(days).ok()
+}
+
 /// Wraps a sort key in the calendar bucket its declaration asked for.
 fn bucketed(
     binder: &mut Binder<'_>,
@@ -530,7 +603,14 @@ fn insert(
     // are built from whatever order arrives, come out narrow instead of each covering the table.
     let root = match &clustering {
         None => root,
-        Some(clustering) => clustered(&mut binder, root, &scope, clustering, &targets, &fields)?,
+        Some(clustering) => {
+            // The width is settled here and not on the table. A declaration that left the bucket to
+            // the data is a standing instruction, so it stays on the table as one and every load
+            // answers it with the rows that load is carrying. What the sort needs is an answer, and
+            // that is what this is.
+            let fitted = fitted(&binder, &scope, clustering, &targets);
+            clustered(&mut binder, root, &scope, &fitted, &targets, &fields)?
+        }
     };
 
     // The projection that makes the source look exactly like the table. Every column the statement

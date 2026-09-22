@@ -95,6 +95,14 @@ const FREQUENCIES: &[u8; 8] = b"RUDBFQ2\0";
 /// optional trailing section with its own magic leaves every file that does not use it byte for
 /// byte what it was, and the version is bumped for a change to a layout that already exists, as
 /// #1029 did. A file with no declaration is the same bytes this build wrote yesterday.
+///
+/// The width byte in this block gained a fifth value for #1285, for a declaration that leaves the
+/// bucket to the row count, and that did not bump the format either. It is the one case where the
+/// reasoning needs saying out loud, because it is a new value in a layout that already exists
+/// rather than a new section. A build without it reading one of these says `clustering width
+/// tag differs` and refuses the table, which is what that message was written for. Bumping the
+/// format instead would have made every file this build writes unreadable to an older one, whether
+/// it has a declaration in it or not, to warn about a case that only arises when it does.
 const CLUSTERING: &[u8; 8] = b"RUDBCL1\0";
 /// The graph section table, written after the clustering declaration and written even when empty.
 ///
