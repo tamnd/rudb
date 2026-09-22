@@ -390,13 +390,19 @@ impl Sort {
         Ok((sort, out))
     }
 
-    /// Whether this instance is holding more than it should be.
+    /// Whether it is time this instance wrote what it is holding out to a file.
     ///
-    /// Half the limit shared between the instances. Half rather than all of it because the sort is
-    /// not the only thing charging the budget: the scan below it holds pages, the writer above it
-    /// holds fragments, and the run this spill is about to write costs an assembly of everything
-    /// being spilled while it is written. A sort that waits until the limit is in sight to start
-    /// spilling has nothing left to spill with.
+    /// Two conditions, and the first one is the database rather than the sort. A run is a file on a
+    /// disk that has to have room for it, so a sort that spills whenever it is holding a lot writes
+    /// gigabytes a load that would have fitted never needed. The clustered SF10 load is sixteen
+    /// gigabytes of rows on a machine with seven and a half free, so the rule that spills at a
+    /// share of the limit fills the disk on a load that had memory to spare. The rule that spills
+    /// when the database is close to its limit does not.
+    ///
+    /// The second is that this instance is holding enough for a file to be worth opening, because
+    /// otherwise a query that is short of memory for some other reason would turn every chunk that
+    /// arrived into a run of one chunk, and a merge of ten thousand of those is slower than the
+    /// query that ran out.
     ///
     /// No limit is no spilling, which is the right answer and not a missing case. A database opened
     /// without one is one whose answer to running out of memory is the allocator's, and a sort that
@@ -406,9 +412,12 @@ impl Sort {
             return false;
         }
         let Some(limit) = self.memory.limit() else { return false };
+        if self.memory.used() < limit - limit / 4 {
+            return false;
+        }
         let instances = self.instances.load(Atomic::Relaxed).max(1) as u64;
-        let share = (limit / 2) / instances;
-        share > 0 && local.charged.bytes() >= share
+        let worth = ((limit / 16) / instances).max(1 << 20);
+        local.charged.bytes() >= worth
     }
 
     /// Sorts what this instance is holding, writes it out as a run, and leaves it empty.
