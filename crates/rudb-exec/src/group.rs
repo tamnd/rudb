@@ -1848,22 +1848,38 @@ impl<'a> Aggregate<'a> {
         // does, would otherwise clear a new map of up to a quarter of a million places for every
         // chunk, in each of the radix partitions of every thread. See [`WINDOW_RATE`]. Codes a page came with are left alone,
         // since their map is as wide as the page's dictionary and no wider.
+        //
+        // A map that only grows upward keeps what it has and is charged for the places it gains.
         *coded_read = coded_read.saturating_add(*length);
+        let grown = direct.as_ref().and_then(|codes| codes.grows(coded_on, coded_map.len()));
         let direct = direct.filter(|codes| {
             codes.same_as(coded_on)
                 || !codes.reads_values()
-                || coded_spent.saturating_add(codes.combos())
+                || coded_spent.saturating_add(codes.combos() - grown.unwrap_or(0))
                     <= coded_read.saturating_mul(WINDOW_RATE).saturating_add(WINDOW_SLACK)
         });
         let mut runs_found = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
                 if codes.reads_values() {
-                    *coded_spent += codes.combos();
+                    *coded_spent += codes.combos() - grown.unwrap_or(0);
                 }
                 codes.hold(coded_on);
-                coded_map.clear();
-                coded_map.resize(codes.combos(), NOWHERE);
+                match grown {
+                    // Every value keeps its place, so only the null place moves, from the last place
+                    // of the old map to the last of the new one. A sorted `CounterID` grows its
+                    // window a dozen times a query, and clearing the whole map for each was a
+                    // second write of every place the map had, and a probe of every group again.
+                    Some(span) => {
+                        let null = std::mem::replace(&mut coded_map[span - 1], NOWHERE);
+                        coded_map.resize(codes.combos(), NOWHERE);
+                        coded_map[codes.combos() - 1] = null;
+                    }
+                    None => {
+                        coded_map.clear();
+                        coded_map.resize(codes.combos(), NOWHERE);
+                    }
+                }
             }
             // A row the map has nothing for goes through the probe and the insert every row used to
             // go through, there and then, and what comes back is written into the map before the
@@ -7625,6 +7641,20 @@ mod tests {
         let building = folded(&aggregate, &chunks);
         assert!(!building.coded_on.is_empty(), "the last chunk was answered by the map");
         assert!(building.coded_spent < 64 * 1_024, "the window settled after a few builds");
+    }
+
+    /// A key that climbs the way a sorted one does keeps the bottom of its window, so its map grows
+    /// upward where it is and no place in it is paid for twice.
+    #[test]
+    fn a_key_that_climbs_grows_its_map_in_place() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, _out) = aggregate(&plan);
+        let chunks: Vec<Vec<i32>> =
+            (0..32).map(|at| (at * 1_024..(at + 1) * 1_024).collect()).collect();
+        let building = folded(&aggregate, &chunks);
+        assert!(!building.coded_on.is_empty(), "the last chunk was answered by the map");
+        assert!(building.coded_map.len() > 32 * 1_024, "the map covers every value");
+        assert_eq!(building.coded_spent, building.coded_map.len(), "no place was cleared twice");
     }
 
     /// Only the table an instance fills before it partitions covers the aggregate's whole key range,
