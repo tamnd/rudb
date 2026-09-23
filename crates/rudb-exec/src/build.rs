@@ -101,7 +101,7 @@ use crate::stream::{Edge, Filter, Limit, Project};
 use crate::topn::TopN;
 use crate::typenames::typenames;
 use crate::window::{Window, Written};
-use crate::writemetrics::write_metrics;
+use crate::writemetrics::{codec_metrics, write_metrics};
 
 /// Builds the pipelines for a plan's root, for a query nothing will stop.
 ///
@@ -1479,6 +1479,7 @@ impl<'a> Building<'a, '_> {
                 function @ (TableFunction::RudbStrategies
                 | TableFunction::RudbLinks
                 | TableFunction::RudbWriteMetrics
+                | TableFunction::RudbCodecMetrics
                 | TableFunction::DuckdbKeywords
                 | TableFunction::DuckdbTypes
                 | TableFunction::DuckdbFunctions
@@ -1505,6 +1506,7 @@ impl<'a> Building<'a, '_> {
                         links(self.session, self.catalog, plan, index, columns)?
                     }
                     TableFunction::RudbWriteMetrics => write_metrics(plan, index, columns)?,
+                    TableFunction::RudbCodecMetrics => codec_metrics(plan, index, columns)?,
                     TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
                     TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
                     TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,

@@ -116,3 +116,40 @@ fn a_statement_that_never_loaded_leaves_no_profile() {
         .expect("reads");
     assert_eq!(count.to_string(), "0");
 }
+
+#[test]
+fn a_load_counts_what_each_codec_it_offered_cost() {
+    let path = scratch("codecs");
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    let integers = |column: &str| -> i64 {
+        let result = database
+            .query(&format!(
+                "SELECT sum({column}) FROM rudb_codec_metrics() WHERE family = 'integer'"
+            ))
+            .expect("the codec metrics read");
+        number(&result.rows().next().expect("one row")[0])
+    };
+    let (offers, kept) = (integers("offers"), integers("kept"));
+    database
+        .execute(
+            "CREATE TABLE coded AS SELECT range AS a, 'v' || (range % 7) AS b FROM range(300000)",
+        )
+        .expect("loads");
+    // Other tests load in this process too, so the counts can only be said to have gone up.
+    assert!(integers("offers") > offers);
+    assert!(integers("kept") > kept);
+    assert!(integers("kept") <= integers("offers"));
+
+    let shares = database
+        .query(
+            "SELECT family, sum(share) FROM rudb_codec_metrics() GROUP BY family ORDER BY family",
+        )
+        .expect("the codec metrics read");
+    for row in shares.rows() {
+        let total: f64 = row[1].to_string().parse().expect("a share");
+        assert!((total - 1.0).abs() < 1e-9, "{} shares add up to {total}", row[0]);
+    }
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}

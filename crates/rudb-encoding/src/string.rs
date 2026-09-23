@@ -61,6 +61,8 @@
 //! measurement this milestone exists for. Everything here is one column on its own, which is the
 //! baseline they get compared against.
 
+use std::time::Instant;
+
 use rudb_common::{Error, Result};
 
 use crate::chooser::{Chooser, EXHAUSTIVE, Settled};
@@ -68,6 +70,7 @@ use crate::fsst::SymbolTable;
 use crate::integer;
 use crate::lz;
 use crate::reader::Reader;
+use crate::tally::{self, Family};
 
 /// How deep the recursion goes. A dictionary of a dictionary is not a thing, so this only has to
 /// stop the dictionary's own entries from being dictionary encoded again.
@@ -111,6 +114,10 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Every kind, in tag order.
+    pub const ALL: [Self; 6] =
+        [Self::Constant, Self::Plain, Self::Fsst, Self::Dict, Self::Front, Self::Lz];
+
     fn tag(self) -> u8 {
         self as u8
     }
@@ -482,17 +489,34 @@ pub fn with_symbols(shape: Settled, blocks: &[Vec<&[u8]>]) -> Settled {
 }
 
 fn encode_at(values: &[&[u8]], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
+    let started = Instant::now();
     let offered = candidates(values, depth);
-    let mut best: Option<Vec<u8>> = None;
-    for kind in chooser.narrow_strings(values, &offered, depth) {
-        let Some(bytes) = encode_as(kind, values, depth, chooser)? else {
+    let narrowed = chooser.narrow_strings(values, &offered, depth);
+    // Only the top level is counted, so that a cascade's time is counted once. See `tally`.
+    let counted = depth == 0;
+    if counted {
+        tally::chose(Family::String, started);
+    }
+    let mut best: Option<(Kind, Vec<u8>)> = None;
+    for kind in narrowed {
+        let encoded = if counted {
+            tally::offer(Family::String, kind.tag(), || encode_as(kind, values, depth, chooser))?
+        } else {
+            encode_as(kind, values, depth, chooser)?
+        };
+        let Some(bytes) = encoded else {
             continue;
         };
-        if best.as_ref().is_none_or(|current| bytes.len() < current.len()) {
-            best = Some(bytes);
+        if best.as_ref().is_none_or(|(_, current)| bytes.len() < current.len()) {
+            best = Some((kind, bytes));
         }
     }
-    best.ok_or_else(|| Error::internal("no string encoding applied to the chunk"))
+    let (kind, bytes) =
+        best.ok_or_else(|| Error::internal("no string encoding applied to the chunk"))?;
+    if counted {
+        tally::kept(Family::String, kind.tag());
+    }
+    Ok(bytes)
 }
 
 fn candidates(values: &[&[u8]], depth: u8) -> Vec<Kind> {

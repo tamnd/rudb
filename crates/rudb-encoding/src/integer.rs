@@ -42,11 +42,13 @@
 //! no way to tell how much the sampler is leaving behind.
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use rudb_common::{Error, Result};
 
 use crate::chooser::{Chooser, EXHAUSTIVE};
 use crate::reader::Reader;
+use crate::tally::{self, Family};
 
 use crate::bitpack::{self, VALUES};
 
@@ -430,19 +432,35 @@ pub fn describe(bytes: &[u8]) -> Result<String> {
 }
 
 fn encode_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
+    let started = Instant::now();
     let offered = candidates(values, depth, chooser);
-    let mut best: Option<Vec<u8>> = None;
-    for kind in chooser.narrow_integers(values, &offered, depth) {
-        let Some(bytes) = encode_as(kind, values, depth, chooser)? else {
+    let narrowed = chooser.narrow_integers(values, &offered, depth);
+    // Only the top level is counted, so that a cascade's time is counted once. See `tally`.
+    let counted = depth == 0;
+    if counted {
+        tally::chose(Family::Integer, started);
+    }
+    let mut best: Option<(Kind, Vec<u8>)> = None;
+    for kind in narrowed {
+        let encoded = if counted {
+            tally::offer(Family::Integer, kind.tag(), || encode_as(kind, values, depth, chooser))?
+        } else {
+            encode_as(kind, values, depth, chooser)?
+        };
+        let Some(bytes) = encoded else {
             continue;
         };
-        if best.as_ref().is_none_or(|current| bytes.len() < current.len()) {
-            best = Some(bytes);
+        if best.as_ref().is_none_or(|(_, current)| bytes.len() < current.len()) {
+            best = Some((kind, bytes));
         }
     }
     // `Packed` applies to every input including the empty one, so the chooser always has at least
     // one candidate and this cannot be reached without a bug in `candidates`.
-    best.ok_or_else(|| Error::internal("no encoding applied to the chunk"))
+    let (kind, bytes) = best.ok_or_else(|| Error::internal("no encoding applied to the chunk"))?;
+    if counted {
+        tally::kept(Family::Integer, kind.tag());
+    }
+    Ok(bytes)
 }
 
 /// Which candidates are worth encoding for this input.
