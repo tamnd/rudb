@@ -9035,3 +9035,102 @@ fn update_and_delete_change_rows_in_place_the_way_the_pin_does() {
     db.execute("CREATE VIEW v AS SELECT 1 AS a").unwrap();
     assert_eq!(error("UPDATE v SET a = 2"), "Binder Error: Can only update base table");
 }
+
+#[test]
+fn a_rollback_puts_back_what_the_transaction_changed_the_way_the_pin_does() {
+    let db = Database::new();
+    let count = |db: &Database| rows(db, "SELECT count(*) FROM t")[0][0].to_string();
+    let error = |sql: &str| db.execute(sql).unwrap_err().to_string();
+    db.execute("CREATE TABLE t (a INTEGER NOT NULL)").unwrap();
+    db.execute("BEGIN TRANSACTION").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    assert_eq!(count(&db), "2");
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(count(&db), "0");
+    db.execute("START TRANSACTION").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    db.execute("COMMIT").unwrap();
+    assert_eq!(count(&db), "2");
+    db.execute("BEGIN").unwrap();
+    db.execute("CREATE TABLE u (b INTEGER)").unwrap();
+    db.execute("DELETE FROM t").unwrap();
+    db.execute("ABORT").unwrap();
+    assert_eq!(count(&db), "2");
+    assert!(
+        error("SELECT * FROM u").starts_with("Catalog Error: Table with name u does not exist")
+    );
+    assert_eq!(
+        error("COMMIT"),
+        "TransactionContext Error: cannot commit - no transaction is active"
+    );
+    assert_eq!(
+        error("ROLLBACK"),
+        "TransactionContext Error: cannot rollback - no transaction is active"
+    );
+    db.execute("BEGIN").unwrap();
+    assert_eq!(
+        error("BEGIN"),
+        "TransactionContext Error: cannot start a transaction within a transaction"
+    );
+    assert_eq!(
+        error("SELECT 1"),
+        "TransactionContext Error: Current transaction is aborted (please ROLLBACK)"
+    );
+    db.execute("ROLLBACK").unwrap();
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (3)").unwrap();
+    assert_eq!(
+        error("INSERT INTO t VALUES (NULL)"),
+        "Constraint Error: NOT NULL constraint failed: t.a"
+    );
+    assert_eq!(
+        error("SELECT 1"),
+        "TransactionContext Error: Current transaction is aborted (please ROLLBACK)"
+    );
+    db.execute("COMMIT").unwrap();
+    assert_eq!(count(&db), "2");
+    db.execute("BEGIN").unwrap();
+    assert!(db.execute("SELEC 1").is_err());
+    db.execute("INSERT INTO t VALUES (3)").unwrap();
+    db.execute("END").unwrap();
+    assert_eq!(count(&db), "3");
+    db.execute("BEGIN READ ONLY").unwrap();
+    assert_eq!(
+        error("INSERT INTO t VALUES (4)"),
+        "TransactionContext Error: Cannot write to database \"\"memory\"\" - transaction is \
+         launched in read-only mode"
+    );
+    db.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn a_file_keeps_what_committed_and_loses_what_rolled_back_or_was_left_open() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-transactions-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let count = |db: &Database| rows(db, "SELECT count(*) FROM t")[0][0].to_string();
+    {
+        let db = Database::open(name).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t SELECT i FROM range(100) AS r(i)").unwrap();
+        db.execute("ROLLBACK").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE t SET a = 7").unwrap();
+        db.execute("INSERT INTO t VALUES (3)").unwrap();
+    }
+    let db = Database::open(name).unwrap();
+    assert_eq!(count(&db), "2");
+    assert_eq!(rows(&db, "SELECT sum(a) FROM t")[0][0].to_string(), "3");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}

@@ -244,6 +244,21 @@ impl Catalog {
         self.generation += 1;
     }
 
+    /// Puts back a catalog kept from before, which is what a `ROLLBACK` does.
+    ///
+    /// The generation still moves on rather than going back to the kept one's, because a plan or a
+    /// set of facts built since was built against contents that are gone and has to be built again.
+    /// The oid counter keeps the higher of the two, so an oid handed out inside the transaction is
+    /// never handed out again to something else.
+    pub fn restore(&mut self, before: Self) {
+        let generation = self.generation;
+        let next = self.next.max(before.next);
+        *self = before;
+        self.generation = generation;
+        self.next = next;
+        self.changed();
+    }
+
     /// The next oid, and moves the counter on.
     ///
     /// Never handed out twice in the life of one catalog, including across a drop and a create of
