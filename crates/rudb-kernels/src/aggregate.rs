@@ -1210,8 +1210,8 @@ pub fn update_scattered(
     Ok(())
 }
 
-/// Folds every argument of one call into many accumulators a row at a time, for the aggregates in
-/// [`General`], or says `false` for any other aggregate and touches nothing.
+/// Folds every argument of one call into many accumulators a row at a time, for the aggregates that
+/// are not a count, a total or an extreme, or says `false` for those and touches nothing.
 ///
 /// The layout is the one [`update_scattered`] folds into, and the caller asks this first. These
 /// states take every argument of the call rather than the first one, and some of them keep a null
