@@ -258,13 +258,28 @@ impl Table {
     /// given too small a number grows the way it always did, and nothing here depends on the number
     /// being right for the answer to be right: it is a capacity and the keys decide everything else.
     pub(crate) fn with_groups(types: &[rudb_common::LogicalType], groups: u64) -> Self {
+        Self::sized(types, Self::buckets_for(groups))
+    }
+
+    /// The bytes the bucket array of [`Table::with_groups`] takes for `groups` groups, which is
+    /// what an aggregate reserves before it asks for them.
+    ///
+    /// Exact, because the array is one `u64` a bucket and the count is worked out here the same
+    /// way it is there. The key columns and the hashes grow as groups arrive and are charged as they
+    /// do, so they are not in this.
+    pub(crate) fn room(groups: u64) -> u64 {
+        u64::try_from(Self::buckets_for(groups) * size_of::<u64>()).unwrap_or(u64::MAX)
+    }
+
+    /// How many buckets hold `groups` groups without growing.
+    fn buckets_for(groups: u64) -> usize {
         // Half full is where `insert` grows, so the room for `groups` of them is twice that many
         // buckets, rounded up to the power of two the mask needs. `FIRST` is the floor because a
         // table smaller than the one every other table starts at is not an optimization.
         let wanted = usize::try_from(groups.saturating_mul(2)).unwrap_or(usize::MAX);
         // Halved before the rounding rather than after, so that the rounding cannot carry it past
         // the most slots a `u32` can address.
-        Self::sized(types, wanted.clamp(FIRST, LIMIT / 2).next_power_of_two())
+        wanted.clamp(FIRST, LIMIT / 2).next_power_of_two()
     }
 
     /// An empty table with `buckets` buckets, which is a power of two at or above [`FIRST`].
