@@ -686,7 +686,7 @@ impl Table {
         let timing = stage::Timing::start(Stage::Fold);
         for part in counted {
             for pair in &part.splits[split] {
-                let key = Key { group: pair.group, hash: pair.group_hash, valid: pair.valid };
+                let key = Key { group: pair.group, hash: pair.hash(), valid: pair.valid };
                 let slot = self.slot(key)?;
                 let state = &mut self.states[slot];
                 state.distinct = state

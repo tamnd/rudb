@@ -237,9 +237,9 @@ impl Run {
     }
 
     /// The row at `at`, counting across the chunks.
-    #[cfg(test)]
     fn at(&self, at: usize) -> Record {
-        self.chunks().flatten().nth(at).copied().expect("a row")
+        let full = self.full.len() * CHUNK;
+        if at < full { self.full[at / CHUNK][at % CHUNK] } else { self.tail[at - full] }
     }
 
     /// The chunks in order, which between them are every row.
@@ -501,20 +501,19 @@ pub(crate) struct Counted {
 
 /// The group of one distinct pair, on its way from the partition that found it to its split.
 ///
-/// The hash rides along because the two sides want it once each, to pick the split the group belongs
-/// in and then to find the group inside that split, and working it out again on the other side would
-/// be the same arithmetic on the same number.
-///
-/// Comparing two of these is what a probe into a split's group table does on every pair it is
-/// handed, and it compares all three fields because the hash is what rules a bucket out cheaply and
-/// the other two are what prove it in. Deriving that rather than writing it out at each probe is
-/// worth a load: the table is a `Vec`, so a probe that names the record three times indexes it three
-/// times, and three bounds checks and three loads of the same twelve bytes become one of each.
+/// Only the key and validity are carried, keeping each record to eight bytes. The counting pass
+/// recomputes the hash instead of storing a copy beside millions of distinct pairs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Grouped {
     pub(crate) group: i32,
-    pub(crate) group_hash: u32,
     pub(crate) valid: bool,
+}
+
+impl Grouped {
+    #[inline]
+    pub(crate) fn hash(self) -> u32 {
+        group_hash(self.group, self.valid)
+    }
 }
 
 /// Which of `splits` a group belongs to, by the top bits of its hash.
@@ -536,44 +535,31 @@ pub(crate) fn distinct_pairs(
 ) -> Result<Counted> {
     let reserving = stage::Timing::start(Stage::Reserve);
     let held_rows = partition.rows();
-    let pair_capacity = held_rows.saturating_mul(2).max(64).next_power_of_two();
+    u32::try_from(held_rows)
+        .map_err(|_| Error::out_of_memory("a radix pair partition is too large"))?;
+    // A three-quarter-full table still leaves room for every input row, including the case
+    // where every pair is new. The former half-full target rounded a typical 10M ClickBench
+    // partition from about 96K rows up to 256K buckets. This target keeps it at 128K buckets,
+    // which is smaller than the rest of the partition's working set and cheaper to probe.
+    let pair_capacity = held_rows.saturating_add(held_rows.div_ceil(3)).max(64).next_power_of_two();
     let mut working = memory.reservation();
     working.grow(width(pair_capacity * size_of::<u32>()))?;
     let mut pair_buckets = vec![EMPTY; pair_capacity];
     let pair_mask = pair_capacity - 1;
-    // A bucket says which pair it stands for as well as where that pair is, so that a probe landing
-    // on somebody else's pair can tell from the bucket alone. The low bits are the index into
-    // `unique` and the high bits are the part of the hash the bucket's own position did not already
-    // fix, which is the only part of it worth comparing. Reading the record instead is a second
-    // random load into a run of about a megabyte, and on ClickBench 8 nine rows in ten are a pair
-    // nobody has seen before, so that load was paid on nearly every row to be told what the bucket
-    // could have said.
-    //
-    // No real bucket reads as `EMPTY`, because that needs every index bit set and the table is twice
-    // the rows it can hold, so the largest index there can be is below half of it. That also makes
-    // the conversion here the only place a partition too large to index has to be caught.
+    // The low bits of a bucket name an ordinal into the input runs and the high bits hold a hash
+    // tag. The runs already own every record, so a second copy of nearly every distinct pair is
+    // unnecessary. A different tag is rejected by the bucket alone; only a matching tag reads the
+    // input record. The table has more slots than input rows, so an ordinal never overlaps its tag.
     let index_mask = u32::try_from(pair_mask)
         .map_err(|_| Error::out_of_memory("a radix pair partition is too large"))?;
     let tag_mask = !index_mask;
+    let mut run_ends = Vec::with_capacity(partition.runs.len());
+    let mut end = 0_usize;
+    for run in &partition.runs {
+        end += run.len();
+        run_ends.push(end);
+    }
     let all_valid = partition.runs.iter().all(|run| run.validity.is_empty());
-    // The deduplicated pairs used to be compacted into the front of the one run the partition held.
-    // There is no one run to compact into now, so they are collected here instead, and this is where
-    // they are read from for the rest of the pass. It is one record per distinct pair rather than one
-    // per row, which is the same bound the compaction had.
-    //
-    // That bound is also what it is asked for up front. A vector that doubles its way from nothing
-    // to n copies about n on the way, and this pass is bandwidth bound rather than thread bound: on
-    // ClickBench 8 the finishing half does not get any quicker between eight threads and sixteen,
-    // and nine pairs in ten there are new, so the doubling was moving nearly as many bytes as the
-    // loop itself was. Asking once costs no more memory than the doubling reached anyway, since a
-    // vector that has just grown holds up to twice what is in it, and it is given back below as soon
-    // as the real count is known.
-    let mut unique: Vec<Record> = Vec::with_capacity(held_rows);
-    let mut unique_validity: Vec<bool> =
-        if all_valid { Vec::new() } else { Vec::with_capacity(held_rows) };
-    working.grow(width(
-        unique.capacity() * size_of::<Record>() + unique_validity.capacity() * size_of::<bool>(),
-    ))?;
 
     // Every distinct pair is one for its group to count, and the group goes to the split its hash
     // picks so that the counting pass finds all of a group's pairs together. The user is not carried
@@ -589,10 +575,7 @@ pub(crate) fn distinct_pairs(
     //
     // The splits are filled by the loop below rather than by a pass over its answer. A pair is
     // written into its split at the moment it turns out to be new, when the record and its validity
-    // are both in registers already, and the pass that used to do it read all of `unique` back to
-    // learn what the loop that wrote it had just known. On ClickBench 8 that is nine hundred
-    // thousand records, sixteen bytes each, read out of memory for the second time to be turned into
-    // twelve.
+    // are both in registers already, avoiding another pass over the input.
     //
     // Each split is asked for a share of the rows up front and not left to double its way there. A
     // hash spreads the groups evenly enough that the guess is close, and the alternative is every
@@ -606,6 +589,7 @@ pub(crate) fn distinct_pairs(
     reserving.stop(0);
 
     let timing = stage::Timing::start(Stage::Fold);
+    let mut start = 0_usize;
     for run in &partition.runs {
         for (source, &row) in run.chunks().flatten().enumerate() {
             let valid = all_valid || run.valid_at(source);
@@ -614,23 +598,19 @@ pub(crate) fn distinct_pairs(
             loop {
                 let slot = pair_buckets[at];
                 if slot == EMPTY {
-                    pair_buckets[at] = tag | unique.len() as u32;
-                    unique.push(row);
-                    if !all_valid {
-                        unique_validity.push(valid);
-                    }
+                    pair_buckets[at] = tag | (start + source) as u32;
                     let group_hash = group_hash(row.group, valid);
                     let split = split_of(group_hash, splits);
-                    parts[split].push(Grouped { group: row.group, group_hash, valid });
+                    parts[split].push(Grouped { group: row.group, valid });
                     break;
                 }
                 if slot & tag_mask == tag {
-                    // The group and the user are what the hash was taken of, so two rows that agree
-                    // on both agree on the whole of it. The tag above is a filter and this is the
-                    // answer, which is why the hash itself is not compared here at all.
                     let held_at = (slot & index_mask) as usize;
-                    let held = unique[held_at];
-                    let held_valid = all_valid || unique_validity[held_at];
+                    let held_run = run_ends.partition_point(|&end| end <= held_at);
+                    let held_start = if held_run == 0 { 0 } else { run_ends[held_run - 1] };
+                    let held_source = held_at - held_start;
+                    let held = partition.runs[held_run].at(held_source);
+                    let held_valid = all_valid || partition.runs[held_run].valid_at(held_source);
                     if held.group == row.group && held.user == row.user && held_valid == valid {
                         break;
                     }
@@ -638,6 +618,7 @@ pub(crate) fn distinct_pairs(
                 at = (at + 1) & pair_mask;
             }
         }
+        start += run.len();
     }
     timing.stop(0);
 
@@ -645,8 +626,6 @@ pub(crate) fn distinct_pairs(
     // before the group pass rather than at the end of the query.
     let reserving = stage::Timing::start(Stage::Reserve);
     partition.runs.clear();
-    drop(unique);
-    drop(unique_validity);
 
     // What the share above guessed too high, given back. A partition whose rows are nearly all new
     // pairs, which on ClickBench 8 is nine in ten of them, keeps what it asked for and copies
@@ -676,8 +655,10 @@ fn poisoned<T>(_: T) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use super::{
-        CHUNK, COMPACT_FROM, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Repeat, Run,
+        CHUNK, COMPACT_FROM, Grouped, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Repeat, Run,
         distinct_pairs, folded, group_hash, group_seed, merged, mix, scatter, scatter_seeded,
         shift, spread, used,
     };
@@ -720,6 +701,24 @@ mod tests {
         assert_eq!(run.validity, [false, true]);
         assert!(!run.valid_at(0));
         assert!(run.valid_at(1));
+    }
+
+    /// A repeated pair can refer back to another run, and a hash collision is still a new pair.
+    #[test]
+    fn a_pair_bucket_reads_the_original_row_across_runs_and_hash_collisions() {
+        assert_eq!(size_of::<Grouped>(), 8);
+        let first = Record { user: 10, group: 7, pair_hash: 3 };
+        let other = Record { user: 11, group: 7, pair_hash: 3 };
+        let mut left = Run::default();
+        left.push(first, true);
+        let mut right = Run::default();
+        right.push(other, true);
+        right.push(first, true);
+        right.push(Record { user: 12, group: 0, pair_hash: u32::MAX }, false);
+        let mut partition = Held { runs: vec![left, right] };
+        let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
+            .expect("colliding pairs");
+        assert_eq!(counted.splits[0].len(), 3);
     }
 
     /// A run that fills up with repeats keeps one row per pair, keeps its capacity, and keeps the
