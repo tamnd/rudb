@@ -1074,6 +1074,9 @@ pub fn update_scattered(
     let into = Where { slots: &slots[..rows], stride, offset };
     // `count(*)` reads nothing, so it never asks for the argument it does not have.
     if kind == Kind::CountStar {
+        if few(states, into, rows, Live::All, Feed::Counted, |_| 0)? {
+            return Ok(());
+        }
         for row in 0..rows {
             let Some(index) = into.index(row) else { continue };
             if let State::Counted { count, .. } = &mut states[index].state {
@@ -1528,6 +1531,81 @@ macro_rules! live_rows {
     };
 }
 
+/// How many groups a call adds up on its own before it touches an accumulator.
+///
+/// Past this the locals cost more to clear than the rows they save, and a call with that many
+/// groups is one where few rows share a group anyway. A call also needs four rows a group, for the
+/// same reason.
+const FEW: usize = 256;
+
+/// One pass that adds each row into a local total for its group, then folds each group's total into
+/// its accumulator once, or false if there are too many groups for that to pay.
+///
+/// The loops below reach the accumulator of every row: the slot times the stride, the enum asked
+/// which state it is, and a 128 bit add checked for overflow. On q01, with four groups and seven
+/// aggregates, that was most of what the query spent. Here the row costs the slot, one add into a
+/// local and one count, and the rest is paid once per group per chunk.
+///
+/// The value a row adds has to fit in 65 bits, which every caller checks before it calls, and so a
+/// local total cannot overflow before there are 2^62 rows in a call. That is why the adds below are
+/// not checked. The fold into the accumulator is checked the way the per row add was, and a sum is
+/// range checked again at the finish, so an answer that does not fit says so as it did before.
+///
+/// Only exact totals, means and counts come here. A float total has to add in row order to round
+/// the way the row at a time path rounds, and a local total per group would change that order.
+fn few<V: Fn(usize) -> i128>(
+    states: &mut [Accumulator],
+    into: Where<'_>,
+    rows: usize,
+    nulls: Live<'_>,
+    feed: Feed,
+    value: V,
+) -> Result<bool> {
+    let groups = states.len().checked_div(into.stride).unwrap_or(usize::MAX);
+    // Clearing the locals is a fixed cost per call, so a call needs rows enough to pay it back. A
+    // partitioned table hands its partitions a few dozen rows at a time over a hundred or so groups,
+    // and there it measured at nine percent more on TPC-H q15 before this second condition.
+    if groups > FEW
+        || groups.saturating_mul(4) > rows
+        || !matches!(feed, Feed::Counted | Feed::Total | Feed::Whole { .. })
+    {
+        return Ok(false);
+    }
+    let mut totals = [0_i128; FEW];
+    let mut counts = [0_i64; FEW];
+    live_rows!(nulls, rows, |row| {
+        let slot = into.slots[row];
+        if slot == NOWHERE {
+            continue;
+        }
+        totals[slot] = totals[slot].wrapping_add(value(row));
+        counts[slot] += 1;
+    });
+    for (slot, (&count, &number)) in counts.iter().zip(&totals).take(groups).enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let index = slot * into.stride + into.offset;
+        match (&mut states[index].state, feed) {
+            (State::Counted { count: held, .. }, Feed::Counted) => *held += count,
+            (State::Whole { total, seen, .. } | State::Scaled { total, seen, .. }, Feed::Total) => {
+                *total = total.checked_add(number).ok_or_else(overflowed)?;
+                *seen = true;
+            }
+            (State::Mean { total, seen, exact, scale: held, .. }, Feed::Whole { scale }) => {
+                *held = scale;
+                match total.checked_add(number).filter(|_| *exact) {
+                    Some(sum) => *total = sum,
+                    None => widened(total, exact, number),
+                }
+                *seen += count;
+            }
+            _ => return Err(Error::internal("a total per group into another state".to_string())),
+        }
+    }
+    Ok(true)
+}
+
 /// One pass over a vector, folding each row into the accumulator it belongs to.
 fn spread(
     states: &mut [Accumulator],
@@ -1540,6 +1618,9 @@ fn spread(
     // Both counts are answered by the mask on its own, whatever the form and whatever the type, so
     // they come back before there is any question of which loop to run.
     if matches!(feed, Feed::Counted) {
+        if few(states, into, rows, nulls, feed, |_| 0)? {
+            return Ok(true);
+        }
         live_rows!(nulls, rows, |row| {
             let Some(index) = into.index(row) else { continue };
             if let State::Counted { count, .. } = &mut states[index].state {
@@ -1639,6 +1720,13 @@ fn total_into<M: Fn(usize) -> usize>(
             match run.data {
                 $(Data::$variant(values) => {
                     let values = values.as_slice();
+                    if size_of::<$native>() < 16
+                        && few(states, into, run.rows, run.nulls, Feed::Total, |row| {
+                            i128::from(values[at(row)])
+                        })?
+                    {
+                        return Ok(true);
+                    }
                     live_rows!(run.nulls, run.rows, |row| {
                         let Some(index) = into.index(row) else { continue };
                         let (State::Whole { total, seen, .. }
@@ -1684,6 +1772,13 @@ fn mean_into<M: Fn(usize) -> usize>(
             match run.data {
                 $(Data::$variant(values) => {
                     let values = values.as_slice();
+                    if size_of::<$native>() < 16
+                        && few(states, into, run.rows, run.nulls, Feed::Whole { scale }, |row| {
+                            i128::from(values[at(row)])
+                        })?
+                    {
+                        return Ok(true);
+                    }
                     live_rows!(run.nulls, run.rows, |row| {
                         let Some(index) = into.index(row) else { continue };
                         let number = i128::from(values[at(row)]);
@@ -1739,6 +1834,14 @@ fn packed_into<M: Fn(usize) -> usize>(
     let wide = input.logical_type().physical() == PhysicalType::UInt128;
     let scale = decimal_scale(input.logical_type());
     let base = packed.base();
+    // A base inside 64 bits and a code of at most 64 is a value inside 65, which is small enough for
+    // [`few`]'s unchecked local totals. A base past that is a column no packing here has built.
+    if !wide
+        && i64::try_from(base).is_ok()
+        && few(states, into, rows, nulls, feed, |row| base + i128::from(packed.code(at(row))))?
+    {
+        return Ok(true);
+    }
     match feed {
         Feed::Counted => Ok(true),
         // The same loop `total_into` is, over a packing rather than a run of values, and the same
@@ -3103,10 +3206,18 @@ mod tests {
     /// answer. Two batches rather than one, because a state that is restarted at every vector is
     /// right on one vector and wrong on the query, and the slots change between them so no group
     /// sees the same rows twice.
+    ///
+    /// It runs twice, at five groups and at more than [`super::FEW`], because those are two different
+    /// loops: the first adds a chunk up per group before it touches a state, and the second reaches
+    /// the state of every row.
     #[test]
     fn every_aggregate_scattered_into_groups_agrees_with_one_accumulator_per_group() {
-        let mut rng = Rng(0x5eed_ca11_ab1e_0061);
-        let groups = 5;
+        scattered_into(5, 0x5eed_ca11_ab1e_0061);
+        scattered_into(super::FEW + 3, 0x5eed_ca11_ab1e_0062);
+    }
+
+    fn scattered_into(groups: usize, seed: u64) {
+        let mut rng = Rng(seed);
         let types = [
             LogicalType::TinyInt,
             LogicalType::SmallInt,
