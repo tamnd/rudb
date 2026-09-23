@@ -6002,12 +6002,45 @@ impl<'a> Cursor<'a> {
     }
 
     /// The next `len` bytes, without moving past them.
+    #[inline]
     fn peek(&mut self, len: usize) -> Result<&[u8]> {
+        if self.window.is_none() {
+            let bytes = self.bytes;
+            return Ok(&bytes[self.at..self.end(len)?]);
+        }
         self.ensure(len)?;
         Ok(self.held(self.at, len))
     }
 
+    /// The next `len` bytes, moving past them.
+    ///
+    /// Every data page is decoded through this, a byte or a word at a time, so a cursor over bytes
+    /// already in memory takes them here and never reaches [`Self::ensure`]. With the window check
+    /// on every call, q06 on TPC-H spent a seventh of its instructions in it.
+    #[inline]
     fn take(&mut self, len: usize) -> Result<&[u8]> {
+        if self.window.is_none() {
+            let bytes = self.bytes;
+            let (at, end) = (self.at, self.end(len)?);
+            self.at = end;
+            return Ok(&bytes[at..end]);
+        }
+        self.take_windowed(len)
+    }
+
+    /// Where `len` bytes from here end, when they end inside the bytes.
+    #[inline]
+    fn end(&self, len: usize) -> Result<usize> {
+        let end = self.at.checked_add(len).ok_or_else(|| invalid("directory offset overflow"))?;
+        if end > self.bytes.len() {
+            return Err(invalid("directory is truncated"));
+        }
+        Ok(end)
+    }
+
+    /// [`Self::take`] out of the file, a window at a time.
+    #[inline(never)]
+    fn take_windowed(&mut self, len: usize) -> Result<&[u8]> {
         self.ensure(len)?;
         self.at += len;
         Ok(self.held(self.at - len, len))
