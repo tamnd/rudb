@@ -80,6 +80,7 @@ mod clock;
 mod counters;
 mod document;
 mod driver;
+mod histogram;
 mod json;
 mod qerror;
 mod report;
@@ -92,6 +93,7 @@ pub use document::{
     Operator, Outcome, Pipeline, Query, Reduced, Resource, Settings, Strategy, Timing,
 };
 pub use driver::{Driver, Running};
+pub use histogram::{HIGHEST, Histogram};
 pub use qerror::{QErrors, Spread, q_error, tenths, word};
 pub use report::Report;
 
