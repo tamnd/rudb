@@ -10070,7 +10070,7 @@ mod tests {
         assert_eq!(whole, lens, "a vector of lengths answers what a length at a time answers");
         let codes = (0..4_000_u32).map(|row| (7 * (4_000 - row)) % 2_800).collect::<Vec<_>>();
         let coded =
-            Vector::dictionary_over(codes.clone(), Arc::new(dictionary)).expect("codes in range");
+            Vector::dictionary_over(codes.clone(), dictionary).expect("codes in range");
         let mut through = vec![0i64; codes.len()];
         assert!(coded.try_bytes_lens(&mut through).expect("read"), "the codes answer whole");
         for (row, &code) in codes.iter().enumerate() {
@@ -10084,7 +10084,7 @@ mod tests {
         let fresh = Reader::open(&path).expect("valid directory");
         let untouched = fresh.dictionary(0).expect("read").expect("a string column has one");
         let few = vec![2_799_u32, 0, 1_024, 1_023, 511, 512];
-        let coded = Vector::dictionary_over(few.clone(), Arc::new(untouched)).expect("in range");
+        let coded = Vector::dictionary_over(few.clone(), untouched).expect("in range");
         let mut short = vec![0i64; few.len()];
         assert!(coded.try_bytes_lens(&mut short).expect("read"), "the codes answer whole");
         let expected = few.iter().map(|&code| lens[code as usize]).collect::<Vec<_>>();
