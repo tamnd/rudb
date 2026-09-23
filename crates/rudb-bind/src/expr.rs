@@ -22,6 +22,21 @@ use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
 use crate::binder::{Binder, PendingSubquery, WindowCall};
 use crate::scope::Scope;
 
+/// The pin's list macros over `list_concat`: the name, its parameters as the pin prints them, which
+/// argument is the value to be wrapped in a list, and whether it goes in front of the list.
+///
+/// Read off `duckdb_functions()` on `v2.0.0-dev84237`. `array_push_front` is the odd one, because
+/// it takes the list first and still puts the value in front, so `array_push_front([1], 0)` is
+/// `[0, 1]` there, and it is copied here as it is rather than put in the order its name suggests.
+const LIST_MACROS: &[(&str, &str, usize, bool)] = &[
+    ("list_append", "l, e", 1, false),
+    ("array_append", "arr, el", 1, false),
+    ("array_push_back", "arr, e", 1, false),
+    ("list_prepend", "e, l", 0, true),
+    ("array_prepend", "el, arr", 0, true),
+    ("array_push_front", "arr, e", 1, true),
+];
+
 impl Binder<'_> {
     /// Binds the value of a `SET`, which is an expression over nothing.
     ///
@@ -524,6 +539,9 @@ impl Binder<'_> {
         for arg in arguments {
             bound.push(self.bind_expr(ast, arg, scope)?);
         }
+        if let Some(expanded) = self.list_macro(&written, &bound)? {
+            return Ok(expanded);
+        }
         // `typeof` is answered here rather than by a kernel, because the type is settled the moment
         // its argument is bound and nothing about it changes per row. The argument still has to be
         // a legal expression where it was written, so it goes through the aggregate rules first and
@@ -562,6 +580,37 @@ impl Binder<'_> {
             bound.insert(0, self.current_date());
         }
         self.call(&written, bound)
+    }
+
+    /// `list_append` and the five names like it, which are macros on the pin and are expanded the
+    /// same way here.
+    ///
+    /// Upstream defines each of them as `list_concat` of the list and a one element list holding
+    /// the value, so they are not functions with rules of their own and everything about them is
+    /// `list_concat`'s. The element type is what the two promote to, `list_append(NULL, 3)` is `[3]`
+    /// because `list_concat` skips a null, and a value that will not go into the list is refused
+    /// with `list_concat`'s sentence naming `list_concat`, which is exactly what the pin prints for
+    /// `list_append([1], 'a')`. Expanding here rather than giving each one a row and a kernel is
+    /// what keeps all of that the same without writing any of it down twice.
+    ///
+    /// The one thing that is the macro's and not `list_concat`'s is the wrong number of arguments,
+    /// which the pin reports as a macro and not as a function, in the words below.
+    fn list_macro(&mut self, written: &str, bound: &[ExprRef]) -> Result<Option<ExprRef>> {
+        let Some(&(name, parameters, element, front)) =
+            LIST_MACROS.iter().find(|(name, ..)| rudb_catalog::same_name(written, name))
+        else {
+            return Ok(None);
+        };
+        if bound.len() != 2 {
+            return Err(Error::binder(format!(
+                "Macro {name}() does not support the supplied arguments. You might need to add \
+                 explicit type casts.\nCandidate macros:\n\t{name}({parameters})"
+            )));
+        }
+        let wrapped = self.call("list_value", vec![bound[element]])?;
+        let list = bound[1 - element];
+        let args = if front { vec![wrapped, list] } else { vec![list, wrapped] };
+        self.call("list_concat", args).map(Some)
     }
 
     fn bind_case(

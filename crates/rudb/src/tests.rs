@@ -1733,6 +1733,64 @@ fn a_null_stops_the_operator_and_is_skipped_by_the_name() {
     );
 }
 
+/// `list_append` and its five relatives are `list_concat` with the value wrapped in a list, which is
+/// how the pin defines them. Per #467.
+///
+/// So everything about them is `list_concat`'s, down to the name in the refusal, and every row here
+/// is the pin's.
+#[test]
+fn appending_to_a_list_is_concatenating_a_list_of_one() {
+    let db = database();
+    let one = |sql: &str| rows(&db, sql);
+    assert_eq!(one("SELECT list_append([1, 2], 3)"), vec![vec![list(&[1, 2, 3])]]);
+    assert_eq!(one("SELECT array_append([1, 2], 3)"), vec![vec![list(&[1, 2, 3])]]);
+    assert_eq!(one("SELECT array_push_back([1, 2], 3)"), vec![vec![list(&[1, 2, 3])]]);
+    assert_eq!(one("SELECT list_prepend(0, [1, 2])"), vec![vec![list(&[0, 1, 2])]]);
+    assert_eq!(one("SELECT array_prepend(0, [1])"), vec![vec![list(&[0, 1])]]);
+    // The list comes first here and the value still goes in front, which is the pin's order and
+    // not the one the name suggests.
+    assert_eq!(one("SELECT array_push_front([1], 0)"), vec![vec![list(&[0, 1])]]);
+    assert_eq!(one("SELECT list_append([], 1)"), vec![vec![list(&[1])]]);
+    assert_eq!(
+        one("SELECT typeof(list_append([1, 2], 3.5::DOUBLE))"),
+        vec![vec![text("DOUBLE[]")]]
+    );
+    assert_eq!(
+        one("SELECT list_append([[1]], [2])"),
+        vec![vec![Value::List {
+            element: LogicalType::list(LogicalType::Integer),
+            values: vec![list(&[1]), list(&[2])],
+        }]]
+    );
+    // A null list is skipped the way `list_concat` skips it, and a null value is an element.
+    assert_eq!(one("SELECT list_append(NULL::INT[], 3)"), vec![vec![list(&[3])]]);
+    assert_eq!(one("SELECT list_append(NULL, 3)"), vec![vec![list(&[3])]]);
+    assert_eq!(one("SELECT list_prepend(1, NULL)"), vec![vec![list(&[1])]]);
+    assert_eq!(
+        one("SELECT list_append([1, 2], NULL)"),
+        vec![vec![Value::List {
+            element: LogicalType::Integer,
+            values: vec![integer(1), integer(2), Value::Null],
+        }]]
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_append([1], 'x'::VARCHAR)"),
+        "Cannot concatenate lists of types INTEGER[] and VARCHAR[] - an explicit cast is required"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_append([1])"),
+        "Macro list_append() does not support the supplied arguments. You might need to add \
+         explicit type casts.\nCandidate macros:\n\tlist_append(l, e)"
+    );
+    // A list column, so the expansion runs per row and not only in the folder.
+    db.execute("CREATE TABLE ap (x INTEGER[], y INTEGER)").unwrap();
+    db.execute("INSERT INTO ap VALUES ([1], 2), (NULL, 3)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT list_append(x, y) FROM ap"),
+        vec![vec![list(&[1, 2])], vec![list(&[3])]]
+    );
+}
+
 /// What the struct vector changes that a query can see today. Per #594.
 ///
 /// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put
