@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.11
+
+A patch release of fifteen pull requests. The native directory format number stays at 27 and the storage format version at 9. #1416 and #1425 add new sections to the directory, and 0.4.10 refuses a directory section it does not know, so a file this build writes with them may not open in 0.4.10. This build still reads every file 0.4.10 wrote.
+
+On TPC-H SF1 native the suite total is 46.67 G instructions on server3, down from 55.39 G at 6e6af60e, measured the same way. Most of that is three things. #1412 closes a group as soon as a sorted key moves past it, so `GROUP BY l_orderkey` in q18 skips the hash table for nearly every group, and q18's inner aggregate now takes 1.75 G against DuckDB's 1.81 G. #1422 fixes a regression from #1410, where an integer key read by value built a new map of up to 262,144 places on almost every chunk in every radix partition, which took q18 to 10.2 G and about 1 GB resident. It is 4.1 G and 173 MB now. #1428 fixes a regression from #1414, where data pages were decoded through the new windowed directory cursor and paid its check on every small read. q06 went from 0.94 G to 0.72 G, and 20 of the 22 queries went down.
+
+On ClickBench, #1410 and #1419 read an integer group key by value against a window that lasts across chunks, #1416 answers certified two key TopN queries from pair counts kept in the directory, and #1425 keeps bounded string frequencies with their text so string predicates plan without opening the dictionary. #1427 decodes only the rows it needs when building a pair summary, and #1424 makes the numeric frequency pass at the end of a load cheaper. #1414 lowers the memory floor of opening a table and links the shell at a fixed address on Linux.
+
+#1415 lets the link reduction take a parent key that reaches the join through another join, which is Q3 and Q5. #1421 mirrors a large Parquet file into a native file on first read. #1418 adds `rudb_write_metrics()` for the stages of a bulk load, and #1402 adds `rudb_device_card()`. #1423 fixes q16 at SF1 sometimes returning `p_type` strings no row holds, because a string arena was known by an address that was about to be freed. #1411 is a doc change.
+
 ## 0.4.10
 
 A patch release of two pull requests, both on the sorted load of SF1 `lineitem`. No format changes. The native directory format stays at 27 and the storage format version at 9, so this build and 0.4.9 read each other's files.
