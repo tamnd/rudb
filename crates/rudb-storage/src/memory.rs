@@ -73,8 +73,11 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::vector::VECTOR_SIZE;
 use rudb_vector::{Chunk, Vector};
 
-use crate::count::{Counting, Counts};
+use crate::count::{Counts, Partial};
 use crate::zone::{Probe, Range, Zone};
+
+/// One column's statistics over one run of the chunks of an append: its count and a range a chunk.
+type Counted = (Partial, Vec<Range>);
 
 /// How many rows one row group holds.
 ///
@@ -227,11 +230,15 @@ impl MemoryTable {
     ///
     /// The table ends up the same as it would after [`Self::append`] a chunk at a time, in the same
     /// order. What differs is who does the statistics. The zone maps and the distinct counts are
-    /// most of what an append costs and both are about one column, so each thread takes a column and
-    /// walks every chunk's piece of it in the order the chunks arrived, which is the order the
-    /// counts have to see them in. On SF1 `lineitem` the statistics were 0.5s on one thread after
-    /// the rows had been read on ten, and 1.3s once the rows came out of a sort as flat strings
-    /// (#1365).
+    /// most of what an append costs, and each column is cut into a run of chunks per thread so that
+    /// the work is many pieces of about the same size. Each run is counted into a [`Partial`] of its
+    /// own and the runs are absorbed into the column in the order of their rows, which leaves the
+    /// counts as reading every chunk in order would have.
+    ///
+    /// It used to be a column a thread, and on SF1 `lineitem` sorted that was 450ms for the comments
+    /// and at most 100ms for any other column, so the append took as long as its one string column
+    /// and most of the threads sat idle for most of it (#1380). The string columns are handed out
+    /// first, because they are the ones that cost the most.
     ///
     /// The timings this keeps are the time each thread spent, added up, so they stay comparable
     /// with the ones [`Self::append`] keeps rather than shrinking with the thread count.
@@ -244,45 +251,63 @@ impl MemoryTable {
             self.check(chunk)?;
         }
         let chunks: Vec<Chunk> = chunks.into_iter().filter(|chunk| !chunk.is_empty()).collect();
-        let columns: Vec<Mutex<(Counting<'_>, Vec<Range>)>> = self
-            .counts
-            .columns_mut()
-            .into_iter()
-            .map(|counting| Mutex::new((counting, Vec::with_capacity(chunks.len()))))
-            .collect();
+        let per = chunks.len().div_ceil(workers.max(1)).max(1);
+        let parts = chunks.len().div_ceil(per);
+        let mut columns: Vec<usize> = (0..self.types.len()).collect();
+        columns.sort_by_key(|&at| {
+            !matches!(self.types.get(at), Some(LogicalType::Varchar | LogicalType::Blob))
+        });
+        let tasks: Vec<(usize, usize)> =
+            columns.iter().flat_map(|&column| (0..parts).map(move |part| (column, part))).collect();
+        let done: Vec<Mutex<Option<Counted>>> =
+            (0..self.types.len() * parts).map(|_| Mutex::new(None)).collect();
         let next = AtomicUsize::new(0);
         let spent = AtomicU64::new(0);
         let counted = AtomicU64::new(0);
         let work = || {
             loop {
-                let at = next.fetch_add(1, Ordering::Relaxed);
-                let Some(column) = columns.get(at) else { return };
-                let Ok(mut column) = column.lock() else { return };
-                let (counting, ranges) = &mut *column;
+                let Some(&(column, part)) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                    return;
+                };
+                let run = chunks.get(part * per..chunks.len().min((part + 1) * per)).unwrap_or(&[]);
                 let started = Instant::now();
                 let mut counting_ns = 0;
-                for chunk in &chunks {
-                    let Ok(vector) = chunk.column(at) else { continue };
+                let mut partial = Partial::new();
+                let mut ranges = Vec::with_capacity(run.len());
+                for chunk in run {
+                    let Ok(vector) = chunk.column(column) else { continue };
                     ranges.push(Range::of(vector));
                     let zoned = Instant::now();
-                    counting.add(vector);
+                    partial.add(vector);
                     counting_ns += zoned.elapsed().as_nanos() as u64;
                 }
                 spent.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 counted.fetch_add(counting_ns, Ordering::Relaxed);
+                let Some(slot) = done.get(column * parts + part) else { return };
+                let Ok(mut slot) = slot.lock() else { return };
+                *slot = Some((partial, ranges));
             }
         };
         std::thread::scope(|scope| {
-            for _ in 1..workers.clamp(1, columns.len().max(1)) {
+            for _ in 1..workers.clamp(1, tasks.len().max(1)) {
                 scope.spawn(work);
             }
             work();
         });
-        let mut ranges = Vec::with_capacity(columns.len());
-        for column in columns {
-            let (_, taken) = column.into_inner().map_err(|_| {
-                Error::internal("a thread taking the statistics of an append panicked")
-            })?;
+        let mut done = done.into_iter();
+        let mut ranges = Vec::with_capacity(self.types.len());
+        for mut counting in self.counts.columns_mut() {
+            let mut taken = Vec::with_capacity(chunks.len());
+            for slot in done.by_ref().take(parts) {
+                let (partial, run) = slot
+                    .into_inner()
+                    .map_err(|_| {
+                        Error::internal("a thread taking the statistics of an append panicked")
+                    })?
+                    .ok_or_else(|| Error::internal("a run of an append was not counted"))?;
+                counting.absorb(partial);
+                taken.extend(run);
+            }
             if taken.len() != chunks.len() {
                 return Err(Error::internal("a column of an append was not read to the end"));
             }
@@ -1292,7 +1317,14 @@ mod tests {
     /// appending it a chunk at a time does, across a group seal, an empty chunk and three forms.
     #[test]
     fn appending_on_threads_keeps_the_statistics_of_appending_in_order() {
-        let types = vec![LogicalType::BigInt, LogicalType::Varchar, LogicalType::Varchar];
+        // The fourth column brings five new values a chunk, so four runs of it hold 495 values between
+        // the first three and cross the tally's cap of 512 in the fourth, while they are absorbed.
+        let types = vec![
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+        ];
         let words: Vec<Value> = ["apple", "pear", "quince"]
             .iter()
             .map(|word| Value::Varchar((*word).to_string()))
@@ -1315,11 +1347,14 @@ mod tests {
                     }
                 })
                 .collect();
+            let crossing: Vec<Value> =
+                (0..1024).map(|row| Value::BigInt(at * 5 + i64::from(row % 5))).collect();
             chunks.push(
                 Chunk::new(vec![
                     Vector::from_values(LogicalType::BigInt, &numbers).expect("numbers"),
                     Vector::dictionary(codes, dictionary.clone()).expect("words"),
                     Vector::from_values(LogicalType::Varchar, &named).expect("names"),
+                    Vector::from_values(LogicalType::BigInt, &crossing).expect("crossing"),
                 ])
                 .expect("a chunk"),
             );
@@ -1336,7 +1371,7 @@ mod tests {
         assert_eq!(all.group_count(), one.group_count());
         for chunk in 0..one.chunk_count() {
             assert_eq!(all.zone(chunk), one.zone(chunk), "the zone of chunk {chunk}");
-            let columns = [0, 1, 2];
+            let columns = [0, 1, 2, 3];
             let (left, right) = (all.read(chunk, &columns), one.read(chunk, &columns));
             let (left, right) = (left.expect("a chunk"), right.expect("a chunk"));
             for column in columns {
@@ -1348,18 +1383,19 @@ mod tests {
                 }
             }
         }
-        for column in 0..3 {
+        for column in 0..4 {
             assert_eq!(
                 all.distinct_estimate(column),
                 one.distinct_estimate(column),
                 "column {column}"
             );
-            assert_eq!(
-                all.frequencies(column).expect("frequencies"),
-                one.frequencies(column).expect("frequencies"),
-                "column {column}"
-            );
+            assert_eq!(all.frequencies(column), one.frequencies(column), "column {column}");
         }
+        assert!(one.frequencies(1).expect("frequencies").is_some(), "the words stay under the cap");
+        assert!(
+            one.frequencies(3).expect("frequencies").is_none(),
+            "the fourth column crosses the cap"
+        );
         assert!(all.counts_ns() <= all.stats_ns(), "a part is larger than the whole");
     }
 }
