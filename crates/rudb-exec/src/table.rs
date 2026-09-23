@@ -446,6 +446,11 @@ impl Table {
             return;
         }
         if self.buckets.len() <= HOT {
+            if let [column] = keys
+                && self.hot_one(hashes, column, rows, slots, walk)
+            {
+                return;
+            }
             for (out, found) in slots.iter_mut().enumerate().take(rows.len()) {
                 let row = rows.at(out);
                 match self.probe(hashes[row], keys, row) {
@@ -653,6 +658,81 @@ impl Table {
             }
         }
         true
+    }
+
+    /// The row at a time probe of a table that fits in cache, for one flat integer key with no nulls.
+    ///
+    /// [`Self::probe`] asks [`Column::holds`] at every step, which matches on the stored type and
+    /// then on the vector's form and widens both sides to 128 bits, all of it the same for every row
+    /// of the batch. On a table this small there is no miss for that to hide behind, so it is most
+    /// of the probe: ClickBench 43 groups half a million rows into 1440 minutes and spent more time
+    /// in the comparison than in the walk. This settles both matches once and compares two slices.
+    ///
+    /// `false` for anything else, which the caller then probes the way it always did.
+    fn hot_one(
+        &self,
+        hashes: &[u64],
+        column: &Vector,
+        rows: Rows<'_>,
+        slots: &mut [usize],
+        walk: &mut Walk,
+    ) -> bool {
+        let Some(data) = column.data() else { return false };
+        if column.validity().has_nulls(column.len()) {
+            return false;
+        }
+        let stored = &self.columns[0];
+        let mask = self.buckets.len() - 1;
+        macro_rules! walk {
+            ($stored:expr, $values:expr, $widen:expr) => {{
+                let (held, values) = ($stored, $values.as_slice());
+                for (out, found) in slots.iter_mut().enumerate().take(rows.len()) {
+                    let row = rows.at(out);
+                    let hash = hashes[row];
+                    let salt = salt_of(hash);
+                    let mut at = (hash as usize) & mask;
+                    loop {
+                        let bucket = self.buckets[at];
+                        let slot = slot_of(bucket);
+                        if slot == EMPTY {
+                            walk.pending.push(out);
+                            break;
+                        }
+                        let slot = slot as usize;
+                        if bucket_salt(bucket) == salt
+                            && match values.get(row) {
+                                Some(&value) => stored.valid[slot] && $widen(value) == held[slot],
+                                None => stored.holds(slot, column, row),
+                            }
+                        {
+                            *found = slot;
+                            break;
+                        }
+                        at = (at + 1) & mask;
+                    }
+                }
+                true
+            }};
+        }
+        match (&stored.data, data) {
+            (StoredData::TinyInt(held), Data::Int8(values)) => walk!(held, values, |v| v),
+            (StoredData::SmallInt(held), Data::Int16(values)) => walk!(held, values, |v| v),
+            (StoredData::Integer(held), Data::Int32(values)) => walk!(held, values, |v| v),
+            (StoredData::BigInt(held), Data::Int64(values)) => walk!(held, values, |v| v),
+            (StoredData::Wide { values: held, .. }, Data::Int128(values)) => {
+                walk!(held, values, |v| v)
+            }
+            (StoredData::Wide { values: held, .. }, Data::Int64(values)) => {
+                walk!(held, values, i128::from)
+            }
+            (StoredData::Wide { values: held, .. }, Data::Int32(values)) => {
+                walk!(held, values, i128::from)
+            }
+            (StoredData::Wide { values: held, .. }, Data::Int16(values)) => {
+                walk!(held, values, i128::from)
+            }
+            _ => false,
+        }
     }
 
     /// Doubles the buckets and puts every group back in one.
