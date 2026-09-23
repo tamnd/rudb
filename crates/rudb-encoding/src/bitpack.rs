@@ -447,6 +447,55 @@ pub fn unpack_mapped<T: Packable, U: Copy>(
     Ok(())
 }
 
+/// Reads one value from a full transposed unit of packed `u64` values.
+///
+/// The serialized integer cascade stores packed words little endian. A point lookup starts from
+/// the row-order index, inverts the fixed FastLanes permutation, and reads the one or two words
+/// that hold that value. This is the point form of [`unpack`] for callers that need a sparse set of
+/// positions rather than a materialized vector.
+///
+/// # Errors
+///
+/// If `width` exceeds 64, `index` is outside a full unit, or `input` is not the exact byte length
+/// of a full unit at that width.
+pub fn unpack_u64_at(input: &[u8], width: usize, index: usize) -> Result<u64> {
+    check_width::<u64>(width)?;
+    if index >= VALUES {
+        return Err(Error::internal(format!(
+            "packed value {index} is outside a {VALUES} value unit"
+        )));
+    }
+    let expected = packed_len::<u64>(width) * size_of::<u64>();
+    if input.len() != expected {
+        return Err(Error::internal(format!(
+            "a {width} bit packed vector is {expected} bytes, not {}",
+            input.len()
+        )));
+    }
+    if width == 0 {
+        return Ok(0);
+    }
+
+    let lanes = <u64 as Packable>::LANES;
+    let block = index / lanes;
+    let lane = index % lanes;
+    // ORDER is its own inverse. `block` is the permuted row group and offset produced by
+    // `source_index`, so applying ORDER again recovers the original group.
+    let group = ORDER[block % 8];
+    let row = group * (<u64 as Packable>::WIDTH / 8) + block / 8;
+    let bit = row * width;
+    let word = bit / <u64 as Packable>::WIDTH;
+    let shift = bit % <u64 as Packable>::WIDTH;
+    let low = word_at(input, (word * lanes + lane) * size_of::<u64>());
+    let bits = if shift + width <= <u64 as Packable>::WIDTH {
+        low >> shift
+    } else {
+        let high = word_at(input, ((word + 1) * lanes + lane) * size_of::<u64>());
+        (low >> shift) | (high << (<u64 as Packable>::WIDTH - shift))
+    };
+    Ok(bits & low_mask(width))
+}
+
 /// How many bytes [`pack_tail`] writes for `count` values at `width` bits.
 #[must_use]
 pub fn tail_len(count: usize, width: usize) -> usize {
@@ -807,6 +856,23 @@ mod tests {
         }
         for width in 0..=64 {
             round_trip::<u64>(width);
+        }
+    }
+
+    #[test]
+    fn one_value_from_a_full_u64_unit_agrees_with_a_whole_unpack() {
+        for width in 0..=64 {
+            let values = sample::<u64>(width);
+            let mut packed = vec![0u64; packed_len::<u64>(width)];
+            pack(&values, width, &mut packed).unwrap();
+            let bytes = packed.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            for (index, expected) in values.iter().enumerate() {
+                assert_eq!(
+                    unpack_u64_at(&bytes, width, index).unwrap(),
+                    *expected,
+                    "value {index} at {width} bits"
+                );
+            }
         }
     }
 
