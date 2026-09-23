@@ -339,6 +339,41 @@ impl SymbolTable {
         Ok(())
     }
 
+    /// Decompresses one string into `out` from `at`, handing back where it ended.
+    ///
+    /// [`Self::decompress`] for a caller that has already made the buffer as long as the output
+    /// is going to be, so a symbol is one eight byte store and a step of the cursor with no length
+    /// to keep and no capacity to check. The store is eight bytes whatever the symbol's length,
+    /// which is why `out` needs [`MAX_SYMBOL_LEN`] bytes of room past the end of the string.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decompress`], and if `out` runs out of room, which a string that really
+    /// decompresses to the length the caller sized for never does.
+    pub fn decompress_at(&self, input: &[u8], out: &mut [u8], mut at: usize) -> Result<usize> {
+        let mut read = 0;
+        while read < input.len() {
+            let code = input[read];
+            read += 1;
+            if code == ESCAPE {
+                let literal = *input.get(read).ok_or_else(|| truncated("an escaped byte"))?;
+                read += 1;
+                *out.get_mut(at).ok_or_else(out_of_room)? = literal;
+                at += 1;
+            } else {
+                let symbol = *self
+                    .symbols
+                    .get(code as usize)
+                    .ok_or_else(|| Error::internal(format!("code {code} is not in the table")))?;
+                out.get_mut(at..at + MAX_SYMBOL_LEN)
+                    .ok_or_else(out_of_room)?
+                    .copy_from_slice(&symbol.value.to_le_bytes());
+                at += symbol.len();
+            }
+        }
+        Ok(at)
+    }
+
     /// The code and how many input bytes it covers. [`ESCAPE`] and 1 when nothing matches.
     fn match_at(&self, input: &[u8], at: usize) -> (u8, usize) {
         let remaining = input.len() - at;
@@ -623,6 +658,10 @@ fn symbol_of(table: &SymbolTable, id: u16) -> Symbol {
     } else {
         Symbol::single((id.saturating_sub(256)) as u8)
     }
+}
+
+fn out_of_room() -> Error {
+    Error::internal("a string decompresses to more than its length says")
 }
 
 fn truncated(what: &str) -> Error {
