@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.20
+
+A patch release of fourteen pull requests. The native directory format number stays at 29 and the storage format version at 9, so this build and 0.4.19 read each other's files.
+
+Three make TPC-H cheaper, and the 22 queries at SF1 now take 23.57 G instructions against DuckDB's 25.38 G, down from 25.57 G at 0.4.19. #1605 takes the exact bitmap of a join's keys whenever it fits in 32 KiB, which took q17 from 94 ms to 63 ms of CPU against DuckDB's 73 ms and q19 from 68 ms to 51 ms. #1607 indexes a join's table by the key itself when its keys are integers that sit close together, which took q13 from 359 ms to 298 ms against DuckDB's 327 ms and q05 from 116 ms to 100 ms. #1610 reads a scan's string columns only at the rows its filters kept and decompresses nothing else, which took q10 from 173 ms to 156 ms against DuckDB's 143 ms.
+
+Five make ClickBench faster. #1600 and #1601 fold a radix partition one cache sized split at a time, #1606 checks a group against the last kept count before searching the list of largest, which took q40 from 1.23 G to 1.14 G cycles, and #1609 counts a partition with few rows by sorting its codes, which cut q39's page faults by a third. #1586 reserves a presized aggregate's room from the memory budget before building it, and starts small when the budget cannot hold it.
+
+#1597 and #1599 stored finished answers to ClickBench q9 and q10 in native files, and #1604 took them out again along with the q17 and q29 answer blocks, so query times measure the engine doing the work. Files that hold those blocks still open and the blocks are ignored.
+
+Four add what DuckDB has. #1598 builds rows as unnamed structs and takes named arguments in `struct_pack`, #1602 builds maps from `MAP` literals and `map()` and adds the map and struct helpers, and #1608 casts text to lists, structs and maps the way DuckDB splits it. #1603 fixes the flatten check that failed the verify job on the 0.4.19 tag.
+
 ## 0.4.19
 
 A patch release of twelve pull requests. The native directory format number goes from 28 to 29 and the storage format version stays at 9. This build reads files 0.4.18 wrote, and 0.4.18 does not read a format 29 file.
