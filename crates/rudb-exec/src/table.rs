@@ -1240,9 +1240,8 @@ fn window_of(
         return None;
     }
     let wanted = if alone { (width * 2).max(1024).min(most) } else { width };
-    let low = i64::try_from(bottom - (wanted - width) / 2)
-        .or_else(|_| i64::try_from(bottom))
-        .ok()?;
+    let low =
+        i64::try_from(bottom - (wanted - width) / 2).or_else(|_| i64::try_from(bottom)).ok()?;
     Some((low, usize::try_from(wanted).ok()?.checked_add(1)?, nullable))
 }
 
@@ -3916,8 +3915,15 @@ mod tests {
         let places = placed(&coded, 4);
         assert_eq!(places[0], places[2], "one value is one place");
         assert_eq!(places.iter().collect::<std::collections::HashSet<_>>().len(), 3);
-        assert!(places.iter().all(|&place| place < coded.combos() - 1), "no value takes the null place");
-        assert_eq!(places[1] - places[3], 1_005, "a place is the value less the bottom of the window");
+        assert!(
+            places.iter().all(|&place| place < coded.combos() - 1),
+            "no value takes the null place"
+        );
+        assert_eq!(
+            places[1] - places[3],
+            1_005,
+            "a place is the value less the bottom of the window"
+        );
     }
 
     /// The window outlives the chunk. The next chunk inside it keeps the map, one reaching past it
@@ -3940,7 +3946,9 @@ mod tests {
         wider.hold(&mut grown);
         let back = [integers(&[Some(200), Some(90_000)])];
         assert!(
-            coded_within(&back, 2, &grown, Some(&mut values)).expect("read by value").same_as(&grown),
+            coded_within(&back, 2, &grown, Some(&mut values))
+                .expect("read by value")
+                .same_as(&grown),
             "and the new one still covers where the old one was"
         );
     }

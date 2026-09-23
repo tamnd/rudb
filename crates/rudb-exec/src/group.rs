@@ -1551,7 +1551,8 @@ impl<'a> Aggregate<'a> {
         // Hashed unless the map answered the whole chunk, which is the ordinary case once the first
         // rows of a row group have been through. A key read by value is not hashed here either,
         // because the rows that missed are hashed one at a time below and they are a few dozen.
-        let one_at_a_time = prehashed.is_none() && direct.as_ref().is_some_and(|codes| codes.by_value());
+        let one_at_a_time =
+            prehashed.is_none() && direct.as_ref().is_some_and(|codes| codes.by_value());
         if !alone && !one_at_a_time && direct.as_ref().is_none_or(|_| !missing.is_empty()) {
             match prehashed {
                 Some(prehashed) => {
