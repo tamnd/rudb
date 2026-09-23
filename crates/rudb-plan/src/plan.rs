@@ -107,6 +107,14 @@ pub struct Plan {
     /// group can be closed as soon as the key moves past it. A decision, like `dense`, written by
     /// one pass, `rudb_opt`'s `cluster`.
     clustered: BTreeSet<u32>,
+    /// The Parquet files this plan read directly and could have read from a native mirror, each
+    /// with whether its binary columns were read as text and how many rows its footer states.
+    ///
+    /// Beside the pools for the reason `measured` is. The binder cannot build a mirror, since that
+    /// is a whole load into a file of its own, so it binds the file as it always did and leaves the
+    /// wish here for the database to act on before it binds the statement again. Document 33 is
+    /// what a mirror is and when one is trusted.
+    mirrors: Vec<(String, bool, u64)>,
 }
 
 impl Default for Plan {
@@ -153,6 +161,7 @@ impl Plan {
             dense: BTreeMap::new(),
             ascending: BTreeSet::new(),
             clustered: BTreeSet::new(),
+            mirrors: Vec::new(),
         }
     }
 
@@ -359,6 +368,20 @@ impl Plan {
     #[must_use]
     pub fn clustered(&self, index: u32) -> bool {
         self.clustered.contains(&index)
+    }
+
+    /// Records that the Parquet file at `path` was read directly and could have been mirrored.
+    pub fn want_mirror(&mut self, path: &str, binary_as_string: bool, rows: u64) {
+        let wanted = (path.to_string(), binary_as_string, rows);
+        if !self.mirrors.contains(&wanted) {
+            self.mirrors.push(wanted);
+        }
+    }
+
+    /// The files [`Plan::want_mirror`] recorded, in the order the binder met them.
+    #[must_use]
+    pub fn wanted_mirrors(&self) -> &[(String, bool, u64)] {
+        &self.mirrors
     }
 
     /// How many nodes are in the arena, reachable or not.

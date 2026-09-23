@@ -109,6 +109,7 @@
 mod config;
 mod connection;
 mod database;
+mod mirror;
 mod prepared;
 mod result;
 mod settings;

@@ -226,6 +226,18 @@ fn checksum(bytes: &[u8]) -> u64 {
     seeded_checksum(bytes, 0)
 }
 
+/// A hundred and twenty eight bit name for `bytes`, as two xxHash64 walks under different seeds,
+/// with the format this build writes folded in so that a name made by one format is never taken
+/// for the name of a file in another.
+///
+/// For a caller outside this crate that has to name a file by what went into it, which is what a
+/// Parquet mirror's key is. See the global dictionary's use of the same pair for the arithmetic.
+#[must_use]
+pub fn content_name(bytes: &[u8]) -> u128 {
+    let seed = u64::from(FORMAT);
+    u128::from(seeded_checksum(bytes, seed)) << 64 | u128::from(seeded_checksum(bytes, !seed))
+}
+
 /// The xxHash64 of `bytes` started from `seed`, which is the same walk with a different beginning.
 ///
 /// A seed is here for one caller: a global dictionary decides whether two values are the same by
