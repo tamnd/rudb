@@ -2982,7 +2982,46 @@ impl Vector {
             return Ok(self.clone());
         }
         slow::took(Cause::Flatten);
+        if let Some(flat) = self.decoded_codes() {
+            return Ok(flat);
+        }
         self.copied((0..self.len).collect(), false)
+    }
+
+    /// A dictionary with no nulls over flat values with none, written out by its codes.
+    ///
+    /// The general copy walks the positions down through every layer and marks each one that
+    /// lands on a null, and then builds the validity back up from those marks. With no null on
+    /// either side the codes are already the positions and the validity is already known, so that
+    /// is one pass over the codes rather than four. A Parquet column that was dictionary encoded
+    /// comes in as this form, and flattening columns on the way to the file was four percent of a
+    /// ClickBench load.
+    fn decoded_codes(&self) -> Option<Self> {
+        let Body::Dictionary { codes, values, .. } = &self.body else {
+            return None;
+        };
+        if !matches!(self.validity, Validity::AllValid)
+            || !matches!(values.validity, Validity::AllValid)
+        {
+            return None;
+        }
+        let Body::Flat(data) = &values.body else {
+            return None;
+        };
+        if matches!(data, Data::Empty) {
+            return None;
+        }
+        let codes = codes.as_slice().get(..self.len)?;
+        if !below(codes, values.len) {
+            return None;
+        }
+        let at = codes.iter().map(|&code| code as usize).collect::<Vec<_>>();
+        Some(Self {
+            ty: self.ty.clone(),
+            len: self.len,
+            validity: Validity::AllValid,
+            body: Body::Flat(copy_of(data, &at)),
+        })
     }
 
     /// The same values in flat form, taking the vector rather than borrowing it.
@@ -3011,6 +3050,9 @@ impl Vector {
     pub fn opened(&self) -> Result<Self> {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
+        }
+        if let Some(flat) = self.decoded_codes() {
+            return Ok(flat);
         }
         self.copied((0..self.len).collect(), false)
     }
@@ -4586,6 +4628,41 @@ mod tests {
         for (codes, len) in cases {
             let expected = codes.iter().all(|&code| (code as usize) < len);
             assert_eq!(below(codes, len), expected, "{codes:?} below {len}");
+        }
+    }
+
+    #[test]
+    fn flattening_a_dictionary_by_its_codes_matches_the_general_copy() {
+        let words = Vector::from_values(
+            LogicalType::Varchar,
+            &["alpha", "a string past the inline length", ""]
+                .map(|text| Value::Varchar(text.into())),
+        )
+        .unwrap();
+        let codes = vec![2, 0, 1, 1, 0, 2, 1];
+        let cases = [
+            Vector::dictionary(codes.clone(), integers(&[7, -3, 40])).unwrap(),
+            Vector::dictionary(codes.clone(), words.clone()).unwrap(),
+            Vector::dictionary(codes.clone(), words.clone()).unwrap().slice(2, 4).unwrap(),
+            // The ones the codes cannot answer alone, which take the general copy.
+            Vector::dictionary(codes.clone(), words.clone())
+                .unwrap()
+                .with_validity(Validity::from_run(&[true, false, true, true, true, true, false])),
+            Vector::dictionary(
+                vec![0, 1, 1],
+                integers(&[1, 2]).with_validity(Validity::from_run(&[true, false])),
+            )
+            .unwrap(),
+        ];
+        for (case, vector) in cases.iter().enumerate() {
+            let flat = vector.flatten().unwrap();
+            let general = vector.copied((0..vector.len()).collect(), false).unwrap();
+            assert!(matches!(flat.body, Body::Flat(_)), "case {case}");
+            assert_eq!(flat.validity, general.validity, "case {case}");
+            for row in 0..vector.len() {
+                assert_eq!(flat.value_at(row), general.value_at(row), "case {case} row {row}");
+            }
+            assert_eq!(flat, vector.opened().unwrap(), "case {case}");
         }
     }
 
