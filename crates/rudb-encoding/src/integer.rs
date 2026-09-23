@@ -426,32 +426,71 @@ fn encode_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>
 /// keeps a dictionary was paying for a sort per level to find out something it would ignore.
 fn candidates(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Vec<Kind> {
     let mut kinds = vec![Kind::Packed];
-    if depth >= MAX_DEPTH || values.is_empty() {
+    if depth >= MAX_DEPTH {
         return kinds;
     }
-    if values.iter().all(|value| *value == values[0]) {
+    let Some(profile) = Profile::of(values) else {
+        return kinds;
+    };
+    if profile.runs == 1 {
         // Nothing else can beat 13 bytes, so this is the whole answer rather than a candidate.
         return vec![Kind::Constant];
     }
     let considered = |kind| chooser.considers_integer(kind, depth);
-    if considered(Kind::Delta) && values.len() >= 2 && deltas_fit(values) {
+    // Every neighbouring difference is no wider than the whole range, so a range that fits in an
+    // `i64` answers for all of them and only a chunk holding both ends of the type walks the pairs.
+    if considered(Kind::Delta)
+        && (profile.max.checked_sub(profile.min).is_some() || deltas_fit(values))
+    {
         kinds.push(Kind::Delta);
     }
-    if considered(Kind::Rle) && run_count(values) * 4 <= values.len() * 3 {
+    if considered(Kind::Rle) && profile.runs * 4 <= values.len() * 3 {
         kinds.push(Kind::Rle);
     }
     if considered(Kind::Dict) && spread_of(values).0 * 2 <= values.len() {
         kinds.push(Kind::Dict);
     }
+    // A value in four rows out of five leaves a fifth for everything else, and each of those rows
+    // starts at most two runs, so a chunk with more runs than that has no such value and the vote
+    // is not taken.
     if considered(Kind::Sparse)
+        && (profile.runs - 1) * 5 <= values.len() * 2
         && majority(values).is_some_and(|(_, count)| count * 10 >= values.len() * 8)
     {
         kinds.push(Kind::Sparse);
     }
-    if considered(Kind::Strided) && stride_of(values).is_some() {
+    if considered(Kind::Strided) && stride_from(values, profile.min).is_some() {
         kinds.push(Kind::Strided);
     }
     kinds
+}
+
+/// What one pass over a chunk says about it, which is most of what the candidate tests ask.
+///
+/// The tests used to walk the chunk once each: once to see whether it was one value, once for the
+/// deltas, once to count runs, twice for the vote and once more for the smallest value under the
+/// stride. That is six passes on every chunk at every level of the cascade, and on ClickBench `hits`
+/// they were most of the tenth of the load's CPU that `encode_at` came to, since a replayed part
+/// still asks every question the fallback would. This is one pass, and the vote is only taken where
+/// the run count leaves room for it.
+struct Profile {
+    min: i64,
+    max: i64,
+    /// Runs of equal neighbours, which is one for a chunk of a single value.
+    runs: usize,
+}
+
+impl Profile {
+    fn of(values: &[i64]) -> Option<Self> {
+        let first = *values.first()?;
+        let (mut min, mut max, mut breaks) = (first, first, 0usize);
+        for (before, after) in values.iter().zip(&values[1..]) {
+            min = min.min(*after);
+            max = max.max(*after);
+            breaks += usize::from(before != after);
+        }
+        Some(Self { min, max, runs: breaks + 1 })
+    }
 }
 
 /// `None` when the encoding does not apply to this input, which the caller treats as a candidate
@@ -1062,7 +1101,11 @@ fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
 /// every chunk. Two values that share no factor are enough to answer, and on a column of arbitrary
 /// numbers that is almost always the first pair.
 fn stride_of(values: &[i64]) -> Option<u64> {
-    let base = values.iter().min().copied()?;
+    stride_from(values, values.iter().min().copied()?)
+}
+
+/// [`stride_of`] for a chunk whose smallest value is already known.
+fn stride_from(values: &[i64], base: i64) -> Option<u64> {
     let mut divisor = 0u64;
     for value in values {
         divisor = gcd(divisor, offset_from(*value, base));
@@ -1129,29 +1172,16 @@ fn unzigzag(value: u64) -> i64 {
 /// came back, which is an allocation and a pass over the chunk thrown away on every chunk, and then
 /// `Kind::Delta` built it again. This is the same pass with nothing kept.
 fn deltas_fit(values: &[i64]) -> bool {
-    values.windows(2).all(|pair| i64::try_from(i128::from(pair[1]) - i128::from(pair[0])).is_ok())
+    values.windows(2).all(|pair| pair[1].checked_sub(pair[0]).is_some())
 }
 
 fn deltas(values: &[i64]) -> Option<Vec<i64>> {
     let mut deltas = Vec::with_capacity(values.len().saturating_sub(1));
     for pair in values.windows(2) {
-        let difference = i128::from(pair[1]) - i128::from(pair[0]);
-        let difference = i64::try_from(difference).ok()?;
+        let difference = pair[1].checked_sub(pair[0])?;
         deltas.push(zigzag(difference) as i64);
     }
     Some(deltas)
-}
-
-fn run_count(values: &[i64]) -> usize {
-    let mut runs = 0;
-    let mut previous = None;
-    for value in values {
-        if previous != Some(value) {
-            runs += 1;
-            previous = Some(value);
-        }
-    }
-    runs
 }
 
 fn runs(values: &[i64]) -> (Vec<i64>, Vec<i64>) {
@@ -1359,6 +1389,66 @@ mod tests {
             let (_, dominant) = spread_of(&chunk);
             let expected = dominant.filter(|(_, count)| count * 2 > chunk.len());
             assert_eq!(majority(&chunk), expected, "{chunk:?}");
+        }
+    }
+
+    /// The one pass offers exactly what the separate tests offered, including on the chunks where
+    /// the shortcuts in it are the whole answer: a range too wide for an `i64`, and a chunk with too
+    /// many runs to have a value in four rows out of five.
+    #[test]
+    fn the_one_pass_offers_what_the_separate_tests_offered() {
+        let mut random = Random::new();
+        let mut chunks: Vec<Vec<i64>> = vec![
+            vec![],
+            vec![5],
+            vec![5, 5, 5],
+            vec![i64::MIN, i64::MAX],
+            vec![i64::MAX, i64::MIN, i64::MAX],
+            vec![i64::MIN, 0, i64::MAX],
+            vec![-1, i64::MAX],
+            (0..1000).map(|index| if index % 5 == 0 { index } else { -4 }).collect(),
+            (0..1000).map(|index| if index % 4 == 0 { index } else { -4 }).collect(),
+            (0..1000).map(|index| index / 7).collect(),
+            (0..1000).map(|index| index * 1_000_000).collect(),
+        ];
+        for _ in 0..200 {
+            let len = (random.next() % 300) as usize;
+            let spread = 1 + random.next() % 8;
+            let common = (random.next() % 5) as i64;
+            chunks.push(
+                (0..len)
+                    .map(|_| {
+                        let draw = random.next();
+                        if draw % 10 < spread { (draw >> 8) as i64 % 50 } else { common }
+                    })
+                    .collect(),
+            );
+        }
+        for chunk in chunks {
+            let mut expected = vec![Kind::Packed];
+            if !chunk.is_empty() {
+                if chunk.iter().all(|value| *value == chunk[0]) {
+                    expected = vec![Kind::Constant];
+                } else {
+                    if chunk.len() >= 2 && deltas_fit(&chunk) {
+                        expected.push(Kind::Delta);
+                    }
+                    let runs = 1 + chunk.windows(2).filter(|pair| pair[0] != pair[1]).count();
+                    if runs * 4 <= chunk.len() * 3 {
+                        expected.push(Kind::Rle);
+                    }
+                    if spread_of(&chunk).0 * 2 <= chunk.len() {
+                        expected.push(Kind::Dict);
+                    }
+                    if majority(&chunk).is_some_and(|(_, count)| count * 10 >= chunk.len() * 8) {
+                        expected.push(Kind::Sparse);
+                    }
+                    if stride_of(&chunk).is_some() {
+                        expected.push(Kind::Strided);
+                    }
+                }
+            }
+            assert_eq!(candidates(&chunk, 0, &EXHAUSTIVE), expected, "{chunk:?}");
         }
     }
 
