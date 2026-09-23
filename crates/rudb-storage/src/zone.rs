@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     /// The range of one column of `values`, typed as `ty`.
-    fn only(ty: LogicalType, values: &[Value]) -> super::Range {
+    fn only(ty: LogicalType, values: &[Value]) -> Range {
         let vector = Vector::from_values(ty, values).expect("a column");
         let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
         zone.column(0).expect("one column").clone()
