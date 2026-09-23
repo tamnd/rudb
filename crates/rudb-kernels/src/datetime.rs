@@ -571,11 +571,13 @@ impl<'a> Unit<'a> {
         // fit takes the wide step, which gives the same answer or the same error.
         let total = match count {
             Count::Whole(whole) => {
-                match (i64::try_from(whole), i64::try_from(self.scale)) {
-                    (Ok(narrow), Ok(scale)) if let Some(total) = narrow.checked_mul(scale) => {
-                        i128::from(total)
-                    }
-                    _ => whole.checked_mul(self.scale).ok_or_else(refuse)?,
+                let narrow = match (i64::try_from(whole), i64::try_from(self.scale)) {
+                    (Ok(narrow), Ok(scale)) => narrow.checked_mul(scale),
+                    _ => None,
+                };
+                match narrow {
+                    Some(total) => i128::from(total),
+                    None => whole.checked_mul(self.scale).ok_or_else(refuse)?,
                 }
             }
             // A double that has gone past `i128` comes back as the saturated bound, which is out of
