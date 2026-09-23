@@ -566,29 +566,58 @@ struct Partition {
 const RADIX_PARTITIONS: usize = 64;
 const DENSE_PARTITIONS: usize = 4;
 
-/// How much of an aggregate's groups one table is being built for.
+/// Which of an aggregate's tables is being built, which is what says how much room it wants.
 ///
-/// A presize is a number of groups for the whole aggregate and a table is built per instance and
-/// then per radix partition, so the number has to be read differently depending on which one is
-/// asking. Nothing here changes an answer: a table takes whatever the keys put in it either way and
-/// this only says how much room to take before the first row arrives.
+/// A presize is a number of groups for the whole aggregate, and one aggregate builds tables of four
+/// different kinds: one an instance fills before it partitions, one per radix partition per instance
+/// while the cache holds them, one per radix partition shared by every instance, and, where the
+/// aggregate cannot partition at all, one that holds everything. Only two of those ever hold the
+/// groups the number counts. Nothing here changes an answer: a table takes whatever the keys put in
+/// it either way and this only says how much room to take before the first row arrives.
+///
+/// Reading the number the same way for all four was worth minus three percent on TPC-H. On the
+/// `GROUP BY l_orderkey` inside q18, which is six million rows into a million and a half groups and
+/// the exact case the presize pass was written for, it was 3.706 G of instructions against 5.208.
+/// The room asked for was half a gigabyte: eight instances each taking room for a million and a half
+/// groups in a table they give up at [`PARTITION_FROM`], and then each taking room for a sixty
+/// fourth of them sixty four more times over in tables the cache cannot hold and which are handed
+/// over almost at once. None of it was ever written into, and clearing the pages for it is what the
+/// query spent the instructions on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Share {
-    /// Every group the aggregate will produce, which is what an instance sees before it partitions.
+    /// Every group the aggregate will produce, which is the one table it answers out of when it
+    /// cannot partition.
     Whole,
-    /// The groups one of [`RADIX_PARTITIONS`] holds, which is the hash spreading them evenly.
+    /// The table an instance fills before it partitions, which it gives up at [`PARTITION_FROM`]
+    /// groups, so that is all the room there is any point taking for it.
+    Passing,
+    /// One of the [`RADIX_PARTITIONS`] tables the whole aggregate shares and answers out of, holding
+    /// the share of the groups the hash puts in it.
     Partition,
+    /// One of an instance's own per partition tables, held only while the cache holds every
+    /// instance's set of them and handed over otherwise, so it takes the room every table used to
+    /// start with and no more.
+    Local,
 }
 
 impl Share {
-    /// The groups to take room for, out of `groups` for the whole aggregate.
-    fn of(self, groups: u64) -> u64 {
+    /// The groups to take room for, out of `groups` for the whole aggregate, or `None` for a table
+    /// that is passing them on rather than holding them.
+    fn of(self, groups: u64) -> Option<u64> {
         match self {
-            Self::Whole => groups,
+            Self::Whole => Some(groups),
+            Self::Passing => Some(groups.min(PARTITION_FROM as u64)),
             // At least one, because a partition that ends up with a group still wants a table and
             // rounding a small aggregate down to nothing would give it the smallest one twice.
-            Self::Partition => (groups / RADIX_PARTITIONS as u64).max(1),
+            Self::Partition => Some((groups / RADIX_PARTITIONS as u64).max(1)),
+            Self::Local => None,
         }
+    }
+
+    /// Whether this is the table an instance keeps before it partitions, which is the one whose key
+    /// covers the aggregate's whole range and so the only one a direct index over that range fits.
+    fn before_the_split(self) -> bool {
+        matches!(self, Self::Whole | Self::Passing)
     }
 }
 
@@ -1300,20 +1329,40 @@ impl<'a> Aggregate<'a> {
     /// empty input answer zero rather than nothing. Building an accumulator can fail, on an
     /// aggregate name nothing implements, and [`Sink::local`] has nowhere to put an error, so the
     /// failure is carried in the instance and reported by the first call that can report it.
+    /// How much room it takes is the one thing that turns on whether this table is the answer. An
+    /// aggregate that can partition gives this table up at [`PARTITION_FROM`] groups, so room past
+    /// that is room for groups it will never be asked to hold, and there is one of these per
+    /// instance. [`Aggregate::ought_to_partition`] wants a second instance to have started as well,
+    /// which is not knowable here, and an aggregate that says it can partition and then runs on one
+    /// thread grows this table by doubling the way it always did.
     fn start(&self) -> Building {
-        self.starting(Share::Whole)
+        let held = self.alone || self.max_groups.is_some();
+        self.starting(if held { Share::Whole } else { Share::Passing })
     }
 
-    /// What one radix partition starts with, which is the same thing over a share of the groups.
+    /// What one of the aggregate's shared radix partitions starts with, which is the same thing over
+    /// a share of the groups.
     ///
-    /// There are [`RADIX_PARTITIONS`] of these to an instance and the presize is a number of groups
-    /// for the whole aggregate, so taking room for all of them in each of them takes room for the
-    /// groups sixty four times over. A partition is split by hash bits and the hash spreads, so it
-    /// holds about that many times fewer groups and wants room for about that many times fewer.
-    /// Being wrong here costs a grow and never an answer, which is what lets the share be a
-    /// division rather than a measurement.
+    /// There are [`RADIX_PARTITIONS`] of these to the aggregate and the presize is a number of groups
+    /// for the whole of it, so taking room for all of them in each of them takes room for the groups
+    /// sixty four times over. A partition is split by hash bits and the hash spreads, so it holds
+    /// about that many times fewer groups and wants room for about that many times fewer. Being
+    /// wrong here costs a grow and never an answer, which is what lets the share be a division
+    /// rather than a measurement.
     fn partition(&self) -> Building {
         self.starting(Share::Partition)
+    }
+
+    /// What one of an instance's own radix partitions starts with, which is what every table started
+    /// with before any of this existed.
+    ///
+    /// There are [`RADIX_PARTITIONS`] of these per instance rather than per aggregate, so the room
+    /// the one above takes is taken again once per instance here, and these are the tables the
+    /// aggregate hands over as soon as [`Aggregate::cache_holds_local`] says the cache does not hold
+    /// every instance's set of them. On a large group by that is almost at once, which makes this the
+    /// place where room taken in advance is least likely to be room used.
+    fn kept(&self) -> Building {
+        self.starting(Share::Local)
     }
 
     fn starting(&self, share: Share) -> Building {
@@ -1336,16 +1385,16 @@ impl<'a> Aggregate<'a> {
             table: {
                 let types: Vec<_> =
                     self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
-                let table = match self.presize.map(|groups| share.of(groups)) {
+                let table = match self.presize.and_then(|groups| share.of(groups)) {
                     Some(groups) => Table::with_groups(&types, groups),
                     None => Table::new(&types),
                 };
-                // Only where the table is the whole aggregate's. The range cannot be shared the
-                // way the presize above is: a partition is split by hash bits and any value can
-                // land in any of them, so a partition's array would have to cover the whole range
-                // anyway, and sixty four copies of it is sixty four times the memory for the same
-                // shortcut. A partition probes the buckets, which is what it did before.
-                match (self.span.filter(|_| share == Share::Whole), types.as_slice()) {
+                // Only where the table is the one an instance holds before it partitions. The range
+                // cannot be shared the way the presize above is: a partition is split by hash bits
+                // and any value can land in any of them, so a partition's array would have to cover
+                // the whole range anyway, and sixty four copies of it is sixty four times the memory
+                // for the same shortcut. A partition probes the buckets, which is what it did before.
+                match (self.span.filter(|_| share.before_the_split()), types.as_slice()) {
                     (Some((low, values)), [ty]) => table.over_range(low, values, ty),
                     _ => table,
                 }
@@ -2772,7 +2821,7 @@ impl<'a> Aggregate<'a> {
         let ready = self.split(rows, spreading)?;
         for (partition, selected) in ready.iter().enumerate() {
             let Some(selected) = selected else { continue };
-            let table = own[partition].get_or_insert_with(|| self.partition());
+            let table = own[partition].get_or_insert_with(|| self.kept());
             if let Some(error) = table.failure.take() {
                 return Err(error);
             }
@@ -2841,7 +2890,7 @@ impl<'a> Aggregate<'a> {
                 if bucket.is_empty() {
                     continue;
                 }
-                let into = own[at].get_or_insert_with(|| self.partition());
+                let into = own[at].get_or_insert_with(|| self.kept());
                 let grown = self.fold_slots(&mut coming, &source, &keys, start, bucket, into)?;
                 charge(into, grown)?;
             }
@@ -5655,7 +5704,7 @@ mod tests {
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
         EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition, FixedRecord,
-        FixedRuns, RADIX_PARTITIONS, Share, Signed, bigint_distinct_partition,
+        FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, bigint_distinct_partition,
         encoded_count_partition, fixed_partition,
     };
     use crate::buffer::Buffered;
@@ -6710,22 +6759,46 @@ mod tests {
     }
 
     #[test]
-    fn an_instance_takes_room_for_every_group() {
-        assert_eq!(Share::Whole.of(8 << 20), 8 << 20);
-        assert_eq!(Share::Whole.of(1), 1);
+    fn the_one_table_an_aggregate_answers_out_of_takes_room_for_every_group() {
+        assert_eq!(Share::Whole.of(8 << 20), Some(8 << 20));
+        assert_eq!(Share::Whole.of(1), Some(1));
     }
 
     #[test]
     fn a_partition_takes_room_for_its_share() {
         let groups = 8 << 20;
-        assert_eq!(Share::Partition.of(groups), groups / RADIX_PARTITIONS as u64);
-        assert_eq!(Share::Partition.of(6400), 100);
+        assert_eq!(Share::Partition.of(groups), Some(groups / RADIX_PARTITIONS as u64));
+        assert_eq!(Share::Partition.of(6400), Some(100));
     }
 
     #[test]
     fn a_partition_of_a_small_aggregate_still_gets_a_group() {
         for groups in 0..RADIX_PARTITIONS as u64 {
-            assert_eq!(Share::Partition.of(groups), 1, "{groups} groups");
+            assert_eq!(Share::Partition.of(groups), Some(1), "{groups} groups");
         }
+    }
+
+    /// The two tables that never hold what the number counts, which is where the number was costing
+    /// half a gigabyte of pages a query on q18.
+    #[test]
+    fn the_tables_that_pass_the_groups_on_take_no_more_room_than_they_will_use() {
+        // Given up at `PARTITION_FROM` groups however many the aggregate ends with, so that is all
+        // the room worth taking, and a smaller aggregate still asks for only what it will hold.
+        assert_eq!(Share::Passing.of(8 << 20), Some(PARTITION_FROM as u64));
+        assert_eq!(Share::Passing.of(100), Some(100));
+        // One of these per partition per instance rather than per aggregate, so it starts where
+        // every table started before any of this existed.
+        assert_eq!(Share::Local.of(8 << 20), None);
+        assert_eq!(Share::Local.of(1), None);
+    }
+
+    /// Only the table an instance fills before it partitions covers the aggregate's whole key range,
+    /// so only that one can carry a direct index over it.
+    #[test]
+    fn a_direct_index_over_the_range_goes_on_the_table_that_sees_the_whole_range() {
+        assert!(Share::Whole.before_the_split());
+        assert!(Share::Passing.before_the_split());
+        assert!(!Share::Partition.before_the_split());
+        assert!(!Share::Local.before_the_split());
     }
 }
