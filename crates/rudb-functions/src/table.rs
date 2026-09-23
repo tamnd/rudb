@@ -911,6 +911,11 @@ pub fn strategy_fields() -> Vec<Field> {
 ///
 /// `waits` and `wait_ms` are the time a stage spent on something other than its own work. For
 /// write it is instances queued on the writer's lock, and for publish it is the syncs.
+///
+/// `accounted_peak` and `peak_rss` are the two peaks section 16.4 asks a load to report, in bytes,
+/// and only the `total` row has them since memory is not charged by stage. The first is the most
+/// the load's holders said they held at once and the second is the process's peak resident set,
+/// null where the kernel does not report one.
 #[must_use]
 pub fn write_metric_fields() -> Vec<Field> {
     vec![
@@ -925,6 +930,8 @@ pub fn write_metric_fields() -> Vec<Field> {
         Field::new("waits", LogicalType::BigInt),
         Field::new("wait_ms", LogicalType::Double),
         Field::new("finished", LogicalType::Boolean),
+        Field::new("accounted_peak", LogicalType::BigInt),
+        Field::new("peak_rss", LogicalType::BigInt),
     ]
 }
 

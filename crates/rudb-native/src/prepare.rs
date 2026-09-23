@@ -535,11 +535,16 @@ impl Step<'_> {
     }
 
     /// Merges the column, settles its dictionary's shape and hands out the blocks it filled.
-    fn run(self, rows: usize, coded: &[AtomicBool]) -> Result<(usize, Merge, Vec<Unencoded>)> {
+    fn run(
+        self,
+        rows: usize,
+        coded: &[AtomicBool],
+        profile: Option<&LoadProfile>,
+    ) -> Result<(usize, Merge, Vec<Unencoded>)> {
         let Self { index, column, slot, gather } = self;
         match slot {
             Slot::Owned(dictionary, mine) => {
-                merge_column(index, column, gather, dictionary, mine, rows, coded)
+                merge_column(index, column, gather, dictionary, mine, rows, coded, profile)
             }
             Slot::Lent(held, lent) => {
                 let mut held = held.lock().map_err(|_| Error::internal("a merge panicked"))?;
@@ -549,13 +554,14 @@ impl Step<'_> {
                     return Err(Error::internal("a stripe was merged after its table was closed"));
                 }
                 let LentColumn { dictionary, gather: mine } = &mut *held;
-                merge_column(index, column, gather, dictionary, mine, rows, coded)
+                merge_column(index, column, gather, dictionary, mine, rows, coded, profile)
             }
         }
     }
 }
 
 /// One column of [`merge_columns`].
+#[expect(clippy::too_many_arguments, reason = "one column's share of the stripe's merge state")]
 fn merge_column(
     index: usize,
     column: Column,
@@ -564,6 +570,7 @@ fn merge_column(
     gather: &mut Option<stats::Gather>,
     rows: usize,
     coded: &[AtomicBool],
+    profile: Option<&LoadProfile>,
 ) -> Result<(usize, Merge, Vec<Unencoded>)> {
     if let (Some(mine), Some(stripe)) = (gather.as_mut(), stripe) {
         mine.absorb(stripe);
@@ -580,6 +587,9 @@ fn merge_column(
             // Empty means nothing has been merged into it yet, so this is the column's first
             // stripe and the only one the decision is allowed to be made on.
             if global.values() == 0 && drops_dictionary(rows, local.values()) {
+                if let Some(profile) = profile {
+                    profile.release(global.charged);
+                }
                 *dictionary = None;
                 coded[index].store(false, Atomic::Relaxed);
                 Merge::Plain(local)
@@ -596,7 +606,9 @@ fn merge_column(
     let blocks = match dictionary {
         Some(dictionary) => {
             dictionary.settle()?;
-            dictionary.hand_out(index)
+            let blocks = dictionary.hand_out(index);
+            dictionary.recharge(profile);
+            blocks
         }
         None => Vec::new(),
     };
@@ -634,7 +646,10 @@ fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &[AtomicBool])
         .min(steps.iter().filter(|step| step.cost(coded) > 0).count())
         .max(1);
     let done = if workers <= 1 {
-        steps.into_iter().map(|step| step.run(rows, coded)).collect::<Result<Vec<_>>>()?
+        steps
+            .into_iter()
+            .map(|step| step.run(rows, coded, profile.as_deref()))
+            .collect::<Result<Vec<_>>>()?
     } else {
         let queue = Mutex::new(steps);
         let pieces = std::thread::scope(|scope| {
@@ -648,7 +663,7 @@ fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &[AtomicBool])
                                 .map_err(|_| Error::internal("a merge worker panicked"))?
                                 .pop();
                             let Some(step) = taken else { break };
-                            mine.push(step.run(rows, coded)?);
+                            mine.push(step.run(rows, coded, profile.as_deref())?);
                         }
                         Ok(mine)
                     })

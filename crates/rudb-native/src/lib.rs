@@ -1433,6 +1433,8 @@ struct GlobalDictionary {
     early: BTreeMap<usize, EncodedBlock>,
     /// Where every block already written to the file is, in block order.
     placed: Vec<Placed>,
+    /// What the load profile was last told this dictionary holds, see [`Self::recharge`].
+    charged: u64,
 }
 
 /// Where one payload block of a global dictionary is in the file, and its checksum.
@@ -1465,6 +1467,7 @@ impl GlobalDictionary {
             blocks: Vec::new(),
             early: BTreeMap::new(),
             placed: Vec::new(),
+            charged: 0,
         }
     }
 
@@ -1481,6 +1484,48 @@ impl GlobalDictionary {
             .map(|block| self.ends[((block + 1) * TEXT_PAYLOAD_VALUES).min(values) - 1] as usize)
             .sum::<usize>();
         decoded.saturating_add(values.saturating_mul(size_of::<(u64, u32)>() + size_of::<u32>()))
+    }
+
+    /// About what the dictionary holds in memory, by capacity rather than by length.
+    ///
+    /// A hash table is charged its buckets, which is a power of two over eight sevenths of what it
+    /// says it can hold, and a byte of control per bucket. The blocks waiting to be encoded and the
+    /// ones kept to settle a shape on are counted one by one, and there are only ever a few.
+    fn held_bytes(&self) -> u64 {
+        fn table<K, V, S>(map: &HashMap<K, V, S>) -> usize {
+            (map.capacity() * 8 / 7).next_power_of_two() * (size_of::<(K, V)>() + 1)
+        }
+        fn spilled<T>(values: &Vec<T>) -> usize {
+            values.capacity() * size_of::<T>()
+        }
+        let raw = |blocks: &Vec<(usize, Vec<u8>)>| {
+            spilled(blocks) + blocks.iter().map(|(_, block)| block.capacity()).sum::<usize>()
+        };
+        let bytes = table(&self.primary)
+            + table(&self.collisions)
+            + self.collisions.values().map(spilled).sum::<usize>()
+            + spilled(&self.checks)
+            + spilled(&self.ends)
+            + spilled(&self.counts)
+            + self.filling.capacity()
+            + spilled(&self.grams)
+            + raw(&self.waiting)
+            + raw(&self.sample)
+            + self.blocks.iter().map(Vec::capacity).sum::<usize>()
+            + spilled(&self.placed);
+        bytes as u64
+    }
+
+    /// Tells `profile` what the dictionary has grown or shrunk by since the last time.
+    fn recharge(&mut self, profile: Option<&LoadProfile>) {
+        let Some(profile) = profile else { return };
+        let now = self.held_bytes();
+        if now >= self.charged {
+            profile.hold(now - self.charged);
+        } else {
+            profile.release(self.charged - now);
+        }
+        self.charged = now;
     }
 
     /// Frees what the dictionary keeps for coding new values, once none are coming.
@@ -3148,6 +3193,7 @@ impl Writer {
         self.place_blocks()?;
         for dictionary in self.dictionaries.iter_mut().flatten() {
             dictionary.release_lookup();
+            dictionary.recharge(profile.as_deref());
         }
         let (numeric, closed) = self.close_columns()?;
         let (frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
@@ -3159,6 +3205,9 @@ impl Writer {
         self.table.frequencies = frequencies;
         self.table.distincts = distincts;
         self.table.pair_frequencies = pairs;
+        if let Some(profile) = &profile {
+            profile.release(self.dictionaries.iter().flatten().map(|held| held.charged).sum());
+        }
         self.dictionaries = Vec::new();
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         self.table.frequency_texts = vec![Vec::new(); self.table.fields.len()];
@@ -3264,7 +3313,8 @@ impl Writer {
         let mut frequencies = vec![(None, None); columns];
         let mut closed = (0..columns).map(|_| None).collect::<Vec<_>>();
         let profile = self.profile.as_deref();
-        let run = |job: Closing<'_>| -> Result<Closed> {
+        let run = |job: Closing<'_>, bytes: usize| -> Result<Closed> {
+            let _holding = profile.map(|profile| profile.holding(bytes as u64));
             match job {
                 Closing::Numeric { column, counted } => {
                     let _timing = profile.map(|profile| profile.span(Stage::Publish));
@@ -3278,7 +3328,7 @@ impl Writer {
         };
         let workers = close_workers().min(jobs.len());
         let pieces = if workers <= 1 {
-            jobs.into_iter().map(|(job, _, _)| run(job)).collect::<Result<Vec<_>>>()?
+            jobs.into_iter().map(|(job, bytes, _)| run(job, bytes)).collect::<Result<Vec<_>>>()?
         } else {
             // The columns not taken yet, cheapest first, and the bytes the ones closing now hold.
             let state = Mutex::new((jobs, 0_usize));
@@ -3313,7 +3363,7 @@ impl Writer {
                                 // Given back on the way out whether the close worked, failed or
                                 // panicked, so that a worker waiting for room is never left waiting.
                                 let _room = Room { state: &state, finished: &finished, bytes };
-                                mine.push(run(job)?);
+                                mine.push(run(job, bytes)?);
                             }
                         })
                     })

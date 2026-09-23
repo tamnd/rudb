@@ -28,6 +28,14 @@
 //! about a hundred stripes, which puts the whole profile at a few thousand atomic adds and a few
 //! hundred clock reads for a statement that runs for minutes.
 //!
+//! # Memory
+//!
+//! Section 16.4 asks a load to report two peaks: `peak_rss`, what the kernel says the process held
+//! at most, and `accounted_peak`, the most the load itself said it was holding at once. The L5 gate
+//! wants the second within a quarter of the first, because a load that does not know what it holds
+//! cannot keep to a budget. The holders call [`LoadProfile::hold`] when they take memory and
+//! [`LoadProfile::release`] when they let it go, once per chunk, stripe or column like the rest.
+//!
 //! Wall time is summed over workers, as section 4.13 says. A stage that ran on eight threads for a
 //! second reports eight seconds, which makes the stage rows comparable with each other and with CPU
 //! time, and the `total` row is the one that says how long the statement took.
@@ -142,6 +150,13 @@ pub struct LoadProfile {
     started: Instant,
     finished_ns: AtomicU64,
     stages: [Counters; 9],
+    /// What the load's holders say they hold right now.
+    held: AtomicU64,
+    /// The most `held` has been.
+    accounted_peak: AtomicU64,
+    /// The process's peak resident set when the load finished, and zero before that or where the
+    /// kernel does not say.
+    peak_rss: AtomicU64,
 }
 
 impl LoadProfile {
@@ -162,6 +177,9 @@ impl LoadProfile {
             started: Instant::now(),
             finished_ns: AtomicU64::new(0),
             stages: Default::default(),
+            held: AtomicU64::new(0),
+            accounted_peak: AtomicU64::new(0),
+            peak_rss: AtomicU64::new(0),
         });
         kept.loads.push(Arc::clone(&profile));
         if kept.loads.len() > KEPT_LOADS {
@@ -215,18 +233,67 @@ impl LoadProfile {
         StageSpan { profile: self, stage, span: Some(Span::start()) }
     }
 
-    /// Marks the statement finished, which fixes the `total` row's wall time.
+    /// Counts `bytes` as held by the load until [`Self::release`] gives them back.
+    pub fn hold(&self, bytes: u64) {
+        let was = self.held.fetch_add(bytes, Ordering::Relaxed);
+        self.accounted_peak.fetch_max(was.saturating_add(bytes), Ordering::Relaxed);
+    }
+
+    /// Gives back `bytes` an earlier [`Self::hold`] counted.
+    pub fn release(&self, bytes: u64) {
+        let _was = self.held.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Holds `bytes` until the returned guard is dropped, for memory that lives inside one call.
+    #[must_use]
+    pub fn holding(&self, bytes: u64) -> Holding<'_> {
+        self.hold(bytes);
+        Holding { profile: self, bytes }
+    }
+
+    /// What the load's holders say they hold right now.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// The most the load's holders ever said they held at once.
+    #[must_use]
+    pub fn accounted_peak(&self) -> u64 {
+        self.accounted_peak.load(Ordering::Relaxed)
+    }
+
+    /// The process's peak resident set: as it was when the load finished, or as it is now if the
+    /// load is still going. `None` where the kernel does not say, which is anywhere but Linux.
+    ///
+    /// It is the process's and not the load's, since the kernel keeps one mark for the whole
+    /// process and resetting it would also reset what `wait4` reports to whoever started the
+    /// process. In a process that only loads, which is how the gate measures, the two are the same.
+    #[must_use]
+    pub fn peak_rss(&self) -> Option<u64> {
+        match self.peak_rss.load(Ordering::Relaxed) {
+            0 => resident_peak(),
+            peak => Some(peak),
+        }
+    }
+
+    /// Marks the statement finished, which fixes the `total` row's wall time and peak resident set.
     ///
     /// The first call wins, so whoever drops the load after it committed does not move the time
     /// the commit fixed.
     pub fn finish(&self) {
         let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let _first = self.finished_ns.compare_exchange(
+        let first = self.finished_ns.compare_exchange(
             0,
             elapsed.max(1),
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+        if first.is_ok() {
+            if let Some(peak) = resident_peak() {
+                self.peak_rss.store(peak, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The statement's wall time: how long it took if it finished, and how long it has been going
@@ -279,6 +346,33 @@ impl Drop for StageSpan<'_> {
     }
 }
 
+/// Memory held for as long as this is alive, given back when it is dropped.
+#[derive(Debug)]
+pub struct Holding<'a> {
+    profile: &'a LoadProfile,
+    bytes: u64,
+}
+
+impl Drop for Holding<'_> {
+    fn drop(&mut self) {
+        self.profile.release(self.bytes);
+    }
+}
+
+/// The process's peak resident set in bytes, from the `VmHWM` line of `/proc/self/status`.
+#[cfg(target_os = "linux")]
+fn resident_peak() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))?;
+    let kib = line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+    Some(kib.saturating_mul(1024)).filter(|&bytes| bytes > 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident_peak() -> Option<u64> {
+    None
+}
+
 #[derive(Debug)]
 struct Kept {
     next: u64,
@@ -327,6 +421,29 @@ mod tests {
         let publish = profile.stage(Stage::Publish);
         assert_eq!(publish.charged, 1);
         assert!(publish.wall_ns > 0);
+    }
+
+    #[test]
+    fn the_accounted_peak_is_the_most_held_at_once() {
+        let profile = LoadProfile::begin("t");
+        profile.hold(100);
+        {
+            let _inside = profile.holding(50);
+            assert_eq!(profile.held(), 150);
+        }
+        profile.release(100);
+        profile.hold(20);
+        assert_eq!(profile.held(), 20);
+        assert_eq!(profile.accounted_peak(), 150);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_peak_resident_set_is_read_from_the_kernel() {
+        let profile = LoadProfile::begin("t");
+        profile.finish();
+        let peak = profile.peak_rss().expect("Linux reports a peak");
+        assert!(peak > 1 << 20, "{peak} bytes is not a running test binary");
     }
 
     #[test]
