@@ -413,6 +413,27 @@ thread_local! {
     static READER: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
+/// Drops the rows of a chunk that the exact rows from a join above do not hold, for a scan with no
+/// filter to fold them into.
+///
+/// `reduced` is the set and the table position of the chunk's first row. The rows are the part's
+/// own at this point, so the row numbers a scan makes up are still in step with them.
+///
+/// # Errors
+///
+/// Whatever narrowing the chunk to the rows that survived raises.
+fn reduce(reduced: Option<(&Rids, u64)>, chunk: &mut Chunk) -> Result<()> {
+    let Some((rows, first)) = reduced else { return Ok(()) };
+    let len = chunk.len();
+    let kept = Selection::from_predicate(len, |row| rows.contains(first + row as u64));
+    if kept.len() == len {
+        return Ok(());
+    }
+    let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+    *chunk = whole.select(&kept)?;
+    Ok(())
+}
+
 /// Which slot the calling thread takes its working space out of.
 fn reader() -> usize {
     READER.with(|reader| {
@@ -619,22 +640,37 @@ impl<'a> Scan<'a> {
     /// TPC-H lineitem, so nearly every chunk of it is one where the comparison was going to keep
     /// every row and the only thing it produced was the knowledge that it had.
     ///
+    /// The exact rows a join above handed down go into the same narrowing, see [`Source::reduce`].
+    ///
     /// # Errors
     ///
     /// Whatever evaluating the predicate or narrowing the chunk reports.
     fn apply(&self, at: usize, chunk: &mut Chunk) -> Result<()> {
-        let Some(pushed) = self.pushed.as_ref() else { return Ok(()) };
+        let reduced = self.reduced(at).filter(|(rows, _)| !rows.is_full());
+        let Some(pushed) = self.pushed.as_ref() else { return reduce(reduced, chunk) };
         let whole =
             pushed.probes.as_deref().is_some_and(|probes| self.table.rows().certain(at, probes));
         if whole {
             self.waved.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return reduce(reduced, chunk);
         }
         // Taken and given back rather than built here. An empty free list means every other reader
         // is holding one, which is a reader that has not had a turn yet rather than an error.
         let slot = reader();
         let mut working = pushed.take(slot);
-        let kept = pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?;
+        let mut kept = pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?;
+        // After the filter and on its answer rather than on the chunk, so that the filter's kernels
+        // read the columns flat as they came off the disk and the chunk is narrowed once. Narrowing
+        // it for the reduction first left the filter a selected chunk, and the comparison on a
+        // selected column was the slow path on Q3 at SF1, seven hundred times a query.
+        if let Some((rows, first)) = reduced {
+            let held: Vec<u32> = kept
+                .iter()
+                .filter(|&row| rows.contains(first + row as u64))
+                .filter_map(|row| u32::try_from(row).ok())
+                .collect();
+            kept = Selection::from_indices(held);
+        }
         if kept.len() != chunk.len() {
             narrow(pushed.compaction, chunk, &kept, &mut working.gauge)?;
         }
@@ -751,31 +787,6 @@ impl<'a> Scan<'a> {
             return false;
         };
         len > 0 && !rows.any_between(first, first + len - 1)
-    }
-
-    /// Drops the rows of part `at` that the exact rows from a join above do not hold.
-    ///
-    /// Before the pushed filter, because it is a bit test per row where the filter is an expression,
-    /// and because the filter narrows the chunk and after that a row's position in it is no longer
-    /// its position in the table. The rows are the part's own, so the row numbers a scan makes up
-    /// are still in step with them here.
-    ///
-    /// # Errors
-    ///
-    /// Whatever narrowing the chunk to the rows that survived raises.
-    fn reduce(&self, at: usize, chunk: &mut Chunk) -> Result<()> {
-        let Some((rows, first)) = self.reduced(at) else { return Ok(()) };
-        if rows.is_full() {
-            return Ok(());
-        }
-        let len = chunk.len();
-        let kept = Selection::from_predicate(len, |row| rows.contains(first + row as u64));
-        if kept.len() == len {
-            return Ok(());
-        }
-        let whole = std::mem::replace(chunk, Chunk::empty(&[]));
-        *chunk = whole.select(&kept)?;
-        Ok(())
     }
 
     /// The parts the statistics leave alive, by stripe, and how many rows they hold between them.
@@ -1058,7 +1069,6 @@ impl Source for Scan<'_> {
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
             *out = read;
-            self.reduce(at, out)?;
             self.apply(at, out)?;
             self.sift(out)?;
             return Ok(more(morsel));
@@ -1074,7 +1084,6 @@ impl Source for Scan<'_> {
             }
         }
         *out = Chunk::with_rows(held, read.len())?;
-        self.reduce(at, out)?;
         self.apply(at, out)?;
         self.sift(out)?;
         Ok(more(morsel))
