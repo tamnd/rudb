@@ -6,6 +6,12 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.15
+
+A patch release of two pull requests, and the one to take instead of 0.4.14. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.14 read each other's files.
+
+#1504 fixes a load that 0.4.14 can fail. #1491 made the chunks the Parquet reader hands out windows of one shared page, and `bit_packed` judged whether packing pays by the window's share of that page rather than by its rows. An INTEGER column whose values span nearly the whole `i32` range was then packed at 32 bits and refused, so `CREATE TABLE ... AS SELECT * FROM read_parquet(...)` over ClickBench `hits` could stop with `packed values from ... which a INTEGER cannot hold`, depending on the thread count. The same decision also let the bytes of a file depend on how many readers a page had. #1505 holds a distinct count's pair runs in fixed size chunks, so a chunk one instance frees is the one it asks for next, which took ClickBench q9 on the 10M file from about 116 MB to 102 MB resident and q10 from 118 MB to 106 MB.
+
 ## 0.4.14
 
 A patch release of eleven pull requests. The native directory format number stays at 28 and the storage format version at 9. #1495 writes exact nonzero counts into the file catalog of a native file, and upgrades the metadata of an older file once when it opens it, so that a count can be answered without reading the table directory.
