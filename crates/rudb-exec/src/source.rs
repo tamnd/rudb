@@ -558,6 +558,23 @@ struct Working {
 struct Late {
     input: usize,
     predicate: Prepared,
+    seen: AtomicUsize,
+    kept: AtomicUsize,
+}
+
+/// Stop paying for the first-column probe when it has not removed enough rows.
+const LATE_WARMUP: usize = 1 << 14;
+
+impl Late {
+    fn worth(&self) -> bool {
+        let seen = self.seen.load(Ordering::Relaxed);
+        seen < LATE_WARMUP || self.kept.load(Ordering::Relaxed).saturating_mul(4) < seen
+    }
+
+    fn saw(&self, rows: usize, kept: usize) {
+        self.seen.fetch_add(rows, Ordering::Relaxed);
+        self.kept.fetch_add(kept, Ordering::Relaxed);
+    }
 }
 
 /// A LIKE conjunct followed by a simple comparison on another column.
@@ -628,6 +645,8 @@ impl Pushed {
                     Ok::<_, Error>(Late {
                         input,
                         predicate: Prepared::one(plan, expr, schema)?.in_session(session),
+                        seen: AtomicUsize::new(0),
+                        kept: AtomicUsize::new(0),
                     })
                 })
                 .transpose()?
@@ -805,7 +824,7 @@ impl<'a> Scan<'a> {
     fn read_late(&self, at: usize, out: &mut Chunk) -> Result<bool> {
         let Some(pushed) = &self.pushed else { return Ok(false) };
         let Some(late) = &pushed.late else { return Ok(false) };
-        if self.sideways.is_some() {
+        if self.sideways.is_some() || !late.worth() {
             return Ok(false);
         }
         let Some(primary) = self.columns[late.input] else { return Ok(false) };
@@ -830,6 +849,7 @@ impl<'a> Scan<'a> {
                 .ok_or_else(|| Error::internal("a late filter has no scratch"))?,
         )?;
         pushed.give(slot, working);
+        late.saw(len, selected.len());
         if selected.len().saturating_mul(4) > len {
             return Ok(false);
         }
