@@ -206,6 +206,8 @@ fn end_to_end(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option
         let column = chunk.column(index)?;
         let piece = match column.form() {
             Form::Flat | Form::StringView => Cow::Borrowed(column),
+            // flatten: a build side is probed by row, so a piece that is a dictionary, a constant or
+            // packed is decoded once here rather than once per probe, the copy the assembly made.
             _ => Cow::Owned(column.flatten()?),
         };
         if piece.form() == Form::Flat && short(&piece) {
@@ -219,6 +221,8 @@ fn end_to_end(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option
     }
     for piece in &mut pieces {
         if piece.form() == Form::StringView {
+            // flatten: views over different arenas cannot share one, so they are copied into a
+            // flat run, which is what the assembly this replaced did for every piece.
             *piece = Cow::Owned(piece.flatten()?);
             if short(piece) {
                 return Ok(None);
