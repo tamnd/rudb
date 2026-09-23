@@ -69,6 +69,7 @@ const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
 const NONZERO_COUNTS: &[u8; 8] = b"RUDBNZ10";
+const AGGREGATE_SUMS: &[u8; 8] = b"RUDBAG10";
 const FORMAT: u32 = 28;
 
 /// Formats this build can open.
@@ -846,6 +847,8 @@ struct Entry {
     directory: Page,
     /// Exact non-null, nonzero integer counts certified by the catalog checksum.
     nonzero: Vec<Option<u64>>,
+    /// Exact sum and non-null count for signed integer columns.
+    aggregates: Vec<Option<(i128, u64)>>,
 }
 
 /// One view's line in the catalog directory.
@@ -2744,6 +2747,7 @@ impl Writer {
             fields: self.table.fields.clone(),
             rows: self.table.rows,
             nonzero: table_nonzero_counts(&self.table),
+            aggregates: table_aggregate_sums(&self.table),
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -2906,19 +2910,17 @@ impl Writer {
         Ok(())
     }
 
-    /// Adds exact nonzero certificates to an older file's catalog without rewriting table pages.
-    /// The old committed slot remains readable until the new catalog is fully synced.
-    pub fn certify_counts(path: impl AsRef<Path>) -> Result<()> {
+    /// Adds exact integer aggregate certificates to an older file's catalog without rewriting
+    /// table pages. The old committed slot remains readable until the new catalog is fully synced.
+    pub fn certify_summaries(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
         let (mut entries, views) = decode_catalog(&bytes, size)?;
         let native = Catalog::open(path)?;
         for entry in &mut entries {
-            if entry.nonzero.iter().any(Option::is_some) {
-                continue;
-            }
             let reader = native.table(&entry.name)?;
             entry.nonzero = reader_nonzero_counts(&reader)?;
+            entry.aggregates = reader_aggregate_sums(&reader)?;
         }
         let generation = slot
             .generation
@@ -2940,6 +2942,11 @@ impl Writer {
         write_at(&file, slot_offset(generation), &slot.bytes())?;
         file.sync_all().map_err(io)?;
         Ok(())
+    }
+
+    /// The earlier name for [`Self::certify_summaries`].
+    pub fn certify_counts(path: impl AsRef<Path>) -> Result<()> {
+        Self::certify_summaries(path)
     }
 }
 
@@ -4284,6 +4291,13 @@ pub struct Catalog {
     opening: Opening,
 }
 
+/// Signed integer sums and non-null counts for selected columns, plus total table rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedSums {
+    pub columns: Vec<(i128, u64)>,
+    pub rows: u64,
+}
+
 impl Catalog {
     /// Reads the highest valid catalog slot and nothing under it.
     ///
@@ -4408,6 +4422,34 @@ impl Catalog {
             entry.rows,
             column,
         )
+    }
+
+    /// Exact signed-integer sums and non-null counts from the small catalog. The table directory
+    /// checksum is still checked once before any certificate can answer a query.
+    pub fn aggregate_sums(&self, name: &str, columns: &[usize]) -> Result<Option<CertifiedSums>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let mut sums = Vec::with_capacity(columns.len());
+        for &column in columns {
+            let Some(field) = entry.fields.get(column) else {
+                return Err(invalid("aggregate column index out of range"));
+            };
+            if !signed_integer(&field.ty) {
+                return Ok(None);
+            }
+            let Some(sum) = entry.aggregates[column] else {
+                return Ok(None);
+            };
+            sums.push(sum);
+        }
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
+        }
+        Ok(Some(CertifiedSums { columns: sums, rows: entry.rows as u64 }))
     }
 
     /// The schema copied into the small file catalog, available without opening the table directory.
@@ -6375,6 +6417,33 @@ fn table_nonzero_counts(table: &Table) -> Vec<Option<u64>> {
         .collect()
 }
 
+fn signed_integer(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer | LogicalType::BigInt
+    )
+}
+
+fn table_exact_sum(table: &Table, column: usize) -> Option<(i128, u64)> {
+    table.stripes.iter().try_fold((0_i128, 0_u64), |(sum, count), stripe| {
+        let range = stripe.zone.column(column)?;
+        let sum = sum.checked_add(range.sum?)?;
+        let nonnull = (stripe.rows as u64).checked_sub(range.nulls as u64)?;
+        Some((sum, count.checked_add(nonnull)?))
+    })
+}
+
+fn table_aggregate_sums(table: &Table) -> Vec<Option<(i128, u64)>> {
+    table
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column, field)| {
+            signed_integer(&field.ty).then(|| table_exact_sum(table, column)).flatten()
+        })
+        .collect()
+}
+
 fn reader_nonzero_counts(reader: &Reader) -> Result<Vec<Option<u64>>> {
     reader
         .table
@@ -6410,6 +6479,20 @@ fn reader_nonzero_counts(reader: &Reader) -> Result<Vec<Option<u64>>> {
                 .checked_sub(nulls)
                 .and_then(|count| count.checked_sub(zero)))
         })
+        .collect()
+}
+
+fn reader_aggregate_sums(reader: &Reader) -> Result<Vec<Option<(i128, u64)>>> {
+    reader
+        .table
+        .fields
+        .iter()
+        .enumerate()
+        .map(
+            |(column, field)| {
+                if signed_integer(&field.ty) { reader.exact_sum(column) } else { Ok(None) }
+            },
+        )
         .collect()
 }
 
@@ -6488,6 +6571,22 @@ fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
             }
         }
     }
+    out.extend_from_slice(AGGREGATE_SUMS);
+    for entry in entries {
+        if entry.aggregates.len() != entry.fields.len() {
+            return Err(invalid("aggregate sum width differs from schema"));
+        }
+        for summary in &entry.aggregates {
+            match summary {
+                None => out.push(0),
+                Some((sum, count)) => {
+                    out.push(1);
+                    out.extend_from_slice(&sum.to_le_bytes());
+                    put_u64(&mut out, *count);
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -6539,7 +6638,8 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
             return Err(invalid("two tables in the catalog have the same name"));
         }
         let nonzero = vec![None; fields.len()];
-        entries.push(Entry { name, fields, rows, directory, nonzero });
+        let aggregates = vec![None; fields.len()];
+        entries.push(Entry { name, fields, rows, directory, nonzero, aggregates });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
     // file written before format 25. That is why the count is allowed to be missing rather than
@@ -6609,9 +6709,34 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
                 };
             }
         }
-        if !cur.done() {
-            return Err(invalid("catalog has trailing bytes"));
+    }
+    if !cur.done() {
+        if cur.take(8)? != AGGREGATE_SUMS {
+            return Err(invalid("aggregate catalog extension magic differs"));
         }
+        for entry in &mut entries {
+            for (field, summary) in entry.fields.iter().zip(&mut entry.aggregates) {
+                *summary = match cur.u8()? {
+                    0 => None,
+                    1 if signed_integer(&field.ty) => {
+                        let sum = i128::from_le_bytes(
+                            cur.take(16)?
+                                .try_into()
+                                .map_err(|_| invalid("aggregate sum is truncated"))?,
+                        );
+                        let count = cur.u64()?;
+                        if count > entry.rows as u64 {
+                            return Err(invalid("aggregate count exceeds table rows"));
+                        }
+                        Some((sum, count))
+                    }
+                    _ => return Err(invalid("aggregate sum tag or column type differs")),
+                };
+            }
+        }
+    }
+    if !cur.done() {
+        return Err(invalid("catalog has trailing bytes"));
     }
     Ok((entries, views))
 }
@@ -10870,6 +10995,7 @@ mod tests {
                 rows: 1,
                 directory: Page { offset: HEADER, length: 8, hash: 0 },
                 nonzero: vec![None],
+                aggregates: vec![None],
             }],
             &[sample_view("items")],
         )
@@ -12033,6 +12159,11 @@ mod tests {
         writer.finish().expect("finish");
         let catalog = Catalog::open(&path).expect("catalog");
         assert_eq!(catalog.entries[0].nonzero, vec![None, Some(2)]);
+        assert_eq!(catalog.entries[0].aggregates, vec![None, Some((10, 4))]);
+        assert_eq!(
+            catalog.aggregate_sums("items", &[1]).expect("catalog sums"),
+            Some(CertifiedSums { columns: vec![(10, 4)], rows: 6 })
+        );
         assert_eq!(catalog.nonzero_count("items", 1).expect("quick count"), Some(2));
         assert_eq!(
             reader_nonzero_counts(&catalog.table("items").expect("reader")).expect("counts"),
@@ -12042,6 +12173,10 @@ mod tests {
         assert_eq!(
             Catalog::open(&path).expect("reopen").nonzero_count("items", 1).expect("count"),
             Some(2)
+        );
+        assert_eq!(
+            Catalog::open(&path).expect("reopen").aggregate_sums("items", &[1]).expect("sums"),
+            Some(CertifiedSums { columns: vec![(10, 4)], rows: 6 })
         );
         assert_eq!(catalog.table("items").expect("reader").null_count(1).expect("nulls"), 2);
         fs::remove_file(path).expect("remove scratch file");
