@@ -42,6 +42,8 @@
 //! than the first, because several symbols share a three byte prefix and taking the first would make
 //! the ratio depend on insertion order.
 
+use std::cell::RefCell;
+
 use rudb_common::{Error, Result};
 
 /// The code that means the next byte is a literal. 255 rather than 0 so that the 255 real codes are
@@ -181,12 +183,24 @@ impl SymbolTable {
     /// to whoever knows what the chunk is rather than to this function.
     #[must_use]
     pub fn train(samples: &[&[u8]]) -> Self {
+        // The counts are a megabyte of pair slots, and a load trains a table for every block of
+        // every text column it writes. So each thread keeps one and clears the slots it used, rather
+        // than asking for a fresh megabyte of zeroes and faulting it in on every block.
+        thread_local! {
+            static COUNTS: RefCell<Option<Counts>> = const { RefCell::new(None) };
+        }
+        COUNTS.with(|held| match held.try_borrow_mut() {
+            Ok(mut held) => Self::train_with(samples, held.get_or_insert_with(Counts::new)),
+            Err(_) => Self::train_with(samples, &mut Counts::new()),
+        })
+    }
+
+    fn train_with(samples: &[&[u8]], counts: &mut Counts) -> Self {
         let mut table = Self::empty();
-        let mut counts = Counts::new();
         for _ in 0..GENERATIONS {
             counts.clear();
             for sample in samples {
-                table.count(sample, &mut counts);
+                table.count(sample, counts);
             }
             let next = counts.best(&table);
             if next.is_empty() {
@@ -452,6 +466,53 @@ struct Counts {
     /// The pair slots that are not zero, so that reading and clearing them costs the pairs seen
     /// rather than the whole array.
     seen: Vec<u32>,
+    /// The candidates of the generation being ranked, kept so a thread sizes them once.
+    gains: Gains,
+}
+
+/// Every candidate symbol once with its summed gain, which [`Counts::best`] ranks.
+#[derive(Default)]
+struct Gains {
+    gains: Vec<(Symbol, u64)>,
+    /// Where each symbol sits in `gains`, open addressed on the symbol, `u32::MAX` where empty.
+    places: Vec<u32>,
+    /// The slots of `places` in use, so that emptying it costs the symbols rather than the table.
+    taken: Vec<u32>,
+}
+
+impl Gains {
+    /// Empties the candidates, with room for `most` of them.
+    fn clear(&mut self, most: usize) {
+        for place in self.taken.drain(..) {
+            self.places[place as usize] = u32::MAX;
+        }
+        let wanted = (most * 2).next_power_of_two();
+        if self.places.len() < wanted {
+            self.places = vec![u32::MAX; wanted];
+        }
+        self.gains.clear();
+    }
+
+    /// Adds `count` uses of `symbol` to its gain, making it a candidate if it is not one yet.
+    fn add(&mut self, symbol: Symbol, count: u64) {
+        let gain = count * symbol.len() as u64;
+        let mask = self.places.len() - 1;
+        let mut place = gain_hash(symbol) & mask;
+        loop {
+            let at = self.places[place];
+            if at == u32::MAX {
+                self.places[place] = self.gains.len() as u32;
+                self.taken.push(place as u32);
+                self.gains.push((symbol, gain));
+                return;
+            }
+            if self.gains[at as usize].0 == symbol {
+                self.gains[at as usize].1 += gain;
+                return;
+            }
+            place = (place + 1) & mask;
+        }
+    }
 }
 
 /// How many symbol ids there are: 256 codes and 256 escaped bytes.
@@ -459,7 +520,12 @@ const IDS: usize = 512;
 
 impl Counts {
     fn new() -> Self {
-        Self { single: vec![0; IDS], pairs: vec![0; IDS * IDS], seen: Vec::new() }
+        Self {
+            single: vec![0; IDS],
+            pairs: vec![0; IDS * IDS],
+            seen: Vec::new(),
+            gains: Gains::default(),
+        }
     }
 
     fn clear(&mut self) {
@@ -487,31 +553,26 @@ impl Counts {
     /// was used. A concatenation is scored on the length it would have, so a pair of four byte
     /// symbols scores as eight and a pair of six byte ones also scores as eight, because that is
     /// what it would be cut down to.
-    fn best(&self, table: &SymbolTable) -> Vec<Symbol> {
-        let mut gains: Vec<(Symbol, u64)> = Vec::with_capacity(IDS + self.seen.len());
+    fn best(&mut self, table: &SymbolTable) -> Vec<Symbol> {
+        // Different ids can spell the same symbol, a code and the pair it was learned from for one,
+        // and two pairs whose concatenation runs past eight bytes for another, so the gains are
+        // summed per symbol before anything is ranked. This was a sort of every candidate by symbol
+        // followed by a dedup, and on a ClickBench load that sort was a quarter of training.
+        self.gains.clear(IDS + self.seen.len());
         for (id, count) in self.single.iter().enumerate() {
             if *count == 0 {
                 continue;
             }
             let symbol = symbol_of(table, id as u16);
-            gains.push((symbol, u64::from(*count) * symbol.len() as u64));
+            self.gains.add(symbol, u64::from(*count));
         }
         for slot in &self.seen {
             let slot = *slot as usize;
             let (first, second) = ((slot / IDS) as u16, (slot % IDS) as u16);
             let symbol = symbol_of(table, first).concat(symbol_of(table, second));
-            gains.push((symbol, u64::from(self.pairs[slot]) * symbol.len() as u64));
+            self.gains.add(symbol, u64::from(self.pairs[slot]));
         }
-        // Different ids can spell the same symbol, a code and the pair it was learned from for one,
-        // so the gains are summed per symbol before anything is ranked.
-        gains.sort_unstable_by_key(|(symbol, _)| *symbol);
-        gains.dedup_by(|next, kept| {
-            let same = next.0 == kept.0;
-            if same {
-                kept.1 += next.1;
-            }
-            same
-        });
+        let gains = &mut self.gains.gains;
         // Gain first, then the symbol itself, so that two symbols with the same gain come out in the
         // same order on every host and the table is a function of the sample and nothing else. The
         // symbols are distinct by now, so the order is total and an unstable sort gives one answer.
@@ -523,8 +584,13 @@ impl Counts {
             gains.truncate(MAX_SYMBOLS);
         }
         gains.sort_unstable_by(order);
-        gains.into_iter().map(|(symbol, _)| symbol).collect()
+        gains.iter().map(|(symbol, _)| *symbol).collect()
     }
+}
+
+/// Where a symbol's search for its place in [`Gains::places`] starts.
+fn gain_hash(symbol: Symbol) -> usize {
+    ((symbol.value ^ u64::from(symbol.len)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize
 }
 
 fn symbol_of(table: &SymbolTable, id: u16) -> Symbol {
@@ -852,6 +918,8 @@ mod tests {
                 .map(|index| format!("prefix-{}-suffix-{}", index % 7, index % 5).into_bytes())
                 .collect(),
         );
+        // One after another on one thread, so every table after the first is trained on the counts
+        // the one before it left behind, which is what a load does block after block.
         for strings in &shapes {
             let samples = borrow(strings);
             assert_eq!(SymbolTable::train(&samples).symbols, train_with_maps(&samples).symbols);
