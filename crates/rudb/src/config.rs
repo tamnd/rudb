@@ -149,7 +149,7 @@ impl Config {
     }
 
     /// The fewest rows a Parquet file has to hold before it is mirrored, which is `RUDB_MIRROR_ROWS`
-    /// where that is set and [`MIRROR_ROWS`] otherwise.
+    /// where that is set and `MIRROR_ROWS` otherwise.
     #[must_use]
     pub fn mirror_rows(&self) -> u64 {
         self.mirror_rows

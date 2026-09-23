@@ -59,7 +59,7 @@
 //! anything else.
 //!
 //! And elimination proper will not fire where the parent's columns would be missed. That is the
-//! same question [`crate::link::absorbed`] asks for the link join's extra column, asked about
+//! same question `crate::link::absorbed` asks for the link join's extra column, asked about
 //! columns going away rather than one arriving, and for the same reason: an operator that reads its
 //! input by position or reads all of it sees a change of width as a change of answer.
 
