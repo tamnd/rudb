@@ -1285,7 +1285,9 @@ impl GlobalDictionary {
     /// of the index alone. What they buy there depends entirely on the column and is much less than
     /// it looks on the columns that cost the most, which [`sort_by_value`] measures.
     fn ranked_with_values(&self, file: Option<&File>) -> Result<RankedDictionary> {
+        let t0 = std::time::Instant::now();
         let (flat, bases) = self.decoded(file)?;
+        if std::env::var_os("RUDB_CLOSE_TRACE").is_some() { eprintln!("decoded in {:.3}", t0.elapsed().as_secs_f64()); }
         let value = |code: u32| {
             let (from, to) = Self::value_span(&self.ends, &bases, code as usize);
             flat.get(from..to).unwrap_or_default()
