@@ -6007,10 +6007,10 @@ mod tests {
     use std::sync::Arc;
 
     use rudb_common::{Field, LogicalType, Memory, Value};
+    use rudb_kernels::NOWHERE;
     use rudb_pipeline::Sink;
     use rudb_plan::{Plan, Slice};
     use rudb_vector::{Chunk, Data, Vector};
-    use rudb_kernels::NOWHERE;
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
@@ -6044,10 +6044,8 @@ mod tests {
     #[test]
     fn slots_in_runs_are_cut_into_them_and_slots_in_no_order_are_not() {
         let lengths = [(4, 40), (NOWHERE, 17), (1, 1), (4, 30), (0, 16)];
-        let slots: Vec<usize> = lengths
-            .iter()
-            .flat_map(|&(slot, length)| std::iter::repeat_n(slot, length))
-            .collect();
+        let slots: Vec<usize> =
+            lengths.iter().flat_map(|&(slot, length)| std::iter::repeat_n(slot, length)).collect();
         let mut runs = Vec::new();
         assert!(slot_runs_of(&slots, &mut runs));
         let mut end = 0;
