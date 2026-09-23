@@ -729,15 +729,7 @@ impl Table {
 
     fn finish(&mut self, bound: usize, memory: &Memory) -> Result<Output> {
         let timing = stage::Timing::start(Stage::Emit);
-        let mut best: Vec<usize> = Vec::with_capacity(bound.min(self.states.len()));
-        for slot in 0..self.states.len() {
-            let at =
-                best.partition_point(|&kept| self.states[kept].count >= self.states[slot].count);
-            if at < bound {
-                best.insert(at, slot);
-                best.truncate(bound);
-            }
-        }
+        let best = crate::group::largest(self.states.len(), bound, |slot| self.states[slot].count);
         let mut output = Vec::with_capacity(best.len());
         for slot in best {
             let key = self.keys[slot];
