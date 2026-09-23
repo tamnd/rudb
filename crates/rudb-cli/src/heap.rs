@@ -79,6 +79,23 @@ pub(crate) fn keep_freed_memory() {
     }
 }
 
+/// Tells mimalloc not to give anything back from here on, which is for the moment before the
+/// process exits.
+///
+/// mimalloc's exit handler collects every heap with the purge forced, and a forced purge hands
+/// back every page still held with `madvise`, one page table entry at a time, moments before the
+/// kernel takes the whole address space back anyway. On ClickBench q41 over the native 10m table
+/// that was a quarter of the samples in the process, 265 MB decommitted by the main thread after
+/// the answer was already written. A purge delay below zero is mimalloc's way of saying never
+/// purge, and the collect at exit reads it.
+pub(crate) fn keep_everything_at_exit() {
+    // SAFETY: as in [`keep_freed_memory`].
+    #[allow(unsafe_code)]
+    unsafe {
+        mi_option_set(PURGE_DELAY, -1);
+    }
+}
+
 /// The purge delay mimalloc is using, for the test that checks the option is the one meant.
 #[cfg(test)]
 fn purge_delay() -> c_long {
@@ -160,10 +177,11 @@ unsafe impl GlobalAlloc for MiMalloc {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIVEN, given, keep_freed_memory, purge_delay};
+    use super::{GIVEN, given, keep_everything_at_exit, keep_freed_memory, purge_delay};
 
     /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
-    /// other entry of the enum the constant could have drifted to.
+    /// other entry of the enum the constant could have drifted to, and the one set at exit turns
+    /// purging off.
     #[test]
     fn keeping_freed_memory_sets_the_purge_delay() {
         if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() {
@@ -172,6 +190,10 @@ mod tests {
         assert_eq!(purge_delay(), 10, "mimalloc's own default");
         keep_freed_memory();
         assert_eq!(purge_delay(), 100);
+        // In the same test rather than one of its own, because the option is process wide and the
+        // tests run at once.
+        keep_everything_at_exit();
+        assert_eq!(purge_delay(), -1);
     }
 
     /// The alignments the engine actually asks for take the plain call, and the ones that would not

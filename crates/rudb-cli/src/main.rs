@@ -76,5 +76,8 @@ fn main() -> ExitCode {
     #[cfg(feature = "mimalloc")]
     heap::keep_freed_memory();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    rudb_cli::run(&arguments, Box::new(std::io::stdout()), Box::new(std::io::stderr()))
+    let code = rudb_cli::run(&arguments, Box::new(std::io::stdout()), Box::new(std::io::stderr()));
+    #[cfg(feature = "mimalloc")]
+    heap::keep_everything_at_exit();
+    code
 }
