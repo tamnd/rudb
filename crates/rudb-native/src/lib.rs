@@ -41,7 +41,7 @@ use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as Atomic};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
@@ -190,6 +190,17 @@ const MAX_FREQUENCY_WORKERS: usize = 32;
 fn close_workers() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from).min(MAX_FREQUENCY_WORKERS)
 }
+
+/// How many decoded bytes the global dictionaries closing at the same time may hold between them.
+///
+/// Closing a dictionary decodes every value it holds, sorts them and drops them, and #1356 took the
+/// columns one at a time so that five of them decoded at once were not the peak of a load. On the
+/// ClickBench `hits` 10M load that made the dictionaries 1.9 s of a 6.3 s load on the 32 core box,
+/// with `Referer`, `Title` and `URL` each most of a second on their own. A column is taken while the
+/// ones already closing leave room for it under this, and always when nothing else is closing, so
+/// every column of `hits` at 10M rows closes at once and `URL` at 100M, which is past this alone,
+/// still closes on its own.
+const CLOSE_DICTIONARY_BYTES: usize = 1 << 30;
 
 /// The most threads one stripe's encode is spread over.
 ///
@@ -1282,6 +1293,16 @@ impl GlobalDictionary {
     /// How many distinct values this dictionary holds, which is one past its largest code.
     fn values(&self) -> usize {
         self.ends.len()
+    }
+
+    /// About how many bytes closing this dictionary holds at once: every value decoded, and a
+    /// sort entry and a code for each.
+    fn closing_bytes(&self) -> usize {
+        let values = self.values();
+        let decoded = (0..values.div_ceil(TEXT_PAYLOAD_VALUES))
+            .map(|block| self.ends[((block + 1) * TEXT_PAYLOAD_VALUES).min(values) - 1] as usize)
+            .sum::<usize>();
+        decoded.saturating_add(values.saturating_mul(size_of::<(u64, u32)>() + size_of::<u32>()))
     }
 
     /// How many blocks are encoded, written or not, which is the number the next one has to have.
@@ -2929,11 +2950,10 @@ impl Writer {
         self.place_blocks()?;
         // The numeric frequencies and the global dictionaries read what is already written and
         // write nothing, so they run at the same time. Each was most of a second on `hits` with the
-        // other waiting for it, and neither keeps every core busy on its own: the frequencies are
-        // as long as their longest column and the dictionaries go one column at a time. The
-        // frequencies charge themselves, one span to each thread that counts, because they run on
-        // threads of their own and a span on this one would see their wall time and none of their
-        // CPU.
+        // other waiting for it, and neither keeps every core busy on its own: each is as long as
+        // its longest column. Both charge themselves, one span to each thread that works, because
+        // they run on threads of their own and a span on this one would see their wall time and
+        // none of their CPU.
         let this = &*self;
         let (numeric, closed) = std::thread::scope(|scope| {
             let numeric = scope.spawn(|| {
@@ -2946,15 +2966,7 @@ impl Writer {
                 let pairs = this.pair_frequencies(&frequencies)?;
                 Ok::<_, Error>((frequencies, distincts, pairs))
             });
-            let closed = this
-                .dictionaries
-                .iter()
-                .enumerate()
-                .map(|(index, dictionary)| {
-                    dictionary.as_ref().map(|dictionary| this.close_dictionary(index, dictionary))
-                })
-                .map(Option::transpose)
-                .collect::<Result<Vec<_>>>();
+            let closed = this.close_dictionaries();
             let numeric =
                 numeric.join().map_err(|_| Error::internal("the native frequency thread panicked"));
             (numeric, closed)
@@ -3028,13 +3040,93 @@ impl Writer {
         })
     }
 
+    /// Every global dictionary's page and statistics, by column, as many columns at a time as
+    /// [`CLOSE_DICTIONARY_BYTES`] allows.
+    ///
+    /// The largest column that fits is the one taken next, so the long ones start first and the
+    /// short ones fill in behind them. A column that does not fit waits for one that is closing to
+    /// finish, unless nothing is closing, in which case it goes alone.
+    fn close_dictionaries(&self) -> Result<Vec<Option<ClosedDictionary>>> {
+        let mut jobs = self
+            .dictionaries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, dictionary)| {
+                dictionary
+                    .as_ref()
+                    .map(|dictionary| (index, dictionary, dictionary.closing_bytes()))
+            })
+            .collect::<Vec<_>>();
+        jobs.sort_by_key(|&(_, _, bytes)| bytes);
+        let mut closed = (0..self.dictionaries.len()).map(|_| None).collect::<Vec<_>>();
+        let workers = close_workers().min(jobs.len());
+        if workers <= 1 {
+            for (index, dictionary, _) in jobs {
+                closed[index] = Some(self.close_dictionary(index, dictionary)?);
+            }
+            return Ok(closed);
+        }
+        // The columns not taken yet, smallest first, and the bytes the ones closing now hold.
+        let state = Mutex::new((jobs, 0_usize));
+        let finished = Condvar::new();
+        let profile = self.profile.as_deref();
+        let pieces = std::thread::scope(|scope| {
+            (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _timing = profile.map(|profile| profile.span(Stage::Dictionary));
+                        let mut mine = Vec::new();
+                        loop {
+                            let mut held = state.lock().map_err(|_| {
+                                Error::internal("a native dictionary worker panicked")
+                            })?;
+                            let (index, dictionary, bytes) = loop {
+                                let (jobs, busy) = &mut *held;
+                                if jobs.is_empty() {
+                                    return Ok(mine);
+                                }
+                                let fits = jobs.iter().rposition(|&(_, _, bytes)| {
+                                    *busy == 0
+                                        || busy.saturating_add(bytes) <= CLOSE_DICTIONARY_BYTES
+                                });
+                                if let Some(at) = fits {
+                                    let job = jobs.remove(at);
+                                    *busy += job.2;
+                                    break job;
+                                }
+                                held = finished.wait(held).map_err(|_| {
+                                    Error::internal("a native dictionary worker panicked")
+                                })?;
+                            };
+                            drop(held);
+                            // Given back on the way out whether the close worked, failed or
+                            // panicked, so that a worker waiting for room is never left waiting.
+                            let _room = Room { state: &state, finished: &finished, bytes };
+                            mine.push((index, self.close_dictionary(index, dictionary)?));
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| Error::internal("a native dictionary worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (index, one) in pieces.into_iter().flatten() {
+            closed[index] = Some(one);
+        }
+        Ok(closed)
+    }
+
     /// One global dictionary's page and statistics, built from what is already in the file.
     ///
     /// Nothing is written here, so that [`Self::close`] can run this beside the numeric frequencies
     /// and put the pages down afterwards in column order, which is where they always went. The
-    /// column's values are decoded in here and dropped before it returns, because five ClickBench
-    /// string columns decoded at once is the peak an earlier change took out, and the columns are
-    /// still taken one at a time for that reason.
+    /// column's values are decoded in here and dropped before it returns, and
+    /// [`Self::close_dictionaries`] decides how many columns are in here at once.
     fn close_dictionary(
         &self,
         index: usize,
@@ -9623,6 +9715,22 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
     Ok(Some(out))
 }
 
+/// The room one closing dictionary takes under [`CLOSE_DICTIONARY_BYTES`], given back when dropped.
+struct Room<'a, T> {
+    state: &'a Mutex<(T, usize)>,
+    finished: &'a Condvar,
+    bytes: usize,
+}
+
+impl<T> Drop for Room<'_, T> {
+    fn drop(&mut self) {
+        let mut held = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        held.1 -= self.bytes;
+        drop(held);
+        self.finished.notify_all();
+    }
+}
+
 /// What [`Writer::close_dictionary`] builds for one column and [`Writer::close`] writes.
 struct ClosedDictionary {
     distinct: u64,
@@ -9804,8 +9912,7 @@ fn sort_by_value_across<'a>(
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
-                    let taken =
-                        queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop();
+                    let taken = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
                     let Some(run) = taken else { break };
                     sort_by_value(run, values);
                 }
@@ -13899,6 +14006,56 @@ mod tests {
                     "rank {rank} follows the one before it"
                 );
             }
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Five text columns of different sizes close at the same time, and each comes back with its
+    /// own values in its own order.
+    ///
+    /// The sizes differ so that the columns are taken in an order that is not the column order, and
+    /// the values of each column are spelled with its number so that one column's page written in
+    /// another's place would read back as the wrong strings rather than the right ones by chance.
+    #[test]
+    fn text_columns_closed_at_once_each_keep_their_own_dictionary() {
+        let sizes = [300_usize, 5_000, 40, 2_000, 1_200];
+        let path = path("dictionaries-at-once");
+        let fields = (0..sizes.len())
+            .map(|column| Field::new(format!("text{column}"), LogicalType::Varchar))
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(&path, "items", fields).expect("new file");
+        let rows = 10_000_usize;
+        for start in (0..rows).step_by(1_024) {
+            let columns = sizes
+                .iter()
+                .enumerate()
+                .map(|(column, &size)| {
+                    let values = (start..(start + 1_024).min(rows))
+                        .map(|row| Value::Varchar(format!("c{column}-{:05}", (row * 7919) % size)))
+                        .collect::<Vec<_>>();
+                    Vector::from_values(LogicalType::Varchar, &values).expect("strings")
+                })
+                .collect::<Vec<_>>();
+            writer.append(&Chunk::new(columns).expect("five columns")).expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        for (column, &size) in sizes.iter().enumerate() {
+            let dictionary =
+                reader.dictionary(column).expect("read").expect("a string column has one");
+            let count = dictionary.ranks().expect("a v10 file stores one");
+            assert_eq!(count, size, "column {column} has its own distinct count");
+            let ranked = (0..count)
+                .map(|rank| {
+                    let code = dictionary.code_at_rank(rank).expect("a code");
+                    dictionary.try_bytes_at(code as usize).expect("read").expect("a value").to_vec()
+                })
+                .collect::<Vec<_>>();
+            let expected = (0..size)
+                .map(|value| format!("c{column}-{value:05}").into_bytes())
+                .collect::<Vec<_>>();
+            assert_eq!(ranked, expected, "column {column} ranks its own values in order");
         }
         fs::remove_file(path).expect("remove scratch file");
     }
