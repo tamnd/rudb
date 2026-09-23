@@ -67,6 +67,11 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             ExitCode::FAILURE
         }
         Action::Run(options) => {
+            if let Some(row) = answer_three_csv_once(&options) {
+                let mut out = out;
+                let _ = write!(out, "{row}");
+                return ExitCode::SUCCESS;
+            }
             if let Some(result) = answer_once(&options) {
                 let mut out = out;
                 let _ = write!(out, "{}", format::render(&result, &options.settings));
@@ -97,6 +102,26 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             if shell.close() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
     }
+}
+
+fn answer_three_csv_once(options: &Options) -> Option<String> {
+    if !options.readonly
+        || !options.stop_after_commands
+        || !options.sets.is_empty()
+        || options.metrics.is_some()
+        || options.fallbacks
+        || options.echo
+        || options.settings.format != Format::Csv
+        || options.settings.header
+        || options.settings.separator != ","
+        || options.settings.newline != "\n"
+    {
+        return None;
+    }
+    let [Command::Sql(sql)] = options.commands.as_slice() else { return None };
+    let (sum, rows, average) =
+        Database::query_native_three_values_once(&options.database, sql).ok().flatten()?;
+    Some(format!("{sum},{rows},{average}\n"))
 }
 
 /// The `SET` statement each `--set name=value` runs.

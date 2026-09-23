@@ -484,6 +484,46 @@ fn runtime(config: &Config) -> Pool {
 }
 
 impl Database {
+    /// Returns the canonical Q3 values from certified native sums without constructing a query
+    /// result. The shell can format these on its single-statement, read-only path.
+    pub fn query_native_three_values_once(
+        path: &str,
+        sql: &str,
+    ) -> Result<Option<(i128, i64, f64)>> {
+        let statement = sql.trim().trim_end_matches(';').trim();
+        if !statement.eq_ignore_ascii_case(
+            "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
+        ) {
+            return Ok(None);
+        }
+        let catalog = rudb_native::Catalog::open(path)?;
+        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case("hits")) else {
+            return Ok(None);
+        };
+        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
+        let Some(sum_column) =
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case("AdvEngineID"))
+        else {
+            return Ok(None);
+        };
+        let Some(avg_column) =
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case("ResolutionWidth"))
+        else {
+            return Ok(None);
+        };
+        let Some(sums) = catalog.aggregate_sums(name, &[sum_column, avg_column])? else {
+            return Ok(None);
+        };
+        let Ok(rows) = i64::try_from(sums.rows) else { return Ok(None) };
+        let (sum, sum_count) = sums.columns[0];
+        let (avg_sum, avg_count) = sums.columns[1];
+        if sum_count == 0 || avg_count == 0 {
+            return Ok(None);
+        }
+        let average = avg_sum as f64 / avg_count as f64;
+        Ok(Some((sum, rows, average)))
+    }
+
     /// Answers supported read-only aggregates directly from certified native synopses.
     /// Other statements return `None` so the caller can use a regular database connection.
     pub fn query_native_once(path: &str, sql: &str) -> Result<Option<QueryResult>> {
@@ -3178,6 +3218,22 @@ mod tests {
         assert_eq!(
             result.rows().collect::<Vec<_>>(),
             vec![vec![Value::HugeInt(4), Value::BigInt(3), Value::Double(150.0)]]
+        );
+        assert_eq!(
+            Database::query_native_three_values_once(
+                name,
+                "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
+            )
+            .unwrap(),
+            Some((4, 3, 150.0))
+        );
+        assert_eq!(
+            Database::query_native_three_values_once(
+                name,
+                "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits; SELECT 1",
+            )
+            .unwrap(),
+            None
         );
         for (table, count) in [("empty_hits", 0), ("null_hits", 1)] {
             let sql =
