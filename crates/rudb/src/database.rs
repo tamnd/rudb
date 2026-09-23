@@ -68,6 +68,32 @@ fn native_simple_average_statement(sql: &str) -> Option<(&str, &str)> {
     (native_simple_identifier(column) && native_simple_identifier(table)).then_some((table, column))
 }
 
+/// Recognizes an unquoted count filtered by a nonzero integer column. Other SQL syntax goes
+/// through the regular parser and executor.
+fn native_simple_nonzero_statement(sql: &str) -> Option<(&str, &str)> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let count = words.next()?;
+    let from = words.next()?;
+    let table = words.next()?;
+    let where_keyword = words.next()?;
+    let column = words.next()?;
+    let comparison = words.next()?;
+    let zero = words.next()?;
+    (words.next().is_none()
+        && select.eq_ignore_ascii_case("select")
+        && count.eq_ignore_ascii_case("count(*)")
+        && from.eq_ignore_ascii_case("from")
+        && where_keyword.eq_ignore_ascii_case("where")
+        && comparison == "<>"
+        && zero == "0"
+        && native_simple_identifier(table)
+        && native_simple_identifier(column))
+    .then_some((table, column))
+}
+
 /// Recognizes a single unquoted COUNT(DISTINCT column) without parsing a general SQL result.
 fn native_simple_distinct_statement(sql: &str) -> Option<(&str, &str)> {
     let statement = sql.trim();
@@ -691,6 +717,42 @@ fn runtime(config: &Config) -> Pool {
 }
 
 impl Database {
+    /// Returns a filtered count for the narrow read-only CSV path without building a query
+    /// result. The count is derived from column frequencies when the statement runs.
+    pub fn query_native_nonzero_value_once(path: &str, sql: &str) -> Result<Option<i64>> {
+        let Some((table, column)) = native_simple_nonzero_statement(sql) else { return Ok(None) };
+        let native = rudb_native::Catalog::open(path)?;
+        let Some(table) = native.names().find(|name| name.eq_ignore_ascii_case(table)) else {
+            return Ok(None);
+        };
+        let Some(fields) = native.table_fields(table) else { return Ok(None) };
+        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            fields[index].ty,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
+        ) {
+            return Ok(None);
+        }
+        let Some(frequencies) = native.exact_numeric_frequencies(table, index)? else {
+            return Ok(None);
+        };
+        let count = frequencies
+            .iter()
+            .filter(|(value, _)| value.is_some_and(|value| value != 0))
+            .try_fold(0_u64, |total, (_, count)| total.checked_add(*count));
+        Ok(count.and_then(|count| i64::try_from(count).ok()))
+    }
+
     /// Returns the canonical Q8 groups from a complete native frequency certificate without
     /// constructing a query result. Other statement shapes use regular SQL execution.
     pub fn query_native_frequency_values_once(
@@ -3776,6 +3838,37 @@ mod tests {
             let parsed = rudb_parse::parse_ast(sql).expect("query parses");
             assert_eq!(native_nonzero_shape(&parsed), None, "{sql}");
         }
+    }
+
+    #[test]
+    fn cold_nonzero_csv_count_uses_column_frequencies() {
+        let path = std::env::temp_dir().join(format!("rudb-q2-csv-{}.rdb", std::process::id()));
+        let name = path.to_str().unwrap();
+        let database = Database::open(name).unwrap();
+        database.execute("CREATE TABLE hits (AdvEngineID SMALLINT)").unwrap();
+        database.execute("INSERT INTO hits VALUES (0), (NULL), (2), (-3)").unwrap();
+        database.execute("CREATE TABLE events (engine INTEGER)").unwrap();
+        database.execute("INSERT INTO events VALUES (0), (8), (NULL)").unwrap();
+        drop(database);
+        let sql = "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0";
+        assert_eq!(Database::query_native_nonzero_value_once(name, sql).unwrap(), Some(2));
+        assert_eq!(
+            Database::query_native_nonzero_value_once(
+                name,
+                "select count(*) from events where engine <> 0;"
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            Database::query_native_nonzero_value_once(
+                name,
+                "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 1"
+            )
+            .unwrap(),
+            None
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

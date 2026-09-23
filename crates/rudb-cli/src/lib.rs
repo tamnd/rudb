@@ -133,6 +133,8 @@ fn answer_native_csv_once(options: &Options) -> Option<String> {
         answer_three_csv_once(options)
     } else if prefix.eq_ignore_ascii_case("avg(") {
         answer_average_csv_once(options)
+    } else if expression.eq_ignore_ascii_case("count(*)") {
+        answer_nonzero_csv_once(options)
     } else if expression.eq_ignore_ascii_case("count(distinct") {
         answer_distinct_csv_once(options)
     } else if expression.eq_ignore_ascii_case("AdvEngineID,") {
@@ -140,6 +142,12 @@ fn answer_native_csv_once(options: &Options) -> Option<String> {
     } else {
         None
     }
+}
+
+fn answer_nonzero_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
+    let count = Database::query_native_nonzero_value_once(&options.database, sql).ok().flatten()?;
+    Some(format!("{count}\n"))
 }
 
 fn answer_frequency_csv_once(options: &Options) -> Option<String> {
