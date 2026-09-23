@@ -1164,8 +1164,9 @@ impl GlobalDictionary {
         let mut grams = [0_u8; TEXT_GRAM_BYTES];
         for value in self.slices(at, &bytes) {
             for gram in value.windows(4) {
-                let bit = gram_bit(gram);
-                grams[bit / 8] |= 1 << (bit % 8);
+                for bit in gram_bits(gram) {
+                    grams[bit / 8] |= 1 << (bit % 8);
+                }
             }
         }
         self.grams.push(grams);
@@ -3312,12 +3313,16 @@ const TEXT_PAYLOAD_VALUES: usize = 1024;
 const TEXT_GRAM_BYTES: usize = 2048;
 
 /// A fast mixing step for exactly four bytes, shared by load and query.
-fn gram_bit(bytes: &[u8]) -> usize {
-    let mut word = u32::from_le_bytes(bytes.try_into().expect("a four-byte gram"));
-    word ^= word >> 16;
-    word = word.wrapping_mul(0x7feb_352d);
-    word ^= word >> 15;
-    (word as usize) & (TEXT_GRAM_BYTES * 8 - 1)
+fn gram_bits(bytes: &[u8]) -> [usize; 2] {
+    let original = u32::from_le_bytes(bytes.try_into().expect("a four-byte gram"));
+    let mut first = original ^ (original >> 16);
+    first = first.wrapping_mul(0x7feb_352d);
+    first ^= first >> 15;
+    let mut second = original ^ (original >> 17);
+    second = second.wrapping_mul(0x846c_a68b);
+    second ^= second >> 16;
+    let mask = TEXT_GRAM_BYTES * 8 - 1;
+    [(first as usize) & mask, (second as usize) & mask]
 }
 
 /// How many decoded payload bytes one dictionary keeps before a sweep stops keeping what it reads.
@@ -3735,8 +3740,7 @@ impl TextSource for NativeText {
             return true;
         };
         literal.windows(4).all(|gram| {
-            let bit = gram_bit(gram);
-            bits[bit / 8] & (1 << (bit % 8)) != 0
+            gram_bits(gram).into_iter().all(|bit| bits[bit / 8] & (1 << (bit % 8)) != 0)
         })
     }
 
