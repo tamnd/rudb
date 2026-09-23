@@ -17,9 +17,16 @@
 //!    statistics of every column are folded into a gather of the stripe's own.
 //! 2. [`Writer::merge`], under the lock. The stripe's dictionaries go into the global ones a
 //!    distinct value at a time, which gives back what each local code is globally, and the gathers
-//!    are absorbed. This is the only step that has to see the stripes one at a time.
-//! 3. [`Merged::pages`], with no lock. The codes are turned into global ones and built into pages.
-//! 4. [`Writer::write`], under the lock. The pages go into the file.
+//!    are absorbed. This is the only step that has to see the stripes one at a time. Every
+//!    dictionary block the merge filled is taken out with the stripe.
+//! 3. [`Merged::pages`], with no lock. The codes are turned into global ones and built into pages,
+//!    and the dictionary blocks the merge took out are encoded.
+//! 4. [`Writer::write`], under the lock. The dictionary blocks go back in order, and they and the
+//!    pages go into the file.
+//!
+//! The dictionary blocks were encoded in the fourth step, under the lock, until the 10m ClickBench
+//! load on the 32 core box was measured spending 2.7 of its 14 seconds there, on thirty two threads
+//! spawned for it every stripe, with every instance queued behind them.
 //!
 //! A value merged in the order the stripe first held it gets the code it would have got had the
 //! stripe been coded against the global dictionary row by row, because the rows before its first
@@ -45,9 +52,9 @@ use rudb_vector::{Bitmap, Chunk, Data, StringColumn, Validity, Vector};
 
 use super::{
     ColumnStripe, DICTIONARY_CHECK_SEED, DICTIONARY_DECIDE_ROWS, DICTIONARY_DISTINCT_IN_TEN,
-    GlobalDictionary, MAX_ENCODE_WORKERS, MAX_PAGE, Part, PendingChunk, STRIPE_PARTS, Spread,
-    Writer, checksum, coded_page, invalid, push_validity, seeded_checksum, stats, unique_codes,
-    weight,
+    EncodedBlock, GlobalDictionary, MAX_ENCODE_WORKERS, MAX_PAGE, Part, PendingChunk, STRIPE_PARTS,
+    Spread, Unencoded, Writer, checksum, coded_page, invalid, push_validity, seeded_checksum,
+    stats, unique_codes, weight,
 };
 
 /// How many stripes are being prepared or paged right now, across every writer in the process.
@@ -105,6 +112,7 @@ pub struct Prepared {
 pub struct Merged {
     parts: Vec<Part>,
     columns: Vec<Merge>,
+    blocks: Vec<Unencoded>,
     profile: Option<Arc<LoadProfile>>,
 }
 
@@ -113,6 +121,14 @@ pub struct Merged {
 pub struct Paged {
     parts: Vec<Part>,
     columns: Vec<ColumnStripe>,
+    /// Encoded dictionary blocks, each with its column and block number.
+    blocks: Vec<(usize, usize, EncodedBlock)>,
+}
+
+/// What one job of [`Merged::pages`] built.
+enum Built {
+    Stripe(ColumnStripe),
+    Block(EncodedBlock),
 }
 
 /// One column of a prepared stripe.
@@ -484,29 +500,49 @@ impl Preparer {
 
 impl Merged {
     /// Builds the pages the merge left to build, which is every column coded against a global
-    /// dictionary and every column that lost one after the stripe was prepared.
+    /// dictionary and every column that lost one after the stripe was prepared, and encodes the
+    /// dictionary blocks the merge filled.
     ///
     /// # Errors
     ///
-    /// If a column cannot be encoded or a page comes out larger than a page may be.
+    /// If a column or a block cannot be encoded or a page comes out larger than a page may be.
     pub fn pages(self) -> Result<Paged> {
-        let Self { parts, columns, profile } = self;
+        let Self { parts, columns, blocks, profile } = self;
         let width = columns.len();
-        let mut jobs = (0..width)
-            .filter(|&index| !matches!(columns[index], Merge::Pages(_)))
+        // The blocks go first so that they are taken last. One block is a thousand values, which is
+        // less than any column of a stripe, and small jobs at the end are what keeps the last
+        // worker from finishing long after the others.
+        let mut jobs = (width..width + blocks.len())
+            .chain((0..width).filter(|&index| !matches!(columns[index], Merge::Pages(_))))
             .collect::<Vec<_>>();
         // A column encoded again from its rows costs more than one whose codes only need building.
-        jobs.sort_by_key(|&index| matches!(columns[index], Merge::Plain(_)));
+        jobs.sort_by_key(|&index| index < width && matches!(columns[index], Merge::Plain(_)));
         let share = Share::take(jobs.len(), parts.len());
-        let built = fan_out(jobs, share.0, profile.as_deref(), |index| match &columns[index] {
-            Merge::Codes { parts, global } => code_pages(parts, global),
-            Merge::Plain(local) => Writer::encode_pages(&local.rows()?.iter().collect::<Vec<_>>()),
-            Merge::Pages(_) => Err(Error::internal("a finished column was queued to be built")),
+        let built = fan_out(jobs, share.0, profile.as_deref(), |index| {
+            let Some(column) = columns.get(index) else {
+                return Ok(Built::Block(blocks[index - width].encode()?));
+            };
+            Ok(Built::Stripe(match column {
+                Merge::Codes { parts, global } => code_pages(parts, global)?,
+                Merge::Plain(local) => {
+                    Writer::encode_pages(&local.rows()?.iter().collect::<Vec<_>>())?
+                }
+                Merge::Pages(_) => {
+                    return Err(Error::internal("a finished column was queued to be built"));
+                }
+            }))
         })?;
         drop(share);
         let mut slots: Vec<Option<ColumnStripe>> = (0..width).map(|_| None).collect();
-        for (index, stripe) in built {
-            slots[index] = Some(stripe);
+        let mut encoded = Vec::with_capacity(blocks.len());
+        for (index, one) in built {
+            match one {
+                Built::Stripe(stripe) => slots[index] = Some(stripe),
+                Built::Block(block) => {
+                    let (column, at) = blocks[index - width].place();
+                    encoded.push((column, at, block));
+                }
+            }
         }
         let columns = columns
             .into_iter()
@@ -516,7 +552,7 @@ impl Merged {
                 _ => Err(Error::internal("a column was never encoded")),
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Paged { parts, columns })
+        Ok(Paged { parts, columns, blocks: encoded })
     }
 }
 
@@ -624,8 +660,19 @@ impl Writer {
                 }
             });
         }
+        // Settled here rather than when the stripe is written, so that the blocks this merge filled
+        // go out with it already knowing their shape. A column still too small to settle one keeps
+        // its blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them, because
+        // encoding them now would be encoding them without having looked at the column.
+        let mut blocks = Vec::new();
+        for (index, dictionary) in self.dictionaries.iter_mut().enumerate() {
+            if let Some(dictionary) = dictionary {
+                dictionary.settle()?;
+                blocks.extend(dictionary.hand_out(index));
+            }
+        }
         drop(timing);
-        Ok(Merged { parts, columns: merged, profile })
+        Ok(Merged { parts, columns: merged, blocks, profile })
     }
 
     /// Writes a stripe whose pages are built.
@@ -638,10 +685,18 @@ impl Writer {
     }
 
     pub(crate) fn write_paged(&mut self, paged: Paged) -> Result<()> {
-        if paged.parts.is_empty() {
-            return Ok(());
+        let Paged { parts, columns, blocks } = paged;
+        for (column, at, block) in blocks {
+            self.dictionaries
+                .get_mut(column)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| Error::internal("a dictionary block came back to no dictionary"))?
+                .take_back(at, block)?;
         }
-        self.write_stripe(&paged.parts, paged.columns)
+        if parts.is_empty() {
+            return self.place_blocks();
+        }
+        self.write_stripe(&parts, columns)
     }
 
     /// All four steps one after the other, for a caller with nobody to share the writer with.
