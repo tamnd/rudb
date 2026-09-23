@@ -66,12 +66,14 @@ pub enum Stage {
     Scatter,
     /// Folding one instance's table into another, one probe per group rather than per row.
     Merge,
+    /// Counting groups after a grouped distinct pass has discarded duplicate pairs.
+    Count,
     /// Turning a finished table into the chunks it answers for.
     Emit,
 }
 
 /// How many stages there are, which is how wide a [`Spent`] is.
-const STAGES: usize = 10;
+const STAGES: usize = 11;
 
 impl Stage {
     /// Every stage, in the order the work goes through them.
@@ -85,6 +87,7 @@ impl Stage {
         Self::Fold,
         Self::Scatter,
         Self::Merge,
+        Self::Count,
         Self::Emit,
     ];
 
@@ -101,6 +104,7 @@ impl Stage {
             Self::Fold => "fold",
             Self::Scatter => "scatter",
             Self::Merge => "merge",
+            Self::Count => "count",
             Self::Emit => "emit",
         }
     }
@@ -118,7 +122,8 @@ impl Stage {
             Self::Fold => 6,
             Self::Scatter => 7,
             Self::Merge => 8,
-            Self::Emit => 9,
+            Self::Count => 9,
+            Self::Emit => 10,
         }
     }
 }

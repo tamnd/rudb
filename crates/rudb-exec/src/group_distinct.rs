@@ -640,10 +640,10 @@ fn count_groups(
     let mut counts: Vec<i64> = Vec::new();
     reserving.stop(0);
 
-    let timing = stage::Timing::start(Stage::Fold);
+    let timing = stage::Timing::start(Stage::Count);
     for part in parts {
         for pair in &part.splits[split] {
-            let mut at = pair.group_hash as usize & mask;
+            let mut at = pair.hash() as usize & mask;
             loop {
                 let slot = buckets[at];
                 if slot == EMPTY {
@@ -843,7 +843,7 @@ fn added_up(parts: Vec<Partial>, shape: &Shape, bound: usize, memory: &Memory) -
     let mut counts: Vec<i64> = Vec::with_capacity(input);
     for part in parts {
         for (pair, &by) in part.groups.iter().zip(&part.counts) {
-            let mut at = pair.group_hash as usize & mask;
+            let mut at = pair.hash() as usize & mask;
             loop {
                 let slot = buckets[at];
                 if slot == EMPTY {
@@ -891,7 +891,7 @@ fn rehashed(capacity: usize, groups: &[Grouped]) -> Result<Vec<u32>> {
     for (slot, group) in groups.iter().enumerate() {
         let slot = u32::try_from(slot)
             .map_err(|_| Error::out_of_memory("a grouped distinct radix split is too large"))?;
-        let mut at = group.group_hash as usize & mask;
+        let mut at = group.hash() as usize & mask;
         while buckets[at] != EMPTY {
             at = (at + 1) & mask;
         }
