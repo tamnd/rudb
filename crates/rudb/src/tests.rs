@@ -8942,3 +8942,44 @@ fn struct_helpers_answer_what_the_pin_does() {
         "Binder Error: \"struct_contains\" can only be used on unnamed structs"
     );
 }
+
+/// Text casts to a list, a struct and a map the way the pin splits it, and a map casts to another
+/// map and a struct to a map.
+#[test]
+fn text_and_nested_values_cast_to_lists_structs_and_maps_the_way_the_pin_does() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT '[1,2]'::INT[]"), "[1, 2]");
+    assert_eq!(column("SELECT '[[1,2],[3]]'::INT[][]"), "[[1, 2], [3]]");
+    assert_eq!(column("SELECT '[1,,2]'::VARCHAR[]"), "[1, '', 2]");
+    assert_eq!(column("SELECT '[ null , NULL, \"null\"]'::VARCHAR[]"), "[NULL, NULL, 'null']");
+    assert_eq!(column("SELECT TRY_CAST('[1, x]' AS INT[])"), "[1, NULL]");
+    assert_eq!(column("SELECT TRY_CAST('[1, 2' AS INT[])"), "NULL");
+    assert_eq!(
+        error("SELECT '[1, 2'::INT[]"),
+        "Conversion Error: Type VARCHAR with value '[1, 2' can't be cast to the destination type \
+         INTEGER[]"
+    );
+    assert_eq!(column("SELECT '{b: 1}'::STRUCT(a INT, b INT)"), "{'a': NULL, 'b': 1}");
+    assert_eq!(column("SELECT '(1)'::STRUCT(a INT, b INT)"), "{'a': 1, 'b': NULL}");
+    assert_eq!(
+        column("SELECT '{a: {b: [1, 2]}}'::STRUCT(a STRUCT(b INT[]))"),
+        "{'a': {'b': [1, 2]}}"
+    );
+    assert_eq!(column("SELECT TRY_CAST('{x: 1}' AS STRUCT(a INT))"), "NULL");
+    assert_eq!(column("SELECT '  { a = 1 ,b= 2 }  '::MAP(VARCHAR, INT)"), "{a=1, b=2}");
+    assert_eq!(column("SELECT '{a={x=1}}'::MAP(VARCHAR, MAP(VARCHAR, INT))"), "{a={x=1}}");
+    assert_eq!(column("SELECT TRY_CAST('{a=1, b=x}' AS MAP(VARCHAR, INT))"), "{a=1, b=NULL}");
+    assert_eq!(
+        error("SELECT '{a=1, a=2}'::MAP(VARCHAR, INT)"),
+        "Invalid Input Error: Map keys must be unique."
+    );
+    assert_eq!(column("SELECT (MAP {1: 2})::MAP(BIGINT, DOUBLE)"), "{1=2.0}");
+    assert_eq!(column("SELECT (MAP {1.5: 2})::MAP(INT, INT)"), "{2=2}");
+    assert_eq!(column("SELECT {'a': 1, 'b': 'x'}::MAP(VARCHAR, VARCHAR)"), "{a=1, b=x}");
+    assert!(error("SELECT (MAP {'a': 'x'})::MAP(INT, INT)").starts_with("Conversion Error"));
+}
