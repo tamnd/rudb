@@ -96,8 +96,10 @@ strip = "debuginfo"
 # No `panic = "abort"`. spec/04-architecture.md section 4.9 catches at the FFI boundary and
 # converts to an error code, and that needs an unwinder.
 
-[profile.release.package.rudb-cli]
-opt-level = "z"
+# No size optimization for `rudb-cli` either. With LTO the link time passes run at the opt-level of
+# the crate being linked, so `opt-level = "z"` on the CLI size-optimized the whole engine and not the
+# CLI alone. It saved 0.8 MB of peak memory on a query that prints one row, and it made every
+# TPC-H query slower: 6.9 percent more instructions over the suite and 25 percent more cycles on q01.
 
 # A database is profiled far more often than it is shipped, so the release profile we actually
 # develop against keeps frame pointers and debug info.
