@@ -264,6 +264,26 @@ impl Plan {
         self.frequencies.len()
     }
 
+    /// Throws away everything the stores said about themselves, as if no store had said anything.
+    ///
+    /// This is `statistics = off` from `spec/stats/09-measurement.md` section 9.3, and it is one
+    /// method rather than a flag threaded through every consumer for a reason worth stating. A flag
+    /// per consumer is a list somebody has to keep complete, and the consumer added next year is the
+    /// one that is not on it. Taking the answers away instead means every consumer that exists and
+    /// every consumer anybody writes later reads `None` or `Stat::Unknown` through the same door it
+    /// already reads a real answer through, and takes the path it took before there was a directory
+    /// worth asking. There is nothing to forget to do.
+    ///
+    /// What this does not reach is the row group and stripe skipping the readers do while the query
+    /// runs, which reads a file's bounds rather than the plan's. That skipping cannot change an
+    /// answer, only how long one takes, so the differential half of the ablation does not need it.
+    /// The measurement half does, and it is not here yet.
+    pub fn forget_statistics(&mut self) {
+        self.zones.clear();
+        self.frequencies.clear();
+        self.distincts.clear();
+    }
+
     /// Records how many groups the aggregate binding its output to `index` is expected to produce.
     ///
     /// Written by one pass, `rudb_opt`'s `presize`, and only for an aggregate whose count it got

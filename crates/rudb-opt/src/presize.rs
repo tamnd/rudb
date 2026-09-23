@@ -75,6 +75,7 @@
 //! A ceiling that is already inside the first bucket array, because a table that was never going to
 //! grow has nothing to save.
 
+use rudb_common::rules::Rule;
 use rudb_common::{Class, Direction, Result, Stat};
 use rudb_plan::{Node, Plan};
 
@@ -102,8 +103,13 @@ const ALREADY: u64 = 32;
 /// Writes the group count onto every aggregate that has a ceiling worth acting on.
 ///
 /// A rudb name rather than a DuckDB one, because DuckDB has no pass that does this and [`crate::UPSTREAM`]
-/// is the list of names it does have. `SET disabled_optimizers = 'aggregate_presize'` is the setting
-/// `spec/stats/09-measurement.md` section 9.3's ablation turns this off with.
+/// is the list of names it does have.
+///
+/// Two settings turn it off and they mean different things. `SET disabled_optimizers =
+/// 'aggregate_presize'` is the pass, which is the door DuckDB's name for a pass goes through. `SET
+/// stats_presize = 'off'` is [`Rule::Presize`], which is the rule, and that is the door
+/// `spec/stats/09-measurement.md` section 9.2 asks for so that a report can say what this rule on its
+/// own earned. `SET statistics = 'off'` is the master over the second of them.
 #[derive(Debug)]
 pub struct AggregatePresize;
 
@@ -113,7 +119,9 @@ impl Pass for AggregatePresize {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        size(plan, context.facts());
+        if context.allows(Rule::Presize) {
+            size(plan, context.facts());
+        }
         Ok(())
     }
 }
@@ -193,7 +201,7 @@ mod tests {
     use rudb_common::Provenance;
     use rudb_plan::Plan;
 
-    use super::{AggregatePresize, MOST};
+    use super::{AggregatePresize, MOST, Rule};
     use crate::estimate::Facts;
     use crate::pass::{Context, Pass};
 
@@ -224,6 +232,31 @@ mod tests {
 
     fn run(plan: &mut Plan, context: &Context) {
         AggregatePresize.run(plan, context).expect("a pass that cannot fail");
+    }
+
+    /// The same facts with one rule turned off, which is what an ablation run does.
+    fn without(rule: Rule) -> Context {
+        let mut context = counted(1_000_000, 50_000);
+        let mut rules = rudb_common::rules::Rules::default();
+        rules.set(rule, false);
+        context.govern(rules);
+        context
+    }
+
+    #[test]
+    fn the_rule_s_own_setting_turns_it_off() {
+        let mut plan = grouped(None);
+        run(&mut plan, &without(Rule::Presize));
+        assert_eq!(plan.presized_count(), 0, "stats_presize = off asked for no room");
+    }
+
+    #[test]
+    fn the_master_setting_turns_it_off_too() {
+        // `statistics = off` reaches this without naming it, which is the point of a master: the
+        // ablation of section 9.3 is one statement and it has to cover a rule written after it.
+        let mut plan = grouped(None);
+        run(&mut plan, &without(Rule::StatsAll));
+        assert_eq!(plan.presized_count(), 0, "statistics = off asked for no room");
     }
 
     #[test]
