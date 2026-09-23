@@ -8,6 +8,10 @@
 //! ten times less resource the project is aiming at, and until today nobody could say which column
 //! it was in.
 //!
+//! That was the number when this tool was written. The same load at 6523d63, format 27, is
+//! 11,231,910,707 bytes, which is 0.55 times what DuckDB stores. The reasoning below is kept because
+//! it is still how to read the table this prints.
+//!
 //! The encoder is not short of tricks. Integers get frame of reference, delta, run length,
 //! dictionary and sparse, cascaded three deep, and strings get FSST, dictionary, front coding and a
 //! copy matcher on top of the same cascade. So 2.2 times is not a missing codec. It is either a few
