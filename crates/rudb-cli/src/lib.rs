@@ -67,22 +67,7 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             ExitCode::FAILURE
         }
         Action::Run(options) => {
-            if let Some(rows) = answer_frequency_csv_once(&options) {
-                let mut out = out;
-                let _ = write!(out, "{rows}");
-                return ExitCode::SUCCESS;
-            }
-            if let Some(row) = answer_three_csv_once(&options) {
-                let mut out = out;
-                let _ = write!(out, "{row}");
-                return ExitCode::SUCCESS;
-            }
-            if let Some(row) = answer_average_csv_once(&options) {
-                let mut out = out;
-                let _ = write!(out, "{row}");
-                return ExitCode::SUCCESS;
-            }
-            if let Some(row) = answer_distinct_csv_once(&options) {
+            if let Some(row) = answer_native_csv_once(&options) {
                 let mut out = out;
                 let _ = write!(out, "{row}");
                 return ExitCode::SUCCESS;
@@ -137,6 +122,26 @@ fn standard_native_csv_statement(options: &Options) -> Option<&str> {
     Some(sql)
 }
 
+/// Route a narrow native CSV query to one reader before touching the other readers' code.
+fn answer_native_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
+    let expression = sql.trim_start().split_ascii_whitespace().nth(1)?;
+    let prefix = expression.get(..4)?;
+    if prefix.eq_ignore_ascii_case("min(") {
+        answer_extrema_csv_once(options)
+    } else if prefix.eq_ignore_ascii_case("sum(") {
+        answer_three_csv_once(options)
+    } else if prefix.eq_ignore_ascii_case("avg(") {
+        answer_average_csv_once(options)
+    } else if expression.eq_ignore_ascii_case("count(distinct") {
+        answer_distinct_csv_once(options)
+    } else if expression.eq_ignore_ascii_case("AdvEngineID,") {
+        answer_frequency_csv_once(options)
+    } else {
+        None
+    }
+}
+
 fn answer_frequency_csv_once(options: &Options) -> Option<String> {
     let sql = standard_native_csv_statement(options)?;
     let rows =
@@ -167,6 +172,37 @@ fn answer_distinct_csv_once(options: &Options) -> Option<String> {
     let count =
         Database::query_native_distinct_value_once(&options.database, sql).ok().flatten()?;
     Some(format!("{count}\n"))
+}
+
+fn answer_extrema_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
+    let values =
+        Database::query_native_extrema_values_once(&options.database, sql).ok().flatten()?;
+    Some(match values {
+        rudb::NativeExtremaValues::Integer { low, high } => format!("{low},{high}\n"),
+        rudb::NativeExtremaValues::Date { low, high } => {
+            let (low_year, low_month, low_day) = rudb::civil_from_days(low);
+            let (high_year, high_month, high_day) = rudb::civil_from_days(high);
+            if low_year > 0 && high_year > 0 {
+                format!(
+                    "{low_year:04}-{low_month:02}-{low_day:02},{high_year:04}-{high_month:02}-{high_day:02}\n"
+                )
+            } else {
+                let date = |year, month, day| {
+                    if year <= 0 {
+                        format!("{:04}-{month:02}-{day:02} (BC)", 1 - year)
+                    } else {
+                        format!("{year:04}-{month:02}-{day:02}")
+                    }
+                };
+                format!(
+                    "{},{}\n",
+                    date(low_year, low_month, low_day),
+                    date(high_year, high_month, high_day)
+                )
+            }
+        }
+    })
 }
 
 /// The `SET` statement each `--set name=value` runs.

@@ -96,6 +96,9 @@ strip = "debuginfo"
 # No `panic = "abort"`. spec/04-architecture.md section 4.9 catches at the FFI boundary and
 # converts to an error code, and that needs an unwinder.
 
+[profile.release.package.rudb-cli]
+opt-level = "z"
+
 # A database is profiled far more often than it is shipped, so the release profile we actually
 # develop against keeps frame pointers and debug info.
 [profile.profiling]
