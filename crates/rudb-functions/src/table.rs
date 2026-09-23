@@ -510,11 +510,60 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
             function.name()
         )));
     }
+    let moment = |ty: &LogicalType| {
+        matches!(
+            ty,
+            LogicalType::Date
+                | LogicalType::Timestamp
+                | LogicalType::TimestampTz
+                | LogicalType::Null
+        )
+    };
+    let timed = |ty: &LogicalType| {
+        matches!(
+            ty,
+            LogicalType::Date
+                | LogicalType::Timestamp
+                | LogicalType::TimestampTz
+                | LogicalType::Interval
+        )
+    };
+    if arguments.iter().any(timed) {
+        let [start, stop, LogicalType::Interval | LogicalType::Null] = arguments else {
+            return Err(no_series(function, arguments));
+        };
+        if !moment(start) || !moment(stop) {
+            return Err(no_series(function, arguments));
+        }
+        let zoned = *start == LogicalType::TimestampTz || *stop == LogicalType::TimestampTz;
+        let ty = if zoned { LogicalType::TimestampTz } else { LogicalType::Timestamp };
+        return Ok(ResolvedTable {
+            function,
+            arguments: vec![ty.clone(), ty.clone(), LogicalType::Interval],
+            columns: Columns::Fixed(vec![Field::new(function.name(), ty)]),
+        });
+    }
     Ok(ResolvedTable {
         function,
         arguments: vec![LogicalType::BigInt; arity],
         columns: Columns::Fixed(vec![Field::new(function.name(), LogicalType::BigInt)]),
     })
+}
+
+/// The pin's refusal of a `range` or `generate_series` call with a date or an interval in it that
+/// fits neither the whole number overloads nor the moment one, with its five candidates.
+fn no_series(function: TableFunction, arguments: &[LogicalType]) -> Error {
+    let name = function.name();
+    // Quoted on the pin for both names, not only for the one that is a keyword.
+    let spelled = format!("\"{name}\"");
+    let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+    Error::binder(format!(
+        "No function matches the given name and argument types '{name}({})'. You might need to \
+         add explicit type casts.\n\tCandidate functions:\n\t{spelled}(BIGINT)\n\t{spelled}(BIGINT, \
+         BIGINT)\n\t{spelled}(BIGINT, BIGINT, BIGINT)\n\t{spelled}(TIMESTAMP, TIMESTAMP, INTERVAL)\n\t\
+         {spelled}(TIMESTAMP WITH TIME ZONE, TIMESTAMP WITH TIME ZONE, INTERVAL)\n",
+        written.join(", ")
+    ))
 }
 
 /// The same resolution for a call the user wrote as `PRAGMA name`, whose messages spell it so.

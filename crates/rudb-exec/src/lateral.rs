@@ -18,6 +18,7 @@
 
 use rudb_common::{Cancel, Error, LogicalType, Result, Session, Value};
 use rudb_functions::{TableFunction, series_length};
+use rudb_kernels::Stepping;
 use rudb_pipeline::{Progress, Stream};
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, VECTOR_SIZE};
@@ -25,6 +26,7 @@ use rudb_vector::{Chunk, VECTOR_SIZE};
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
+use crate::source::moments;
 
 /// One call of a series function per input row, with the input row beside every value it produced.
 #[derive(Debug)]
@@ -35,6 +37,8 @@ pub(crate) struct LateralSeries {
     /// The input's columns followed by the one column a series produces.
     schema: Schema,
     types: Vec<LogicalType>,
+    /// The type of the column the series produces, BIGINT or a moment.
+    produced: LogicalType,
     cancel: Cancel,
 }
 
@@ -48,21 +52,13 @@ pub(crate) struct Calling {
     ///
     /// Worked out for the whole chunk in one pass rather than per row, because the arguments are
     /// ordinary expressions over the input and the evaluator reads a chunk at a time.
-    calls: Vec<Option<Call>>,
+    calls: Vec<Option<Stepping>>,
     row: usize,
     /// How many of the current row's values have already come out.
     ///
     /// One call can produce more rows than fit in a chunk, and `range(1000000)` on one input row is
     /// exactly that, so a row is not always finished by the call that started it.
     made: usize,
-}
-
-/// One resolved call, which is a start, a step and how many values there are.
-#[derive(Debug, Clone, Copy)]
-struct Call {
-    start: i64,
-    step: i64,
-    rows: usize,
 }
 
 impl LateralSeries {
@@ -98,8 +94,8 @@ impl LateralSeries {
         }
         // The plan's own field rather than one made up here, so the name is the one the binder gave
         // and a query that renamed the column still finds it. The type is checked rather than taken,
-        // because what comes out of this is a BIGINT and a field that said otherwise would be a
-        // chunk that does not match the schema above it.
+        // because what comes out of this is a BIGINT or a moment and a field that said otherwise
+        // would be a chunk that does not match the schema above it.
         let fields = plan.field_list(columns).to_vec();
         let [field] = fields.as_slice() else {
             return Err(Error::internal(format!(
@@ -108,9 +104,11 @@ impl LateralSeries {
                 fields.len()
             )));
         };
-        if field.ty != LogicalType::BigInt {
+        let made = field.ty.clone();
+        if !matches!(made, LogicalType::BigInt | LogicalType::Timestamp | LogicalType::TimestampTz)
+        {
             return Err(Error::internal(format!(
-                "{}() producing {} rather than BIGINT",
+                "{}() producing {} rather than BIGINT or a moment",
                 function.name(),
                 field.ty
             )));
@@ -122,6 +120,7 @@ impl LateralSeries {
             function,
             args: Prepared::new(plan, &exprs, input)?,
             types: schema.types(),
+            produced: made,
             schema,
             cancel: cancel.clone(),
         })
@@ -137,10 +136,21 @@ impl LateralSeries {
     /// A NULL in any argument gives no rows, which is what the uncorrelated form answers and is not
     /// the same as an error. A step of zero is an error, and it is raised from here rather than
     /// skipped, because a query that wrote one is asking for a sequence that does not exist.
-    fn calls(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<Vec<Option<Call>>> {
+    fn calls(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<Vec<Option<Stepping>>> {
         let mut evaluated = Vec::new();
         self.args.evaluate(chunk, scratch, &mut evaluated)?;
         let mut calls = Vec::with_capacity(chunk.len());
+        if self.produced != LogicalType::BigInt {
+            let [start, stop, step] = evaluated.as_slice() else {
+                return Err(Error::internal("a series of moments without three arguments"));
+            };
+            for row in 0..chunk.len() {
+                let (start, stop, step) =
+                    (start.value_at(row), stop.value_at(row), step.value_at(row));
+                calls.push(moments(self.function, &start, &stop, &step)?);
+            }
+            return Ok(calls);
+        }
         // row at a time: a call is a start, a step and a length, and working those out is arithmetic
         // over at most three numbers that ends in a branch on how many arguments were written. There
         // is no kernel shape to it and there is one of these per input row rather than one per
@@ -177,8 +187,8 @@ impl LateralSeries {
                     )));
                 }
             };
-            let rows = series_length(self.function, start, stop, step)?;
-            calls.push(Some(Call { start, step, rows }));
+            let count = series_length(self.function, start, stop, step)?;
+            calls.push(Some(Stepping::Even { start, step, count }));
         }
         Ok(calls)
     }
@@ -209,19 +219,21 @@ impl Stream for LateralSeries {
             // in this operator that runs long. `range(1000000000)` on one row is one check and then
             // a million chunks, so the re-entry below is what the token actually sees.
             self.cancel.check()?;
-            if let Some(call) = local.calls[local.row] {
+            if let Some(call) = &local.calls[local.row] {
                 let left: Vec<Value> = input.row(local.row).collect();
                 let room = VECTOR_SIZE - out.len();
-                let end = (local.made + room).min(call.rows);
+                let end = (local.made + room).min(call.len());
                 for at in local.made..end {
-                    let steps = i64::try_from(at).unwrap_or(i64::MAX);
+                    let value = call.at(at);
                     let mut made = left.clone();
-                    made.push(Value::BigInt(
-                        call.start.saturating_add(call.step.saturating_mul(steps)),
-                    ));
+                    made.push(match self.produced {
+                        LogicalType::Timestamp => Value::Timestamp(value),
+                        LogicalType::TimestampTz => Value::TimestampTz(value),
+                        _ => Value::BigInt(value),
+                    });
                     out.push(made);
                 }
-                if end < call.rows {
+                if end < call.len() {
                     // A call with more values than fit in a chunk. The row stays where it is and the
                     // next call picks up from the value this one stopped at.
                     local.made = end;

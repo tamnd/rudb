@@ -20,7 +20,7 @@ use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
 };
 use rudb_graph::Rids;
-use rudb_kernels::cast;
+use rudb_kernels::{Stepping, cast, moment_steps};
 use rudb_metrics::Counters;
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
@@ -1532,6 +1532,11 @@ pub(crate) struct Series {
     step: i64,
     /// How many values there are, which `series_length` worked out once.
     rows: u64,
+    /// BIGINT, or the moment type of a series of moments.
+    ty: LogicalType,
+    /// The moments of a series whose step has months in it, which cannot be worked out from a
+    /// position and so are walked once and kept.
+    listed: Option<Arc<[i64]>>,
     morsels: AtomicU64,
 }
 
@@ -1552,13 +1557,28 @@ impl Series {
         let Some(function) = TableFunction::lookup(function) else {
             return Err(Error::internal(format!("a plan with a table function called {function}")));
         };
-        let fields = vec![Field::new(function.name(), LogicalType::BigInt)];
-        let schema = Schema::numbered(fields, index);
-
         let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
         let source = Schema::empty();
         let one = Chunk::with_rows(Vec::new(), 1)?;
         let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
+        if let [start, stop, step] = evaluated.as_slice()
+            && *step.logical_type() == LogicalType::Interval
+        {
+            let ty = start.logical_type().clone();
+            let schema = Schema::numbered(vec![Field::new(function.name(), ty.clone())], index);
+            let empty = Self { ty, ..Self::empty(schema.clone()) };
+            let values = (start.value_at(0), stop.value_at(0), step.value_at(0));
+            let Some(stepping) = moments(function, &values.0, &values.1, &values.2)? else {
+                return Ok(empty);
+            };
+            let rows = u64::try_from(stepping.len()).unwrap_or(u64::MAX);
+            return Ok(match stepping {
+                Stepping::Even { start, step, .. } => Self { start, step, rows, ..empty },
+                Stepping::Listed(stamps) => Self { rows, listed: Some(stamps.into()), ..empty },
+            });
+        }
+        let fields = vec![Field::new(function.name(), LogicalType::BigInt)];
+        let schema = Schema::numbered(fields, index);
         let mut given = Vec::with_capacity(evaluated.len());
         for vector in &evaluated {
             match vector.value_at(0) {
@@ -1584,14 +1604,22 @@ impl Series {
             }
         };
         let rows = u64::try_from(series_length(function, start, stop, step)?).unwrap_or(u64::MAX);
-        Ok(Self { schema, start, step, rows, morsels: AtomicU64::new(0) })
+        Ok(Self { start, step, rows, ..Self::empty(schema) })
     }
 
     fn empty(schema: Schema) -> Self {
-        Self { schema, start: 0, step: 1, rows: 0, morsels: AtomicU64::new(0) }
+        Self {
+            schema,
+            start: 0,
+            step: 1,
+            rows: 0,
+            ty: LogicalType::BigInt,
+            listed: None,
+            morsels: AtomicU64::new(0),
+        }
     }
 
-    /// What this produces, which is one BIGINT column named after the function.
+    /// What this produces, which is one column named after the function.
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -1622,7 +1650,7 @@ impl Source for Series {
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let count = usize::try_from(morsel.remaining()).unwrap_or(usize::MAX).min(VECTOR_SIZE);
         if count == 0 {
-            *out = Chunk::empty(&[LogicalType::BigInt]);
+            *out = Chunk::empty(std::slice::from_ref(&self.ty));
             return Ok(Progress::Done);
         }
         // The loop is over `i64` rather than over `Value`, and the vector is built out of the run
@@ -1630,17 +1658,67 @@ impl Source for Series {
         // at a time to find the run again. `range()` is the source every microbenchmark in
         // `rudb-bench` reads from, so a chunk of it costing a `Value` a row would be measuring the
         // generator instead of what is downstream of it.
-        let mut at = self.value_at(morsel.cursor());
-        let mut counted = Vec::with_capacity(count);
-        for _ in 0..count {
-            counted.push(at);
-            at = at.saturating_add(self.step);
-        }
+        let counted = if let Some(listed) = &self.listed {
+            let from = usize::try_from(morsel.cursor()).unwrap_or(usize::MAX);
+            let Some(run) = listed.get(from..from.saturating_add(count)) else {
+                return Err(Error::internal("a morsel past the end of a series of moments"));
+            };
+            run.to_vec()
+        } else {
+            let mut at = self.value_at(morsel.cursor());
+            let mut counted = Vec::with_capacity(count);
+            for _ in 0..count {
+                counted.push(at);
+                at = at.saturating_add(self.step);
+            }
+            counted
+        };
         morsel.advance(u64::try_from(count).unwrap_or(u64::MAX));
-        let vector = Vector::flat(LogicalType::BigInt, Data::Int64(counted.into()))?;
+        let vector = Vector::flat(self.ty.clone(), Data::Int64(counted.into()))?;
         *out = Chunk::with_rows(vec![vector], count)?;
         Ok(if morsel.is_drained() { Progress::Done } else { Progress::More })
     }
+}
+
+/// The moments a `range` or `generate_series` call over dates or timestamps gives, or `None` when an
+/// argument is null, which is no rows at all.
+///
+/// The bounds are checked here and not in the kernel because the table form refuses them in its
+/// own words, as binder errors, and refuses a zero interval where the list form answers empty.
+///
+/// # Errors
+///
+/// An infinite bound, a zero interval, one with mixed signs, and a series past 2^32 moments.
+pub(crate) fn moments(
+    function: TableFunction,
+    start: &Value,
+    stop: &Value,
+    step: &Value,
+) -> Result<Option<Stepping>> {
+    let moment = |value: &Value| match value {
+        Value::Timestamp(stamp) | Value::TimestampTz(stamp) => Ok(Some(*stamp)),
+        Value::Null => Ok(None),
+        other => Err(Error::internal(format!("a range of moments from a {other}"))),
+    };
+    let (Some(start), Some(stop), Value::Interval { months, days, micros }) =
+        (moment(start)?, moment(stop)?, step)
+    else {
+        return Ok(None);
+    };
+    if [start, stop].iter().any(|&stamp| stamp == i64::MAX || stamp == -i64::MAX) {
+        return Err(Error::binder("RANGE with infinite bounds is not supported"));
+    }
+    let forward = *months > 0 || *days > 0 || *micros > 0;
+    let backward = *months < 0 || *days < 0 || *micros < 0;
+    if !forward && !backward {
+        return Err(Error::binder("interval cannot be 0!"));
+    }
+    if forward && backward {
+        return Err(Error::binder(
+            "RANGE with composite interval that has mixed signs is not supported",
+        ));
+    }
+    moment_steps(function.inclusive(), start, stop, (*months, *days, *micros)).map(Some)
 }
 
 /// A scan of one or more files, Parquet or CSV.
@@ -2639,7 +2717,7 @@ impl Source for Values {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use rudb_catalog::{QualifiedName, Table};
     use rudb_common::{Field, LogicalType, Value};
@@ -2675,7 +2753,7 @@ mod tests {
 
     /// A series without going through a plan, which is what `Series::new` is for.
     fn series(start: i64, step: i64, rows: u64) -> Series {
-        Series { schema: Schema::empty(), start, step, rows, morsels: AtomicU64::new(0) }
+        Series { start, step, rows, ..Series::empty(Schema::empty()) }
     }
 
     /// Every value the series produces, and how many morsels it took to produce them.

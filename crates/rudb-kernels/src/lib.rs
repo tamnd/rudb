@@ -88,6 +88,7 @@ pub use compare::{
 };
 pub use datetime::came_round;
 pub use fallback::Kernel;
+pub use lists::{Stepping, moment_steps};
 pub use logic::{Connective, combine, is_true};
 pub use membership::{Members, in_set};
 pub use peel::{Found, Lookup};
