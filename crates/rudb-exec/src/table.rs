@@ -2220,13 +2220,13 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
     // every query on the suite.
     let straight = !validity.has_nulls(rows);
     if let Some(packed) = column.packed_parts() {
-        fold_packed(&packed, wide, rows, straight, finish, hashes, |row| {
+        fold_packed(&packed, wide, rows, straight.then_some(Reads::Own), finish, hashes, |row| {
             validity.is_valid(row).then_some(row)
         });
         return;
     }
     if let Some(data) = column.data() {
-        if fold_data(data, rows, hashes, straight, finish, |row| {
+        if fold_data(data, rows, hashes, straight.then_some(Reads::Own), finish, |row| {
             validity.is_valid(row).then_some(row)
         }) {
             return;
@@ -2243,10 +2243,23 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
     // values than the thousand rows being hashed, so hashing it whole would be the slower of the two
     // exactly when the dictionary is doing its job.
     if let Some((at, values)) = column.positions() {
+        // Whether no row is nothing, which for a column read through codes takes both sides saying
+        // so: the column's own validity and that of what the codes point at. This is the shape a
+        // filter hands on, since it keeps the rows that got through as codes into the chunk it was
+        // given, so behind a filter this is what a flat key column with no nulls turns into. It
+        // used to take the path that asks every row both questions and an `Option` besides.
+        //
+        // The side the codes point at is only asked when it is not much longer than the rows,
+        // because counting its nulls is a pass over it, and a Parquet dictionary can cover a whole
+        // column chunk. That is the case where it is also least likely to matter.
+        let inner = values.validity();
+        let clean = !validity.has_nulls(rows)
+            && values.len() <= rows.saturating_mul(4)
+            && !inner.has_nulls(values.len());
+        let through = clean.then_some(Reads::Codes(&at[..]));
         if let Some(data) = values.data() {
             // A dictionary keeps its nulls in the vector it points at, so a row is null when either
             // the column says so or the value its code points at does.
-            let inner = values.validity();
             let pick = |row: usize| {
                 if !validity.is_valid(row) {
                     return None;
@@ -2254,7 +2267,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
                 let code = *at.get(row)? as usize;
                 inner.is_valid(code).then_some(code)
             };
-            if fold_data(data, rows, hashes, false, finish, pick) {
+            if fold_data(data, rows, hashes, through, finish, pick) {
                 return;
             }
         }
@@ -2267,8 +2280,7 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
         // two keys, one of which arrives in exactly that form, so a fifth of the whole query was
         // building a `Value` per row to hash it.
         if let Some(packed) = values.packed_parts() {
-            let inner = values.validity();
-            fold_packed(&packed, wide, rows, false, finish, hashes, |row| {
+            fold_packed(&packed, wide, rows, through, finish, hashes, |row| {
                 if !validity.is_valid(row) {
                     return None;
                 }
@@ -2298,6 +2310,20 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
     }
 }
 
+/// Which place a row reads when every row reads one and none of them is nothing.
+///
+/// The two shapes a key column with no nulls arrives in. [`Reads::Own`] is a flat column, and
+/// [`Reads::Codes`] is the same column behind a filter, which keeps the rows that got through as
+/// codes into the chunk it was handed rather than copying them. Handing the passes below this
+/// rather than a closure is what lets them walk two runs side by side with nothing to ask per row.
+#[derive(Clone, Copy)]
+enum Reads<'a> {
+    /// Row `i` reads place `i`.
+    Own,
+    /// Row `i` reads the place its code names.
+    Codes(&'a [u32]),
+}
+
 /// Folds one packed run into the running hash, with `pick` saying which code a row reads.
 ///
 /// `None` from `pick` is a null, the same way it is for [`fold_data`]. `wide` says the type needs
@@ -2308,32 +2334,36 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
 /// for the same number, since the same column is a packed run in one chunk and something else in
 /// the next, and the base plus the code is that number.
 ///
-/// `straight` says every row reads its own place and no row is nothing, which is `pick` answering
-/// `Some(row)` for every row it will be asked about. It is the caller's for the same reason `wide`
-/// is: the caller holds the column and the column's validity says it once, where a closure can
-/// only be asked a row at a time. Saying it wrongly is a wrong answer and not a slow one, so the
-/// two call sites that read through codes say `false` rather than working out whether they could.
+/// `straight` says no row is nothing and which place each row reads, which is `pick` answering
+/// `Some` for every row it will be asked about. It is the caller's for the same reason `wide` is:
+/// the caller holds the column and the column's validity says it once, where a closure can only be
+/// asked a row at a time. Saying it wrongly is a wrong answer and not a slow one, so a caller that
+/// cannot tell cheaply says `None` and every row asks `pick`.
 fn fold_packed(
     packed: &Packed<'_>,
     wide: bool,
     rows: usize,
-    straight: bool,
+    straight: Option<Reads<'_>>,
     finish: bool,
     hashes: &mut [u64],
     pick: impl Fn(usize) -> Option<usize>,
 ) {
     let base = packed.base();
-    if straight {
-        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-            let value = base + i128::from(packed.code(row));
-            let one = if wide {
-                mix(mix(*state, value as u64), (value >> 64) as u64)
-            } else {
-                mix(*state, value as u64)
-            };
-            *state = end(one, finish);
+    match straight {
+        Some(Reads::Own) => {
+            let rows = rows.min(hashes.len());
+            straight_packed(packed, wide, finish, &mut hashes[..rows], 0..rows);
+            return;
         }
-        return;
+        Some(Reads::Codes(codes)) => {
+            if let Some(codes) = codes.get(..rows) {
+                let at = codes.iter().map(|&code| code as usize);
+                let rows = rows.min(hashes.len());
+                straight_packed(packed, wide, finish, &mut hashes[..rows], at);
+                return;
+            }
+        }
+        None => {}
     }
     for (row, state) in hashes.iter_mut().enumerate().take(rows) {
         let Some(code) = pick(row) else {
@@ -2350,6 +2380,44 @@ fn fold_packed(
     }
 }
 
+/// The straight passes of [`fold_packed`], with the two questions that are the same for every row
+/// of the pass taken out of the loop by the compiler rather than asked in it.
+///
+/// Written as one generic pass and four copies of it because that is what makes the copies. As a
+/// closure over `wide` and `finish` the loop kept both as loads off the stack and a compare and a
+/// branch each, per row, once `fold` stopped being inlined into `hash`, and TPC-H q17, which hashes
+/// six million packed `l_partkey` values for its join filter, came out seven percent worse for it.
+fn straight_packed(
+    packed: &Packed<'_>,
+    wide: bool,
+    finish: bool,
+    hashes: &mut [u64],
+    at: impl Iterator<Item = usize>,
+) {
+    fn run<const WIDE: bool, const FINISH: bool>(
+        packed: &Packed<'_>,
+        hashes: &mut [u64],
+        at: impl Iterator<Item = usize>,
+    ) {
+        let base = packed.base();
+        for (state, code) in hashes.iter_mut().zip(at) {
+            let value = base + i128::from(packed.code(code));
+            let one = if WIDE {
+                mix(mix(*state, value as u64), (value >> 64) as u64)
+            } else {
+                mix(*state, value as u64)
+            };
+            *state = end(one, FINISH);
+        }
+    }
+    match (wide, finish) {
+        (false, false) => run::<false, false>(packed, hashes, at),
+        (false, true) => run::<false, true>(packed, hashes, at),
+        (true, false) => run::<true, false>(packed, hashes, at),
+        (true, true) => run::<true, true>(packed, hashes, at),
+    }
+}
+
 /// Folds one word per row into `hashes`, reading the values through `pick`.
 ///
 /// `pick` says which index of `data` a row reads, and `None` says the row is null. That is what
@@ -2358,14 +2426,14 @@ fn fold_packed(
 /// The answer is whether there was an arm for the data at all, which is `false` for the nested
 /// types and leaves the caller to fall through to whatever it has after this.
 ///
-/// `straight` says every row reads its own place and no row is nothing, which is the shape a flat
-/// column with no nulls arrives in and is most of what a key column ever is. It has the same
-/// meaning and the same reason for being the caller's as it does in [`fold_packed`].
+/// `straight` says no row is nothing and which place each row reads, which is the shape a key
+/// column with no nulls arrives in whether it is flat or behind a filter. It has the same meaning
+/// and the same reason for being the caller's as it does in [`fold_packed`].
 fn fold_data(
     data: &Data,
     rows: usize,
     hashes: &mut [u64],
-    straight: bool,
+    straight: Option<Reads<'_>>,
     finish: bool,
     pick: impl Fn(usize) -> Option<usize>,
 ) -> bool {
@@ -2378,13 +2446,32 @@ fn fold_data(
             // rows, so the walk is two runs side by side and there is no validity read, no branch,
             // no `Option` and no bounds check left in the body. What is in it is the load, the
             // widen and the mix, which is the work.
-            if straight {
-                if let (Some(values), Some(hashes)) = (values.get(..rows), hashes.get_mut(..rows)) {
-                    for (state, value) in hashes.iter_mut().zip(values) {
-                        *state = end(mix(*state, word(*value)), finish);
+            match straight {
+                Some(Reads::Own) => {
+                    if let (Some(values), Some(hashes)) =
+                        (values.get(..rows), hashes.get_mut(..rows))
+                    {
+                        for (state, value) in hashes.iter_mut().zip(values) {
+                            *state = end(mix(*state, word(*value)), finish);
+                        }
+                        return true;
                     }
-                    return true;
                 }
+                // Through the codes, with the one question left being whether a code is inside
+                // what it points at, which is a compare that always goes the same way.
+                Some(Reads::Codes(codes)) => {
+                    if let Some(codes) = codes.get(..rows) {
+                        for (state, &code) in hashes.iter_mut().zip(codes) {
+                            let one = match values.get(code as usize) {
+                                Some(value) => word(*value),
+                                None => NOTHING,
+                            };
+                            *state = end(mix(*state, one), finish);
+                        }
+                        return true;
+                    }
+                }
+                None => {}
             }
             for (row, state) in hashes.iter_mut().enumerate().take(rows) {
                 let one = match pick(row).and_then(|at| values.get(at)) {
@@ -2412,7 +2499,11 @@ fn fold_data(
         // is rather than as a null.
         Data::Varlen(strings) => {
             for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-                let at = if straight { Some(row) } else { pick(row) };
+                let at = match straight {
+                    Some(Reads::Own) => Some(row),
+                    Some(Reads::Codes(codes)) => codes.get(row).map(|&code| code as usize),
+                    None => pick(row),
+                };
                 let one = match at.and_then(|at| strings.bytes(at)) {
                     Some(bytes) => bytes_word(bytes),
                     None => NOTHING,
@@ -3041,6 +3132,40 @@ mod tests {
         let (table, slots) = a_batch_at_a_time(&keys, values.len(), &types);
         assert_eq!(table.len(), 1);
         assert!(slots.iter().all(|&slot| slot == 0));
+    }
+
+    /// The shape a filter hands on, which is codes naming the rows that got through over the whole
+    /// chunk it was given, has to hash each kept row the way the chunk itself hashes that row. That
+    /// is true whether the chunk is flat or packed, and whether the payload has a null in a row the
+    /// filter dropped, in which case the pass without per row questions may not run, or has none.
+    #[test]
+    fn the_rows_a_filter_kept_hash_the_way_they_hashed_before_it() {
+        let rows = 3_000usize;
+        let kept: Vec<u32> = (0..rows as u32).filter(|row| row % 3 != 1).collect();
+        for ty in [LogicalType::Integer, LogicalType::BigInt, LogicalType::Varchar] {
+            let of = |row: usize| match &ty {
+                LogicalType::Integer => Value::Integer(((row * 7919) % 5003) as i32),
+                LogicalType::BigInt => Value::BigInt(1_000_000 + ((row * 7919) % 5003) as i64),
+                _ => Value::Varchar(format!("k{}", (row * 7919) % 5003)),
+            };
+            let mut values: Vec<Value> = (0..rows).map(of).collect();
+            let whole = hashed(&flat(ty.clone(), &values));
+            let want: Vec<u64> = kept.iter().map(|&row| whole[row as usize]).collect();
+            let mut payloads = vec![flat(ty.clone(), &values)];
+            if ty != LogicalType::Varchar {
+                let packed = flat(ty.clone(), &values).bit_packed().expect("a packed column");
+                assert_eq!(packed.form(), rudb_vector::Form::BitPacked, "{ty} has to pack");
+                payloads.push(packed);
+            }
+            // A null in a row the filter dropped, which the kept rows never read.
+            values[1] = Value::Null;
+            payloads.push(flat(ty.clone(), &values));
+            for payload in payloads {
+                let form = payload.form();
+                let selected = Vector::dictionary(kept.clone(), payload).expect("codes into it");
+                assert_eq!(want, hashed(&selected), "{ty} kept out of {form:?}");
+            }
+        }
     }
 
     /// The pass that skips the per row null question has to answer what the pass that asks it
