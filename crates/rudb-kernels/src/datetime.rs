@@ -814,7 +814,7 @@ pub fn came_round(when: &Value, interval: &Value, subtract: bool) -> bool {
 
 /// The day an interval's months and days land on, which is where both of the date range failures
 /// are and where upstream has a different sentence for each of them.
-fn shifted_days(day: i32, months: i64, days: i64) -> Result<i32> {
+pub(crate) fn shifted_days(day: i32, months: i64, days: i64) -> Result<i32> {
     let day = if months == 0 { day } else { shifted_months(day, months)? };
     let moved = i64::from(day) + days;
     match i32::try_from(moved) {
