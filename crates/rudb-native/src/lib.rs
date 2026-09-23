@@ -1145,7 +1145,8 @@ struct Entry {
     rows: usize,
     /// Where this table's own directory sits, with the checksum it was committed under.
     directory: Page,
-    /// Exact non-null, nonzero integer counts certified by the catalog checksum.
+    /// Legacy nonzero counts. New files leave these empty and derive filtered counts from
+    /// reusable column frequencies when a query needs them.
     nonzero: Vec<Option<u64>>,
     /// Exact sum and non-null count for signed integer columns.
     aggregates: Vec<Option<(i128, u64)>>,
@@ -3168,7 +3169,7 @@ impl Writer {
             name: self.table.name.clone(),
             fields: self.table.fields.clone(),
             rows: self.table.rows,
-            nonzero: table_nonzero_counts(&self.table),
+            nonzero: vec![None; self.table.fields.len()],
             aggregates: table_aggregate_sums(&self.table),
             distincts: self.table.distincts.clone(),
             extremes: table_integer_extremes(&self.table),
@@ -3455,7 +3456,7 @@ impl Writer {
         let native = Catalog::open(path)?;
         for entry in &mut entries {
             let reader = native.table(&entry.name)?;
-            entry.nonzero = reader_nonzero_counts(&reader)?;
+            entry.nonzero.fill(None);
             entry.aggregates = reader_aggregate_sums(&reader)?;
             entry.distincts = (0..entry.fields.len())
                 .map(|column| reader.distinct_values(column))
@@ -5144,9 +5145,10 @@ impl Catalog {
         )
     }
 
-    /// Counts non-null, nonzero values from a validated native directory without building a
-    /// reader for every stripe. Returns `None` when the bounded frequency synopsis cannot prove
-    /// the count, so callers can use the ordinary query path.
+    /// Counts non-null, nonzero values from generic column frequencies when complete. For an
+    /// older file or a partial catalog synopsis, reads the validated native directory without
+    /// building a reader for every stripe. Returns `None` when the bounded frequency synopsis
+    /// cannot prove the count, so callers can use the ordinary query path.
     pub fn nonzero_count(&self, name: &str, column: usize) -> Result<Option<u64>> {
         let entry = self
             .entries
@@ -5173,8 +5175,13 @@ impl Catalog {
         if file_checksum(&self.file, offset, length)? != entry.directory.hash {
             return Err(invalid(&format!("the directory of table {name} does not checksum")));
         }
-        if let Some(count) = entry.nonzero.get(column).copied().flatten() {
-            return Ok(Some(count));
+        if let Some(Some(frequencies)) = entry.frequencies.get(column) {
+            return frequencies
+                .iter()
+                .filter(|(value, _)| value.is_some_and(|value| value != 0))
+                .try_fold(0_u64, |total, (_, count)| total.checked_add(*count))
+                .map(Some)
+                .ok_or_else(|| invalid("numeric frequency count overflow"));
         }
         quick_nonzero(
             Cursor::over(&self.file, offset, length),
@@ -7256,42 +7263,6 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
 ///
 /// The views go after the tables and are whole here, since a view is text and a column list and has
 /// no pages for a second level to point at.
-fn table_nonzero_counts(table: &Table) -> Vec<Option<u64>> {
-    table
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(column, field)| {
-            if !matches!(
-                field.ty,
-                LogicalType::TinyInt
-                    | LogicalType::SmallInt
-                    | LogicalType::Integer
-                    | LogicalType::BigInt
-                    | LogicalType::UTinyInt
-                    | LogicalType::USmallInt
-                    | LogicalType::UInteger
-                    | LogicalType::UBigInt
-            ) {
-                return None;
-            }
-            let Some(Frequencies::Held(summary)) = &table.frequencies[column] else {
-                return None;
-            };
-            let zero = summary
-                .entries
-                .iter()
-                .find(|entry| entry.value == FrequencyValue::Integer(0))
-                .map(|entry| entry.count)
-                .or_else(|| (summary.omitted_max == 0).then_some(0))?;
-            let nulls = table.stripes.iter().try_fold(0_u64, |count, stripe| {
-                count.checked_add(stripe.zone.column(column)?.nulls as u64)
-            })?;
-            (table.rows as u64).checked_sub(nulls)?.checked_sub(zero)
-        })
-        .collect()
-}
-
 fn signed_integer(ty: &LogicalType) -> bool {
     matches!(
         ty,
@@ -7455,44 +7426,6 @@ fn table_aggregate_sums(table: &Table) -> Vec<Option<(i128, u64)>> {
         .enumerate()
         .map(|(column, field)| {
             signed_integer(&field.ty).then(|| table_exact_sum(table, column)).flatten()
-        })
-        .collect()
-}
-
-fn reader_nonzero_counts(reader: &Reader) -> Result<Vec<Option<u64>>> {
-    reader
-        .table
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(column, field)| {
-            if !matches!(
-                field.ty,
-                LogicalType::TinyInt
-                    | LogicalType::SmallInt
-                    | LogicalType::Integer
-                    | LogicalType::BigInt
-                    | LogicalType::UTinyInt
-                    | LogicalType::USmallInt
-                    | LogicalType::UInteger
-                    | LogicalType::UBigInt
-            ) {
-                return Ok(None);
-            }
-            let Some(summary) = reader.frequency_summary(column)? else {
-                return Ok(None);
-            };
-            let zero = summary
-                .entries
-                .iter()
-                .find(|entry| entry.value == FrequencyValue::Integer(0))
-                .map(|entry| entry.count)
-                .or_else(|| (summary.omitted_max == 0).then_some(0));
-            let Some(zero) = zero else { return Ok(None) };
-            let nulls = reader.null_count(column)?;
-            Ok((reader.table.rows as u64)
-                .checked_sub(nulls)
-                .and_then(|count| count.checked_sub(zero)))
         })
         .collect()
 }
@@ -13877,7 +13810,7 @@ mod tests {
         }
         writer.finish().expect("finish");
         let catalog = Catalog::open(&path).expect("catalog");
-        assert_eq!(catalog.entries[0].nonzero, vec![None, Some(2)]);
+        assert_eq!(catalog.entries[0].nonzero, vec![None, None]);
         assert_eq!(catalog.entries[0].aggregates, vec![None, Some((10, 4))]);
         assert_eq!(catalog.entries[0].distincts, vec![Some(1), Some(3)]);
         let frequencies =
@@ -13896,10 +13829,11 @@ mod tests {
             Some(CertifiedSums { columns: vec![(10, 4)], rows: 6 })
         );
         assert_eq!(catalog.nonzero_count("items", 1).expect("quick count"), Some(2));
-        assert_eq!(
-            reader_nonzero_counts(&catalog.table("items").expect("reader")).expect("counts"),
-            vec![None, Some(2)]
-        );
+        let mut legacy = catalog.clone();
+        Arc::make_mut(&mut legacy.entries)[0].nonzero[1] = Some(999);
+        assert_eq!(legacy.nonzero_count("items", 1).expect("ignore legacy count"), Some(2));
+        Arc::make_mut(&mut legacy.entries)[0].frequencies[1] = None;
+        assert_eq!(legacy.nonzero_count("items", 1).expect("directory fallback"), Some(2));
         Writer::certify_counts(&path).expect("recertify");
         assert_eq!(
             Catalog::open(&path).expect("reopen").nonzero_count("items", 1).expect("count"),
