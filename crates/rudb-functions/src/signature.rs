@@ -2349,7 +2349,8 @@ mod tests {
                     (_, Shape::ListConcatenated | Shape::ListCounted) => {
                         LogicalType::list(LogicalType::Varchar)
                     }
-                    (true, _) => LogicalType::Integer,
+                    // The bit aggregates take whole numbers and nothing else.
+                    (true, _) | (_, Shape::Bitwise) => LogicalType::Integer,
                     (false, _) => LogicalType::Varchar,
                 };
                 let mut arguments = vec![ty; count];
