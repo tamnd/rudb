@@ -297,6 +297,19 @@ impl Counts {
         self.columns.iter_mut().map(|column| Counting { column }).collect()
     }
 
+    /// Takes in what `later` counted, column by column, as though this had read its rows itself.
+    ///
+    /// The same rule as [`Counting::absorb`]: the tally lists come out in the order this had read
+    /// the rows only when `later` counted the rows that came after these. The native writer counts
+    /// a stripe on the thread that encodes it and absorbs the stripes as they reach the writer,
+    /// which is the order it counted them in before it did that. A column `later` does not have is
+    /// left as it is.
+    pub fn absorb(&mut self, later: Counts) {
+        for (column, later) in self.columns.iter_mut().zip(later.columns) {
+            column.absorb(later);
+        }
+    }
+
     /// Gives up on a column, which is what a form with no hash rule leaves behind.
     fn blind(&mut self, at: usize) {
         if let Some(column) = self.columns.get_mut(at) {
