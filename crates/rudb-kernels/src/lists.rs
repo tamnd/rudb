@@ -164,12 +164,11 @@ fn series_length(start: i64, stop: i64, step: i64, inclusive: bool) -> Result<us
     if step == 0 || (start > stop && step > 0) || (start < stop && step < 0) {
         return Ok(0);
     }
-    let apart = (i128::from(stop) - i128::from(start)).unsigned_abs();
-    let by = i128::from(step).unsigned_abs();
-    let mut count = apart / by;
-    if inclusive || apart % by != 0 {
-        count += 1;
-    }
+    let apart = stop.abs_diff(start);
+    let by = step.unsigned_abs();
+    // A step of one is nearly every series written, and it needs no division at all.
+    let (whole, over) = if by == 1 { (apart, false) } else { (apart / by, apart % by != 0) };
+    let count = u128::from(whole) + u128::from(inclusive || over);
     usize::try_from(count).ok().filter(|&count| count <= MAX_SERIES).ok_or_else(too_long)
 }
 
@@ -589,37 +588,36 @@ fn series<V: AsRef<Vector>>(
         };
         columns.push((values.as_slice(), vector.validity().live()));
     }
-    let mut entries = Vec::with_capacity(rows);
-    let mut child = Vec::new();
+    // Every row is counted before anything is written, so the child is allocated once at its full
+    // length and never moved while it grows.
+    let mut runs = Vec::with_capacity(rows);
     let mut live = vec![true; rows];
-    for row in 0..rows {
+    let mut total = 0_usize;
+    for (row, live) in live.iter_mut().enumerate() {
         let mut held = [0_i64; 3];
-        let mut null = false;
-        for (at, (values, live)) in columns.iter().enumerate() {
+        for (at, (values, valid)) in columns.iter().enumerate() {
             match values.get(row) {
-                Some(&value) if live.at(row) => held[at] = value,
-                _ => null = true,
+                Some(&value) if valid.at(row) => held[at] = value,
+                _ => *live = false,
             }
-        }
-        let at = entry(child.len())?;
-        if null {
-            entries.push((at, 0));
-            live[row] = false;
-            continue;
         }
         let (start, stop, step) = match columns.len() {
             1 => (0, held[0], 1),
             2 => (held[0], held[1], 1),
             _ => (held[0], held[1], held[2]),
         };
-        let count = series_length(start, stop, step, inclusive)?;
-        child.reserve(count);
-        let mut value = start;
-        for _ in 0..count {
-            child.push(value);
-            value = value.wrapping_add(step);
-        }
-        entries.push((at, entry(count)?));
+        let count = if *live { series_length(start, stop, step, inclusive)? } else { 0 };
+        runs.push((start, step, count));
+        total += count;
+    }
+    let mut entries = Vec::with_capacity(rows);
+    let mut child = Vec::with_capacity(total);
+    for &(start, step, count) in &runs {
+        entries.push((entry(child.len())?, entry(count)?));
+        // Every value taken is between the start and the stop, both BIGINTs, so neither the product
+        // nor the sum can leave the type for any of them.
+        let steps = i64::try_from(count).map_err(|_| too_long())?;
+        child.extend((0..steps).map(|at| start.wrapping_add(at.wrapping_mul(step))));
     }
     let child = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(child)))?;
     let validity = Validity::from_iter(rows, |row| live[row]).normalize(rows);
