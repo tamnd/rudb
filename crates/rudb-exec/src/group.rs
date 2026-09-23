@@ -642,6 +642,17 @@ impl Share {
 /// same peak memory. Both numbers were measured in the same sweep and the lower one won everywhere.
 const PARTITION_FROM: usize = 4_096;
 
+/// How many places a map read by value may clear for each row the table has folded.
+///
+/// Clearing a place is a store, and a row the map answers is a hash and a probe it did not do, so a
+/// map that clears no more than two places for every row folded costs less than the hashing it can
+/// save, and a key whose window settles, the way `CounterID` does, stops clearing at all.
+const WINDOW_RATE: usize = 2;
+
+/// The places a map read by value may clear before a row has been folded, which is enough for the
+/// smallest window [`coded_within`](crate::table::coded_within) makes and a few times over.
+const WINDOW_SLACK: usize = 4_096;
+
 /// How much of one set of tables per instance the cache is taken to hold.
 ///
 /// Read by [`Aggregate::cache_holds_local`], which is where the reasoning is. It is a constant
@@ -1500,6 +1511,8 @@ impl<'a> Aggregate<'a> {
             coded_on: Vec::new(),
             coded_places: Vec::new(),
             coded_values: Vec::new(),
+            coded_spent: 0,
+            coded_read: 0,
             coded_map: Vec::new(),
             missing: Vec::new(),
             same: Vec::new(),
@@ -1556,6 +1569,8 @@ impl<'a> Aggregate<'a> {
             coded_on,
             coded_places,
             coded_values,
+            coded_spent,
+            coded_read,
             coded_map,
             missing,
             same,
@@ -1608,8 +1623,23 @@ impl<'a> Aggregate<'a> {
         } else {
             crate::table::coded_within(keys, *length, coded_on, Some(coded_values))
         };
+        // A map read by value is paid for out of the rows this table has folded. A window is the
+        // caller's to choose, and a key that keeps moving past it, the way a sorted `l_orderkey`
+        // does, would otherwise clear a new map of up to a quarter of a million places for every
+        // chunk, in each of the radix partitions of every thread. See [`WINDOW_RATE`]. Codes a page came with are left alone,
+        // since their map is as wide as the page's dictionary and no wider.
+        *coded_read = coded_read.saturating_add(*length);
+        let direct = direct.filter(|codes| {
+            codes.same_as(coded_on)
+                || !codes.reads_values()
+                || coded_spent.saturating_add(codes.combos())
+                    <= coded_read.saturating_mul(WINDOW_RATE).saturating_add(WINDOW_SLACK)
+        });
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
+                if codes.reads_values() {
+                    *coded_spent += codes.combos();
+                }
                 codes.hold(coded_on);
                 coded_map.clear();
                 coded_map.resize(codes.combos(), NOWHERE);
@@ -3525,6 +3555,10 @@ pub(crate) struct Building {
     coded_places: Vec<usize>,
     /// The values of each integer key column the map reads by value, widened, one run per column.
     coded_values: Vec<Vec<i64>>,
+    /// How many places the maps built on a window of values have cleared, summed over every build.
+    coded_spent: usize,
+    /// How many rows this table has folded, which is what pays for a map read by value.
+    coded_read: usize,
     /// The rows of the last chunk the map had no slot for, in row order.
     missing: Vec<usize>,
     /// One flag per row of the last chunk, true where the row's key is the key of the row before.
@@ -5909,8 +5943,8 @@ mod tests {
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
         EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition, FixedRecord,
-        FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, bigint_distinct_partition,
-        encoded_count_partition, fixed_partition,
+        FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, WINDOW_RATE, WINDOW_SLACK,
+        bigint_distinct_partition, encoded_count_partition, fixed_partition,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -6995,6 +7029,51 @@ mod tests {
         // every table started before any of this existed.
         assert_eq!(Share::Local.of(8 << 20), None);
         assert_eq!(Share::Local.of(1), None);
+    }
+
+    /// Folds `chunks` into one table the way a single instance does and hands it back.
+    fn folded(aggregate: &Aggregate<'_>, chunks: &[Vec<i32>]) -> super::Building {
+        let mut local = aggregate.local();
+        let mut building = aggregate.starting(Share::Local);
+        for part in chunks {
+            let rows = aggregate.read(&chunk(part), &mut local.expressions).expect("a chunk");
+            aggregate.fold(&rows, &mut building, None, None).expect("folded");
+        }
+        building
+    }
+
+    /// A sorted key moves past any window it is given, so every chunk would build a new map. The
+    /// maps it builds are held to [`WINDOW_RATE`] places a row folded, which is what kept q18's
+    /// `GROUP BY l_orderkey` from clearing a quarter of a million places per chunk per partition.
+    #[test]
+    fn a_key_that_keeps_moving_past_its_window_builds_maps_only_as_the_rows_pay_for_them() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, _out) = aggregate(&plan);
+        let chunks: Vec<Vec<i32>> =
+            (0..100).map(|at| (at * 2_048..(at + 1) * 2_048).collect()).collect();
+        let building = folded(&aggregate, &chunks);
+        assert_eq!(building.coded_read, 100 * 2_048);
+        assert!(building.coded_spent > 0, "the first chunks are read by value");
+        assert!(
+            building.coded_spent <= building.coded_read * WINDOW_RATE + WINDOW_SLACK,
+            "{} places cleared for {} rows",
+            building.coded_spent,
+            building.coded_read
+        );
+    }
+
+    /// The other side of it, a key the way `CounterID` is, a few thousand values that come back in
+    /// every chunk. Its window settles and the map is still the one reading it at the end.
+    #[test]
+    fn a_key_that_stays_inside_its_window_keeps_its_map() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, _out) = aggregate(&plan);
+        let chunks: Vec<Vec<i32>> = (0..100)
+            .map(|at| (0..2_048).map(|row| (row * 7 + at * 13) % 3_000 + 17).collect())
+            .collect();
+        let building = folded(&aggregate, &chunks);
+        assert!(!building.coded_on.is_empty(), "the last chunk was answered by the map");
+        assert!(building.coded_spent < 64 * 1_024, "the window settled after a few builds");
     }
 
     /// Only the table an instance fills before it partitions covers the aggregate's whole key range,
