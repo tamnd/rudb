@@ -617,8 +617,12 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
             // Room for one run past the end, so the write below never has to ask how much of its
-            // fixed width landed inside the chunk.
-            let mut values = vec![0; count + RUN];
+            // fixed width landed inside the chunk. Room rather than values: a short run appends its
+            // fixed eight and then cuts back to its real length, and a long one appends itself, so
+            // every value is written by the run it belongs to and nothing is zeroed first. On a
+            // sorted column the runs are thousands long and the zeroing was a second write of the
+            // whole chunk.
+            let mut values = Vec::with_capacity(count + RUN);
             let mut at = 0usize;
             for (value, length) in run_values.into_iter().zip(run_lengths) {
                 let length = usize::try_from(length)
@@ -627,16 +631,15 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
                     .checked_add(length)
                     .filter(|end| *end <= count)
                     .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
-                let short =
-                    if length <= RUN { values[at..].first_chunk_mut::<RUN>() } else { None };
-                match short {
-                    Some(window) => window.fill(value),
-                    None => values[at..end].fill(value),
+                if length <= RUN {
+                    values.extend_from_slice(&[value; RUN]);
+                    values.truncate(end);
+                } else {
+                    values.resize(end, value);
                 }
                 at = end;
             }
             check_count(at, count)?;
-            values.truncate(count);
             Ok(values)
         }
         Kind::Dict => {
