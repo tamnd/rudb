@@ -39,6 +39,7 @@
 //! position per row and a flatten per piece to answer something that is a run of `memcpy`s, so it is
 //! its own function. What the two share is the typed append underneath both of them.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value};
@@ -299,6 +300,9 @@ pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Resul
             order.iter().map(|&index| laid.get(index).cloned().unwrap_or(Value::Null)).collect();
         return Vector::from_values(ty.clone(), &values);
     }
+    if let Some(merged) = merged_dictionary(ty, pieces, order)? {
+        return Ok(merged);
+    }
     let mut data = data_for(ty, rows)?;
     // The untyped null, which has no run of data to lay or to gather out of, and is null whatever
     // the order is.
@@ -354,6 +358,89 @@ pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Resul
         );
     }
     Ok(Vector::flat(ty.clone(), copy_of(&data, order))?.with_validity(validity))
+}
+
+/// How many rows a merged dictionary entry has to stand for on average before a string column is
+/// gathered as codes rather than as views.
+///
+/// A Parquet file carries one dictionary per row group, so a sorted `lineitem` column arrives as
+/// 733 pieces over 49 dictionaries. The low cardinality columns have 98 to 343 entries between all
+/// of them, and merging those is nothing next to gathering six million views. A column whose
+/// dictionaries are nearly as long as the column is one the writer should not have encoded, and
+/// merging it would hash every value to save nothing, so it is gathered flat.
+const ROWS_PER_MERGED_ENTRY: usize = 8;
+
+/// The string column gathered by `order` as one dictionary, when every piece is a dictionary.
+///
+/// The pieces' dictionaries are merged into one with each distinct value once, so the codes mean
+/// the same thing on every page cut from the result and the result is a stable dictionary. The
+/// gather is then four bytes a row instead of sixteen, and the append after the sort gets the
+/// dictionary the scan handed up rather than a flat column it has to read a row at a time.
+///
+/// `None` when the column is not a string, when any piece is not a dictionary or has nulls at its
+/// own level, or when the dictionaries are too long for the merge to pay.
+fn merged_dictionary(
+    ty: &LogicalType,
+    pieces: &[Vector],
+    order: &[usize],
+) -> Result<Option<Vector>> {
+    if !matches!(ty, LogicalType::Varchar | LogicalType::Blob) || pieces.is_empty() {
+        return Ok(None);
+    }
+    let rows: usize = pieces.iter().map(Vector::len).sum();
+    let mut dictionaries: Vec<&Arc<Vector>> = Vec::new();
+    let mut which = Vec::with_capacity(pieces.len());
+    let mut entries = 0;
+    for piece in pieces {
+        let Some((_, values)) = piece.shared_dictionary_parts() else {
+            return Ok(None);
+        };
+        if !matches!(piece.validity(), Validity::AllValid) {
+            return Ok(None);
+        }
+        let at = match dictionaries.iter().position(|seen| Arc::ptr_eq(seen, values)) {
+            Some(at) => at,
+            None => {
+                entries += values.len();
+                if entries.saturating_mul(ROWS_PER_MERGED_ENTRY) > rows {
+                    return Ok(None);
+                }
+                dictionaries.push(values);
+                dictionaries.len() - 1
+            }
+        };
+        which.push(at);
+    }
+    // A null entry has no bytes, so it merges with every other null entry.
+    let mut merged: HashMap<Option<&[u8]>, u32> = HashMap::new();
+    let mut values = Vec::new();
+    let mut remaps = Vec::with_capacity(dictionaries.len());
+    for dictionary in &dictionaries {
+        let mut remap = Vec::with_capacity(dictionary.len());
+        // row at a time: over the dictionary entries, a few hundred of them against millions of
+        // rows, and only the first sighting of each value becomes one.
+        for entry in 0..dictionary.len() {
+            let next = u32::try_from(values.len())
+                .map_err(|_| Error::internal("a merged dictionary past four billion entries"))?;
+            let code = *merged.entry(dictionary.bytes_at(entry)).or_insert_with(|| {
+                values.push(dictionary.value_at(entry));
+                next
+            });
+            remap.push(code);
+        }
+        remaps.push(remap);
+    }
+    let mut laid = Vec::with_capacity(rows);
+    for (piece, &at) in pieces.iter().zip(&which) {
+        let (codes, _) = piece
+            .dictionary_parts()
+            .ok_or_else(|| Error::internal("a dictionary piece lost its dictionary"))?;
+        let remap = &remaps[at];
+        laid.extend(codes.iter().map(|&code| remap[code as usize]));
+    }
+    let codes = order.iter().map(|&index| laid[index]).collect();
+    let values = Vector::from_values(ty.clone(), &values)?;
+    Ok(Some(Vector::stable_dictionary(codes, Arc::new(values))?))
 }
 
 /// The validity of the pieces laid end to end, in `rows` rows.
@@ -823,5 +910,39 @@ mod tests {
         let untyped = [Vector::constant(LogicalType::Null, Value::Null, 3)];
         let got = interleave(&LogicalType::Null, &untyped, &[2, 0]).expect("an untyped null");
         assert_eq!(values(&got), vec![Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn an_interleave_of_dictionaries_merges_them_into_one() {
+        let word = |text: &str| Value::Varchar(text.to_string());
+        let first = [word("MAIL"), word("a word long enough to leave the inline view")];
+        let second = [Value::Null, word("MAIL"), word("SHIP")];
+        let first = Arc::new(Vector::from_values(LogicalType::Varchar, &first).expect("words"));
+        let second = Arc::new(Vector::from_values(LogicalType::Varchar, &second).expect("words"));
+        let over = |codes: Vec<u32>, dictionary: &Arc<Vector>| {
+            Vector::dictionary_over(codes, Arc::clone(dictionary)).expect("a dictionary")
+        };
+        let pieces = [
+            over((0..16).map(|row| row % 2).collect(), &first),
+            over((0..16).map(|row| row % 3).collect(), &second),
+            over(vec![1; 8], &first),
+        ];
+        let order: Vec<usize> = (0..40).rev().collect();
+        let laid: Vec<Value> = pieces.iter().flat_map(values).collect();
+        let expected: Vec<Value> = order.iter().map(|&index| laid[index].clone()).collect();
+        let got = interleave(&LogicalType::Varchar, &pieces, &order).expect("an interleave");
+        assert_eq!(values(&got), expected);
+        let (_, merged) = got.stable_dictionary_parts().expect("one stable dictionary");
+        assert_eq!(merged.len(), 4, "MAIL once, the long word, the null and SHIP");
+
+        let mixed = [pieces[0].clone(), pieces[1].flatten().expect("flat")];
+        let got = interleave(&LogicalType::Varchar, &mixed, &order[8..]).expect("an interleave");
+        assert!(got.dictionary_parts().is_none(), "a flat piece gathers flat");
+        let few = &pieces[..1];
+        let got = interleave(&LogicalType::Varchar, few, &[3, 2]).expect("an interleave");
+        assert_eq!(
+            values(&got),
+            vec![word("a word long enough to leave the inline view"), word("MAIL")]
+        );
     }
 }
