@@ -267,6 +267,95 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
     Ok(Some(Vector::flat(ty.clone(), data)?.with_validity(validity).into_pages()))
 }
 
+/// Several vectors of one type laid end to end and then read back in `order`.
+///
+/// What a sort is. Row `n` of the answer is row `order[n]` of the pieces laid end to end, so the
+/// pieces are laid once and the answer is one gather, which writes the answer front to back. An
+/// [`Assembly`] answers the same question the other way round, with a position per input row that
+/// it scatters into, and that costs it a map of the whole column and a scatter per column, which for
+/// a sort is the same permutation worked out again for every column. Here the caller works it out
+/// once and every column reads it.
+///
+/// A string column comes back as views over the one arena its bytes were laid into, the same as
+/// [`concat()`] gives, so the gather moves sixteen bytes a row.
+///
+/// # Errors
+///
+/// If the type has no layout this can lay, if a piece holds fewer values than it has rows, or if
+/// an entry of `order` is past the end of the pieces.
+pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Result<Vector> {
+    let rows: usize = pieces.iter().map(Vector::len).sum();
+    if let Some(&past) = order.iter().find(|&&index| index >= rows) {
+        return Err(Error::internal(format!("row {past} read out of pieces of {rows} rows")));
+    }
+    if matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _)) {
+        // row at a time: the nested types, for the reason `Assembly::values` gives. They have no run
+        // of data to lay end to end and no typed copy to gather with.
+        let laid: Vec<Value> = pieces
+            .iter()
+            .flat_map(|piece| (0..piece.len()).map(|row| piece.value_at(row)))
+            .collect();
+        let values: Vec<Value> =
+            order.iter().map(|&index| laid.get(index).cloned().unwrap_or(Value::Null)).collect();
+        return Vector::from_values(ty.clone(), &values);
+    }
+    let mut data = data_for(ty, rows)?;
+    // The untyped null, which has no run of data to lay or to gather out of, and is null whatever
+    // the order is.
+    if matches!(data, Data::Empty) {
+        return Ok(Vector::constant(ty.clone(), Value::Null, order.len()));
+    }
+    // Each piece's validity, taken after it is flattened, because a constant null keeps its null in
+    // its value rather than in its mask and a flattened one has it in the mask like any other row.
+    let mut masks = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        // flatten: the gather below reads one run of data, and a piece can arrive dictionary
+        // encoded, constant or bit packed. The flatten is a typed loop per layout, a flat piece is
+        // not copied by it, and one piece is flattened at a time so a column is never held twice.
+        let flat = piece.flatten()?;
+        let from = flat.data().ok_or_else(|| Error::internal("a flattened vector with no data"))?;
+        let appended = extend(&mut data, from)?;
+        if appended != piece.len() {
+            return Err(Error::internal(format!(
+                "a piece of {} rows laid {appended} values end to end",
+                piece.len()
+            )));
+        }
+        masks.push((flat.len(), flat.validity().clone()));
+    }
+    let laid = if masks.iter().all(|(_, mask)| matches!(mask, Validity::AllValid)) {
+        Validity::AllValid
+    } else {
+        let mut live = Vec::with_capacity(rows);
+        for (len, mask) in &masks {
+            // row at a time: a bit a row for the mixed case, once a column rather than once a
+            // piece of every column the way it would be read otherwise.
+            live.extend((0..*len).map(|row| mask.is_valid(row)));
+        }
+        Validity::from_run(&live)
+    };
+    if laid.count_valid(rows) == 0 {
+        return Ok(Vector::constant(ty.clone(), Value::Null, order.len()));
+    }
+    let validity = match laid {
+        Validity::AllValid => Validity::AllValid,
+        laid => Validity::from_iter(order.len(), |row| {
+            order.get(row).is_some_and(|&index| laid.is_valid(index))
+        }),
+    };
+    if let Data::Varlen(column) = data {
+        let (views, arena) = column.into_parts();
+        let gathered = order
+            .iter()
+            .map(|&index| views.get(index).copied().unwrap_or_else(StringView::empty))
+            .collect();
+        return Ok(
+            Vector::string_views(ty.clone(), gathered, Arc::new(arena))?.with_validity(validity)
+        );
+    }
+    Ok(Vector::flat(ty.clone(), copy_of(&data, order))?.with_validity(validity))
+}
+
 /// The validity of the pieces laid end to end, in `rows` rows.
 ///
 /// The two cheap answers are checked for first because they are the answers real data gives. A
@@ -672,5 +761,67 @@ mod tests {
         let other =
             Vector::from_values(LogicalType::Integer, &[Value::Integer(1)]).expect("an int");
         assert!(concat(&ty, &[flat, other]).expect("no error").is_none(), "two types laid");
+    }
+
+    /// Pieces of every form a sort hands over, read back through an order, against the same order
+    /// read a value at a time.
+    #[test]
+    fn an_interleave_reads_the_pieces_in_the_order_it_is_given() {
+        let words: Vec<Value> = ["a long enough word to leave the inline view", "b", "c"]
+            .iter()
+            .map(|word| Value::Varchar((*word).to_string()))
+            .collect();
+        let dictionary = Vector::from_values(LogicalType::Varchar, &words).expect("words");
+        let strings = [
+            Vector::dictionary(vec![2, 0, 1], dictionary).expect("a dictionary"),
+            Vector::from_values(
+                LogicalType::Varchar,
+                &[Value::Null, Value::Varchar("another string past twelve bytes".to_string())],
+            )
+            .expect("flat"),
+        ];
+        let numbers = [
+            Vector::from_values(
+                LogicalType::BigInt,
+                &[Value::BigInt(7), Value::Null, Value::BigInt(9)],
+            )
+            .expect("flat"),
+            Vector::constant(LogicalType::BigInt, Value::BigInt(4), 1),
+            Vector::constant(LogicalType::BigInt, Value::Null, 1),
+        ];
+        let lists = [
+            Vector::from_values(
+                LogicalType::List(Box::new(LogicalType::Integer)),
+                &[
+                    Value::List { element: LogicalType::Integer, values: vec![Value::Integer(1)] },
+                    Value::Null,
+                    Value::List { element: LogicalType::Integer, values: vec![] },
+                ],
+            )
+            .expect("lists"),
+            Vector::from_values(
+                LogicalType::List(Box::new(LogicalType::Integer)),
+                &[
+                    Value::List {
+                        element: LogicalType::Integer,
+                        values: vec![Value::Integer(2), Value::Integer(3)],
+                    },
+                    Value::Null,
+                ],
+            )
+            .expect("lists"),
+        ];
+        let order = [4, 0, 3, 1, 2, 3];
+        for pieces in [&strings[..], &numbers[..], &lists[..]] {
+            let ty = pieces[0].logical_type().clone();
+            let laid: Vec<Value> = pieces.iter().flat_map(values).collect();
+            let expected: Vec<Value> = order.iter().map(|&index| laid[index].clone()).collect();
+            let got = interleave(&ty, pieces, &order).expect("an interleave");
+            assert_eq!(values(&got), expected, "{ty}");
+        }
+        assert!(interleave(&LogicalType::BigInt, &numbers, &[5]).is_err(), "row 5 of 5 rows");
+        let untyped = [Vector::constant(LogicalType::Null, Value::Null, 3)];
+        let got = interleave(&LogicalType::Null, &untyped, &[2, 0]).expect("an untyped null");
+        assert_eq!(values(&got), vec![Value::Null, Value::Null]);
     }
 }
