@@ -52,6 +52,12 @@
 //! D2 adds a few more of that third kind. Each one is a column list here and a list of rows in
 //! `rudb_exec::metadata`, and nothing else.
 //!
+//! `rudb_device_card(path)` is the one of that kind that takes an argument, because the fact it
+//! reports is about a directory rather than the process: what a sync costs on the device under it,
+//! measured the way `engine-v4/16-measurement.md` section 16.3 says. It resolves in its own arm
+//! because its argument is a path and an optional iteration count, which is neither a table name
+//! nor nothing.
+//!
 //! `pragma_table_info()` and `pragma_show()` are a fourth kind and the first two of the pragma
 //! family. They take one table name and describe whatever it names, so their columns are fixed and
 //! their rows are not a fact about the engine at all, they are a fact about one entry in a catalog.
@@ -87,6 +93,8 @@ pub enum TableFunction {
     RudbStrategies,
     /// `rudb_links()`, every relationship declared and what is stored for it.
     RudbLinks,
+    /// `rudb_device_card(path)`, what a sync costs on the device a directory is on.
+    RudbDeviceCard,
     /// `duckdb_keywords()`, every word the grammar knows and which class each one is in.
     DuckdbKeywords,
     /// `duckdb_types()`, every type name the engine knows and what each one stands for.
@@ -154,6 +162,7 @@ impl TableFunction {
             Self::ReadCsv => "read_csv",
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
+            Self::RudbDeviceCard => "rudb_device_card",
             Self::DuckdbKeywords => "duckdb_keywords",
             Self::DuckdbTypes => "duckdb_types",
             Self::DuckdbFunctions => "duckdb_functions",
@@ -289,6 +298,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("rudb_links") {
             return Some(Self::RudbLinks);
+        }
+        if name.eq_ignore_ascii_case("rudb_device_card") {
+            return Some(Self::RudbDeviceCard);
         }
         if name.eq_ignore_ascii_case("duckdb_keywords") {
             return Some(Self::DuckdbKeywords);
@@ -469,6 +481,9 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
             columns: Columns::Fixed(name_columns(function)),
         });
     }
+    if function == TableFunction::RudbDeviceCard {
+        return device_card(arguments);
+    }
     let arity = arguments.len();
     // The metadata tables take nothing and their columns are fixed, which makes them the simplest
     // case here. They are one arm rather than one each because the only thing that differs is the
@@ -544,6 +559,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::GenerateSeries
         | TableFunction::RudbStrategies
         | TableFunction::RudbLinks
+        | TableFunction::RudbDeviceCard
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions
@@ -600,10 +616,72 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::GenerateSeries
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
+        | TableFunction::RudbDeviceCard
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => None,
     }
+}
+
+/// `rudb_device_card(path)` and `rudb_device_card(path, iterations)`.
+///
+/// The path is a directory and the card is about the device under it. The second argument is how
+/// many timed iterations each sync probe runs, and giving it at all means measuring again rather
+/// than reading the card this process already has for that device, which is what somebody passing
+/// `2000` to get the spec's precision wants. A null path is left a null so the executor can say
+/// what is wrong with it in its own words, the same as the file readers do.
+fn device_card(arguments: &[LogicalType]) -> Result<ResolvedTable> {
+    let function = TableFunction::RudbDeviceCard;
+    let path = matches!(arguments.first(), Some(LogicalType::Varchar | LogicalType::Null));
+    let count = arguments.get(1).is_none_or(LogicalType::is_integer);
+    if !path || !count || arguments.len() > 2 {
+        return Err(Error::binder(format!(
+            "No function matches the given name and argument types '{}({})'. You might need to \
+             add explicit type casts.\n\tCandidate functions:\n\t{0}(VARCHAR)\n\t{0}(VARCHAR, \
+             BIGINT)\n",
+            function.name(),
+            arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        )));
+    }
+    let mut wanted = vec![arguments[0].clone()];
+    if arguments.len() == 2 {
+        wanted.push(LogicalType::BigInt);
+    }
+    Ok(ResolvedTable { function, arguments: wanted, columns: Columns::Fixed(device_card_fields()) })
+}
+
+/// The columns `rudb_device_card()` produces, one row per sync call the platform has.
+///
+/// The first row is the call `commit_sync = full` uses, and the columns after `plausible` are about
+/// the device rather than the call, so they repeat on every row. One row per call rather than one
+/// row with a column per call, because which calls there are depends on the platform and a column
+/// that is null on every Linux machine is a column nobody can write a query against. The latencies
+/// are microseconds as doubles, because that is the unit the spec states them in and a p50 of 24 µs
+/// and one of 3,347 µs should both read as what they are.
+#[must_use]
+pub fn device_card_fields() -> Vec<Field> {
+    vec![
+        Field::new("path", LogicalType::Varchar),
+        Field::new("device", LogicalType::Varchar),
+        Field::new("filesystem", LogicalType::Varchar),
+        Field::new("sync_call", LogicalType::Varchar),
+        Field::new("chosen", LogicalType::Boolean),
+        Field::new("p50_4k_us", LogicalType::Double),
+        Field::new("p99_4k_us", LogicalType::Double),
+        Field::new("p50_64k_us", LogicalType::Double),
+        Field::new("p99_64k_us", LogicalType::Double),
+        Field::new("plausible", LogicalType::Boolean),
+        Field::new("write_mib_s", LogicalType::Double),
+        Field::new("syncs_1", LogicalType::BigInt),
+        Field::new("syncs_2", LogicalType::BigInt),
+        Field::new("syncs_4", LogicalType::BigInt),
+        Field::new("syncs_8", LogicalType::BigInt),
+        Field::new("scaling", LogicalType::Double),
+        Field::new("plp", LogicalType::Varchar),
+        Field::new("memory_backed", LogicalType::Boolean),
+        Field::new("lanes", LogicalType::Integer),
+        Field::new("iterations", LogicalType::Integer),
+    ]
 }
 
 /// The columns one of the two name taking pragmas produces.
@@ -1378,5 +1456,25 @@ mod tests {
             .collect();
         assert_eq!(numbers, ["block_size", "total_blocks", "used_blocks", "free_blocks"]);
         assert!(fields.iter().filter(|field| field.ty == LogicalType::Varchar).count() == 5);
+    }
+
+    #[test]
+    fn the_device_card_takes_a_path_and_maybe_a_count() {
+        let found = resolve_table("rudb_device_card", &[LogicalType::Varchar]).unwrap();
+        assert_eq!(found.function, TableFunction::RudbDeviceCard);
+        assert_eq!(found.columns, Columns::Fixed(device_card_fields()));
+        let counted =
+            resolve_table("RUDB_DEVICE_CARD", &[LogicalType::Varchar, LogicalType::Integer])
+                .unwrap();
+        assert_eq!(counted.arguments, [LogicalType::Varchar, LogicalType::BigInt]);
+        for wrong in [
+            &[][..],
+            &[LogicalType::Integer][..],
+            &[LogicalType::Varchar, LogicalType::Varchar][..],
+            &[LogicalType::Varchar, LogicalType::BigInt, LogicalType::BigInt][..],
+        ] {
+            let message = resolve_table("rudb_device_card", wrong).unwrap_err().to_string();
+            assert!(message.contains("rudb_device_card(VARCHAR, BIGINT)"), "{message}");
+        }
     }
 }
