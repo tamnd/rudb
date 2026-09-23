@@ -2751,10 +2751,11 @@ impl Writer {
     }
 
     /// Derives bounded two-key leaders from numeric anchor ordinals and stable string codes.
-    fn pair_frequencies(&self) -> Result<Vec<PairFrequencySummary>> {
-        let anchors = self
-            .table
-            .frequencies
+    fn pair_frequencies(
+        &self,
+        frequencies: &[Option<Frequencies>],
+    ) -> Result<Vec<PairFrequencySummary>> {
+        let anchors = frequencies
             .iter()
             .enumerate()
             .filter_map(|(column, summary)| {
@@ -2854,55 +2855,66 @@ impl Writer {
             previous = Some(*last);
         }
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
-        // The frequencies charge themselves, one span to each thread that counts, because they run
-        // on threads of their own and a span on this one would see their wall time and none of
-        // their CPU.
         drop(timing);
-        let (frequencies, distincts): (Vec<Option<FrequencySummary>>, _) =
-            self.numeric_frequencies()?.into_iter().unzip();
-        self.table.frequencies =
-            frequencies.into_iter().map(|held| held.map(Frequencies::Held)).collect();
-        self.table.distincts = distincts;
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
         let placing = self.at;
         finish_dictionaries(&mut self.dictionaries)?;
         self.place_blocks()?;
-        self.table.pair_frequencies = self.pair_frequencies()?;
-        let dictionaries = std::mem::take(&mut self.dictionaries);
+        // The numeric frequencies and the global dictionaries read what is already written and
+        // write nothing, so they run at the same time. Each was most of a second on `hits` with the
+        // other waiting for it, and neither keeps every core busy on its own: the frequencies are
+        // as long as their longest column and the dictionaries go one column at a time. The
+        // frequencies charge themselves, one span to each thread that counts, because they run on
+        // threads of their own and a span on this one would see their wall time and none of their
+        // CPU.
+        let this = &*self;
+        let (numeric, closed) = std::thread::scope(|scope| {
+            let numeric = scope.spawn(|| {
+                let (frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
+                    this.numeric_frequencies()?.into_iter().unzip();
+                let frequencies = frequencies
+                    .into_iter()
+                    .map(|held| held.map(Frequencies::Held))
+                    .collect::<Vec<_>>();
+                let pairs = this.pair_frequencies(&frequencies)?;
+                Ok::<_, Error>((frequencies, distincts, pairs))
+            });
+            let closed = this
+                .dictionaries
+                .iter()
+                .enumerate()
+                .map(|(index, dictionary)| {
+                    dictionary.as_ref().map(|dictionary| this.close_dictionary(index, dictionary))
+                })
+                .map(Option::transpose)
+                .collect::<Result<Vec<_>>>();
+            let numeric =
+                numeric.join().map_err(|_| Error::internal("the native frequency thread panicked"));
+            (numeric, closed)
+        });
+        let (frequencies, distincts, pairs) = numeric??;
+        let closed = closed?;
+        self.table.frequencies = frequencies;
+        self.table.distincts = distincts;
+        self.table.pair_frequencies = pairs;
+        self.dictionaries = Vec::new();
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         self.table.frequency_texts = vec![Vec::new(); self.table.fields.len()];
         self.table.host_groups = None;
-        // One column at a time, and every column's values dropped before the next column's are read
-        // back. Sorting the columns across threads is the obvious thing and was what this did, but
-        // sorting a column now means decoding it, and five ClickBench string columns decoded at once
-        // is the peak this change is about.
-        for (index, dictionary) in dictionaries.into_iter().enumerate() {
-            let Some(dictionary) = dictionary else { continue };
-            let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
-            // A code nothing counted is a code no non-null row of this column holds, which is the
-            // empty string a null was written as and nothing else, because a code is only ever made
-            // by a row asking for one.
-            self.table.distincts[index] =
-                Some(dictionary.counts.iter().filter(|count| **count != 0).count() as u64);
-            let (frequencies, texts) = code_frequency(&dictionary, &flat, &bases)?;
+        for (index, closed) in closed.into_iter().enumerate() {
+            let Some(closed) = closed else { continue };
+            let ClosedDictionary { distinct, frequencies, texts, hosts, encoded, payload } = closed;
+            self.table.distincts[index] = Some(distinct);
             self.table.frequencies[index] = Some(Frequencies::Held(frequencies));
             self.table.frequency_texts[index] = texts;
-            if self.table.fields[index].name.eq_ignore_ascii_case("Referer") {
-                self.table.host_groups = host::build(index, &dictionary, &flat, &bases)?;
+            if hosts.is_some() {
+                self.table.host_groups = hosts;
             }
-            drop(flat);
-            drop(bases);
-            let encoded = encode_global_dictionary(&dictionary, &order, &dictionary.placed, true)?;
-            drop(order);
             let offset = self.at;
             self.put(&encoded.index)?;
             self.put(&encoded.ranks)?;
             self.put(&encoded.grams)?;
-            self.table.dictionary_payloads[index] = dictionary
-                .placed
-                .iter()
-                .try_fold(0_u64, |sum, place| sum.checked_add(place.length))
-                .ok_or_else(|| invalid("global dictionary payload overflow"))?;
+            self.table.dictionary_payloads[index] = payload;
             let length = encoded
                 .index
                 .len()
@@ -2946,6 +2958,40 @@ impl Writer {
                 hash: checksum(&directory),
             },
         })
+    }
+
+    /// One global dictionary's page and statistics, built from what is already in the file.
+    ///
+    /// Nothing is written here, so that [`Self::close`] can run this beside the numeric frequencies
+    /// and put the pages down afterwards in column order, which is where they always went. The
+    /// column's values are decoded in here and dropped before it returns, because five ClickBench
+    /// string columns decoded at once is the peak an earlier change took out, and the columns are
+    /// still taken one at a time for that reason.
+    fn close_dictionary(
+        &self,
+        index: usize,
+        dictionary: &GlobalDictionary,
+    ) -> Result<ClosedDictionary> {
+        let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
+        // A code nothing counted is a code no non-null row of this column holds, which is the
+        // empty string a null was written as and nothing else, because a code is only ever made by
+        // a row asking for one.
+        let distinct = dictionary.counts.iter().filter(|count| **count != 0).count() as u64;
+        let (frequencies, texts) = code_frequency(dictionary, &flat, &bases)?;
+        let hosts = if self.table.fields[index].name.eq_ignore_ascii_case("Referer") {
+            host::build(index, dictionary, &flat, &bases)?
+        } else {
+            None
+        };
+        drop(flat);
+        drop(bases);
+        let encoded = encode_global_dictionary(dictionary, &order, &dictionary.placed, true)?;
+        let payload = dictionary
+            .placed
+            .iter()
+            .try_fold(0_u64, |sum, place| sum.checked_add(place.length))
+            .ok_or_else(|| invalid("global dictionary payload overflow"))?;
+        Ok(ClosedDictionary { distinct, frequencies, texts, hosts, encoded, payload })
     }
 
     /// Writes the statistics sections for the table being closed, as far as the budget reaches.
@@ -9321,6 +9367,17 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
         put_u32(&mut out, code);
     }
     Ok(Some(out))
+}
+
+/// What [`Writer::close_dictionary`] builds for one column and [`Writer::close`] writes.
+struct ClosedDictionary {
+    distinct: u64,
+    frequencies: FrequencySummary,
+    texts: Vec<Option<Vec<u8>>>,
+    hosts: Option<host::HostSummary>,
+    encoded: EncodedDictionary,
+    /// The bytes of the column's payload blocks, which are already in the file.
+    payload: u64,
 }
 
 struct EncodedDictionary {
