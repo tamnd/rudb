@@ -1011,6 +1011,38 @@ fn nulls_at(plan: &Plan, input: NodeRef, position: usize) -> Option<Stat<u64>> {
     Some(zones.nulls(zones.column(name)?))
 }
 
+/// A null count that licenses a rewrite is entitled to an exact one and to nothing else.
+///
+/// [`NULLS`] is the same number read to choose between two plans, where any class will do because a
+/// wrong number there is a slow query. Here a wrong number is a wrong answer, so this is
+/// [`Use::Enable`] and a count the store estimated does not get through.
+pub(crate) const NO_NULLS: Use = Use::Enable;
+
+/// Whether the store says the column this binding names holds no nulls at all.
+///
+/// The certificate `spec/stats/05-every-query.md` section 5.10 is about. A column with an exact zero
+/// null count has a null branch that is provably dead, and the branch is dead at every level: the
+/// mask is not written, the kernels do not test it, and a predicate asking whether a value is null
+/// has an answer before the query runs.
+///
+/// Exact and nothing else, through [`NO_NULLS`]. An estimated null count of zero is a column nobody
+/// found a null in, which is not the same claim and is the claim that loses rows.
+///
+/// The count is about a column of a table, and the question here is about a value an operator is
+/// reading, so the two are only the same claim if nothing in between put a null there. `input` is
+/// what the expression reads from, and [`walk::scan_of`] walks down it to the scan through the
+/// operators that keep a value as it was. A left join is not one of them: it pads, and a column that
+/// holds no nulls in the file holds one in every row the join had no match for. That is what makes
+/// `LEFT JOIN ... WHERE parent.x IS NULL` the way to write an anti join, and settling that predicate
+/// on the file's count would answer the opposite of the question.
+pub(crate) fn never_null(plan: &Plan, input: NodeRef, binding: ColumnBinding) -> bool {
+    let Some(at) = walk::scan_of(plan, input, binding.table) else {
+        return false;
+    };
+    let Some(stat) = nulls_at(plan, at, binding.column as usize) else { return false };
+    stat.read(NO_NULLS) == Some(&0)
+}
+
 /// One equality or inequality between a column of the scan numbered `index` and a constant.
 ///
 /// Written either way round, because the optimizer does not normalise which side the constant sits
