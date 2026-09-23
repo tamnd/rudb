@@ -591,6 +591,15 @@ fn hashes(vector: &Vector) -> Option<(Vec<u64>, usize)> {
     let nullable = vector.validity().has_nulls(vector.len());
     let mut hashes = Vec::with_capacity(vector.len());
     let mut counter = Counter::new();
+    if let Some(numbers) = signed_values(vector, nullable) {
+        for number in numbers {
+            let hash = hash_int(i128::from(number));
+            counter.saw(hash);
+            hashes.push(hash);
+        }
+        let distinct = counter.distinct().min(hashes.len());
+        return Some((hashes, distinct));
+    }
     // row at a time: the third reader has no vectorised form, and a row it cannot read is a sieve
     // that has to be abandoned rather than a row that can be left out.
     for row in 0..vector.len() {
@@ -627,6 +636,32 @@ fn hashes(vector: &Vector) -> Option<(Vec<u64>, usize)> {
     Some((hashes, distinct))
 }
 
+/// The value of every row that is not null, for a column [`Vector::signed_block`] hands over whole.
+///
+/// The first of the three readers in [`fill`] and [`hashes`], taken a block at a time. Read a row at
+/// a time, [`Vector::signed_at`] matches on the body and then on the layout for every row, and on
+/// the 10m ClickBench load that made this module 14 percent of the load's CPU, most of it on columns
+/// that were a flat slice of integers all along. The values are the same ones in the same order, so
+/// the sieve is the same bits.
+///
+/// `None` for every column the block reader does not take, which then goes a row at a time as
+/// before.
+fn signed_values(vector: &Vector, nullable: bool) -> Option<Vec<i64>> {
+    let mut numbers = Vec::with_capacity(vector.len());
+    if !vector.signed_block(&mut numbers) {
+        return None;
+    }
+    if nullable {
+        let mut row = 0;
+        numbers.retain(|_| {
+            let valid = !vector.is_null_at(row);
+            row += 1;
+            valid
+        });
+    }
+    Some(numbers)
+}
+
 /// Puts every value of `vector` into `sieve`, answering whether it could read all of them.
 ///
 /// Three readers in falling order of what they cost. [`Vector::signed_at`] covers the signed widths
@@ -635,6 +670,9 @@ fn hashes(vector: &Vector) -> Option<(Vec<u64>, usize)> {
 /// own, and those go through a value.
 fn fill(vector: &Vector, sieve: &mut Sieve) -> bool {
     let nullable = vector.validity().has_nulls(vector.len());
+    if let Some(numbers) = signed_values(vector, nullable) {
+        return numbers.into_iter().all(|number| sieve.add_int(i128::from(number)));
+    }
     // row at a time: the third reader has no vectorised form, and a row it cannot read is a sieve
     // that has to be abandoned rather than a row that can be left out.
     for row in 0..vector.len() {
@@ -736,7 +774,7 @@ mod tests {
 
     use rudb_vector::Chunk;
 
-    use super::{BLOCK_WORDS, Blocked, Counter, Sieve, hash_int};
+    use super::{BLOCK_WORDS, Blocked, Counter, Sieve, dense, fill, hash_int, hashes};
     use crate::zone::Zone;
 
     /// The sieve of a one column chunk holding `values`, with a generous budget.
@@ -963,6 +1001,63 @@ mod tests {
         let absent = (0..100_i64).map(|n| i128::from(n.wrapping_mul(982_451_653)) + 1);
         let kept = absent.filter(|number| !sieve.excludes(&int(*number))).count();
         assert!(kept < 10, "a filter of one block kept {kept} of 100 values it never saw");
+    }
+
+    #[test]
+    fn a_column_read_as_a_block_gets_the_sieve_it_got_a_row_at_a_time() {
+        // The hashes and the bits are what a row at a time walk of the values gives, nulls left out,
+        // whatever width the column is and however many of its rows are null.
+        let wide = |n: i64| n.wrapping_mul(982_451_653);
+        let columns = [
+            (
+                LogicalType::BigInt,
+                (0..3000_i64).map(|n| Value::BigInt(wide(n))).collect::<Vec<_>>(),
+            ),
+            (LogicalType::Integer, (0..3000).map(|n| Value::Integer(n % 700 - 350)).collect()),
+            (LogicalType::SmallInt, (0..3000).map(|n| Value::SmallInt((n % 90) as i16)).collect()),
+            (
+                LogicalType::BigInt,
+                (0..3000_i64)
+                    .map(|n| if n % 7 == 0 { Value::Null } else { Value::BigInt(wide(n)) })
+                    .collect(),
+            ),
+            (
+                LogicalType::Integer,
+                (0..3000)
+                    .map(|n| if n % 3 == 0 { Value::Null } else { Value::Integer(n % 50) })
+                    .collect(),
+            ),
+        ];
+        let mut bitmaps = 0;
+        for (ty, values) in columns {
+            let numbers = values
+                .iter()
+                .filter_map(|value| match value {
+                    Value::BigInt(number) => Some(i128::from(*number)),
+                    Value::Integer(number) => Some(i128::from(*number)),
+                    Value::SmallInt(number) => Some(i128::from(*number)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let flat = Vector::from_values(ty.clone(), &values).expect("a column");
+            let mut block = Vec::new();
+            assert!(flat.signed_block(&mut block), "the column is read as a block");
+            let (hashed, _) = hashes(&flat).expect("every row reads");
+            assert_eq!(hashed, numbers.iter().map(|&number| hash_int(number)).collect::<Vec<_>>());
+            let zone = Zone::of(&Chunk::new(vec![flat.clone()]).expect("a chunk"));
+            if let Some(dense) = dense(zone.column(0).expect("one column")) {
+                let mut filled = Sieve::Dense(dense.clone());
+                let mut expected = Sieve::Dense(dense);
+                assert!(fill(&flat, &mut filled));
+                assert!(numbers.iter().all(|&number| expected.add_int(number)));
+                assert_eq!(filled, expected, "{ty:?}");
+                bitmaps += 1;
+            }
+        }
+        assert!(
+            bitmaps >= 2,
+            "only {bitmaps} of the columns had a range narrow enough for a bitmap"
+        );
     }
 
     #[test]
