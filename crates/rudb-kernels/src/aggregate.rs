@@ -1083,7 +1083,7 @@ pub fn update_scattered(
 }
 
 /// How many of a chunk's rows land in each group, or none if there are too many groups for the
-/// locals of [`few`] to be the way the chunk is folded.
+/// locals of `few` to be the way the chunk is folded.
 ///
 /// Every sum, mean and count over a few groups used to count its rows again as it added them, which
 /// on q01 is eight counts a row that all come out the same whenever the argument has no nulls. This
