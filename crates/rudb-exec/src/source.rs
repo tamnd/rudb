@@ -1561,21 +1561,21 @@ impl Series {
         let source = Schema::empty();
         let one = Chunk::with_rows(Vec::new(), 1)?;
         let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
-        if let [start, stop, step] = evaluated.as_slice()
-            && *step.logical_type() == LogicalType::Interval
-        {
-            let ty = start.logical_type().clone();
-            let schema = Schema::numbered(vec![Field::new(function.name(), ty.clone())], index);
-            let empty = Self { ty, ..Self::empty(schema.clone()) };
-            let values = (start.value_at(0), stop.value_at(0), step.value_at(0));
-            let Some(stepping) = moments(function, &values.0, &values.1, &values.2)? else {
-                return Ok(empty);
-            };
-            let rows = u64::try_from(stepping.len()).unwrap_or(u64::MAX);
-            return Ok(match stepping {
-                Stepping::Even { start, step, .. } => Self { start, step, rows, ..empty },
-                Stepping::Listed(stamps) => Self { rows, listed: Some(stamps.into()), ..empty },
-            });
+        if let [start, stop, step] = evaluated.as_slice() {
+            if *step.logical_type() == LogicalType::Interval {
+                let ty = start.logical_type().clone();
+                let schema = Schema::numbered(vec![Field::new(function.name(), ty.clone())], index);
+                let empty = Self { ty, ..Self::empty(schema.clone()) };
+                let values = (start.value_at(0), stop.value_at(0), step.value_at(0));
+                let Some(stepping) = moments(function, &values.0, &values.1, &values.2)? else {
+                    return Ok(empty);
+                };
+                let rows = u64::try_from(stepping.len()).unwrap_or(u64::MAX);
+                return Ok(match stepping {
+                    Stepping::Even { start, step, .. } => Self { start, step, rows, ..empty },
+                    Stepping::Listed(stamps) => Self { rows, listed: Some(stamps.into()), ..empty },
+                });
+            }
         }
         let fields = vec![Field::new(function.name(), LogicalType::BigInt)];
         let schema = Schema::numbered(fields, index);
