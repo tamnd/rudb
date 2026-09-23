@@ -35,6 +35,12 @@ pub(crate) struct Visible {
     /// also what the reference binary says. `DESCRIBE SELECT * FROM t` keeps `NO` on a `NOT NULL`
     /// column and `DESCRIBE SELECT c + 0 FROM t` does not.
     pub(crate) not_null: bool,
+    /// A second name the column answers to when no column has the one asked for.
+    ///
+    /// Only `range` and `generate_series` set it. `FROM range(3) r` names the one column `r`, the
+    /// way PostgreSQL names a set returning function's column after its alias, and on the pin the
+    /// column still answers to `range` as well, until a subquery or a column list renames it.
+    pub(crate) also: Option<String>,
 }
 
 /// The columns a name can resolve against.
@@ -112,6 +118,17 @@ impl Scope {
                     && table.is_none_or(|table| same_name(&held.table, table))
             })
             .collect();
+        let matched = if matched.is_empty() {
+            self.columns
+                .iter()
+                .filter(|held| {
+                    held.also.as_deref().is_some_and(|also| same_name(also, column))
+                        && table.is_none_or(|table| same_name(&held.table, table))
+                })
+                .collect()
+        } else {
+            matched
+        };
         match matched.as_slice() {
             [one] => Ok(Some(one)),
             [] => Ok(None),
@@ -187,6 +204,7 @@ impl Scope {
     pub(crate) fn rename_prefix(&mut self, names: &[&str]) {
         for (column, name) in self.columns.iter_mut().zip(names) {
             column.name = (*name).to_string();
+            column.also = None;
         }
     }
 
@@ -281,6 +299,7 @@ mod tests {
             binding: ColumnBinding::new(0, 0),
             ty: LogicalType::BigInt,
             not_null: false,
+            also: None,
         });
         scope.push(Visible {
             table: "hits".into(),
@@ -288,6 +307,7 @@ mod tests {
             binding: ColumnBinding::new(0, 1),
             ty: LogicalType::Varchar,
             not_null: false,
+            also: None,
         });
         scope.push(Visible {
             table: "visits".into(),
@@ -295,6 +315,7 @@ mod tests {
             binding: ColumnBinding::new(1, 0),
             ty: LogicalType::Varchar,
             not_null: false,
+            also: None,
         });
         scope
     }

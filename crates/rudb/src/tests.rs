@@ -8559,3 +8559,82 @@ fn the_list_functions_that_look_inside_a_list_refuse_the_way_the_pin_does() {
          expression"
     ));
 }
+
+#[test]
+fn range_and_generate_series_over_moments_are_tables_the_way_the_pin_has_them() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    let dated = "range(DATE '1992-01-01', DATE '1992-10-01', INTERVAL 1 MONTH)";
+    assert_eq!(column(&format!("SELECT typeof(range) FROM {dated} LIMIT 1")), "TIMESTAMP");
+    assert_eq!(column(&format!("SELECT count(*) FROM {dated}")), "9");
+    assert_eq!(
+        column("SELECT * FROM range(DATE '1992-01-31', DATE '1992-06-01', INTERVAL 1 MONTH)"),
+        "1992-01-31 00:00:00;1992-02-29 00:00:00;1992-03-29 00:00:00;1992-04-29 00:00:00;\
+         1992-05-29 00:00:00"
+    );
+    assert_eq!(
+        column(
+            "SELECT * FROM generate_series(TIMESTAMP '1992-01-01', \
+             TIMESTAMP '1992-01-01 03:00', INTERVAL 1 HOUR)"
+        ),
+        "1992-01-01 00:00:00;1992-01-01 01:00:00;1992-01-01 02:00:00;1992-01-01 03:00:00"
+    );
+    assert_eq!(
+        column(
+            "SELECT typeof(generate_series) FROM generate_series(TIMESTAMPTZ '1992-01-01', \
+             TIMESTAMP '1992-01-01 03:00', INTERVAL 1 HOUR) LIMIT 1"
+        ),
+        "TIMESTAMP WITH TIME ZONE"
+    );
+    assert_eq!(
+        column("SELECT count(*) FROM range(TIMESTAMP '1992-01-01', NULL, INTERVAL 1 HOUR)"),
+        "0"
+    );
+    assert_eq!(
+        error(
+            "SELECT * FROM range(TIMESTAMP '1992-01-01', TIMESTAMP '1992-01-02', \
+             INTERVAL '1 month -1 day')"
+        ),
+        "Binder Error: RANGE with composite interval that has mixed signs is not supported"
+    );
+    assert_eq!(
+        error(
+            "SELECT * FROM range(TIMESTAMP '1992-01-01', TIMESTAMP '1992-01-02', INTERVAL 0 DAY)"
+        ),
+        "Binder Error: interval cannot be 0!"
+    );
+    let refused =
+        error("SELECT * FROM generate_series(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02')");
+    assert!(
+        refused.contains(
+            "'generate_series(TIMESTAMP, TIMESTAMP)'. You might need to add explicit type casts."
+        ) && refused.contains("\"generate_series\"(TIMESTAMP, TIMESTAMP, INTERVAL)"),
+        "{refused}"
+    );
+    // Over a column, one call per row, and a null row is no rows.
+    db.execute(
+        "CREATE TABLE spans AS SELECT * FROM (VALUES (1, TIMESTAMP '2020-01-01 02:00'), \
+         (2, NULL), (3, TIMESTAMP '2020-01-01')) v(id, e)",
+    )
+    .expect("created");
+    assert_eq!(
+        column(
+            "SELECT id || ' ' || r FROM spans, range(TIMESTAMP '2020-01-01', e, INTERVAL 1 HOUR) t(r) \
+             ORDER BY id, r"
+        ),
+        "1 2020-01-01 00:00:00;1 2020-01-01 01:00:00"
+    );
+    // The alias names the one column, which still answers to its own name as well.
+    assert_eq!(column("SELECT r FROM range(3) r"), "0;1;2");
+    assert_eq!(column("SELECT r.range FROM range(1, 3) r"), "1;2");
+    assert_eq!(column("SELECT i FROM generate_series(1, 2) i"), "1;2");
+    assert_eq!(
+        column("SELECT column_name FROM (DESCRIBE SELECT * FROM generate_series(1, 2) AS g)"),
+        "g"
+    );
+    assert_eq!(column("SELECT column_name FROM (DESCRIBE SELECT * FROM range(3) t(x))"), "x");
+}

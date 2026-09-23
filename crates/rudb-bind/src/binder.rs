@@ -592,6 +592,7 @@ impl<'a> Binder<'a> {
             binding: ColumnBinding::new(index, 0),
             ty: LogicalType::Varchar,
             not_null: false,
+            also: None,
         });
         Ok((node, scope))
     }
@@ -653,6 +654,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: false,
+                also: None,
             });
         }
         let keys = self.sort_keys(ast, query, &scope, &[])?;
@@ -752,6 +754,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: false,
+                also: None,
             });
         }
         let keys = self.sort_keys(ast, query, &scope, &[])?;
@@ -801,6 +804,7 @@ impl<'a> Binder<'a> {
                 // A column of a set operation is nullable whatever the two sides were, because a
                 // column that refuses nulls on one side and takes them on the other takes them.
                 not_null: false,
+                also: None,
             });
         }
         // Above a set operation there is nothing but the output columns, so an ORDER BY term is
@@ -936,6 +940,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(project, at as u32),
                 ty: self.plan.expr_type(*expr).clone(),
                 not_null: self.passes_through(*expr, &input),
+                also: None,
             });
         }
 
@@ -1030,6 +1035,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty,
                 not_null: output.columns[at].not_null,
+                also: None,
             });
         }
         let exprs = self.plan.add_expr_list(&kept);
@@ -1204,6 +1210,14 @@ impl<'a> Binder<'a> {
         if let ast::Expr::Column { name } = ast.expr(target) {
             let parts: Vec<&str> = ast.name(name).collect();
             if let Ok(found) = input.resolve(&parts) {
+                // A column found by its second name is headed by that name, so `t.range` over
+                // `range(2) t` is a column called `range` on the pin while `SELECT *` calls it `t`.
+                let written = parts.last().copied().unwrap_or_default();
+                if let Some(also) = &found.also {
+                    if !same_name(&found.name, written) && same_name(also, written) {
+                        return also.clone();
+                    }
+                }
                 return found.name.clone();
             }
         }
@@ -1776,6 +1790,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: field.not_null,
+                also: None,
             });
         }
         if !columns.is_empty() {
@@ -1832,6 +1847,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: field.not_null,
+                also: None,
             });
         }
         if !columns.is_empty() {
@@ -2177,6 +2193,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: false,
+                also: None,
             });
         }
         if !columns.is_empty() {
@@ -2488,10 +2505,17 @@ impl<'a> Binder<'a> {
                 // A reader takes what the file has, and no file format this reads says a column
                 // cannot be null. The reference binary answers YES for every column of a Parquet.
                 not_null: false,
+                also: None,
             });
         }
         if !names.is_empty() {
             scope.rename(names, label)?;
+        } else if matches!(function, TableFunction::Range | TableFunction::GenerateSeries) {
+            // The PostgreSQL naming, which the pin follows for these two and for no reader: the
+            // alias names the one column, and the column keeps answering to its own name too.
+            for column in &mut scope.columns {
+                column.also = Some(std::mem::replace(&mut column.name, label.to_string()));
+            }
         }
         let function = self.plan.intern(function.name());
         let args = self.plan.add_expr_list(args);

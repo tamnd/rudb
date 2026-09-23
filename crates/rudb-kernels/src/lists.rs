@@ -246,6 +246,77 @@ fn step_stamps(
     }
 }
 
+/// A series of moments as the table form of `range` hands it out, one position at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stepping {
+    /// Every step the same number of microseconds, so a position is worked out and not kept.
+    Even {
+        /// The moment at position zero.
+        start: i64,
+        /// Microseconds between one moment and the next.
+        step: i64,
+        /// How many moments there are.
+        count: usize,
+    },
+    /// A step with months in it, walked on the calendar and kept.
+    Listed(Vec<i64>),
+}
+
+impl Stepping {
+    /// How many moments there are.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Even { count, .. } => *count,
+            Self::Listed(stamps) => stamps.len(),
+        }
+    }
+
+    /// Whether there are none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The moment at a position, which is below [`Self::len`].
+    #[must_use]
+    pub fn at(&self, position: usize) -> i64 {
+        match self {
+            Self::Even { start, step, .. } => {
+                let steps = i64::try_from(position).unwrap_or(i64::MAX);
+                start.wrapping_add(steps.wrapping_mul(*step))
+            }
+            Self::Listed(stamps) => stamps[position],
+        }
+    }
+}
+
+/// The moments from `start` toward `end` by `interval`, for the table form of `range` and
+/// `generate_series`, which checks the interval itself because it words the refusals differently.
+///
+/// # Errors
+///
+/// A series past 2^32 moments, and a moment the calendar cannot reach.
+pub fn moment_steps(
+    inclusive: bool,
+    start: i64,
+    end: i64,
+    interval: (i32, i32, i64),
+) -> Result<Stepping> {
+    let (months, days, micros) = interval;
+    let whole = i128::from(days) * i128::from(datetime::MICROS_PER_DAY) + i128::from(micros);
+    if let (0, Ok(step)) = (months, i64::try_from(whole)) {
+        return Ok(Stepping::Even {
+            start,
+            step,
+            count: series_length(start, end, step, inclusive)?,
+        });
+    }
+    let mut stamps = Vec::new();
+    step_stamps(inclusive, start, end, interval, &mut stamps)?;
+    Ok(Stepping::Listed(stamps))
+}
+
 /// The longest list the pin builds for a series, which is the most entries a list can hold.
 const MAX_SERIES: usize = u32::MAX as usize;
 
