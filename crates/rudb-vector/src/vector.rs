@@ -585,9 +585,9 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     ///
     /// A false answer is a proof that every value in the block misses. A source without a stored
     /// substring signature answers true, which keeps the ordinary exact comparison authoritative.
-    fn might_contain(&self, first: usize, literal: &[u8]) -> bool {
+    fn might_contain(&self, first: usize, literal: &[u8]) -> Result<bool> {
         let _ = (first, literal);
-        true
+        Ok(true)
     }
     /// Hands over the values at `indices`, which rise, without keeping what reading them decoded.
     ///
@@ -2310,13 +2310,12 @@ impl Vector {
     ///
     /// Only a file-backed string source with all-valid values can skip a whole block. Every other
     /// form returns true and lets the ordinary sweep decide its values.
-    #[must_use]
-    pub fn text_block_might_contain(&self, first: usize, literal: &[u8]) -> bool {
+    pub fn text_block_might_contain(&self, first: usize, literal: &[u8]) -> Result<bool> {
         match &self.body {
             Body::ExternalText { source } if matches!(self.validity, Validity::AllValid) => {
                 source.might_contain(first, literal)
             }
-            _ => true,
+            _ => Ok(true),
         }
     }
 

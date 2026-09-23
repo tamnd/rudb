@@ -1794,7 +1794,7 @@ impl StableLike {
         if !like.fold_case {
             if let Pattern::Contains(finder) = &like.compiled {
                 if finder.needle().len() >= 4
-                    && !self.dictionary.text_block_might_contain(first, finder.needle())
+                    && !self.dictionary.text_block_might_contain(first, finder.needle())?
                 {
                     // A stored signature can only prove absence. Mark the whole group as decided,
                     // with the negated answer when this is NOT LIKE, without decoding its payload.
