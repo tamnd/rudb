@@ -238,3 +238,22 @@ fn a_filter_the_bounds_cannot_read_asks_them_nothing() {
     assert!(line.contains("[~3276 rows estimated from default]"), "{line}");
     assert_eq!(answered(&database, "k = g"), 97, "k is 0 to 16383 and g is k modulo 97");
 }
+
+#[test]
+fn statistics_off_takes_the_bounds_away_and_the_estimate_goes_back_to_the_constant() {
+    // The master ablation, which has to reach a reader with no switch of its own. Nothing about the
+    // filter estimate is behind a per rule setting, because it is not a rewrite: it is the number
+    // every rewrite above it chooses on. So the way `statistics = off` reaches it is by the plan
+    // being handed no zone map at all, and then this reader answers what it answered before there
+    // was a footer worth asking.
+    let database = Database::new();
+    let with = estimated(&database, "k = 5000");
+    assert!(with.contains("from zone map"), "{with}");
+    database.execute("SET statistics = 'off'").expect("the master is a setting");
+    let without = estimated(&database, "k = 5000");
+    assert!(!without.contains("zone map"), "the bounds should be gone:\n{without}");
+    // And the answer is the same either way, which is the half of the ablation that matters.
+    assert_eq!(answered(&database, "k = 5000"), 1);
+    database.execute("RESET statistics").expect("and back on");
+    assert_eq!(estimated(&database, "k = 5000"), with, "resetting put the bounds back");
+}

@@ -1160,7 +1160,7 @@ impl Shared {
     fn optimizer(&self, catalog: &Catalog) -> Result<rudb_opt::pass::Context> {
         let mut context =
             rudb_opt::pass::Context::without(&self.inner.settings.disabled_optimizers())?;
-        context.measure(self.facts(catalog));
+        context.measure(self.estimates(catalog));
         context.relate(self.relationships(catalog));
         context.size(self.inner.settings.sizes());
         context.govern(self.inner.settings.rules());
@@ -1261,6 +1261,23 @@ impl Shared {
     }
 
     /// Everything the optimizer is told about that catalog, read once.
+    /// The counts the optimizer is allowed to plan from, which is all of them unless `statistics` is
+    /// off.
+    ///
+    /// The same shape [`Self::relationships`] has and for the same reason. A switch that reached half
+    /// the layer would make the comparison the ablation runs say nothing, and the honest way to turn a
+    /// statistic off is to not hand it over rather than to ask every reader to remember to check.
+    ///
+    /// Off leaves the row counts, because a row count is the length of the table rather than something
+    /// a store measured. `rudb_opt::estimate::Facts::without_distincts` says why at more length.
+    fn estimates(&self, catalog: &Catalog) -> Arc<rudb_opt::estimate::Facts> {
+        let held = self.facts(catalog);
+        if self.inner.settings.rules().enabled(Rule::StatsAll) {
+            return held;
+        }
+        Arc::new(held.without_distincts())
+    }
+
     fn measured(catalog: &Catalog, generation: u64) -> rudb_opt::estimate::Facts {
         let mut facts = rudb_opt::estimate::Facts::at(generation);
         for table in catalog.tables() {

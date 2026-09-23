@@ -227,6 +227,21 @@ impl Facts {
         self.columns.insert(key, (distinct, provenance));
     }
 
+    /// The same facts with every distinct count dropped and every row count kept.
+    ///
+    /// The other half of `statistics = off`, the first being [`Plan::forget_statistics`]. Which half
+    /// a number belongs in comes from what it is rather than from where it is stored. A distinct
+    /// count is a store statistic: a file counted its dictionary entries and a table in memory read a
+    /// sketch, and neither number existed before somebody built the thing that holds it. A row count
+    /// is the length of the table, which every planner that ever ran over it already had, and
+    /// `crate::rules` says the master starts on because a better answer to a question already being
+    /// asked is not a new behaviour. Taking the row counts away would not be ablating the statistics,
+    /// it would be running an optimizer nobody has ever shipped.
+    #[must_use]
+    pub fn without_distincts(&self) -> Self {
+        Self { tables: self.tables.clone(), columns: BTreeMap::new(), generation: self.generation }
+    }
+
     /// How many distinct values that column holds, where anybody counted.
     ///
     /// Private for the same reason [`Facts::rows_in`] is.

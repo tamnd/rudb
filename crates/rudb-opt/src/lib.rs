@@ -44,6 +44,7 @@ mod transitive;
 pub mod unnest;
 mod walk;
 
+use rudb_common::rules::Rule;
 use rudb_common::{Error, Result};
 use rudb_plan::{JoinKind, Node, NodeRef, Plan};
 
@@ -301,6 +302,15 @@ pub fn optimize(plan: &mut Plan) -> Result<()> {
 /// Whatever a pass reported, and then, in a debug build, if a pass left the plan malformed, narrowed
 /// what it returns or did not settle, all three of which are a bug in the pass and not in the query.
 pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
+    // The master ablation, and the whole of it. Every rule with a switch of its own also has
+    // `Rule::StatsAll` as its master and so is already off by the time a pass asks, but the passes
+    // are not the only readers: a cardinality the join order chose on, a bound a filter was ordered
+    // by and a distinct count an aggregate sized from are all answers that came from here. Taking
+    // the answers away is one line that reaches all of them, including the reader nobody has written
+    // yet.
+    if !context.allows(Rule::StatsAll) {
+        plan.forget_statistics();
+    }
     unnest::lower(plan)?;
     run(plan, context, &PASSES)
 }

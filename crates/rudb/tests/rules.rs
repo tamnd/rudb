@@ -8,8 +8,15 @@
 //! catching that at the commit and catching it at the next SF100 run is the difference between
 //! bisecting one commit and bisecting a week.
 //!
-//! Today every switch is trivially satisfied: nothing consumes a statistic and there are no graph
-//! sections, so all three runs take the same code path. That is the point of landing it at G0.
+//! This landed at G0, when every switch was trivially satisfied because nothing consumed a statistic
+//! and there were no graph sections. It is not trivial any more. Four rules are read, the graph
+//! sections are built and used, and `statistics = off` reaches the readers that have no switch of
+//! their own by leaving the plan with no store statistics attached at all.
+//!
+//! What this file does not do is say that a switch has teeth. A test that only checks the answers is
+//! green for a switch nothing reads, which is what these were for a while. The teeth are asserted
+//! where the rewrite is: `zoned.rs` for the master over the filter estimate, `validity.rs` for the
+//! validity free rule, and a unit test beside each pass for the rest.
 
 use rudb::Database;
 use rudb_common::Value;
