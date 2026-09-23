@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.18
+
+A patch release of nineteen pull requests. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.17 read each other's files.
+
+Six make a native load faster. #1562 merges a stripe's columns on their own threads, which took the ClickBench `hits` 10M load on the 32 core box from a median of 12.31 s to 11.53 s, and #1568 then gives each column its own lock instead of the writer's, from a median of 8.48 s to 7.79 s on the main it merged into. #1571 asks the kernel to start writing the file every 32 MB instead of all at the commit, which took the same load on gpc from 7 to 9 s to about 6.3 s. #1573 closes several global dictionaries at once under a memory bound, from about 6.3 s to 5.9 s. #1574 builds the FSST lookup tables only when a block is compressed, which took a `URL LIKE` scan from 2.77 G to 2.69 G cycles. #1578 stops testing integer kinds a settled packed shape can never keep, so a load skips the delta, RLE, dictionary, sparse and strided tests on those chunks.
+
+Nine make queries faster. #1577 replays a matched string chunk into a buffer sized up front, which took the same `URL LIKE` scan from 2.64 G to 2.41 G user cycles. #1576 runs a chain of decimal arithmetic as one loop over 256 row blocks, proven free of overflow once per chunk, and compacts a packed column in a filter by unpacking only the kept rows, which took ten q01 runs on one thread from 35.41 G to 32.22 G instructions and TPC-H q14 on gpc from 28 ms to 16 ms. #1559 drops a distinct pair that repeats the row before it, and #1560 folds a run of rows with one group into a mixed aggregate at once, which both help ClickBench, where a user's rows sit together. #1567 compares one flat integer key directly when probing a small group table, #1570 looks a key that comes in runs up in the direct map once a run, which took ClickBench q28 from 1.360 G to 1.177 G instructions, and #1563 turns an interval unit's scale into a double once, which took q43 from 585 M to 557 M. #1564 pages a parent column's string arena so gathers over it stop copying, and #1575 reads a link join's parent columns in parallel, which took the read from 283 ms to 109 ms on server2.
+
+Two add what DuckDB has. #1561 adds `range` and `generate_series` as list scalars and runs `list_aggr` over whole vectors, and #1572 takes dates and timestamps in the table form of `range`, which took the table_function corpus from 144 to 168 passing records. #1569 and #1579 keep the build on Rust 1.85.
+
+This release also marks three flatten calls and two row loops that the release gate refused on 0.4.17, so the tag verifies again.
+
 ## 0.4.17
 
 A patch release of nineteen pull requests. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.16 read each other's files.

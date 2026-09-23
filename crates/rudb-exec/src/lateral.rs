@@ -144,6 +144,8 @@ impl LateralSeries {
             let [start, stop, step] = evaluated.as_slice() else {
                 return Err(Error::internal("a series of moments without three arguments"));
             };
+            // row at a time: each row is one call that yields a whole series of dates or timestamps,
+            // so reading its three arguments as values is small next to the series it produces.
             for row in 0..chunk.len() {
                 let (start, stop, step) =
                     (start.value_at(row), stop.value_at(row), step.value_at(row));

@@ -261,12 +261,12 @@ impl Parent {
         if piece.is_empty() {
             return Ok(None);
         }
-        // flatten: the whole point of this type is a run the gather can index by a row id of the
-        // parent table, and a row id has no meaning against a bit packed part that has not been
-        // decoded. See the module doc for why this is a decode the hash join pays as well.
         if piece.form() == Form::Flat {
             return Ok(Some(piece.clone()));
         }
+        // flatten: the whole point of this type is a run the gather can index by a row id of the
+        // parent table, and a row id has no meaning against a bit packed part that has not been
+        // decoded. See the module doc for why this is a decode the hash join pays as well.
         Ok(Some(piece.flatten()?))
     }
 }
