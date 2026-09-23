@@ -1443,6 +1443,24 @@ impl GlobalDictionary {
         if self.shape.is_some() && complete < self.settled.saturating_mul(4) {
             return Ok(());
         }
+        self.settle_on_sample(complete)
+    }
+
+    /// Settles a shape on however much sample there is, for a column that ends the load without
+    /// one.
+    ///
+    /// A column that never filled [`PAYLOAD_SAMPLE_BLOCKS`] blocks used to encode each of them by
+    /// trying every candidate at every level, FSST training and LZ matching included, and `hits`
+    /// has dozens of text columns like that. Its sample is then every block it has, so settling on
+    /// it tries the few payload shapes on exactly the blocks about to be written.
+    fn settle_rest(&mut self) -> Result<()> {
+        if self.shape.is_some() || self.sample.is_empty() {
+            return Ok(());
+        }
+        self.settle_on_sample(self.ends.len() / TEXT_PAYLOAD_VALUES)
+    }
+
+    fn settle_on_sample(&mut self, complete: usize) -> Result<()> {
         let sample =
             self.sample.iter().map(|(at, bytes)| self.slices(*at, bytes)).collect::<Vec<_>>();
         self.shape = Some(string::with_symbols(settle_shape(&sample)?, &sample));
@@ -10151,8 +10169,9 @@ fn block_values<'a>(ends: &[u32], bytes: &'a [u8]) -> Vec<&'a [u8]> {
 /// for a column too small to have settled a shape, every block it has.
 ///
 /// Across threads, the way [`encode_ready`] does it. This ran one column at a time on the thread
-/// closing the table, and a column that never settled a shape encodes each block by trying every
-/// candidate, so on a million rows of `hits` it was most of the load's CPU on one core.
+/// closing the table, and a column that never settled a shape encoded each block by trying every
+/// candidate, so on a million rows of `hits` it was most of the load's CPU on one core. Such a column
+/// now settles on the blocks it has first (see [`GlobalDictionary::settle_rest`]).
 fn finish_dictionaries(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     for dictionary in dictionaries.iter_mut().flatten() {
         if !dictionary.early.is_empty() {
@@ -10160,6 +10179,7 @@ fn finish_dictionaries(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<
         }
         dictionary.seal_rest();
     }
+    settle_rest(dictionaries)?;
     encode_waiting(dictionaries)?;
     // A block handed out and never given back leaves a gap nothing above would notice when it was
     // the last one, so the count is checked against the values as well.
@@ -10171,6 +10191,43 @@ fn finish_dictionaries(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<
         return Err(Error::internal("a dictionary block handed out never came back"));
     }
     Ok(())
+}
+
+/// Settles a shape for every column that ends the load without one, across threads.
+///
+/// A column settles in a few milliseconds, and `hits` has dozens of them, so they are handed out
+/// one at a time from a queue rather than split up front.
+fn settle_rest(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
+    let mut unsettled = dictionaries
+        .iter_mut()
+        .flatten()
+        .filter(|dictionary| dictionary.shape.is_none() && !dictionary.sample.is_empty())
+        .collect::<Vec<_>>();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_FREQUENCY_WORKERS)
+        .min(unsettled.len());
+    if workers <= 1 {
+        return unsettled.into_iter().try_for_each(GlobalDictionary::settle_rest);
+    }
+    let queue = Mutex::new(unsettled.iter_mut());
+    std::thread::scope(|scope| {
+        (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
+                        let Some(dictionary) = next else { return Ok(()) };
+                        dictionary.settle_rest()?;
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .try_for_each(|handle| {
+                handle.join().map_err(|_| Error::internal("a dictionary settle worker panicked"))?
+            })
+    })
 }
 
 /// Encodes the waiting blocks of every dictionary across threads, and appends them to their columns
