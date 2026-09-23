@@ -83,6 +83,8 @@ struct Raw {
 
 /// Splits `input` into literal runs and back references.
 pub(crate) fn tokens_of(input: &[u8]) -> Tokens<'_> {
+    PROBE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PROBE[1].fetch_add(input.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut raw = Raw::default();
     let mut head = vec![u32::MAX; 1 << HASH_BITS];
     let span = SEGMENT.min(input.len()).max(1);
@@ -535,3 +537,5 @@ mod tests {
         assert!(rebuild(&literals, &[0, 0], &[0, 0], 2).is_err());
     }
 }
+
+pub static PROBE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];

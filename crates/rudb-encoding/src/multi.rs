@@ -261,7 +261,7 @@ fn encode_as(strategy: Strategy, columns: &[&[&[u8]]]) -> Result<Option<Vec<u8>>
                 })
                 .collect();
             let tokens: Vec<lz::Tokens<'_>> =
-                joined.iter().map(|bytes| lz::tokens_of(bytes)).collect();
+                joined.iter().map(|bytes| { lz::PROBE[4].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed); lz::tokens_of(bytes) }).collect();
             let literals: Vec<&[&[u8]]> =
                 tokens.iter().map(|token| token.literals.as_slice()).collect();
             let table = SymbolTable::train(&shared_sample(&literals));

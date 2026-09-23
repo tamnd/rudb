@@ -467,6 +467,7 @@ pub fn with_symbols(shape: Settled, blocks: &[Vec<&[u8]>]) -> Settled {
                 Kind::Dict => dictionary_of(&refs).0.into_iter().map(<[u8]>::to_vec).collect(),
                 _ => {
                     let joined = refs.concat();
+                    lz::PROBE[2].fetch_add(joined.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     lz::tokens_of(&joined).literals.into_iter().map(<[u8]>::to_vec).collect()
                 }
             };
@@ -656,6 +657,8 @@ fn encode_as(
                 joined.extend_from_slice(value);
                 sizes.push(value.len() as i64);
             }
+            lz::PROBE[3].fetch_add(joined.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if depth == 0 { lz::PROBE[5].fetch_add(joined.len() as u64, std::sync::atomic::Ordering::Relaxed); }
             let tokens = lz::tokens_of(&joined);
             out.extend_from_slice(&integer::encode_with(&sizes, chooser)?);
             out.extend_from_slice(&integer::encode_with(&tokens.lengths, chooser)?);

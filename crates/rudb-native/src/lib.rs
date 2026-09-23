@@ -3164,6 +3164,7 @@ impl Writer {
             profile.moved(Stage::Dictionary, 0, placed, 0);
             profile.moved(Stage::Publish, 0, self.at - before - placed, 0);
         }
+        eprintln!("PROBE lz calls,bytes,with_symbols,encode_as_lz,multi,depth0 = {:?}", rudb_encoding::probe_lz());
         Ok(Entry {
             name: self.table.name.clone(),
             fields: self.table.fields.clone(),

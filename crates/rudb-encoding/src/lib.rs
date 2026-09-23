@@ -22,6 +22,9 @@ mod reader;
 pub mod sketch;
 pub mod string;
 
+/// probe
+pub fn probe_lz() -> Vec<u64> { lz::PROBE.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect() }
+
 /// The symbol table and the code, which live a layer down now that a vector can be in FSST form.
 ///
 /// They were written here, because this is where compression is. They moved to `rudb-vector` when
