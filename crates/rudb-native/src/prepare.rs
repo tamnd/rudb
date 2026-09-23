@@ -42,7 +42,8 @@
 //! core box from 3.5 GB resident to 9.9 GB, with thirty two stripes waiting at a time.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as Atomic};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{Error, LogicalType, Result};
@@ -64,6 +65,73 @@ use super::{
 /// that at once would be a thousand threads on a machine with thirty two cores. So each one takes
 /// its share of the machine: the cores over however many stripes are being worked on right now.
 static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+/// What all of a table's global dictionaries may hold at once before the fastest growing one is
+/// demoted, from section 5.5 of the encoding spec.
+///
+/// Dictionaries are the one thing a load holds that grows with the table rather than with the
+/// stripe. `hits` has tens of millions of distinct `URL`, `Title`, `Referer` and `SearchPhrase`
+/// values, at forty five to seventy bytes each for the lookup alone, which is past the whole two
+/// gigabyte bound on its own.
+pub const DICTIONARY_CAP_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Which varchar columns still code against a global dictionary, and what their dictionaries hold
+/// between them.
+///
+/// Shared by a writer with every [`Preparer`] and [`Merger`] it hands out. The flags are what a
+/// stripe prepared later reads to decide whether to code a column at all, and the rest is what a
+/// merge reads to decide whether its column should stop, see [`demotes`].
+#[derive(Debug)]
+pub(crate) struct Coding {
+    flags: Box<[AtomicBool]>,
+    /// What each column's dictionary grew by in the last stripe merged into it.
+    growth: Box<[AtomicU64]>,
+    /// What every dictionary held the last time it was merged into, added up.
+    held: AtomicU64,
+    cap: AtomicU64,
+}
+
+impl Coding {
+    pub(crate) fn new(flags: impl IntoIterator<Item = bool>) -> Self {
+        let flags = flags.into_iter().map(AtomicBool::new).collect::<Box<[_]>>();
+        let growth = flags.iter().map(|_| AtomicU64::new(0)).collect();
+        Self { flags, growth, held: AtomicU64::new(0), cap: AtomicU64::new(DICTIONARY_CAP_BYTES) }
+    }
+
+    /// Sets what the dictionaries may hold between them before one is demoted.
+    pub(crate) fn cap(&self, bytes: u64) {
+        self.cap.store(bytes, Atomic::Relaxed);
+    }
+
+    /// Moves what one dictionary is counted for from `before` to `now`, and hands back the new
+    /// total.
+    fn recount(&self, before: u64, now: u64) -> u64 {
+        if now >= before {
+            self.held.fetch_add(now - before, Atomic::Relaxed) + (now - before)
+        } else {
+            self.held.fetch_sub(before - now, Atomic::Relaxed).saturating_sub(before - now)
+        }
+    }
+
+    /// Whether the column grew the most in the stripes last merged into each column.
+    ///
+    /// Read without a lock across columns that may be merging at the same moment, so it is about
+    /// the last stripe or the one before it. That is close enough for choosing which column to
+    /// stop: a column that grows fastest keeps doing so, and it is asked again next stripe. A column
+    /// that did not grow at all is never the one, since stopping it would free nothing.
+    fn grew_most(&self, index: usize) -> bool {
+        let mine = self.growth[index].load(Atomic::Relaxed);
+        mine > 0 && self.growth.iter().all(|other| other.load(Atomic::Relaxed) <= mine)
+    }
+}
+
+impl Deref for Coding {
+    type Target = [AtomicBool];
+
+    fn deref(&self) -> &[AtomicBool] {
+        &self.flags
+    }
+}
 
 /// One stripe's share of the machine, held for as long as the stripe is being worked on.
 struct Share(usize);
@@ -93,7 +161,7 @@ impl Drop for Share {
 #[derive(Debug, Clone)]
 pub struct Preparer {
     types: Vec<LogicalType>,
-    coded: Arc<[AtomicBool]>,
+    coded: Arc<Coding>,
     profile: Option<Arc<LoadProfile>>,
 }
 
@@ -422,6 +490,23 @@ fn drops_dictionary(rows: usize, distinct: usize) -> bool {
         && distinct.saturating_mul(10) > rows.saturating_mul(DICTIONARY_DISTINCT_IN_TEN)
 }
 
+/// Whether a column's dictionary should stop taking values after a stripe that added `new` of them
+/// in `rows` rows, with the dictionaries holding `total` bytes between them.
+///
+/// Section 5.5 of the encoding spec, which asks at every stripe what [`drops_dictionary`] asks at
+/// the first. A column that turns into a column of new values partway through, which is what a
+/// URL column of a log does once its first hours are past, stops growing its dictionary one stripe
+/// after it turns rather than at the end of the load. The stripes already coded keep their codes,
+/// so unlike the first stripe's decision this one costs nothing to make late.
+///
+/// The second reason is the cap. Once the dictionaries together hold more than it, the column that
+/// grew the most in its last stripe is the one that stops, because it is the one that would have
+/// taken the most of what is left.
+fn demotes(rows: usize, new: usize, total: u64, coding: &Coding, index: usize) -> bool {
+    drops_dictionary(rows, new)
+        || (total > coding.cap.load(Atomic::Relaxed) && coding.grew_most(index))
+}
+
 /// Runs `work` on every one of `jobs`, spread over `workers` threads, and hands back each job with
 /// what it came to, in no particular order.
 ///
@@ -586,7 +671,7 @@ impl Step<'_> {
     /// Roughly what the merge costs: a hash a distinct value when there is a global dictionary to
     /// merge into, and next to nothing otherwise. Read off `coded` rather than the dictionary, so a
     /// lent column does not have to be locked to be sorted.
-    fn cost(&self, coded: &[AtomicBool]) -> usize {
+    fn cost(&self, coded: &Coding) -> usize {
         match &self.column {
             Column::Coded(local) if coded[self.index].load(Atomic::Relaxed) => {
                 local.values().saturating_add(1)
@@ -599,7 +684,7 @@ impl Step<'_> {
     fn run(
         self,
         rows: usize,
-        coded: &[AtomicBool],
+        coded: &Coding,
         profile: Option<&LoadProfile>,
     ) -> Result<(usize, Merge, Vec<Unencoded>)> {
         let Self { index, column, slot, gather } = self;
@@ -630,20 +715,24 @@ fn merge_column(
     dictionary: &mut Option<GlobalDictionary>,
     gather: &mut Option<stats::Gather>,
     rows: usize,
-    coded: &[AtomicBool],
+    coded: &Coding,
     profile: Option<&LoadProfile>,
 ) -> Result<(usize, Merge, Vec<Unencoded>)> {
     if let (Some(mine), Some(stripe)) = (gather.as_mut(), stripe) {
         mine.absorb(stripe);
     }
+    let mut new = None;
     let merge = match (column, dictionary.as_mut()) {
         (Column::Pages(stripe), None) => Merge::Pages(stripe),
+        (Column::Pages(stripe), Some(global)) if global.demoted => Merge::Pages(stripe),
         (Column::Pages(_), Some(_)) => {
             return Err(Error::internal(
                 "a column with a global dictionary was prepared without one",
             ));
         }
         (Column::Coded(local), None) => Merge::Plain(local),
+        // Prepared before the column was demoted and merged after.
+        (Column::Coded(local), Some(global)) if global.demoted => Merge::Plain(local),
         (Column::Coded(local), Some(global)) => {
             // Empty means nothing has been merged into it yet, so this is the column's first
             // stripe and the only one the decision is allowed to be made on.
@@ -651,15 +740,30 @@ fn merge_column(
                 if let Some(profile) = profile {
                     profile.release(global.charged);
                 }
+                coded.recount(global.charged, 0);
                 *dictionary = None;
                 coded[index].store(false, Atomic::Relaxed);
                 Merge::Plain(local)
             } else {
-                let global = local.merge_into(global)?;
-                Merge::Codes { parts: local.parts, global }
+                let before = global.values();
+                let codes = local.merge_into(global)?;
+                new = Some(global.values() - before);
+                Merge::Codes { parts: local.parts, global: codes }
             }
         }
     };
+    // Asked before the blocks go out, so that a demotion's sealed part block goes out with them.
+    if let (Some(new), Some(global)) = (new, dictionary.as_mut()) {
+        let now = global.held_bytes();
+        coded.growth[index].store(now.saturating_sub(global.charged), Atomic::Relaxed);
+        let total =
+            coded.held.load(Atomic::Relaxed).saturating_add(now).saturating_sub(global.charged);
+        if demotes(rows, new, total, coded, index) {
+            global.demote();
+            coded[index].store(false, Atomic::Relaxed);
+            coded.growth[index].store(0, Atomic::Relaxed);
+        }
+    }
     // Settled here rather than when the stripe is written, so that the blocks this merge filled go
     // out with it already knowing their shape. A column still too small to settle one keeps its
     // blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them, because encoding them
@@ -668,7 +772,8 @@ fn merge_column(
         Some(dictionary) => {
             dictionary.settle()?;
             let blocks = dictionary.hand_out(index);
-            dictionary.recharge(profile);
+            let (before, now) = dictionary.recharge(profile);
+            coded.recount(before, now);
             blocks
         }
         None => Vec::new(),
@@ -683,7 +788,7 @@ fn merge_column(
 /// spread over threads, and a stripe takes as long as its slowest column rather than all of them.
 /// The answer is the same in any order, because a column's merge only depends on the stripes
 /// merged into that column before it.
-fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &[AtomicBool]) -> Result<Merged> {
+fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &Coding) -> Result<Merged> {
     let Prepared { parts, columns, gathers, profile, .. } = prepared;
     let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
     let rows: usize = parts.iter().map(|part| part.rows).sum();
@@ -816,7 +921,7 @@ impl Lent {
 pub struct Merger {
     lent: Arc<Lent>,
     types: Vec<LogicalType>,
-    coded: Arc<[AtomicBool]>,
+    coded: Arc<Coding>,
 }
 
 impl Merger {
@@ -1363,6 +1468,159 @@ mod tests {
         assert_eq!(writer.table.rows, 0);
         drop(other);
         fs::remove_file(path.with_extension("other")).expect("remove");
+        fs::remove_file(path).expect("remove");
+    }
+
+    /// A table whose `url` repeats twenty values for its first five parts and never repeats after,
+    /// the way a log's URLs look once its first hours are past, next to a `city` that repeats
+    /// throughout.
+    fn turning(id: usize) -> [Value; 3] {
+        let url = match id {
+            _ if id % 13 == 0 => Value::Null,
+            _ if id < 5 * PART => Value::Varchar(format!("https://example.com/{}", id % 20)),
+            _ => Value::Varchar(format!("https://example.com/page/{id}")),
+        };
+        [Value::BigInt(id as i64), Value::Varchar(format!("city {}", id % 13)), url]
+    }
+
+    fn turning_fields() -> Vec<Field> {
+        vec![
+            Field::required("id", LogicalType::BigInt),
+            Field::new("city", LogicalType::Varchar),
+            Field::new("url", LogicalType::Varchar),
+        ]
+    }
+
+    fn turning_stripe(
+        rows: fn(usize) -> [Value; 3],
+        first: usize,
+        parts: usize,
+    ) -> Vec<((u64, u64), Chunk)> {
+        (first..first + parts)
+            .map(|part| {
+                let rows = (part * PART..(part + 1) * PART).map(rows).collect::<Vec<_>>();
+                let column = |at: usize| {
+                    let values = rows.iter().map(|row| row[at].clone()).collect::<Vec<_>>();
+                    Vector::from_values(turning_fields()[at].ty.clone(), &values).expect("a column")
+                };
+                let chunk = Chunk::new(vec![column(0), column(1), column(2)]).expect("a chunk");
+                ((part as u64, 0), chunk)
+            })
+            .collect()
+    }
+
+    fn turning_runs() -> Vec<Vec<((u64, u64), Chunk)>> {
+        vec![
+            turning_stripe(turning, 0, 5),
+            turning_stripe(turning, 5, 5),
+            turning_stripe(turning, 10, 3),
+        ]
+    }
+
+    /// Reads every row of the turned table back and checks what the reader says about `url`.
+    fn check_turned(path: &PathBuf) {
+        let reader = Reader::open(path).expect("reopen");
+        assert_eq!(reader.parts(), 13);
+        assert_eq!(reader.table().demoted, [false, false, true], "only url is demoted");
+        for part in 0..13 {
+            let chunk = reader.read(part, &[0, 1, 2]).expect("a part");
+            let url = chunk.column(2).expect("url");
+            assert!(url.stable_dictionary_parts().is_none(), "part {part} hands out no codes");
+            for at in 0..PART {
+                let want = turning(part * PART + at);
+                for (column, value) in want.iter().enumerate() {
+                    assert_eq!(&chunk.value_at(at, column), value, "part {part} row {at}");
+                }
+            }
+        }
+        // Everything the dictionary would have vouched for covers only the first stripes.
+        assert_eq!(reader.distinct_values(2).expect("asked"), None);
+        assert_eq!(reader.text_extremes(2).expect("asked"), None);
+        assert_eq!(reader.exact_frequencies(2).expect("asked"), None);
+        assert_eq!(reader.top_frequencies(2, 5).expect("asked"), None);
+        assert!(!reader.skips_codes(0, 2, &[0]).expect("asked"), "no code proves a value absent");
+        // `city` keeps its dictionary and all of it.
+        assert_eq!(reader.distinct_values(1).expect("asked"), Some(13));
+        assert!(reader.text_extremes(1).expect("asked").is_some());
+    }
+
+    /// A column whose second stripe is nearly all new values stops growing its dictionary there,
+    /// whether the later stripes were prepared before that decision or after it, and every row
+    /// reads back.
+    #[test]
+    fn a_column_that_turns_unique_is_demoted_and_reads_back() {
+        let alone = path("demoted-alone");
+        let mut writer = Writer::create(&alone, "t", turning_fields()).expect("a file");
+        let preparer = writer.preparer();
+        let mut runs = turning_runs().into_iter();
+        writer.append_stripe(runs.next().expect("a run")).expect("a stripe");
+        assert!(preparer.coded[2].load(Atomic::Relaxed), "url repeats in its first stripe");
+        for run in runs {
+            writer.append_stripe(run).expect("a stripe");
+        }
+        assert!(!preparer.coded[2].load(Atomic::Relaxed), "url was demoted");
+        assert!(preparer.coded[1].load(Atomic::Relaxed), "city kept its dictionary");
+        writer.finish().expect("commit");
+        check_turned(&alone);
+
+        let split = path("demoted-split");
+        let mut writer = Writer::create(&split, "t", turning_fields()).expect("a file");
+        let preparer = writer.preparer();
+        let prepared = turning_runs()
+            .into_iter()
+            .map(|run| preparer.prepare(run).expect("prepared"))
+            .collect::<Vec<_>>();
+        for one in prepared {
+            writer.append_prepared(one).expect("a stripe");
+        }
+        writer.finish().expect("commit");
+        check_turned(&split);
+
+        fs::remove_file(alone).expect("remove");
+        fs::remove_file(split).expect("remove");
+    }
+
+    /// A table where `url` takes a quarter of its rows as new values every stripe, which keeps its
+    /// dictionary under the per-stripe rule, and `city` stops growing after its first stripe.
+    fn growing(id: usize) -> [Value; 3] {
+        let url = Value::Varchar(format!("https://example.com/{}", id / 4));
+        [Value::BigInt(id as i64), Value::Varchar(format!("city {}", id % 13)), url]
+    }
+
+    /// Once the dictionaries together pass the cap, the column that grew the most stops and the
+    /// one that did not grow keeps its dictionary.
+    #[test]
+    fn the_dictionary_cap_demotes_the_column_that_grew_most() {
+        let path = path("capped");
+        let mut writer = Writer::create(&path, "t", turning_fields())
+            .expect("a file")
+            .with_dictionary_cap(1 << 30);
+        let preparer = writer.preparer();
+        writer.append_stripe(turning_stripe(growing, 0, 5)).expect("a stripe");
+        assert!(preparer.coded[2].load(Atomic::Relaxed), "url is under the cap");
+        assert!(preparer.coded[1].load(Atomic::Relaxed), "city is under the cap");
+
+        writer.coded.cap(1);
+        writer.append_stripe(turning_stripe(growing, 5, 5)).expect("a stripe");
+        assert!(!preparer.coded[2].load(Atomic::Relaxed), "url grew most and was demoted");
+        assert!(preparer.coded[1].load(Atomic::Relaxed), "city grew nothing and keeps it");
+        writer.append_stripe(turning_stripe(growing, 10, 3)).expect("a stripe");
+        assert!(preparer.coded[1].load(Atomic::Relaxed), "city still grows nothing");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen");
+        assert_eq!(reader.table().demoted, [false, false, true]);
+        for part in 0..13 {
+            let chunk = reader.read(part, &[0, 1, 2]).expect("a part");
+            for at in 0..PART {
+                let want = growing(part * PART + at);
+                for (column, value) in want.iter().enumerate() {
+                    assert_eq!(&chunk.value_at(at, column), value, "part {part} row {at}");
+                }
+            }
+        }
+        assert_eq!(reader.distinct_values(1).expect("asked"), Some(13));
+        assert_eq!(reader.distinct_values(2).expect("asked"), None);
         fs::remove_file(path).expect("remove");
     }
 }
