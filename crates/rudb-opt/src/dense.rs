@@ -50,6 +50,7 @@
 //! `c`'s and reading through the expression to say so is a separate piece of work.
 
 use rudb_common::Result;
+use rudb_common::rules::Rule;
 use rudb_plan::{Expr, Node, Plan};
 
 use crate::estimate::{self, DISTINCT, Facts};
@@ -81,9 +82,13 @@ const SPARSEST: u64 = 8;
 /// Records the range of every grouped aggregate whose key is one integer column with known ends.
 ///
 /// A rudb name rather than a DuckDB one, because DuckDB has no pass that does this and
-/// [`crate::UPSTREAM`] is the list of names it does have. `SET disabled_optimizers =
-/// 'aggregate_dense'` is the setting `spec/stats/09-measurement.md` section 9.3's ablation turns
-/// this off with.
+/// [`crate::UPSTREAM`] is the list of names it does have.
+///
+/// Two settings turn it off and they mean different things. `SET disabled_optimizers =
+/// 'aggregate_dense'` is the pass, which is the door DuckDB's name for a pass goes through. `SET
+/// stats_direct_addressing = 'off'` is [`Rule::DirectAddressing`], which is the rule, and that is the
+/// door `spec/stats/09-measurement.md` section 9.2 asks for so that a report can say what this rule
+/// on its own earned. `SET statistics = 'off'` is the master over the second of them.
 #[derive(Debug)]
 pub struct AggregateDense;
 
@@ -93,7 +98,9 @@ impl Pass for AggregateDense {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        densify(plan, context.facts());
+        if context.allows(Rule::DirectAddressing) {
+            densify(plan, context.facts());
+        }
         Ok(())
     }
 }
@@ -150,7 +157,7 @@ mod tests {
     use rudb_common::stat::Provenance;
     use rudb_plan::Plan;
 
-    use super::{AggregateDense, WIDEST};
+    use super::{AggregateDense, Rule, WIDEST};
     use crate::estimate::Facts;
     use crate::pass::{Context, Pass};
 
@@ -225,6 +232,31 @@ mod tests {
 
     fn run(plan: &mut Plan, context: &Context) {
         AggregateDense.run(plan, context).expect("a pass that cannot fail");
+    }
+
+    /// The same facts with one rule turned off, which is what an ablation run does.
+    fn without(rule: Rule) -> Context {
+        let mut context = counted(Some(100));
+        let mut rules = rudb_common::rules::Rules::default();
+        rules.set(rule, false);
+        context.govern(rules);
+        context
+    }
+
+    #[test]
+    fn the_rule_s_own_setting_turns_it_off() {
+        let mut plan = grouped(Stub::exact(100, 199));
+        run(&mut plan, &without(Rule::DirectAddressing));
+        assert_eq!(plan.dense_count(), 0, "stats_direct_addressing = off left the hash table");
+    }
+
+    #[test]
+    fn the_master_setting_turns_it_off_too() {
+        // `statistics = off` reaches this without naming it, which is the point of a master: the
+        // ablation of section 9.3 is one statement and it has to cover a rule written after it.
+        let mut plan = grouped(Stub::exact(100, 199));
+        run(&mut plan, &without(Rule::StatsAll));
+        assert_eq!(plan.dense_count(), 0, "statistics = off left the hash table");
     }
 
     #[test]
