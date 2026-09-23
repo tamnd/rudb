@@ -959,6 +959,18 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
         vec![vec![text("a-b-c")]]
     );
     assert_eq!(rows(&db, "SELECT regexp_replace(NULL, 'a', 'b')"), vec![vec![Value::Null]]);
+    // A null in the middle of a column keeps its row, and the answers after it keep theirs.
+    let sql = "SELECT regexp_replace(x, 'a', 'b'), regexp_extract(x, '[a-z]+') FROM (VALUES ('a1'), \
+               (NULL), ('ca'), ('aa')) t(x)";
+    assert_eq!(
+        rows(&db, sql),
+        vec![
+            vec![text("b1"), text("a")],
+            vec![Value::Null, Value::Null],
+            vec![text("cb"), text("ca")],
+            vec![text("ba"), text("aa")],
+        ]
+    );
     // The column is the thing that varies and the pattern is not, which is the shape the kernel
     // compiles once per vector rather than once per row.
     assert_eq!(
