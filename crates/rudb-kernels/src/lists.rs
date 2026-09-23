@@ -497,6 +497,7 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
 ) -> Result<Option<Vector>> {
     match (name, args) {
         ("list_value", [_, ..]) => built(args, returns, rows),
+        ("range" | "generate_series", [_, ..]) => series(name == "generate_series", args, rows),
         ("list_reverse", [list]) => reversed(list.as_ref()),
         ("length" | "array_length", [list]) => counted(list.as_ref()),
         ("list_distinct", [list]) => deduplicated(false, list.as_ref()),
@@ -542,6 +543,57 @@ fn built<V: AsRef<Vector>>(
     let count = entry(width)?;
     let entries = (0..rows).map(|row| Ok((entry(row * width)?, count))).collect::<Result<_>>()?;
     Vector::list(entries, child).map(Some)
+}
+
+/// `range` and `generate_series` over integer columns, with every row's series written straight
+/// into one child and no `Value` made for any element. A row with a null argument is a null list.
+fn series<V: AsRef<Vector>>(inclusive: bool, args: &[V], rows: usize) -> Result<Option<Vector>> {
+    if args.iter().any(|arg| arg.as_ref().logical_type() != &LogicalType::BigInt) {
+        return Ok(None);
+    }
+    let flat: Vec<Vector> = args.iter().map(|arg| arg.as_ref().flatten()).collect::<Result<_>>()?;
+    let mut columns = Vec::with_capacity(flat.len());
+    for vector in &flat {
+        let Some(Data::Int64(values)) = vector.data() else {
+            return Ok(None);
+        };
+        columns.push((values.as_slice(), vector.validity().live()));
+    }
+    let mut entries = Vec::with_capacity(rows);
+    let mut child = Vec::new();
+    let mut live = vec![true; rows];
+    for row in 0..rows {
+        let mut held = [0_i64; 3];
+        let mut null = false;
+        for (at, (values, live)) in columns.iter().enumerate() {
+            match values.get(row) {
+                Some(&value) if live.at(row) => held[at] = value,
+                _ => null = true,
+            }
+        }
+        let at = entry(child.len())?;
+        if null {
+            entries.push((at, 0));
+            live[row] = false;
+            continue;
+        }
+        let (start, stop, step) = match columns.len() {
+            1 => (0, held[0], 1),
+            2 => (held[0], held[1], 1),
+            _ => (held[0], held[1], held[2]),
+        };
+        let count = series_length(start, stop, step, inclusive)?;
+        child.reserve(count);
+        let mut value = start;
+        for _ in 0..count {
+            child.push(value);
+            value = value.wrapping_add(step);
+        }
+        entries.push((at, entry(count)?));
+    }
+    let child = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(child)))?;
+    let validity = Validity::from_iter(rows, |row| live[row]).normalize(rows);
+    Ok(Some(Vector::list(entries, child)?.with_validity(validity)))
 }
 
 /// `length` of a list column, which is every entry's length with the column's nulls.
