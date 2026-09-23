@@ -62,7 +62,7 @@
 
 use rudb_common::Value;
 use rudb_common::bounds::{Bound, Op, certain, excluded, scaled_as};
-use rudb_vector::{Chunk, Data, Form, Packed, Vector};
+use rudb_vector::{Chunk, Data, Form, Packed, StringView, Vector};
 
 #[cfg(doc)]
 use crate::MemoryTable;
@@ -701,6 +701,9 @@ fn widen<T: Copy + PartialOrd>(value: T, low: &mut Option<T>, high: &mut Option<
 
 /// The range of a column of strings, walked as bytes.
 fn text(vector: &Vector) -> (Option<Bound>, Option<Bound>) {
+    if let Some((views, arena)) = vector.text_parts() {
+        return viewed(vector, views, arena);
+    }
     let mut low: Option<&[u8]> = None;
     let mut high: Option<&[u8]> = None;
     for index in 0..vector.len() {
@@ -713,6 +716,42 @@ fn text(vector: &Vector) -> (Option<Bound>, Option<Bound>) {
         }
     }
     (low.map(|bytes| Bound::Bytes(bytes.to_vec())), high.map(|bytes| Bound::Bytes(bytes.to_vec())))
+}
+
+/// The two ends of a column held as views, found from the prefixes wherever they decide it.
+///
+/// The view keeps the first four bytes of its string, zero padded, and two strings whose padded
+/// prefixes differ are ordered the way those prefixes are. So a row whose prefix is above the low
+/// end's cannot be the new low and one below it is, and neither of those reads the arena. Only a
+/// row with the same prefix as an end is compared in full. The ends are kept as rows rather than
+/// bytes and copied out once at the end.
+///
+/// The arena is where the time went. After a sort the views of a chunk point all over an arena of
+/// a few hundred megabytes, so reading every row's bytes is a cache miss a row, and on SF1
+/// `lineitem` sorted by ship month that was 310ms of the append's statistics for `l_comment` alone.
+fn viewed(vector: &Vector, views: &[StringView], arena: &[u8]) -> (Option<Bound>, Option<Bound>) {
+    let validity = vector.validity();
+    let bytes =
+        |index: usize| views.get(index).and_then(|view| view.bytes_in(arena)).unwrap_or_default();
+    let mut ends: Option<(usize, u32, usize, u32)> = None;
+    for (index, view) in views.iter().enumerate() {
+        if !validity.is_valid(index) {
+            continue;
+        }
+        let prefix = u32::from_be_bytes(view.prefix());
+        let Some((low, low_prefix, high, high_prefix)) = ends.as_mut() else {
+            ends = Some((index, prefix, index, prefix));
+            continue;
+        };
+        if prefix < *low_prefix || (prefix == *low_prefix && bytes(index) < bytes(*low)) {
+            (*low, *low_prefix) = (index, prefix);
+        }
+        if prefix > *high_prefix || (prefix == *high_prefix && bytes(index) > bytes(*high)) {
+            (*high, *high_prefix) = (index, prefix);
+        }
+    }
+    let Some((low, _, high, _)) = ends else { return (None, None) };
+    (Some(Bound::Bytes(bytes(low).to_vec())), Some(Bound::Bytes(bytes(high).to_vec())))
 }
 
 #[cfg(test)]
@@ -846,6 +885,39 @@ mod tests {
         let range = zone.column(0).expect("one column");
         assert_eq!(range.low, Some(Bound::Bytes(b"ada".to_vec())));
         assert_eq!(range.high, Some(Bound::Bytes(b"turing".to_vec())));
+    }
+
+    /// A column of views finds its ends from the prefixes, and a prefix shared with an end is the one
+    /// case that has to read the bytes. Every rotation of the rows gives the ends sorting would.
+    #[test]
+    fn a_column_of_views_is_ordered_as_bytes_whatever_its_prefixes_share() {
+        let texts = [
+            Some("abcdefghijklmnop"),
+            Some("abcdefghijklmnoa"),
+            Some("abcd"),
+            None,
+            Some("abc"),
+            Some("abcdzzzzzzzzzzzzzz"),
+            Some("zzzzzzzzzzzzzzzzzz"),
+            Some("zzzz"),
+            Some("zzzzzzzzzzzzzzzzzy"),
+        ];
+        for turn in 0..texts.len() {
+            let mut turned = texts.to_vec();
+            turned.rotate_left(turn);
+            let values: Vec<Value> = turned
+                .iter()
+                .map(|text| text.map_or(Value::Null, |text| Value::Varchar(text.to_string())))
+                .collect();
+            let flat = Vector::from_values(LogicalType::Varchar, &values).expect("a column");
+            let vector = flat.shared_text().expect("the same strings as views");
+            assert!(vector.text_parts().is_some() && vector.data().is_none(), "held as views");
+            let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+            let range = zone.column(0).expect("one column");
+            assert_eq!(range.low, Some(Bound::Bytes(b"abc".to_vec())), "turned {turn}");
+            assert_eq!(range.high, Some(Bound::Bytes(b"zzzzzzzzzzzzzzzzzz".to_vec())));
+            assert_eq!(range.nulls, 1);
+        }
     }
 
     /// The `SearchPhrase` shape: more entries in the dictionary than rows in the chunk. The rows are
