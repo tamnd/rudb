@@ -54,6 +54,7 @@ use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::aggregate::Accumulator;
 use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
@@ -2569,6 +2570,22 @@ pub fn call_values(
     }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
+    }
+    // `list_aggr` over one list. The binder resolved the aggregate and put its name second, and
+    // cast the list to the element type it takes, so this is the accumulator a `GROUP BY` would use
+    // with the elements as its rows, and an empty list answers what an empty group does.
+    if let ("list_aggr", [Value::List { values, .. }, Value::Varchar(aggregate), extra @ ..]) =
+        (name, args)
+    {
+        let mut accumulator = Accumulator::new(aggregate, returns)?;
+        let mut row = Vec::with_capacity(1 + extra.len());
+        for value in values {
+            row.clear();
+            row.push(value.clone());
+            row.extend(extra.iter().cloned());
+            accumulator.update(&row)?;
+        }
+        return accumulator.finish();
     }
     match (name, args) {
         // Two lists joined end to end, which is the reading of this operator the arguments picked.

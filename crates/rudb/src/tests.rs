@@ -7989,3 +7989,73 @@ fn a_decimal_sum_is_as_wide_as_a_decimal_goes() {
         vec![vec![text("DECIMAL(38,1)")]]
     );
 }
+
+#[test]
+fn an_aggregate_runs_over_the_elements_of_a_list() {
+    let db = database();
+    let one = |sql: &str| rows(&db, sql);
+    assert_eq!(one("SELECT list_aggr([1, 2, 3], 'sum')"), vec![vec![Value::HugeInt(6)]]);
+    assert_eq!(
+        db.query("SELECT list_aggr([1, 2, 3], 'sum')").unwrap().names(),
+        ["list_aggr(list_value(1, 2, 3), 'sum')"]
+    );
+    assert_eq!(one("SELECT list_aggr([1, 2, 3], 'avg')"), vec![vec![Value::Double(2.0)]]);
+    assert_eq!(one("SELECT list_aggr([1, NULL, 3], 'count')"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(one("SELECT list_aggr(['b', 'a'], 'min')"), vec![vec![text("a")]]);
+    assert_eq!(one("SELECT list_aggregate([1, 2], 'SUM')"), vec![vec![Value::HugeInt(3)]]);
+    assert_eq!(one("SELECT array_aggr([1, 2], 'max')"), vec![vec![integer(2)]]);
+    assert_eq!(one("SELECT aggregate([1], 'sum')"), vec![vec![Value::HugeInt(1)]]);
+    assert_eq!(one("SELECT list_aggr([1, 2], 's' || 'um')"), vec![vec![Value::HugeInt(3)]]);
+    assert_eq!(
+        one("SELECT list_aggr([], 'sum'), list_aggr([], 'count'), list_aggr(NULL, 'count')"),
+        vec![vec![Value::Null, Value::BigInt(0), Value::Null]]
+    );
+    assert_eq!(one("SELECT list_aggr(NULL, 'nope')"), vec![vec![Value::Null]]);
+    assert_eq!(
+        one("SELECT typeof(list_aggr([1, 2]::TINYINT[], 'sum')), \
+             typeof(list_aggr([1, 2]::TINYINT[], 'min')), \
+             typeof(list_aggr([1.5]::FLOAT[], 'sum')), \
+             typeof(list_aggr([1, 2]::DECIMAL(4,1)[], 'sum'))"),
+        vec![vec![text("HUGEINT"), text("TINYINT"), text("DOUBLE"), text("DECIMAL(38,1)")]]
+    );
+    assert_eq!(
+        one("SELECT list_aggr(x, 'sum') FROM (VALUES ([1, 2]), (NULL), ([3])) v(x)"),
+        vec![vec![Value::HugeInt(3)], vec![Value::Null], vec![Value::HugeInt(3)]]
+    );
+}
+
+#[test]
+fn an_aggregate_over_a_list_is_refused_the_way_the_pin_refuses_it() {
+    let db = database();
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert!(
+        error("SELECT list_aggr([1, 2], 'nope')")
+            .starts_with("Catalog Error: Aggregate Function with name nope does not exist!")
+    );
+    assert!(
+        error("SELECT list_aggr([1, 2], 'lower')")
+            .starts_with("Catalog Error: lower is not an aggregate function")
+    );
+    assert!(
+        error("SELECT list_aggr([1, 2], NULL)")
+            .starts_with("Catalog Error: Aggregate Function with name NULL does not exist!")
+    );
+    assert!(error("SELECT list_aggr([1, 2])").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'list_aggr(INTEGER[])'. You might need to add explicit type casts.\n\tCandidate \
+         functions:\n\tlist_aggr(col0 ANY[], col1 VARCHAR, [ANY...]) -> ANY\n"
+    ));
+    db.execute("CREATE TABLE f AS SELECT 'sum' AS f").unwrap();
+    assert!(error("SELECT list_aggr([1, 2], f) FROM f").starts_with(
+        "Binder Error: The \"col1\" argument in function \"list_aggr\" must be a constant \
+             expression"
+    ));
+    assert!(error("SELECT list_aggr(['a'], 'sum')").starts_with(
+        "Binder Error: No matching aggregate function\nBinder Error: No function matches the \
+         given name and argument types 'sum(VARCHAR)'."
+    ));
+    assert!(error("SELECT list_aggr([1, 2], 'sum', 3)").starts_with(
+        "Binder Error: No matching aggregate function\nBinder Error: No function matches the \
+         given name and argument types 'sum(INTEGER, INTEGER)'."
+    ));
+}
