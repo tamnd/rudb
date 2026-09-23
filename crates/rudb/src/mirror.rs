@@ -48,19 +48,28 @@ fn key(path: &str, binary_as_string: bool, stamp: FileStamp) -> Result<u128> {
     if length + 12 > stamp.size {
         return Err(Error::io(format!("{path} states a footer longer than itself")));
     }
-    let mut material = Vec::with_capacity(path.len() + 64 + length as usize);
-    material.extend_from_slice(path.as_bytes());
-    material.push(0);
-    material.push(u8::from(binary_as_string));
-    material.extend_from_slice(&stamp.device.to_le_bytes());
-    material.extend_from_slice(&stamp.inode.to_le_bytes());
-    material.extend_from_slice(&stamp.size.to_le_bytes());
-    material.extend_from_slice(&stamp.modified.to_le_bytes());
-    let footer = material.len();
-    material.resize(footer + length as usize, 0);
-    read_at(&file, stamp.size - 8 - length, &mut material[footer..], path)?;
-    Ok(rudb_native::content_name(&material))
+    let mut namer = rudb_native::ContentNamer::default();
+    namer.update(path.as_bytes());
+    namer.update(&[0, u8::from(binary_as_string)]);
+    namer.update(&stamp.device.to_le_bytes());
+    namer.update(&stamp.inode.to_le_bytes());
+    namer.update(&stamp.size.to_le_bytes());
+    namer.update(&stamp.modified.to_le_bytes());
+    // The footer a window at a time, so that naming a mirror holds a window rather than the footer.
+    let mut window = vec![0; KEY_WINDOW.min(length as usize)];
+    let mut at = stamp.size - 8 - length;
+    let end = stamp.size - 8;
+    while at < end {
+        let piece = &mut window[..KEY_WINDOW.min((end - at) as usize)];
+        read_at(&file, at, piece, path)?;
+        namer.update(piece);
+        at += piece.len() as u64;
+    }
+    Ok(namer.finish())
 }
+
+/// How much of a footer [`key`] reads at a time.
+const KEY_WINDOW: usize = 64 * 1024;
 
 #[cfg(unix)]
 fn read_at(file: &File, offset: u64, into: &mut [u8], path: &str) -> Result<()> {

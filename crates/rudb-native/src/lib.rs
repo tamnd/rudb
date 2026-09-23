@@ -267,6 +267,76 @@ pub fn content_name(bytes: &[u8]) -> u128 {
     u128::from(seeded_checksum(bytes, seed)) << 64 | u128::from(seeded_checksum(bytes, !seed))
 }
 
+/// [`content_name`] of bytes that arrive in pieces, which gives the same name as the pieces joined.
+///
+/// A Parquet mirror is named for the file's footer, and that is 930 KB on the ten million row
+/// ClickBench file. Read whole to be hashed it is a freed megabyte in every process that opens the
+/// mirror, which the allocator keeps. Read a window at a time it is a window.
+#[derive(Debug, Clone)]
+pub struct ContentNamer {
+    seeds: [u64; 2],
+    lanes: [[u64; 4]; 2],
+    held: [u8; 32],
+    filled: usize,
+    length: u64,
+}
+
+impl Default for ContentNamer {
+    fn default() -> Self {
+        let seed = u64::from(FORMAT);
+        let seeds = [seed, !seed];
+        let lanes = seeds.map(|seed| {
+            [
+                seed.wrapping_add(XXH_P1).wrapping_add(XXH_P2),
+                seed.wrapping_add(XXH_P2),
+                seed,
+                seed.wrapping_sub(XXH_P1),
+            ]
+        });
+        Self { seeds, lanes, held: [0; 32], filled: 0, length: 0 }
+    }
+}
+
+impl ContentNamer {
+    /// Takes the next piece.
+    pub fn update(&mut self, mut bytes: &[u8]) {
+        self.length += bytes.len() as u64;
+        if self.filled > 0 {
+            let take = (32 - self.filled).min(bytes.len());
+            self.held[self.filled..self.filled + take].copy_from_slice(&bytes[..take]);
+            self.filled += take;
+            bytes = &bytes[take..];
+            if self.filled < 32 {
+                return;
+            }
+            let block = self.held;
+            self.lanes.iter_mut().for_each(|lanes| checksum_block(lanes, &block));
+            self.filled = 0;
+        }
+        let mut blocks = bytes.chunks_exact(32);
+        for block in blocks.by_ref() {
+            self.lanes.iter_mut().for_each(|lanes| checksum_block(lanes, block));
+        }
+        let rest = blocks.remainder();
+        self.held[..rest.len()].copy_from_slice(rest);
+        self.filled = rest.len();
+    }
+
+    /// The name of everything taken so far.
+    #[must_use]
+    pub fn finish(&self) -> u128 {
+        let rest = &self.held[..self.filled];
+        let [first, second] = [0, 1].map(|at| {
+            if self.length < 32 {
+                checksum_tail(self.seeds[at].wrapping_add(XXH_P5).wrapping_add(self.length), rest)
+            } else {
+                finish_checksum(self.lanes[at], rest, self.length)
+            }
+        });
+        u128::from(first) << 64 | u128::from(second)
+    }
+}
+
 /// The xxHash64 of `bytes` started from `seed`, which is the same walk with a different beginning.
 ///
 /// A seed is here for one caller: a global dictionary decides whether two values are the same by
@@ -10119,6 +10189,19 @@ mod tests {
     use rudb_common::stat::Provenance;
 
     use super::*;
+
+    #[test]
+    fn a_name_taken_in_pieces_is_the_name_of_the_pieces_joined() {
+        let bytes: Vec<u8> = (0..300_u32).map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for length in [0, 1, 7, 31, 32, 33, 63, 64, 65, 100, 300] {
+            let whole = content_name(&bytes[..length]);
+            for step in [1, 3, 8, 31, 32, 33, 64, 301] {
+                let mut namer = ContentNamer::default();
+                bytes[..length].chunks(step).for_each(|piece| namer.update(piece));
+                assert_eq!(namer.finish(), whole, "{length} bytes in pieces of {step}");
+            }
+        }
+    }
 
     /// The chooser as it was before it could rule kinds out up front: the same narrowing, with every
     /// kind tested for. What it writes is what the file used to hold.

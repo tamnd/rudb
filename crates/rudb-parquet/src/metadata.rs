@@ -968,6 +968,14 @@ fn expect(found: Kind, wanted: Kind, what: &str) -> Result<()> {
 
 /// The footer bytes of an open file, checked the way [`Metadata::read`] says.
 fn footer(file: &dyn File) -> Result<Vec<u8>> {
+    let (at, length) = footer_span(file)?;
+    let mut bytes = vec![0_u8; length];
+    file.read_exact_at(at, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Where a file's footer starts and how long it is, after checking both ends say Parquet.
+fn footer_span(file: &dyn File) -> Result<(u64, usize)> {
     let len = file.len()?;
     if len < 12 {
         return Err(Error::io(format!("a parquet file of {len} bytes, which is too short")));
@@ -988,9 +996,8 @@ fn footer(file: &dyn File) -> Result<Vec<u8>> {
             "a footer of {footer} bytes in a file of {len}, which does not fit"
         )));
     }
-    let mut bytes = vec![0_u8; footer as usize];
-    file.read_exact_at(len - 8 - footer, &mut bytes)?;
-    Ok(bytes)
+    let length = usize::try_from(footer).map_err(|_| Error::io("a footer too long to read"))?;
+    Ok((len - 8 - footer, length))
 }
 
 /// The columns of a file and how many rows it holds, without its row groups.
@@ -1010,14 +1017,56 @@ pub struct Outline {
     pub rows: i64,
 }
 
+/// How much of the front of a footer [`Outline::read`] reads before it gives up and reads it all.
+const OUTLINE_FRONT: usize = 64 * 1024;
+
 impl Outline {
-    /// Reads the outline of an open file, which reads the whole footer and parses part of it.
+    /// Reads the outline of an open file, which reads the front of the footer and parses part of it.
+    ///
+    /// The schema and the row count are the second and third fields of the footer and the row
+    /// groups come after them, so the front of it is usually all there is to read. On the ten
+    /// million row ClickBench file the footer is 930 KB and the outline is inside its first 64 KB.
+    /// Reading the whole of it put a freed megabyte in the process for every statement that named
+    /// the file, which the allocator keeps, and a statement read through a mirror names it twice.
+    /// A front that ends before both fields have been seen falls back to reading the whole footer.
     ///
     /// # Errors
     ///
     /// Everything [`Metadata::read`] reports, less what it finds wrong with a row group.
     pub fn read(file: &dyn File) -> Result<Self> {
-        Self::parse(&footer(file)?)
+        let (at, length) = footer_span(file)?;
+        if length > OUTLINE_FRONT {
+            let mut front = vec![0_u8; OUTLINE_FRONT];
+            file.read_exact_at(at, &mut front)?;
+            if let Ok(Some(outline)) = Self::parse_front(&front) {
+                return Ok(outline);
+            }
+        }
+        let mut bytes = vec![0_u8; length];
+        file.read_exact_at(at, &mut bytes)?;
+        Self::parse(&bytes)
+    }
+
+    /// The outline out of the front of a footer, or `None` when the front ends before it does.
+    ///
+    /// The front is cut wherever the read stopped, so running out of it is an error from the
+    /// reader, and the caller takes any error here as a reason to read the whole footer. That
+    /// read is then the one that reports what is wrong with the file.
+    fn parse_front(bytes: &[u8]) -> Result<Option<Self>> {
+        let mut reader = Reader::new(bytes);
+        let mut rows = None;
+        let mut schema = Vec::new();
+        while let Some(field) = reader.field_begin()? {
+            match field.id {
+                2 => schema = read_schema(&mut reader)?,
+                3 => rows = Some(reader.read_int()?),
+                _ => reader.skip(field.kind)?,
+            }
+            if let (false, Some(rows)) = (schema.is_empty(), rows) {
+                return Ok(Some(Self { schema, rows }));
+            }
+        }
+        Ok(None)
     }
 
     /// Parses the outline out of a footer that has already been read.
