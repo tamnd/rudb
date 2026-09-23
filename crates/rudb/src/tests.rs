@@ -8331,6 +8331,23 @@ fn the_list_calls_with_a_vector_loop_answer_over_a_column_the_way_they_do_a_row_
     );
     assert_eq!(column("SELECT contains(l, 2) FROM held ORDER BY id"), "true;false;NULL;true");
     assert_eq!(column("SELECT contains(s, 'a') FROM shaped ORDER BY id"), "true;NULL;true;false");
+    let aggregated = |call: &str, answer: &str| {
+        assert_eq!(column(&format!("SELECT {call} FROM held ORDER BY id")), answer, "{call}");
+    };
+    aggregated("list_sum(l)", "3;11;NULL;6");
+    aggregated("list_count(l)", "2;2;NULL;3");
+    aggregated("list_min(l)", "1;5;NULL;2");
+    aggregated("list_max(l)", "2;6;NULL;2");
+    aggregated("list_avg(l)", "1.5;5.5;NULL;2.0");
+    aggregated("list_first(l)", "1;NULL;NULL;2");
+    aggregated("list_last(l)", "NULL;6;NULL;2");
+    let ranged = |call: &str, answer: &str| {
+        assert_eq!(column(&format!("SELECT {call} FROM shaped ORDER BY id")), answer, "{call}");
+    };
+    ranged("list_sum(range(a - 1))", "NULL;NULL;15;0");
+    ranged("list_count(range(a - 1))", "0;NULL;6;1");
+    ranged("list_bit_or(range(a))", "0;NULL;7;1");
+    ranged("list_stddev_samp(range(a))", "NULL;NULL;2.160246899469287;0.7071067811865476");
 }
 
 #[test]

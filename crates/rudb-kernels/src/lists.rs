@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Buffer, Data, Live, Validity, Vector, interleave};
 
+use crate::aggregate::{Accumulator, NOWHERE, finish_run, update_runs, update_scattered};
 use crate::compare::order;
 use crate::datetime;
 use crate::number::integral;
@@ -531,6 +532,7 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
         ("range" | "generate_series", [_, ..]) => {
             series(name == "generate_series", args, returns, rows)
         }
+        ("list_aggr", [list, aggregate]) => aggregated(list.as_ref(), aggregate.as_ref(), returns),
         ("list_reverse", [list]) => reversed(list.as_ref()),
         ("length" | "array_length", [list]) => counted(list.as_ref()),
         ("list_distinct", [list]) => deduplicated(false, list.as_ref()),
@@ -694,6 +696,59 @@ fn counted(list: &Vector) -> Result<Option<Vector>> {
     let lengths: Vec<i64> = entries.iter().map(|&(_, len)| i64::from(len)).collect();
     let answer = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(lengths)))?;
     Ok(Some(answer.with_validity(list.validity().clone())))
+}
+
+/// `list_aggr` over a column, as a grouped aggregate whose groups are the lists.
+///
+/// Every element of the child belongs to the row whose list holds it, so the child is the input and
+/// the rows are the slots, and the same one pass folds a `GROUP BY` uses do the rest. The elements
+/// of one list are walked in order, which keeps a floating point total adding the way the row path
+/// adds it. A null list folds nothing and is null. Left to the row path when two lists share an
+/// element of the child, since a row of the input can only go to one slot, and when the call has
+/// arguments after the aggregate's name.
+fn aggregated(list: &Vector, aggregate: &Vector, returns: &LogicalType) -> Result<Option<Vector>> {
+    let (Some((entries, child)), Some(Value::Varchar(aggregate))) =
+        (list.list_parts(), aggregate.constant_value())
+    else {
+        return Ok(None);
+    };
+    let live = list.validity().live();
+    let mut slots = vec![NOWHERE; child.len()];
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        if !live.at(row) {
+            continue;
+        }
+        let (start, len) = (start as usize, len as usize);
+        let Some(held) = slots.get_mut(start..start + len) else {
+            return Err(Error::internal("a list entry past the end of its child"));
+        };
+        if held.iter().any(|&slot| slot != NOWHERE) {
+            return Ok(None);
+        }
+        held.fill(row);
+    }
+    let rows = entries.len();
+    let mut states = vec![Accumulator::new(aggregate, returns)?; rows];
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (at, &slot) in slots.iter().enumerate() {
+        match runs.last_mut() {
+            Some((held, end)) if *held == slot => *end = at + 1,
+            _ => runs.push((slot, at + 1)),
+        }
+    }
+    if !update_runs(&mut states, &runs, 1, 0, Some(child), child.len())? {
+        update_scattered(&mut states, &slots, 1, 0, Some(child), child.len())?;
+    }
+    let every: Vec<usize> = (0..rows).collect();
+    let answer = match finish_run(&states, &every, 1, 0, returns)? {
+        Some(answer) => answer,
+        None => {
+            let values = states.iter().map(Accumulator::finish).collect::<Result<Vec<_>>>()?;
+            Vector::from_values(returns.clone(), &values)?
+        }
+    };
+    let validity = answer.validity().and(list.validity(), rows);
+    Ok(Some(answer.with_validity(validity)))
 }
 
 /// `list_reverse` over a column: one gather of the child with every row's run turned round.
