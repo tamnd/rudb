@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.16
+
+A patch release of seven pull requests. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.15 read each other's files.
+
+#1536 lets a runtime filter pass through the inner and semi joins between the join that built it and the scan it belongs to. Before, a join that drove from another join built a filter that had nowhere to go, so in TPC-H q05 the lineitem scan handed up 976 thousand rows where 203 thousand can match. When the build keys are integers close together, the filter is replaced by an exact bitmap over their range, which costs a subtraction a row instead of a hash. At SF1, q05 went from 182 ms to 116 ms of CPU against DuckDB's 79, q18 from 296 ms to 199 ms against 248, and q02 from 32 ms to 21 ms against 26, with every answer the same.
+
+Three make a native load cheaper. #1530 searches the integer cascade once per column per stripe and replays the shape it found for the next parts, #1531 compares LZ matches eight bytes at a time and turns a candidate away on one byte, and #1535 sums FSST gains in an open addressed table that is cleared rather than dropped and reuses the training counts per thread. Each took about 5 to 9 percent off the user CPU of loading ClickBench `hits` 10M, and the files are the same size.
+
+#1533 answers a fresh process `AVG(column)` over a whole table from the sum and count the catalog already certifies, which took ClickBench q4 on the 10M file from 53 ms to 3.7 ms. #1534 reads a Parquet footer 64 KB at a time where a statement only needs the schema and the row count, which saves about a megabyte a statement over the 10M file. #1518 adds fourteen list functions that look inside a list without a lambda, among them `list_position`, `list_contains`, `list_distinct`, `list_sort` and `flatten`, with every alias DuckDB has for them. The release commit also formats one line of a test #1534 added, which the gate checks.
+
 ## 0.4.15
 
 A patch release of sixteen pull requests, and the one to take instead of 0.4.14, which was tagged but whose release run stops at the gate, because the gate finds a flatten in #1494 with its reason one line too far from the call. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.14 read each other's files.
