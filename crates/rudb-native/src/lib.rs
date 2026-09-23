@@ -3241,6 +3241,16 @@ struct NativeText {
     /// [`Self::ends_worth_unpacking`] decides and [`Self::ends_asked`] counts towards, because a
     /// table built for a reader that wanted three values is four bytes a value spent on nothing.
     value_ends: OnceLock<Option<Vec<u32>>>,
+    /// The length of every value, worked out of [`Self::value_ends`] the first time a vector of
+    /// lengths is asked for.
+    ///
+    /// A length out of the ends is two loads, a test for whether the value opens its block and a
+    /// check that it does not end before it starts, which came to thirteen instructions a row on
+    /// ClickBench 28. Out of this it is one load. The order is checked once for the whole table
+    /// while it is built, and a column that fails it gets no table and goes on reading the ends,
+    /// which is where the error is reported. Four bytes a value, and only for a column something
+    /// has asked the length of a vector at a time.
+    value_lens: OnceLock<Option<Vec<u32>>>,
     /// How many single offset reads have come in while the table is not built.
     ///
     /// Relaxed, and read only against a threshold, so two threads racing here means the table is
@@ -3389,6 +3399,23 @@ fn gram_bits(bytes: &[u8]) -> [usize; 2] {
 /// least useful one evicted. That is F2 work. What is here is the part of it that can be written
 /// without an eviction order, which is a ceiling.
 const TEXT_KEEP_BUDGET: usize = 256 * 1024 * 1024;
+
+/// The length of every value out of where each one ends inside its payload block, or `None` for
+/// ends that go backwards somewhere inside a block.
+///
+/// A value that opens a block starts at zero and every other one starts where the value before it
+/// ends, so a block is a run of differences.
+fn lengths_of(ends: &[u32]) -> Option<Vec<u32>> {
+    let mut lens = Vec::with_capacity(ends.len());
+    for block in ends.chunks(TEXT_PAYLOAD_VALUES) {
+        let mut start = 0;
+        for &end in block {
+            lens.push(end.checked_sub(start)?);
+            start = end;
+        }
+    }
+    Some(lens)
+}
 
 /// How many offsets go in one packed run.
 ///
@@ -3838,6 +3865,14 @@ impl TextSource for NativeText {
             }
             return Ok(());
         };
+        if let Some(lens) = self.value_lens.get_or_init(|| lengths_of(ends)) {
+            for (slot, &index) in into.iter_mut().zip(indices) {
+                // Past the end is no value and so no length, which is what a row at a time read
+                // says.
+                *slot = lens.get(index as usize).map_or(0, |&len| i64::from(len));
+            }
+            return Ok(());
+        }
         for (slot, &index) in into.iter_mut().zip(indices) {
             let index = index as usize;
             // Past the end is no value and so no length, which is what a row at a time read says.
@@ -4046,6 +4081,11 @@ impl TextSource for NativeText {
                 .get()
                 .and_then(Option::as_ref)
                 .map_or(0, |ends| ends.capacity() * size_of::<u32>())
+            + self
+                .value_lens
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(0, |lens| lens.capacity() * size_of::<u32>())
             + self
                 .code_ranks
                 .get()
@@ -8774,6 +8814,7 @@ fn open_global_dictionary(
             offsets,
             offset_bits,
             value_ends: OnceLock::new(),
+            value_lens: OnceLock::new(),
             ends_asked: AtomicUsize::new(0),
             ranks,
             rank_at: page.offset + index_len as u64,
@@ -11896,7 +11937,33 @@ mod tests {
                 );
             }
         }
+        // The lengths a vector at a time, twice over, because the first pass is what makes the
+        // table of ends worth building and the second is read out of the lengths worked out of it.
+        for _ in 0..2 {
+            for part in 0..rows / 1_000 {
+                let chunk = reader.read(part, &[0]).expect("a part");
+                let mut lens = vec![0_i64; 1_000];
+                let column = chunk.column(0).expect("one column");
+                assert!(column.try_bytes_lens(&mut lens).expect("lengths"), "a stored column");
+                for (row, &len) in lens.iter().enumerate() {
+                    let row = part * 1_000 + row;
+                    assert_eq!(len as usize, value(row).len(), "the length of value {row}");
+                }
+            }
+        }
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Lengths start again at every block, and ends that go backwards inside one give no table.
+    #[test]
+    fn lengths_restart_at_each_block_and_refuse_ends_that_go_backwards() {
+        let mut ends: Vec<u32> = (1..=TEXT_PAYLOAD_VALUES as u32).map(|at| at * 2).collect();
+        ends.extend([3, 3, 10]);
+        let lens = lengths_of(&ends).expect("ordered ends");
+        assert!(lens[..TEXT_PAYLOAD_VALUES].iter().all(|&len| len == 2));
+        assert_eq!(&lens[TEXT_PAYLOAD_VALUES..], &[3, 0, 7]);
+        ends.push(9);
+        assert_eq!(lengths_of(&ends), None);
     }
 
     /// Every worker of a scan wants the dictionary at the same moment and one of them fetches it.
