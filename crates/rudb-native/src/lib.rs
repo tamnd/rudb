@@ -1365,6 +1365,28 @@ struct PendingChunk {
     chunk: Chunk,
 }
 
+/// What the writer still needs of a part once its columns are encoded: where in the source it came
+/// from, how many rows it has and how large those rows were.
+///
+/// A stripe waiting for the writer's lock carries these rather than its chunks, so its rows are
+/// freed as soon as they are encoded and not after the stripe is written. See [`prepare`].
+#[derive(Debug, Clone, Copy)]
+struct Part {
+    order: (u64, u64),
+    rows: usize,
+    footprint: usize,
+}
+
+impl Part {
+    fn of(pending: &PendingChunk) -> Self {
+        Self {
+            order: pending.order,
+            rows: pending.chunk.len(),
+            footprint: pending.chunk.footprint(),
+        }
+    }
+}
+
 /// One column's share of a stripe, which is what one encode worker produces.
 ///
 /// Indexed by part, so a stripe is a column of these and the write loop reads down one of them.
@@ -1866,15 +1888,14 @@ impl Writer {
     }
 
     /// One column's parts of a stripe as pages, for a column with no global dictionary.
-    fn encode_pages(index: usize, held: &[PendingChunk]) -> Result<ColumnStripe> {
+    fn encode_pages(columns: &[&Vector]) -> Result<ColumnStripe> {
         let mut stripe = ColumnStripe {
-            pages: Vec::with_capacity(held.len()),
-            codes: Vec::with_capacity(held.len()),
-            sieves: Vec::with_capacity(held.len()),
-            ranges: Vec::with_capacity(held.len()),
+            pages: Vec::with_capacity(columns.len()),
+            codes: Vec::with_capacity(columns.len()),
+            sieves: Vec::with_capacity(columns.len()),
+            ranges: Vec::with_capacity(columns.len()),
         };
-        for pending in held {
-            let column = pending.chunk.column(index)?;
+        for &column in columns {
             let bytes = encode(column)?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
@@ -1940,11 +1961,7 @@ impl Writer {
     }
 
     /// Writes one stripe whose pages are built, each column's parts contiguous on disk.
-    fn write_stripe(
-        &mut self,
-        mut held: Vec<PendingChunk>,
-        encoded: Vec<ColumnStripe>,
-    ) -> Result<()> {
+    fn write_stripe(&mut self, held: &[Part], encoded: Vec<ColumnStripe>) -> Result<()> {
         let width = self.table.fields.len();
         let parts = held.len();
         if encoded.len() != width {
@@ -1952,8 +1969,8 @@ impl Writer {
         }
         let profile = self.profile.clone();
         if let Some(profile) = &profile {
-            let rows = held.iter().map(|pending| pending.chunk.len() as u64).sum();
-            let raw = held.iter().map(|pending| pending.chunk.footprint() as u64).sum();
+            let rows = held.iter().map(|part| part.rows as u64).sum();
+            let raw = held.iter().map(|part| part.footprint as u64).sum();
             let pages =
                 encoded.iter().flat_map(|stripe| &stripe.pages).map(|page| page.len() as u64).sum();
             profile.moved(Stage::Pages, raw, pages, rows);
@@ -2070,13 +2087,10 @@ impl Writer {
         let mut rows = 0_usize;
         let mut lengths = Vec::with_capacity(parts);
         let mut span = None;
-        for pending in held.drain(..) {
-            let part = pending.chunk.len();
-            rows = rows.checked_add(part).ok_or_else(|| invalid("row count overflow"))?;
-            lengths.push(u32::try_from(part).map_err(|_| invalid("part row count overflow"))?);
-            span = Some(
-                span.map_or((pending.order, pending.order), |(first, _)| (first, pending.order)),
-            );
+        for part in held {
+            rows = rows.checked_add(part.rows).ok_or_else(|| invalid("row count overflow"))?;
+            lengths.push(u32::try_from(part.rows).map_err(|_| invalid("part row count overflow"))?);
+            span = Some(span.map_or((part.order, part.order), |(first, _)| (first, part.order)));
         }
         self.order.push(span.ok_or_else(|| invalid("a stripe was flushed with no parts"))?);
         self.table.stripes.push(Stripe {
@@ -2092,10 +2106,6 @@ impl Writer {
         drop(timing);
         if let Some(profile) = &profile {
             profile.moved(Stage::Write, 0, self.at - before, rows as u64);
-        }
-        // Back where it came from, empty, so the next stripe buffers into the same allocation.
-        if self.pending.is_empty() {
-            self.pending = held;
         }
         Ok(())
     }
