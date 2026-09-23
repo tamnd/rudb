@@ -6294,25 +6294,62 @@ impl<'a> Cursor<'a> {
     }
 
     /// The next `len` bytes, without moving past them.
+    #[inline]
     fn peek(&mut self, len: usize) -> Result<&[u8]> {
+        if self.window.is_none() {
+            let bytes = self.bytes;
+            return Ok(&bytes[self.at..self.end(len)?]);
+        }
         self.ensure(len)?;
         Ok(self.held(self.at, len))
     }
 
+    /// The next `len` bytes, moving past them.
+    ///
+    /// Every data page is decoded through this, a byte or a word at a time, so a cursor over bytes
+    /// already in memory takes them here and never reaches [`Self::ensure`]. With the window check
+    /// on every call, q06 on TPC-H spent a seventh of its instructions in it.
+    #[inline]
     fn take(&mut self, len: usize) -> Result<&[u8]> {
+        if self.window.is_none() {
+            let bytes = self.bytes;
+            let (at, end) = (self.at, self.end(len)?);
+            self.at = end;
+            return Ok(&bytes[at..end]);
+        }
+        self.take_windowed(len)
+    }
+
+    /// Where `len` bytes from here end, when they end inside the bytes.
+    #[inline]
+    fn end(&self, len: usize) -> Result<usize> {
+        let end = self.at.checked_add(len).ok_or_else(|| invalid("directory offset overflow"))?;
+        if end > self.bytes.len() {
+            return Err(invalid("directory is truncated"));
+        }
+        Ok(end)
+    }
+
+    /// [`Self::take`] out of the file, a window at a time.
+    #[inline(never)]
+    fn take_windowed(&mut self, len: usize) -> Result<&[u8]> {
         self.ensure(len)?;
         self.at += len;
         Ok(self.held(self.at - len, len))
     }
+    #[inline]
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
+    #[inline]
     fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("two bytes")))
     }
+    #[inline]
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
     }
+    #[inline]
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
     }
@@ -8651,10 +8688,12 @@ fn decode(
         let width = u32::from(cur.u8()?);
         let base = i128::from_le_bytes(cur.take(16)?.try_into().expect("sixteen bytes"));
         let count = cur.u32()? as usize;
-        let mut words = Vec::with_capacity(count);
-        for _ in 0..count {
-            words.push(cur.u64()?);
-        }
+        let length = count.checked_mul(8).ok_or_else(|| invalid("packed page is too long"))?;
+        let words: Vec<u64> = cur
+            .take(length)?
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
+            .collect();
         if cur.at != bytes.len() {
             return Err(invalid("packed page has trailing bytes"));
         }
