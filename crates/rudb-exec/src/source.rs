@@ -3145,6 +3145,77 @@ mod tests {
         (plan, scan)
     }
 
+    /// A necessary LIKE can read one column first without changing the full AND answer.
+    #[test]
+    fn a_sparse_like_fetches_the_second_column_after_selection() {
+        let mut table = Table::new(
+            QualifiedName::new("memory", "main", "t"),
+            vec![
+                Field::new("URL", LogicalType::Varchar),
+                Field::new("SearchPhrase", LogicalType::Varchar),
+            ],
+        )
+        .expect("two columns");
+        let rows = (0..VECTOR_SIZE * 3)
+            .map(|row| {
+                let matching =
+                    row == 3 || row == 5 || (VECTOR_SIZE..VECTOR_SIZE + 400).contains(&row);
+                let phrase = if row == 5 || row == VECTOR_SIZE + 10 { "" } else { "phrase" };
+                vec![
+                    Value::Varchar(if matching { "google.test" } else { "example.test" }.into()),
+                    Value::Varchar(phrase.into()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        table.append_rows(&rows).expect("rows");
+        let plan = Plan::parse(
+            "Filter (\"~~\"(#0.0::VARCHAR, '%google%'::VARCHAR)::BOOLEAN AND (#0.1::VARCHAR <> ''::VARCHAR)::BOOLEAN)::BOOLEAN\n  Get memory.main.t AS t #0 [URL::VARCHAR, SearchPhrase::VARCHAR]",
+        )
+        .expect("the plan text round trips");
+        let Node::Filter { input, predicate } = *plan.node(plan.root()) else {
+            panic!("the plan is a filter");
+        };
+        let Node::Get { index, columns, .. } = *plan.node(input) else { panic!("under a get") };
+        let moved =
+            rudb_opt::bounds::into_scan(&plan, plan.root()).expect("a filter over a stored table");
+        let pushdown =
+            Pushdown { node: plan.root(), predicate, tests: moved.tests, whole: moved.whole };
+        let filters = Filters { pushed: Some(pushdown), ..Filters::default() };
+        let scan = Scan::new(
+            &plan,
+            &table,
+            index,
+            columns,
+            filters,
+            &Settings::default(),
+            &Session::default(),
+        )
+        .expect("two projected columns");
+        assert!(scan.pushed.as_ref().and_then(|pushed| pushed.late.as_ref()).is_some());
+        let mut found = Vec::new();
+        while let Some(mut morsel) = scan.morsel() {
+            loop {
+                let mut chunk = Chunk::empty(&[]);
+                let progress = scan.read(&mut morsel, &mut chunk).expect("a part reads");
+                found.extend(
+                    (0..chunk.len()).map(|row| (chunk.value_at(row, 0), chunk.value_at(row, 1))),
+                );
+                if progress == Progress::Done {
+                    break;
+                }
+            }
+        }
+        let expected = rows
+            .iter()
+            .filter(|row| {
+                matches!(&row[0], Value::Varchar(url) if url.contains("google"))
+                    && matches!(&row[1], Value::Varchar(phrase) if !phrase.is_empty())
+            })
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(found, expected, "sparse, dense, and empty parts keep the same rows");
+    }
+
     /// The middle of the three answers. Every row of the table is at or above zero, so every chunk
     /// is one the zone waves through and the comparison never runs on any of them.
     #[test]
