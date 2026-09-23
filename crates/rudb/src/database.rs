@@ -29,6 +29,15 @@ use crate::settings::Settings;
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
 const MEMORY: &str = ":memory:";
 
+/// Exact native bounds for a one-statement result, before CSV formatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeExtremaValues {
+    /// Bounds for an integer column.
+    Integer { low: i128, high: i128 },
+    /// Day counts for a DATE column.
+    Date { low: i32, high: i32 },
+}
+
 fn native_simple_identifier(text: &str) -> bool {
     let mut bytes = text.bytes();
     matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
@@ -79,6 +88,38 @@ fn native_simple_distinct_statement(sql: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((table, column))
+}
+
+/// Recognizes one unquoted MIN and MAX of the same column, with no other SQL clauses.
+fn native_simple_extrema_statement(sql: &str) -> Option<(&str, &str)> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let minimum = words.next()?;
+    let maximum = words.next()?;
+    let from = words.next()?;
+    let table = words.next()?;
+    if words.next().is_some()
+        || !select.eq_ignore_ascii_case("select")
+        || !from.eq_ignore_ascii_case("from")
+        || !native_simple_identifier(table)
+    {
+        return None;
+    }
+    let min_prefix = minimum.get(..4)?;
+    let max_prefix = maximum.get(..4)?;
+    if !min_prefix.eq_ignore_ascii_case("min(")
+        || !max_prefix.eq_ignore_ascii_case("max(")
+        || !minimum.ends_with("),")
+        || !maximum.ends_with(')')
+    {
+        return None;
+    }
+    let column = &minimum[4..minimum.len() - 2];
+    let other = &maximum[4..maximum.len() - 1];
+    (native_simple_identifier(column) && column.eq_ignore_ascii_case(other))
+        .then_some((table, column))
 }
 
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
@@ -759,6 +800,44 @@ impl Database {
             return Ok(None);
         };
         Ok(i64::try_from(count).ok())
+    }
+
+    /// Reads certified bounds for a simple one-statement CSV invocation without constructing a
+    /// parsed query or result vectors. Null and unsupported bounds use regular execution.
+    pub fn query_native_extrema_values_once(
+        path: &str,
+        sql: &str,
+    ) -> Result<Option<NativeExtremaValues>> {
+        let Some((table, column)) = native_simple_extrema_statement(sql) else {
+            return Ok(None);
+        };
+        let catalog = rudb_native::Catalog::open(path)?;
+        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table)) else {
+            return Ok(None);
+        };
+        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
+        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(None);
+        };
+        let Some(rudb_native::IntegerExtremes::Values { low, high }) =
+            catalog.integer_extremes(name, index)?
+        else {
+            return Ok(None);
+        };
+        let ty = &fields[index].ty;
+        if native_integer_value(ty, low).is_none() || native_integer_value(ty, high).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(match ty {
+            LogicalType::Date => {
+                let (Ok(low), Ok(high)) = (i32::try_from(low), i32::try_from(high)) else {
+                    return Ok(None);
+                };
+                NativeExtremaValues::Date { low, high }
+            }
+            _ => NativeExtremaValues::Integer { low, high },
+        }))
     }
 
     /// Answers supported read-only aggregates directly from certified native synopses.
@@ -3300,10 +3379,10 @@ mod tests {
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
     use super::{
-        Database, native_extrema_shape, native_frequency_group_shape, native_nonzero_shape,
-        native_simple_average_statement, native_simple_distinct_statement,
-        native_single_average_shape, native_single_distinct_shape, native_three_aggregate_shape,
-        publish,
+        Database, NativeExtremaValues, native_extrema_shape, native_frequency_group_shape,
+        native_nonzero_shape, native_simple_average_statement, native_simple_distinct_statement,
+        native_simple_extrema_statement, native_single_average_shape, native_single_distinct_shape,
+        native_three_aggregate_shape, publish,
     };
 
     #[test]
@@ -3379,6 +3458,23 @@ mod tests {
     }
 
     #[test]
+    fn simple_extrema_statement_rejects_other_sql() {
+        assert_eq!(
+            native_simple_extrema_statement(" SELECT MIN(EventDate), MAX(EventDate) FROM hits; "),
+            Some(("hits", "EventDate"))
+        );
+        for sql in [
+            "SELECT MIN(EventDate), MAX(EventDate) FROM hits WHERE EventDate > 0",
+            "SELECT MIN(EventDate), MAX(OtherDate) FROM hits",
+            "SELECT MIN(EventDate + 1), MAX(EventDate) FROM hits",
+            "SELECT MIN(EventDate), MAX(EventDate) FROM hits; SELECT 1",
+            "SELECT MIN(EventDate), MAX(EventDate) FROM hits GROUP BY RegionID",
+        ] {
+            assert_eq!(native_simple_extrema_statement(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
     fn cold_extrema_matches_regular_execution_for_dates_and_nulls() {
         let path = std::env::temp_dir().join(format!("rudb-q7-{}.rdb", std::process::id()));
         let name = path.to_str().unwrap();
@@ -3403,6 +3499,26 @@ mod tests {
         for (sql, expected) in cases.into_iter().zip(expected) {
             let actual = Database::query_native_once(name, sql).unwrap().unwrap();
             assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
+        }
+        assert_eq!(
+            Database::query_native_extrema_values_once(
+                name,
+                "SELECT MIN(EventDate), MAX(EventDate) FROM hits"
+            )
+            .unwrap(),
+            Some(NativeExtremaValues::Date { low: 15888, high: 15917 })
+        );
+        assert_eq!(
+            Database::query_native_extrema_values_once(
+                name,
+                "SELECT MIN(EventDate), MAX(EventDate) FROM small_hits"
+            )
+            .unwrap(),
+            Some(NativeExtremaValues::Integer { low: 15888, high: 15917 })
+        );
+        for table in ["empty_hits", "null_hits"] {
+            let sql = format!("SELECT MIN(EventDate), MAX(EventDate) FROM {table}");
+            assert_eq!(Database::query_native_extrema_values_once(name, &sql).unwrap(), None);
         }
         std::fs::remove_file(path).unwrap();
     }

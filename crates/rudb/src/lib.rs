@@ -121,7 +121,7 @@ mod tests;
 
 pub use config::{Config, parse_size};
 pub use connection::Connection;
-pub use database::Database;
+pub use database::{Database, NativeExtremaValues};
 pub use prepared::Prepared;
 pub use result::QueryResult;
 pub use statements::{Statement, is_complete, statements};
@@ -134,7 +134,8 @@ pub use syntax::{
 // `rudb-compat` and `rudb-bench` driving the library through one crate is the point of #110, and a
 // caller who had to reach for `rudb-common` to name the type of a value would not be doing that.
 pub use rudb_common::{
-    Cancel, Error, ErrorCode, Field, LogicalType, Result, Span, Value, format_double,
+    Cancel, Error, ErrorCode, Field, LogicalType, Result, Span, Value, civil_from_days,
+    format_double,
 };
 pub use rudb_vector::{Chunk, VECTOR_SIZE};
 
