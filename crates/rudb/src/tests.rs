@@ -1592,6 +1592,99 @@ fn a_list_sorts_and_groups_and_maxes_like_any_other_value() {
     assert_eq!(rows(&db, "SELECT [1, 2] IN ([1, 2], [3])"), vec![vec![Value::Boolean(true)]]);
 }
 
+/// Two lists joined end to end, by the operator and by the name. Per #467.
+#[test]
+fn two_lists_concatenate_with_the_operator_and_with_the_name() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT [1, 2] || [3]"), vec![vec![list(&[1, 2, 3])]]);
+    assert_eq!(rows(&db, "SELECT [1] || [2] || [3]"), vec![vec![list(&[1, 2, 3])]]);
+    assert_eq!(rows(&db, "SELECT [] || [1]"), vec![vec![list(&[1])]]);
+    assert_eq!(rows(&db, "SELECT [1] || []"), vec![vec![list(&[1])]]);
+    // The elements promote the way a list literal's do, so the answer is a list of what the two
+    // element types meet at rather than a list of the left one's.
+    assert_eq!(rows(&db, "SELECT typeof([1] || [2.5::DOUBLE])"), vec![vec![text("DOUBLE[]")]]);
+    assert_eq!(rows(&db, "SELECT typeof([1, 2] || [3.5])"), vec![vec![text("DECIMAL(11,1)[]")]]);
+    assert_eq!(rows(&db, "SELECT typeof([] || [])"), vec![vec![text("\"NULL\"[]")]]);
+    assert_eq!(
+        rows(&db, "SELECT [1] || [NULL]"),
+        vec![vec![Value::List {
+            element: LogicalType::Integer,
+            values: vec![integer(1), Value::Null],
+        }]]
+    );
+    // The name, and the three other names the pin answers to for it.
+    assert_eq!(rows(&db, "SELECT list_concat([1], [2], [3])"), vec![vec![list(&[1, 2, 3])]]);
+    assert_eq!(rows(&db, "SELECT list_cat([1], [2])"), vec![vec![list(&[1, 2])]]);
+    assert_eq!(rows(&db, "SELECT array_concat([1], [2])"), vec![vec![list(&[1, 2])]]);
+    assert_eq!(rows(&db, "SELECT array_cat([1], [2])"), vec![vec![list(&[1, 2])]]);
+    // A list column and not only a list literal, which is the row at a time path rather than the
+    // folder.
+    db.execute("CREATE TABLE cs (a INTEGER[], b INTEGER[])").unwrap();
+    db.execute("INSERT INTO cs VALUES ([1], [2]), ([], [3, 4])").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT a || b FROM cs ORDER BY 1"),
+        vec![vec![list(&[1, 2])], vec![list(&[3, 4])]]
+    );
+}
+
+/// A list against something that is not a list is neither reading of `||`. Per #467.
+///
+/// It has to be refused rather than falling back to the string reading, because the string reading
+/// would answer it. `[1, 2] || 3` would be `[1, 2]3`, which is not a wrong list so much as a list
+/// printed by accident.
+#[test]
+fn concatenating_a_list_with_something_that_is_not_one_is_refused() {
+    let db = database();
+    assert_eq!(
+        failure(&db, "SELECT [1, 2] || 3"),
+        "Cannot concatenate types INTEGER[] and INTEGER - an explicit cast is required"
+    );
+    assert_eq!(
+        failure(&db, "SELECT 'a' || ['b']"),
+        "Cannot concatenate types VARCHAR and VARCHAR[] - an explicit cast is required"
+    );
+    // Two lists whose elements will not meet anywhere is a different sentence, because the two
+    // arguments are both the right shape and it is what is inside them that does not agree.
+    assert_eq!(
+        failure(&db, "SELECT [1] || ['a']"),
+        "Cannot concatenate lists of types INTEGER[] and VARCHAR[] - an explicit cast is required"
+    );
+    // The name splits the two the same way. The wrong shape is the candidate block and elements that
+    // will not meet is the sentence above.
+    assert_eq!(
+        failure(&db, "SELECT list_concat([1], ['a'])"),
+        "Cannot concatenate lists of types INTEGER[] and VARCHAR[] - an explicit cast is required"
+    );
+    assert!(
+        failure(&db, "SELECT list_concat([1], 2)").contains("list_concat([ANY[]...]) -> ANY[]")
+    );
+    // The string reading is untouched by any of this and still takes anything.
+    assert_eq!(rows(&db, "SELECT 1 || 'a'"), vec![vec![text("1a")]]);
+}
+
+/// The operator propagates a null and the name skips it. Per #467.
+///
+/// This is the whole of the difference between `||` over two lists and `list_concat` over the same
+/// two, and it is the reason the two are not one function with an alias pointing at it. The name
+/// follows `concat`'s rule over strings and the operator follows every other operator's.
+#[test]
+fn a_null_stops_the_operator_and_is_skipped_by_the_name() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT [1, 2] || NULL::INT[]"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT [1, 2] || NULL"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT list_concat([1], NULL::INT[])"), vec![vec![list(&[1])]]);
+    assert_eq!(rows(&db, "SELECT list_concat([1], NULL)"), vec![vec![list(&[1])]]);
+    assert_eq!(rows(&db, "SELECT typeof(list_concat([1], NULL))"), vec![vec![text("INTEGER[]")]]);
+    assert_eq!(rows(&db, "SELECT list_concat([1], [2], NULL, [3])"), vec![vec![list(&[1, 2, 3])]]);
+    // Every argument was null, which is a null answer and not an empty list. An empty list argument
+    // is a different thing and does give one back.
+    assert_eq!(rows(&db, "SELECT list_concat(NULL, NULL)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        rows(&db, "SELECT list_concat([], [])"),
+        vec![vec![Value::List { element: LogicalType::Null, values: Vec::new() }]]
+    );
+}
+
 /// What the struct vector changes that a query can see today. Per #594.
 ///
 /// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put

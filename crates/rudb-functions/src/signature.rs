@@ -136,6 +136,31 @@ enum Shape {
     /// The first argument is a string or a list, the rest are the bounds, and the result is the first
     /// argument's own type. `array_slice`.
     Sliced,
+    /// Two arguments joined end to end, which means two strings or two lists. `||`.
+    ///
+    /// One operator with two readings and the arguments pick which. Two lists concatenate into a
+    /// list of the type their elements promote to, so `[1, 2] || [3.5]` is a list of decimals, and
+    /// anything else is the string reading that [`Shape::FixedTo`] gave this row before lists could
+    /// be concatenated at all, which is what keeps `1 || 'a'` answering `1a`.
+    ///
+    /// A list on one side and something that is not a list on the other is neither reading and is
+    /// refused. It has to be, because the string reading would answer it: `[1, 2] || 3` would be
+    /// `[1, 2]3`, which is not a wrong list so much as a list printed by accident. Upstream refuses
+    /// it too and this is its sentence.
+    ///
+    /// An untyped null on one side takes the other side's reading, since a null belongs to every
+    /// type and the answer is null whichever way it went.
+    Concatenated,
+    /// Every argument is a list and they are joined end to end. `list_concat`.
+    ///
+    /// The variadic sibling of [`Shape::Concatenated`] with the string reading taken away, so
+    /// `list_concat('a', 'b')` is refused where `'a' || 'b'` is a string. The elements of every
+    /// argument promote to one type the way they do for a list literal.
+    ///
+    /// It differs from the operator on nulls, which is not a detail: `list_concat([1], NULL)` is
+    /// `[1]` upstream and `[1] || NULL` is null. A null argument here is a list with nothing in it
+    /// and is skipped, which is the same rule `concat` follows over strings.
+    ListConcatenated,
     /// The first `n` arguments have to be strings already, the rest are indexes, and the result is
     /// fixed. `substring(s, a, b)` and `overlay(s, r, a, b)`.
     ///
@@ -355,13 +380,14 @@ const TABLE: &[Entry] = &[
     number("//", Arity::exactly(2), Shape::Divided),
     number("abs", Arity::exactly(1), Shape::Promoted),
     // Strings.
-    // `||` is the one that takes anything and turns it into a string, which is why it is a
-    // `FixedTo` and everything under it is a `Text`. `1 || 'a'` is `1a` upstream.
+    // `||` takes anything and turns it into a string, which is why everything under it is a `Text`
+    // and this is not. `1 || 'a'` is `1a` upstream, and two lists are the second reading of the same
+    // operator, which is what [`Shape::Concatenated`] is for.
     Entry {
         name: "||",
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(2),
-        shape: Shape::FixedTo(Fixed::Varchar, Fixed::Varchar),
+        shape: Shape::Concatenated,
         numeric_only: false,
     },
     text("lower", Arity::exactly(1), Fixed::Varchar),
@@ -618,6 +644,21 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::at_least(0),
         shape: Shape::Listed,
+        numeric_only: false,
+    },
+    // Joining lists end to end. The pin prints one overload, `list_concat([ANY[]...]) -> ANY[]`,
+    // and answers to four names for it, three of which are aliases below. It is the named form of
+    // `||` over two lists and is not quite the same function, because a null argument is skipped
+    // here and answers null there.
+    //
+    // It starts at one argument and not at none, which is a divergence and a deliberate one. The pin
+    // answers `list_concat()` with the empty string, of type VARCHAR, from a function that declares
+    // it returns `ANY[]`. That is tamnd/duckdb#11 and this refuses the call rather than copying it.
+    Entry {
+        name: "list_concat",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(1),
+        shape: Shape::ListConcatenated,
         numeric_only: false,
     },
     // The type of an expression, as a string. Nothing is cast and nothing runs: the binder folds
@@ -938,6 +979,62 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let element = list_element(arguments)?;
             (vec![element.clone(); arguments.len()], LogicalType::list(element))
         }
+        Shape::Concatenated => {
+            let left = &arguments[0];
+            let right = &arguments[1];
+            match (left, right) {
+                (LogicalType::List(_), _) | (_, LogicalType::List(_)) => {
+                    // A null on one side is not a list and is not the string reading either, so it
+                    // takes the reading the other side is already in and the answer is a null of
+                    // that side's type.
+                    let wanted = match (left, right) {
+                        (LogicalType::Null, ty) | (ty, LogicalType::Null) => ty.clone(),
+                        (LogicalType::List(_), LogicalType::List(_)) => {
+                            left.promote(right).ok_or_else(|| {
+                                Error::binder(format!(
+                                    "Cannot concatenate lists of types {left} and {right} - an explicit cast is required"
+                                ))
+                            })?
+                        }
+                        _ => {
+                            return Err(Error::binder(format!(
+                                "Cannot concatenate types {left} and {right} - an explicit cast is required"
+                            )));
+                        }
+                    };
+                    (vec![wanted.clone(), wanted.clone()], wanted)
+                }
+                _ => (vec![LogicalType::Varchar; 2], LogicalType::Varchar),
+            }
+        }
+        Shape::ListConcatenated => {
+            let mut wanted = LogicalType::Null;
+            for ty in arguments {
+                // A null is every type's, so it is left out of the meeting rather than dragging the
+                // answer down to the untyped null, and the cast below turns it into a null list of
+                // whatever the rest of them settled on.
+                if *ty == LogicalType::Null {
+                    continue;
+                }
+                if !matches!(ty, LogicalType::List(_)) {
+                    return Err(no_match(entry.name, arguments));
+                }
+                // An argument of the wrong shape is the candidate block above and an argument whose
+                // elements will not meet the rest is the operator's sentence, which is the pin's
+                // split too: `list_concat([1], 2)` is a candidate block and
+                // `list_concat([1], ['a'])` is the sentence.
+                let met = wanted.promote(ty).ok_or_else(|| {
+                    Error::binder(format!(
+                        "Cannot concatenate lists of types {wanted} and {ty} - an explicit cast is required"
+                    ))
+                })?;
+                wanted = met;
+            }
+            if wanted == LogicalType::Null {
+                wanted = LogicalType::list(LogicalType::Null);
+            }
+            (vec![wanted.clone(); arguments.len()], wanted)
+        }
         Shape::Extracted => {
             let target = &arguments[0];
             let index = &arguments[1];
@@ -1177,6 +1274,9 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     // variadic. Reachable with no arguments at all, since the grammar has nothing to say about the
     // count of an ordinary call.
     ("concat", &["concat(col0 ANY, [ANY...]) -> ANY"]),
+    // The other variadic, and the one the pin prints with no leading parameter at all, which is why
+    // the zero argument call binds there. See the entry in [`TABLE`].
+    ("list_concat", &["list_concat([ANY[]...]) -> ANY[]"]),
     (
         "substring",
         &[
@@ -1579,6 +1679,9 @@ const SAME_LIST: &str = "T[]";
 /// A list of the untyped null, which is what a list constructor with nothing in it gives back.
 const NULL_LIST: &str = "\"NULL\"[]";
 
+/// A list whose element type the call decides and that is not tied to the other arguments.
+const ANY_LIST: &str = "ANY[]";
+
 impl Shape {
     /// What the arguments and the result are declared to be, at this argument count.
     ///
@@ -1644,6 +1747,13 @@ impl Shape {
             // arguments to meet. Both rows are the pin's, which carries the two of them for this
             // name and nothing in between.
             Self::Listed => (all(SAME), if count == 0 { NULL_LIST } else { SAME_LIST }),
+            // The string reading's row, which is the one the pin lists first for this name. The list
+            // reading gets no row of its own because an entry here is a name and an argument count,
+            // and this name at two arguments is already spoken for.
+            Self::Concatenated => (all(Fixed::Varchar.name()), Fixed::Varchar.name()),
+            // The pin's row, which is one variadic overload over lists of anything. The element type
+            // is not `T` because the arguments do not have to agree on it, they promote to it.
+            Self::ListConcatenated => (all(ANY_LIST), ANY_LIST),
             // No arguments, so `all` is empty whatever it is handed and only the result is named.
             Self::Constant(fixed) => (Vec::new(), fixed.name()),
         }
@@ -1693,6 +1803,9 @@ const ALIASES: &[(&str, &str)] = &[
     ("list_element", "array_extract"),
     ("list_slice", "array_slice"),
     ("list_pack", "list_value"),
+    ("list_cat", "list_concat"),
+    ("array_concat", "list_concat"),
+    ("array_cat", "list_concat"),
     ("rank_dense", "dense_rank"),
 ];
 
@@ -2114,6 +2227,8 @@ mod tests {
                         | Shape::Widened(argument, _)
                         | Shape::WidenedTogether(argument, _),
                     ) => argument.ty(),
+                    // Only lists go in, so it is asked with a list of the same string the rest are.
+                    (_, Shape::ListConcatenated) => LogicalType::list(LogicalType::Varchar),
                     (true, _) => LogicalType::Integer,
                     (false, _) => LogicalType::Varchar,
                 };
