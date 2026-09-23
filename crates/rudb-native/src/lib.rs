@@ -9196,8 +9196,25 @@ fn quick_integer_fold(
                     return Err(invalid("encoded integer part holds the wrong number of rows"));
                 }
             } else {
-                let column =
-                    decode(&fields[wanted].ty, expected_rows, &bytes, None)?.into_flat()?;
+                let column = decode(&fields[wanted].ty, expected_rows, &bytes, None)?;
+                if let Some(packed) = column.packed_parts() {
+                    let validity = column.validity();
+                    let all_valid = column.none_null();
+                    let base = packed.base();
+                    let mut codes = [0_u64; 64];
+                    for from in (0..expected_rows).step_by(codes.len()) {
+                        let count = (expected_rows - from).min(codes.len());
+                        packed.unpack(from, &mut codes[..count]);
+                        for (offset, &code) in codes[..count].iter().enumerate() {
+                            if all_valid || validity.is_valid(from + offset) {
+                                // Vector::packed checked that this entire range fits the type.
+                                emit((base + i128::from(code)) as i64, 1)?;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let column = column.into_flat()?;
                 let validity = column.validity();
                 macro_rules! count_decoded {
                     ($values:expr) => {
