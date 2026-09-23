@@ -49,7 +49,7 @@ use crate::pairs::in_parallel;
 use crate::table::{BATCH, Probe, Table, Walk};
 
 /// The end of a chain, and the row a slot with nothing in it points at.
-const NONE: u32 = u32::MAX;
+pub(crate) const NONE: u32 = u32::MAX;
 
 /// Below this many rows a side is built on one thread.
 ///
@@ -272,6 +272,39 @@ impl Lookup {
                 }
                 from = upto;
             }
+        }
+    }
+
+    /// Whether every key in the table holds exactly one gathered row.
+    ///
+    /// True of a join against a primary key, which is most of the large joins in TPC-H. Every chain
+    /// is then its head and nothing after it, so a probe can answer with the head alone and never
+    /// read [`Lookup::next`]. That read is a miss into an array as long as the gathered side, taken
+    /// once per driving row only to find the end of a chain that has already ended.
+    pub(crate) fn single(&self) -> bool {
+        self.head.len() == self.kept
+    }
+
+    /// The first gathered row of each slot in `slots`, [`NONE`] for a [`MISS`].
+    ///
+    /// A pass over a whole driving chunk before any row is answered, rather than a load per row in
+    /// the loop that answers them. Each load is a miss into an array as long as the gathered side
+    /// and none of them depends on another, so taken together the processor has many of them in
+    /// flight at once, where the row loop had one and waited it out before the next.
+    pub(crate) fn firsts(&self, slots: &[usize], into: &mut Vec<u32>) {
+        into.clear();
+        into.extend(slots.iter().map(|&slot| self.head.get(slot).copied().unwrap_or(NONE)));
+    }
+
+    /// The gathered rows of the chain that starts at `first`, which [`Lookup::firsts`] handed out.
+    ///
+    /// The same as [`Lookup::matches`] from its second step on. `into` is cleared here.
+    pub(crate) fn chain_from(&self, first: u32, into: &mut Vec<u32>) {
+        into.clear();
+        let mut at = first;
+        while at != NONE {
+            into.push(at);
+            at = self.next[at as usize].load(Ordering::Relaxed);
         }
     }
 
