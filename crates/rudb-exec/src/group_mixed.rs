@@ -37,7 +37,7 @@ use rudb_pipeline::Lease;
 use rudb_vector::{Chunk, Vector};
 
 use crate::pairs::{
-    self, Counted, Held, PARTITIONS, Run, distinct_pairs, in_parallel, scatter_seeded,
+    self, Counted, Held, PARTITIONS, Repeat, Run, distinct_pairs, in_parallel, scatter_seeded,
 };
 use crate::rows;
 use crate::signed::SignedBlock;
@@ -241,6 +241,7 @@ impl Exchange {
             held_mean.cut(rows)?,
             held_user.cut(rows)?,
         );
+        let mut repeat = Repeat::default();
         if !(null_group || null_sum || null_mean || null_user) {
             for row in 0..rows {
                 let key = held_group[row] as i32;
@@ -255,7 +256,9 @@ impl Exchange {
                     },
                     shift,
                 )?;
-                scatter_seeded(&mut local.pairs, shift, seed, key, true, held_user[row]);
+                if repeat.fresh(key, true, held_user[row]) {
+                    scatter_seeded(&mut local.pairs, shift, seed, key, true, held_user[row]);
+                }
             }
             return Ok(());
         }
@@ -291,7 +294,7 @@ impl Exchange {
             // A null value counts towards nothing, so it never becomes a pair. The row still counts
             // towards the numeric aggregates above, which is why this is the only part of it that is
             // skipped.
-            if !(null_user && user.is_null_at(row)) {
+            if !(null_user && user.is_null_at(row)) && repeat.fresh(key, held, held_user[row]) {
                 scatter_seeded(&mut local.pairs, shift, seed, key, held, held_user[row]);
             }
         }
