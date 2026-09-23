@@ -43,9 +43,13 @@
 //! result, and the only honest way to know the noise is to measure something that cannot have moved.
 //!
 //! A floor query also checks this harness rather than the engine. Its two sides run the same plan, so
-//! its interval should contain zero, and one that does not means the pairing is favouring whichever
-//! side runs first or second and every other row of the table is suspect. That is printed where it
-//! happens.
+//! nothing it measures could have moved, and an interval of its that misses zero is a row this run
+//! got wrong. How many of them do that is the rate at which any row gets called wrong, and with
+//! eighteen floor queries at ninety five percent about one should, so a single link join query
+//! clearing zero means much less than it looks like. That count is printed, with the directions,
+//! because floor queries missing zero both ways is an interval behaving normally while all of them
+//! missing the same way is the pairing favouring whichever side runs first and would put the same
+//! lean under every other row of the table.
 //!
 //! # The pair is the unit
 //!
@@ -115,33 +119,46 @@ impl Verdict {
 }
 
 impl Outcome {
-    /// The share of the forced hash join run that the link join took off, one per pair.
+    /// How many milliseconds the link join took off the forced hash join, one per pair.
     ///
-    /// Per pair and dimensionless, so a repeat that ran while the machine was busy and a repeat that
-    /// ran while it was not contribute the same kind of number and can be averaged together.
+    /// Milliseconds and not a share. A share per pair looks like the tidier thing to average and is
+    /// the wrong estimator: its denominator is one timing, so a pair where the control happened to
+    /// run fast divides a small difference by a small number and produces a large share, and because
+    /// the denominator cannot go below zero while the numerator can go either way the large ones all
+    /// land on the same side. Averaging those is biased, not merely noisy. The first run of this
+    /// harness averaged shares and its floor queries, which run the same plan on both sides and must
+    /// therefore centre on zero, came out between -51.7% and +3.0% with one of them clearing zero
+    /// altogether. The differences are what the pairing makes comparable, so the differences are what
+    /// gets averaged, and the division happens once at the end.
     fn deltas(&self) -> Vec<f64> {
-        self.pairs
-            .iter()
-            .filter(|(_, without)| *without > 0.0)
-            .map(|(with, without)| (without - with) / without)
-            .collect()
+        self.pairs.iter().map(|(with, without)| without - with).collect()
     }
 
-    /// The mean of those, so positive means the link join won.
+    /// What the control cost on average, which is what the mean difference is divided by.
+    fn scale(&self) -> Option<f64> {
+        let count = self.pairs.len();
+        let total = self.pairs.iter().map(|(_, without)| without).sum::<f64>();
+        (count > 0 && total > 0.0).then(|| total / count as f64)
+    }
+
+    /// The share of the forced hash join run that the link join takes off, so positive is a win.
     fn delta(&self) -> Option<f64> {
         let deltas = self.deltas();
+        let scale = self.scale()?;
         let count = deltas.len();
-        (count > 0).then(|| deltas.iter().sum::<f64>() / count as f64)
+        (count > 0).then(|| deltas.iter().sum::<f64>() / count as f64 / scale)
     }
 
-    /// The ninety five percent interval around that mean, or nothing from a single pair.
+    /// The ninety five percent interval around that share, or nothing from a single pair.
     ///
-    /// One pair has no spread to estimate a width from. Two or three have one and it comes out very
-    /// wide, which is the honest answer rather than a shortcoming: a run of three repeats on a loaded
-    /// machine does not know what happened, and an interval that says so is better than a delta that
-    /// does not.
+    /// Taken over the differences in milliseconds and scaled at the end, for the reason
+    /// [`Outcome::deltas`] gives. One pair has no spread to estimate a width from. Two or three have
+    /// one and it comes out very wide, which is the honest answer rather than a shortcoming: a run of
+    /// three repeats on a loaded machine does not know what happened, and an interval that says so is
+    /// better than a delta that does not.
     fn interval(&self) -> Option<(f64, f64)> {
         let deltas = self.deltas();
+        let scale = self.scale()?;
         if deltas.len() < 2 {
             return None;
         }
@@ -150,7 +167,7 @@ impl Outcome {
         let variance =
             deltas.iter().map(|delta| (delta - mean).powi(2)).sum::<f64>() / (count - 1.0);
         let error = (variance / count).sqrt() * critical(deltas.len() - 1);
-        Some((mean - error, mean + error))
+        Some(((mean - error) / scale, (mean + error) / scale))
     }
 
     /// Which of the four things this query is, once the interval has been consulted.
@@ -220,7 +237,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let mut lost = Vec::new();
     let mut unresolved = Vec::new();
     let mut floor = Vec::new();
-    let mut biased = Vec::new();
+    let mut cleared = Vec::new();
     let mut wrong = Vec::new();
     let mut refused = Vec::new();
     for (name, sql) in &queries {
@@ -252,11 +269,13 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             Verdict::Unresolved => unresolved.push(name.clone()),
             Verdict::Floor => {
                 floor.push(delta);
-                // The two sides of a floor query ran the same plan, so an interval that misses zero
-                // is this harness leaning rather than the engine moving.
+                // The two sides of a floor query ran the same plan, so nothing here could have
+                // moved and an interval that misses zero is a row this run called wrong. How often
+                // that happens is how often any row of the table is called wrong, which is the only
+                // honest thing to read a single link join row against.
                 if let Some((low, high)) = outcome.interval() {
                     if low > 0.0 || high < 0.0 {
-                        biased.push((name.clone(), delta));
+                        cleared.push((name.clone(), delta));
                     }
                 }
             }
@@ -300,15 +319,38 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             unresolved.join(" ")
         );
     }
-    if !biased.is_empty() {
+    if !cleared.is_empty() {
+        let up = cleared.iter().filter(|(_, delta)| *delta > 0.0).count();
+        let down = cleared.len() - up;
         println!(
-            "\nthese queries planned no link join, so both their sides ran the same plan, and their \
-             intervals still missed zero. that is this harness favouring one side of the pair and \
-             not the engine, and it makes every other row above doubtful"
+            "\n{} of the {} queries that planned no link join had an interval that missed zero \
+             anyway, {} of them upward and {} downward:",
+            cleared.len(),
+            floor.len(),
+            up,
+            down
         );
-        for (name, delta) in &biased {
+        for (name, delta) in &cleared {
             println!("  {name:<5} {}", percent(Some(*delta)));
         }
+        // Both directions is what a ninety five percent interval does one row in twenty and says
+        // nothing about the harness. One direction is the harness favouring whichever side of the
+        // pair runs first or second, which would put the same lean under every other row too.
+        if up == 0 || down == 0 {
+            println!(
+                "they all lean the same way, which is this harness favouring one side of the pair \
+                 rather than the engine moving, and it puts that lean under every row above"
+            );
+        } else {
+            println!(
+                "they lean both ways, so this is an interval being wrong at the rate a ninety five \
+                 percent interval is wrong and not a lean in the harness"
+            );
+        }
+        println!(
+            "either way it is the rate at which a row of this table clears zero without anything \
+             having moved, so read a single link join row that cleared against it"
+        );
     }
     if !wrong.is_empty() {
         println!("\nanswered differently with the rule and without it: {}", wrong.join(" "));
@@ -522,6 +564,18 @@ mod tests {
         // took the fastest of each side separately would compare 40 against 200 and say eighty.
         let delta = timed(&[(200.0, 250.0), (40.0, 50.0)]).delta().expect("two pairs were timed");
         assert!((delta - 0.2).abs() < 1e-9, "{delta}");
+    }
+
+    #[test]
+    fn a_pair_where_the_control_ran_fast_does_not_get_a_vote_the_size_of_the_query() {
+        // Three repeats where the two sides tied at ten milliseconds and one where the machine was
+        // briefly free and both sides came in around one, the control at half the subject. Averaging
+        // a share per pair reads that last pair as minus one hundred percent, weighs it the same as
+        // the three that said nothing, and reports the query twenty five percent slower. Almost all
+        // of the time this query spends is in pairs that tied, so the answer is close to zero.
+        let outcome = timed(&[(10.0, 10.0), (10.0, 10.0), (10.0, 10.0), (1.0, 0.5)]);
+        let delta = outcome.delta().expect("four pairs were timed");
+        assert!((delta + 0.0164).abs() < 1e-3, "{delta}");
     }
 
     #[test]

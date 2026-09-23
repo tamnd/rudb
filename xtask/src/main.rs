@@ -216,7 +216,9 @@ fn usage() {
     println!("           not are timed too because between them they say what the machine was");
     println!("           doing meanwhile. the cache bytes is the same knob sections takes, and at");
     println!("           scale factor one it is the difference between evidence and no evidence,");
-    println!("           because every parent side of TPC-H fits in the default cache. every repeat");
+    println!(
+        "           because every parent side of TPC-H fits in the default cache. every repeat"
+    );
     println!("           keeps both of its timings and the verdict is read off the interval over");
     println!("           their differences, so ask for twenty repeats or more: a query whose");
     println!("           interval spans zero is reported unresolved however large its delta looks");
