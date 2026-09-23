@@ -341,7 +341,7 @@ pub fn interleave_placed(
             order.iter().map(|&index| laid.get(index).cloned().unwrap_or(Value::Null)).collect();
         return Vector::from_values(ty.clone(), &values);
     }
-    if let Some(merged) = merged_dictionary(ty, pieces, order)? {
+    if let Some(merged) = merged_dictionary(ty, pieces, order, inverse)? {
         return Ok(merged);
     }
     let mut data = data_for(ty, rows)?;
@@ -449,6 +449,7 @@ fn merged_dictionary(
     ty: &LogicalType,
     pieces: &[Vector],
     order: &[usize],
+    inverse: Option<&[u32]>,
 ) -> Result<Option<Vector>> {
     if !matches!(ty, LogicalType::Varchar | LogicalType::Blob) || pieces.is_empty() {
         return Ok(None);
@@ -504,7 +505,20 @@ fn merged_dictionary(
         let remap = &remaps[at];
         laid.extend(codes.iter().map(|&code| remap[code as usize]));
     }
-    let codes = order.iter().map(|&index| laid[index]).collect();
+    // Written through the inverse when there is one, for the reason `interleave_placed` gives: a
+    // few long runs read through `order` spend a cache line on every four byte code.
+    let codes = match inverse {
+        Some(inverse) => {
+            let mut codes = vec![0u32; order.len()];
+            for (&code, &to) in laid.iter().zip(inverse) {
+                if let Some(slot) = codes.get_mut(to as usize) {
+                    *slot = code;
+                }
+            }
+            codes
+        }
+        None => order.iter().map(|&index| laid[index]).collect(),
+    };
     let values = Vector::from_values(ty.clone(), &values)?;
     Ok(Some(Vector::stable_dictionary(codes, Arc::new(values))?))
 }
@@ -1027,6 +1041,14 @@ mod tests {
         assert_eq!(values(&got), expected);
         let (_, merged) = got.stable_dictionary_parts().expect("one stable dictionary");
         assert_eq!(merged.len(), 4, "MAIL once, the long word, the null and SHIP");
+        let mut inverse = vec![0u32; order.len()];
+        for (to, &from) in order.iter().enumerate() {
+            inverse[from] = u32::try_from(to).expect("a small row");
+        }
+        let placed = interleave_placed(&LogicalType::Varchar, &pieces, &order, Some(&inverse))
+            .expect("a placed interleave");
+        assert_eq!(values(&placed), expected, "placed codes land where pulled ones do");
+        assert!(placed.stable_dictionary_parts().is_some(), "and stay one dictionary");
 
         let mixed = [pieces[0].clone(), pieces[1].flatten().expect("flat")];
         let got = interleave(&LogicalType::Varchar, &mixed, &order[8..]).expect("an interleave");
