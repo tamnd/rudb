@@ -3358,7 +3358,8 @@ mod tests {
         for width in [4u8, 9, 18, 30] {
             let ty = LogicalType::Decimal { width, scale: 2 };
             let of = |unscaled: i128| Value::Decimal { unscaled, width, scale: 2 };
-            let values: Vec<Value> = (0..600).map(of).collect();
+            // A hundred distinct values, so a two byte `DECIMAL(4)` still halves when it packs.
+            let values: Vec<Value> = (0..600).map(|row| of(row % 100)).collect();
             let plain = flat(ty.clone(), &values);
             let packed = plain.bit_packed().expect("a packed run of those values");
             assert_eq!(packed.form(), rudb_vector::Form::BitPacked, "DECIMAL({width}) has to pack");
@@ -3438,7 +3439,7 @@ mod tests {
     fn a_key_that_is_one_integer_without_being_an_integer_groups_the_same_in_every_form() {
         a_key_of_every_form(&LogicalType::Date, |code| Value::Date(code as i32));
         a_key_of_every_form(&LogicalType::Time, |code| Value::Time(code * 1_000));
-        a_key_of_every_form(&LogicalType::Timestamp, |code| Value::Timestamp(code * 1_000_000));
+        a_key_of_every_form(&LogicalType::Timestamp, |code| Value::Timestamp(code * 1_000));
         a_key_of_every_form(&LogicalType::HugeInt, |code| Value::HugeInt(i128::from(code)));
         a_key_of_every_form(&LogicalType::Decimal { width: 9, scale: 2 }, |code| Value::Decimal {
             unscaled: i128::from(code),

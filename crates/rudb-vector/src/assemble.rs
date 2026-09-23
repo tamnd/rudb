@@ -229,11 +229,21 @@ impl Assembly {
 /// # Errors
 ///
 /// If the type has no flat layout, or if a piece holds fewer values than it says it has rows.
-pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
+pub fn concat<V: AsRef<Vector>>(ty: &LogicalType, pieces: &[V]) -> Result<Option<Vector>> {
+    let pieces: Vec<&Vector> = pieces.iter().map(AsRef::as_ref).collect();
+    laid(ty, &pieces)
+}
+
+/// The body of [`concat()`], over borrowed pieces.
+///
+/// A caller holding its pieces inside chunks would otherwise clone each one into a list, and a
+/// clone of a flat vector that owns its values copies every one of them, which is the copy this
+/// function exists to make once.
+fn laid(ty: &LogicalType, pieces: &[&Vector]) -> Result<Option<Vector>> {
     if pieces.is_empty() {
         return Ok(None);
     }
-    let rows = pieces.iter().map(Vector::len).sum();
+    let rows = pieces.iter().map(|piece| piece.len()).sum();
     let shared = pieces[0].stable_dictionary_parts().map(|(_, values)| values).filter(|values| {
         pieces.iter().all(|piece| {
             piece.logical_type() == ty
@@ -253,6 +263,26 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
         let validity = run_of(pieces, rows);
         return Ok(Some(
             Vector::stable_dictionary(codes, Arc::clone(values))?.with_validity(validity),
+        ));
+    }
+    // String views that all point into one arena, which is what a string column gathered out of a
+    // join's build side is, chunk after chunk. Laid end to end they are the same views over the same
+    // arena, so sixteen bytes a row move and no string is copied.
+    if let Some(arena) = pieces[0].shared_views().map(|(_, arena)| arena).filter(|arena| {
+        pieces.iter().all(|piece| {
+            piece.logical_type() == ty
+                && piece.shared_views().is_some_and(|(_, held)| Arc::ptr_eq(held, arena))
+        })
+    }) {
+        let mut views = Vec::with_capacity(rows);
+        for piece in pieces {
+            if let Some((held, _)) = piece.shared_views() {
+                views.extend_from_slice(held);
+            }
+        }
+        let validity = run_of(pieces, rows);
+        return Ok(Some(
+            Vector::string_views(ty.clone(), views, Arc::clone(arena))?.with_validity(validity),
         ));
     }
     // Checked before anything is copied, because the fallback is for the caller to keep the pieces
@@ -787,7 +817,7 @@ fn merged_dictionary(
 /// The two cheap answers are checked for first because they are the answers real data gives. A
 /// column that was never null anywhere is a page with no mask on it at all, and a bit per row read
 /// out of every piece to build a mask that is all ones would be throwing that away.
-fn run_of(pieces: &[Vector], rows: usize) -> Validity {
+fn run_of(pieces: &[&Vector], rows: usize) -> Validity {
     if pieces.iter().all(|piece| matches!(piece.validity(), Validity::AllValid)) {
         return Validity::AllValid;
     }
@@ -811,10 +841,10 @@ fn straight(at: &[usize]) -> bool {
 }
 
 /// The arenas the flat string pieces among `pieces` share, counted before any of them is laid.
-fn arenas_of(pieces: &[Vector]) -> Arenas {
+fn arenas_of<V: AsRef<Vector>>(pieces: &[V]) -> Arenas {
     let mut arenas = Arenas::default();
     for piece in pieces {
-        if let Some(Data::Varlen(column)) = piece.data() {
+        if let Some(Data::Varlen(column)) = piece.as_ref().data() {
             arenas.count(column);
         }
     }
@@ -827,7 +857,7 @@ fn arenas_of(pieces: &[Vector]) -> Arenas {
 /// out of that page, and a table then lays those chunks end to end into row groups, which without
 /// this copies every value back into a run the page already holds. A string column joins when its
 /// views are a page and every piece shares one arena, which is what a sorted string column is.
-fn adjoined(pieces: &[Vector]) -> Option<Data> {
+fn adjoined(pieces: &[&Vector]) -> Option<Data> {
     macro_rules! joined {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match pieces.first()?.data()? {
@@ -1285,7 +1315,10 @@ mod tests {
             concat(&ty, &[flat.clone(), coded]).expect("no error").is_none(),
             "a mixed run laid"
         );
-        assert!(concat(&ty, &[]).expect("no error").is_none(), "nothing laid into something");
+        assert!(
+            concat::<Vector>(&ty, &[]).expect("no error").is_none(),
+            "nothing laid into something"
+        );
         // A piece of another type is the caller's mistake and is still answered as a layout it will
         // not build, because the fallback keeps the pieces and keeping them is always correct.
         let other =
