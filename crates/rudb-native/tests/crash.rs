@@ -90,8 +90,10 @@ fn found(after: &SimFilesystem, scratch: &Path) -> Found {
     let rows = PARTS * PART_ROWS;
     assert_eq!(reader.table().rows(), rows, "a table that opens has every row");
     let mut at = 0;
+    // row at a time: the test compares every cell of a small table against what it wrote.
     for index in 0..reader.parts() {
         let chunk = reader.read(index, &[0, 1, 2]).expect("a committed part reads");
+        // row at a time: each cell is checked against the row the test wrote.
         for one in 0..chunk.len() {
             let want = row(at);
             for (column, value) in want.iter().enumerate() {

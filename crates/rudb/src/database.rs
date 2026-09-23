@@ -2403,14 +2403,16 @@ impl Shared {
         let result = run();
         // A statement rudb does not run yet leaves the transaction open. The pin would have run it,
         // so aborting here would turn one gap into a refusal of everything after it.
-        if let Err(error) = &result
-            && !matches!(
+        let aborts = result.as_ref().err().is_some_and(|error| {
+            !matches!(
                 error.code(),
                 rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented
             )
-            && let Some(open) = self.open().as_mut()
-        {
-            open.aborted = true;
+        });
+        if aborts {
+            if let Some(open) = self.open().as_mut() {
+                open.aborted = true;
+            }
         }
         result
     }

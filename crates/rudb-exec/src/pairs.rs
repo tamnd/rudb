@@ -591,6 +591,7 @@ pub(crate) fn distinct_pairs(
     let timing = stage::Timing::start(Stage::Fold);
     let mut start = 0_usize;
     for run in &partition.runs {
+        // flatten: this is the iterator over a run's chunks of pairs, and no column is copied out.
         for (source, &row) in run.chunks().flatten().enumerate() {
             let valid = all_valid || run.valid_at(source);
             let tag = row.pair_hash & tag_mask;
