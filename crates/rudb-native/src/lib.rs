@@ -35,8 +35,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::File;
 use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::slice;
@@ -46,6 +45,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
 use rudb_encoding::{bitpack, chooser, integer, string};
+use rudb_io::{Filesystem, OpenMode, RealFilesystem};
 use rudb_metrics::{LoadProfile, Stage};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
@@ -1636,7 +1636,7 @@ impl GlobalDictionary {
     /// The blocks already written are read back out of `file`, so what a thread holds beyond the
     /// answer is one encoded block. They were written moments or minutes ago and are almost always
     /// still in the page cache, so this is a copy rather than a read of the disk.
-    fn decoded(&self, file: Option<&File>) -> Result<(Vec<u8>, Vec<u64>)> {
+    fn decoded(&self, file: Option<&dyn rudb_io::File>) -> Result<(Vec<u8>, Vec<u64>)> {
         let count = self.placed.len() + self.blocks.len();
         if count != self.values().div_ceil(TEXT_PAYLOAD_VALUES) {
             return Err(invalid("global dictionary blocks do not cover its values"));
@@ -1745,7 +1745,7 @@ impl GlobalDictionary {
     /// The heads are kept because a reader searching this order wants a comparison it can make out
     /// of the index alone. What they buy there depends entirely on the column and is much less than
     /// it looks on the columns that cost the most, which [`sort_by_value`] measures.
-    fn ranked_with_values(&self, file: Option<&File>) -> Result<RankedDictionary> {
+    fn ranked_with_values(&self, file: Option<&dyn rudb_io::File>) -> Result<RankedDictionary> {
         let (flat, bases) = self.decoded(file)?;
         let value = |code: u32| {
             let (from, to) = Self::value_span(&self.ends, &bases, code as usize);
@@ -1758,7 +1758,7 @@ impl GlobalDictionary {
     }
 
     #[cfg(test)]
-    fn ranked(&self, file: Option<&File>) -> Result<Vec<(u64, u32)>> {
+    fn ranked(&self, file: Option<&dyn rudb_io::File>) -> Result<Vec<(u64, u32)>> {
         self.ranked_with_values(file).map(|(order, _, _)| order)
     }
 }
@@ -1772,7 +1772,9 @@ impl GlobalDictionary {
 /// generation after it.
 #[derive(Debug)]
 pub struct Writer {
-    file: File,
+    /// The file, through `rudb-io` rather than `std::fs`, so that a test can hand the writer a
+    /// simulated filesystem and crash a load at every call it makes.
+    file: Box<dyn rudb_io::File>,
     /// Where the next write goes, counted here rather than asked of the file.
     ///
     /// The file's own cursor is not ours. Building the numeric frequencies reads pages back through
@@ -1966,12 +1968,28 @@ impl Writer {
         name: impl Into<String>,
         fields: Vec<Field>,
     ) -> Result<Self> {
+        Self::open_in(&RealFilesystem::new(), path, name, fields)
+    }
+
+    /// [`Writer::open`] on a file in `fs`, which is how a crash test runs an append against the
+    /// simulated filesystem.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::open`].
+    pub fn open_in(
+        fs: &dyn Filesystem,
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        fields: Vec<Field>,
+    ) -> Result<Self> {
         for field in &fields {
             type_tag(&field.ty)?;
         }
         let name = name.into();
-        let path = path.as_ref();
-        let (_, size, slot, bytes, _) = slot_bytes(path)?;
+        let file = fs.open(path.as_ref(), OpenMode::ReadWrite)?;
+        let size = file.len()?;
+        let (slot, bytes, _) = committed_slot(&*file, size)?;
         let (mut closed, views) = decode_catalog(&bytes, size)?;
         // A table already in the file under this name is only in the way if it holds rows. One that
         // holds none has no pages for this generation to carry and no reader that could lose
@@ -1997,7 +2015,6 @@ impl Writer {
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("native file generation overflow"))?;
-        let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
         Ok(Self {
             file,
             // The end of the file, so that the committed generation's catalog stays where its slot
@@ -2050,15 +2067,32 @@ impl Writer {
         name: impl Into<String>,
         fields: Vec<Field>,
     ) -> Result<Self> {
+        Self::create_in(&RealFilesystem::new(), path, name, fields)
+    }
+
+    /// [`Writer::create`] with the file made in `fs` rather than on the real filesystem.
+    ///
+    /// Every call the writer makes on the file from here to [`Writer::finish`] goes to that
+    /// filesystem, which is what lets a test built on `rudb_io::SimFilesystem` stop a load at any
+    /// one of them and look at what a crash there would leave on the disk.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::create`].
+    pub fn create_in(
+        fs: &dyn Filesystem,
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        fields: Vec<Field>,
+    ) -> Result<Self> {
         for field in &fields {
             type_tag(&field.ty)?;
         }
-        let file =
-            OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
+        let file = fs.open(path.as_ref(), OpenMode::CreateNew)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
-        write_at(&file, 0, &header)?;
+        file.write_at(0, &header)?;
         Ok(Self {
             file,
             at: HEADER,
@@ -2121,26 +2155,25 @@ impl Writer {
     ///
     /// If the file exists or the path cannot be written.
     pub fn empty(path: impl AsRef<Path>, views: &[ViewEntry]) -> Result<()> {
-        let file =
-            OpenOptions::new().write(true).read(true).create_new(true).open(path).map_err(io)?;
+        let file = RealFilesystem::new().open(path.as_ref(), OpenMode::CreateNew)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
-        write_at(&file, 0, &header)?;
+        file.write_at(0, &header)?;
         let catalog = encode_catalog(&[], views)?;
-        write_at(&file, HEADER, &catalog)?;
+        file.write_at(HEADER, &catalog)?;
         // The same two syncs in the same order as [`Writer::finish`], and for the same reason. The
         // catalog is on the disk before the slot names it, so a file this is interrupted in the
         // middle of is a header with no valid slot rather than a slot pointing at nothing.
-        file.sync_all().map_err(io)?;
+        file.sync()?;
         let slot = Slot {
             offset: HEADER,
             length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
             generation: 1,
             hash: checksum(&catalog),
         };
-        write_at(&file, slot_offset(1), &slot.bytes())?;
-        file.sync_all().map_err(io)?;
+        file.write_at(slot_offset(1), &slot.bytes())?;
+        file.sync()?;
         Ok(())
     }
 
@@ -2261,13 +2294,13 @@ impl Writer {
     /// Every write in here goes through this, so that [`Writer::at`] is the only answer to where
     /// anything is and the file's cursor is never consulted for it.
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
-        write_at(&self.file, self.at, bytes)?;
+        self.file.write_at(self.at, bytes)?;
         self.at = self
             .at
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| invalid("native file length overflow"))?;
         if self.at - self.written_back >= WRITEBACK_STRETCH {
-            rudb_io::start_writeback(&self.file, self.written_back, self.at - self.written_back);
+            self.file.start_writeback(self.written_back, self.at - self.written_back);
             self.written_back = self.at;
         }
         Ok(())
@@ -2508,7 +2541,7 @@ impl Writer {
             let section = index.len();
             let mut length = 0_usize;
             for bytes in &stripe.pages {
-                write_at(&self.file, self.at + length as u64, bytes)?;
+                self.file.write_at(self.at + length as u64, bytes)?;
                 put_u32(
                     &mut index,
                     u32::try_from(bytes.len()).map_err(|_| invalid("part length overflow"))?,
@@ -3275,7 +3308,7 @@ impl Writer {
         _index: usize,
         dictionary: &GlobalDictionary,
     ) -> Result<ClosedDictionary> {
-        let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
+        let (order, flat, bases) = dictionary.ranked_with_values(Some(&*self.file))?;
         // A code nothing counted is a code no non-null row of this column holds, which is the
         // empty string a null was written as and nothing else, because a code is only ever made by
         // a row asking for one.
@@ -3348,7 +3381,7 @@ impl Writer {
                 (*section::SKETCHES, sketches, rudb_stats::sketches::HEADER_BYTES),
             ] {
                 let written = write_section(
-                    &self.file,
+                    &*self.file,
                     &mut self.at,
                     &section::Attachment { kind, id, flags: 0, header_bytes, bytes },
                     self.generation,
@@ -3389,7 +3422,7 @@ impl Writer {
         // Every page and every table directory is on the disk before anything points at them. The
         // slot write below is what makes this generation the one a reader picks, so the order of
         // these two syncs is the whole of the commit.
-        synced(&self.file, profile.as_deref())?;
+        synced(&*self.file, profile.as_deref())?;
         let slot = Slot {
             offset,
             length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
@@ -3400,8 +3433,8 @@ impl Writer {
         // header, so it names its offset rather than going through `put`, and `at` does not move.
         // Which of the two slots it is alternates with the generation, so the one naming the
         // generation before this is still intact and still valid until this write lands.
-        write_at(&self.file, slot_offset(self.generation), &slot.bytes())?;
-        synced(&self.file, profile.as_deref())?;
+        self.file.write_at(slot_offset(self.generation), &slot.bytes())?;
+        synced(&*self.file, profile.as_deref())?;
         Ok(self.table)
     }
 
@@ -3422,8 +3455,9 @@ impl Writer {
     /// If the file has no valid committed directory, is not this build's format, or cannot be
     /// written.
     pub fn restate(path: impl AsRef<Path>, views: &[ViewEntry]) -> Result<()> {
-        let path = path.as_ref();
-        let (_, size, slot, bytes, _) = slot_bytes(path)?;
+        let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
+        let size = file.len()?;
+        let (slot, bytes, _) = committed_slot(&*file, size)?;
         let (closed, _) = decode_catalog(&bytes, size)?;
         let generation = slot
             .generation
@@ -3433,17 +3467,16 @@ impl Writer {
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
-        let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
-        write_at(&file, size, &catalog)?;
-        file.sync_all().map_err(io)?;
+        file.write_at(size, &catalog)?;
+        file.sync()?;
         let slot = Slot {
             offset: size,
             length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
             generation,
             hash: checksum(&catalog),
         };
-        write_at(&file, slot_offset(generation), &slot.bytes())?;
-        file.sync_all().map_err(io)?;
+        file.write_at(slot_offset(generation), &slot.bytes())?;
+        file.sync()?;
         Ok(())
     }
 
@@ -3472,17 +3505,17 @@ impl Writer {
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
-        let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
-        write_at(&file, size, &catalog)?;
-        file.sync_all().map_err(io)?;
+        let file = RealFilesystem::new().open(path, OpenMode::ReadWrite)?;
+        file.write_at(size, &catalog)?;
+        file.sync()?;
         let slot = Slot {
             offset: size,
             length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
             generation,
             hash: checksum(&catalog),
         };
-        write_at(&file, slot_offset(generation), &slot.bytes())?;
-        file.sync_all().map_err(io)?;
+        file.write_at(slot_offset(generation), &slot.bytes())?;
+        file.sync()?;
         Ok(())
     }
 
@@ -3497,9 +3530,9 @@ impl Writer {
 /// The append half of [`attach`], which cannot use [`Writer::put`] because it is not writing a
 /// table. Every byte a section costs goes through here, so the offsets in an extent table come
 /// from one place.
-fn append(file: &File, at: &mut u64, bytes: &[u8]) -> Result<u64> {
+fn append(file: &dyn rudb_io::File, at: &mut u64, bytes: &[u8]) -> Result<u64> {
     let offset = *at;
-    write_at(file, offset, bytes)?;
+    file.write_at(offset, bytes)?;
     *at =
         at.checked_add(bytes.len() as u64).ok_or_else(|| invalid("native file length overflow"))?;
     Ok(offset)
@@ -3511,7 +3544,7 @@ fn append(file: &File, at: &mut u64, bytes: &[u8]) -> Result<u64> {
 /// whose extents should break on a row boundary instead will want to hand its extents over already
 /// split; nothing needs that yet, and guessing at the shape of it now would be guessing.
 fn write_section(
-    file: &File,
+    file: &dyn rudb_io::File,
     at: &mut u64,
     one: &section::Attachment<'_>,
     generation: u64,
@@ -3581,16 +3614,17 @@ pub fn attach(
     table: &str,
     attachments: &[section::Attachment<'_>],
 ) -> Result<Table> {
-    let path = path.as_ref();
-    let (_, size, slot, bytes, _) = slot_bytes(path)?;
+    let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
+    let file = &*file;
+    let size = file.len()?;
+    let (slot, bytes, _) = committed_slot(file, size)?;
     let (mut entries, views) = decode_catalog(&bytes, size)?;
     let at = entries
         .iter()
         .position(|entry| entry.name == table)
         .ok_or_else(|| invalid(&format!("the file holds no table called {table}")))?;
-    let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
     let mut version = [0; 4];
-    read_at(&file, 8, &mut version)?;
+    read_at(file, 8, &mut version)?;
     let version = u32::from_le_bytes(version);
     // Readable is not the same as writable. A format 22 file has no section table, and giving its
     // directory one without moving the number in its header would leave a file that claims to be
@@ -3604,14 +3638,14 @@ pub fn attach(
         )));
     }
     let mut directory = vec![0; entries[at].directory.length as usize];
-    read_at(&file, entries[at].directory.offset, &mut directory)?;
+    read_at(file, entries[at].directory.offset, &mut directory)?;
     if checksum(&directory) != entries[at].directory.hash {
         return Err(invalid(&format!("the directory of table {table} does not checksum")));
     }
     let mut held = decode_directory(&directory, size)?;
     let mut cursor = size;
     for one in attachments {
-        let written = write_section(&file, &mut cursor, one, held.generation)?;
+        let written = write_section(file, &mut cursor, one, held.generation)?;
         held.sections.retain(|old| !(old.kind == one.kind && old.id == one.id));
         held.sections.push(written);
     }
@@ -3622,7 +3656,7 @@ pub fn attach(
     if encoded.len() > MAX_DIRECTORY {
         return Err(invalid("directory exceeds the configured bound"));
     }
-    let offset = append(&file, &mut cursor, &encoded)?;
+    let offset = append(file, &mut cursor, &encoded)?;
     entries[at].directory = Page {
         offset,
         length: u32::try_from(encoded.len()).map_err(|_| invalid("directory length overflow"))?,
@@ -3634,8 +3668,8 @@ pub fn attach(
     if catalog.len() > MAX_DIRECTORY {
         return Err(invalid("catalog exceeds the configured bound"));
     }
-    let offset = append(&file, &mut cursor, &catalog)?;
-    file.sync_all().map_err(io)?;
+    let offset = append(file, &mut cursor, &catalog)?;
+    file.sync()?;
     let generation =
         slot.generation.checked_add(1).ok_or_else(|| invalid("native file generation overflow"))?;
     let committed = Slot {
@@ -3644,8 +3678,8 @@ pub fn attach(
         generation,
         hash: checksum(&catalog),
     };
-    write_at(&file, slot_offset(generation), &committed.bytes())?;
-    file.sync_all().map_err(io)?;
+    file.write_at(slot_offset(generation), &committed.bytes())?;
+    file.sync()?;
     Ok(held)
 }
 
@@ -4940,7 +4974,11 @@ fn places(table: &Table) -> Result<Vec<Place>> {
 ///
 /// The section carries its own checksum, so a reader that wants one column out of a hundred and
 /// five preads a few hundred bytes and still knows that what it got is what was written.
-fn read_index(file: &File, stripe: &Stripe, column: usize) -> Result<Vec<PartSpan>> {
+fn read_index<F: Positional + ?Sized>(
+    file: &F,
+    stripe: &Stripe,
+    column: usize,
+) -> Result<Vec<PartSpan>> {
     let parts = stripe.parts.len();
     let section = index_section(parts)?;
     let at = column.checked_mul(section).ok_or_else(|| invalid("index page offset overflow"))?;
@@ -5303,13 +5341,23 @@ fn slot_offset(generation: u64) -> u64 {
 /// Both levels of the directory are reached this way, so the magic check, the version check and the
 /// choice between the two slots live here rather than being written out twice.
 fn slot_bytes(path: impl AsRef<Path>) -> Result<(File, u64, Slot, Vec<u8>, Opening)> {
-    let mut file = File::open(path).map_err(io)?;
+    let file = File::open(path).map_err(io)?;
     let size = file.metadata().map_err(io)?.len();
+    let (slot, bytes, opening) = committed_slot(&file, size)?;
+    Ok((file, size, slot, bytes, opening))
+}
+
+/// The committed slot of a file that is `size` bytes long, and the catalog it points at.
+///
+/// The half of [`slot_bytes`] that does not care how the file was opened. A reader comes here with
+/// the `std::fs::File` it goes on to share between its threads, and a writer with the `rudb_io`
+/// file it is about to append to.
+fn committed_slot<F: Positional + ?Sized>(file: &F, size: u64) -> Result<(Slot, Vec<u8>, Opening)> {
     if size < HEADER {
         return Err(invalid("file is shorter than its header"));
     }
     let mut header = [0; HEADER as usize];
-    file.read_exact(&mut header).map_err(io)?;
+    read_at(file, 0, &mut header)?;
     let mut opening = Opening { reads: 1, bytes: HEADER };
     let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
     // The two halves are worth telling apart. A wrong magic is a file that was never ours and
@@ -5336,8 +5384,7 @@ fn slot_bytes(path: impl AsRef<Path>) -> Result<(File, u64, Slot, Vec<u8>, Openi
             continue;
         }
         let mut bytes = vec![0; slot.length as usize];
-        file.seek(SeekFrom::Start(slot.offset)).map_err(io)?;
-        file.read_exact(&mut bytes).map_err(io)?;
+        read_at(file, slot.offset, &mut bytes)?;
         opening.reads += 1;
         opening.bytes += u64::from(slot.length);
         if checksum(&bytes) == slot.hash
@@ -5349,7 +5396,7 @@ fn slot_bytes(path: impl AsRef<Path>) -> Result<(File, u64, Slot, Vec<u8>, Openi
         }
     }
     let (slot, bytes) = selected.ok_or_else(|| invalid("no committed directory slot is valid"))?;
-    Ok((file, size, slot, bytes, opening))
+    Ok((slot, bytes, opening))
 }
 
 impl Reader {
@@ -6651,48 +6698,6 @@ fn text_at_rank(dictionary: &Vector, rank: usize) -> Result<Value> {
     Ok(Value::Varchar(text.into()))
 }
 
-/// Writes one span of a file at an offset, without depending on where the cursor is.
-///
-/// The writer owns an offset of its own and passes it in here, so that nothing it writes depends on
-/// a cursor that a read is entitled to move. Both of these can come back short and both loop.
-#[cfg(unix)]
-fn write_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::FileExt;
-    while !bytes.is_empty() {
-        let written = file.write_at(bytes, offset).map_err(io)?;
-        if written == 0 {
-            return Err(invalid("a write to the native file wrote nothing"));
-        }
-        offset += written as u64;
-        bytes = &bytes[written..];
-    }
-    Ok(())
-}
-
-/// The same write, on the call Windows spells differently.
-#[cfg(windows)]
-fn write_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !bytes.is_empty() {
-        let written = file.seek_write(bytes, offset).map_err(io)?;
-        if written == 0 {
-            return Err(invalid("a write to the native file wrote nothing"));
-        }
-        offset += written as u64;
-        bytes = &bytes[written..];
-    }
-    Ok(())
-}
-
-/// Somewhere that is neither, where the cursor is all there is.
-#[cfg(not(any(unix, windows)))]
-fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut file = file.try_clone().map_err(io)?;
-    file.seek(SeekFrom::Start(offset)).map_err(io)?;
-    file.write_all(bytes).map_err(io)
-}
-
 /// Reads one span of a file at an offset, without moving a cursor anybody else can see.
 ///
 /// Every reader of a table shares one [`File`] behind an [`Arc`], and a grouped aggregate reads its
@@ -6700,50 +6705,116 @@ fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<()> {
 /// two calls with a gap in the middle, and in that gap another thread's seek lands and the read
 /// comes back with somebody else's bytes.
 ///
-/// Both of these can come back short, so both loop. A read of zero bytes before the span is filled
-/// means the file stops earlier than the directory said it does.
-#[cfg(unix)]
-fn read_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
-    use std::os::unix::fs::FileExt;
-    while !bytes.is_empty() {
-        let read = file.read_at(bytes, offset).map_err(io)?;
-        if read == 0 {
-            return Err(invalid("column page ends before its declared length"));
-        }
-        offset += read as u64;
-        bytes = &mut bytes[read..];
-    }
-    Ok(())
+/// The writer reads back through here too, out of the `rudb_io` file it writes through, which is
+/// why this takes anything [`Positional`] rather than a [`File`].
+fn read_at<F: Positional + ?Sized>(file: &F, offset: u64, bytes: &mut [u8]) -> Result<()> {
+    file.fill_at(offset, bytes)
 }
 
-/// The same read, on the call Windows spells differently.
+/// Something a span of bytes can be read out of by offset.
 ///
-/// `seek_read` is one `ReadFile` carrying the offset with it, so two of them cannot interleave the
-/// way a seek and a read can. It does leave the shared cursor somewhere afterwards, which is why
-/// nothing in this file may read that cursor.
-#[cfg(windows)]
-fn read_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !bytes.is_empty() {
-        let read = file.seek_read(bytes, offset).map_err(io)?;
-        if read == 0 {
-            return Err(invalid("column page ends before its declared length"));
-        }
-        offset += read as u64;
-        bytes = &mut bytes[read..];
-    }
-    Ok(())
+/// There are two of these. The reader holds a `std::fs::File`, because it shares it between its
+/// threads behind an [`Arc`] and every read it makes is on the hot path of a scan. The writer holds
+/// an `rudb_io::File`, because everything it does to the file has to be something the simulated
+/// filesystem can stop and crash. The few helpers both of them use, [`read_index`] and the choice
+/// of committed slot, are written once over this rather than once for each.
+trait Positional {
+    /// Fills `bytes` from `offset`, or fails if the file ends first.
+    ///
+    /// Both kinds can come back short, so both loop. A read of zero bytes before the span is filled
+    /// means the file stops earlier than the directory said it does.
+    fn fill_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()>;
 }
 
-/// Somewhere that is neither, where the cursor is all there is.
+impl<T: Positional + ?Sized> Positional for &T {
+    fn fill_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        (**self).fill_at(offset, bytes)
+    }
+}
+
+impl<T: Positional + ?Sized> Positional for Arc<T> {
+    fn fill_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        (**self).fill_at(offset, bytes)
+    }
+}
+
+impl<T: Positional + ?Sized> Positional for Box<T> {
+    fn fill_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        (**self).fill_at(offset, bytes)
+    }
+}
+
+impl Positional for dyn rudb_io::File + '_ {
+    fn fill_at(&self, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let read = self.read_at(offset, bytes)?;
+            if read == 0 {
+                return Err(invalid("column page ends before its declared length"));
+            }
+            offset += read as u64;
+            bytes = &mut bytes[read..];
+        }
+        Ok(())
+    }
+}
+
+impl Positional for File {
+    #[cfg(unix)]
+    fn fill_at(&self, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        while !bytes.is_empty() {
+            let read = self.read_at(bytes, offset).map_err(io)?;
+            if read == 0 {
+                return Err(invalid("column page ends before its declared length"));
+            }
+            offset += read as u64;
+            bytes = &mut bytes[read..];
+        }
+        Ok(())
+    }
+
+    /// The same read, on the call Windows spells differently.
+    ///
+    /// `seek_read` is one `ReadFile` carrying the offset with it, so two of them cannot interleave
+    /// the way a seek and a read can. It does leave the shared cursor somewhere afterwards, which is
+    /// why nothing in this file may read that cursor.
+    #[cfg(windows)]
+    fn fill_at(&self, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+        use std::os::windows::fs::FileExt;
+        while !bytes.is_empty() {
+            let read = self.seek_read(bytes, offset).map_err(io)?;
+            if read == 0 {
+                return Err(invalid("column page ends before its declared length"));
+            }
+            offset += read as u64;
+            bytes = &mut bytes[read..];
+        }
+        Ok(())
+    }
+
+    /// Somewhere that is neither, where the cursor is all there is.
+    ///
+    /// This one does race, and there is no way to write it so it does not. Nothing we build for
+    /// runs here, so it exists to keep the crate compiling rather than to be correct under threads.
+    #[cfg(not(any(unix, windows)))]
+    fn fill_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = self.try_clone().map_err(io)?;
+        file.seek(SeekFrom::Start(offset)).map_err(io)?;
+        file.read_exact(bytes).map_err(io)
+    }
+}
+
+/// Overwrites one span of a file in place, which is how the tests damage a file on purpose.
 ///
-/// This one does race, and there is no way to write it so it does not. Nothing we build for runs
-/// here, so it exists to keep the crate compiling rather than to be correct under threads.
-#[cfg(not(any(unix, windows)))]
-fn read_at(file: &File, offset: u64, bytes: &mut [u8]) -> Result<()> {
-    let mut file = file.try_clone().map_err(io)?;
+/// The writer does not come through here. It writes through `rudb_io`, and this is a
+/// `std::fs::File` opened by a test beside it.
+#[cfg(test)]
+fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = file;
     file.seek(SeekFrom::Start(offset)).map_err(io)?;
-    file.read_exact(bytes).map_err(io)
+    file.write_all(bytes).map_err(io)
 }
 
 /// What a column type is called in the directory.
@@ -10251,9 +10322,9 @@ fn payload_shapes() -> Vec<chooser::Settled> {
 /// A wait rather than time, because the time is already in the publish span around it. What the
 /// wait columns add is how much of publish was the device, which on the WSL2 disk of the gaming PC
 /// is most of it: a sync there costs about two milliseconds (see `rudb_device_card`).
-fn synced(file: &File, profile: Option<&LoadProfile>) -> Result<()> {
+fn synced(file: &dyn rudb_io::File, profile: Option<&LoadProfile>) -> Result<()> {
     let started = profile.map(|_| std::time::Instant::now());
-    file.sync_all().map_err(io)?;
+    file.sync()?;
     if let (Some(profile), Some(started)) = (profile, started) {
         profile.waited(
             Stage::Publish,
@@ -11194,7 +11265,7 @@ fn decode(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -11434,11 +11505,12 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// The writer records where it put a page and puts it there, whatever the cursor is doing.
+    /// The writer records where it put a page and puts it there.
     ///
-    /// The cursor is moved between the steps that record an offset, which is what reading the pages
-    /// back to build the frequencies does on a platform with no `pread`. Without the fix the
-    /// directory lands on top of a page and the file fails to reopen.
+    /// This used to move the file's cursor between the steps that record an offset, which is what
+    /// reading the pages back to build the frequencies did on a platform with no `pread`, and the
+    /// directory landed on top of a page. The writer's file is an `rudb_io` file now and has no
+    /// cursor to move, so what is left is the check that every page is where the directory says.
     #[test]
     fn a_writer_puts_a_page_where_it_said_it_did_wherever_the_cursor_has_got_to() {
         let path = path("cursor");
@@ -11452,9 +11524,7 @@ mod tests {
         )
         .expect("new file");
         writer.append(&sample()).expect("first part");
-        writer.file.seek(SeekFrom::Start(0)).expect("the cursor goes back to the header");
         writer.append(&sample()).expect("second part");
-        writer.file.seek(SeekFrom::Start(1)).expect("and somewhere useless again");
         writer.finish().expect("commit");
         let reader = Reader::open(&path).expect("reopen from disk");
         assert_eq!(reader.table().rows(), 6);

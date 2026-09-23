@@ -150,6 +150,10 @@ impl File for RealFile {
         self.file.sync_all().map_err(|e| Error::io(format!("sync failed: {e}")))
     }
 
+    fn start_writeback(&self, offset: u64, length: u64) {
+        crate::writeback::start_writeback(&self.file, offset, length);
+    }
+
     fn truncate(&self, len: u64) -> Result<()> {
         if !self.writable {
             return Err(Error::io("this file was opened for reading"));

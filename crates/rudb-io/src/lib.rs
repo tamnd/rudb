@@ -171,6 +171,18 @@ pub trait File: Debug + Send + Sync {
     /// dirty pages, so a second call may return success while the data is gone.
     fn sync(&self) -> Result<()>;
 
+    /// Asks for `length` bytes from `offset` to start on their way to the device, without waiting
+    /// for them and without making them durable.
+    ///
+    /// A hint, and only a real file on an operating system that has the call can act on it. See
+    /// [`crate::writeback`] for what it buys a bulk load. The default does nothing, which is also
+    /// what the simulation wants: a write here is pending until [`Self::sync`] whatever was hinted,
+    /// so recording the hint would add an operation to the log that changes nothing a crash can
+    /// leave behind.
+    fn start_writeback(&self, offset: u64, length: u64) {
+        let _ = (offset, length);
+    }
+
     /// Cuts the file to `len` bytes, or extends it with zeroes.
     ///
     /// # Errors
