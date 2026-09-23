@@ -793,22 +793,22 @@ impl Database {
             return Ok(None);
         }
         let mut sparse = BTreeMap::<i128, u64>::new();
-        if let Some(counts) = catalog.integer_tally(name, index)? {
-            for (value, count) in counts {
-                if value == 0 {
-                    continue;
-                }
-                let value = i128::from(value);
-                if let Some((low, dense_counts)) = &mut dense {
-                    let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
-                    if let Some(held) = dense_counts.get_mut(at) {
-                        *held += count;
-                        continue;
-                    }
-                }
-                *sparse.entry(value).or_default() += count;
+        let folded = catalog.integer_fold(name, index, |value, count| {
+            if value == 0 {
+                return Ok(());
             }
-        } else {
+            let value = i128::from(value);
+            if let Some((low, dense_counts)) = &mut dense {
+                let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
+                if let Some(held) = dense_counts.get_mut(at) {
+                    *held += count;
+                    return Ok(());
+                }
+            }
+            *sparse.entry(value).or_default() += count;
+            Ok(())
+        })?;
+        if folded.is_none() {
             let reader = catalog.table(name)?;
             for part in 0..reader.parts() {
                 if let Some(counts) = reader.integer_tally(part, index)? {
