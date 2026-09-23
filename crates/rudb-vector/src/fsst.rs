@@ -60,6 +60,18 @@ pub const MAX_SYMBOL_LEN: usize = 8;
 /// How many generations the trainer runs. The paper's number.
 const GENERATIONS: usize = 5;
 
+/// How much of the sample each generation counts, in 128ths. The paper's schedule: the early
+/// generations only have to find which bytes and pairs are common, which a slice of the sample says
+/// as well as all of it, and the last one counts everything so the table it leaves is ranked on the
+/// whole sample. It is 2.7 passes over the sample where counting all of it every time is five.
+const FRACTIONS: [u64; GENERATIONS] = [8, 38, 68, 98, 128];
+
+/// Whether the sample string at `index` is counted in a generation that counts `fraction` 128ths.
+/// A hash of the index rather than a random draw, so a table is a function of its sample.
+fn counted(index: usize, fraction: u64) -> bool {
+    fraction >= 128 || ((index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) < fraction
+}
+
 /// Slots in the prefix hash table. A power of two, and four times the largest number of symbols that
 /// can be in it, which keeps the eight slot probe from filling up on a full table.
 const HASH_SLOTS: usize = 1024;
@@ -197,13 +209,20 @@ impl SymbolTable {
 
     fn train_with(samples: &[&[u8]], counts: &mut Counts) -> Self {
         let mut table = Self::empty();
-        for _ in 0..GENERATIONS {
+        for fraction in FRACTIONS {
             counts.clear();
-            for sample in samples {
-                table.count(sample, counts);
+            for (index, sample) in samples.iter().enumerate() {
+                if counted(index, fraction) {
+                    table.count(sample, counts);
+                }
             }
             let next = counts.best(&table);
+            // A slice of a small sample can hold no string at all, and that says nothing about the
+            // sample, so it is the next generation's turn rather than the end of training.
             if next.is_empty() {
+                if fraction < 128 {
+                    continue;
+                }
                 break;
             }
             table = Self::build(next);
@@ -817,6 +836,18 @@ mod tests {
     }
 
     #[test]
+    fn a_first_generation_that_counts_nothing_does_not_end_training() {
+        // The first generation counts about one string in sixteen, and here the one it is sure to
+        // count is empty. Ending on that would leave a table that escapes every byte.
+        let samples: Vec<&[u8]> = vec![b"", b"abcabcabc", b"abcabcabc", b"abcabcabc"];
+        let table = SymbolTable::train(&samples);
+        assert!(!table.is_empty());
+        let mut out = Vec::new();
+        table.compress(b"abcabcabc", &mut out);
+        assert!(out.len() < 9, "{} bytes", out.len());
+    }
+
+    #[test]
     fn training_twice_on_the_same_sample_gives_the_same_table() {
         // A table that differs run to run would make every size in the M1 report unreproducible.
         let strings = urls();
@@ -858,10 +889,13 @@ mod tests {
     fn train_with_maps(samples: &[&[u8]]) -> SymbolTable {
         use std::collections::HashMap;
         let mut table = SymbolTable::empty();
-        for _ in 0..GENERATIONS {
+        for fraction in FRACTIONS {
             let mut single = [0u32; IDS];
             let mut pairs: HashMap<(u16, u16), u32> = HashMap::new();
-            for sample in samples {
+            for (index, sample) in samples.iter().enumerate() {
+                if !counted(index, fraction) {
+                    continue;
+                }
                 let mut at = 0;
                 let mut previous: Option<u16> = None;
                 while at < sample.len() {
@@ -889,6 +923,9 @@ mod tests {
             ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
             ranked.truncate(MAX_SYMBOLS);
             if ranked.is_empty() {
+                if fraction < 128 {
+                    continue;
+                }
                 break;
             }
             table = SymbolTable::build(ranked.into_iter().map(|(symbol, _)| symbol).collect());
