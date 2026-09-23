@@ -38,6 +38,7 @@
 //! child per member plus a tag saying which member each row is in.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -71,6 +72,24 @@ use crate::validity::Validity;
 /// with a string column, where a vector of views is half a megabyte. 8192 is where the per call
 /// overhead has stopped mattering and the working set has not started to.
 pub const VECTOR_SIZE: usize = 8192;
+
+/// The smallest and largest of `at`, or `None` when it is empty.
+///
+/// Compared as signed 32 bit numbers with the top bit flipped, which keeps the order and is the
+/// one minimum and maximum SSE2 has, so the loop vectorizes where an unsigned one does not.
+fn extent(at: &[u32]) -> Option<(u32, u32)> {
+    const FLIP: u32 = 1 << 31;
+    #[expect(clippy::cast_possible_wrap, reason = "the flip makes the wrap keep the order")]
+    let signed = |row: u32| (row ^ FLIP) as i32;
+    #[expect(clippy::cast_sign_loss, reason = "undoing the flip above")]
+    let unsigned = |row: i32| (row as u32) ^ FLIP;
+    if at.is_empty() {
+        return None;
+    }
+    let low = at.iter().fold(i32::MAX, |low, &row| low.min(signed(row)));
+    let high = at.iter().fold(i32::MIN, |high, &row| high.max(signed(row)));
+    Some((unsigned(low), unsigned(high)))
+}
 
 /// Whether every one of `codes` is below `len`.
 ///
@@ -3150,7 +3169,6 @@ impl Vector {
         let packed = Packed { words, width: *width, base: *base, offset: *offset };
         let low = i64::try_from(packed.base()).ok()?;
         i64::try_from(packed.ceiling()).ok()?;
-        let codes = packed.codes_at(|index| indices[index] as usize, indices.len());
         // Every value is between the two ends, which both fit, so the add lands without wrapping
         // and the narrowing below keeps every value, since the layout was chosen to hold them.
         #[expect(clippy::cast_possible_wrap, reason = "a code is below the span, which fits")]
@@ -3158,13 +3176,13 @@ impl Vector {
         #[expect(clippy::cast_possible_truncation, reason = "the layout holds every value")]
         let data = match self.ty.physical() {
             rudb_common::PhysicalType::Int64 => {
-                Data::Int64(codes.iter().map(|&code| value(code)).collect())
+                Data::Int64(Buffer::from_vec(packed.values_at(indices, value)))
             }
             rudb_common::PhysicalType::Int32 => {
-                Data::Int32(codes.iter().map(|&code| value(code) as i32).collect())
+                Data::Int32(Buffer::from_vec(packed.values_at(indices, |code| value(code) as i32)))
             }
             rudb_common::PhysicalType::Int16 => {
-                Data::Int16(codes.iter().map(|&code| value(code) as i16).collect())
+                Data::Int16(Buffer::from_vec(packed.values_at(indices, |code| value(code) as i16)))
             }
             _ => return None,
         };
@@ -3574,6 +3592,39 @@ impl Packed<'_> {
         let mut run = vec![0; high - low + 1];
         self.unpack(low, &mut run);
         (0..rows).map(|index| run[at(index) - low]).collect()
+    }
+
+    /// The value of each row `at` names, in order, made from its code by `value`.
+    ///
+    /// [`Self::codes_at`] for a filter's `u32` positions, with the value made as each row is read
+    /// rather than in a second pass over the codes. Three things it did cost more than the reads on
+    /// q01, where a filter keeps nearly every row of every packed column. The smallest and largest
+    /// position were a scalar compare and move a row, because SSE2 has no unsigned or 64 bit
+    /// minimum, and here they are signed 32 bit ones, which it has. The span was a fresh buffer
+    /// of zeroes, and here each thread keeps one. And the codes were written out whole before the
+    /// values were made from them.
+    pub fn values_at<T>(&self, at: &[u32], value: impl Fn(u64) -> T) -> Vec<T> {
+        thread_local! {
+            static SPAN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+        let Some((low, high)) = extent(at) else { return Vec::new() };
+        let (low, high) = (low as usize, high as usize);
+        if high - low >= at.len().saturating_mul(4) {
+            return at.iter().map(|&row| value(self.code(row as usize))).collect();
+        }
+        let span = high - low + 1;
+        let gathered = |run: &mut Vec<u64>| {
+            if run.len() < span {
+                run.resize(span, 0);
+            }
+            let run = &mut run[..span];
+            self.unpack(low, run);
+            at.iter().map(|&row| value(run[row as usize - low])).collect()
+        };
+        SPAN.with(|held| match held.try_borrow_mut() {
+            Ok(mut held) => gathered(&mut held),
+            Err(_) => gathered(&mut Vec::new()),
+        })
     }
 }
 
@@ -4534,6 +4585,14 @@ mod tests {
     }
 
     #[test]
+    fn extent_keeps_the_unsigned_order_across_the_sign_bit() {
+        assert_eq!(super::extent(&[]), None);
+        assert_eq!(super::extent(&[7]), Some((7, 7)));
+        let rows = [0x8000_0000, 3, u32::MAX, 0x7fff_ffff, 9];
+        assert_eq!(super::extent(&rows), Some((3, u32::MAX)));
+    }
+
+    #[test]
     fn unpacking_in_bulk_reads_what_a_code_at_a_time_reads_at_every_width() {
         let mut state = 0x5eed_0b17_u64;
         let mut next = || {
@@ -4558,6 +4617,11 @@ mod tests {
                 let far = [0_usize, 5000];
                 let want: Vec<u64> = far.iter().map(|&row| packed.code(row)).collect();
                 assert_eq!(packed.codes_at(|index| far[index], far.len()), want);
+                for rows in [&[][..], &[5, 9, 9, 70, 6, 200, 131], &[0, 5000], &[3, 4, 5, 6]] {
+                    let want: Vec<u64> =
+                        rows.iter().map(|&row| packed.code(row as usize)).collect();
+                    assert_eq!(packed.values_at(rows, |code| code), want, "width {width}");
+                }
             }
         }
     }
