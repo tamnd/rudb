@@ -29,6 +29,91 @@ use crate::settings::Settings;
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
 const MEMORY: &str = ":memory:";
 
+/// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
+/// Keep this check strict: every clause it does not understand belongs to the regular binder.
+fn native_nonzero_shape(ast: &Ast) -> Option<(&str, &str, &str)> {
+    use ast::{BinaryOp, Distinct, Expr, LiteralKind, QueryBody, Source, Statement};
+    use rudb_parse::NONE;
+
+    let [Statement::Query(query_ref)] = ast.statements.as_slice() else {
+        return None;
+    };
+    let query = ast.query(*query_ref);
+    if query.ctes.len != 0
+        || query.order_by.len != 0
+        || query.order_by_all
+        || query.limit != NONE
+        || query.offset != NONE
+        || query.limit_percent
+    {
+        return None;
+    }
+    let QueryBody::Select(select_ref) = query.body else {
+        return None;
+    };
+    let select = ast.select(select_ref);
+    if select.distinct != Distinct::No
+        || select.group_by.len != 0
+        || select.group_by_all
+        || select.having != NONE
+    {
+        return None;
+    }
+    let [target] = ast.target_list(select.targets) else {
+        return None;
+    };
+    let Expr::Function { name, args, distinct: false, filter: NONE } = ast.expr(target.expr) else {
+        return None;
+    };
+    if name.len != 1 {
+        return None;
+    }
+    let function = ast.name(name).next()?;
+    if !function.eq_ignore_ascii_case("count") {
+        return None;
+    }
+    let [arg] = ast.expr_list(args) else {
+        return None;
+    };
+    if !matches!(ast.expr(*arg), Expr::Star { qualifier, replacements } if qualifier.len == 0 && replacements.len == 0)
+    {
+        return None;
+    }
+    let [source] = ast.source_list(select.from) else {
+        return None;
+    };
+    let Source::Table { name, alias: NONE, columns } = ast.source(*source) else {
+        return None;
+    };
+    if columns.len != 0 {
+        return None;
+    }
+    if name.len != 1 {
+        return None;
+    }
+    let table = ast.name(name).next()?;
+    let Expr::Binary { op: BinaryOp::NotEq, left, right } = ast.expr(select.filter) else {
+        return None;
+    };
+    let (column, zero) = match (ast.expr(left), ast.expr(right)) {
+        (Expr::Column { name }, Expr::Literal { kind: LiteralKind::Number, text }) => (name, text),
+        (Expr::Literal { kind: LiteralKind::Number, text }, Expr::Column { name }) => (name, text),
+        _ => return None,
+    };
+    if ast.string(zero) != "0" {
+        return None;
+    }
+    if column.len != 1 {
+        return None;
+    }
+    let column = ast.name(column).next()?;
+    Some((
+        table,
+        column,
+        if target.alias == NONE { "count_star()" } else { ast.string(target.alias) },
+    ))
+}
+
 /// An in process database.
 ///
 /// One catalog, held in memory, with no file behind it. `ATTACH` and the storage format are E2, and
@@ -153,6 +238,41 @@ fn runtime(config: &Config) -> Pool {
 }
 
 impl Database {
+    /// Answers a read-only, single-statement count directly from a certified native synopsis.
+    /// Other statements return `None` so the caller can use a regular database connection.
+    pub fn query_native_once(path: &str, sql: &str) -> Result<Option<QueryResult>> {
+        let ast = rudb_parse::parse_ast(sql)?;
+        let Some((table, column, name)) = native_nonzero_shape(&ast) else {
+            return Ok(None);
+        };
+        let native = rudb_native::Catalog::open(path)?;
+        let Some((stored_name, fields)) = native
+            .names()
+            .find(|stored| stored.eq_ignore_ascii_case(table))
+            .and_then(|stored| native.table_fields(stored).map(|fields| (stored, fields)))
+        else {
+            return Ok(None);
+        };
+        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(None);
+        };
+        let Some(count) = native.nonzero_count(stored_name, index)? else {
+            return Ok(None);
+        };
+        let Ok(count) = i64::try_from(count) else {
+            return Ok(None);
+        };
+        let value = Value::BigInt(count);
+        let vector = Vector::from_values(LogicalType::BigInt, &[value])?;
+        let chunk = Chunk::new(vec![vector])?;
+        Ok(Some(QueryResult::new(
+            vec![name.to_string()],
+            vec![LogicalType::BigInt],
+            vec![chunk],
+            Memory::unlimited().reservation(),
+        )))
+    }
     /// An empty database with the default catalog and schema, held in memory.
     #[must_use]
     pub fn new() -> Self {
@@ -2472,7 +2592,23 @@ mod tests {
 
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
-    use super::{Database, publish};
+    use super::{Database, native_nonzero_shape, publish};
+
+    #[test]
+    fn cold_count_shape_accepts_only_the_certified_query() {
+        let parsed = rudb_parse::parse_ast("SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0")
+            .expect("query parses");
+        assert_eq!(native_nonzero_shape(&parsed), Some(("hits", "AdvEngineID", "count_star()")));
+        for sql in [
+            "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 1",
+            "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 LIMIT 1",
+            "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0 AND RegionID = 1",
+            "SELECT COUNT(DISTINCT AdvEngineID) FROM hits WHERE AdvEngineID <> 0",
+        ] {
+            let parsed = rudb_parse::parse_ast(sql).expect("query parses");
+            assert_eq!(native_nonzero_shape(&parsed), None, "{sql}");
+        }
+    }
 
     #[test]
     fn publishing_syncs_the_directory_after_the_rename() {

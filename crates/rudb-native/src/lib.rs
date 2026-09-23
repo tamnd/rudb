@@ -68,6 +68,7 @@ pub use zones::{Common, Stripes, ascending, distincts};
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
+const NONZERO_COUNTS: &[u8; 8] = b"RUDBNZ10";
 const FORMAT: u32 = 28;
 
 /// Formats this build can open.
@@ -843,6 +844,8 @@ struct Entry {
     rows: usize,
     /// Where this table's own directory sits, with the checksum it was committed under.
     directory: Page,
+    /// Exact non-null, nonzero integer counts certified by the catalog checksum.
+    nonzero: Vec<Option<u64>>,
 }
 
 /// One view's line in the catalog directory.
@@ -2740,6 +2743,7 @@ impl Writer {
             name: self.table.name.clone(),
             fields: self.table.fields.clone(),
             rows: self.table.rows,
+            nonzero: table_nonzero_counts(&self.table),
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -2885,6 +2889,42 @@ impl Writer {
             .checked_add(1)
             .ok_or_else(|| invalid("native file generation overflow"))?;
         let catalog = encode_catalog(&closed, views)?;
+        if catalog.len() > MAX_DIRECTORY {
+            return Err(invalid("catalog exceeds the configured bound"));
+        }
+        let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
+        write_at(&file, size, &catalog)?;
+        file.sync_all().map_err(io)?;
+        let slot = Slot {
+            offset: size,
+            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+            generation,
+            hash: checksum(&catalog),
+        };
+        write_at(&file, slot_offset(generation), &slot.bytes())?;
+        file.sync_all().map_err(io)?;
+        Ok(())
+    }
+
+    /// Adds exact nonzero certificates to an older file's catalog without rewriting table pages.
+    /// The old committed slot remains readable until the new catalog is fully synced.
+    pub fn certify_counts(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let (_, size, slot, bytes, _) = slot_bytes(path)?;
+        let (mut entries, views) = decode_catalog(&bytes, size)?;
+        let native = Catalog::open(path)?;
+        for entry in &mut entries {
+            if entry.nonzero.iter().any(Option::is_some) {
+                continue;
+            }
+            let reader = native.table(&entry.name)?;
+            entry.nonzero = reader_nonzero_counts(&reader)?;
+        }
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("native file generation overflow"))?;
+        let catalog = encode_catalog(&entries, &views)?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -4327,6 +4367,52 @@ impl Catalog {
             u64::from(entry.directory.length),
             opening,
         )
+    }
+
+    /// Counts non-null, nonzero values from a validated native directory without building a
+    /// reader for every stripe. Returns `None` when the bounded frequency synopsis cannot prove
+    /// the count, so callers can use the ordinary query path.
+    pub fn nonzero_count(&self, name: &str, column: usize) -> Result<Option<u64>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(field) = entry.fields.get(column) else {
+            return Err(invalid("frequency column index out of range"));
+        };
+        if !matches!(
+            field.ty,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
+        ) {
+            return Ok(None);
+        }
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
+        }
+        if let Some(count) = entry.nonzero.get(column).copied().flatten() {
+            return Ok(Some(count));
+        }
+        quick_nonzero(
+            Cursor::over(&self.file, offset, length),
+            &entry.name,
+            &entry.fields,
+            entry.rows,
+            column,
+        )
+    }
+
+    /// The schema copied into the small file catalog, available without opening the table directory.
+    pub fn table_fields(&self, name: &str) -> Option<&[Field]> {
+        self.entries.iter().find(|entry| entry.name == name).map(|entry| entry.fields.as_slice())
     }
 }
 
@@ -6253,6 +6339,80 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
 ///
 /// The views go after the tables and are whole here, since a view is text and a column list and has
 /// no pages for a second level to point at.
+fn table_nonzero_counts(table: &Table) -> Vec<Option<u64>> {
+    table
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column, field)| {
+            if !matches!(
+                field.ty,
+                LogicalType::TinyInt
+                    | LogicalType::SmallInt
+                    | LogicalType::Integer
+                    | LogicalType::BigInt
+                    | LogicalType::UTinyInt
+                    | LogicalType::USmallInt
+                    | LogicalType::UInteger
+                    | LogicalType::UBigInt
+            ) {
+                return None;
+            }
+            let Some(Frequencies::Held(summary)) = &table.frequencies[column] else {
+                return None;
+            };
+            let zero = summary
+                .entries
+                .iter()
+                .find(|entry| entry.value == FrequencyValue::Integer(0))
+                .map(|entry| entry.count)
+                .or_else(|| (summary.omitted_max == 0).then_some(0))?;
+            let nulls = table.stripes.iter().try_fold(0_u64, |count, stripe| {
+                count.checked_add(stripe.zone.column(column)?.nulls as u64)
+            })?;
+            (table.rows as u64).checked_sub(nulls)?.checked_sub(zero)
+        })
+        .collect()
+}
+
+fn reader_nonzero_counts(reader: &Reader) -> Result<Vec<Option<u64>>> {
+    reader
+        .table
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column, field)| {
+            if !matches!(
+                field.ty,
+                LogicalType::TinyInt
+                    | LogicalType::SmallInt
+                    | LogicalType::Integer
+                    | LogicalType::BigInt
+                    | LogicalType::UTinyInt
+                    | LogicalType::USmallInt
+                    | LogicalType::UInteger
+                    | LogicalType::UBigInt
+            ) {
+                return Ok(None);
+            }
+            let Some(summary) = reader.frequency_summary(column)? else {
+                return Ok(None);
+            };
+            let zero = summary
+                .entries
+                .iter()
+                .find(|entry| entry.value == FrequencyValue::Integer(0))
+                .map(|entry| entry.count)
+                .or_else(|| (summary.omitted_max == 0).then_some(0));
+            let Some(zero) = zero else { return Ok(None) };
+            let nulls = reader.null_count(column)?;
+            Ok((reader.table.rows as u64)
+                .checked_sub(nulls)
+                .and_then(|count| count.checked_sub(zero)))
+        })
+        .collect()
+}
+
 fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
     let mut out = CATALOG.to_vec();
     put_u32(&mut out, u32::try_from(entries.len()).map_err(|_| invalid("too many tables"))?);
@@ -6313,6 +6473,21 @@ fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
             out.push(u8::from(field.not_null));
         }
     }
+    out.extend_from_slice(NONZERO_COUNTS);
+    for entry in entries {
+        if entry.nonzero.len() != entry.fields.len() {
+            return Err(invalid("nonzero count width differs from schema"));
+        }
+        for count in &entry.nonzero {
+            match count {
+                None => out.push(0),
+                Some(count) => {
+                    out.push(1);
+                    put_u64(&mut out, *count);
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -6363,7 +6538,8 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
         if entries.iter().any(|held| held.name == name) {
             return Err(invalid("two tables in the catalog have the same name"));
         }
-        entries.push(Entry { name, fields, rows, directory });
+        let nonzero = vec![None; fields.len()];
+        entries.push(Entry { name, fields, rows, directory, nonzero });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
     // file written before format 25. That is why the count is allowed to be missing rather than
@@ -6402,6 +6578,40 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
             return Err(invalid("a table and a view in the catalog have the same name"));
         }
         views.push(ViewEntry { name, sql, statement, aliases, columns });
+    }
+    if !cur.done() {
+        if cur.take(8)? != NONZERO_COUNTS {
+            return Err(invalid("catalog extension magic differs"));
+        }
+        for entry in &mut entries {
+            for (field, count) in entry.fields.iter().zip(&mut entry.nonzero) {
+                *count = match cur.u8()? {
+                    0 => None,
+                    1 if matches!(
+                        field.ty,
+                        LogicalType::TinyInt
+                            | LogicalType::SmallInt
+                            | LogicalType::Integer
+                            | LogicalType::BigInt
+                            | LogicalType::UTinyInt
+                            | LogicalType::USmallInt
+                            | LogicalType::UInteger
+                            | LogicalType::UBigInt
+                    ) =>
+                    {
+                        let value = cur.u64()?;
+                        if value > entry.rows as u64 {
+                            return Err(invalid("nonzero count exceeds rows"));
+                        }
+                        Some(value)
+                    }
+                    _ => return Err(invalid("nonzero count tag or column type differs")),
+                };
+            }
+        }
+        if !cur.done() {
+            return Err(invalid("catalog has trailing bytes"));
+        }
     }
     Ok((entries, views))
 }
@@ -6500,6 +6710,30 @@ impl<'a> Cursor<'a> {
             return Ok(&bytes[at..end]);
         }
         self.take_windowed(len)
+    }
+
+    /// Moves over a checked field without reading its payload from a windowed directory.
+    fn skip(&mut self, len: usize) -> Result<()> {
+        let end = self.at.checked_add(len).ok_or_else(|| invalid("directory offset overflow"))?;
+        if end > self.len() {
+            return Err(invalid("directory is truncated"));
+        }
+        self.at = end;
+        Ok(())
+    }
+
+    fn skip_bound(&mut self) -> Result<()> {
+        match self.u8()? {
+            0 => Ok(()),
+            1 => self.skip(16),
+            2 => self.skip(8),
+            3 => {
+                let length = self.u32()? as usize;
+                self.skip(length)
+            }
+            4 => self.skip(17),
+            _ => Err(invalid("a stored bound has an unknown tag")),
+        }
     }
 
     /// Where `len` bytes from here end, when they end inside the bytes.
@@ -6695,6 +6929,164 @@ fn decode_summary(
         }
         _ => return Err(invalid("frequency summary tag differs")),
     })
+}
+
+/// Skips a synopsis whose column the caller does not need. The directory checksum was checked
+/// before this walk, and the fields still need their lengths and tags checked to find the next one.
+fn skip_summary(cur: &mut Cursor<'_>, values: bool, rows: usize) -> Result<()> {
+    match cur.u8()? {
+        0 => Ok(()),
+        1 => {
+            cur.skip(8)?;
+            let entries = cur.u32()? as usize;
+            if entries > FREQUENCY_ENTRIES {
+                return Err(invalid("frequency entry count exceeds its bound"));
+            }
+            for _ in 0..entries {
+                match cur.u8()? {
+                    0 => {}
+                    1 => cur.skip(16)?,
+                    2 => cur.skip(4)?,
+                    _ => return Err(invalid("frequency value tag differs")),
+                }
+                cur.skip(8)?;
+            }
+            let ordinals = cur.u32()? as usize;
+            if ordinals > FREQUENCY_ORDINALS || ordinals > rows {
+                return Err(invalid("frequency ordinal count exceeds its bound"));
+            }
+            for _ in 0..ordinals {
+                cur.var_u64()?;
+            }
+            if values {
+                cur.skip(ordinals * 2)?;
+            }
+            Ok(())
+        }
+        _ => Err(invalid("frequency summary tag differs")),
+    }
+}
+
+/// Reads only the catalog, stripe null counts, and one frequency synopsis. This is the cold path
+/// for a summary-backed count; constructing every page descriptor and zone map would make it cost
+/// the size of the table directory even when no row is read.
+fn quick_nonzero(
+    mut cur: Cursor<'_>,
+    name: &str,
+    fields: &[Field],
+    rows: usize,
+    wanted: usize,
+) -> Result<Option<u64>> {
+    if cur.take(8)? != DIRECTORY || cur.text()? != name {
+        return Err(invalid("table directory differs from the catalog"));
+    }
+    let width = cur.u16()? as usize;
+    if width != fields.len() {
+        return Err(invalid("table directory width differs from the catalog"));
+    }
+    for field in fields {
+        let stored =
+            Field { name: cur.text()?, ty: read_type(&mut cur)?, not_null: cur.u8()? != 0 };
+        if &stored != field {
+            return Err(invalid("table directory schema differs from the catalog"));
+        }
+    }
+    let mut dictionaries = Vec::with_capacity(width);
+    for _ in 0..width {
+        let held = match cur.u8()? {
+            0 => false,
+            1 => {
+                cur.skip(20)?;
+                true
+            }
+            _ => return Err(invalid("dictionary page tag differs")),
+        };
+        dictionaries.push(held);
+    }
+    for _ in 0..width {
+        match cur.u8()? {
+            0 => {}
+            1 => cur.skip(8)?,
+            _ => return Err(invalid("distinct count tag differs")),
+        }
+    }
+    if cur.u64()? != rows as u64 {
+        return Err(invalid("table row count differs from the catalog"));
+    }
+    let stripes = cur.u32()? as usize;
+    let mut total = 0_usize;
+    let mut nulls = 0_u64;
+    for _ in 0..stripes {
+        let parts = cur.u32()? as usize;
+        if parts == 0 || parts > STRIPE_PARTS {
+            return Err(invalid("stripe part count is outside its bound"));
+        }
+        let mut stripe_rows = 0_usize;
+        for _ in 0..parts {
+            stripe_rows = stripe_rows
+                .checked_add(cur.u32()? as usize)
+                .ok_or_else(|| invalid("stripe row count overflow"))?;
+        }
+        total =
+            total.checked_add(stripe_rows).ok_or_else(|| invalid("stripe row count overflow"))?;
+        cur.skip(12 + width * 12)?;
+        for (field, held) in fields.iter().zip(&dictionaries) {
+            if field.ty == LogicalType::Varchar && *held {
+                cur.skip(20)?;
+            }
+        }
+        for _ in 0..width * 2 {
+            match cur.u8()? {
+                0 => {}
+                1 => cur.skip(20)?,
+                _ => return Err(invalid("stripe page tag differs")),
+            }
+        }
+        for column in 0..width {
+            cur.skip_bound()?;
+            cur.skip_bound()?;
+            let count = cur.u32()? as u64;
+            if count > stripe_rows as u64 {
+                return Err(invalid("null count exceeds stripe rows"));
+            }
+            if column == wanted {
+                nulls = nulls.checked_add(count).ok_or_else(|| invalid("null count overflow"))?;
+            }
+            cur.skip(1)?;
+            match cur.u8()? {
+                0 => {}
+                1 => cur.skip(16)?,
+                _ => return Err(invalid("a stripe sum has an unknown tag")),
+            }
+        }
+    }
+    if total != rows {
+        return Err(invalid("table row count differs from stripes"));
+    }
+    if cur.done() {
+        return Ok(None);
+    }
+    let magic = cur.take(8)?;
+    let values = magic == FREQUENCIES;
+    if !values && magic != FREQUENCIES_V2 {
+        return Err(invalid("directory extension magic differs"));
+    }
+    if cur.u16()? as usize != width {
+        return Err(invalid("frequency column count differs"));
+    }
+    for _ in 0..wanted {
+        skip_summary(&mut cur, values, rows)?;
+    }
+    let Some(summary) = decode_summary(&mut cur, &fields[wanted], rows, values)? else {
+        return Ok(None);
+    };
+    let zero = summary
+        .entries
+        .iter()
+        .find(|entry| entry.value == FrequencyValue::Integer(0))
+        .map(|entry| entry.count)
+        .or_else(|| (summary.omitted_max == 0).then_some(0));
+    Ok(zero.and_then(|zero| (rows as u64).checked_sub(nulls)?.checked_sub(zero)))
 }
 
 fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
@@ -10482,6 +10874,7 @@ mod tests {
                 fields: vec![Field::required("id", LogicalType::Integer)],
                 rows: 1,
                 directory: Page { offset: HEADER, length: 8, hash: 0 },
+                nonzero: vec![None],
             }],
             &[sample_view("items")],
         )
@@ -11615,6 +12008,47 @@ mod tests {
                 "column {column}"
             );
         }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn narrow_nonzero_count_matches_the_full_reader_across_stripes() {
+        let path = path("quick-nonzero");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![Field::new("label", LogicalType::Varchar), Field::new("id", LogicalType::Integer)],
+        )
+        .expect("create");
+        for ids in [
+            &[Value::Integer(0), Value::Null, Value::Integer(3)][..],
+            &[Value::Integer(0), Value::Integer(7), Value::Null][..],
+        ] {
+            let labels = vec![Value::Varchar("same".into()); ids.len()];
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, &labels).expect("labels"),
+                        Vector::from_values(LogicalType::Integer, ids).expect("ids"),
+                    ])
+                    .expect("chunk"),
+                )
+                .expect("append");
+        }
+        writer.finish().expect("finish");
+        let catalog = Catalog::open(&path).expect("catalog");
+        assert_eq!(catalog.entries[0].nonzero, vec![None, Some(2)]);
+        assert_eq!(catalog.nonzero_count("items", 1).expect("quick count"), Some(2));
+        assert_eq!(
+            reader_nonzero_counts(&catalog.table("items").expect("reader")).expect("counts"),
+            vec![None, Some(2)]
+        );
+        Writer::certify_counts(&path).expect("recertify");
+        assert_eq!(
+            Catalog::open(&path).expect("reopen").nonzero_count("items", 1).expect("count"),
+            Some(2)
+        );
+        assert_eq!(catalog.table("items").expect("reader").null_count(1).expect("nulls"), 2);
         fs::remove_file(path).expect("remove scratch file");
     }
 
