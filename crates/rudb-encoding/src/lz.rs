@@ -53,8 +53,19 @@ const SEGMENT: usize = 256 * 1024;
 /// lz4 landed on for the same reason.
 const MIN_MATCH: usize = 4;
 
-/// The shortest copy worth emitting, as the value the hash is taken over.
+/// How many bits of hash pick a chain.
 const HASH_BITS: u32 = 16;
+
+/// How many bytes a position is hashed over, which is the shortest copy the chains lead to.
+///
+/// Eight rather than [`MIN_MATCH`]. Over four bytes, the chains of a block of URLs are long with
+/// positions that share `http` or `.com/` and nothing after it, and the walk spends its tries on
+/// them. Over eight a chain holds positions that agree for eight bytes, so the tries go to copies
+/// worth having. On the `URL`, `Title` and `Referer` columns of `hits_0` in blocks of 1024 values
+/// the matcher took 25, 39 and 19 percent less time, and the blocks came out 5, 5 and 6 percent
+/// smaller, because the tries it no longer spends on short copies find longer ones. A copy of four
+/// to seven bytes is only found now when a hash collision leads to it, and those rarely saved much.
+const HASH_LEN: usize = 8;
 
 /// How far back along one hash chain the search goes before it settles for what it has.
 ///
@@ -114,10 +125,10 @@ fn matches_in(
     let mut literal_start = start;
     let mut at = start;
     while at < end {
-        if at + MIN_MATCH > end {
+        if at + HASH_LEN > end {
             break;
         }
-        let key = hash(&input[at..at + MIN_MATCH]);
+        let key = hash(&input[at..at + HASH_LEN]);
         let found = longest(input, at, end, head[key], prev, start);
         insert(input, at, end, head, prev, start);
         match found {
@@ -179,10 +190,10 @@ fn longest(
 
 /// Puts `at` at the head of its chain, so later positions can match against it.
 fn insert(input: &[u8], at: usize, end: usize, head: &mut [u32], prev: &mut [u32], start: usize) {
-    if at + MIN_MATCH > end {
+    if at + HASH_LEN > end {
         return;
     }
-    let key = hash(&input[at..at + MIN_MATCH]);
+    let key = hash(&input[at..at + HASH_LEN]);
     let slot = at - start;
     prev[slot] = head[key];
     head[key] = slot as u32;
@@ -312,8 +323,8 @@ pub(crate) fn replay(
 }
 
 fn hash(bytes: &[u8]) -> usize {
-    let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    (word.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS)) as usize
+    let word = u64::from_le_bytes(bytes[..HASH_LEN].try_into().expect("eight bytes to hash"));
+    (word.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - HASH_BITS)) as usize
 }
 
 /// How many bytes `a` and `b` start with in common.
@@ -342,6 +353,44 @@ fn shared(a: &[u8], b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Times the matcher over real text and says what the blocks come to, for comparing matchers.
+    ///
+    /// `LZ_DATA` names a directory of files with one value a line, in the order a dictionary first
+    /// saw them. They are cut into blocks of 1024 values the way a dictionary's payload is, and each
+    /// block is matched as it is and after front coding, which are the two ways a settled shape
+    /// reaches this.
+    #[test]
+    #[ignore = "a measurement over real text, run by hand in release with LZ_DATA set"]
+    fn measure_on_real_text() {
+        use crate::string::{Kind, front_code, size_as};
+        use std::time::{Duration, Instant};
+        let Ok(dir) = std::env::var("LZ_DATA") else { return };
+        for name in ["URL", "Title", "Referer"] {
+            let text = std::fs::read(format!("{dir}/{name}.txt")).expect("a data file");
+            let values: Vec<&[u8]> =
+                text.split(|byte| *byte == b'\n').filter(|value| !value.is_empty()).collect();
+            let (mut raw, mut lz, mut front) = (0, 0, 0);
+            let mut spent = Duration::ZERO;
+            for block in values.chunks(1024) {
+                let joined = block.concat();
+                let suffixes = front_code(block).1.concat();
+                raw += joined.len();
+                let start = Instant::now();
+                std::hint::black_box(tokens_of(&joined));
+                std::hint::black_box(tokens_of(&suffixes));
+                spent += start.elapsed();
+                lz += size_as(Kind::Lz, block, 0).expect("encodes").expect("applies");
+                front += size_as(Kind::Front, block, 0).expect("encodes").expect("applies");
+            }
+            println!(
+                "{name}: {raw} bytes, matched in {:.1} ms, LZ {lz} ({:.3}x), FRONT {front} ({:.3}x)",
+                spent.as_secs_f64() * 1e3,
+                raw as f64 / lz as f64,
+                raw as f64 / front as f64,
+            );
+        }
+    }
 
     fn round_trip(input: &[u8]) {
         let tokens = tokens_of(input);
@@ -445,8 +494,8 @@ mod tests {
                 head.fill(u32::MAX);
                 let mut literal_start = start;
                 let mut at = start;
-                while at + MIN_MATCH <= end {
-                    let mut candidate = head[hash(&input[at..at + MIN_MATCH])];
+                while at + HASH_LEN <= end {
+                    let mut candidate = head[hash(&input[at..at + HASH_LEN])];
                     let mut found: Option<(usize, usize)> = None;
                     let mut tries = 0;
                     while candidate != u32::MAX && tries < MAX_TRIES {
