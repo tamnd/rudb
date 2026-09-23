@@ -256,6 +256,39 @@ fn a_view_over_a_parquet_file_runs_the_published_benchmark_sql_unmodified() {
     assert_eq!(result.value_at(0, 2), Value::Double(699.5));
 }
 
+#[test]
+fn a_date_filter_through_the_benchmark_view_counts_what_a_filter_on_the_stored_days_counts() {
+    // The view turns the stored count of days into a date, and the filter on that date is moved back
+    // onto the count so a row group can be skipped on it. Every comparison has to count the same rows
+    // either way, including the ones no row satisfies and the ones every row does.
+    let sql = format!(
+        "CREATE VIEW hits AS SELECT * REPLACE (DATE '1970-01-01' + EventDate::INTEGER AS EventDate) FROM read_parquet('{HITS}')"
+    );
+    let database = ran(&[&sql]);
+    let pairs = [
+        ("EventDate >= '2013-07-01' AND EventDate <= '2013-07-31'", "d >= 15887 AND d <= 15917"),
+        ("EventDate = '2013-07-15'", "d = 15901"),
+        ("'2013-07-15' < EventDate", "15901 < d"),
+        ("EventDate <> '2013-07-15'", "d <> 15901"),
+        ("EventDate < '1969-12-01'", "d < -31"),
+        ("EventDate >= '1969-12-01'", "d >= -31"),
+    ];
+    for (dated, counted) in pairs {
+        let through = database
+            .value(&format!("SELECT COUNT(*) FROM hits WHERE {dated}"))
+            .unwrap_or_else(|error| panic!("{dated}: {error}"));
+        let raw = database
+            .value(&format!(
+                "SELECT COUNT(*) FROM (SELECT EventDate::INTEGER AS d FROM read_parquet('{HITS}')) WHERE {counted}"
+            ))
+            .unwrap_or_else(|error| panic!("{counted}: {error}"));
+        assert_eq!(through, raw, "{dated} against {counted}");
+    }
+    let plan =
+        database.plan("SELECT COUNT(*) FROM hits WHERE EventDate >= '2013-07-01'").expect("a plan");
+    assert!(plan.contains(">= 15887::USMALLINT"), "the filter is not on the stored days:\n{plan}");
+}
+
 /// A file holding a database the statements were run against, and the path it is at.
 ///
 /// Opened, written to and dropped, so what comes back is a committed file and not a handle. Every

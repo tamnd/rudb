@@ -309,6 +309,10 @@ fn simplify(plan: &mut Plan, expr: ExprRef) -> ExprRef {
         Expr::Conjunction { op, children } => conjunction(plan, expr, op, children),
         Expr::Case { arms, otherwise } => case(plan, expr, arms, otherwise),
         Expr::Compare { op, left, right } => {
+            if let Some(shifted) = shifted_comparison(plan, expr, op, left, right) {
+                let Expr::Compare { op, left, right } = *plan.expr(shifted) else { return shifted };
+                return narrowed_comparison(plan, shifted, op, left, right).unwrap_or(shifted);
+            }
             match narrowed_comparison(plan, expr, op, left, right) {
                 Some(narrowed) => narrowed,
                 None => null_comparison(plan, expr, op, left, right),
@@ -370,6 +374,68 @@ fn narrowed_comparison(
     let (left, right) = if cast_on_the_left { (cast, constant) } else { (constant, cast) };
     let ty = plan.expr_type(expr).clone();
     Some(plan.add_expr_at(Expr::Compare { op, left, right }, ty, plan.expr_span(expr)))
+}
+
+/// Moves a constant date off a count of days and onto the date it is compared against.
+///
+/// A Parquet file keeps a date as a count of days, and the view ClickBench reads it through turns
+/// the count back into a date with `DATE '1970-01-01' + EventDate`. A filter on that date is then a
+/// comparison on an expression, which neither a row group's statistics nor a stored zone can
+/// answer, so a query that wants one month reads every row to find it. Adding a constant is strictly
+/// increasing, so `d0 + x < d1` holds exactly when `x < d1 - d0`, and the second form is a column
+/// against a constant again. [`narrowed_comparison`] then takes the widening cast off the column.
+///
+/// The sum is checked by the kernel and raises when it leaves the range of a date, and a rewrite
+/// that removed the sum would remove the error with it. So this only fires when no value the count
+/// can hold takes the date out of range, which it reads off the integer type under a widening cast,
+/// and it declines for a bare `INTEGER`, whose extremes do.
+fn shifted_comparison(
+    plan: &mut Plan,
+    expr: ExprRef,
+    op: CompareOp,
+    left: ExprRef,
+    right: ExprRef,
+) -> Option<ExprRef> {
+    let (sum, bound, op) = match (plan.expr(left), plan.expr(right)) {
+        (Expr::Function { .. }, Expr::Constant(_)) => (left, right, op),
+        (Expr::Constant(_), Expr::Function { .. }) => (right, left, op.flip()),
+        _ => return None,
+    };
+    let Value::Date(bound) = constant(plan, bound)? else { return None };
+    let Expr::Function { name, args } = *plan.expr(sum) else { return None };
+    if plan.string(name) != "+" {
+        return None;
+    }
+    let &[first, second] = plan.expr_list(args) else { return None };
+    let (origin, count) = match (constant(plan, first), constant(plan, second)) {
+        (Some(Value::Date(origin)), None) => (origin, second),
+        (None, Some(Value::Date(origin))) => (origin, first),
+        _ => return None,
+    };
+    if *plan.expr_type(count) != LogicalType::Integer {
+        return None;
+    }
+    let held = match *plan.expr(count) {
+        Expr::Cast { input, .. } => plan.expr_type(input).clone(),
+        _ => LogicalType::Integer,
+    };
+    let (low, high) = integer_range(&held)?;
+    // Far inside the kernel's range on both sides, so no sum a count of this type makes can fail.
+    let room = 1_i128 << 30;
+    let origin = i128::from(origin);
+    if origin.abs() >= room || low <= -room || high >= room {
+        return None;
+    }
+    let apart = integer_of(&LogicalType::Integer, i128::from(bound) - origin)?;
+    let held = plan.add_value(apart);
+    let constant =
+        plan.add_expr_at(Expr::Constant(held), LogicalType::Integer, plan.expr_span(right));
+    let ty = plan.expr_type(expr).clone();
+    Some(plan.add_expr_at(
+        Expr::Compare { op, left: count, right: constant },
+        ty,
+        plan.expr_span(expr),
+    ))
 }
 
 /// The inclusive range of an integer type, in the widest signed integer a plan value holds.
@@ -694,6 +760,44 @@ mod tests {
         // UBIGINT is eight bytes to INTEGER's four and still holds none of INTEGER's negatives, so
         // width is not the test and the rule declines.
         let before = format!("Filter (CAST(#0.0::INTEGER)::UBIGINT = 5::UBIGINT)::BOOLEAN\n{SCAN}");
+        assert_eq!(folded(&before), before);
+    }
+
+    /// A scan with a count of days in the width a Parquet file stores it in, and a bare INTEGER.
+    const DAYS: &str = "  Get memory.main.t AS t #0 [d::USMALLINT, i::INTEGER]\n";
+
+    #[test]
+    fn a_date_made_from_a_count_of_days_is_compared_as_the_count() {
+        let before = format!(
+            "Filter (\"+\"(0::DATE, CAST(#0.0::USMALLINT)::INTEGER)::DATE >= 15887::DATE)::BOOLEAN\n{DAYS}"
+        );
+        let after = format!("Filter (#0.0::USMALLINT >= 15887::USMALLINT)::BOOLEAN\n{DAYS}");
+        assert_eq!(folded(&before), after);
+    }
+
+    #[test]
+    fn a_date_on_the_left_flips_the_comparison_onto_the_count() {
+        let before = format!(
+            "Filter (15917::DATE >= \"+\"(CAST(#0.0::USMALLINT)::INTEGER, 10::DATE)::DATE)::BOOLEAN\n{DAYS}"
+        );
+        let after = format!("Filter (#0.0::USMALLINT <= 15907::USMALLINT)::BOOLEAN\n{DAYS}");
+        assert_eq!(folded(&before), after);
+    }
+
+    #[test]
+    fn a_date_before_the_origin_keeps_the_cast_since_no_count_reaches_it() {
+        let before = format!(
+            "Filter (\"+\"(0::DATE, CAST(#0.0::USMALLINT)::INTEGER)::DATE < -3::DATE)::BOOLEAN\n{DAYS}"
+        );
+        let after =
+            format!("Filter (CAST(#0.0::USMALLINT)::INTEGER < -3::INTEGER)::BOOLEAN\n{DAYS}");
+        assert_eq!(folded(&before), after);
+    }
+
+    #[test]
+    fn a_bare_integer_count_is_left_alone_because_its_extremes_leave_the_range_of_a_date() {
+        let before =
+            format!("Filter (\"+\"(0::DATE, #0.1::INTEGER)::DATE >= 15887::DATE)::BOOLEAN\n{DAYS}");
         assert_eq!(folded(&before), before);
     }
 
