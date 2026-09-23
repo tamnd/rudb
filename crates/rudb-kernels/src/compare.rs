@@ -1670,6 +1670,17 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
             Value::Interval { months: bm, days: bd, micros: bu },
         ) => Ok(interval_micros(*am, *ad, *au).cmp(&interval_micros(*bm, *bd, *bu))),
         (Value::List { values: a, .. }, Value::List { values: b, .. }) => list_order(a, b),
+        // Two structs of one type order field by field in the order the type lists them, with a
+        // null field above everything the way a null element is in a list, which is the pin's.
+        (Value::Struct(a), Value::Struct(b)) => {
+            for ((_, one), (_, other)) in a.iter().zip(b) {
+                let ordering = order_with_nulls(one, other, false)?;
+                if ordering != Ordering::Equal {
+                    return Ok(ordering);
+                }
+            }
+            Ok(a.len().cmp(&b.len()))
+        }
         _ => numeric_order(left, right),
     }
 }

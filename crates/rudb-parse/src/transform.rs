@@ -2007,6 +2007,7 @@ impl<'a> Transform<'a> {
                 // of more than one is a row.
                 "ParensExpression" if count == 1 => node = self.first(node),
                 "BoundedListExpression" => return self.list(node),
+                "StructExpression" => return self.structure(node),
                 "QuestionMarkNumberedParameter"
                 | "AnonymousParameter"
                 | "NumberedParameter"
@@ -3202,6 +3203,27 @@ impl<'a> Transform<'a> {
         Ok(self.push(Expr::List { items }))
     }
 
+    /// `StructExpression <- '{' List(StructField)? '}'` and
+    /// `StructField <- ColIdOrString ':' Expression`.
+    ///
+    /// A field name is read the way a column name is, so `{a: 1}`, `{"a": 1}` and `{'a': 1}` are
+    /// the same struct, and a name written twice is left for the binder to refuse in the pin's words.
+    fn structure(&mut self, node: u32) -> Result<ExprRef> {
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        for field in self.kids(node).collect::<Vec<_>>() {
+            let kids: Vec<u32> = self.kids(field).collect();
+            let [name, value] = kids[..] else {
+                return self.unsupported(field);
+            };
+            names.push(self.identifier(name));
+            values.push(self.expr(value)?);
+        }
+        let names = self.part_slice(names);
+        let values = self.expr_slice(values);
+        Ok(self.push(Expr::Struct { names, values }))
+    }
+
     /// `SubqueryExpression <- SubqueryNot? SubqueryExists? SubqueryReference`.
     fn subquery(&mut self, node: u32) -> Result<ExprRef> {
         let negated = self.find(node, "SubqueryNot") != NONE;
@@ -3679,6 +3701,14 @@ mod tests {
             }
             Expr::Parameter { name } => format!("${}", ast.string(name)),
             Expr::Row { items } => format!("ROW({})", list(items)),
+            Expr::Struct { names, values } => {
+                let fields: Vec<String> = ast
+                    .name(names)
+                    .zip(ast.expr_list(values))
+                    .map(|(name, &value)| format!("{name}: {}", show(ast, value)))
+                    .collect();
+                format!("{{{}}}", fields.join(", "))
+            }
             Expr::Subquery { query } => format!("({})", show_query(ast, query)),
             Expr::Exists { query, negated } => {
                 let exists = format!("EXISTS ({})", show_query(ast, query));

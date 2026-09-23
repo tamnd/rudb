@@ -64,6 +64,7 @@ use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
 use crate::shape::{first, identity, nulls_of, single};
+use crate::structs;
 use crate::subscript;
 use crate::text;
 
@@ -197,6 +198,9 @@ fn specialized<V: AsRef<Vector>>(
         return substring_of(args, returns, rows);
     }
     if let Some(vector) = lists::vectorized(name, args, returns, rows)? {
+        return Ok(Some(vector));
+    }
+    if let Some(vector) = structs::vectorized(name, args, returns)? {
         return Ok(Some(vector));
     }
     match args {
@@ -2677,6 +2681,11 @@ pub fn call_values(
     // than an answer for the whole call. `[1, NULL]` is a list of two things on the pin and not null,
     // and the difference between a null list and a list holding a null is the difference this whole
     // family of types exists to keep.
+    // A struct holds a null field as a field, and a field of a null struct is null, so both of
+    // these answer before the null rule does.
+    if let Some(value) = structs::value(name, args, returns)? {
+        return Ok(value);
+    }
     if name == "list_value" {
         let LogicalType::List(element) = returns else {
             return Err(Error::internal(format!("list_value returning {returns}")));
