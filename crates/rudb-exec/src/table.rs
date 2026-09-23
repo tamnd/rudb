@@ -1196,18 +1196,26 @@ fn window_of(
         return None;
     }
     let nullable = !key.none_null();
+    // A block at a time, so that a key spread wider than the map, a user id say, is given up
+    // after a block rather than after the whole chunk. Its rows are hashed after all of this, and
+    // a whole pass here that ends in a refusal was five percent of ClickBench 18.
     let (mut lowest, mut highest) = (i64::MAX, i64::MIN);
-    if nullable {
-        for (row, &value) in into.iter().enumerate() {
-            if !key.is_null_at(row) {
+    for (block, values) in into.chunks(128).enumerate() {
+        if nullable {
+            for (row, &value) in values.iter().enumerate() {
+                if !key.is_null_at(block * 128 + row) {
+                    lowest = lowest.min(value);
+                    highest = highest.max(value);
+                }
+            }
+        } else {
+            for &value in values {
                 lowest = lowest.min(value);
                 highest = highest.max(value);
             }
         }
-    } else {
-        for &value in into.iter() {
-            lowest = lowest.min(value);
-            highest = highest.max(value);
+        if lowest <= highest && (i128::from(highest) - i128::from(lowest)) >= limit as i128 {
+            return None;
         }
     }
     let kept = match held {
