@@ -228,6 +228,7 @@ dependencies = [
  "rudb-bind",
  "rudb-catalog",
  "rudb-common",
+ "rudb-csv",
  "rudb-exec",
  "rudb-functions",
  "rudb-graph",
