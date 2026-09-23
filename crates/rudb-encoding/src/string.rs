@@ -933,10 +933,14 @@ fn replay_in_place(
         .checked_add(REPLAY_SLACK)
         .ok_or_else(|| Error::internal("a string chunk longer than memory"))?;
     out.resize(base + room, 0);
-    let mut read = 0;
+    let mut payload = compressed.payload;
     let mut at = base;
-    for (index, (&length, &offset)) in lengths.iter().zip(offsets).enumerate() {
-        at = compressed.table.decompress_at(compressed.run(index, &mut read)?, out, at)?;
+    for ((&run, &length), &offset) in compressed.lengths.iter().zip(lengths).zip(offsets) {
+        let Some((codes, rest)) = payload.split_at_checked(run) else {
+            return Err(Error::internal("a compressed run is past the end of its chunk"));
+        };
+        payload = rest;
+        at = compressed.table.decompress_at(codes, out, at)?;
         let length =
             usize::try_from(length).map_err(|_| Error::internal("a negative copy length"))?;
         if length == 0 {
