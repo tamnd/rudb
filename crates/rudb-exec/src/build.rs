@@ -854,7 +854,8 @@ fn scanned<'a>(
     Ok(None)
 }
 
-/// What turns a join's build side into exact driving rows, when the join is over a stored link.
+/// What turns a join's build side into exact driving rows, when the join is over a stored link, or
+/// into an exact test of the driving column when the parent has a key map and there is no link.
 ///
 /// spec/graph/05-execution.md section 5.4, and the conditions that make it exact rather than
 /// approximately right. The build side's key has to be the parent's stored key column, read as it
@@ -882,16 +883,22 @@ fn exact(
     let key = traced(plan, parent, key)?;
     let (parent_table, parent_columns) = scanned(plan, catalog, parent, key.table).ok()??;
     let (child_table, child_columns) = scanned(plan, catalog, driving, binding.table).ok()??;
-    let (child_rows, parent_rows) = (child_table.rows().stored()?, parent_table.rows().stored()?);
+    let parent_rows = parent_table.rows().stored()?;
     let parent_column = stored_column(plan, parent_table, key.table, parent_columns, key)?;
-    let edge = rudb_native::graph::Edge {
-        child: child_table.name().table.clone(),
-        child_column: stored_column(plan, child_table, binding.table, child_columns, binding)?,
-        parent: parent_table.name().table.clone(),
-        parent_column,
-    };
-    let link = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)?;
+    let child_column = stored_column(plan, child_table, binding.table, child_columns, binding)?;
     let keys = rudb_native::graph::key_map(parent_rows, parent_column)?;
+    // No link is a join that still has the key map, and the key map alone is enough for an exact
+    // test of the driving column's values, see `sideways::Domain`. A link over the budget is not in
+    // the file, and neither is one for a child that is not one committed file.
+    let link = child_table.rows().stored().and_then(|child_rows| {
+        let edge = rudb_native::graph::Edge {
+            child: child_table.name().table.clone(),
+            child_column,
+            parent: parent_table.name().table.clone(),
+            parent_column,
+        };
+        rudb_native::graph::stored_link(child_rows, parent_rows, &edge)
+    });
     Some(Exact::new(keys, link))
 }
 

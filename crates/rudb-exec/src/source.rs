@@ -754,6 +754,19 @@ impl<'a> Scan<'a> {
     ///
     /// Whatever narrowing the chunk to the rows that survived raises.
     fn sift(&self, chunk: &mut Chunk) -> Result<()> {
+        // The bitmap a join over a relationship with no link in the file leaves, which is exact and
+        // costs a subtraction and a bit a row, so it is not asked whether it is paying its way. It
+        // takes the place of the filter rather than going in front of it, see `Found::domain`.
+        if let Some((at, domain)) = self.sideways.as_ref().and_then(|s| s.domain(self.index)) {
+            let Ok(column) = chunk.column(at) else { return Ok(()) };
+            let rows = chunk.len();
+            let kept = domain.keep(column, rows, &mut Vec::new());
+            if kept.len() < rows {
+                let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+                *chunk = whole.select(&Selection::from_indices(kept))?;
+            }
+            return Ok(());
+        }
         let Some((at, filter)) = self.sideways.as_ref().and_then(|s| s.sifting(self.index)) else {
             return Ok(());
         };

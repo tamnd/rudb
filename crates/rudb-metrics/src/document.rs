@@ -287,6 +287,7 @@ impl Document {
                             out.count("kept", reduced.kept);
                             out.count("rows", reduced.rows);
                             out.flag("stopped", reduced.stopped);
+                            out.flag("by_key", reduced.by_key);
                         });
                     }
                 });
@@ -762,6 +763,11 @@ pub struct Reduced {
     pub rows: u64,
     /// Whether the push gave up after a third of the table because it had removed nothing.
     pub stopped: bool,
+    /// Whether the build side's keys were tested against a bitmap over the parent's key range
+    /// rather than pushed through a link, which is what a join over a relationship whose link is not
+    /// in the file gets. Then `kept` and `rows` count the parent's keys, because the rows of the
+    /// table are only tested as they are read.
+    pub by_key: bool,
 }
 
 /// How a join found the rows one row matches.
