@@ -25,7 +25,8 @@ use crate::ast::{
     Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Cte, Distinct, DropTable, Expr,
     ExprRef, Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody,
     QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement,
-    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    StrRef, Target, Transaction, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec,
+    WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -455,6 +456,18 @@ impl<'a> Transform<'a> {
             "PragmaStatement" => self.pragma_statement(inner),
             "ExplainStatement" => self.explain_statement(inner),
             "CheckpointStatement" => Ok(Statement::Checkpoint),
+            "TransactionStatement" => {
+                let kind = self.first(inner);
+                Ok(Statement::Transaction(match self.name(kind) {
+                    "BeginTransaction" => {
+                        let mode = self.find(kind, "ReadOrWrite");
+                        let read_only = mode != NONE && self.descendant(mode, "ReadOnly") != NONE;
+                        Transaction::Begin { read_only }
+                    }
+                    "CommitTransaction" => Transaction::Commit,
+                    _ => Transaction::Rollback,
+                }))
+            }
             "CallStatement" => {
                 let query = self.call_query(inner)?;
                 Ok(Statement::Query(query))
@@ -4209,6 +4222,12 @@ mod tests {
                 format!("RESET{scope} {}", ast.string(setting.name))
             }
             Statement::Checkpoint => "CHECKPOINT".to_string(),
+            Statement::Transaction(Transaction::Begin { read_only: false }) => "BEGIN".to_string(),
+            Statement::Transaction(Transaction::Begin { read_only: true }) => {
+                "BEGIN READ ONLY".to_string()
+            }
+            Statement::Transaction(Transaction::Commit) => "COMMIT".to_string(),
+            Statement::Transaction(Transaction::Rollback) => "ROLLBACK".to_string(),
             Statement::Explain { query, analyze, statistics } => {
                 let analyze = if analyze { "ANALYZE " } else { "" };
                 let statistics = if statistics { "(STATISTICS) " } else { "" };

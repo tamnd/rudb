@@ -47,6 +47,8 @@ pub enum Bound {
     Setting(Setting),
     /// Flushes a persistent database snapshot.
     Checkpoint,
+    /// `BEGIN`, `COMMIT` or `ROLLBACK`, which have nothing to bind and are carried as written.
+    Transaction(ast::Transaction),
     /// `EXPLAIN` over a query, holding the plan of the query rather than the query.
     ///
     /// The same `Plan` a [`Bound::Query`] would have carried, bound the same way and by the same
@@ -237,6 +239,7 @@ fn bind_one(
             setting(ast, catalog, parameters, session, index)
         }
         ast::Statement::Checkpoint => Ok(Bound::Checkpoint),
+        ast::Statement::Transaction(kind) => Ok(Bound::Transaction(kind)),
         ast::Statement::Explain { query, analyze, statistics } => {
             let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, query)?;

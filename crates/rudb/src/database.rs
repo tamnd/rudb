@@ -592,6 +592,8 @@ struct Inner {
     /// ends, and reads can run while the rows go in. Every other writer takes this too, which is
     /// what stops a checkpoint or a second load from writing the file under the first one.
     writer: Mutex<()>,
+    /// The transaction a `BEGIN` opened, until a `COMMIT` or a `ROLLBACK` closes it.
+    open: Mutex<Option<Open>>,
     /// Told when a load has let go of the catalog, so a test can run a query in the middle of one.
     #[cfg(test)]
     loading: Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -653,12 +655,35 @@ struct CachedNativeAggregate {
 /// The error is swallowed, because a `Drop` has nowhere to put one. [`Database::close`] is the same
 /// write with the error handed back, for a program that wants to know. Nothing is written for an in
 /// memory database, which has no file, or for a read only one, which was asked not to.
+/// A transaction `BEGIN` opened and nothing has closed yet.
+///
+/// The catalog as it was at the `BEGIN` is kept whole, and a `ROLLBACK` puts it back. A table's
+/// rows are chunks that are shared rather than copied when the catalog is cloned, so holding the
+/// old one costs the rows that changed and not the database. One transaction for the database
+/// rather than one per connection, which is as much as a database that runs its statements one at
+/// a time can tell apart.
+#[derive(Debug)]
+struct Open {
+    /// What the catalog was when the transaction began.
+    before: Catalog,
+    /// Whether a statement failed inside it, after which only `COMMIT` and `ROLLBACK` run and both
+    /// of them roll back, which is what the pin does.
+    aborted: bool,
+    /// Whether it was begun `READ ONLY`.
+    read_only: bool,
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         let Some(path) = self.path.as_ref().filter(|_| self.writable) else {
             return;
         };
         let catalog = self.catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
+        // A transaction still open when the database goes away never committed, so what it changed
+        // is not what the file gets.
+        if let Some(open) = self.open.get_mut().unwrap_or_else(PoisonError::into_inner).take() {
+            catalog.restore(open.before);
+        }
         let _ = persist(path, catalog, &self.pages);
     }
 }
@@ -1055,6 +1080,7 @@ impl Database {
         let inner = Inner {
             catalog: RwLock::new(Catalog::new()),
             writer: Mutex::default(),
+            open: Mutex::default(),
             #[cfg(test)]
             loading: Mutex::default(),
             path: None,
@@ -1193,6 +1219,7 @@ impl Database {
         let inner = Inner {
             catalog: RwLock::new(catalog),
             writer: Mutex::default(),
+            open: Mutex::default(),
             #[cfg(test)]
             loading: Mutex::default(),
             path: Some(path),
@@ -2180,10 +2207,77 @@ impl Shared {
     /// since printing a plan changes nothing. A statement that writes is refused here rather than
     /// run under a read lock.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
-        if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
-            return Ok(answer);
+        self.in_transaction(sql, || {
+            if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
+                return Ok(answer);
+            }
+            self.query_mirrored(sql, cancel, true)
+        })
+    }
+
+    /// Runs a statement under whatever transaction is open.
+    ///
+    /// A transaction a statement failed in is aborted, and until it is closed every statement but
+    /// the one closing it is refused with the pin's sentence. A statement that did not parse leaves
+    /// the transaction as it was, because on the pin it never reached one.
+    fn in_transaction(
+        &self,
+        sql: &str,
+        run: impl FnOnce() -> Result<QueryResult>,
+    ) -> Result<QueryResult> {
+        let aborted = self.open().as_ref().is_some_and(|open| open.aborted);
+        if aborted && crate::syntax::statement_kind(sql) != Some("TransactionStatement") {
+            return Err(Error::transaction("Current transaction is aborted (please ROLLBACK)"));
         }
-        self.query_mirrored(sql, cancel, true)
+        let result = run();
+        if let Err(error) = &result
+            && error.code() != rudb_common::ErrorCode::Parser
+            && let Some(open) = self.open().as_mut()
+        {
+            open.aborted = true;
+        }
+        result
+    }
+
+    /// The open transaction, if there is one.
+    fn open(&self) -> MutexGuard<'_, Option<Open>> {
+        self.inner.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `BEGIN`, `COMMIT` or `ROLLBACK`, with the pin's refusals for the ones that do not fit.
+    fn transaction(&self, kind: ast::Transaction, catalog: &mut Catalog) -> Result<QueryResult> {
+        let mut open = self.open();
+        match kind {
+            ast::Transaction::Begin { read_only } => {
+                if open.is_some() {
+                    return Err(Error::transaction(
+                        "cannot start a transaction within a transaction",
+                    ));
+                }
+                *open = Some(Open { before: catalog.clone(), aborted: false, read_only });
+            }
+            ast::Transaction::Commit => {
+                let Some(closed) = open.take() else {
+                    return Err(Error::transaction("cannot commit - no transaction is active"));
+                };
+                if closed.aborted {
+                    catalog.restore(closed.before);
+                }
+            }
+            ast::Transaction::Rollback => {
+                let Some(closed) = open.take() else {
+                    return Err(Error::transaction("cannot rollback - no transaction is active"));
+                };
+                catalog.restore(closed.before);
+            }
+        }
+        Ok(QueryResult::empty())
+    }
+
+    /// Whether a transaction is open, which is what keeps a load from writing the file directly,
+    /// since a file that was written cannot be rolled back.
+    fn transacting(&self) -> bool {
+        self.open().is_some()
     }
 
     /// Reuse a simple native aggregate plan while the table and settings are unchanged.
@@ -2562,13 +2656,16 @@ impl Shared {
     /// SELECT * FROM t` would otherwise read the table under a read lock, let go, and append to
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
-        if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
-            return Ok(answer);
-        }
-        let session = self.session();
-        let (ast, parse_ns) =
-            timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
-        self.execute_ast(&ast, sql, &Parameters::new(), cancel, parse_ns)
+        self.in_transaction(sql, || {
+            if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
+                return Ok(answer);
+            }
+            let session = self.session();
+            let (ast, parse_ns) = timed(|| {
+                rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())
+            })?;
+            self.execute_ast(&ast, sql, &Parameters::new(), cancel, parse_ns)
+        })
     }
 
     /// Runs one parsed statement, with values for its parameters.
@@ -2625,6 +2722,16 @@ impl Shared {
                 return self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, false);
             }
         }
+        let writes = matches!(
+            bound,
+            Bound::CreateTable(_) | Bound::CreateView(_) | Bound::DropTable(_) | Bound::Insert(_)
+        );
+        if writes && self.open().as_ref().is_some_and(|open| open.read_only) {
+            return Err(Error::transaction(format!(
+                "Cannot write to database \"\"{}\"\" - transaction is launched in read-only mode",
+                catalog.default_catalog()
+            )));
+        }
         match bound {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
@@ -2670,6 +2777,7 @@ impl Shared {
                 self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
                 Ok(QueryResult::empty())
             }
+            Bound::Transaction(kind) => self.transaction(kind, &mut catalog),
             Bound::Checkpoint => {
                 // A read only database answers this the way the pinned DuckDB does, which is by
                 // succeeding and writing nothing. It is not an error there and it is not one here.
@@ -2695,7 +2803,8 @@ impl Shared {
                 // well it fits the shape otherwise, and neither does anything at all on a read only
                 // database, which is the one other way a statement writes the file without being a
                 // checkpoint.
-                let writable = self.inner.writable && !create.name.temporary();
+                let writable =
+                    self.inner.writable && !create.name.temporary() && !self.transacting();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| writable) {
                     let fresh = create.source.is_some() && catalog.table(&create.name).is_err();
                     let alone = fresh && !path.exists() && catalog.stored_tables().count() == 0;
@@ -2773,7 +2882,8 @@ impl Shared {
                     timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
                 // Same as the create above: rows going into a temporary table are rows the file
                 // never sees, and a read only database writes no file at all.
-                let writable = self.inner.writable && !insert.name.temporary();
+                let writable =
+                    self.inner.writable && !insert.name.temporary() && !self.transacting();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| writable && !insert.replace)
                 {
                     let target = catalog.table(&insert.name)?;

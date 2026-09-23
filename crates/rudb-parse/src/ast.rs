@@ -100,6 +100,8 @@ pub enum Statement {
     Reset(SettingRef),
     /// `CHECKPOINT` or `FORCE CHECKPOINT`.
     Checkpoint,
+    /// `BEGIN`, `COMMIT` or `ROLLBACK`, under any of the spellings the grammar takes for each.
+    Transaction(Transaction),
     /// `EXPLAIN` over a query, and whether `ANALYZE` was asked for.
     ///
     /// The query rather than a statement, because the grammar lets every statement be explained
@@ -874,6 +876,20 @@ pub struct CaseArm {
     pub when: ExprRef,
     /// The `THEN`.
     pub then: ExprRef,
+}
+
+/// What a transaction statement asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transaction {
+    /// `BEGIN` or `START TRANSACTION`, and whether `READ ONLY` was written after it.
+    Begin {
+        /// Whether the transaction may not write.
+        read_only: bool,
+    },
+    /// `COMMIT` or `END`.
+    Commit,
+    /// `ROLLBACK` or `ABORT`.
+    Rollback,
 }
 
 /// Which literal.
