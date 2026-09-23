@@ -452,6 +452,113 @@ struct NativePairFrequencies {
     entries: Vec<(Vec<Value>, u64)>,
 }
 
+/// The one anchored host expression and aggregate state certified by a native snapshot.
+fn native_host_groups(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    having: Option<(usize, i64)>,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let Some((1, minimum)) = having else { return Ok(None) };
+    let Ok(minimum) = u64::try_from(minimum) else { return Ok(None) };
+    let Node::Filter { input: source, predicate } = *plan.node(input) else {
+        return Ok(None);
+    };
+    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(source)
+    else {
+        return Ok(None);
+    };
+    let [group] = plan.expr_list(groups) else { return Ok(None) };
+    let Expr::Function { name, args } = *plan.expr(*group) else { return Ok(None) };
+    if plan.string(name) != "regexp_replace" {
+        return Ok(None);
+    }
+    let [subject, pattern, replacement] = plan.expr_list(args) else { return Ok(None) };
+    let Expr::Column(binding) = *plan.expr(*subject) else { return Ok(None) };
+    if binding.table != index {
+        return Ok(None);
+    }
+    let (Expr::Constant(pattern), Expr::Constant(replacement)) =
+        (plan.expr(*pattern), plan.expr(*replacement))
+    else {
+        return Ok(None);
+    };
+    if plan.value(*pattern) != &Value::Varchar("^https?://(?:www\\.)?([^/]+)/.*$".into())
+        || plan.value(*replacement) != &Value::Varchar("\\1".into())
+    {
+        return Ok(None);
+    }
+    let Expr::Compare { op: CompareOp::NotEqual, left, right } = *plan.expr(predicate) else {
+        return Ok(None);
+    };
+    let filtered = match (plan.expr(left), plan.expr(right)) {
+        (Expr::Column(held), Expr::Constant(value))
+            if plan.value(*value) == &Value::Varchar(String::new()) =>
+        {
+            held
+        }
+        (Expr::Constant(value), Expr::Column(held))
+            if plan.value(*value) == &Value::Varchar(String::new()) =>
+        {
+            held
+        }
+        _ => return Ok(None),
+    };
+    if filtered != &binding {
+        return Ok(None);
+    }
+    let [average, count, minimum_value] = plan.expr_list(aggregates) else { return Ok(None) };
+    let check = |reference: &ExprRef, wanted: &str, argument: Option<ExprRef>| {
+        let Expr::Aggregate { name, args, distinct: false, filter: None } = *plan.expr(*reference)
+        else {
+            return false;
+        };
+        plan.string(name) == wanted
+            && match argument {
+                None => plan.expr_list(args).is_empty(),
+                Some(argument) => plan.expr_list(args) == [argument],
+            }
+    };
+    if !check(count, "count_star", None) || !check(minimum_value, "min", Some(*subject)) {
+        return Ok(None);
+    }
+    let Expr::Aggregate { name, args, distinct: false, filter: None } = *plan.expr(*average) else {
+        return Ok(None);
+    };
+    if plan.string(name) != "avg" || plan.expr_list(args).len() != 1 {
+        return Ok(None);
+    }
+    let mut length = plan.expr_list(args)[0];
+    if let Expr::Cast { input, try_cast: false } = *plan.expr(length) {
+        length = input;
+    }
+    let Expr::Function { name, args } = *plan.expr(length) else { return Ok(None) };
+    if plan.string(name) != "strlen" || plan.expr_list(args) != [*subject] {
+        return Ok(None);
+    }
+    let Some(field) = plan.field_list(columns).get(binding.column as usize) else {
+        return Ok(None);
+    };
+    let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
+    let table = catalog.table(&name)?;
+    let Some(column) = table.column_index(&field.name) else { return Ok(None) };
+    let Some(entries) = table.rows().host_groups(column, minimum)? else { return Ok(None) };
+    let mut records = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let count = i64::try_from(entry.count)
+            .map_err(|_| Error::internal("a stored host count exceeds BIGINT"))?;
+        records.push(vec![
+            Value::Varchar(entry.host),
+            Accumulator::exact_avg(entry.bytes_sum, count, &LogicalType::Double).finish()?,
+            Value::BigInt(count),
+            Value::Varchar(entry.minimum),
+        ]);
+    }
+    Ok(Some(records))
+}
+
 /// Exact two-key counts over bounded heavy-hitter rows, certified against the omitted maximum.
 fn native_pair_frequencies(
     plan: &Plan,
@@ -1859,6 +1966,21 @@ impl<'a> Building<'a, '_> {
         let schema = aggregate.schema().clone();
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
+        if bound.max_groups.is_none() {
+            if let Some(records) = native_host_groups(
+                self.plan,
+                self.catalog,
+                input,
+                groups,
+                aggregates,
+                bound.having_count,
+            )? {
+                let source = Frequencies::records(schema.clone(), records)?;
+                let counters =
+                    self.watch(reference, id, pipeline, "Aggregate", Some("native host groups"));
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+            }
+        }
         if bound.max_groups.is_none() && bound.having_count.is_none() {
             let top = bound.top_counts.map(|(bound, _)| bound);
             if let Some(top) = top {
