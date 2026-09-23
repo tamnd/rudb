@@ -89,6 +89,10 @@ use crate::table::{Across, hash};
 /// still handed over and the filter is not, which is the same answer for fewer bytes.
 const BUDGET: usize = 32 << 20;
 
+/// The bits of a bitmap small enough to take whatever it costs a key, which is thirty two
+/// kilobytes, the first level data cache of the smallest core this is built for. See [`dense`].
+const SMALL: u64 = 32 << 13;
+
 /// The edge one join's runtime filter crosses, shared between the join, its build side's sink and
 /// one scan.
 ///
@@ -563,7 +567,12 @@ pub(crate) fn found_for(
 ///
 /// Sixty four bits a key is the most this takes, and never more than the filter's own budget, past
 /// which the filter is the smaller of the two and a bit test that misses the cache is no cheaper
-/// than a filter lookup that does too. Only the four signed integer types of sixty four bits or
+/// than a filter lookup that does too. A bitmap of [`SMALL`] bits or fewer is taken however few keys
+/// it holds, because it sits in the first level cache of any core this runs on, and there a bit
+/// test is cheaper than the hash the filter has to take first. TPC-H q17 is the case: two hundred
+/// and four parts over two hundred thousand keys is a thousand bits a key and 25 KB, and the
+/// filter it made instead cost a hash for each of six million rows and let through twelve times
+/// the rows that matched. Only the four signed integer types of sixty four bits or
 /// fewer, because the scan reads the driving column through the same widening and the join has
 /// already made the two sides one type. `None` for anything else, and the filter is built instead.
 fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
@@ -598,7 +607,7 @@ fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
     }
     let range = u64::try_from(i128::from(high) - i128::from(low) + 1).ok()?;
     let bytes = usize::try_from(range.div_ceil(8)).ok()?;
-    if range > (rows as u64).saturating_mul(64) || bytes > BUDGET {
+    if (range > (rows as u64).saturating_mul(64) && range > SMALL) || bytes > BUDGET {
         return None;
     }
     let mut words = vec![0_u64; usize::try_from(range.div_ceil(64)).ok()?];
@@ -759,7 +768,7 @@ mod tests {
     use rudb_graph::{KeyMap, Link};
 
     use super::{
-        Across, Exact, Extremes, Found, Keyed, Schema, Sideways, beneath, found_for, hash,
+        Across, Exact, Extremes, Found, Keyed, SMALL, Schema, Sideways, beneath, found_for, hash,
     };
 
     fn found(
@@ -861,12 +870,12 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
-        let found = found(&keyed, None, &[chunk(&[Some(5), Some(90_000)]), chunk(&[Some(2)])])
+        let found = found(&keyed, None, &[chunk(&[Some(5), Some(900_000)]), chunk(&[Some(2)])])
             .expect("a column of integers");
 
-        assert_eq!(found.range, Some((Bound::Int(2), Bound::Int(90_000))));
+        assert_eq!(found.range, Some((Bound::Int(2), Bound::Int(900_000))));
         let filter = found.filter.expect("a filter over three keys");
-        assert_eq!(through(&filter, &[Some(5), Some(90_000), Some(2)]), [true, true, true]);
+        assert_eq!(through(&filter, &[Some(5), Some(900_000), Some(2)]), [true, true, true]);
     }
 
     /// The property the whole thing rests on: a filter says no about a key that is in it never, at
@@ -941,16 +950,35 @@ mod tests {
         assert_eq!(domain.keep(&whole, whole.len(), &mut Vec::new()), [0, 2]);
     }
 
-    /// Past sixty four bits a key the bitmap is bigger than the filter it would replace.
+    /// Past sixty four bits a key the bitmap is bigger than the filter it would replace, once it is
+    /// too big to sit in the first level cache.
     #[test]
     fn keys_spread_wide_still_get_a_filter() {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let wide = i32::try_from(SMALL).expect("small");
 
-        let found = found(&keyed, None, &[chunk(&[Some(0), Some(64 * 2)])]).expect("integers");
+        let found = found(&keyed, None, &[chunk(&[Some(0), Some(wide)])]).expect("integers");
 
         assert!(found.domain.is_none() && found.filter.is_some());
+    }
+
+    /// A few keys over a range that fits the first level cache are a bitmap however far apart they
+    /// are, which is TPC-H q17's two hundred and four parts over two hundred thousand keys.
+    #[test]
+    fn a_few_keys_over_a_small_range_are_a_bitmap_however_far_apart() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let edge = i32::try_from(SMALL).expect("small") - 1;
+
+        let found = found(&keyed, None, &[chunk(&[Some(0), Some(edge)])]).expect("integers");
+
+        assert!(found.filter.is_none(), "the bitmap takes the filter's place");
+        let domain = found.domain.expect("two keys over the cache sized range");
+        let probe = column(&[Some(0), Some(1), Some(edge), Some(edge + 1)]);
+        assert_eq!(domain.keep(&probe, 4, &mut Vec::new()), [0, 2]);
     }
 
     /// A side that gathered nothing leaves a filter that holds nothing, which is a scan that drops
