@@ -86,6 +86,9 @@ pub enum ErrorCode {
     Settings,
     /// The query was cancelled. Cooperative, checked at morsel boundaries.
     Interrupt,
+    /// A value is one the function refuses outright rather than one of the wrong type, for example
+    /// an empty list handed to `list_reduce` with nothing to start from.
+    ParameterNotAllowed,
     /// An invariant this code is responsible for does not hold. Always a bug here, never in the
     /// query.
     Internal,
@@ -115,6 +118,7 @@ impl ErrorCode {
             Self::Transaction => "TransactionContext Error",
             Self::Settings => "Settings Error",
             Self::Interrupt => "Interrupt Error",
+            Self::ParameterNotAllowed => "Parameter Not Allowed Error",
             Self::Internal => "INTERNAL Error",
         }
     }
@@ -137,6 +141,7 @@ impl ErrorCode {
                 | Self::Constraint
                 | Self::Transaction
                 | Self::Settings
+                | Self::ParameterNotAllowed
         )
     }
 }
@@ -289,6 +294,11 @@ impl Error {
         Self::new(ErrorCode::Settings, message)
     }
 
+    /// A value the function refuses outright.
+    pub fn parameter_not_allowed(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::ParameterNotAllowed, message)
+    }
+
     /// The query was cancelled.
     pub fn interrupt(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Interrupt, message)
@@ -329,6 +339,7 @@ impl ErrorCode {
             Self::Transaction => "TransactionContext",
             Self::Settings => "Settings",
             Self::Interrupt => "Interrupt",
+            Self::ParameterNotAllowed => "Parameter Not Allowed",
             Self::Internal => "INTERNAL",
         }
     }
