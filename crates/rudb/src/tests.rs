@@ -9322,6 +9322,51 @@ fn a_with_ahead_of_a_write_is_in_scope_for_all_of_it() {
 }
 
 #[test]
+fn a_column_default_fills_what_an_insert_leaves_out_the_way_the_pin_does() {
+    let db = scripted(&[
+        "CREATE TABLE t (i INTEGER DEFAULT 1+2, s VARCHAR DEFAULT 'x', k INT, q VARCHAR DEFAULT 'it''s')",
+        "INSERT INTO t (k) VALUES (5)",
+        "INSERT INTO t VALUES (DEFAULT, DEFAULT, 1, DEFAULT), (7, 'y', DEFAULT, 'z')",
+        "INSERT INTO t DEFAULT VALUES",
+    ]);
+    let all = db
+        .query("SELECT i, s, k, q FROM t")
+        .unwrap()
+        .rows()
+        .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
+        .collect::<Vec<_>>();
+    assert_eq!(all, ["3,x,5,it's", "3,x,1,it's", "7,y,NULL,z", "3,x,NULL,it's"]);
+    let described = db
+        .query("SELECT column_name, \"default\" FROM (DESCRIBE t)")
+        .unwrap()
+        .rows()
+        .map(|row| format!("{}={}", row[0], row[1]))
+        .collect::<Vec<_>>();
+    assert_eq!(described, ["i=(1 + 2)", "s='x'", "k=NULL", "q='it''s'"]);
+    for (statement, message) in [
+        ("CREATE TABLE u (a INT DEFAULT k)", "DEFAULT value cannot contain column names"),
+        ("CREATE TABLE u (a INT DEFAULT (SELECT 1))", "DEFAULT value cannot contain subqueries"),
+        ("CREATE TABLE u (a INT DEFAULT sum(1))", "DEFAULT value cannot contain aggregates!"),
+        (
+            "CREATE TABLE u (a INT DEFAULT row_number() OVER ())",
+            "DEFAULT value cannot contain window functions!",
+        ),
+        ("INSERT INTO t VALUES (DEFAULT + 1, 'a', 1, 'b')", "DEFAULT is not allowed here!"),
+        (
+            "INSERT INTO t (k) DEFAULT VALUES",
+            "You can not provide both a column list and DEFAULT VALUES, please remove one of the \
+             two",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    db.execute("UPDATE t SET i = DEFAULT, k = DEFAULT, s = 'w' WHERE i = 7").unwrap();
+    let updated = db.query("SELECT i, s, k FROM t WHERE s = 'w'").unwrap();
+    let row: Vec<String> = updated.rows().next().unwrap().iter().map(|v| v.to_string()).collect();
+    assert_eq!(row, ["3", "w", "NULL"]);
+}
+
+#[test]
 fn an_insert_that_meets_a_held_key_does_what_its_conflict_clause_says() {
     let db = scripted(&[
         "CREATE TABLE t (i INTEGER PRIMARY KEY, j INTEGER, k INTEGER)",

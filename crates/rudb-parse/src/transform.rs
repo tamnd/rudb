@@ -990,6 +990,7 @@ impl<'a> Transform<'a> {
             return self.unsupported(self.find(node, "GeneratedColumn"));
         }
         let mut not_null = false;
+        let mut default = NONE;
         let mut keys = Vec::new();
         for kid in self.kids(node) {
             if self.name(kid) != "ColumnConstraint" {
@@ -1002,10 +1003,13 @@ impl<'a> Transform<'a> {
                 }
                 "PrimaryKeyConstraint" => keys.push(true),
                 "UniqueConstraint" => keys.push(false),
+                "DefaultValue" => {
+                    default = self.expr(self.find(constraint, "ColumnDefaultExpr"))?;
+                }
                 _ => return self.unsupported(constraint),
             }
         }
-        Ok((ColumnDef { name, ty, not_null }, keys))
+        Ok((ColumnDef { name, ty, not_null, default }, keys))
     }
 
     /// `CreateTableAs <- IdentifierList? PartitionSortedOptions? WithList? 'AS' Statement
@@ -1029,7 +1033,7 @@ impl<'a> Transform<'a> {
             let mut defs = Vec::new();
             for kid in self.kids(names) {
                 let name = self.identifier(kid);
-                defs.push(ColumnDef { name, ty: NONE, not_null: false });
+                defs.push(ColumnDef { name, ty: NONE, not_null: false, default: NONE });
             }
             self.column_def_slice(defs)
         };
@@ -1114,10 +1118,17 @@ impl<'a> Transform<'a> {
         };
         let values = self.find(node, "InsertValues");
         let inner = self.first(values);
-        if self.name(inner) != "SelectInsertValues" {
-            return self.unsupported(inner);
-        }
-        let source = self.query(self.find(inner, "SelectStatementInternal"))?;
+        let source = match self.name(inner) {
+            "SelectInsertValues" => self.query(self.find(inner, "SelectStatementInternal"))?,
+            "DefaultValues" if list == NONE => NONE,
+            "DefaultValues" => {
+                return Err(Error::parser(
+                    "You can not provide both a column list and DEFAULT VALUES, please remove one \
+                     of the two",
+                ));
+            }
+            _ => return self.unsupported(inner),
+        };
         let returning = self.returning(node, name, alias)?;
         let conflict = self.conflict(node, name, alias)?;
         let index = self.ast.inserts.len() as u32;
@@ -2413,8 +2424,13 @@ impl<'a> Transform<'a> {
             let count = self.count(node);
             let name = self.name(node);
             match name {
-                "LogicalOrExpression" if count > 1 => return self.logical(node, BinaryOp::Or),
-                "LogicalAndExpression" if count > 1 => return self.logical(node, BinaryOp::And),
+                "LogicalOrExpression" | "ColDefOrExpr" if count > 1 => {
+                    return self.logical(node, BinaryOp::Or);
+                }
+                "LogicalAndExpression" | "ColDefAndExpr" if count > 1 => {
+                    return self.logical(node, BinaryOp::And);
+                }
+                "DefaultExpression" => return Ok(self.push(Expr::Default)),
                 "LogicalNotExpression" if count > 1 => return self.logical_not(node),
                 "IsExpression" if count > 1 => return self.is_expression(node),
                 "BetweenInLikeExpression" if count > 1 => return self.between_in_like(node),
@@ -4261,6 +4277,7 @@ mod tests {
                 format!("(lambda {}: {})", params.join(", "), show(ast, body))
             }
             Expr::Parameter { name } => format!("${}", ast.string(name)),
+            Expr::Default => "DEFAULT".to_string(),
             Expr::Row { items } => format!("ROW({})", list(items)),
             Expr::Struct { names, values } => {
                 let fields: Vec<String> = ast
@@ -4893,7 +4910,6 @@ mod tests {
         for query in [
             "INSERT INTO t BY NAME SELECT 1 AS a",
             "INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT c DO NOTHING",
-            "INSERT INTO t DEFAULT VALUES",
         ] {
             let error = parse_ast(query).unwrap_err().to_string();
             assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
@@ -4906,7 +4922,6 @@ mod tests {
         // table checks are kept and the rest are refused until there is somewhere to put them.
         for query in [
             "CREATE TABLE t (a INT CHECK (a > 0))",
-            "CREATE TABLE t (a INT DEFAULT 1)",
             "CREATE TABLE t (a INT REFERENCES u (b))",
             "CREATE TABLE t (a INT, CHECK (a > 0))",
             "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES u (b))",

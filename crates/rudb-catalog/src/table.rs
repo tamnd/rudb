@@ -974,6 +974,8 @@ pub struct Table {
     keys: Vec<Key>,
     /// The keys held for each of `keys`, built by the first write that needs them.
     seen: Vec<Option<Seen>>,
+    /// The `DEFAULT` of each column as the SQL of its expression, or empty when no column has one.
+    defaults: Vec<Option<String>>,
 }
 
 impl Table {
@@ -997,6 +999,7 @@ impl Table {
             clustering: None,
             keys: Vec::new(),
             seen: Vec::new(),
+            defaults: Vec::new(),
         })
     }
 
@@ -1017,6 +1020,7 @@ impl Table {
             clustering,
             keys: Vec::new(),
             seen: Vec::new(),
+            defaults: Vec::new(),
         })
     }
 
@@ -1297,6 +1301,18 @@ impl Table {
     #[must_use]
     pub fn keys(&self) -> &[Key] {
         &self.keys
+    }
+
+    /// The `DEFAULT` of a column as the SQL of its expression, or `None` when it has none, which
+    /// is a null.
+    #[must_use]
+    pub fn default(&self, column: usize) -> Option<&str> {
+        self.defaults.get(column).and_then(Option::as_deref)
+    }
+
+    /// Declares the columns' defaults, one per column.
+    pub fn set_defaults(&mut self, defaults: Vec<Option<String>>) {
+        self.defaults = defaults;
     }
 
     /// Declares the table's keys, which makes the columns of a primary key `NOT NULL` as well.

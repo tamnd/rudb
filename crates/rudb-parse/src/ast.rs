@@ -211,6 +211,8 @@ pub struct ColumnDef {
     pub ty: StrRef,
     /// Whether `NOT NULL` was written.
     pub not_null: bool,
+    /// The `DEFAULT` expression, or `NONE` when the definition had none.
+    pub default: ExprRef,
 }
 
 /// `CREATE VIEW name (columns) AS query`.
@@ -258,7 +260,8 @@ pub struct Insert {
     pub name: Slice,
     /// The column list, as a run of parts, empty when the statement did not write one.
     pub columns: Slice,
-    /// What produces the rows, which is a `VALUES` clause or any other query.
+    /// What produces the rows, which is a `VALUES` clause or any other query, or `NONE` for
+    /// `DEFAULT VALUES`, which is one row of every column's default.
     pub source: QueryRef,
     /// The `RETURNING` list, held as `SELECT list FROM table [AS alias]` and run over the rows the
     /// statement wrote rather than over the table.
@@ -858,6 +861,9 @@ pub enum Expr {
         /// Whether the quantifier was `ALL` rather than `ANY`.
         all: bool,
     },
+    /// `DEFAULT` where a value is written, which is the column's default and only means something
+    /// as a whole item of an `INSERT`'s `VALUES` row.
+    Default,
     /// A prepared statement parameter, written `?`, `?1`, `$1` or `$name`.
     Parameter {
         /// The identifier, which is the number for a positional one and the word for a named one.

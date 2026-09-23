@@ -147,6 +147,10 @@ impl Binder<'_> {
                 self.pack_struct(&names, &bound)
             }
             ast::Expr::Parameter { name } => self.bind_parameter(ast, name),
+            // A whole item of an insert's `VALUES` row is taken care of before it gets here, so a
+            // `DEFAULT` that reaches this is one written anywhere else.
+            ast::Expr::Default if self.default_as_null => Ok(self.add_constant(Value::Null)),
+            ast::Expr::Default => Err(Error::binder("DEFAULT is not allowed here!")),
             ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query, scope),
             ast::Expr::Exists { query, negated } => {
                 self.bind_exists_subquery(ast, query, negated, scope)
@@ -1190,7 +1194,8 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         ast::Expr::Star { .. }
         | ast::Expr::Column { .. }
         | ast::Expr::Literal { .. }
-        | ast::Expr::Parameter { .. } => false,
+        | ast::Expr::Parameter { .. }
+        | ast::Expr::Default => false,
         ast::Expr::Unary { operand, .. } => has_aggregate(ast, operand),
         ast::Expr::Binary { left, right, .. } => {
             has_aggregate(ast, left) || has_aggregate(ast, right)
@@ -1539,6 +1544,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         // DuckDB names the column after the parameter, so `SELECT ?` comes back as `$1` whatever
         // the value turns out to be.
         ast::Expr::Parameter { name } => format!("${}", ast.string(name)),
+        ast::Expr::Default => "DEFAULT".to_string(),
         ast::Expr::Subquery { .. } => "subquery".to_string(),
         ast::Expr::Exists { query, negated } => {
             let exists = format!("EXISTS({})", rudb_parse::deparse::query(ast, query));

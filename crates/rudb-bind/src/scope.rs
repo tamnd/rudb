@@ -38,6 +38,8 @@ pub(crate) struct Visible {
     /// `PRI` or `UNI` when the column it came from is in a key of its table, carried the same way
     /// and for the same reader as `not_null`.
     pub(crate) key: Option<&'static str>,
+    /// The SQL of the `DEFAULT` of the column it came from, carried the same way as `key`.
+    pub(crate) default: Option<String>,
     /// Whether only a name with the table in front of it reaches the column, which is what the
     /// `excluded` of an `ON CONFLICT DO UPDATE` is: a bare name there means the held row's column.
     pub(crate) qualified: bool,
@@ -307,6 +309,7 @@ mod tests {
             ty: LogicalType::BigInt,
             not_null: false,
             key: None,
+            default: None,
             qualified: false,
             also: None,
         });
@@ -317,6 +320,7 @@ mod tests {
             ty: LogicalType::Varchar,
             not_null: false,
             key: None,
+            default: None,
             qualified: false,
             also: None,
         });
@@ -327,6 +331,7 @@ mod tests {
             ty: LogicalType::Varchar,
             not_null: false,
             key: None,
+            default: None,
             qualified: false,
             also: None,
         });

@@ -259,6 +259,12 @@ pub(crate) struct Binder<'a> {
     /// Whether this binds the query of an `ON CONFLICT DO UPDATE`, whose `excluded` reads the new
     /// rows rather than the table.
     pub(crate) upsert: bool,
+    /// The type and the default of each column an `INSERT` writes, handed to the `VALUES` right
+    /// under it so that a `DEFAULT` item there can be the default of the column it lands in.
+    pub(crate) insert_defaults: Option<Vec<(LogicalType, Option<String>)>>,
+    /// Whether a `DEFAULT` binds as a null that the statement replaces afterwards, which is what an
+    /// `UPDATE` does with `SET c = DEFAULT`.
+    pub(crate) default_as_null: bool,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
     /// Set while an aggregate's `FILTER` is being bound, which is refused its own aggregate.
@@ -328,6 +334,8 @@ impl<'a> Binder<'a> {
             aggregation: None,
             want_ascending: false,
             upsert: false,
+            insert_defaults: None,
+            default_as_null: false,
             in_aggregate: false,
             in_filter: false,
             windows: Vec::new(),
@@ -597,6 +605,7 @@ impl<'a> Binder<'a> {
             ty: LogicalType::Varchar,
             not_null: false,
             key: None,
+            default: None,
             qualified: false,
             also: None,
         });
@@ -613,7 +622,7 @@ impl<'a> Binder<'a> {
     /// relation with no special case above it.
     ///
     /// The six columns, their order and their types are the reference binary's. `key` says which
-    /// key of its table a column passed straight through from one is in. `default` is null because `DEFAULT` is refused by `CREATE TABLE` today, and
+    /// key of its table a column passed straight through from one is in. `default` is the SQL of the column's `DEFAULT` in the pin's spelling, and
     /// `extra` is empty upstream as well on every table it was asked about. They are here rather
     /// than left out because the width of a result is part of the result, and a program that reads
     /// the fifth column has to find one.
@@ -641,8 +650,16 @@ impl<'a> Binder<'a> {
                 .into_iter()
                 .map(|text| self.plan.add_constant(Value::Varchar(text)))
                 .collect();
-            if let Some(mark) = column.key {
-                items.push(self.plan.add_constant(Value::Varchar(mark.to_owned())));
+            let mark = match column.key {
+                Some(mark) => self.plan.add_constant(Value::Varchar(mark.to_owned())),
+                None => {
+                    let empty = self.plan.add_constant(Value::Null);
+                    self.cast_to(empty, &LogicalType::Varchar)
+                }
+            };
+            items.push(mark);
+            if let Some(default) = &column.default {
+                items.push(self.plan.add_constant(Value::Varchar(default.clone())));
             }
             while items.len() < 6 {
                 let empty = self.plan.add_constant(Value::Null);
@@ -663,6 +680,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: false,
                 key: None,
+                default: None,
                 qualified: false,
                 also: None,
             });
@@ -674,6 +692,31 @@ impl<'a> Binder<'a> {
         }
         node = self.apply_limit(ast, query, node, &mut scope)?;
         Ok((node, scope))
+    }
+
+    /// A column's default as an expression of the column's type, or a null of that type for a
+    /// column with none. A typed null rather than `add_constant`, which would give it the null
+    /// type and make the column's type depend on whether a row happened to be inserted into it.
+    pub(crate) fn bind_default(&mut self, text: Option<&str>, ty: &LogicalType) -> Result<ExprRef> {
+        let Some(text) = text else {
+            let value = self.plan.add_value(Value::Null);
+            return Ok(self.plan.add_expr(Expr::Constant(value), ty.clone()));
+        };
+        let ast = rudb_parse::parse_ast(&format!("SELECT {text}"))?;
+        let found = match ast.statements.first() {
+            Some(&ast::Statement::Query(query)) => match ast.query(query).body {
+                ast::QueryBody::Select(select) => {
+                    ast.target_list(ast.select(select).targets).first().map(|target| target.expr)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(expr) = found else {
+            return Err(Error::internal(format!("a default that is not an expression: {text}")));
+        };
+        let expr = self.bind_expr(&ast, expr, &Scope::empty())?;
+        self.checked_cast_to(expr, ty, false)
     }
 
     /// Whether a projected expression is a column passed straight through from below.
@@ -690,8 +733,13 @@ impl<'a> Binder<'a> {
     /// table that has one. The same question as [`Self::passes_through`], asked for `DESCRIBE`'s
     /// `key` column.
     fn key_through(&self, expr: ExprRef, input: &Scope) -> Option<&'static str> {
+        self.through(expr, input).and_then(|column| column.key)
+    }
+
+    /// The column a projected expression passes straight through from below, if it is one.
+    fn through<'s>(&self, expr: ExprRef, input: &'s Scope) -> Option<&'s Visible> {
         let Expr::Column(binding) = *self.plan.expr(expr) else { return None };
-        input.columns.iter().find(|column| column.binding == binding).and_then(|column| column.key)
+        input.columns.iter().find(|column| column.binding == binding)
     }
 
     /// `VALUES (1, 'a'), (2, 'b')`, as a query in its own right.
@@ -722,12 +770,19 @@ impl<'a> Binder<'a> {
         }
         // A row of a `VALUES` cannot see a column, because there is nothing under it to see.
         let empty = Scope::empty();
+        let defaults = self.insert_defaults.take();
         let previous = std::mem::replace(&mut self.clause, "VALUES clause");
         let mut bound: Vec<Vec<ExprRef>> = Vec::with_capacity(written.len());
         for row in &written {
             let mut items = Vec::with_capacity(width);
-            for &expr in ast.expr_list(*row) {
-                items.push(self.bind_expr(ast, expr, &empty)?);
+            for (at, &expr) in ast.expr_list(*row).iter().enumerate() {
+                let column = defaults.as_ref().and_then(|defaults| defaults.get(at));
+                items.push(match (ast.expr(expr), column) {
+                    (ast::Expr::Default, Some((ty, default))) => {
+                        self.bind_default(default.as_deref(), ty)?
+                    }
+                    _ => self.bind_expr(ast, expr, &empty)?,
+                });
             }
             bound.push(items);
         }
@@ -773,6 +828,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: false,
                 key: None,
+                default: None,
                 qualified: false,
                 also: None,
             });
@@ -825,6 +881,7 @@ impl<'a> Binder<'a> {
                 // column that refuses nulls on one side and takes them on the other takes them.
                 not_null: false,
                 key: None,
+                default: None,
                 qualified: false,
                 also: None,
             });
@@ -963,6 +1020,7 @@ impl<'a> Binder<'a> {
                 ty: self.plan.expr_type(*expr).clone(),
                 not_null: self.passes_through(*expr, &input),
                 key: self.key_through(*expr, &input),
+                default: self.through(*expr, &input).and_then(|column| column.default.clone()),
                 qualified: false,
                 also: None,
             });
@@ -1060,6 +1118,7 @@ impl<'a> Binder<'a> {
                 ty,
                 not_null: output.columns[at].not_null,
                 key: output.columns[at].key,
+                default: output.columns[at].default.clone(),
                 qualified: false,
                 also: None,
             });
@@ -1817,6 +1876,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: field.not_null,
                 key: None,
+                default: None,
                 qualified: false,
                 also: None,
             });
@@ -1889,6 +1949,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: field.not_null,
                 key: marks[at],
+                default: table.default(at).map(str::to_owned),
                 qualified: excluded,
                 also: None,
             });
@@ -2240,6 +2301,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: false,
                 key: None,
+                default: None,
                 qualified: false,
                 also: None,
             });
@@ -2554,6 +2616,7 @@ impl<'a> Binder<'a> {
                 // cannot be null. The reference binary answers YES for every column of a Parquet.
                 not_null: false,
                 key: None,
+                default: None,
                 qualified: false,
                 also: None,
             });

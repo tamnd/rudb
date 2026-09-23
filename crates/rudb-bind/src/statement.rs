@@ -103,6 +103,8 @@ pub struct CreateTable {
     pub or_replace: bool,
     /// The primary key and the unique constraints, over the columns by place.
     pub keys: Vec<rudb_catalog::Key>,
+    /// Each column's `DEFAULT` as the SQL of its expression, or `None` for a column with none.
+    pub defaults: Vec<Option<String>>,
 }
 
 /// A bound `CREATE VIEW`.
@@ -382,6 +384,14 @@ fn create_table(
         (columns, Some(finish(binder, root)?))
     };
     duplicate_check(&columns)?;
+    let mut defaults = Vec::with_capacity(defs.len());
+    for def in defs {
+        defaults.push(if def.default == NONE {
+            None
+        } else {
+            Some(default_text(ast, def.default, catalog, parameters, session)?)
+        });
+    }
     let mut keys = Vec::new();
     for (at, &names) in ast.name_list(written.keys).iter().enumerate() {
         let mut places = Vec::new();
@@ -410,7 +420,39 @@ fn create_table(
         if_not_exists: written.if_not_exists,
         or_replace: written.or_replace,
         keys,
+        defaults,
     }))
+}
+
+/// The SQL a column's `DEFAULT` is kept as, refused the way the pin refuses one when the table is
+/// made. The expression is bound once here to find out, and bound again by every insert that needs
+/// it, because a default like `random()` is worked out per row.
+fn default_text(
+    ast: &Ast,
+    expr: ast::ExprRef,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+) -> Result<String> {
+    if crate::expr::has_aggregate(ast, expr) {
+        return Err(Error::binder("DEFAULT value cannot contain aggregates!"));
+    }
+    let mut binder = Binder::with(catalog, parameters, session);
+    let before = binder.plan_mut().node_count();
+    match binder.bind_expr(ast, expr, &crate::scope::Scope::empty()) {
+        Err(error) if error.message().starts_with("Referenced ") => {
+            Err(Error::binder("DEFAULT value cannot contain column names"))
+        }
+        Err(error) => Err(error),
+        // Nothing but a subquery adds a node to the plan while an expression over no rows binds.
+        Ok(_) if binder.plan_mut().node_count() > before => {
+            Err(Error::binder("DEFAULT value cannot contain subqueries"))
+        }
+        Ok(_) if !binder.windows.is_empty() => {
+            Err(Error::binder("DEFAULT value cannot contain window functions!"))
+        }
+        Ok(_) => Ok(deparse::expression(ast, expr)),
+    }
 }
 
 /// Renames the columns a query repeated, which is what makes `CREATE TABLE t AS SELECT 1 AS a, 2 AS
@@ -710,8 +752,23 @@ fn insert(
         targets
     };
 
+    let defaults: Vec<(LogicalType, Option<String>)> = (0..fields.len())
+        .map(|at| (fields[at].ty.clone(), target.default(at).map(str::to_owned)))
+        .collect();
     let mut binder = Binder::with(catalog, parameters, session);
-    let (root, scope) = binder.bind_query(ast, written.source)?;
+    let (root, scope) = if written.source == NONE {
+        // `DEFAULT VALUES` is one row with nothing in it, and the projection below fills every
+        // column with its default.
+        (binder.plan_mut().add_node(Node::Dummy), crate::scope::Scope::empty())
+    } else {
+        // A `DEFAULT` item of a `VALUES` row is the default of the column it lands in, which only
+        // this statement knows, so the `VALUES` right under it is told.
+        if matches!(ast.query(written.source).body, ast::QueryBody::Values(_)) {
+            binder.insert_defaults = Some(targets.iter().map(|&at| defaults[at].clone()).collect());
+        }
+        binder.bind_query(ast, written.source)?
+    };
+    let targets = if written.source == NONE { Vec::new() } else { targets };
     if scope.len() != targets.len() {
         return Err(Error::binder(format!(
             "Table \"{}\" has {} columns but {} values were supplied",
@@ -751,12 +808,8 @@ fn insert(
                     binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
                 binder.checked_cast_to(expr, &field.ty, false)?
             }
-            None => {
-                // A typed null rather than `add_constant`, which would give it the null type and
-                // make the column's type depend on whether a row happened to be inserted into it.
-                let value = binder.plan_mut().add_value(Value::Null);
-                binder.plan_mut().add_expr(Expr::Constant(value), field.ty.clone())
-            }
+            // The column's default, or a null of the column's own type when it has none.
+            None => binder.bind_default(defaults[at].1.as_deref(), &field.ty)?,
         };
         exprs.push(expr);
         let interned = binder.plan_mut().intern(&field.name);
@@ -919,8 +972,20 @@ fn change(
         targets.push(at);
     }
 
+    // Which assignments are `SET c = DEFAULT`, which are the last items of the source's list.
+    let mut defaulted = vec![false; targets.len()];
+    if let ast::QueryBody::Select(select) = ast.query(written.source).body {
+        let items = ast.target_list(ast.select(select).targets);
+        let first = items.len().saturating_sub(targets.len());
+        for (at, item) in items[first..].iter().enumerate() {
+            defaulted[at] = matches!(ast.expr(item.expr), ast::Expr::Default);
+        }
+    }
+    let table = catalog.table(&name)?;
     let mut binder = Binder::with(catalog, parameters, session);
+    binder.default_as_null = defaulted.contains(&true);
     let (root, scope) = binder.bind_query(ast, written.source)?;
+    binder.default_as_null = false;
     let width = fields.len();
     if scope.len() != width + 1 + targets.len() {
         return Err(Error::internal(format!(
@@ -940,8 +1005,12 @@ fn change(
         let old = column(&mut binder, at);
         let expr = match targets.iter().position(|&target| target == at) {
             Some(from) => {
-                let new = column(&mut binder, width + 1 + from);
-                let then = binder.checked_cast_to(new, &field.ty, false)?;
+                let then = if defaulted[from] {
+                    binder.bind_default(table.default(at), &field.ty)?
+                } else {
+                    let new = column(&mut binder, width + 1 + from);
+                    binder.checked_cast_to(new, &field.ty, false)?
+                };
                 let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then }]);
                 binder
                     .plan_mut()
