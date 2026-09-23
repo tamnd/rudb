@@ -1154,13 +1154,13 @@ pub(crate) fn column_bytes(table: &crate::Table) -> u64 {
         .map(|at| {
             crate::sum(table.stripes.iter().map(|stripe| crate::span_bytes(&stripe.pages, at)))
                 .saturating_add(crate::sum(
-                    table.stripes.iter().map(|stripe| crate::page_bytes(&stripe.memberships, at)),
+                    table.stripes.iter().map(|stripe| stripe.memberships.bytes(at)),
                 ))
                 .saturating_add(crate::sum(
-                    table.stripes.iter().map(|stripe| crate::page_bytes(&stripe.sieves, at)),
+                    table.stripes.iter().map(|stripe| stripe.sieves.bytes(at)),
                 ))
                 .saturating_add(crate::sum(
-                    table.stripes.iter().map(|stripe| crate::page_bytes(&stripe.part_ranges, at)),
+                    table.stripes.iter().map(|stripe| stripe.part_ranges.bytes(at)),
                 ))
                 .saturating_add(crate::dictionary_bytes(table, at))
         })
