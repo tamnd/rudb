@@ -5353,20 +5353,26 @@ fn read_index<F: Positional + ?Sized>(
     stripe: &Stripe,
     column: usize,
 ) -> Result<Vec<PartSpan>> {
-    let parts = stripe.parts.len();
+    let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
+    read_index_span(file, stripe.index, *page, stripe.parts.len(), column)
+}
+
+fn read_index_span<F: Positional + ?Sized>(
+    file: &F,
+    index: Span,
+    page: Span,
+    parts: usize,
+    column: usize,
+) -> Result<Vec<PartSpan>> {
     let section = index_section(parts)?;
     let at = column.checked_mul(section).ok_or_else(|| invalid("index page offset overflow"))?;
     let end = at.checked_add(section).ok_or_else(|| invalid("index page offset overflow"))?;
-    if end > stripe.index.length as usize {
+    if end > index.length as usize {
         return Err(invalid("index page is shorter than its columns"));
     }
-    let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
     let mut bytes = vec![0; section];
-    let offset = stripe
-        .index
-        .offset
-        .checked_add(at as u64)
-        .ok_or_else(|| invalid("index page offset overflow"))?;
+    let offset =
+        index.offset.checked_add(at as u64).ok_or_else(|| invalid("index page offset overflow"))?;
     read_at(file, offset, &mut bytes)?;
     let entries = section - size_of::<u64>();
     let stored = u64::from_le_bytes(bytes[entries..].try_into().expect("eight bytes"));
@@ -5557,6 +5563,39 @@ impl Catalog {
             u64::from(entry.directory.length),
             opening,
             self.pool.clone(),
+        )
+    }
+
+    /// Counts one signed integer column from its encoded parts without building metadata for
+    /// unrelated columns. The counts are computed from row encodings when this is called.
+    /// Nullable and non-cascade parts use the ordinary decoder for that part.
+    ///
+    /// # Errors
+    ///
+    /// If the directory, selected page index, checksum, or encoded integer is invalid.
+    pub fn integer_tally(&self, name: &str, column: usize) -> Result<Option<Vec<(i64, u64)>>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let field =
+            entry.fields.get(column).ok_or_else(|| invalid("integer column index out of range"))?;
+        if !signed_integer(&field.ty) {
+            return Ok(None);
+        }
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
+        }
+        quick_integer_tally(
+            &self.file,
+            Cursor::over(&self.file, offset, length),
+            &entry.name,
+            &entry.fields,
+            entry.rows,
+            self.size,
+            column,
         )
     }
 
@@ -8926,6 +8965,173 @@ fn quick_nonzero(
         .map(|entry| entry.count)
         .or_else(|| (summary.omitted_max == 0).then_some(0));
     Ok(zero.and_then(|zero| (rows as u64).checked_sub(nulls)?.checked_sub(zero)))
+}
+
+/// Walks the row-oriented directory while retaining only one column's index and page spans.
+/// The catalog supplies the schema and the caller checks the complete directory checksum first.
+fn quick_integer_tally(
+    file: &File,
+    mut cur: Cursor<'_>,
+    name: &str,
+    fields: &[Field],
+    rows: usize,
+    size: u64,
+    wanted: usize,
+) -> Result<Option<Vec<(i64, u64)>>> {
+    if cur.take(8)? != DIRECTORY || cur.text()? != name {
+        return Err(invalid("table directory differs from the catalog"));
+    }
+    let width = cur.u16()? as usize;
+    if width != fields.len() {
+        return Err(invalid("table directory width differs from the catalog"));
+    }
+    for field in fields {
+        let stored =
+            Field { name: cur.text()?, ty: read_type(&mut cur)?, not_null: cur.u8()? != 0 };
+        if &stored != field {
+            return Err(invalid("table directory schema differs from the catalog"));
+        }
+    }
+    let mut dictionaries = Vec::with_capacity(width);
+    for field in fields {
+        dictionaries.push(match cur.u8()? {
+            0 => false,
+            tag if coded_type(&field.ty) && tag == dictionary_tag(&field.ty) => {
+                cur.skip(20)?;
+                true
+            }
+            _ => return Err(invalid("dictionary page tag differs")),
+        });
+    }
+    for _ in 0..width {
+        match cur.u8()? {
+            0 => {}
+            1 => cur.skip(8)?,
+            _ => return Err(invalid("distinct count tag differs")),
+        }
+    }
+    if cur.u64()? != rows as u64 {
+        return Err(invalid("table row count differs from the catalog"));
+    }
+    let stripes = cur.u32()? as usize;
+    let mut total = 0_usize;
+    let mut counts = BTreeMap::<i64, u64>::new();
+    let mut bytes = Vec::new();
+    for _ in 0..stripes {
+        let parts = cur.u32()? as usize;
+        if parts == 0 || parts > STRIPE_PARTS {
+            return Err(invalid("stripe part count is outside its bound"));
+        }
+        let mut part_rows = Vec::with_capacity(parts);
+        for _ in 0..parts {
+            let count = cur.u32()? as usize;
+            if count == 0 {
+                return Err(invalid("empty part"));
+            }
+            total = total.checked_add(count).ok_or_else(|| invalid("stripe row count overflow"))?;
+            part_rows.push(count);
+        }
+        let index = Span { offset: cur.u64()?, length: cur.u32()? };
+        let section = index_section(parts)?;
+        let index_length =
+            section.checked_mul(width).ok_or_else(|| invalid("index page length overflow"))?;
+        if index.offset < HEADER
+            || index.offset.checked_add(u64::from(index.length)).is_none_or(|end| end > size)
+            || index.length as usize != index_length
+        {
+            return Err(invalid("index page range is outside the file"));
+        }
+        cur.skip(wanted * 12)?;
+        let page = Span { offset: cur.u64()?, length: cur.u32()? };
+        if page.offset < HEADER
+            || page.offset.checked_add(u64::from(page.length)).is_none_or(|end| end > size)
+            || page.length as usize > MAX_PAGE
+        {
+            return Err(invalid("column page range is outside the file"));
+        }
+        cur.skip((width - wanted - 1) * 12)?;
+        for (field, held) in fields.iter().zip(&dictionaries) {
+            if coded_type(&field.ty) && *held {
+                cur.skip(20)?;
+            }
+        }
+        for _ in 0..width * 2 {
+            match cur.u8()? {
+                0 => {}
+                1 => cur.skip(20)?,
+                _ => return Err(invalid("stripe page tag differs")),
+            }
+        }
+        for _ in 0..width {
+            cur.skip_bound()?;
+            cur.skip_bound()?;
+            cur.skip(5)?;
+            match cur.u8()? {
+                0 => {}
+                1 => cur.skip(16)?,
+                _ => return Err(invalid("a stripe sum has an unknown tag")),
+            }
+        }
+        let spans = read_index_span(file, index, page, parts, wanted)?;
+        for (span, expected_rows) in spans.into_iter().zip(part_rows) {
+            bytes.resize(span.length, 0);
+            let at = page
+                .offset
+                .checked_add(span.start as u64)
+                .ok_or_else(|| invalid("part range overflow"))?;
+            read_at(file, at, &mut bytes)?;
+            if checksum(&bytes) != span.hash {
+                return Err(invalid("integer part checksum differs"));
+            }
+            let part_counts = if bytes.first() == Some(&5) && bytes.get(1) == Some(&0) {
+                let (decoded_rows, part_counts) = integer::tally(&bytes[2..])?;
+                if decoded_rows != expected_rows {
+                    return Err(invalid("encoded integer part holds the wrong number of rows"));
+                }
+                part_counts
+            } else {
+                let column =
+                    decode(&fields[wanted].ty, expected_rows, &bytes, None)?.into_flat()?;
+                let validity = column.validity();
+                let mut part_counts = BTreeMap::<i64, u64>::new();
+                macro_rules! count_decoded {
+                    ($values:expr) => {
+                        for (row, &value) in $values.as_slice().iter().enumerate() {
+                            if validity.is_valid(row) {
+                                *part_counts.entry(i64::from(value)).or_default() += 1;
+                            }
+                        }
+                    };
+                }
+                match column.data() {
+                    Some(Data::Int8(values)) => count_decoded!(values),
+                    Some(Data::Int16(values)) => count_decoded!(values),
+                    Some(Data::Int32(values)) => count_decoded!(values),
+                    Some(Data::Int64(values)) => count_decoded!(values),
+                    _ => return Err(invalid("decoded integer part has the wrong type")),
+                }
+                part_counts.into_iter().collect()
+            };
+            for (value, count) in part_counts {
+                let fits = match fields[wanted].ty {
+                    LogicalType::TinyInt => i8::try_from(value).is_ok(),
+                    LogicalType::SmallInt => i16::try_from(value).is_ok(),
+                    LogicalType::Integer => i32::try_from(value).is_ok(),
+                    LogicalType::BigInt => true,
+                    _ => false,
+                };
+                if !fits {
+                    return Err(invalid("encoded integer value is outside its column type"));
+                }
+                let held = counts.entry(value).or_default();
+                *held = held.checked_add(count).ok_or_else(|| invalid("integer count overflow"))?;
+            }
+        }
+    }
+    if total != rows {
+        return Err(invalid("table row count differs from stripes"));
+    }
+    Ok(Some(counts.into_iter().collect()))
 }
 
 fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
@@ -16400,6 +16606,47 @@ mod tests {
             Some(vec![(-2, 1), (0, 1021), (3, 2)])
         );
         assert!(reader.integer_tally(1, 0).expect("valid null part").is_none());
+        let catalog = Catalog::open(&file).expect("catalog");
+        assert_eq!(
+            catalog.integer_tally("events", 0).expect("nullable column"),
+            Some(vec![(-2, 2), (0, 2041), (3, 4)])
+        );
+        fs::remove_file(file).expect("remove scratch file");
+    }
+
+    #[test]
+    fn catalog_tallies_one_integer_column_without_opening_the_whole_table() {
+        let file = path("catalog-integer-tally");
+        let mut writer = Writer::create(
+            &file,
+            "events",
+            vec![
+                Field::new("noise", LogicalType::SmallInt),
+                Field::new("source", LogicalType::SmallInt),
+            ],
+        )
+        .expect("new file");
+        let noise = vec![Value::SmallInt(9); 1024];
+        let mut source = vec![Value::SmallInt(0); 1024];
+        source[7] = Value::SmallInt(3);
+        source[99] = Value::SmallInt(-2);
+        let chunk = Chunk::new(vec![
+            Vector::from_values(LogicalType::SmallInt, &noise).expect("noise"),
+            Vector::from_values(LogicalType::SmallInt, &source).expect("source"),
+        ])
+        .expect("two columns");
+        writer.append(&chunk).expect("append");
+        writer.finish().expect("commit");
+
+        let catalog = Catalog::open(&file).expect("catalog");
+        assert_eq!(
+            catalog.integer_tally("events", 1).expect("selected column"),
+            Some(vec![(-2, 1), (0, 1022), (3, 1)])
+        );
+        assert_eq!(
+            catalog.integer_tally("events", 0).expect("other column"),
+            Some(vec![(9, 1024)])
+        );
         fs::remove_file(file).expect("remove scratch file");
     }
 
