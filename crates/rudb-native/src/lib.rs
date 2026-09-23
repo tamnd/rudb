@@ -9962,9 +9962,20 @@ mod tests {
             assert_eq!(chunk.value_at(0, 0), Value::Varchar(value(part * per_part)));
         }
 
+        // The last block is wherever the writer was when it was encoded, which the index says.
+        let mut header = [0; DICTIONARY_HEADER];
+        read_at(&reader.file, dictionary.offset, &mut header).expect("dictionary header");
+        let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
+        let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
+        let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
+        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let mut place = [0; 16];
+        let at = DICTIONARY_HEADER + offset_bytes(count, bits) + (blocks - 1) * 16;
+        read_at(&reader.file, dictionary.offset + at as u64, &mut place).expect("its place");
+        let start = u64::from_le_bytes(place[..8].try_into().expect("eight bytes"));
+        let length = u64::from_le_bytes(place[8..].try_into().expect("eight bytes"));
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
-        file.seek(SeekFrom::Start(dictionary.offset + u64::from(dictionary.length) - 4))
-            .expect("the last bytes of the page are payload");
+        file.seek(SeekFrom::Start(start + length - 4)).expect("the last bytes of the last block");
         file.write_all(&[255]).expect("damage the last payload block");
         let reader = Reader::open(&path).expect("the directory and the index are untouched");
         let chunk = reader.read(parts - 1, &[0]).expect("the code page remains valid");
