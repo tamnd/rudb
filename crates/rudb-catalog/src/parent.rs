@@ -154,7 +154,20 @@ impl Parent {
         if whole.footprint() > room {
             return Ok(None);
         }
-        Ok(Some(Arc::new(whole)))
+        // The pieces go before the paging and not after it, and the order is the whole of whether
+        // the paging happens. `into_pages` moves a string arena into a page only when the column it
+        // is paging is the one holder of it, because the other way to do it is to copy the arena and
+        // copying is what this is here to avoid. With one part, `concat` hands back that part's own
+        // arena, so a `pieces` still in scope is a second holder and the paging quietly declines.
+        drop(pieces);
+        // Paged, because this is the definition of a column that is handed out many times: it is
+        // read once here and then gathered from by every chunk of the child for the rest of the
+        // query. The form that cares is the string body. A flatten of a gather over one takes a
+        // handle to the arena when the arena is a page and copies the bytes of every string it
+        // reached when it is not. Without this line every chunk copies, and on TPC-H q12 at scale
+        // factor one that was fourteen hundred copies a query out of a column of five distinct
+        // values.
+        Ok(Some(Arc::new(whole.into_pages())))
     }
 }
 
@@ -184,6 +197,42 @@ mod tests {
             rows.append(Chunk::new(vec![column]).expect("a chunk")).expect("appended");
         }
         Rows::Memory(rows)
+    }
+
+    /// The same table with one string column, which is the form the paging below is about.
+    fn strings(values: &[&str], per: usize) -> Rows {
+        let mut rows = MemoryTable::new(vec![LogicalType::Varchar]);
+        for group in values.chunks(per) {
+            let held: Vec<Value> =
+                group.iter().map(|value| Value::Varchar((*value).to_string())).collect();
+            let column = Vector::from_values(LogicalType::Varchar, &held).expect("a column");
+            rows.append(Chunk::new(vec![column]).expect("a chunk")).expect("appended");
+        }
+        Rows::Memory(rows)
+    }
+
+    /// A string column comes back over a page, which is what keeps a link join from copying the
+    /// bytes it gathers once per chunk of the child.
+    ///
+    /// Asserted here rather than left to the vector crate because the thing that can break it is
+    /// local: `into_pages` declines an arena that has another holder, so a piece of the read left
+    /// alive would turn this into a silent no change with every test still green and q12 still slow.
+    ///
+    /// Several parts, because that is the read that lays an arena out and the one a parent worth
+    /// gathering from has. A column that arrived in one part is handed back as that part and keeps
+    /// whatever form the part was in, which for a stored column is already over a page.
+    #[test]
+    fn a_string_column_comes_back_over_a_page_rather_than_an_arena_of_its_own() {
+        let values = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
+        let held: Vec<&str> = (0..500).map(|row| values[row % values.len()]).collect();
+        for per in [250, 64] {
+            let parent = Parent::new(strings(&held, per), 64 * 1024 * 1024);
+            let column = parent.column(0, &LogicalType::Varchar).expect("read").expect("it fits");
+            let (_, arena) = column.shared_views().expect("a string column is string views");
+            assert!(arena.is_shared(), "{per} rows a part came back over an arena of its own");
+            assert_eq!(column.len(), 500);
+            assert_eq!(column.value_at(499), Value::Varchar("5-LOW".into()));
+        }
     }
 
     /// The thing the whole module exists for: the parts of a column come back as one vector, in

@@ -2693,11 +2693,24 @@ impl Vector {
     /// This vector with its payload held as a page, so that copying or cutting it is free.
     ///
     /// For a producer that means to hand the same values out many times, which is what a stored
-    /// column is. A flat body and a dictionary are the forms this changes, because they own a run a
-    /// copy would have to copy: the values of a flat body and the codes of a dictionary. Every other
-    /// form already shares what is expensive and owns only what a cut has to rewrite, so it comes
-    /// back as it was: a packed body shares its words, a string body shares its arena, an FSST body
-    /// shares its codes and its table, and a constant and a sequence have nothing to share.
+    /// column is. A flat body, a dictionary and a string body are the forms this changes, because
+    /// each owns a run a copy would have to copy: the values of a flat body, the codes of a
+    /// dictionary and the arena of a string body. The rest come back as they were, because a packed
+    /// body shares its words, an FSST body shares its codes and its table, and a constant and a
+    /// sequence have nothing to share.
+    ///
+    /// The string body is the one worth spelling out, because an `Arc` around the arena looks like
+    /// sharing and is not the sharing that matters. Every reader that wants a run of an arena
+    /// without copying the bytes asks [`Buffer::is_shared`], which is a question about the store
+    /// inside the `Arc` and not about the `Arc`: an owned store clones by copying every byte and a
+    /// page clones by taking a handle. So an arena that was built rather than read stays a thing
+    /// each reader copies out of until somebody calls this, however many `Arc`s point at it. The
+    /// reader this is for is [`Self::gather`] over a parent column, which without it copies the
+    /// bytes of every gathered string once per chunk.
+    ///
+    /// Only when the arena is this vector's alone, which is the case a producer that has just built
+    /// one is in. An arena with another holder is left as it is, because turning it into a page
+    /// behind their back would mean copying it, which is the cost this exists to avoid.
     ///
     /// Not recursive into a nested column's children, because a `LIST` or a `STRUCT` holds its
     /// children behind an `Arc` already.
@@ -2708,6 +2721,7 @@ impl Vector {
             Body::Dictionary { codes, values, stable } => {
                 Body::Dictionary { codes: codes.into_page(), values, stable }
             }
+            Body::Views { views, arena } => Body::Views { views, arena: paged(arena) },
             other => other,
         };
         Self { body, ..self }
@@ -3760,6 +3774,25 @@ fn compose(codes: Vec<u32>, values: Arc<Vector>) -> (Vec<u32>, Arc<Vector>) {
 /// nine times rather than once. It is a constant with a name so that the sweep that eventually moves
 /// it has something to move.
 const RUNS_PAY_AT: usize = 2;
+
+/// A string body's arena as a page, when this is the only holder of it.
+///
+/// The move out of the `Arc` and back into one is what makes this free: [`Buffer::into_page`] takes
+/// the run by value and puts it behind an `Arc` without touching a byte of it, so the whole of this
+/// is two allocations of a pointer's worth each however large the arena is.
+///
+/// An arena somebody else is holding comes back untouched. Paging it would mean copying it, since
+/// the other holder's view of it has to go on meaning what it meant, and a copy is what the caller
+/// asked to avoid.
+fn paged(arena: Arc<Buffer<u8>>) -> Arc<Buffer<u8>> {
+    if arena.is_shared() {
+        return arena;
+    }
+    match Arc::try_unwrap(arena) {
+        Ok(owned) => Arc::new(owned.into_page()),
+        Err(held) => held,
+    }
+}
 
 /// Which run holds `row`, given ends that are exclusive and increasing.
 ///
@@ -4969,6 +5002,80 @@ mod tests {
             again.iter().collect::<Vec<_>>(),
             [Value::Varchar("blue".into()), Value::Varchar("red".into())]
         );
+    }
+
+    /// A parent column read for a link join, and the copy per chunk that not paging it was.
+    ///
+    /// The path is the one a kernel takes. A link join emits [`Body::Gathered`] over the parent and
+    /// reads nothing, and the kernel that first wants the values flattens it, which is where the
+    /// arena is either taken by handle or copied out of. The arena was already behind an `Arc`
+    /// before this and every flatten still copied every byte it reached, because the question
+    /// [`Buffer::is_shared`] answers is about the store inside the `Arc` rather than the `Arc`. On
+    /// TPC-H q12 that was fourteen hundred copies a query out of a column of five distinct values.
+    #[test]
+    fn flattening_a_gather_off_a_paged_parent_takes_the_arena_rather_than_copying_it() {
+        let arena = Arc::new(Buffer::from_vec(b"1-URGENT2-HIGH".to_vec()));
+        let views = vec![
+            StringView::over(b"1-URGENT", 0),
+            StringView::over(b"2-HIGH", 8),
+            StringView::over(b"1-URGENT", 0),
+        ];
+        let built = Vector::string_views(LogicalType::Varchar, views, arena).unwrap();
+        let owned = match &built.body {
+            Body::Views { arena, .. } => arena.is_shared(),
+            _ => panic!("string views are a views body"),
+        };
+        assert!(!owned, "concat builds an arena rather than reading one, so it starts owned");
+
+        let bytes = |vector: &Vector| match &vector.body {
+            Body::Views { arena, .. } => arena.as_slice().as_ptr() as usize,
+            Body::Flat(Data::Varlen(column)) => column.arena().as_ptr() as usize,
+            _ => panic!("a string vector holds string bytes"),
+        };
+        let gathered = |parent: &Vector| {
+            Vector::gathered(Arc::new(parent.clone()), Arc::new(vec![1, 0])).unwrap()
+        };
+
+        // Built again rather than cloned, because a clone would be a second holder of the arena and
+        // paging would decline it, which is the case the test below this one is about.
+        let paged = Vector::string_views(
+            LogicalType::Varchar,
+            built.shared_views().unwrap().0.to_vec(),
+            Arc::new(Buffer::from_vec(b"1-URGENT2-HIGH".to_vec())),
+        )
+        .unwrap()
+        .into_pages();
+        assert_eq!(
+            bytes(&gathered(&paged).flatten().unwrap()),
+            bytes(&paged),
+            "a flatten off a page shares the arena"
+        );
+        assert_ne!(
+            bytes(&gathered(&built).flatten().unwrap()),
+            bytes(&built),
+            "and off an owned arena it copies, which is what this changed"
+        );
+        assert_eq!(
+            gathered(&paged).flatten().unwrap().iter().collect::<Vec<_>>(),
+            [Value::Varchar("2-HIGH".into()), Value::Varchar("1-URGENT".into())]
+        );
+    }
+
+    /// An arena somebody else is still holding is left as it was, because the only way to page it
+    /// would be to copy it and a copy is the thing the caller asked not to pay for.
+    #[test]
+    fn paging_a_string_column_whose_arena_has_another_holder_leaves_it_alone() {
+        let arena = Arc::new(Buffer::from_vec(b"red".to_vec()));
+        let vector =
+            Vector::string_views(LogicalType::Varchar, vec![StringView::over(b"red", 0)], arena)
+                .unwrap();
+        // The clone is the other holder: both vectors point at the one arena.
+        let paged = vector.clone().into_pages();
+        match &paged.body {
+            Body::Views { arena, .. } => assert!(!arena.is_shared(), "it was not ours to move"),
+            _ => panic!("string views are a views body"),
+        }
+        assert_eq!(paged.iter().collect::<Vec<_>>(), [Value::Varchar("red".into())]);
     }
 
     /// Once the codes are a page, a cut and a clone of a coded column point at the same codes, which
