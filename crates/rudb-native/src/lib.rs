@@ -2056,7 +2056,7 @@ impl Writer {
         // One column at a time, and every column's values dropped before the next column's are read
         // back. Sorting the columns across threads is the obvious thing and was what this did, but
         // sorting a column now means decoding it, and five ClickBench string columns decoded at once
-        // is the peak this release was about.
+        // is the peak this change is about.
         for (index, dictionary) in dictionaries.into_iter().enumerate() {
             let Some(mut dictionary) = dictionary else { continue };
             dictionary.finish_blocks()?;
