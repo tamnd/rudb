@@ -1217,23 +1217,38 @@ impl GlobalDictionary {
         Ok(())
     }
 
-    /// Encodes whatever is still raw, which is the part block at the end of the load and, for a
-    /// column too small to have settled a shape, every block it has.
-    fn finish_blocks(&mut self) -> Result<()> {
+    /// Seals the part block at the end of the load, if there is one.
+    fn seal_rest(&mut self) {
         // Asked of the values rather than of the bytes, because a block of empty strings has values
         // in it and no bytes, and a column of nulls is exactly that.
         if self.ends.len() % TEXT_PAYLOAD_VALUES != 0 {
             self.seal();
         }
-        for (at, bytes) in std::mem::take(&mut self.waiting) {
+    }
+
+    /// Encodes the waiting block at `at`, with the settled shape when there is one and by trying
+    /// everything when the column was too small to settle one.
+    fn encode_waiting(&self, at: usize) -> Result<Vec<u8>> {
+        let (block, bytes) = &self.waiting[at];
+        let values = self.slices(*block, bytes);
+        match &self.shape {
+            Some(shape) => string::encode_with(&values, shape),
+            None => string::encode(&values),
+        }
+    }
+
+    /// [`finish_dictionaries`] for one dictionary on this thread, for the tests that hold one.
+    #[cfg(test)]
+    fn finish_blocks(&mut self) -> Result<()> {
+        self.seal_rest();
+        let made = (0..self.waiting.len())
+            .map(|at| self.encode_waiting(at))
+            .collect::<Result<Vec<_>>>()?;
+        for ((at, _), bytes) in std::mem::take(&mut self.waiting).into_iter().zip(made) {
             if self.encoded() != at {
                 return Err(Error::internal("a dictionary block was encoded out of order"));
             }
-            let values = self.slices(at, &bytes);
-            self.blocks.push(match &self.shape {
-                Some(shape) => string::encode_with(&values, shape)?,
-                None => string::encode(&values)?,
-            });
+            self.blocks.push(bytes);
         }
         Ok(())
     }
@@ -2655,9 +2670,7 @@ impl Writer {
         self.table.distincts = distincts;
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
         let placing = self.at;
-        for dictionary in self.dictionaries.iter_mut().flatten() {
-            dictionary.finish_blocks()?;
-        }
+        finish_dictionaries(&mut self.dictionaries)?;
         self.place_blocks()?;
         self.table.pair_frequencies = self.pair_frequencies()?;
         let dictionaries = std::mem::take(&mut self.dictionaries);
@@ -8526,10 +8539,29 @@ fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     // wait. There are at most `PAYLOAD_SAMPLE_BLOCKS` of them and they are about to be encoded one
     // way or the other, and encoding them now would be encoding them without having looked at the
     // column.
+    encode_waiting(dictionaries, false)
+}
+
+/// Encodes every block still raw at the end of a load: the part block each column ends on and,
+/// for a column too small to have settled a shape, every block it has.
+///
+/// Across threads, the way [`encode_ready`] does it. This ran one column at a time on the thread
+/// closing the table, and a column that never settled a shape encodes each block by trying every
+/// candidate, so on a million rows of `hits` it was most of the load's CPU on one core.
+fn finish_dictionaries(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
+    for dictionary in dictionaries.iter_mut().flatten() {
+        dictionary.seal_rest();
+    }
+    encode_waiting(dictionaries, true)
+}
+
+/// Encodes the waiting blocks of every dictionary with a shape, or of every dictionary when
+/// `closing`, across threads, and appends them to their columns in order.
+fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>], closing: bool) -> Result<()> {
     let jobs = dictionaries
         .iter()
         .enumerate()
-        .filter(|(_, held)| held.as_ref().is_some_and(|held| held.shape.is_some()))
+        .filter(|(_, held)| held.as_ref().is_some_and(|held| closing || held.shape.is_some()))
         .flat_map(|(column, held)| {
             (0..held.as_ref().map_or(0, |held| held.waiting.len())).map(move |at| (column, at))
         })
@@ -8539,10 +8571,7 @@ fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     }
     let one = |column: usize, at: usize| -> Result<(usize, usize, Vec<u8>)> {
         let held = dictionaries[column].as_ref().ok_or_else(|| Error::internal("no dictionary"))?;
-        let (block, bytes) = &held.waiting[at];
-        let values = held.slices(*block, bytes);
-        let shape = held.shape.as_ref().ok_or_else(|| Error::internal("no dictionary shape"))?;
-        Ok((column, at, string::encode_with(&values, shape)?))
+        Ok((column, at, held.encode_waiting(at)?))
     };
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
