@@ -10192,7 +10192,8 @@ mod tests {
 
     #[test]
     fn a_name_taken_in_pieces_is_the_name_of_the_pieces_joined() {
-        let bytes: Vec<u8> = (0..300_u32).map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let bytes: Vec<u8> =
+            (0..300_u32).map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
         for length in [0, 1, 7, 31, 32, 33, 63, 64, 65, 100, 300] {
             let whole = content_name(&bytes[..length]);
             for step in [1, 3, 8, 31, 32, 33, 64, 301] {
