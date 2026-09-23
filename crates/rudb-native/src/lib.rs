@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -234,64 +235,115 @@ fn checksum(bytes: &[u8]) -> u64 {
 /// seeds are independent, so the pair is a hundred and twenty eight bits and the same arithmetic
 /// puts that at around one in 1e24.
 fn seeded_checksum(bytes: &[u8], seed: u64) -> u64 {
-    const P1: u64 = 11_400_714_785_074_694_791;
-    const P2: u64 = 14_029_467_366_897_019_727;
-    const P3: u64 = 1_609_587_929_392_839_161;
-    const P4: u64 = 9_650_029_242_287_828_579;
-    const P5: u64 = 2_870_177_450_012_600_261;
-    let round = |state: u64, word: u64| {
-        state.wrapping_add(word.wrapping_mul(P2)).rotate_left(31).wrapping_mul(P1)
-    };
-    let merge = |state: u64, lane: u64| (state ^ round(0, lane)).wrapping_mul(P1).wrapping_add(P4);
-    let word = |chunk: &[u8]| u64::from_le_bytes(chunk.try_into().expect("eight checksum bytes"));
-
     // Asked for before the loop rather than after it, because a `ChunksExact` settles what it
     // cannot divide when it is built and hands back the same tail whether it has been walked or not.
     let mut blocks = bytes.chunks_exact(32);
-    let mut rest = blocks.remainder();
-    let mut hash = if bytes.len() >= 32 {
-        let mut one = seed.wrapping_add(P1).wrapping_add(P2);
-        let mut two = seed.wrapping_add(P2);
-        let mut three = seed;
-        let mut four = seed.wrapping_sub(P1);
-        for block in blocks.by_ref() {
-            one = round(one, word(&block[..8]));
-            two = round(two, word(&block[8..16]));
-            three = round(three, word(&block[16..24]));
-            four = round(four, word(&block[24..]));
-        }
-        let combined = one
-            .rotate_left(1)
-            .wrapping_add(two.rotate_left(7))
-            .wrapping_add(three.rotate_left(12))
-            .wrapping_add(four.rotate_left(18));
-        merge(merge(merge(merge(combined, one), two), three), four)
-    } else {
-        seed.wrapping_add(P5)
+    let rest = blocks.remainder();
+    if bytes.len() < 32 {
+        return checksum_tail(seed.wrapping_add(XXH_P5).wrapping_add(bytes.len() as u64), rest);
+    }
+    let mut lanes = [
+        seed.wrapping_add(XXH_P1).wrapping_add(XXH_P2),
+        seed.wrapping_add(XXH_P2),
+        seed,
+        seed.wrapping_sub(XXH_P1),
+    ];
+    for block in blocks.by_ref() {
+        checksum_block(&mut lanes, block);
+    }
+    finish_checksum(lanes, rest, bytes.len() as u64)
+}
+
+const XXH_P1: u64 = 11_400_714_785_074_694_791;
+const XXH_P2: u64 = 14_029_467_366_897_019_727;
+const XXH_P3: u64 = 1_609_587_929_392_839_161;
+const XXH_P4: u64 = 9_650_029_242_287_828_579;
+const XXH_P5: u64 = 2_870_177_450_012_600_261;
+
+fn checksum_round(state: u64, word: u64) -> u64 {
+    state.wrapping_add(word.wrapping_mul(XXH_P2)).rotate_left(31).wrapping_mul(XXH_P1)
+}
+
+fn checksum_word(chunk: &[u8]) -> u64 {
+    u64::from_le_bytes(chunk.try_into().expect("eight checksum bytes"))
+}
+
+/// One thirty two byte block into the four lanes.
+fn checksum_block(lanes: &mut [u64; 4], block: &[u8]) {
+    for (lane, chunk) in lanes.iter_mut().zip(block.chunks_exact(8)) {
+        *lane = checksum_round(*lane, checksum_word(chunk));
+    }
+}
+
+/// The lanes after every whole block, folded together with what was left over and the length.
+fn finish_checksum(lanes: [u64; 4], rest: &[u8], length: u64) -> u64 {
+    let merge = |state: u64, lane: u64| {
+        (state ^ checksum_round(0, lane)).wrapping_mul(XXH_P1).wrapping_add(XXH_P4)
     };
-    hash = hash.wrapping_add(bytes.len() as u64);
+    let [one, two, three, four] = lanes;
+    let combined = one
+        .rotate_left(1)
+        .wrapping_add(two.rotate_left(7))
+        .wrapping_add(three.rotate_left(12))
+        .wrapping_add(four.rotate_left(18));
+    let hash = merge(merge(merge(merge(combined, one), two), three), four);
+    checksum_tail(hash.wrapping_add(length), rest)
+}
+
+/// The fewer than thirty two bytes after the last whole block, and the final mix.
+fn checksum_tail(mut hash: u64, mut rest: &[u8]) -> u64 {
     let mut words = rest.chunks_exact(8);
     for chunk in words.by_ref() {
-        hash ^= round(0, word(chunk));
-        hash = hash.rotate_left(27).wrapping_mul(P1).wrapping_add(P4);
+        hash ^= checksum_round(0, checksum_word(chunk));
+        hash = hash.rotate_left(27).wrapping_mul(XXH_P1).wrapping_add(XXH_P4);
     }
     rest = words.remainder();
     if rest.len() >= 4 {
         let (head, tail) = rest.split_at(4);
         let quarter = u32::from_le_bytes(head.try_into().expect("four checksum bytes"));
-        hash ^= u64::from(quarter).wrapping_mul(P1);
-        hash = hash.rotate_left(23).wrapping_mul(P2).wrapping_add(P3);
+        hash ^= u64::from(quarter).wrapping_mul(XXH_P1);
+        hash = hash.rotate_left(23).wrapping_mul(XXH_P2).wrapping_add(XXH_P3);
         rest = tail;
     }
     for &byte in rest {
-        hash ^= u64::from(byte).wrapping_mul(P5);
-        hash = hash.rotate_left(11).wrapping_mul(P1);
+        hash ^= u64::from(byte).wrapping_mul(XXH_P5);
+        hash = hash.rotate_left(11).wrapping_mul(XXH_P1);
     }
     hash ^= hash >> 33;
-    hash = hash.wrapping_mul(P2);
+    hash = hash.wrapping_mul(XXH_P2);
     hash ^= hash >> 29;
-    hash = hash.wrapping_mul(P3);
+    hash = hash.wrapping_mul(XXH_P3);
     hash ^ (hash >> 32)
+}
+
+/// The checksum of `length` bytes of `file` from `offset`, read [`DIRECTORY_WINDOW`] at a time.
+///
+/// The same xxHash64 as [`checksum`], carried across reads rather than over one buffer, so that a
+/// directory can be checked without all of it being in memory at once. The four lanes take whole
+/// thirty two byte blocks, and a read that ends partway through one keeps the tail for the next.
+fn file_checksum(file: &File, offset: u64, length: usize) -> Result<u64> {
+    if length < 32 {
+        let mut bytes = vec![0; length];
+        read_at(file, offset, &mut bytes)?;
+        return Ok(checksum(&bytes));
+    }
+    let mut lanes = [XXH_P1.wrapping_add(XXH_P2), XXH_P2, 0, 0_u64.wrapping_sub(XXH_P1)];
+    let mut buffer = vec![0; DIRECTORY_WINDOW.min(length)];
+    let mut kept = 0;
+    let mut read = 0;
+    while read < length {
+        let want = (buffer.len() - kept).min(length - read);
+        read_at(file, offset + read as u64, &mut buffer[kept..kept + want])?;
+        read += want;
+        let filled = kept + want;
+        let whole = filled / 32 * 32;
+        for block in buffer[..whole].chunks_exact(32) {
+            checksum_block(&mut lanes, block);
+        }
+        buffer.copy_within(whole..filled, 0);
+        kept = filled - whole;
+    }
+    Ok(finish_checksum(lanes, &buffer[..kept], length as u64))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -381,6 +433,24 @@ struct PairFrequencySummary {
     omitted_max: u64,
 }
 
+/// One column's frequency synopsis, in memory or left where it is in the file.
+///
+/// A writer holds what it counted. A reader leaves every synopsis in the file and reads one back
+/// when a query asks about its column, because they are the largest thing in a directory once they
+/// are decoded, forty eight bytes an entry and nearly twenty thousand entries over `hits`, and
+/// most queries ask about none of them. Where one sits is found at open, by reading it through and
+/// checking it, so a torn synopsis is still refused when the table is opened.
+#[derive(Debug, Clone)]
+enum Frequencies {
+    Held(FrequencySummary),
+    /// Where the synopsis sits, and whether it was written with the value of each ordinal, which
+    /// is what the directory's frequency magic says and the synopsis itself does not.
+    Stored {
+        span: Span,
+        values: bool,
+    },
+}
+
 /// The values one column's frequency synopsis lists, with a bound on everything it left out.
 ///
 /// What [`Reader::frequency_prefix`] answers. The counts are exact, and `omitted_max` is how many
@@ -421,6 +491,65 @@ struct Span {
     length: u32,
 }
 
+/// One optional page for each column of a stripe, holding only the pages that are there.
+///
+/// A stripe has three of these, the membership, sieve and part range pages. As a
+/// `Vec<Option<Page>>` each was thirty two bytes a column whether the page was there or not, and
+/// over the ten million rows of `hits` that is half a megabyte at open for 7171 pages out of 16380
+/// slots. Kept sparse and packed, a page that is there is twenty four bytes and one that is not is
+/// nothing.
+#[derive(Debug, Clone, Default)]
+struct Pages {
+    columns: usize,
+    held: Box<[StripePage]>,
+}
+
+/// A page and the column it is for, packed so that the column sits where the padding was.
+#[derive(Debug, Clone, Copy)]
+struct StripePage {
+    offset: u64,
+    hash: u64,
+    length: u32,
+    column: u32,
+}
+
+impl Pages {
+    /// The pages of `columns` columns, one slot each in column order.
+    fn from_slots(slots: Vec<Option<Page>>) -> Result<Self> {
+        let mut held = Vec::with_capacity(slots.iter().flatten().count());
+        for (column, page) in slots.iter().enumerate() {
+            if let Some(page) = page {
+                let column =
+                    u32::try_from(column).map_err(|_| invalid("too many columns for a page"))?;
+                held.push(StripePage {
+                    offset: page.offset,
+                    hash: page.hash,
+                    length: page.length,
+                    column,
+                });
+            }
+        }
+        Ok(Self { columns: slots.len(), held: held.into_boxed_slice() })
+    }
+
+    /// The page of one column, if it has one.
+    fn get(&self, column: usize) -> Option<Page> {
+        let at = self.held.binary_search_by_key(&column, |placed| placed.column as usize).ok()?;
+        let placed = self.held[at];
+        Some(Page { offset: placed.offset, length: placed.length, hash: placed.hash })
+    }
+
+    /// One slot per column, in column order, the way the directory writes them.
+    fn slots(&self) -> impl Iterator<Item = Option<Page>> + '_ {
+        (0..self.columns).map(|column| self.get(column))
+    }
+
+    /// How much of the file one column's page takes, or zero when it has none.
+    fn bytes(&self, column: usize) -> u64 {
+        self.get(column).map_or(0, |page| page.bytes())
+    }
+}
+
 /// One independently readable stripe of a table.
 #[derive(Debug, Clone)]
 pub struct Stripe {
@@ -433,10 +562,10 @@ pub struct Stripe {
     /// still know it is intact.
     index: Span,
     pages: Vec<Span>,
-    memberships: Vec<Option<Page>>,
+    memberships: Pages,
     /// One page per column holding the membership sieve of every part of the stripe, for the
     /// columns that have one. A column whose parts all declined a sieve has no page at all.
-    sieves: Vec<Option<Page>>,
+    sieves: Pages,
     /// One page per column holding the two ends and the null count of every part of the stripe.
     ///
     /// The stripe's own `zone` below covers sixty four times as many rows, and on a column that is
@@ -447,7 +576,7 @@ pub struct Stripe {
     /// A page per column rather than one page for the stripe, so that a query that compares one
     /// column reads the ends of that column and not of the hundred and four beside it. Read lazily
     /// for the same reason, like the sieves.
-    part_ranges: Vec<Option<Page>>,
+    part_ranges: Pages,
     zone: Zone,
 }
 
@@ -489,7 +618,7 @@ pub struct Table {
     /// Empty rather than a row of zeros on a table that has none, and read with `get` for that
     /// reason, so that a table built by hand in a test does not have to know about it.
     dictionary_payloads: Vec<u64>,
-    frequencies: Vec<Option<FrequencySummary>>,
+    frequencies: Vec<Option<Frequencies>>,
     pair_frequencies: Vec<PairFrequencySummary>,
     /// How many distinct values each column holds, for the columns that know.
     ///
@@ -1939,9 +2068,9 @@ impl Writer {
             parts: lengths,
             index,
             pages,
-            memberships,
-            sieves,
-            part_ranges,
+            memberships: Pages::from_slots(memberships)?,
+            sieves: Pages::from_slots(sieves)?,
+            part_ranges: Pages::from_slots(part_ranges)?,
             zone: Zone::from_ranges(ranges),
         });
         // Back where it came from, empty, so the next stripe buffers into the same allocation.
@@ -2242,14 +2371,17 @@ impl Writer {
             .iter()
             .enumerate()
             .filter_map(|(column, summary)| {
-                summary
-                    .as_ref()
-                    .filter(|summary| {
-                        !summary.ordinals.is_empty()
-                            && summary.ordinal_entries.len() == summary.ordinals.len()
-                    })
-                    .cloned()
-                    .map(|summary| (column, summary))
+                // A writer holds every synopsis it counted, so there is nothing stored to skip.
+                match summary {
+                    Some(Frequencies::Held(summary)) => Some(summary),
+                    _ => None,
+                }
+                .filter(|summary| {
+                    !summary.ordinals.is_empty()
+                        && summary.ordinal_entries.len() == summary.ordinals.len()
+                })
+                .cloned()
+                .map(|summary| (column, summary))
             })
             .collect::<Vec<_>>();
         let strings = self
@@ -2329,8 +2461,10 @@ impl Writer {
             previous = Some(*last);
         }
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
-        let (frequencies, distincts) = self.numeric_frequencies()?.into_iter().unzip();
-        self.table.frequencies = frequencies;
+        let (frequencies, distincts): (Vec<Option<FrequencySummary>>, _) =
+            self.numeric_frequencies()?.into_iter().unzip();
+        self.table.frequencies =
+            frequencies.into_iter().map(|held| held.map(Frequencies::Held)).collect();
         self.table.distincts = distincts;
         for dictionary in self.dictionaries.iter_mut().flatten() {
             dictionary.finish_blocks()?;
@@ -2351,7 +2485,7 @@ impl Writer {
             // by a row asking for one.
             self.table.distincts[index] =
                 Some(dictionary.counts.iter().filter(|count| **count != 0).count() as u64);
-            self.table.frequencies[index] = Some(code_frequency(&dictionary));
+            self.table.frequencies[index] = Some(Frequencies::Held(code_frequency(&dictionary)));
             let encoded = encode_global_dictionary(&dictionary, &order, &dictionary.placed, true)?;
             drop(order);
             let offset = self.at;
@@ -3834,9 +3968,11 @@ impl Catalog {
             .iter()
             .find(|entry| entry.name == name)
             .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
-        let mut bytes = vec![0; entry.directory.length as usize];
-        read_at(&self.file, entry.directory.offset, &mut bytes)?;
-        if checksum(&bytes) != entry.directory.hash {
+        // Checked and then decoded a window at a time, so that the directory's own bytes are never
+        // all in memory beside the table they decode into. It is read twice, and the second read
+        // comes out of the page cache the first one filled.
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
             return Err(invalid(&format!("the directory of table {name} does not checksum")));
         }
         let mut opening = self.opening;
@@ -3845,7 +3981,7 @@ impl Catalog {
         Reader::build(
             Arc::clone(&self.file),
             self.size,
-            decode_directory(&bytes, self.size)?,
+            read_directory(Cursor::over(&self.file, offset, length), self.size, Some(offset))?,
             u64::from(entry.directory.length),
             opening,
         )
@@ -4012,9 +4148,9 @@ impl Reader {
                 name: field.name.clone(),
                 kind: field.ty.to_string(),
                 pages: sum(stripes.iter().map(|stripe| span_bytes(&stripe.pages, at))),
-                memberships: sum(stripes.iter().map(|stripe| page_bytes(&stripe.memberships, at))),
-                sieves: sum(stripes.iter().map(|stripe| page_bytes(&stripe.sieves, at))),
-                part_ranges: sum(stripes.iter().map(|stripe| page_bytes(&stripe.part_ranges, at))),
+                memberships: sum(stripes.iter().map(|stripe| stripe.memberships.bytes(at))),
+                sieves: sum(stripes.iter().map(|stripe| stripe.sieves.bytes(at))),
+                part_ranges: sum(stripes.iter().map(|stripe| stripe.part_ranges.bytes(at))),
                 dictionary: dictionary_bytes(table, at),
             })
             .collect();
@@ -4156,7 +4292,7 @@ impl Reader {
             .fields
             .get(column)
             .ok_or_else(|| invalid("frequency column index out of range"))?;
-        let Some(summary) = self.table.frequencies.get(column).and_then(Option::as_ref) else {
+        let Some(summary) = self.frequency_summary(column)? else {
             return Ok(None);
         };
         if top == 0 || summary.entries.len() < top {
@@ -4203,10 +4339,7 @@ impl Reader {
             return Ok(None);
         }
         let first_summary = self
-            .table
-            .frequencies
-            .get(first)
-            .and_then(Option::as_ref)
+            .frequency_summary(first)?
             .ok_or_else(|| invalid("pair frequency first column has no synopsis"))?;
         let anchors = self
             .decode_frequencies(first, &self.table.fields[first].ty, &first_summary.entries)?
@@ -4298,11 +4431,31 @@ impl Reader {
             .fields
             .get(column)
             .ok_or_else(|| invalid("frequency column index out of range"))?;
-        let Some(summary) = self.table.frequencies.get(column).and_then(Option::as_ref) else {
+        let Some(summary) = self.frequency_summary(column)? else {
             return Ok(None);
         };
         let entries = self.decode_frequencies(column, &field.ty, &summary.entries)?;
         Ok(Some(FrequencyPrefix { entries, omitted_max: summary.omitted_max }))
+    }
+
+    /// One column's synopsis, read back from the file when the directory left it there.
+    fn frequency_summary(&self, column: usize) -> Result<Option<Cow<'_, FrequencySummary>>> {
+        Ok(match self.table.frequencies.get(column) {
+            None | Some(None) => None,
+            Some(Some(Frequencies::Held(summary))) => Some(Cow::Borrowed(summary)),
+            Some(Some(Frequencies::Stored { span, values })) => {
+                let field = self
+                    .table
+                    .fields
+                    .get(column)
+                    .ok_or_else(|| invalid("frequency column index out of range"))?;
+                let mut bytes = vec![0; span.length as usize];
+                read_at(&self.file, span.offset, &mut bytes)?;
+                let summary =
+                    decode_summary(&mut Cursor::new(&bytes), field, self.table.rows, *values)?;
+                Some(Cow::Owned(summary.ok_or_else(|| invalid("a stored synopsis is missing"))?))
+            }
+        })
     }
 
     /// Turns stored frequency entries into values of the column's own type.
@@ -4425,7 +4578,7 @@ impl Reader {
             .fields
             .get(column)
             .ok_or_else(|| invalid("frequency column index out of range"))?;
-        let Some(summary) = self.table.frequencies.get(column).and_then(Option::as_ref) else {
+        let Some(summary) = self.frequency_summary(column)? else {
             return Ok(None);
         };
         if summary.ordinals.is_empty() {
@@ -4756,7 +4909,7 @@ impl Reader {
             return Err(Error::internal("native code candidates are not sorted and unique"));
         }
         let stripe = self.stripe_of(part)?;
-        let Some(page) = stripe.memberships.get(column).copied().flatten() else {
+        let Some(page) = stripe.memberships.get(column) else {
             return Ok(false);
         };
         let mut bytes = vec![0; page.length as usize];
@@ -4978,7 +5131,7 @@ impl Reader {
         if let Some(held) = slot.get() {
             return Some(held);
         }
-        let page = self.table.stripes.get(stripe)?.part_ranges.get(column).copied().flatten()?;
+        let page = self.table.stripes.get(stripe)?.part_ranges.get(column)?;
         let mut bytes = vec![0; page.length as usize];
         read_at(&self.file, page.offset, &mut bytes).ok()?;
         if checksum(&bytes) != page.hash {
@@ -5075,7 +5228,7 @@ impl Reader {
         if let Some(held) = slot.get() {
             return Some(held);
         }
-        let page = self.table.stripes.get(stripe)?.sieves.get(column).copied().flatten()?;
+        let page = self.table.stripes.get(stripe)?.sieves.get(column)?;
         let mut bytes = vec![0; page.length as usize];
         read_at(&self.file, page.offset, &mut bytes).ok()?;
         if checksum(&bytes) != page.hash {
@@ -5414,7 +5567,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         // file written before that decision existed has a dictionary on every varchar column, so
         // this reads those files byte for byte the way it always did.
         for ((field, dictionary), membership) in
-            table.fields.iter().zip(&table.dictionaries).zip(&stripe.memberships)
+            table.fields.iter().zip(&table.dictionaries).zip(stripe.memberships.slots())
         {
             if field.ty != LogicalType::Varchar || dictionary.is_none() {
                 continue;
@@ -5425,7 +5578,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             put_u32(&mut out, page.length);
             put_u64(&mut out, page.hash);
         }
-        for sieve in &stripe.sieves {
+        for sieve in stripe.sieves.slots() {
             match sieve {
                 None => out.push(0),
                 Some(page) => {
@@ -5436,7 +5589,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 }
             }
         }
-        for held in &stripe.part_ranges {
+        for held in stripe.part_ranges.slots() {
             match held {
                 None => out.push(0),
                 Some(page) => {
@@ -5471,9 +5624,16 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             .map_err(|_| invalid("too many frequency columns"))?,
     );
     for summary in &table.frequencies {
-        let Some(summary) = summary else {
-            out.push(0);
-            continue;
+        let summary = match summary {
+            None => {
+                out.push(0);
+                continue;
+            }
+            Some(Frequencies::Held(summary)) => summary,
+            // Only a reader leaves a synopsis in the file, and nothing writes a reader's table back.
+            Some(Frequencies::Stored { .. }) => {
+                return Err(invalid("a synopsis left in the file cannot be written back"));
+            }
         };
         out.push(1);
         put_u64(&mut out, summary.omitted_max);
@@ -5681,7 +5841,7 @@ fn put_long_text(out: &mut Vec<u8>, text: &str, what: &str) -> Result<()> {
 /// Reads the catalog directory back, checking every span against the file before anything is
 /// allocated for it.
 fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>)> {
-    let mut cur = Cursor { bytes, at: 0 };
+    let mut cur = Cursor::new(bytes);
     if cur.take(8)? != CATALOG {
         return Err(invalid("catalog magic differs"));
     }
@@ -5760,17 +5920,85 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
     Ok((entries, views))
 }
 
+/// Reads the fields of a directory or a catalog in order, off bytes in memory or out of the file.
+///
+/// A catalog is small and is read whole. A table directory is not: at ten million rows of `hits` it
+/// is nearly a megabyte, and holding that buffer while the table it describes is built out of it
+/// put both at the peak of every query. Out of the file, the cursor holds one window of
+/// [`DIRECTORY_WINDOW`] bytes and moves it forward as the fields are read, so what a directory
+/// costs at open is what it decodes into and not that plus its own bytes.
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
+    window: Option<Window<'a>>,
 }
+
+/// The part of a directory in the file that a [`Cursor`] has read in.
+struct Window<'a> {
+    file: &'a File,
+    offset: u64,
+    length: usize,
+    /// Where `held` starts, counted from the start of the directory.
+    start: usize,
+    held: Vec<u8>,
+    /// How much to read at once, which is [`DIRECTORY_WINDOW`] outside the tests.
+    size: usize,
+}
+
+/// How much of a directory a cursor reading one out of the file holds at once.
+const DIRECTORY_WINDOW: usize = 64 << 10;
+
 impl<'a> Cursor<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0, window: None }
+    }
+
+    /// A cursor over `length` bytes of `file` from `offset`, which it reads a window at a time.
+    fn over(file: &'a File, offset: u64, length: usize) -> Self {
+        let window =
+            Window { file, offset, length, start: 0, held: Vec::new(), size: DIRECTORY_WINDOW };
+        Self { bytes: &[], at: 0, window: Some(window) }
+    }
+
+    /// How many bytes the cursor walks in all.
+    fn len(&self) -> usize {
+        self.window.as_ref().map_or(self.bytes.len(), |window| window.length)
+    }
+
+    /// Makes sure the next `len` bytes are in memory.
+    fn ensure(&mut self, len: usize) -> Result<()> {
         let end = self.at.checked_add(len).ok_or_else(|| invalid("directory offset overflow"))?;
-        let bytes =
-            self.bytes.get(self.at..end).ok_or_else(|| invalid("directory is truncated"))?;
-        self.at = end;
-        Ok(bytes)
+        if end > self.len() {
+            return Err(invalid("directory is truncated"));
+        }
+        let Some(window) = &mut self.window else { return Ok(()) };
+        if self.at < window.start || end > window.start + window.held.len() {
+            let want = len.max(window.size).min(window.length - self.at);
+            window.start = self.at;
+            window.held.resize(want, 0);
+            read_at(window.file, window.offset + self.at as u64, &mut window.held)?;
+        }
+        Ok(())
+    }
+
+    /// `len` bytes from `at`, which [`Self::ensure`] has already brought in.
+    fn held(&self, at: usize, len: usize) -> &[u8] {
+        match &self.window {
+            Some(window) => &window.held[at - window.start..at - window.start + len],
+            None => &self.bytes[at..at + len],
+        }
+    }
+
+    /// The next `len` bytes, without moving past them.
+    fn peek(&mut self, len: usize) -> Result<&[u8]> {
+        self.ensure(len)?;
+        Ok(self.held(self.at, len))
+    }
+
+    fn take(&mut self, len: usize) -> Result<&[u8]> {
+        self.ensure(len)?;
+        self.at += len;
+        Ok(self.held(self.at - len, len))
     }
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
@@ -5804,8 +6032,24 @@ impl<'a> Cursor<'a> {
     /// The bytes are the ones this directory has written since format 10 and the codec moved to
     /// rank zero rather than being copied, because a column summary now writes the same two ends
     /// and two encodings of one type is how the two quietly stop agreeing.
+    ///
+    /// A bound's length is in the bound, so out of the file the cursor offers the codec a few bytes
+    /// and offers it twice as many whenever it runs out before the directory does.
     fn bound(&mut self) -> Result<Option<Bound>> {
-        bounds::get(self.bytes, &mut self.at)
+        let rest = self.len().saturating_sub(self.at);
+        let mut want = 32;
+        loop {
+            let offered = self.peek(want.min(rest))?;
+            let mut used = 0;
+            match bounds::get(offered, &mut used) {
+                Ok(bound) => {
+                    self.at += used;
+                    return Ok(bound);
+                }
+                Err(_) if want < rest => want *= 2,
+                Err(error) => return Err(error),
+            }
+        }
     }
     fn text(&mut self) -> Result<String> {
         let len = self.u16()? as usize;
@@ -5814,7 +6058,7 @@ impl<'a> Cursor<'a> {
     /// Whether everything has been read, which is how a section that an older file does not have at
     /// all is told from one that is there and empty.
     fn done(&self) -> bool {
-        self.at >= self.bytes.len()
+        self.at >= self.len()
     }
     /// The same, for text that is a query rather than a name.
     ///
@@ -5828,8 +6072,117 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// One column's frequency synopsis, or `None` for a column that has none, checked against the column.
+fn decode_summary(
+    cur: &mut Cursor<'_>,
+    field: &Field,
+    rows: usize,
+    values: bool,
+) -> Result<Option<FrequencySummary>> {
+    Ok(match cur.u8()? {
+        0 => None,
+        1 => {
+            let omitted_max = cur.u64()?;
+            let count = cur.u32()? as usize;
+            if count > FREQUENCY_ENTRIES {
+                return Err(invalid("frequency entry count exceeds its bound"));
+            }
+            let mut entries = Vec::with_capacity(count);
+            // row at a time: directory decoding validates each persisted bounded frequency entry.
+            for _ in 0..count {
+                let value = match cur.u8()? {
+                    0 => FrequencyValue::Null,
+                    1 => FrequencyValue::Integer(i128::from_le_bytes(
+                        cur.take(16)?.try_into().expect("sixteen bytes"),
+                    )),
+                    2 => FrequencyValue::Code(cur.u32()?),
+                    _ => return Err(invalid("frequency value tag differs")),
+                };
+                let valid = matches!(
+                    (&field.ty, value),
+                    (_, FrequencyValue::Null)
+                        | (LogicalType::Varchar, FrequencyValue::Code(_))
+                        | (
+                            LogicalType::TinyInt
+                                | LogicalType::SmallInt
+                                | LogicalType::Integer
+                                | LogicalType::BigInt
+                                | LogicalType::UTinyInt
+                                | LogicalType::USmallInt
+                                | LogicalType::UInteger
+                                | LogicalType::UBigInt
+                                | LogicalType::Date
+                                | LogicalType::Timestamp,
+                            FrequencyValue::Integer(_),
+                        )
+                );
+                if !valid {
+                    return Err(invalid("frequency value does not match its column"));
+                }
+                let count = cur.u64()?;
+                if count == 0 || count > rows as u64 {
+                    return Err(invalid("frequency count is outside the table"));
+                }
+                entries.push(FrequencyEntry { value, count });
+            }
+            if entries.windows(2).any(|pair| pair[0].count < pair[1].count) {
+                return Err(invalid("frequency entries are not descending"));
+            }
+            let ordinals = {
+                let ordinal_count = cur.u32()? as usize;
+                if ordinal_count > FREQUENCY_ORDINALS || ordinal_count > rows {
+                    return Err(invalid("frequency ordinal count exceeds its bound"));
+                }
+                let mut ordinals = Vec::with_capacity(ordinal_count);
+                let mut previous = 0_u64;
+                for at in 0..ordinal_count {
+                    let delta = cur.var_u64()?;
+                    if at != 0 && delta == 0 {
+                        return Err(invalid("frequency ordinals are not increasing"));
+                    }
+                    let ordinal = if at == 0 {
+                        delta
+                    } else {
+                        previous
+                            .checked_add(delta)
+                            .ok_or_else(|| invalid("frequency ordinal overflows"))?
+                    };
+                    if ordinal >= rows as u64 {
+                        return Err(invalid("frequency ordinal is outside the table"));
+                    }
+                    ordinals.push(ordinal);
+                    previous = ordinal;
+                }
+                ordinals
+            };
+            let ordinal_entries = if values {
+                let mut ordinal_entries = Vec::with_capacity(ordinals.len());
+                for _ in 0..ordinals.len() {
+                    let entry = cur.u16()?;
+                    if entry as usize >= entries.len() {
+                        return Err(invalid("frequency ordinal value is outside its entries"));
+                    }
+                    ordinal_entries.push(entry);
+                }
+                ordinal_entries
+            } else {
+                Vec::new()
+            };
+            Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries })
+        }
+        _ => return Err(invalid("frequency summary tag differs")),
+    })
+}
+
 fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
-    let mut cur = Cursor { bytes, at: 0 };
+    read_directory(Cursor::new(bytes), size, None)
+}
+
+/// A directory out of `cur`, which is a whole one in memory or one being read out of the file.
+///
+/// `stored_at` is where the directory starts in the file when it is being read out of it, and then
+/// every frequency synopsis is checked and left there, as [`Frequencies::Stored`].
+fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Result<Table> {
     if cur.take(8)? != DIRECTORY {
         return Err(invalid("directory magic differs"));
     }
@@ -6004,16 +6357,19 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             parts,
             index,
             pages,
-            memberships,
-            sieves,
-            part_ranges,
+            memberships: Pages::from_slots(memberships)?,
+            sieves: Pages::from_slots(sieves)?,
+            part_ranges: Pages::from_slots(part_ranges)?,
             zone: Zone::from_ranges(ranges),
         });
     }
     if total != rows {
         return Err(invalid("table row count differs from stripes"));
     }
-    let frequencies = if cur.at == bytes.len() {
+    // How many entries each column's synopsis lists, which is all a pair summary is checked against,
+    // kept apart because the synopses themselves may be left in the file.
+    let mut entry_counts = vec![0; width];
+    let frequencies = if cur.done() {
         vec![None; width]
     } else {
         let frequency_magic = cur.take(8)?;
@@ -6025,103 +6381,22 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             return Err(invalid("frequency column count differs"));
         }
         let mut frequencies = Vec::with_capacity(width);
-        for field in &fields {
-            let summary = match cur.u8()? {
-                0 => None,
-                1 => {
-                    let omitted_max = cur.u64()?;
-                    let count = cur.u32()? as usize;
-                    if count > FREQUENCY_ENTRIES {
-                        return Err(invalid("frequency entry count exceeds its bound"));
-                    }
-                    let mut entries = Vec::with_capacity(count);
-                    // row at a time: directory decoding validates each persisted bounded frequency entry.
-                    for _ in 0..count {
-                        let value = match cur.u8()? {
-                            0 => FrequencyValue::Null,
-                            1 => FrequencyValue::Integer(i128::from_le_bytes(
-                                cur.take(16)?.try_into().expect("sixteen bytes"),
-                            )),
-                            2 => FrequencyValue::Code(cur.u32()?),
-                            _ => return Err(invalid("frequency value tag differs")),
-                        };
-                        let valid = matches!(
-                            (&field.ty, value),
-                            (_, FrequencyValue::Null)
-                                | (LogicalType::Varchar, FrequencyValue::Code(_))
-                                | (
-                                    LogicalType::TinyInt
-                                        | LogicalType::SmallInt
-                                        | LogicalType::Integer
-                                        | LogicalType::BigInt
-                                        | LogicalType::UTinyInt
-                                        | LogicalType::USmallInt
-                                        | LogicalType::UInteger
-                                        | LogicalType::UBigInt
-                                        | LogicalType::Date
-                                        | LogicalType::Timestamp,
-                                    FrequencyValue::Integer(_),
-                                )
-                        );
-                        if !valid {
-                            return Err(invalid("frequency value does not match its column"));
-                        }
-                        let count = cur.u64()?;
-                        if count == 0 || count > rows as u64 {
-                            return Err(invalid("frequency count is outside the table"));
-                        }
-                        entries.push(FrequencyEntry { value, count });
-                    }
-                    if entries.windows(2).any(|pair| pair[0].count < pair[1].count) {
-                        return Err(invalid("frequency entries are not descending"));
-                    }
-                    let ordinals = {
-                        let ordinal_count = cur.u32()? as usize;
-                        if ordinal_count > FREQUENCY_ORDINALS || ordinal_count > rows {
-                            return Err(invalid("frequency ordinal count exceeds its bound"));
-                        }
-                        let mut ordinals = Vec::with_capacity(ordinal_count);
-                        let mut previous = 0_u64;
-                        for at in 0..ordinal_count {
-                            let delta = cur.var_u64()?;
-                            if at != 0 && delta == 0 {
-                                return Err(invalid("frequency ordinals are not increasing"));
-                            }
-                            let ordinal = if at == 0 {
-                                delta
-                            } else {
-                                previous
-                                    .checked_add(delta)
-                                    .ok_or_else(|| invalid("frequency ordinal overflows"))?
-                            };
-                            if ordinal >= rows as u64 {
-                                return Err(invalid("frequency ordinal is outside the table"));
-                            }
-                            ordinals.push(ordinal);
-                            previous = ordinal;
-                        }
-                        ordinals
-                    };
-                    let ordinal_entries = if frequency_values {
-                        let mut ordinal_entries = Vec::with_capacity(ordinals.len());
-                        for _ in 0..ordinals.len() {
-                            let entry = cur.u16()?;
-                            if entry as usize >= entries.len() {
-                                return Err(invalid(
-                                    "frequency ordinal value is outside its entries",
-                                ));
-                            }
-                            ordinal_entries.push(entry);
-                        }
-                        ordinal_entries
-                    } else {
-                        Vec::new()
-                    };
-                    Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries })
-                }
-                _ => return Err(invalid("frequency summary tag differs")),
-            };
-            frequencies.push(summary);
+        for (field, entry_count) in fields.iter().zip(&mut entry_counts) {
+            let start = cur.at;
+            let summary = decode_summary(&mut cur, field, rows, frequency_values)?;
+            *entry_count = summary.as_ref().map_or(0, |summary| summary.entries.len());
+            frequencies.push(match (summary, stored_at) {
+                (None, _) => None,
+                (Some(summary), None) => Some(Frequencies::Held(summary)),
+                (Some(_), Some(offset)) => Some(Frequencies::Stored {
+                    span: Span {
+                        offset: offset + start as u64,
+                        length: u32::try_from(cur.at - start)
+                            .map_err(|_| invalid("a frequency synopsis is too long"))?,
+                    },
+                    values: frequency_values,
+                }),
+            });
         }
         frequencies
     };
@@ -6144,7 +6419,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     // Zero until a section table says otherwise, which is what a format 22 table gets and what
     // makes every section stamp fail to match on one, because real generations start at one.
     let mut generation = 0;
-    while cur.at != bytes.len() {
+    while !cur.done() {
         let mut tag = [0u8; 8];
         tag.copy_from_slice(cur.take(8)?);
         if &tag == PAIR_FREQUENCIES {
@@ -6162,9 +6437,10 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                 let second = cur.u16()?;
                 let first_at = first as usize;
                 let second_at = second as usize;
-                let Some(first_summary) = frequencies.get(first_at).and_then(Option::as_ref) else {
+                if frequencies.get(first_at).and_then(Option::as_ref).is_none() {
                     return Err(invalid("pair frequency first column has no synopsis"));
-                };
+                }
+                let first_entries = entry_counts[first_at];
                 if !matches!(fields.get(second_at), Some(field) if field.ty == LogicalType::Varchar)
                     || dictionaries.get(second_at).copied().flatten().is_none()
                 {
@@ -6187,7 +6463,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                 let mut entries = Vec::with_capacity(entries_count);
                 for _ in 0..entries_count {
                     let first_entry = cur.u16()?;
-                    if first_entry as usize >= first_summary.entries.len() {
+                    if first_entry as usize >= first_entries {
                         return Err(invalid("pair frequency anchor is outside its synopsis"));
                     }
                     let second = match cur.u8()? {
@@ -6273,7 +6549,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
             return Err(invalid("directory extension magic differs"));
         }
     }
-    if cur.at != bytes.len() {
+    if !cur.done() {
         return Err(invalid("directory has trailing bytes"));
     }
     Ok(Table {
@@ -7063,7 +7339,7 @@ fn encode_part_ranges(ranges: &[Range]) -> Result<Vec<u8>> {
 
 /// The ranges one encoded page holds, one entry per part of the stripe.
 fn decode_part_ranges(bytes: &[u8]) -> Result<Vec<Range>> {
-    let mut cur = Cursor { bytes, at: 0 };
+    let mut cur = Cursor::new(bytes);
     let parts = cur.u32()? as usize;
     let mut out = Vec::new();
     for _ in 0..parts {
@@ -7786,7 +8062,7 @@ fn open_global_dictionary(
 fn page_encoding(ty: &LogicalType, rows: usize, bytes: &[u8]) -> String {
     /// The page header is the codec, the validity tag and, for a page that stores a mask, the mask.
     fn cascade_at(rows: usize, bytes: &[u8]) -> Result<(u8, usize)> {
-        let mut cur = Cursor { bytes, at: 0 };
+        let mut cur = Cursor::new(bytes);
         let codec = cur.u8()?;
         if cur.u8()? == 2 {
             cur.take(rows.div_ceil(8))?;
@@ -7819,7 +8095,7 @@ fn page_encoding(ty: &LogicalType, rows: usize, bytes: &[u8]) -> String {
 /// the code pages are final but the dictionary index is not in the directory yet, and the values
 /// are irrelevant: equality and nullness are all a grouped count needs.
 fn decode_stable_codes(rows: usize, bytes: &[u8]) -> Result<Option<Vec<Option<u32>>>> {
-    let mut cur = Cursor { bytes, at: 0 };
+    let mut cur = Cursor::new(bytes);
     let codec = cur.u8()?;
     let flag = cur.u8()?;
     let validity = match flag {
@@ -7874,7 +8150,7 @@ fn decode(
     bytes: &[u8],
     global: Option<Arc<Vector>>,
 ) -> Result<Vector> {
-    let mut cur = Cursor { bytes, at: 0 };
+    let mut cur = Cursor::new(bytes);
     let codec = cur.u8()?;
     let flag = cur.u8()?;
     let validity = match flag {
@@ -9772,8 +10048,10 @@ mod tests {
         writer.append(&chunk).expect("one part");
         writer.finish().expect("commit");
 
-        let page =
-            Reader::open(&path).expect("reopen").table.stripes[0].sieves[0].expect("a sieve page");
+        let page = Reader::open(&path).expect("reopen").table.stripes[0]
+            .sieves
+            .get(0)
+            .expect("a sieve page");
         let mut file = OpenOptions::new().write(true).open(&path).expect("open the sieve page");
         file.seek(SeekFrom::Start(page.offset + u64::from(page.length) - 1)).expect("seek");
         file.write_all(&[0xff]).expect("damage one byte");
@@ -10797,6 +11075,115 @@ mod tests {
     /// five hundred and twelve codes spread over all three payload blocks. Reading it used to leave
     /// all three decoded for as long as the reader lived. It leaves none of them now, and the second
     /// read answers out of what the first remembered.
+    /// A directory read out of the file a window at a time is the directory read whole.
+    ///
+    /// The windows here are far smaller than any field is long, so every kind of field is split
+    /// across a refill somewhere, and a bound is offered to its codec short more than once. The
+    /// synopses are left in the file, and each one read back from where it was left is the one the
+    /// whole read decoded.
+    #[test]
+    fn a_directory_read_a_window_at_a_time_is_the_directory_read_whole() {
+        let path = path("windowed-directory");
+        let fields = vec![
+            Field::required("id", LogicalType::BigInt),
+            Field::required("word", LogicalType::Varchar),
+            Field::new("score", LogicalType::Double),
+        ];
+        let mut writer = Writer::create(&path, "items", fields).expect("new file");
+        for part in 0..70_i64 {
+            let ids = (0..100).map(|row| Value::BigInt(part * 100 + row % 7)).collect::<Vec<_>>();
+            let words = (0..100)
+                .map(|row| Value::Varchar(format!("word {}", row % 13)))
+                .collect::<Vec<_>>();
+            let scores = (0..100)
+                .map(|row| if row % 4 == 0 { Value::Null } else { Value::Double(row as f64) })
+                .collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &ids).expect("integers"),
+                Vector::from_values(LogicalType::Varchar, &words).expect("strings"),
+                Vector::from_values(LogicalType::Double, &scores).expect("doubles"),
+            ])
+            .expect("three columns");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let entry = catalog.entries.first().expect("one table").directory;
+        let (offset, length) = (entry.offset, entry.length as usize);
+        let mut bytes = vec![0; length];
+        read_at(&catalog.file, offset, &mut bytes).expect("the directory");
+        assert_eq!(file_checksum(&catalog.file, offset, length).expect("checksum"), entry.hash);
+        let whole = decode_directory(&bytes, catalog.size).expect("whole");
+        assert!(whole.stripes.len() > 1, "the table should span stripes");
+        for size in [1, 7, 33, 4_096] {
+            let mut cursor = Cursor::over(&catalog.file, offset, length);
+            cursor.window.as_mut().expect("a window").size = size;
+            let windowed = read_directory(cursor, catalog.size, Some(offset)).expect("windowed");
+            assert_eq!(format!("{:?}", windowed.stripes), format!("{:?}", whole.stripes));
+            assert_eq!(format!("{:?}", windowed.fields), format!("{:?}", whole.fields));
+            let mut stored = 0;
+            for (column, (left, held)) in
+                windowed.frequencies.iter().zip(&whole.frequencies).enumerate()
+            {
+                match (left, held) {
+                    (None, None) => {}
+                    (
+                        Some(super::Frequencies::Stored { span, values }),
+                        Some(super::Frequencies::Held(summary)),
+                    ) => {
+                        let mut one = vec![0; span.length as usize];
+                        read_at(&catalog.file, span.offset, &mut one).expect("a synopsis");
+                        let read = decode_summary(
+                            &mut Cursor::new(&one),
+                            &whole.fields[column],
+                            whole.rows,
+                            *values,
+                        )
+                        .expect("a valid synopsis")
+                        .expect("one is there");
+                        assert_eq!(format!("{read:?}"), format!("{summary:?}"));
+                        stored += 1;
+                    }
+                    other => panic!("column {column} came back as {other:?}"),
+                }
+            }
+            assert!(stored >= 2, "only {stored} synopses were left in the file");
+        }
+        let reader = catalog.table("items").expect("the table");
+        assert!(reader.top_frequencies(1, 1).expect("a readable synopsis").is_some());
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_checksum_carried_across_reads_is_the_checksum_of_the_whole() {
+        let path = path("file-checksum");
+        let bytes = (0..200_000_u32)
+            .map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).expect("scratch file");
+        let file = File::open(&path).expect("open");
+        for (offset, length) in [
+            (0, 0),
+            (3, 1),
+            (5, 31),
+            (0, 32),
+            (9, 33),
+            (1, 65_536),
+            (7, 65_567),
+            (0, 200_000),
+            (11, 131_101),
+        ] {
+            let whole = checksum(&bytes[offset..offset + length]);
+            assert_eq!(
+                file_checksum(&file, offset as u64, length).expect("read"),
+                whole,
+                "{offset} {length}"
+            );
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     #[test]
     fn a_string_synopsis_is_read_without_keeping_the_dictionary_blocks() {
         let path = path("synopsis-keeps-no-block");
@@ -11289,7 +11676,7 @@ mod tests {
         writer.finish().expect("commit");
 
         let reader = Reader::open(&path).expect("valid directory");
-        let membership = reader.table.stripes[0].memberships[1].expect("string membership");
+        let membership = reader.table.stripes[0].memberships.get(1).expect("string membership");
         let mut file = OpenOptions::new().write(true).open(&path).expect("open membership page");
         file.seek(SeekFrom::Start(membership.offset)).expect("membership start");
         file.write_all(&[255]).expect("damage membership");
