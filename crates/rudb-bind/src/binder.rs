@@ -252,6 +252,9 @@ pub(crate) struct Binder<'a> {
     pub(crate) current_span: Span,
     /// Set while a select block aggregates, which changes what a bare column means.
     pub(crate) aggregation: Option<Aggregation>,
+    /// A grouped block may need stored column order to close groups while it scans. Other queries
+    /// leave the summaries in the file instead of reading every column's section while binding.
+    want_ascending: bool,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
     /// Set while an aggregate's `FILTER` is being bound, which is refused its own aggregate.
@@ -310,6 +313,7 @@ impl<'a> Binder<'a> {
             next_index: 0,
             current_span: Span::new(0, 0),
             aggregation: None,
+            want_ascending: false,
             in_aggregate: false,
             in_filter: false,
             windows: Vec::new(),
@@ -848,6 +852,7 @@ impl<'a> Binder<'a> {
         query: &ast::Query,
     ) -> Result<(NodeRef, Scope)> {
         let written = ast.select(select);
+        self.want_ascending |= !written.group_by.is_empty() || written.group_by_all;
         // A window belongs to the block that wrote it, and a block can be bound inside another one
         // without a subquery in between, so the outer block's runs are put aside for the duration
         // rather than left where a nested block would append to them.
@@ -1840,8 +1845,10 @@ impl<'a> Binder<'a> {
         for (column, distinct) in table.distincts() {
             self.plan.measure_distinct(index, &column, distinct);
         }
-        for column in table.ascending() {
-            self.plan.mark_ascending(index, &column);
+        if self.want_ascending {
+            for column in table.ascending() {
+                self.plan.mark_ascending(index, &column);
+            }
         }
         let node = self.add_node(Node::Get {
             catalog: catalog_name,
