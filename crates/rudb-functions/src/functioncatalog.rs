@@ -164,7 +164,8 @@ fn tables() -> Vec<FunctionEntry> {
     for function in TABLE_FUNCTIONS {
         for count in positional_counts(*function) {
             let mut parameters = positional(count);
-            let mut parameter_types = vec![positional_type(*function).to_string(); count];
+            let mut parameter_types: Vec<String> =
+                (0..count).map(|at| positional_type(*function, at).to_string()).collect();
             for (name, ty) in function.parameters() {
                 parameters.push((*name).to_string());
                 parameter_types.push(ty.to_string());
@@ -207,6 +208,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ReadCsv,
     TableFunction::RudbStrategies,
     TableFunction::RudbLinks,
+    TableFunction::RudbDeviceCard,
     TableFunction::DuckdbKeywords,
     TableFunction::DuckdbTypes,
     TableFunction::DuckdbFunctions,
@@ -237,6 +239,7 @@ const TABLE_ALIASES: &[(&str, TableFunction)] =
 fn positional_counts(function: TableFunction) -> Vec<usize> {
     match function {
         TableFunction::Range | TableFunction::GenerateSeries => vec![1, 2, 3],
+        TableFunction::RudbDeviceCard => vec![1, 2],
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::PragmaTableInfo
@@ -267,9 +270,10 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
     }
 }
 
-/// The type a table function's positional arguments take.
-const fn positional_type(function: TableFunction) -> &'static str {
+/// The type a table function's positional argument at `at` takes.
+const fn positional_type(function: TableFunction, at: usize) -> &'static str {
     match function {
+        TableFunction::RudbDeviceCard if at == 0 => "VARCHAR",
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::PragmaTableInfo
