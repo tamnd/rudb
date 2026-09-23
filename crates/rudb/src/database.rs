@@ -12,6 +12,7 @@ use rudb_common::stat::Provenance;
 use rudb_common::{
     Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Rule, Session, Value,
 };
+use rudb_io::{Filesystem, RealFilesystem};
 use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
 use rudb_native::graph::Edge;
 use rudb_parse::ast::Ast;
@@ -618,7 +619,29 @@ fn scratch(path: &Path) -> Result<PathBuf> {
 
 /// Publishes the file that was built beside the database, which is what makes a rewrite atomic.
 fn rename(temporary: &Path, path: &Path) -> Result<()> {
-    std::fs::rename(temporary, path).map_err(|error| Error::io(error.to_string()))
+    publish(&RealFilesystem::new(), temporary, path)
+}
+
+/// Renames a finished file over the one it replaces, then syncs the directory the name is in.
+///
+/// The rename is atomic, which says that a reader sees the old file or the new one and never half
+/// of each. It says nothing about the new name having reached the disk. That is the directory's
+/// own write and it is only durable once the directory is synced, so without the second call a
+/// power loss after the rename can bring the machine back with the directory still naming the old
+/// file. The data and the slot were synced before the rename, so the new file is intact on disk
+/// with nothing pointing at it, and a load that was acknowledged is gone.
+pub(crate) fn publish(fs: &dyn Filesystem, temporary: &Path, path: &Path) -> Result<()> {
+    fs.rename(temporary, path)?;
+    fs.sync_dir(directory_of(path))
+}
+
+/// The directory a path's name lives in. A bare file name has an empty parent rather than none,
+/// and the directory it means is the current one.
+fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// What the committed file holds, or `None` for a path nothing has been written to yet.
@@ -1156,7 +1179,7 @@ impl Sink for NativeSink {
         };
         let renamed = {
             let _timing = self.profile.span(Stage::Publish);
-            std::fs::rename(temporary, &self.target).map_err(|error| Error::io(error.to_string()))
+            publish(&RealFilesystem::new(), temporary, &self.target)
         };
         self.profile.finish();
         renamed
@@ -2307,7 +2330,36 @@ fn create_table(
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use std::path::Path;
+
+    use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
+
+    use super::{Database, publish};
+
+    #[test]
+    fn publishing_syncs_the_directory_after_the_rename() {
+        let fs = SimFilesystem::new();
+        fs.create_dir_all(Path::new("/data")).unwrap();
+        let file = fs.open(Path::new("/data/db.7.tmp"), OpenMode::CreateNew).unwrap();
+        file.write_at(0, b"new").unwrap();
+        file.sync().unwrap();
+        fs.clear_log();
+
+        publish(&fs, Path::new("/data/db.7.tmp"), Path::new("/data/db")).unwrap();
+
+        let ops = fs.ops();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(matches!(ops[0], Op::Rename { .. }), "{ops:?}");
+        assert_eq!(ops[1], Op::SyncDir { path: "/data".into() });
+        assert_eq!(fs.contents(Path::new("/data/db")).unwrap(), b"new".to_vec());
+    }
+
+    #[test]
+    fn a_bare_file_name_lives_in_the_current_directory() {
+        assert_eq!(super::directory_of(Path::new("db")), Path::new("."));
+        assert_eq!(super::directory_of(Path::new("/data/db")), Path::new("/data"));
+        assert_eq!(super::directory_of(Path::new("a/db")), Path::new("a"));
+    }
 
     #[test]
     fn two_statements_over_one_catalog_plan_from_the_same_counts() {
