@@ -37,6 +37,8 @@
 //! yet. Until there is, this is a plain trait with two implementations and an ablation, which is
 //! the part that can be measured today.
 
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
 use crate::{integer, string};
 
 /// Which of the candidates that apply are worth encoding in full.
@@ -320,6 +322,124 @@ impl Chooser for Settled {
     }
 }
 
+/// Encode an integer chunk the way an earlier one came out, and search only where it stops fitting.
+///
+/// [`Settled`] holds one kind per level, which is too coarse for a cascade that branches: an `RLE`
+/// wants its run values packed and its run lengths constant, and a shape of one kind per level
+/// cannot say both. This holds every level's kind in the order the encoder asks for them, which is
+/// what [`integer::shape`] reads back out of an encoded chunk, and hands them back one per question.
+///
+/// The first question whose answer is not among the kinds offered ends the replay, and from there
+/// on every question goes to `fallback`. A chunk only offers kinds that apply to it, so a shape
+/// that stops fitting costs a search and never a chunk that will not decode. The order of the
+/// questions is the order of the kinds only while every answer is a single kind, which is why the
+/// replay does not pick back up after a search.
+///
+/// A shape that still fits can still be the wrong one. Bit packing applies to everything, so a
+/// shape settled on a stretch of noise replays happily over a column that has since become one
+/// value with exceptions, at forty times the size. What does change when the column does is the set
+/// of kinds the top level offers, so a replay can be told the set its shape was searched under with
+/// [`Replay::expecting`], and searches from the top when the chunk offers anything else. The set is
+/// worked out for the chunk whatever the chooser, so the check costs nothing.
+///
+/// One of these is for one chunk. The position is kept in atomics because a chooser is shared
+/// between threads by contract, not because a chunk's encode is ever split between them.
+#[derive(Debug)]
+pub struct Replay<'a> {
+    kinds: &'a [integer::Kind],
+    next: AtomicUsize,
+    lost: AtomicBool,
+    /// The kinds the top level offered, one bit per tag, once it has been asked.
+    first: AtomicU8,
+    /// The set the top level has to offer for the replay to go ahead, when there is one.
+    expected: Option<u8>,
+    fallback: &'a dyn Chooser,
+}
+
+impl<'a> Replay<'a> {
+    /// A replay of `kinds`, with `fallback` answering once they stop fitting.
+    #[must_use]
+    pub fn new(kinds: &'a [integer::Kind], fallback: &'a dyn Chooser) -> Self {
+        Self {
+            kinds,
+            next: AtomicUsize::new(0),
+            lost: AtomicBool::new(false),
+            first: AtomicU8::new(0),
+            expected: None,
+            fallback,
+        }
+    }
+
+    /// The same replay, going ahead only on a chunk whose top level offers exactly `offered`.
+    #[must_use]
+    pub fn expecting(mut self, offered: &[integer::Kind]) -> Self {
+        self.expected = Some(bits(offered));
+        self
+    }
+
+    /// What the top level of the chunk offered, in tag order, or nothing before it was asked.
+    #[must_use]
+    pub fn first_offered(&self) -> Vec<integer::Kind> {
+        let first = self.first.load(Ordering::Relaxed);
+        integer::Kind::ALL.into_iter().filter(|kind| first & (1 << *kind as u8) != 0).collect()
+    }
+
+    /// Whether every question was answered from the shape, which is whether the chunk came out
+    /// the shape it was given.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        !self.lost.load(Ordering::Relaxed) && self.next.load(Ordering::Relaxed) == self.kinds.len()
+    }
+}
+
+impl Chooser for Replay<'_> {
+    fn name(&self) -> &'static str {
+        "replay"
+    }
+
+    fn narrow_strings(
+        &self,
+        values: &[&[u8]],
+        offered: &[string::Kind],
+        depth: u8,
+    ) -> Vec<string::Kind> {
+        self.fallback.narrow_strings(values, offered, depth)
+    }
+
+    fn narrow_integers(
+        &self,
+        values: &[i64],
+        offered: &[integer::Kind],
+        depth: u8,
+    ) -> Vec<integer::Kind> {
+        if depth == 0 {
+            self.first.store(bits(offered), Ordering::Relaxed);
+            if self.expected.is_some_and(|expected| expected != bits(offered)) {
+                self.lost.store(true, Ordering::Relaxed);
+            }
+        }
+        if !self.lost.load(Ordering::Relaxed) {
+            let at = self.next.fetch_add(1, Ordering::Relaxed);
+            match self.kinds.get(at) {
+                Some(kind) if offered.contains(kind) => return vec![*kind],
+                _ => self.lost.store(true, Ordering::Relaxed),
+            }
+        }
+        self.fallback.narrow_integers(values, offered, depth)
+    }
+
+    fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
+        // Asked before the question the replay answers, so it has to say yes to the kind the shape
+        // is about to hand back as well as to anything the fallback might keep.
+        self.kinds.contains(&kind) || self.fallback.considers_integer(kind, depth)
+    }
+}
+
+/// A set of integer kinds as one bit per tag.
+fn bits(kinds: &[integer::Kind]) -> u8 {
+    kinds.iter().fold(0, |set, kind| set | 1 << *kind as u8)
+}
+
 /// `regions` windows of `window` consecutive values each, spread evenly across the input.
 ///
 /// The starts are spread over the whole range a window can start at, so the first window begins at
@@ -346,8 +466,81 @@ pub(crate) fn sample<T: Copy>(values: &[T], window: usize, regions: usize) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{Chooser, EXHAUSTIVE, Sampled, sample};
+    use super::{Chooser, EXHAUSTIVE, Replay, Sampled, sample};
     use crate::{integer, string};
+
+    /// Columns of the shapes a writer meets: a climbing timestamp, runs, one value with exceptions,
+    /// a stride, noise, and a short tail.
+    fn shaped_columns() -> Vec<Vec<i64>> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_000) as i64
+        };
+        vec![
+            (0..2048).map(|row| 1_600_000_000_000_000 + row * 1_000_000 + row % 7).collect(),
+            (0..2048).map(|row| row / 300).collect(),
+            (0..2048).map(|row| if row % 97 == 0 { row } else { 42 }).collect(),
+            (0..2048).map(|row| 5 + row * 1_000_000).collect(),
+            (0..2048).map(|_| noise()).collect(),
+            (0..37).map(|row| row * row).collect(),
+        ]
+    }
+
+    /// Replaying the shape a chunk came out as gives the same bytes, and asks no question the shape
+    /// did not answer, which is the whole of what a writer is relying on when it stops searching.
+    #[test]
+    fn a_chunk_replayed_through_its_own_shape_comes_out_the_same() {
+        for values in shaped_columns() {
+            let searched = integer::encode_with(&values, &EXHAUSTIVE).unwrap();
+            let kinds = integer::shape(&searched).unwrap();
+            let replay = Replay::new(&kinds, &EXHAUSTIVE);
+            let replayed = integer::encode_with(&values, &replay).unwrap();
+            assert_eq!(replayed, searched, "{}", integer::describe(&searched).unwrap());
+            assert!(replay.held(), "{}", integer::describe(&searched).unwrap());
+        }
+    }
+
+    /// A shape that fits but was searched under a different offer is not replayed. Bit packing
+    /// fits everything, so without the check a shape settled on noise would pack a column of one
+    /// value with exceptions, which the search writes in a fraction of the bytes.
+    #[test]
+    fn a_shape_searched_under_another_offer_searches_again() {
+        let columns = shaped_columns();
+        let (noise, sparse) = (&columns[4], &columns[2]);
+        let first = Replay::new(&[], &EXHAUSTIVE);
+        let searched = integer::encode_with(noise, &first).unwrap();
+        let kinds = integer::shape(&searched).unwrap();
+        let offered = first.first_offered();
+        assert_eq!(offered, integer::offered(noise));
+
+        let blind = Replay::new(&kinds, &EXHAUSTIVE);
+        let packed = integer::encode_with(sparse, &blind).unwrap();
+        assert!(blind.held(), "packing fits any column, which is the trouble");
+
+        let checked = Replay::new(&kinds, &EXHAUSTIVE).expecting(&offered);
+        let written = integer::encode_with(sparse, &checked).unwrap();
+        assert!(!checked.held());
+        assert_eq!(written, integer::encode_with(sparse, &EXHAUSTIVE).unwrap());
+        assert!(written.len() * 4 < packed.len(), "{} against {}", written.len(), packed.len());
+    }
+
+    /// A shape from one column on another column it does not fit still writes that column, because
+    /// the replay stops at the first kind that is not offered and searches from there.
+    #[test]
+    fn a_shape_that_does_not_fit_still_writes_values_that_read_back() {
+        let columns = shaped_columns();
+        for from in &columns {
+            let kinds = integer::shape(&integer::encode_with(from, &EXHAUSTIVE).unwrap()).unwrap();
+            for values in &columns {
+                let replay = Replay::new(&kinds, &EXHAUSTIVE);
+                let bytes = integer::encode_with(values, &replay).unwrap();
+                assert_eq!(&integer::decode(&bytes).unwrap(), values);
+            }
+        }
+    }
 
     #[test]
     fn a_sample_covers_the_whole_input_and_not_one_end_of_it() {
