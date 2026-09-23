@@ -106,10 +106,9 @@ impl ExactDistinct {
         let set = (hash >> (64 - SET_BITS)) as usize;
         let waiting = usize::from(self.waiting[set]);
         self.buffered[set * BUFFERED + waiting] = hash;
+        self.waiting[set] = (waiting + 1) as u8;
         if waiting + 1 == BUFFERED {
             self.drain(set);
-        } else {
-            self.waiting[set] = (waiting + 1) as u8;
         }
     }
 
