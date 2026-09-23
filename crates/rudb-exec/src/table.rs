@@ -1555,10 +1555,16 @@ fn runs_in<T: Copy + Eq>(
 /// The values a filter kept out of a flat integer column, which is a dictionary whose codes are the
 /// rows that got through.
 ///
-/// Widened whole and then gathered down in place, which is safe for as long as no row reads from
-/// before itself, and that is what a selection's rows always do since they only ever go forward.
-/// `false` for codes that go back, which a selection never hands over.
+/// A flat column is gathered and widened in one pass. Any other form is widened whole and then
+/// gathered down in place, which is safe for as long as no row reads from before itself, and that
+/// is what a selection's rows always do since they only ever go forward. `false` for codes that go
+/// back, which a selection never hands over.
 fn gathered(at: &[u32], values: &Vector, into: &mut Vec<i64>) -> bool {
+    // A flat column is read at the kept rows and nowhere else, one pass rather than a copy of every
+    // row and a second pass to pick the kept ones out of it.
+    if values.signed_gather(at, into) {
+        return true;
+    }
     if at.iter().enumerate().any(|(row, &code)| (code as usize) < row) {
         return false;
     }
