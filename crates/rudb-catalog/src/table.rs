@@ -979,6 +979,21 @@ impl Table {
         self.rows.to_append()?.append(chunk)
     }
 
+    /// Adds every chunk of a finished result, with the statistics taken on up to `workers` threads.
+    ///
+    /// Every chunk is checked before any of them is kept, so a null in the last chunk leaves the
+    /// table as it was rather than holding the rows that came before it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::append`].
+    pub fn append_all(&mut self, chunks: Vec<Chunk>, workers: usize) -> Result<()> {
+        for chunk in &chunks {
+            self.refuse_nulls(chunk)?;
+        }
+        self.rows.to_append()?.append_all(chunks, workers)
+    }
+
     /// Adds rows of single values, refusing a null in a column that said it would not have one.
     ///
     /// # Errors
