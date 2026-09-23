@@ -542,25 +542,36 @@ impl Sink for Sort {
         self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
         let at = u32::try_from(local.held.chunks.len()).map_err(|_| too_many())?;
         let mut taken = u64::try_from(chunk.footprint()).unwrap_or(u64::MAX);
-        // row at a time: the keys, and nothing else. The payload is not read here at all, which is
-        // the point of `Sortable`.
         match (&self.widths, &mut local.held.rows) {
             (Some(widths), Keyed::Normal(rows)) => {
-                for row in 0..chunk.len() {
-                    let mut key: Normal = [0; normal::WIDTH];
-                    let mut written = 0;
-                    for (at, column) in keys.iter().enumerate() {
-                        let wide = *widths.get(at).ok_or_else(mismatched)?;
-                        let value = column.try_value_at(row)?;
-                        normal::write(&mut key, written, wide, &value, self.keys[at])?;
-                        written += wide;
-                    }
-                    taken += NORMALIZED;
-                    let row = u32::try_from(row).map_err(|_| too_many())?;
-                    rows.push((key, local.place.of(row as usize), (at, row)));
+                // A key column at a time into the rows' keys, a typed loop per layout rather than a
+                // value a key a row. The payload is not read here at all, which is the point of
+                // `Normalized`.
+                let first = rows.len();
+                let place = &local.place;
+                rows.extend(
+                    (0..chunk.len())
+                        .map(|row| ([0; normal::WIDTH], place.of(row), (at, row as u32))),
+                );
+                let fresh = rows.get_mut(first..).ok_or_else(mismatched)?;
+                let mut written = 0;
+                for (position, column) in keys.iter().enumerate() {
+                    let wide = *widths.get(position).ok_or_else(mismatched)?;
+                    let key = *self.keys.get(position).ok_or_else(mismatched)?;
+                    normal::write_column(
+                        fresh.iter_mut().map(|row| &mut row.0),
+                        written,
+                        wide,
+                        column,
+                        key,
+                    )?;
+                    written += wide;
                 }
+                taken += NORMALIZED * chunk.len() as u64;
             }
             (None, Keyed::Valued(rows)) => {
+                // row at a time: the keys as values, which is the path for a key list with a string
+                // or a float in it and has no fixed width bytes to write a column at a time.
                 for row in 0..chunk.len() {
                     let key: Vec<Value> = keys
                         .iter()
