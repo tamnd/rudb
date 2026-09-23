@@ -2583,6 +2583,25 @@ struct NativeText {
     /// Bits one offset is packed at, which is what the largest block of this column spans and is the
     /// same for every block of it.
     offset_bits: usize,
+    /// The same ends unpacked, built once enough readers have asked for one at a time.
+    ///
+    /// Reading one offset out of the packed form costs about fifty instructions: a division to find
+    /// the run, a bounds check to slice it, a shift to reach the bit the value starts at and a
+    /// narrowing on the way out. That is the right price for a reader that wants a handful. It is
+    /// the wrong price for `STRLEN` over a column, which asks for one per row and nothing else, and
+    /// where a million of them was a third of ClickBench 28.
+    ///
+    /// With the ends unpacked every read is a load, and a vector of lengths is one loop over them.
+    /// The table is built only once the reads say it will be used, which is what
+    /// [`Self::ends_worth_unpacking`] decides and [`Self::ends_asked`] counts towards, because a
+    /// table built for a reader that wanted three values is four bytes a value spent on nothing.
+    value_ends: OnceLock<Option<Vec<u32>>>,
+    /// How many single offset reads have come in while the table is not built.
+    ///
+    /// Relaxed, and read only against a threshold, so two threads racing here means the table is
+    /// built one read early or one read late. Counting stops the moment the table exists, because
+    /// [`OnceLock::get`] settles it before this is touched.
+    ends_asked: AtomicUsize,
     /// How many entries the sorted order has, which is the value count.
     ranks: usize,
     /// Where the sorted order starts in the file. It is read a block at a time and only when
@@ -2788,8 +2807,64 @@ impl NativeText {
         Ok(bytes)
     }
 
+    /// How many single offset reads make [`Self::value_ends`] worth building.
+    ///
+    /// As many reads as the dictionary has values. Building the table costs about thirty
+    /// instructions a value once the fresh pages it lands in are counted, and a read out of it saves
+    /// about thirty five, so it repays itself after roughly one read per value. The reads so far are
+    /// the only guess there is at the reads to come, and waiting until they match the size of the
+    /// dictionary is betting that a column read that much will be read that much again.
+    ///
+    /// A sixteenth was the first answer, from counting the unpacking alone at three instructions a
+    /// value. ClickBench 38 showed what that missed: it reads about twenty thousand titles a
+    /// statement out of a dictionary of three hundred and fifty thousand, crossed a sixteenth in its
+    /// second statement and was two percent slower for a table it did not read enough to repay. A
+    /// scan asking for the length of every row crosses it part way through its first statement on
+    /// ClickBench, where a string column has about two rows for every value, and a filter that keeps
+    /// a few thousand rows never does. The floor is there
+    /// because a short dictionary would otherwise build a table for a handful of reads.
+    fn ends_worth_unpacking(&self) -> usize {
+        self.values.max(TEXT_PAYLOAD_VALUES)
+    }
+
+    /// The unpacked ends, if they are built or if this read is the one that makes them worth it.
+    fn value_ends(&self) -> Option<&[u32]> {
+        if let Some(built) = self.value_ends.get() {
+            return built.as_deref();
+        }
+        if self.ends_asked.fetch_add(1, Atomic::Relaxed) < self.ends_worth_unpacking() {
+            return None;
+        }
+        self.value_ends.get_or_init(|| self.unpack_ends()).as_deref()
+    }
+
+    /// Every end of the column, a run at a time.
+    ///
+    /// `None` rather than an error on anything wrong, because this is a cache in front of a reader
+    /// that answers the same question. A column whose offsets are short or whose ends do not fit in
+    /// four bytes gets no table and the same error it would have got, from the read that wanted it.
+    fn unpack_ends(&self) -> Option<Vec<u32>> {
+        let mut ends = vec![0u32; self.values];
+        for (run, into) in ends.chunks_mut(TEXT_OFFSET_RUN).enumerate() {
+            let bytes = self.offsets.get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)?;
+            bitpack::unpack_tail_into(bytes, self.offset_bits, into, |bits| {
+                u32::try_from(bits).unwrap_or(u32::MAX)
+            })
+            .ok()?;
+        }
+        // An end that did not fit was stored as the sentinel, and a real one cannot reach it because
+        // a payload block is far smaller than four gigabytes. So the column keeps the packed reader.
+        if ends.contains(&u32::MAX) { None } else { Some(ends) }
+    }
+
     /// Where the value at `index` ends inside its payload block.
     fn end_within(&self, index: usize) -> Result<u32> {
+        if let Some(ends) = self.value_ends() {
+            return ends
+                .get(index)
+                .copied()
+                .ok_or_else(|| invalid("global dictionary offsets are short"));
+        }
         let run = index / TEXT_OFFSET_RUN;
         let bytes = self
             .offsets
@@ -2863,6 +2938,17 @@ impl NativeText {
     /// twice and does the bounds arithmetic once. This is asked once per string a text column hands
     /// out, and on ClickBench 27 the two reads together were a quarter of the query.
     fn span_within(&self, index: usize) -> Result<(u32, u32)> {
+        if let Some(ends) = self.value_ends() {
+            let end =
+                *ends.get(index).ok_or_else(|| invalid("global dictionary offsets are short"))?;
+            // The value before it in the same block, and zero where there is no value before it.
+            // `index` is inside the table, so the one under it is too.
+            let start = if index % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[index - 1] };
+            if start > end {
+                return Err(invalid("global dictionary value ends before it starts"));
+            }
+            return Ok((start, end));
+        }
         let within = index % TEXT_OFFSET_RUN;
         let (start, end) = if within == 0 {
             (self.start_within(index)?, self.end_within(index)?)
@@ -3028,6 +3114,38 @@ impl TextSource for NativeText {
         Ok(Some((end - start) as usize))
     }
 
+    /// Every length out of the unpacked ends in one loop, which is the point of having them.
+    ///
+    /// The whole run of positions counts towards [`Self::ends_worth_unpacking`] at once, because a
+    /// caller asking for a vector of lengths has said how many it wants, and a vector of them is
+    /// usually enough on its own. Until the table is worth building this is the row at a time read,
+    /// the same as the default.
+    fn bytes_lens_at(&self, indices: &[u32], into: &mut [i64]) -> Result<()> {
+        self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed);
+        let Some(ends) = self.value_ends() else {
+            for (slot, &index) in into.iter_mut().zip(indices) {
+                *slot = self
+                    .bytes_len_at(index as usize)?
+                    .map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX));
+            }
+            return Ok(());
+        };
+        for (slot, &index) in into.iter_mut().zip(indices) {
+            let index = index as usize;
+            // Past the end is no value and so no length, which is what a row at a time read says.
+            let Some(&end) = ends.get(index) else {
+                *slot = 0;
+                continue;
+            };
+            let start = if index % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[index - 1] };
+            if start > end {
+                return Err(invalid("global dictionary value ends before it starts"));
+            }
+            *slot = i64::from(end - start);
+        }
+        Ok(())
+    }
+
     /// The rest of the block holding `first`, decoded into a buffer that may die with the call.
     ///
     /// A block is the unit this format decodes, so a walk that wants every value is going to decode
@@ -3173,6 +3291,11 @@ impl TextSource for NativeText {
 
     fn footprint(&self) -> usize {
         self.offsets.capacity()
+            + self
+                .value_ends
+                .get()
+                .and_then(Option::as_ref)
+                .map_or(0, |ends| ends.capacity() * size_of::<u32>())
             + self
                 .code_ranks
                 .get()
@@ -7030,6 +7153,8 @@ fn open_global_dictionary(
             values: count,
             offsets,
             offset_bits,
+            value_ends: OnceLock::new(),
+            ends_asked: AtomicUsize::new(0),
             ranks,
             rank_at: page.offset + index_len as u64,
             rank_ends,
@@ -10015,7 +10140,14 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
-        assert_eq!(dictionary.footprint(), after, "a point read of a kept block decodes nothing");
+        // A read per value is about what makes the unpacked ends worth building, so whether they
+        // are built here depends on how many reads the sweep made on the way. They are the one thing
+        // allowed to grow, by four bytes a value, and nothing of the payload is.
+        let grown = dictionary.footprint() - after;
+        assert!(
+            grown == 0 || grown == dictionary.len() * size_of::<u32>(),
+            "a point read of a kept block decodes nothing, and {grown} bytes grew"
+        );
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -10074,6 +10206,83 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// The unpacked ends answer what the packed ends answer, on both sides of the switch.
+    ///
+    /// A column asked for one offset at a time reads them out of the packed form until the reads
+    /// are worth a table and out of the table after that, so every value here is read twice and the
+    /// two passes are compared against the spellings and against each other. Two thousand eight
+    /// hundred values is two payload blocks and a bit, which puts the switch in the middle of the
+    /// first pass and means the pass straddles a block boundary, where the start of a value is zero
+    /// rather than the end of the value before it.
+    #[test]
+    fn the_unpacked_ends_answer_what_the_packed_ends_answer() {
+        let path = path("dictionary-unpacked-ends");
+        let spellings = (0..2_800)
+            .map(|index| Value::Varchar(format!("value {index:08} {}", "x".repeat(index % 40))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        assert_eq!(dictionary.len(), spellings.len(), "every value is distinct");
+        let wanted = (0..spellings.len())
+            .map(|index| format!("value {index:08} {}", "x".repeat(index % 40)).into_bytes())
+            .collect::<Vec<_>>();
+
+        let pass = |what: &str| {
+            for (index, value) in wanted.iter().enumerate() {
+                let len = dictionary.try_bytes_len_at(index).expect("read").expect("a value");
+                assert_eq!(len, value.len(), "{what} has the wrong length at {index}");
+                let bytes = dictionary.try_bytes_at(index).expect("read").expect("a value");
+                assert_eq!(bytes, value.as_slice(), "{what} has the wrong value at {index}");
+            }
+        };
+        pass("the first pass");
+        pass("the second pass");
+
+        // The whole vector in one call, over the text and through codes into it, which is how a
+        // scan of a stored column hands it out. The codes run backwards and repeat so that they are
+        // neither the positions nor in order.
+        let lens = wanted.iter().map(|value| value.len() as i64).collect::<Vec<_>>();
+        let mut whole = vec![0i64; wanted.len()];
+        assert!(dictionary.try_bytes_lens(&mut whole).expect("read"), "the text answers whole");
+        assert_eq!(whole, lens, "a vector of lengths answers what a length at a time answers");
+        let codes = (0..4_000_u32).map(|row| (7 * (4_000 - row)) % 2_800).collect::<Vec<_>>();
+        let coded = Vector::dictionary_over(codes.clone(), dictionary).expect("codes in range");
+        let mut through = vec![0i64; codes.len()];
+        assert!(coded.try_bytes_lens(&mut through).expect("read"), "the codes answer whole");
+        for (row, &code) in codes.iter().enumerate() {
+            assert_eq!(through[row], lens[code as usize], "row {row} reads code {code}");
+            let one = coded.try_bytes_len_at(row).expect("read").expect("a value");
+            assert_eq!(through[row], one as i64, "row {row} a row at a time");
+        }
+
+        // A handful of codes over a column nobody has read yet is short of the table, so the same
+        // call answers out of the packed ends instead, and has to answer the same.
+        let fresh = Reader::open(&path).expect("valid directory");
+        let untouched = fresh.dictionary(0).expect("read").expect("a string column has one");
+        let few = vec![2_799_u32, 0, 1_024, 1_023, 511, 512];
+        let coded = Vector::dictionary_over(few.clone(), untouched).expect("in range");
+        let mut short = vec![0i64; few.len()];
+        assert!(coded.try_bytes_lens(&mut short).expect("read"), "the codes answer whole");
+        let expected = few.iter().map(|&code| lens[code as usize]).collect::<Vec<_>>();
+        assert_eq!(short, expected, "the packed ends answer what the table answers");
         fs::remove_file(path).expect("remove scratch file");
     }
 
