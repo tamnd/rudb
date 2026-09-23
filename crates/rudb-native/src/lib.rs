@@ -1973,6 +1973,27 @@ struct ColumnStripe {
     ranges: Vec<Range>,
 }
 
+/// Whether a column of this type is coded against a global dictionary.
+///
+/// A dictionary, its codes and the membership index beside them are about bytes and not about
+/// text, so a blob gets one the same as a varchar does. ClickBench's `hits.parquet` stores every
+/// string column as a plain byte array, which reads back as a blob, and those columns were being
+/// written as a length and the bytes for every row: 533 MB for the first million rows where DuckDB
+/// writes 142.
+fn coded_type(ty: &LogicalType) -> bool {
+    matches!(ty, LogicalType::Varchar | LogicalType::Blob)
+}
+
+/// The tag a directory gives a column's global dictionary.
+///
+/// A varchar's is 1, as it always was. A blob's is 2, so that a reader from before blobs had
+/// dictionaries meets a tag it does not know and refuses the file, rather than laying the rest of
+/// the directory out as if the blob columns had no dictionary and reading everything after the
+/// first one from the wrong place.
+fn dictionary_tag(ty: &LogicalType) -> u8 {
+    if ty == &LogicalType::Blob { 2 } else { 1 }
+}
+
 /// Roughly what encoding a column of this type costs, for ordering the encode queue.
 ///
 /// Only the order matters and only roughly. A string column hashes and copies every value into a
@@ -2128,12 +2149,9 @@ impl Writer {
             written_back: size,
             dictionaries: fields
                 .iter()
-                .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
                 .collect(),
-            coded: fields
-                .iter()
-                .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
-                .collect(),
+            coded: fields.iter().map(|field| AtomicBool::new(coded_type(&field.ty))).collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             lent: None,
             table: Table {
@@ -2204,12 +2222,9 @@ impl Writer {
             written_back: HEADER,
             dictionaries: fields
                 .iter()
-                .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
                 .collect(),
-            coded: fields
-                .iter()
-                .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
-                .collect(),
+            coded: fields.iter().map(|field| AtomicBool::new(coded_type(&field.ty))).collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, 1)).collect(),
             lent: None,
             table: Table {
@@ -2313,12 +2328,9 @@ impl Writer {
             profile: None,
             dictionaries: fields
                 .iter()
-                .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
                 .collect(),
-            coded: fields
-                .iter()
-                .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
-                .collect(),
+            coded: fields.iter().map(|field| AtomicBool::new(coded_type(&field.ty))).collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             lent: None,
             table: Table {
@@ -5967,11 +5979,8 @@ impl Reader {
         if stored_texts.is_some_and(|texts| texts.len() != entries.len()) {
             return Err(invalid("frequency text count differs from its synopsis"));
         }
-        let dictionary = if *ty == LogicalType::Varchar && stored_texts.is_none() {
-            self.dictionary(column)?
-        } else {
-            None
-        };
+        let dictionary =
+            if coded_type(ty) && stored_texts.is_none() { self.dictionary(column)? } else { None };
         let mut codes = entries
             .iter()
             .filter_map(|entry| match entry.value {
@@ -6039,10 +6048,14 @@ impl Reader {
                 },
                 FrequencyValue::Code(code) => {
                     if let Some(text) = stored_texts.and_then(|texts| texts[entry_at].as_ref()) {
-                        Value::Varchar(
-                            String::from_utf8(text.clone())
-                                .map_err(|_| invalid("frequency text is not UTF-8"))?,
-                        )
+                        if *ty == LogicalType::Blob {
+                            Value::Blob(text.clone())
+                        } else {
+                            Value::Varchar(
+                                String::from_utf8(text.clone())
+                                    .map_err(|_| invalid("frequency text is not UTF-8"))?,
+                            )
+                        }
                     } else {
                         if dictionary.is_none() {
                             return Err(invalid("frequency code has no dictionary or stored text"));
@@ -6803,6 +6816,12 @@ impl Reader {
 /// The value sitting at one position of a dictionary's sorted order.
 fn text_at_rank(dictionary: &Vector, rank: usize) -> Result<Value> {
     let code = dictionary.code_at_rank(rank)? as usize;
+    if dictionary.logical_type() == &LogicalType::Blob {
+        let bytes = dictionary
+            .try_bytes_at(code)?
+            .ok_or_else(|| invalid("global dictionary order names a code it does not have"))?;
+        return Ok(Value::Blob(bytes.to_vec()));
+    }
     let text = dictionary
         .try_text_at(code)?
         .ok_or_else(|| invalid("global dictionary order names a code it does not have"))?;
@@ -7143,11 +7162,11 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         put_type(&mut out, &field.ty)?;
         out.push(u8::from(field.not_null));
     }
-    for dictionary in &table.dictionaries {
+    for (field, dictionary) in table.fields.iter().zip(&table.dictionaries) {
         match dictionary {
             None => out.push(0),
             Some(page) => {
-                out.push(1);
+                out.push(dictionary_tag(&field.ty));
                 put_u64(&mut out, page.offset);
                 put_u32(&mut out, page.length);
                 put_u64(&mut out, page.hash);
@@ -7186,7 +7205,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         for ((field, dictionary), membership) in
             table.fields.iter().zip(&table.dictionaries).zip(stripe.memberships.slots())
         {
-            if field.ty != LogicalType::Varchar || dictionary.is_none() {
+            if !coded_type(&field.ty) || dictionary.is_none() {
                 continue;
             }
             let page =
@@ -8297,7 +8316,7 @@ fn decode_summary(
                 let valid = matches!(
                     (&field.ty, value),
                     (_, FrequencyValue::Null)
-                        | (LogicalType::Varchar, FrequencyValue::Code(_))
+                        | (LogicalType::Varchar | LogicalType::Blob, FrequencyValue::Code(_))
                         | (
                             LogicalType::TinyInt
                                 | LogicalType::SmallInt
@@ -8431,10 +8450,10 @@ fn quick_nonzero(
         }
     }
     let mut dictionaries = Vec::with_capacity(width);
-    for _ in 0..width {
+    for field in fields {
         let held = match cur.u8()? {
             0 => false,
-            1 => {
+            tag if coded_type(&field.ty) && tag == dictionary_tag(&field.ty) => {
                 cur.skip(20)?;
                 true
             }
@@ -8470,7 +8489,7 @@ fn quick_nonzero(
             total.checked_add(stripe_rows).ok_or_else(|| invalid("stripe row count overflow"))?;
         cur.skip(12 + width * 12)?;
         for (field, held) in fields.iter().zip(&dictionaries) {
-            if field.ty == LogicalType::Varchar && *held {
+            if coded_type(&field.ty) && *held {
                 cur.skip(20)?;
             }
         }
@@ -8554,10 +8573,10 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         fields.push(Field { name, ty, not_null });
     }
     let mut dictionaries = Vec::with_capacity(width);
-    for _ in 0..width {
+    for field in &fields {
         dictionaries.push(match cur.u8()? {
             0 => None,
-            1 => {
+            tag if tag == dictionary_tag(&field.ty) => {
                 let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
                 let end = page
                     .offset
@@ -8633,7 +8652,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         }
         let mut memberships = vec![None; width];
         for (column, field) in fields.iter().enumerate() {
-            if field.ty != LogicalType::Varchar || dictionaries[column].is_none() {
+            if !coded_type(&field.ty) || dictionaries[column].is_none() {
                 continue;
             }
             let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
@@ -8853,7 +8872,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 if !frequency_texts.get(column).is_some_and(Vec::is_empty) {
                     return Err(invalid("frequency text column is repeated or out of range"));
                 }
-                if !matches!(fields.get(column), Some(field) if field.ty == LogicalType::Varchar)
+                if !matches!(fields.get(column), Some(field) if coded_type(&field.ty))
                     || dictionaries.get(column).copied().flatten().is_none()
                     || frequencies.get(column).and_then(Option::as_ref).is_none()
                 {
@@ -8870,8 +8889,10 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                         1 => {
                             let length = cur.u32()? as usize;
                             let bytes = cur.take(length)?.to_vec();
-                            std::str::from_utf8(&bytes)
-                                .map_err(|_| invalid("frequency text is not UTF-8"))?;
+                            if fields[column].ty == LogicalType::Varchar {
+                                std::str::from_utf8(&bytes)
+                                    .map_err(|_| invalid("frequency text is not UTF-8"))?;
+                            }
                             Some(bytes)
                         }
                         _ => return Err(invalid("frequency text tag differs")),
@@ -9538,12 +9559,9 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
     let mut out = Vec::new();
-    let dictionary = if ty == &LogicalType::Varchar { string_dictionary(&flat)? } else { None };
-    let compressed_text = if dictionary.is_none() && ty == &LogicalType::Varchar {
-        text_compressed(&flat)?
-    } else {
-        None
-    };
+    let dictionary = if coded_type(ty) { string_dictionary(&flat)? } else { None };
+    let compressed_text =
+        if dictionary.is_none() && coded_type(ty) { text_compressed(&flat)? } else { None };
     let packed_vector = if dictionary.is_none() { Some(flat.bit_packed()?) } else { None };
     let packed = packed_vector.as_ref().and_then(Vector::packed_parts);
     // Only where nothing else has claimed the page, which is the plain integer case. A packed part
@@ -10687,7 +10705,7 @@ fn open_global_dictionary(
     ty: &LogicalType,
     keep_budget: usize,
 ) -> Result<Vector> {
-    if ty != &LogicalType::Varchar {
+    if !coded_type(ty) {
         return Err(invalid("global dictionary belongs to a non-string column"));
     }
     let mut header = [0; DICTIONARY_HEADER];
@@ -10832,7 +10850,7 @@ fn open_global_dictionary(
         return Err(invalid("global dictionary blocks do not bound the payload"));
     }
     Vector::external_text(
-        LogicalType::Varchar,
+        ty.clone(),
         Arc::new(NativeText {
             file,
             values: count,
@@ -10983,7 +11001,7 @@ fn decode_at(
     if bytes.first() != Some(&6) {
         return decode(ty, rows, bytes, global)?.gather(positions);
     }
-    if ty != &LogicalType::Varchar {
+    if !coded_type(ty) {
         return Err(invalid("compressed text codec belongs to a non-string page"));
     }
     let mut cur = Cursor::new(bytes);
@@ -11007,10 +11025,21 @@ fn decode_at(
         let len = end
             .checked_sub(start)
             .ok_or_else(|| invalid("compressed text value ends before it starts"))?;
-        values.push_in_place(start, len)?;
+        push_value(&mut values, ty, start, len)?;
         start = end;
     }
     Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity))
+}
+
+/// One value of a string or blob page, found in the page's payload. A varchar is checked for text
+/// on the way in and a blob is not, since a blob never claimed to hold any.
+fn push_value(values: &mut StringColumn, ty: &LogicalType, at: usize, len: usize) -> Result<()> {
+    if ty == &LogicalType::Varchar {
+        values.push_in_place(at, len)?;
+    } else {
+        values.push_bytes_in_place(at, len)?;
+    }
+    Ok(())
 }
 
 fn decode(
@@ -11032,7 +11061,7 @@ fn decode(
         _ => return Err(invalid("page validity tag differs")),
     };
     if codec == 1 {
-        if ty != &LogicalType::Varchar {
+        if !coded_type(ty) {
             return Err(invalid("dictionary codec belongs to a non-string page"));
         }
         let count = cur.u32()? as usize;
@@ -11057,7 +11086,7 @@ fn decode(
         // page is what lets a cut be the views and nothing else.
         let mut strings = StringColumn::over(Buffer::from_vec(payload).into_page());
         for pair in offsets.windows(2) {
-            strings.push_in_place(pair[0] as usize, (pair[1] - pair[0]) as usize)?;
+            push_value(&mut strings, ty, pair[0] as usize, (pair[1] - pair[0]) as usize)?;
         }
         let mut codes = Vec::with_capacity(rows);
         for _ in 0..rows {
@@ -11069,7 +11098,7 @@ fn decode(
         if cur.at != bytes.len() {
             return Err(invalid("dictionary page has trailing bytes"));
         }
-        let dictionary = Vector::flat(LogicalType::Varchar, Data::Varlen(strings))?;
+        let dictionary = Vector::flat(ty.clone(), Data::Varlen(strings))?;
         return Ok(Vector::dictionary(codes, dictionary)?.with_validity(validity));
     }
     if codec == 3 || codec == 4 {
@@ -11107,7 +11136,7 @@ fn decode(
             .with_validity(validity));
     }
     if codec == 6 {
-        if ty != &LogicalType::Varchar {
+        if !coded_type(ty) {
             return Err(invalid("compressed text codec belongs to a non-string page"));
         }
         // As codec 5, the layer holds the whole tail of the page and says how long it is itself.
@@ -11125,7 +11154,7 @@ fn decode(
             let len = end
                 .checked_sub(start)
                 .ok_or_else(|| invalid("compressed text value ends before it starts"))?;
-            values.push_in_place(start, len)?;
+            push_value(&mut values, ty, start, len)?;
             start = end;
         }
         return Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity));
