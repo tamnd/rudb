@@ -792,45 +792,76 @@ impl Database {
             return Ok(None);
         }
         let mut sparse = BTreeMap::<i128, u64>::new();
-        let reader = catalog.table(name)?;
-        for part in 0..reader.parts() {
-            if let Some(counts) = reader.integer_tally(part, index)? {
-                for (value, count) in counts {
-                    if value == 0 {
+        if let Some(counts) = catalog.integer_tally(name, index)? {
+            for (value, count) in counts {
+                if value == 0 {
+                    continue;
+                }
+                let value = i128::from(value);
+                if let Some((low, dense_counts)) = &mut dense {
+                    let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
+                    if let Some(held) = dense_counts.get_mut(at) {
+                        *held += count;
                         continue;
                     }
-                    let value = i128::from(value);
-                    if let Some((low, dense_counts)) = &mut dense {
-                        let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
-                        if let Some(held) = dense_counts.get_mut(at) {
-                            *held += count;
+                }
+                *sparse.entry(value).or_default() += count;
+            }
+        } else {
+            let reader = catalog.table(name)?;
+            for part in 0..reader.parts() {
+                if let Some(counts) = reader.integer_tally(part, index)? {
+                    for (value, count) in counts {
+                        if value == 0 {
                             continue;
                         }
+                        let value = i128::from(value);
+                        if let Some((low, dense_counts)) = &mut dense {
+                            let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
+                            if let Some(held) = dense_counts.get_mut(at) {
+                                *held += count;
+                                continue;
+                            }
+                        }
+                        *sparse.entry(value).or_default() += count;
                     }
-                    *sparse.entry(value).or_default() += count;
+                    continue;
                 }
-                continue;
-            }
-            let chunk = reader.read(part, &[index])?;
-            let column = chunk
-                .into_columns()
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::internal("native column scan returned no column"))?
-                .into_flat()?;
-            let validity = column.validity();
-            macro_rules! count_values {
-                ($values:expr) => {
-                    if let Some((low, counts)) = &mut dense {
-                        if column.none_null() {
-                            for &value in $values.as_slice() {
-                                let value = i128::from(value);
-                                if value != 0 {
-                                    let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
-                                    if let Some(held) = counts.get_mut(at) {
-                                        *held += 1;
-                                    } else {
-                                        *sparse.entry(value).or_default() += 1;
+                let chunk = reader.read(part, &[index])?;
+                let column = chunk
+                    .into_columns()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::internal("native column scan returned no column"))?
+                    .into_flat()?;
+                let validity = column.validity();
+                macro_rules! count_values {
+                    ($values:expr) => {
+                        if let Some((low, counts)) = &mut dense {
+                            if column.none_null() {
+                                for &value in $values.as_slice() {
+                                    let value = i128::from(value);
+                                    if value != 0 {
+                                        let at =
+                                            usize::try_from(value - *low).unwrap_or(usize::MAX);
+                                        if let Some(held) = counts.get_mut(at) {
+                                            *held += 1;
+                                        } else {
+                                            *sparse.entry(value).or_default() += 1;
+                                        }
+                                    }
+                                }
+                            } else {
+                                for (row, &value) in $values.as_slice().iter().enumerate() {
+                                    let value = i128::from(value);
+                                    if value != 0 && validity.is_valid(row) {
+                                        let at =
+                                            usize::try_from(value - *low).unwrap_or(usize::MAX);
+                                        if let Some(held) = counts.get_mut(at) {
+                                            *held += 1;
+                                        } else {
+                                            *sparse.entry(value).or_default() += 1;
+                                        }
                                     }
                                 }
                             }
@@ -838,35 +869,23 @@ impl Database {
                             for (row, &value) in $values.as_slice().iter().enumerate() {
                                 let value = i128::from(value);
                                 if value != 0 && validity.is_valid(row) {
-                                    let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
-                                    if let Some(held) = counts.get_mut(at) {
-                                        *held += 1;
-                                    } else {
-                                        *sparse.entry(value).or_default() += 1;
-                                    }
+                                    *sparse.entry(value).or_default() += 1;
                                 }
                             }
                         }
-                    } else {
-                        for (row, &value) in $values.as_slice().iter().enumerate() {
-                            let value = i128::from(value);
-                            if value != 0 && validity.is_valid(row) {
-                                *sparse.entry(value).or_default() += 1;
-                            }
-                        }
-                    }
-                };
-            }
-            match column.data() {
-                Some(Data::Int8(values)) => count_values!(values),
-                Some(Data::Int16(values)) => count_values!(values),
-                Some(Data::Int32(values)) => count_values!(values),
-                Some(Data::Int64(values)) => count_values!(values),
-                Some(Data::UInt8(values)) => count_values!(values),
-                Some(Data::UInt16(values)) => count_values!(values),
-                Some(Data::UInt32(values)) => count_values!(values),
-                Some(Data::UInt64(values)) => count_values!(values),
-                _ => return Ok(None),
+                    };
+                }
+                match column.data() {
+                    Some(Data::Int8(values)) => count_values!(values),
+                    Some(Data::Int16(values)) => count_values!(values),
+                    Some(Data::Int32(values)) => count_values!(values),
+                    Some(Data::Int64(values)) => count_values!(values),
+                    Some(Data::UInt8(values)) => count_values!(values),
+                    Some(Data::UInt16(values)) => count_values!(values),
+                    Some(Data::UInt32(values)) => count_values!(values),
+                    Some(Data::UInt64(values)) => count_values!(values),
+                    _ => return Ok(None),
+                }
             }
         }
         if let Some((low, counts)) = dense {
