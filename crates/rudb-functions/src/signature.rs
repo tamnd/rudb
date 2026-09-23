@@ -126,6 +126,12 @@ enum Shape {
     LeadingFixedToLast(Fixed),
     /// Every argument promotes and an integer result widens to the accumulator. `sum`.
     Accumulated,
+    /// Every argument promotes to one integer type and the result is that type. `bit_and`.
+    ///
+    /// [`Shape::Promoted`] with everything but the integers taken away, which is the pin's list of
+    /// overloads: `bit_and(1.5)` and `bit_and(true)` are refused there rather than cast. A null
+    /// argument is a BIGINT, since that is the type the pin answers `bit_or(NULL)` with.
+    Bitwise,
     /// The first argument is a string or a list and the result is one piece of it. `array_extract`.
     ///
     /// The index is a BIGINT and nothing is cast to one, which is upstream's rule rather than an
@@ -741,6 +747,31 @@ const TABLE: &[Entry] = &[
     aggregate("avg", Arity::exactly(1), Shape::PromotedTo(Fixed::Double), true),
     aggregate("min", Arity::exactly(1), Shape::Promoted, false),
     aggregate("max", Arity::exactly(1), Shape::Promoted, false),
+    aggregate("list", Arity::exactly(1), Shape::Listed, false),
+    aggregate("first", Arity::exactly(1), Shape::AsGiven, false),
+    aggregate("last", Arity::exactly(1), Shape::AsGiven, false),
+    aggregate("any_value", Arity::exactly(1), Shape::AsGiven, false),
+    aggregate("bool_and", Arity::exactly(1), Shape::Widened(Fixed::Boolean, Fixed::Boolean), false),
+    aggregate("bool_or", Arity::exactly(1), Shape::Widened(Fixed::Boolean, Fixed::Boolean), false),
+    aggregate("bit_and", Arity::exactly(1), Shape::Bitwise, false),
+    aggregate("bit_or", Arity::exactly(1), Shape::Bitwise, false),
+    aggregate("bit_xor", Arity::exactly(1), Shape::Bitwise, false),
+    aggregate("product", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), false),
+    aggregate("var_samp", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), false),
+    aggregate("var_pop", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), false),
+    aggregate(
+        "stddev_samp",
+        Arity::exactly(1),
+        Shape::FixedTo(Fixed::Double, Fixed::Double),
+        false,
+    ),
+    aggregate("stddev_pop", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double), false),
+    aggregate(
+        "string_agg",
+        Arity::between(1, 2),
+        Shape::FixedTo(Fixed::Varchar, Fixed::Varchar),
+        false,
+    ),
     // The ranking windows, which answer from where the row sits in its partition rather than from
     // anything in it. Six names and seven rows, since `rank_dense` is an alias upstream reports
     // with `dense_rank` in its `alias_of`. The three that count rows are BIGINT and the two that
@@ -1002,6 +1033,18 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             let common = promote_all(name, arguments)?;
             let returns = accumulator(&common);
             (vec![common; arguments.len()], returns)
+        }
+        Shape::Bitwise => {
+            // A null literal promotes to INTEGER on its own, and the pin's answer is BIGINT.
+            let common = if arguments.iter().all(|ty| *ty == LogicalType::Null) {
+                LogicalType::BigInt
+            } else {
+                promote_all(name, arguments)?
+            };
+            if !common.is_integer() {
+                return Err(no_match(entry.name, arguments));
+            }
+            (vec![common.clone(); arguments.len()], common)
         }
         Shape::Listed => {
             let element = list_element(arguments)?;
@@ -1759,7 +1802,7 @@ impl Shape {
         };
         match self {
             // Promoting says `T` and the result is that same `T`, exactly.
-            Self::Promoted | Self::PromotedToFirst => (all(SAME), SAME),
+            Self::Promoted | Self::PromotedToFirst | Self::Bitwise => (all(SAME), SAME),
             // Promoting and then moving: a decimal product is as wide as both operands, a decimal
             // quotient is a double, a decimal sum gains a carry digit and an integer sum widens to
             // the accumulator. The arguments still meet at one type and the result is no longer it.
@@ -1868,6 +1911,12 @@ const ALIASES: &[(&str, &str)] = &[
     ("lcase", "lower"),
     ("ucase", "upper"),
     ("mean", "avg"),
+    ("array_agg", "list"),
+    ("arbitrary", "first"),
+    ("stddev", "stddev_samp"),
+    ("variance", "var_samp"),
+    ("group_concat", "string_agg"),
+    ("listagg", "string_agg"),
     ("list_extract", "array_extract"),
     ("list_element", "array_extract"),
     ("list_slice", "array_slice"),
@@ -2300,7 +2349,8 @@ mod tests {
                     (_, Shape::ListConcatenated | Shape::ListCounted) => {
                         LogicalType::list(LogicalType::Varchar)
                     }
-                    (true, _) => LogicalType::Integer,
+                    // The bit aggregates take whole numbers and nothing else.
+                    (true, _) | (_, Shape::Bitwise) => LogicalType::Integer,
                     (false, _) => LogicalType::Varchar,
                 };
                 let mut arguments = vec![ty; count];

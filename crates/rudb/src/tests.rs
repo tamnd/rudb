@@ -7991,6 +7991,108 @@ fn a_decimal_sum_is_as_wide_as_a_decimal_goes() {
 }
 
 #[test]
+fn the_aggregates_past_the_first_five_answer_the_way_the_pin_does() {
+    let db = database();
+    let one = |sql: &str| -> Vec<String> {
+        rows(&db, sql)
+            .into_iter()
+            .flatten()
+            .map(|value| match value {
+                Value::Varchar(text) => text,
+                other => other.to_string(),
+            })
+            .collect()
+    };
+    let three = "FROM (VALUES (NULL), (1), (NULL)) t(x)";
+    assert_eq!(
+        one(&format!(
+            "SELECT list(x)::VARCHAR, array_agg(x)::VARCHAR, first(x), last(x), any_value(x) {three}"
+        )),
+        ["[NULL, 1, NULL]", "[NULL, 1, NULL]", "NULL", "NULL", "1"]
+    );
+    assert_eq!(
+        one("SELECT bool_and(x), bool_or(x) FROM (VALUES (true), (NULL), (false)) t(x)"),
+        ["false", "true"]
+    );
+    assert_eq!(
+        one("SELECT bit_and(x), bit_or(x), bit_xor(x) FROM (VALUES (5), (3), (NULL)) t(x)"),
+        ["1", "7", "6"]
+    );
+    assert_eq!(one("SELECT bit_and(x) FROM (VALUES (-1::TINYINT), (7::TINYINT)) t(x)"), ["7"]);
+    assert_eq!(one("SELECT product(x) FROM (VALUES (2), (NULL), (3)) t(x)"), ["6.0"]);
+    assert_eq!(
+        one("SELECT stddev(x), stddev_pop(x), var_samp(x), var_pop(x), variance(x) \
+             FROM (VALUES (1), (2), (4)) t(x)"),
+        [
+            "1.5275252316519465",
+            "1.247219128924647",
+            "2.333333333333333",
+            "1.5555555555555554",
+            "2.333333333333333"
+        ]
+    );
+    assert_eq!(
+        one("SELECT stddev(1), var_samp(1), var_pop(1), stddev_pop(1)"),
+        ["NULL", "NULL", "0.0", "0.0"]
+    );
+    assert_eq!(
+        one("SELECT string_agg(x), string_agg(x, '-'), group_concat(x, ''), string_agg(x, NULL) \
+             FROM (VALUES ('a'), (NULL), ('b')) t(x)"),
+        ["a,b", "a-b", "ab", "NULL"]
+    );
+    assert_eq!(
+        one("SELECT list(i), first(i), bool_and(i > 0), string_agg(i::VARCHAR), product(i), \
+             bit_or(i), stddev(i) FROM range(0) t(i)"),
+        ["NULL"; 7]
+    );
+    assert_eq!(
+        one("SELECT typeof(list(1::TINYINT)), typeof(first(1::DECIMAL(4,1))), \
+             typeof(bit_and(1::TINYINT)), typeof(bit_or(NULL)), typeof(product(1)), \
+             typeof(stddev(1::DECIMAL(4,1))), typeof(string_agg(1.5)), typeof(list(NULL))"),
+        [
+            "TINYINT[]",
+            "DECIMAL(4,1)",
+            "TINYINT",
+            "BIGINT",
+            "DOUBLE",
+            "DOUBLE",
+            "VARCHAR",
+            "\"NULL\"[]"
+        ]
+    );
+    assert_eq!(
+        one("SELECT i % 2 AS k, list(i)::VARCHAR, last(i), string_agg(i::VARCHAR, '|') \
+             FROM range(6) t(i) GROUP BY k ORDER BY k"),
+        ["0", "[0, 2, 4]", "4", "0|2|4", "1", "[1, 3, 5]", "5", "1|3|5"]
+    );
+    assert_eq!(
+        one("SELECT k, list(v) FILTER (WHERE v > 1)::VARCHAR \
+             FROM (VALUES (1, 1), (1, 2), (2, 1), (2, NULL)) t(k, v) GROUP BY k ORDER BY k"),
+        ["1", "[2]", "2", "NULL"]
+    );
+    assert_eq!(
+        one("SELECT list_aggr([1, 2, 4], 'stddev'), list_aggr(['a', 'b'], 'string_agg', '-')"),
+        ["1.5275252316519465", "a-b"]
+    );
+    assert_eq!(
+        one("SELECT list_sum([1, 2]), list_stddev_samp([1, 2, 4]), list_string_agg(['a', 'b']), \
+             list_first([NULL, 1]), LIST_BOOL_AND([true]), list_sum([])"),
+        ["3", "1.5275252316519465", "a,b", "NULL", "true", "NULL"]
+    );
+    let refused = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert!(refused("SELECT list_sum([1], 2)").contains(
+        "Macro list_sum() does not support the supplied arguments. You might need to add \
+             explicit type casts.\nCandidate macros:\n\tlist_sum(l)"
+    ));
+    assert!(refused("SELECT bit_and(1.5)").contains("bit_and(DECIMAL(2,1))"));
+    assert!(refused("SELECT bool_and(1)").contains("bool_and(INTEGER)"));
+    assert!(
+        refused("SELECT string_agg(x, y) FROM (VALUES ('a', ','), ('b', ';')) t(x, y)")
+            .contains("The \"separator\" argument in function \"string_agg\" must be a constant")
+    );
+}
+
+#[test]
 fn an_aggregate_runs_over_the_elements_of_a_list() {
     let db = database();
     let one = |sql: &str| rows(&db, sql);

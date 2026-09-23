@@ -25,6 +25,43 @@ const NAMES: &[&str] =
 /// The name the plan records, which is the one the executor dispatches on.
 pub(crate) const LIST_AGGR: &str = "list_aggr";
 
+/// The aggregates the pin has a `list_` macro for, each of which is `list_aggr(l, 'name')`.
+///
+/// Read off `duckdb_functions()` where the macro definition calls `list_aggr`. A name here that
+/// rudb has no aggregate for yet is still expanded, so it is refused as a missing aggregate and not
+/// as a missing function, which is what the pin would say if it lacked one too.
+const MACROS: &[&str] = &[
+    "any_value",
+    "approx_count_distinct",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    "count",
+    "entropy",
+    "first",
+    "histogram",
+    "kurtosis",
+    "kurtosis_pop",
+    "last",
+    "mad",
+    "max",
+    "median",
+    "min",
+    "mode",
+    "product",
+    "sem",
+    "skewness",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "sum",
+    "var_pop",
+    "var_samp",
+];
+
 impl Binder<'_> {
     /// A bound call to `list_aggr` under any of its names, or `None` for any other name.
     ///
@@ -37,6 +74,17 @@ impl Binder<'_> {
         written: &str,
         bound: &[ExprRef],
     ) -> Result<Option<ExprRef>> {
+        if let Some(aggregate) = macro_aggregate(written) {
+            if bound.len() != 1 {
+                let written = written.to_lowercase();
+                return Err(Error::binder(format!(
+                    "Macro {written}() does not support the supplied arguments. You might need to \
+                     add explicit type casts.\nCandidate macros:\n\t{written}(l)"
+                )));
+            }
+            let name = self.add_constant(Value::Varchar(aggregate.to_string()));
+            return self.list_aggregate(LIST_AGGR, &[bound[0], name]);
+        }
         if !NAMES.iter().any(|name| rudb_catalog::same_name(written, name)) {
             return Ok(None);
         }
@@ -95,6 +143,15 @@ impl Binder<'_> {
         let recorded = self.plan_mut().intern(LIST_AGGR);
         Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, resolved.returns)))
     }
+}
+
+/// The aggregate a `list_` macro stands for, or `None` for any other name.
+fn macro_aggregate(written: &str) -> Option<&'static str> {
+    let head = written.get(..5)?;
+    if !head.eq_ignore_ascii_case("list_") {
+        return None;
+    }
+    MACROS.iter().copied().find(|name| written[5..].eq_ignore_ascii_case(name))
 }
 
 /// The pin's refusal of a call whose list or name argument is the wrong type.
