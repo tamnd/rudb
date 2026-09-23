@@ -1174,6 +1174,16 @@ impl Gather {
         self.counts.sketch(0).map(|sketch| sketch.distinct())
     }
 
+    /// Every non-null value of the column with the rows holding it, and the rows holding a null,
+    /// while the tally still holds the whole column.
+    ///
+    /// Nothing once the column has passed the tally's cap or turned out to be blind. The counts are
+    /// exact, which is what lets the close take a narrow column's frequencies from here rather than
+    /// read its pages back and count them a second time.
+    pub(crate) fn frequencies(&self) -> Option<(Vec<(Value, u64)>, u64)> {
+        Some((self.counts.frequencies(0)?, self.pass.nulls))
+    }
+
     /// The summary and the merged sketch, or nothing if the column turned out to be blind.
     ///
     /// Blind means a form `rudb_storage::count` has no arm for turned up, so the sketch is missing
