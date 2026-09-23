@@ -74,6 +74,11 @@ impl<S: Source> Source for Watched<S> {
         self.inner.morsels(threads, weight)
     }
 
+    /// Passed through, because the wrapper hands out nothing of its own to gather.
+    fn gather(&self, rows: usize) {
+        self.inner.gather(rows);
+    }
+
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let measure = Measure::start(&self.counters);
         let progress = self.inner.read(morsel, out);
@@ -203,6 +208,11 @@ impl<K: Sink> Sink for Watched<K> {
     /// hundred thousand pairs on sixteen threads with the other half of the machine parked.
     fn finalize_degree(&self, ceiling: usize) -> usize {
         self.inner.finalize_degree(ceiling)
+    }
+
+    /// Passed through, because a question that stops at the wrapper is never asked.
+    fn gather(&self) -> usize {
+        self.inner.gather()
     }
 
     /// Counted against this operator the way its chunks are, because it is its work.

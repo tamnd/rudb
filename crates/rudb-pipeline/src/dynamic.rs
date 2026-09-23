@@ -179,6 +179,9 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     /// How many threads the typed operator could finish on. See [`Sink::finalize_degree`].
     fn finalize_width(&self, ceiling: usize) -> usize;
 
+    /// How many rows the typed operator would like a morsel to hold. See [`Sink::gather`].
+    fn gather_rows(&self) -> usize;
+
     /// How much more than an ordinary operator the typed one spends on a row. See
     /// [`Sink::weight`].
     fn row_weight(&self) -> usize;
@@ -215,6 +218,10 @@ impl<S: Sink> DynSink for S {
 
     fn finalize_width(&self, ceiling: usize) -> usize {
         self.finalize_degree(ceiling)
+    }
+
+    fn gather_rows(&self) -> usize {
+        Sink::gather(self)
     }
 
     fn row_weight(&self) -> usize {

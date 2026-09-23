@@ -51,6 +51,15 @@ pub trait Source: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Told that the sink wants morsels of about `rows` rows where the source has smaller units.
+    ///
+    /// Asked once, before [`Source::morsels`], with what [`Sink::gather`] answered. A source whose
+    /// units are small and adjacent may hand several out as one morsel up to that many rows, and
+    /// anything else ignores it, which is what the default does. Zero means the sink has no wish.
+    fn gather(&self, rows: usize) {
+        let _ = rows;
+    }
+
     /// Fill `out` from `morsel`, overwriting whatever was in it.
     ///
     /// May be called many times for one morsel, returning [`Progress::More`] until the morsel is
@@ -257,6 +266,16 @@ pub trait Sink: Send + Sync + fmt::Debug {
     fn finalize_degree(&self, ceiling: usize) -> usize {
         let _ = ceiling;
         1
+    }
+
+    /// How many rows this sink would like one morsel to hold, or zero for no preference.
+    ///
+    /// A sink that pays for every morsel boundary says so here. A load into a native file writes a
+    /// stripe per morsel at the least, one at a time behind the writer's lock, so a Parquet file of
+    /// eight thousand row groups loads as eight thousand row stripes unless the scan gathers them.
+    /// A query has no such cost and gathering only takes threads away from it, so the default is no.
+    fn gather(&self) -> usize {
+        0
     }
 
     /// How much more than an ordinary operator this one spends on a row. See [`Stream::weight`].

@@ -935,6 +935,17 @@ fn declared(
     }
 }
 
+/// How many rows a load asks the scan under it to gather small row groups into, as one morsel.
+///
+/// The sink never lets a stripe span two morsels, so a Parquet file of eight thousand row groups
+/// loaded a group at a time is eight thousand row stripes, written one at a time behind the
+/// writer's lock. Loading the ClickBench ten million row sample (1,203 groups) on the 32 thread
+/// gamingpc took 76.4 s that way. Gathered, it took 17.0 s at 32,768 rows, 20.8 s at 131,072 and
+/// 19.9 s at 524,288, and the smallest target wrote a 2.31 GiB file against 1.55 GiB for the other
+/// two, because short stripes compress worse. The largest peaked at 6.46 GiB of memory against 3.37
+/// GiB, so this is the middle one: the file size and query speed of a full stripe at half its peak.
+const GATHER_ROWS: usize = 131_072;
+
 /// The root of a file-backed initial insert.
 #[derive(Debug)]
 struct NativeSink {
@@ -1043,11 +1054,16 @@ impl Sink for NativeSink {
         NativePlace::default()
     }
 
+    fn gather(&self) -> usize {
+        GATHER_ROWS
+    }
+
     fn at(&self, morsel: &Morsel, place: &mut Self::Local) -> Result<()> {
         place.start();
         // A stripe never spans two morsels, so that its parts are a run of the source with nothing
         // from another instance in the middle of them. The cost is a short stripe at the end of
-        // each morsel, and a morsel on ClickBench is a whole row group of about a million rows.
+        // each morsel, and a morsel on ClickBench is a whole row group of about a million rows, or
+        // a run of small groups gathered up to GATHER_ROWS.
         self.hand_over(place)?;
         place.morsel = morsel.index();
         place.chunk = 0;

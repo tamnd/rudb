@@ -117,6 +117,7 @@ impl<'a> Pipeline<'a> {
     #[must_use]
     pub fn degree(&self, ceiling: usize) -> usize {
         let ceiling = if self.parallel() { ceiling.max(1) } else { 1 };
+        self.source.gather(self.sink.gather_rows());
         match self.source.morsels(ceiling, self.weight()) {
             Some(work) => work.clamp(1, ceiling),
             None => ceiling,
