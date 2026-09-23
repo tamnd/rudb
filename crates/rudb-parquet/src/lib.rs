@@ -46,7 +46,7 @@ mod values;
 
 pub use chunk::{Page, Pages};
 pub use metadata::{
-    ColumnChunk, Encoding, Metadata, Physical, Region, RowGroup, SchemaColumn, Stats,
+    ColumnChunk, Encoding, Metadata, Outline, Physical, Region, RowGroup, SchemaColumn, Stats,
 };
 pub use page::{Body, DataV1, DataV2, Dictionary, Header};
 pub use prune::{Bound, Footer, Op, Test, skips};

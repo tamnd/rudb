@@ -20,8 +20,9 @@ use rudb_common::{
     Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, Value,
 };
 use rudb_functions::{
-    Columns, FILE_ROW_NUMBER, FunctionKind, Given, Resolved, TableFunction, csv_fields, csv_given,
-    files, is_file, is_pattern, kind_of, parquet_footers, resolve, resolve_pragma, resolve_table,
+    Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TableFunction, csv_fields,
+    csv_given, files, is_file, is_pattern, kind_of, parquet_footers, parquet_outline, resolve,
+    resolve_pragma, resolve_table,
 };
 use rudb_kernels::{percentage, row_count};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
@@ -284,6 +285,15 @@ pub(crate) struct Binder<'a> {
     pub(crate) lambda_frames: Vec<crate::lambda::Frame>,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
+    /// Whether a Parquet file that could be read through a native mirror is bound from its outline
+    /// alone, which is the columns and the row count and none of the row groups.
+    ///
+    /// Set by a bind whose plan is thrown away: a `CREATE VIEW`, and the first bind of a query that
+    /// may be bound again once its mirrors are in. A plan bound this way knows no bounds and no
+    /// distinct counts for the file, so the caller must not run it, and every read it did this for
+    /// asked for a mirror, which is how the caller knows to bind again. See
+    /// [`rudb_parquet::Outline`].
+    pub(crate) outlined: bool,
     /// The views whose bodies are open on the stack, which is what catches a cycle.
     expanding: Vec<String>,
     /// The materialised `WITH` definitions whose bodies are being bound, innermost last.
@@ -325,6 +335,7 @@ impl<'a> Binder<'a> {
             correlations: Vec::new(),
             lambda_frames: Vec::new(),
             clause: "SELECT clause",
+            outlined: false,
             expanding: Vec::new(),
             materialized: Vec::new(),
             next_cte: 0,
@@ -2053,7 +2064,7 @@ impl<'a> Binder<'a> {
                     // them, which is not a choice made here. See `csv_fields`.
                     Columns::Csv => csv_fields(&paths, options.given)?,
                     _ => {
-                        let footers = parquet_footers(&paths)?;
+                        let footers = self.footers(&paths, mirrorable.as_deref())?;
                         if let Some(path) = mirrorable.as_deref() {
                             self.want_mirror(path, options.binary_as_string, &footers.rows);
                         }
@@ -2370,7 +2381,7 @@ impl<'a> Binder<'a> {
         }
         let read = match function {
             TableFunction::ReadParquet => {
-                let footers = parquet_footers(&paths)?;
+                let footers = self.footers(&paths, mirrorable.as_deref())?;
                 if let Some(canonical) = mirrorable.as_deref() {
                     self.want_mirror(canonical, false, &footers.rows);
                 }
@@ -2386,6 +2397,21 @@ impl<'a> Binder<'a> {
         let arguments: Vec<ExprRef> = paths.iter().map(|path| self.path_constant(path)).collect();
         let names: Vec<&str> = ast.name(columns).collect();
         self.table_function_source(function, &arguments, &[], read, &label, &names)
+    }
+
+    /// What the footers of `paths` say, from the outline alone where this bind is outlined and the
+    /// read could go through a mirror.
+    ///
+    /// An outline that does not state a row count is read again in full, because a read that asks
+    /// for no mirror would leave the plan outlined with nothing telling the caller to bind again.
+    fn footers(&self, paths: &[String], mirrorable: Option<&str>) -> Result<Footers> {
+        if let Some(path) = mirrorable.filter(|_| self.outlined) {
+            let outline = parquet_outline(path)?;
+            if outline.rows.value().is_some() {
+                return Ok(outline);
+            }
+        }
+        parquet_footers(paths)
     }
 
     /// Says the Parquet file at `path` could have been read through a native mirror, when its
