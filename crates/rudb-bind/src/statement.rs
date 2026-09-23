@@ -179,6 +179,37 @@ pub fn bind_statement_with(
     parameters: &Parameters,
     session: &Session,
 ) -> Result<Bound> {
+    bind_one(ast, catalog, parameters, session, false)
+}
+
+/// Binds one statement the way [`bind_statement_with`] does, except that a query reads a Parquet
+/// file that could go through a native mirror from its columns and row count alone.
+///
+/// For the first bind of a query that will be bound again once its mirrors are in. A query that
+/// comes back with [`rudb_plan::Plan::wanted_mirrors`] empty was bound in full and can run. One that
+/// comes back with any must be bound again with [`bind_statement_with`] before it runs, because the
+/// reads that asked for a mirror were bound without the bounds and the distinct counts the
+/// optimizer would have used.
+///
+/// # Errors
+///
+/// Everything [`bind_statement_with`] reports.
+pub fn bind_statement_outlined(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+) -> Result<Bound> {
+    bind_one(ast, catalog, parameters, session, true)
+}
+
+fn bind_one(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    outlined: bool,
+) -> Result<Bound> {
     let statement = match ast.statements.as_slice() {
         [statement] => *statement,
         [] => return Err(Error::binder("no statement to bind")),
@@ -187,6 +218,7 @@ pub fn bind_statement_with(
     match statement {
         ast::Statement::Query(query) => {
             let mut binder = Binder::with(catalog, parameters, session);
+            binder.outlined = outlined;
             let (root, _) = binder.bind_query(ast, query)?;
             Ok(Bound::Query(finish(binder, root)?))
         }
@@ -344,6 +376,9 @@ fn create_view(
     let aliases: Vec<String> = ast.name(written.columns).map(str::to_string).collect();
 
     let mut binder = Binder::with(catalog, parameters, session);
+    // The plan is thrown away and the columns are all that is kept, so a file is read for its
+    // columns and nothing else.
+    binder.outlined = true;
     let (_, mut scope) = binder.bind_query(ast, written.query)?;
     if aliases.len() > scope.len() {
         return Err(Error::binder("More VIEW aliases than columns in query result"));

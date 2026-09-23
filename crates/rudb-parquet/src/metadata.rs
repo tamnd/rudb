@@ -333,29 +333,7 @@ impl Metadata {
     /// If the file is too short, is not Parquet, states a footer longer than itself, or the footer
     /// does not parse.
     pub fn read(file: &dyn File) -> Result<Self> {
-        let len = file.len()?;
-        if len < 12 {
-            return Err(Error::io(format!("a parquet file of {len} bytes, which is too short")));
-        }
-        let mut head = [0_u8; 4];
-        file.read_exact_at(0, &mut head)?;
-        if &head != MAGIC {
-            return Err(Error::io("a file that does not start with PAR1"));
-        }
-        let mut tail = [0_u8; 8];
-        file.read_exact_at(len - 8, &mut tail)?;
-        if &tail[4..] != MAGIC {
-            return Err(Error::io("a file that does not end with PAR1"));
-        }
-        let footer = u64::from(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]));
-        if footer + 8 > len {
-            return Err(Error::io(format!(
-                "a footer of {footer} bytes in a file of {len}, which does not fit"
-            )));
-        }
-        let mut bytes = vec![0_u8; footer as usize];
-        file.read_exact_at(len - 8 - footer, &mut bytes)?;
-        Self::parse(&bytes)
+        Self::parse(&footer(file)?)
     }
 
     /// Parses a footer that has already been read.
@@ -988,6 +966,104 @@ fn expect(found: Kind, wanted: Kind, what: &str) -> Result<()> {
     Err(Error::io(format!("{what} written as a list of {found:?} rather than {wanted:?}")))
 }
 
+/// The footer bytes of an open file, checked the way [`Metadata::read`] says.
+fn footer(file: &dyn File) -> Result<Vec<u8>> {
+    let len = file.len()?;
+    if len < 12 {
+        return Err(Error::io(format!("a parquet file of {len} bytes, which is too short")));
+    }
+    let mut head = [0_u8; 4];
+    file.read_exact_at(0, &mut head)?;
+    if &head != MAGIC {
+        return Err(Error::io("a file that does not start with PAR1"));
+    }
+    let mut tail = [0_u8; 8];
+    file.read_exact_at(len - 8, &mut tail)?;
+    if &tail[4..] != MAGIC {
+        return Err(Error::io("a file that does not end with PAR1"));
+    }
+    let footer = u64::from(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]));
+    if footer + 8 > len {
+        return Err(Error::io(format!(
+            "a footer of {footer} bytes in a file of {len}, which does not fit"
+        )));
+    }
+    let mut bytes = vec![0_u8; footer as usize];
+    file.read_exact_at(len - 8 - footer, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// The columns of a file and how many rows it holds, without its row groups.
+///
+/// What a caller that is only naming columns needs. A `CREATE VIEW` over a file binds its body to
+/// learn the columns and throws the plan away, and a query that is about to be bound again through
+/// a native mirror throws its first plan away too. Neither reads a bound or a distinct count. On
+/// the ten million row ClickBench file the row groups are almost all of the footer, eighty two of
+/// them with a hundred and five chunks each, and parsing them held two megabytes and peaked at
+/// three, which was a quarter of what the process needed to answer `SELECT COUNT(*)` from a
+/// mirror.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outline {
+    /// The columns, flat, in the order the file stores them.
+    pub schema: Vec<SchemaColumn>,
+    /// How many rows are in the file, across every row group.
+    pub rows: i64,
+}
+
+impl Outline {
+    /// Reads the outline of an open file, which reads the whole footer and parses part of it.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Metadata::read`] reports, less what it finds wrong with a row group.
+    pub fn read(file: &dyn File) -> Result<Self> {
+        Self::parse(&footer(file)?)
+    }
+
+    /// Parses the outline out of a footer that has already been read.
+    ///
+    /// # Errors
+    ///
+    /// If the bytes are not a `FileMetaData` or the schema is nested.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(bytes);
+        let mut rows = 0;
+        let mut schema = Vec::new();
+        while let Some(field) = reader.field_begin()? {
+            match field.id {
+                2 => schema = read_schema(&mut reader)?,
+                3 => rows = reader.read_int()?,
+                _ => reader.skip(field.kind)?,
+            }
+        }
+        if schema.is_empty() {
+            return Err(Error::io("a parquet footer with no schema in it"));
+        }
+        Ok(Self { schema, rows })
+    }
+
+    /// The columns as rudb sees them, the way [`crate::Reader::fields`] reads them.
+    #[must_use]
+    pub fn fields(&self) -> Vec<Field> {
+        self.schema
+            .iter()
+            .map(|column| {
+                if column.optional {
+                    Field::new(column.name.clone(), column.ty.clone())
+                } else {
+                    Field::required(column.name.clone(), column.ty.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// How many rows the file holds, where the footer states a count that is not negative.
+    #[must_use]
+    pub fn rows(&self) -> Option<u64> {
+        u64::try_from(self.rows).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -995,7 +1071,7 @@ mod tests {
     use rudb_common::LogicalType;
     use rudb_io::{Filesystem, OpenMode, RealFilesystem};
 
-    use super::{Codec, Encoding, Metadata, Physical};
+    use super::{Codec, Encoding, Metadata, Outline, Physical};
 
     /// The file every test here reads.
     ///
@@ -1031,6 +1107,19 @@ mod tests {
             // a, b, s, d, flag, day, t.
             assert_eq!(stated, vec![Some(97), None, Some(5), Some(64), None, None, None]);
         }
+    }
+
+    #[test]
+    fn an_outline_is_the_footer_without_its_row_groups() {
+        let fs = RealFilesystem::new();
+        let file = fs.open(&fixture(), OpenMode::Read).expect("opens the fixture");
+        let outline = Outline::read(file.as_ref()).expect("reads the outline");
+        let metadata = read();
+        assert_eq!(outline.schema, metadata.schema, "the same columns");
+        assert_eq!(outline.rows, metadata.rows, "the same row count");
+        let reader = crate::Reader::open(fs.open(&fixture(), OpenMode::Read).expect("opens"))
+            .expect("reads the footer");
+        assert_eq!(outline.fields(), reader.fields(), "the same fields a reader names");
     }
 
     #[test]

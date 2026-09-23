@@ -278,6 +278,21 @@ pub fn parquet_footers(paths: &[String]) -> Result<Footers> {
     Ok(counted(Some(total), largest))
 }
 
+/// The columns of the one Parquet file at `path` and how many rows it holds, with no bounds and no
+/// distinct counts, for a bind whose plan is not going to run.
+///
+/// See [`rudb_parquet::Outline`] for who that is and what it saves. The count is here because a bind
+/// that could be answered through a native mirror asks for one by the row count.
+///
+/// # Errors
+///
+/// Everything [`open_parquet`] reports.
+pub fn parquet_outline(path: &str) -> Result<Footers> {
+    let outline = rudb_parquet::Outline::read(open_file(path)?.as_ref())?;
+    let rows = outline.rows().map_or(Stat::Unknown, |rows| Stat::exact(rows, Provenance::RowCount));
+    Ok(Footers { fields: outline.fields(), rows, distincts: Vec::new(), zones: None })
+}
+
 /// What the row groups of one column said about how many distinct values it holds.
 ///
 /// Two numbers rather than one, because a column's distinct count is not in the footer and what is

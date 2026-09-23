@@ -1330,11 +1330,22 @@ impl Shared {
         let session = self.session();
         let (ast, parse_ns) =
             timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
-        let (bound, bind_ns) =
-            timed(|| rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session))?;
+        let outlined = mirror && self.inner.settings.config().parquet_mirror();
+        let (bound, bind_ns) = timed(|| {
+            if outlined {
+                rudb_bind::bind_statement_outlined(&ast, &catalog, &Parameters::new(), &session)
+            } else {
+                rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session)
+            }
+        })?;
         if mirror {
             let wanted = self.wanted_mirrors(&bound);
-            if !wanted.is_empty() {
+            // An outlined plan that asked for a mirror is bound again whether or not it gets one,
+            // because the reads that asked were bound without their bounds.
+            if !wanted.is_empty() || (outlined && asked_for_mirrors(&bound)) {
+                // The plan goes first. It holds the bounds of the footer it was bound against, which
+                // on a file of eighty row groups is two megabytes the rebound plan does not use.
+                drop(bound);
                 drop(catalog);
                 self.mirror(&wanted);
                 return self.query_mirrored(sql, cancel, false);
@@ -1690,11 +1701,19 @@ impl Shared {
         let mut catalog = self.write();
         let context = self.optimizer(&catalog)?;
         let session = self.session();
-        let (bound, bind_ns) =
-            timed(|| rudb_bind::bind_statement_with(ast, &catalog, parameters, &session))?;
+        let outlined = mirror && self.inner.settings.config().parquet_mirror();
+        let (bound, bind_ns) = timed(|| {
+            if outlined {
+                rudb_bind::bind_statement_outlined(ast, &catalog, parameters, &session)
+            } else {
+                rudb_bind::bind_statement_with(ast, &catalog, parameters, &session)
+            }
+        })?;
         if mirror {
             let wanted = self.wanted_mirrors(&bound);
-            if !wanted.is_empty() {
+            if !wanted.is_empty() || (outlined && asked_for_mirrors(&bound)) {
+                // See `query_mirrored`: the plan bound against the file holds its footer.
+                drop(bound);
                 drop(catalog);
                 self.mirror(&wanted);
                 return self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, false);
@@ -2055,6 +2074,12 @@ impl Planning {
     fn total_ns(self) -> u64 {
         self.parse_ns.saturating_add(self.bind_ns).saturating_add(self.optimize_ns)
     }
+}
+
+/// Whether a bound query read any Parquet file that could have gone through a native mirror,
+/// whatever became of the ask.
+fn asked_for_mirrors(bound: &Bound) -> bool {
+    matches!(bound, Bound::Query(plan) if !plan.wanted_mirrors().is_empty())
 }
 
 /// Run something and say how long it took, in wall nanoseconds.
