@@ -4063,9 +4063,9 @@ struct NativeText {
     /// check that it does not end before it starts, which came to thirteen instructions a row on
     /// ClickBench 28. Out of this it is one load. The order is checked once for the whole table
     /// while it is built, and a column that fails it gets no table and goes on reading the ends,
-    /// which is where the error is reported. Four bytes a value, and only for a column something
-    /// has asked the length of a vector at a time.
-    value_lens: OnceLock<Option<Vec<u32>>>,
+    /// which is where the error is reported. Two bytes a value where every value is short enough,
+    /// four otherwise, and only for a column something has asked the length of a vector at a time.
+    value_lens: OnceLock<Option<Lengths>>,
     /// How many single offset reads have come in while the table is not built.
     ///
     /// Relaxed, and read only against a threshold, so two threads racing here means the table is
@@ -4284,21 +4284,77 @@ fn gram_bits(bytes: &[u8], width: usize) -> [usize; 2] {
 /// without an eviction order, which is a ceiling.
 const TEXT_KEEP_BUDGET: usize = 256 * 1024 * 1024;
 
+/// The length of every value of a column, as narrow as the longest of them allows.
+///
+/// The table is read at the codes a vector holds, which on a column the size of ClickBench `URL`
+/// land all over it, so what a length costs is whether its line is in cache. Half a million URLs
+/// are two megabytes at four bytes a length and one at two, which is the difference between the
+/// table sitting in the second level cache or not.
+#[derive(Debug)]
+enum Lengths {
+    /// Every length fits in sixteen bits.
+    Narrow(Vec<u16>),
+    /// Some value is longer than that.
+    Wide(Vec<u32>),
+}
+
+impl Lengths {
+    /// The lengths at `indices`, appended to `into`, and zero for a position past the end, which
+    /// is what a row at a time read says.
+    fn extend_at(&self, indices: &[u32], into: &mut Vec<i64>) {
+        match self {
+            Lengths::Narrow(lens) => into.extend(
+                indices
+                    .iter()
+                    .map(|&index| lens.get(index as usize).map_or(0, |&len| i64::from(len))),
+            ),
+            Lengths::Wide(lens) => into.extend(
+                indices
+                    .iter()
+                    .map(|&index| lens.get(index as usize).map_or(0, |&len| i64::from(len))),
+            ),
+        }
+    }
+
+    /// The bytes the table holds on to.
+    fn footprint(&self) -> usize {
+        match self {
+            Lengths::Narrow(lens) => lens.capacity() * size_of::<u16>(),
+            Lengths::Wide(lens) => lens.capacity() * size_of::<u32>(),
+        }
+    }
+}
+
 /// The length of every value out of where each one ends inside its payload block, or `None` for
 /// ends that go backwards somewhere inside a block.
 ///
 /// A value that opens a block starts at zero and every other one starts where the value before it
 /// ends, so a block is a run of differences.
-fn lengths_of(ends: &[u32]) -> Option<Vec<u32>> {
+///
+/// Built at two bytes a length straight away, and built again at four only when some value turns
+/// out too long for that, which is rare enough that the second pass is not worth avoiding.
+fn lengths_of(ends: &[u32]) -> Option<Lengths> {
+    match lengths_as::<u16>(ends)? {
+        Some(narrow) => Some(Lengths::Narrow(narrow)),
+        None => lengths_as::<u32>(ends)?.map(Lengths::Wide),
+    }
+}
+
+/// [`lengths_of`] at one width: `None` for ends that go backwards, and `Some(None)` for a length
+/// that does not fit in `T`.
+fn lengths_as<T: TryFrom<u32>>(ends: &[u32]) -> Option<Option<Vec<T>>> {
     let mut lens = Vec::with_capacity(ends.len());
     for block in ends.chunks(TEXT_PAYLOAD_VALUES) {
         let mut start = 0;
         for &end in block {
-            lens.push(end.checked_sub(start)?);
+            let Ok(len) = T::try_from(end.checked_sub(start)?) else {
+                return Some(None);
+            };
+            lens.push(len);
             start = end;
         }
     }
-    Some(lens)
+    Some(Some(lens))
 }
 
 /// How many offsets go in one packed run.
@@ -4745,12 +4801,7 @@ impl TextSource for NativeText {
             return Ok(());
         };
         if let Some(lens) = self.value_lens.get_or_init(|| lengths_of(ends)) {
-            // Past the end is no value and so no length, which is what a row at a time read says.
-            into.extend(
-                indices
-                    .iter()
-                    .map(|&index| lens.get(index as usize).map_or(0, |&len| i64::from(len))),
-            );
+            lens.extend_at(indices, into);
             return Ok(());
         }
         for &index in indices {
@@ -4961,11 +5012,7 @@ impl TextSource for NativeText {
                 .get()
                 .and_then(Option::as_ref)
                 .map_or(0, |ends| ends.capacity() * size_of::<u32>())
-            + self
-                .value_lens
-                .get()
-                .and_then(Option::as_ref)
-                .map_or(0, |lens| lens.capacity() * size_of::<u32>())
+            + self.value_lens.get().and_then(Option::as_ref).map_or(0, Lengths::footprint)
             + self
                 .code_ranks
                 .get()
@@ -14408,11 +14455,18 @@ mod tests {
     fn lengths_restart_at_each_block_and_refuse_ends_that_go_backwards() {
         let mut ends: Vec<u32> = (1..=TEXT_PAYLOAD_VALUES as u32).map(|at| at * 2).collect();
         ends.extend([3, 3, 10]);
-        let lens = lengths_of(&ends).expect("ordered ends");
+        let Some(Lengths::Narrow(lens)) = lengths_of(&ends) else { panic!("short ordered ends") };
         assert!(lens[..TEXT_PAYLOAD_VALUES].iter().all(|&len| len == 2));
         assert_eq!(&lens[TEXT_PAYLOAD_VALUES..], &[3, 0, 7]);
+        // One value longer than sixteen bits keeps every length at four bytes.
+        let long = [5, 70_005, 70_006];
+        let Some(Lengths::Wide(lens)) = lengths_of(&long) else { panic!("long ordered ends") };
+        assert_eq!(lens, [5, 70_000, 1]);
+        let mut read = Vec::new();
+        Lengths::Wide(lens).extend_at(&[1, 9, 0], &mut read);
+        assert_eq!(read, [70_000, 0, 5], "a position past the end is no length");
         ends.push(9);
-        assert_eq!(lengths_of(&ends), None);
+        assert!(lengths_of(&ends).is_none());
     }
 
     /// Every worker of a scan wants the dictionary at the same moment and one of them fetches it.
