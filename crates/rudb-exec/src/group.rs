@@ -29,7 +29,9 @@ use rudb_common::{
     Error, Field, LogicalType, Memory, PhysicalType, Reservation, Result, Session, Stage, Value,
     stage,
 };
-use rudb_kernels::{Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_scattered};
+use rudb_kernels::{
+    Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_runs, update_scattered,
+};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
@@ -390,6 +392,38 @@ const EMPTY_SLOT: u32 = SLOT_MASK;
 const fn slot_tag(hash: u64) -> u32 {
     (((hash >> SLOT_BITS) as u32) & 0xff) << SLOT_BITS
 }
+
+/// Cuts a chunk's slots into runs of one slot, each given as its slot and the row it ends before,
+/// when they come in runs at least [`RUN_ROWS`] long on average.
+///
+/// The count of places the slot changes comes first and a block at a time, so that a chunk of
+/// keys in no order is given up on after a block of a few hundred rows, which is a compare and an
+/// add a row. `false`, with `into` empty, for a chunk that is not worth it.
+fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>) -> bool {
+    into.clear();
+    let most = slots.len() / RUN_ROWS;
+    let mut changes = 0;
+    for (block, run) in slots.chunks(256).enumerate() {
+        let before = if block == 0 { run[0] } else { slots[block * 256 - 1] };
+        changes += usize::from(run[0] != before)
+            + run.windows(2).map(|pair| usize::from(pair[0] != pair[1])).sum::<usize>();
+        if changes >= most {
+            return false;
+        }
+    }
+    let mut start = 0;
+    for row in 1..=slots.len() {
+        if row == slots.len() || slots[row] != slots[start] {
+            into.push((slots[start], row));
+            start = row;
+        }
+    }
+    true
+}
+
+/// How many rows a run of one slot has to hold on average for [`slot_runs_of`] to cut a chunk
+/// into runs, which is where folding a run at once costs less than the pass that finds them.
+const RUN_ROWS: usize = 8;
 
 /// A bucket for a group at this slot with this hash, or an error when the partition is too large.
 fn bucket_for(slot: usize, hash: u64, what: &'static str) -> Result<u32> {
@@ -1511,6 +1545,7 @@ impl<'a> Aggregate<'a> {
             coded_on: Vec::new(),
             coded_places: Vec::new(),
             coded_values: Vec::new(),
+            slot_runs: Vec::new(),
             coded_spent: 0,
             coded_read: 0,
             coded_map: Vec::new(),
@@ -1569,6 +1604,7 @@ impl<'a> Aggregate<'a> {
             coded_on,
             coded_places,
             coded_values,
+            slot_runs,
             coded_spent,
             coded_read,
             coded_map,
@@ -1875,10 +1911,25 @@ impl<'a> Aggregate<'a> {
                 )?;
             }
         }
+        // A chunk whose key the rows are sorted on lands in a handful of groups one after another,
+        // and then each aggregate takes a run of rows into one group at once rather than a row at
+        // a time. The pass that finds out is one compare a row, so it is only taken where the
+        // slots can come in runs at all, which is a key whose rows are grouped together.
+        let by_runs = slot_runs_of(slots, slot_runs);
         if self.count_only {
-            for &slot in slots.iter() {
-                if slot != NOWHERE {
-                    counts[slot] += 1;
+            if by_runs {
+                let mut start = 0;
+                for &(slot, end) in slot_runs.iter() {
+                    if slot != NOWHERE {
+                        counts[slot] += (end - start) as i64;
+                    }
+                    start = end;
+                }
+            } else {
+                for &slot in slots.iter() {
+                    if slot != NOWHERE {
+                        counts[slot] += 1;
+                    }
                 }
             }
         }
@@ -1894,6 +1945,12 @@ impl<'a> Aggregate<'a> {
             }
             if call.distinct {
                 aside += self.distinct(states, seen, seen_rows, slots, at, given)?;
+                continue;
+            }
+            if by_runs
+                && filters[at].is_none()
+                && update_runs(states, slot_runs, calls, at, arguments[at].first(), *length)?
+            {
                 continue;
             }
             let picked = match &filters[at] {
@@ -3555,6 +3612,9 @@ pub(crate) struct Building {
     coded_places: Vec<usize>,
     /// The values of each integer key column the map reads by value, widened, one run per column.
     coded_values: Vec<Vec<i64>>,
+    /// The last chunk's slots cut into runs of one slot, each its slot and the row it ends before,
+    /// when they came in runs long enough to fold a run at a time.
+    slot_runs: Vec<(usize, usize)>,
     /// How many places the maps built on a window of values have cleared, summed over every build.
     coded_spent: usize,
     /// How many rows this table has folded, which is what pays for a map read by value.

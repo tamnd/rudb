@@ -1176,6 +1176,152 @@ pub fn update_scattered(
     Ok(())
 }
 
+/// Folds one vector into many accumulators a run of rows at a time, where every row of a run
+/// belongs to one group.
+///
+/// `runs` is the chunk cut into runs of one slot, each given as its slot and the row it ends
+/// before, so the first starts at row zero and each starts where the last ended. A chunk whose key
+/// the rows are sorted on comes in a handful of runs, and folding each run as a whole is one
+/// accumulator touched per run instead of one per row: a count is a length, and a total is a sum
+/// over a slice the compiler can keep in registers. That is how ClickBench 28 reads its
+/// `AVG(STRLEN(URL))` and its `COUNT(*)` over rows sorted on `CounterID`.
+///
+/// `false`, with nothing touched, for what this does not cover, which is anything but a count, an
+/// exact total or an exact mean, and any of those over a column with a null in it or in a form
+/// other than flat. The caller then goes the way [`update_scattered`] goes. A float total is left
+/// out on purpose, because adding a run up on its own first would round differently from adding
+/// its rows one at a time into what the group already holds.
+///
+/// A mean that has already gone inexact takes its run a row at a time for the same reason. An
+/// exact total is the same answer in any order, and the only thing adding a run as one number can
+/// change is at which row an `i128` overflows, which a column of 64 bit values cannot reach.
+///
+/// # Errors
+///
+/// The overflow an exact total raises, as [`update_scattered`] raises it, and an internal error if
+/// the runs do not cover exactly the rows given or if the vector is shorter than them.
+pub fn update_runs(
+    states: &mut [Accumulator],
+    runs: &[(usize, usize)],
+    stride: usize,
+    offset: usize,
+    input: Option<&Vector>,
+    rows: usize,
+) -> Result<bool> {
+    if runs.last().map_or(0, |&(_, end)| end) != rows {
+        return Err(Error::internal(format!("runs that do not end at the {rows} rows given")));
+    }
+    let Some(first) = states.get(offset) else {
+        return Ok(false);
+    };
+    let group = |slot: usize| (slot != NOWHERE).then(|| slot * stride + offset);
+    if first.kind() == Kind::CountStar {
+        count_runs(states, runs, group);
+        return Ok(true);
+    }
+    let Some(input) = input else { return Ok(false) };
+    if input.form() != Form::Flat || input.len() < rows || !matches!(nulls_of(input), Validity::AllValid) {
+        return Ok(false);
+    }
+    let Some(feed) = feed_of(first, input.logical_type()) else {
+        return Ok(false);
+    };
+    // A count of a column with no nulls in it is the length of each run whatever the column holds.
+    if matches!(feed, Feed::Counted) {
+        count_runs(states, runs, group);
+        return Ok(true);
+    }
+    let Some(data) = input.data().filter(|data| data.len() >= rows) else {
+        return Ok(false);
+    };
+    macro_rules! each {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    let values = &values.as_slice()[..rows];
+                    let mut start = 0;
+                    for &(slot, end) in runs {
+                        let run = &values[start..end];
+                        let length = end - start;
+                        start = end;
+                        let Some(index) = group(slot) else { continue };
+                        match (&mut states[index].state, feed) {
+                            (
+                                State::Whole { total, seen, .. }
+                                | State::Scaled { total, seen, .. },
+                                Feed::Total,
+                            ) => {
+                                let sum = run_total(run).ok_or_else(overflowed)?;
+                                *total = total.checked_add(sum).ok_or_else(overflowed)?;
+                                *seen = true;
+                            }
+                            (
+                                State::Mean { total, seen, exact, scale: held, .. },
+                                Feed::Whole { scale },
+                            ) => {
+                                *held = scale;
+                                *seen += length as i64;
+                                let sum = run_total(run).filter(|_| *exact);
+                                match sum.and_then(|sum| total.checked_add(sum)) {
+                                    Some(sum) => *total = sum,
+                                    None => {
+                                        for &value in run {
+                                            let number = i128::from(value);
+                                            match total.checked_add(number).filter(|_| *exact) {
+                                                Some(sum) => *total = sum,
+                                                None => widened(total, exact, number),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => return Err(Error::internal(
+                                "a run into a state its feed does not fit".to_string(),
+                            )),
+                        }
+                    }
+                })+
+                _ => return Ok(false),
+            }
+        };
+    }
+    match feed {
+        Feed::Total | Feed::Whole { .. } => {}
+        Feed::Counted | Feed::Real { .. } | Feed::Extreme(_) => return Ok(false),
+    }
+    rudb_vector::for_each_layout!(exact, each);
+    Ok(true)
+}
+
+/// Adds the length of each run to the count of the group it belongs to.
+fn count_runs(
+    states: &mut [Accumulator],
+    runs: &[(usize, usize)],
+    group: impl Fn(usize) -> Option<usize>,
+) {
+    let mut start = 0;
+    for &(slot, end) in runs {
+        if let Some(index) = group(slot) {
+            if let State::Counted { count, .. } = &mut states[index].state {
+                *count += (end - start) as i64;
+            }
+        }
+        start = end;
+    }
+}
+
+/// The exact total of a run of integers, or `None` when it does not fit an `i128`.
+///
+/// Only a run of 128 bit values can miss, since a run of anything narrower would need more rows
+/// than there are to leave the range, and so only that width pays for a check per value.
+fn run_total<T: Copy + Into<i128>>(run: &[T]) -> Option<i128> {
+    if size_of::<T>() < size_of::<i128>() {
+        Some(run.iter().map(|&value| value.into()).sum())
+    } else {
+        run.iter().try_fold(0_i128, |sum, &value| sum.checked_add(value.into()))
+    }
+}
+
 /// A grouped min or max over a dictionary that sorted its values when it was written.
 ///
 /// The win is that no string is read. Each row turns into the rank of its code, which is one load
@@ -3171,6 +3317,86 @@ mod tests {
                                  {slow:?} against {fast:?}"
                             ),
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A run at a time answers what a row at a time answers, over every aggregate and type, and
+    /// takes every count and every exact total and mean over a column with no nulls in it.
+    #[test]
+    fn a_run_at_a_time_agrees_with_a_row_at_a_time() {
+        let mut rng = Rng(0x5eed_0f00_2c0d_0028);
+        let groups = 4;
+        let types = [
+            LogicalType::TinyInt,
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::HugeInt,
+            LogicalType::UBigInt,
+            LogicalType::Double,
+            LogicalType::decimal(18, 4).expect("a legal decimal"),
+            LogicalType::decimal(30, 6).expect("a legal decimal"),
+            LogicalType::Date,
+            LogicalType::Varchar,
+        ];
+        // Runs of one slot in no order, with a run that belongs to nothing among them.
+        let slots: Vec<usize> = [(2, 30), (0, 11), (NOWHERE, 9), (3, 1), (0, 20), (1, 26)]
+            .iter()
+            .flat_map(|&(slot, length)| std::iter::repeat_n(slot, length))
+            .collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            match runs.last_mut() {
+                Some((last, end)) if *last == slot => *end = row + 1,
+                _ => runs.push((slot, row + 1)),
+            }
+        }
+        for ty in &types {
+            for name in ["count_star", "count", "sum", "avg", "min", "max"] {
+                let returns = returns_of(name, ty);
+                let reads = name != "count_star";
+                for nulls in [0_usize, 4] {
+                    let batch = flat(ty, slots.len(), nulls, &mut rng);
+                    let note = format!("{name} over {ty}, one null in {nulls}");
+                    let dealt = vec![(batch.clone(), slots.clone())];
+                    let slow = group_at_a_time(name, &returns, &dealt, groups, reads);
+                    let mut states = Vec::new();
+                    for _ in 0..groups * STRIDE {
+                        states.push(Accumulator::new(name, &returns).expect("known"));
+                    }
+                    let input = reads.then_some(&batch);
+                    let took = update_runs(&mut states, &runs, STRIDE, OFFSET, input, slots.len());
+                    let taken = took.as_ref().ok().copied();
+                    let fast = took.and_then(|took| {
+                        if !took {
+                            update_scattered(
+                                &mut states,
+                                &slots,
+                                STRIDE,
+                                OFFSET,
+                                input,
+                                slots.len(),
+                            )?;
+                        }
+                        (0..groups)
+                            .map(|group| states[group * STRIDE + OFFSET].finish())
+                            .collect::<Result<Vec<_>>>()
+                    });
+                    match (slow, fast) {
+                        (Ok(slow), Ok(fast)) => assert_eq!(slow, fast, "{note}"),
+                        (Err(slow), Err(fast)) => {
+                            assert_eq!(slow.message(), fast.message(), "{note}");
+                        }
+                        (slow, fast) => panic!("{note}: {slow:?} against {fast:?}"),
+                    }
+                    let exact = ty.is_integer() || matches!(ty, LogicalType::Decimal { .. });
+                    let covered = name == "count_star"
+                        || (nulls == 0
+                            && (name == "count" || (exact && matches!(name, "sum" | "avg"))));
+                    if covered {
+                        assert_eq!(taken, Some(true), "{note} is taken a run at a time");
                     }
                 }
             }
