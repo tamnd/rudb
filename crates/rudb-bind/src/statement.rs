@@ -105,6 +105,8 @@ pub struct CreateTable {
     pub keys: Vec<rudb_catalog::Key>,
     /// Each column's `DEFAULT` as the SQL of its expression, or `None` for a column with none.
     pub defaults: Vec<Option<String>>,
+    /// The SQL of each `CHECK`, in the order written.
+    pub checks: Vec<String>,
 }
 
 /// A bound `CREATE VIEW`.
@@ -165,6 +167,21 @@ pub struct Insert {
     pub returning: Option<Box<Plan>>,
     /// What an append does with a row whose key the table already holds.
     pub conflict: Option<Conflict>,
+    /// The table's `CHECK` constraints, for the rows an append or an update writes.
+    pub checks: Option<Checks>,
+}
+
+/// The `CHECK` constraints of a table, bound as one query over it.
+///
+/// The query answers, for each row the table holds, whether each constraint fails on it. The write
+/// runs it with the table standing in for the rows it wrote, so a failed constraint is found before
+/// anything the statement wrote is kept.
+#[derive(Debug)]
+pub struct Checks {
+    /// One boolean column per constraint, true where the row fails it. A null is a pass.
+    pub plan: Box<Plan>,
+    /// The pin's message for each constraint, in the same order as the columns.
+    pub messages: Vec<String>,
 }
 
 /// A bound `ON CONFLICT`, `INSERT OR REPLACE` or `INSERT OR IGNORE`.
@@ -392,6 +409,10 @@ fn create_table(
             Some(default_text(ast, def.default, catalog, parameters, session)?)
         });
     }
+    let mut checks = Vec::new();
+    for &expr in ast.expr_list(written.checks) {
+        checks.push(check_text(ast, expr, &columns, catalog, parameters, session)?);
+    }
     let mut keys = Vec::new();
     for (at, &names) in ast.name_list(written.keys).iter().enumerate() {
         let mut places = Vec::new();
@@ -421,7 +442,98 @@ fn create_table(
         or_replace: written.or_replace,
         keys,
         defaults,
+        checks,
     }))
+}
+
+/// The SQL a `CHECK` is kept as, refused the way the pin refuses one when the table is made.
+fn check_text(
+    ast: &Ast,
+    expr: ast::ExprRef,
+    columns: &[Field],
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+) -> Result<String> {
+    if crate::expr::has_aggregate(ast, expr) {
+        return Err(Error::binder("aggregate functions are not allowed in check constraints"));
+    }
+    let mut binder = Binder::with(catalog, parameters, session);
+    let index = binder.fresh_index();
+    let mut scope = crate::scope::Scope::empty();
+    for (at, field) in columns.iter().enumerate() {
+        scope.push(crate::scope::Visible {
+            table: String::new(),
+            name: field.name.clone(),
+            binding: rudb_plan::ColumnBinding::new(index, at as u32),
+            ty: field.ty.clone(),
+            not_null: false,
+            key: None,
+            default: None,
+            qualified: false,
+            also: None,
+        });
+    }
+    match binder.bind_expr(ast, expr, &scope) {
+        Err(error) if error.message().starts_with("Referenced column \"") => {
+            let column = error.message().split('"').nth(1).unwrap_or_default();
+            Err(Error::binder(format!(
+                "Table does not contain column \"{column}\" referenced in check constraint!"
+            )))
+        }
+        Err(error) => Err(error),
+        Ok(_) if !binder.windows.is_empty() => {
+            Err(Error::binder("window functions are not allowed in check constraints"))
+        }
+        Ok(_) => Ok(deparse::expression(ast, expr)),
+    }
+}
+
+/// The `CHECK` constraints of a table as the query a write runs over the rows it wrote, or `None`
+/// for a table with none.
+fn bind_checks(
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    name: &QualifiedName,
+) -> Result<Option<Checks>> {
+    let table = catalog.table(name)?;
+    if table.checks().is_empty() {
+        return Ok(None);
+    }
+    let failed: Vec<String> =
+        table.checks().iter().map(|text| format!("NOT CAST(({text}) AS BOOLEAN)")).collect();
+    let ast = parse_ast(&format!("SELECT {}", failed.join(", ")))?;
+    let ast::Statement::Query(query) = ast.statements[0] else {
+        return Err(Error::internal("a check that is not an expression"));
+    };
+    let ast::QueryBody::Select(select) = ast.query(query).body else {
+        return Err(Error::internal("a check that is not an expression"));
+    };
+    let mut binder = Binder::with(catalog, parameters, session);
+    let (root, scope) =
+        binder.bind_catalog_table(&ast, name, name.table.clone(), ast::Slice::default())?;
+    let mut exprs = Vec::with_capacity(failed.len());
+    let mut names = Vec::with_capacity(failed.len());
+    for target in ast.target_list(ast.select(select).targets) {
+        exprs.push(binder.bind_expr(&ast, target.expr, &scope)?);
+        names.push(binder.plan_mut().intern("failed"));
+    }
+    let exprs = binder.plan_mut().add_expr_list(&exprs);
+    let names = binder.plan_mut().add_name_list(&names);
+    let index = binder.fresh_index();
+    let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+    let messages = table
+        .checks()
+        .iter()
+        .map(|text| {
+            format!(
+                "CHECK constraint failed on table \"{}\" with expression CHECK({text})",
+                name.table
+            )
+        })
+        .collect();
+    Ok(Some(Checks { plan: Box::new(finish(binder, root)?), messages }))
 }
 
 /// The SQL a column's `DEFAULT` is kept as, refused the way the pin refuses one when the table is
@@ -827,7 +939,8 @@ fn insert(
         }
         None => None,
     };
-    Ok(Bound::Insert(Insert { name, source, write: Write::Append, returning, conflict }))
+    let checks = bind_checks(catalog, parameters, session, &name)?;
+    Ok(Bound::Insert(Insert { name, source, write: Write::Append, returning, conflict, checks }))
 }
 
 /// Which key an `ON CONFLICT` is about and what it does, refused the way the pin refuses one that
@@ -1037,5 +1150,6 @@ fn change(
     let source = finish(binder, root)?;
     let returning = returning(ast, catalog, parameters, session, written.returning)?;
     let write = if delete { Write::Delete } else { Write::Update };
-    Ok(Bound::Insert(Insert { name, source, write, returning, conflict: None }))
+    let checks = if delete { None } else { bind_checks(catalog, parameters, session, &name)? };
+    Ok(Bound::Insert(Insert { name, source, write, returning, conflict: None, checks }))
 }

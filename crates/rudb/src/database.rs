@@ -3066,6 +3066,7 @@ impl Shared {
                     writable
                         && insert.write == Write::Append
                         && insert.returning.is_none()
+                        && insert.checks.is_none()
                         && catalog.table(&insert.name).is_ok_and(|table| table.keys().is_empty())
                 }) {
                     let target = catalog.table(&insert.name)?;
@@ -3121,14 +3122,19 @@ impl Shared {
                 let workers = self.inner.pool.threads();
                 let chunks = result.into_chunks();
                 let wanted = insert.returning.is_some();
+                let place = (cancel, &seams, &session);
+                let mut checks = insert.checks.take();
                 let (count, written) = match insert.write {
                     Write::Append if insert.conflict.is_some() => {
                         let conflict = insert.conflict.take().expect("asked just above");
                         let name = insert.name.clone();
-                        let place = (cancel, &seams, &session);
-                        self.upsert(sql, &mut catalog, place, &name, conflict, chunks)?
+                        let upsert = (conflict, checks.as_mut());
+                        self.upsert(sql, &mut catalog, place, &name, upsert, chunks)?
                     }
                     Write::Append => {
+                        if let Some(checks) = checks.as_mut() {
+                            self.check(sql, &mut catalog, place, &insert.name, checks, &chunks)?;
+                        }
                         let added = chunks.iter().map(Chunk::len).sum();
                         let written = if wanted { chunks.clone() } else { Vec::new() };
                         catalog.table_mut(&insert.name)?.append_all(chunks, workers)?;
@@ -3136,7 +3142,11 @@ impl Shared {
                     }
                     Write::Update | Write::Delete => {
                         let delete = insert.write == Write::Delete;
-                        let (kept, changed, count) = split(chunks, delete, wanted)?;
+                        let (kept, changed, count) =
+                            split(chunks, delete, wanted || checks.is_some())?;
+                        if let Some(checks) = checks.as_mut() {
+                            self.check(sql, &mut catalog, place, &insert.name, checks, &changed)?;
+                        }
                         catalog.table_mut(&insert.name)?.replace_all(kept, workers)?;
                         (count, changed)
                     }
@@ -3168,6 +3178,45 @@ impl Shared {
 }
 
 impl Shared {
+    /// Refuses rows a write is about to keep when one of them fails a `CHECK` of the table, with
+    /// the pin's message for the first constraint, in the order written, that a row fails.
+    ///
+    /// For the length of the query the table holds just these rows, and it gets its own back
+    /// whether the query ran or not.
+    fn check(
+        &self,
+        sql: &str,
+        catalog: &mut Catalog,
+        (cancel, seams, session): (&Cancel, &rudb_seam::Settings, &Session),
+        name: &QualifiedName,
+        checks: &mut rudb_bind::Checks,
+        rows: &[Chunk],
+    ) -> Result<()> {
+        if rows.iter().all(|chunk| chunk.is_empty()) {
+            return Ok(());
+        }
+        let workers = self.inner.pool.threads();
+        let before = catalog.table_mut(name)?.stand_in(rows.to_vec(), workers)?;
+        let answer = (|| {
+            let context = self.optimizer(catalog)?;
+            rudb_opt::optimize_with(&mut checks.plan, &context)?;
+            let under =
+                Under::new(self.budget(), context.facts(), seams, session, Rows::ForACaller);
+            run(sql, &checks.plan, catalog, cancel, under)
+        })();
+        catalog.table_mut(name)?.put_back(before);
+        let chunks = answer?.into_chunks();
+        for (at, message) in checks.messages.iter().enumerate() {
+            let failed = chunks.iter().any(|chunk| {
+                (0..chunk.len()).any(|row| chunk.value_at(row, at) == Value::Boolean(true))
+            });
+            if failed {
+                return Err(Error::constraint(message.clone()));
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the rows of an `INSERT` that says what to do with a key the table already holds, and
     /// answers how many rows it inserted or updated and which, the updated ones first, which is the
     /// count and the order the pin gives.
@@ -3182,7 +3231,7 @@ impl Shared {
         catalog: &mut Catalog,
         (cancel, seams, session): (&Cancel, &rudb_seam::Settings, &Session),
         name: &QualifiedName,
-        conflict: rudb_bind::Conflict,
+        (conflict, checks): (rudb_bind::Conflict, Option<&mut rudb_bind::Checks>),
         chunks: Vec<Chunk>,
     ) -> Result<(usize, Vec<Chunk>)> {
         let workers = self.inner.pool.threads();
@@ -3264,6 +3313,10 @@ impl Shared {
         let count = updated.len() + added.len();
         let mut written: Vec<Vec<Value>> = updated.iter().map(|&at| held[at].clone()).collect();
         written.extend(added.iter().cloned());
+        if let Some(checks) = checks {
+            let rows = upsert::chunks_of(&types, &written)?;
+            self.check(sql, catalog, (cancel, seams, session), name, checks, &rows)?;
+        }
         let table = catalog.table_mut(name)?;
         if updated.is_empty() {
             table.append_all(upsert::chunks_of(&types, &added)?, workers)?;
@@ -3810,6 +3863,9 @@ fn create_table(
     }
     if create.defaults.iter().any(Option::is_some) {
         catalog.table_mut(&create.name)?.set_defaults(create.defaults);
+    }
+    if !create.checks.is_empty() {
+        catalog.table_mut(&create.name)?.set_checks(create.checks);
     }
     if let Some(rows) = rows {
         catalog.table_mut(&create.name)?.append_all(rows.into_chunks(), budget.pool.threads())?;

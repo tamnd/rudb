@@ -809,12 +809,16 @@ impl<'a> Transform<'a> {
         let body = self.first(definition);
         let mut keys = Vec::new();
         let mut primary = NONE;
+        let mut checks = Vec::new();
         let (columns, query) = match self.name(body) {
-            "CreateColumnList" => (self.column_list(body, name, &mut keys, &mut primary)?, NONE),
+            "CreateColumnList" => {
+                (self.column_list(body, name, &mut keys, &mut primary, &mut checks)?, NONE)
+            }
             "CreateTableAs" => self.create_table_as(body)?,
             _ => return self.unsupported(body),
         };
         let keys = self.name_list_slice(keys);
+        let checks = self.expr_slice(checks);
         let index = self.ast.create_tables.len() as u32;
         self.ast.create_tables.push(CreateTable {
             name,
@@ -825,6 +829,7 @@ impl<'a> Transform<'a> {
             temporary,
             keys,
             primary,
+            checks,
         });
         Ok(Statement::CreateTable(index))
     }
@@ -885,6 +890,7 @@ impl<'a> Transform<'a> {
         table: Slice,
         keys: &mut Vec<Slice>,
         primary: &mut u32,
+        checks: &mut Vec<ExprRef>,
     ) -> Result<Slice> {
         for kid in self.kids(node) {
             if matches!(self.name(kid), "PartitionOptions" | "SortedOptions" | "WithList") {
@@ -901,7 +907,7 @@ impl<'a> Transform<'a> {
         for element in self.kids(list) {
             let inner = self.first(element);
             if self.name(inner) == "CreateTableColumnDefinition" {
-                let (def, marks) = self.column_definition(self.first(inner))?;
+                let (def, marks) = self.column_definition(self.first(inner), checks)?;
                 for is_primary in marks {
                     let names = self.part_slice(vec![def.name]);
                     self.add_key(table, names, is_primary, keys, primary)?;
@@ -909,9 +915,14 @@ impl<'a> Transform<'a> {
                 defs.push(def);
                 continue;
             }
-            // A table level constraint. `CHECK` and `FOREIGN KEY` are not enforced anywhere yet and
-            // silently dropping one is a wrong answer waiting to happen, so they are refused.
+            // A table level constraint. `FOREIGN KEY` is not enforced anywhere yet and silently
+            // dropping one is a wrong answer waiting to happen, so it is refused.
             let mut found = Vec::new();
+            self.named_nodes(inner, "TopCheckConstraint", &mut found);
+            if let Some(&check) = found.first() {
+                checks.push(self.check(check)?);
+                continue;
+            }
             self.named_nodes(inner, "TopPrimaryKeyConstraint", &mut found);
             let is_primary = !found.is_empty();
             if !is_primary {
@@ -936,6 +947,22 @@ impl<'a> Transform<'a> {
             self.add_key(table, names, is_primary, keys, primary)?;
         }
         Ok(self.column_def_slice(defs))
+    }
+
+    /// `CheckConstraint <- 'CHECK' Parens(Expression)`, refused the way the pin refuses a subquery in
+    /// one.
+    fn check(&mut self, node: u32) -> Result<ExprRef> {
+        let mut found = Vec::new();
+        self.named_nodes(node, "SubqueryExpression", &mut found);
+        if !found.is_empty() {
+            return Err(Error::parser("subqueries prohibited in CHECK constraints"));
+        }
+        let mut found = Vec::new();
+        self.named_nodes(node, "Expression", &mut found);
+        let Some(&expr) = found.first() else {
+            return self.unsupported(node);
+        };
+        self.expr(expr)
     }
 
     /// Every node under this one, itself included, with this rule name, in the order written.
@@ -977,7 +1004,11 @@ impl<'a> Transform<'a> {
     /// `ColumnDefinition <- DottedIdentifier Type? GeneratedColumn? ConstraintNameClause?
     /// ColumnConstraint*`.
     /// A column and the keys written on it, `true` for a primary key and `false` for a unique one.
-    fn column_definition(&mut self, node: u32) -> Result<(ColumnDef, Vec<bool>)> {
+    fn column_definition(
+        &mut self,
+        node: u32,
+        checks: &mut Vec<ExprRef>,
+    ) -> Result<(ColumnDef, Vec<bool>)> {
         let name = self.identifier(self.find(node, "DottedIdentifier"));
         let type_node = self.find(node, "Type");
         let ty = if type_node == NONE {
@@ -1006,6 +1037,7 @@ impl<'a> Transform<'a> {
                 "DefaultValue" => {
                     default = self.expr(self.find(constraint, "ColumnDefaultExpr"))?;
                 }
+                "CheckConstraint" => checks.push(self.check(constraint)?),
                 _ => return self.unsupported(constraint),
             }
         }
@@ -4921,9 +4953,7 @@ mod tests {
         // Accepting a constraint and not enforcing it is the wrong answer, so only the ones the
         // table checks are kept and the rest are refused until there is somewhere to put them.
         for query in [
-            "CREATE TABLE t (a INT CHECK (a > 0))",
             "CREATE TABLE t (a INT REFERENCES u (b))",
-            "CREATE TABLE t (a INT, CHECK (a > 0))",
             "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES u (b))",
         ] {
             let error = parse_ast(query).unwrap_err().to_string();
