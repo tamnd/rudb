@@ -58,20 +58,18 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
         ("list_has_all", [Value::List { values, .. }, Value::List { values: wanted, .. }]) => {
             has_any_missing(values, wanted).map(|missing| Value::Boolean(!missing))
         }
-        ("list_distinct", [Value::List { values, .. }]) => {
-            distinct(values).and_then(|kept| list(kept))
-        }
+        ("list_distinct", [Value::List { values, .. }]) => distinct(values).and_then(&list),
         ("list_unique", [Value::List { values, .. }]) => {
             distinct(values).map(|kept| Value::UBigInt(kept.len() as u64))
         }
         ("list_intersect", [Value::List { values, .. }, Value::List { values: other, .. }]) => {
-            intersect(values, other).and_then(|kept| list(kept))
+            intersect(values, other).and_then(&list)
         }
         ("list_where", [Value::List { values, .. }, Value::List { values: mask, .. }]) => {
-            masked(values, mask).and_then(|kept| list(kept))
+            masked(values, mask).and_then(&list)
         }
         ("list_select", [Value::List { values, .. }, Value::List { values: indexes, .. }]) => {
-            selected(values, indexes).and_then(|kept| list(kept))
+            selected(values, indexes).and_then(&list)
         }
         ("list_sort", [Value::List { values, .. }, spelled @ ..]) => {
             let order = spelled.first().map(spelled_order).transpose();
