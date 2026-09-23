@@ -363,7 +363,7 @@ impl Exchange {
         self.flush(&mut local)?;
         self.absorb(&mut local.table)?;
         for (at, run) in local.pairs.iter_mut().enumerate() {
-            if !run.rows.is_empty() {
+            if !run.is_empty() {
                 let run = std::mem::take(run);
                 self.pairs[at].lock().map_err(poisoned)?.runs.push(run);
             }

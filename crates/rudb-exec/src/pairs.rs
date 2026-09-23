@@ -152,9 +152,26 @@ pub(crate) fn group_hash(group: i32, valid: bool) -> u32 {
 }
 
 /// One instance's rows for one radix partition.
+///
+/// The rows are held in chunks of [`CHUNK`] rather than in one vector, and the reason is what a
+/// vector that doubles leaves behind. Every instance has [`PARTITIONS`] runs and they all grow at
+/// about the same pace, so each size a run passes through is freed by all of them at about the same
+/// time and asked for by none of them again. The allocator keeps what was freed, and on
+/// `COUNT(DISTINCT UserID) GROUP BY RegionID` over ten million rows that was as much again as the
+/// runs themselves: 71MB live and 131MB resident. A chunk is one size for every run, so the one a
+/// compaction frees is the next one any run of that instance asks for, and what a run holds past its
+/// rows is at most one chunk rather than up to its whole length.
 #[derive(Debug, Default)]
 pub(crate) struct Run {
-    pub(crate) rows: Vec<Record>,
+    /// The chunks already filled, every one of them [`CHUNK`] rows.
+    full: Vec<Vec<Record>>,
+    /// The chunk being filled. The first grows the way a vector does, so that a run of a query with
+    /// a handful of rows does not take a whole chunk for them, and every one after it is asked for
+    /// whole.
+    tail: Vec<Record>,
+    /// How many rows the run takes before it is deduplicated. Zero until the first compaction, which
+    /// reads as [`COMPACT_FROM`].
+    limit: usize,
     /// Empty while every group key in this run is valid.
     pub(crate) validity: Vec<bool>,
 }
@@ -162,16 +179,20 @@ pub(crate) struct Run {
 /// How long a run gets before a full one is deduplicated rather than grown.
 ///
 /// Small enough that the table the deduplication builds sits in cache, and large enough that a run
-/// of a query with few rows never pays for it at all.
+/// of a query with few rows never pays for it at all. A multiple of [`CHUNK`], because a run only
+/// looks at its length when a chunk fills.
 const COMPACT_FROM: usize = 4_096;
+
+/// The rows in one chunk of a [`Run`], sixteen kilobytes of them.
+const CHUNK: usize = 1_024;
 
 impl Run {
     #[inline]
     pub(crate) fn push(&mut self, row: Record, valid: bool) {
-        if self.rows.len() == self.rows.capacity() && self.rows.len() >= COMPACT_FROM {
-            self.compact();
+        if self.tail.len() == self.tail.capacity() {
+            self.turn();
         }
-        self.rows.push(row);
+        self.tail.push(row);
         if self.validity.is_empty() {
             if valid {
                 // No invalid key has reached this run yet, so there is nothing for a vector to say.
@@ -181,9 +202,49 @@ impl Run {
             // this one was valid. The length is taken after the push and one is taken off it, so
             // that a run whose very first row is the invalid one still gets a vector rather than
             // being left with an empty one that reads as all valid.
-            self.validity = vec![true; self.rows.len() - 1];
+            self.validity = vec![true; self.len() - 1];
         }
         self.validity.push(valid);
+    }
+
+    /// Makes room for one more row once the tail is full: the first chunk grows until it is a whole
+    /// one, a whole one is put with the others, and a run at its limit is deduplicated first.
+    #[cold]
+    #[inline(never)]
+    fn turn(&mut self) {
+        if self.tail.len() < CHUNK {
+            self.tail.reserve(1);
+            return;
+        }
+        self.full.push(std::mem::take(&mut self.tail));
+        if self.len() >= self.limit.max(COMPACT_FROM) {
+            self.compact();
+        }
+        if self.tail.len() == CHUNK {
+            self.full.push(std::mem::take(&mut self.tail));
+        }
+        if self.tail.capacity() == 0 {
+            self.tail = Vec::with_capacity(CHUNK);
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.full.len() * CHUNK + self.tail.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The row at `at`, counting across the chunks.
+    #[cfg(test)]
+    fn at(&self, at: usize) -> Record {
+        self.chunks().flatten().nth(at).copied().expect("a row")
+    }
+
+    /// The chunks in order, which between them are every row.
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &[Record]> {
+        self.full.iter().map(Vec::as_slice).chain(std::iter::once(self.tail.as_slice()))
     }
 
     /// Throws away the rows that repeat a pair already in the run, keeping the first of each.
@@ -192,24 +253,25 @@ impl Run {
     /// distinct count held sixteen bytes for every row it read. `COUNT(DISTINCT UserID) GROUP BY
     /// RegionID` on ten million rows has a million and a half distinct pairs, and it held three
     /// hundred megabytes against DuckDB's hundred and fifty, nearly all of it rows the finishing
-    /// pass was going to throw away. Deduplicating a run when it is full, rather than doubling it,
+    /// pass was going to throw away. Deduplicating a run when it is full, rather than growing it,
     /// keeps what it holds near the pairs it has seen instead of the rows.
     ///
-    /// It only ever runs when the vector is full, so it costs a pass over what the run holds once
-    /// per capacity. When it frees less than half, the vector doubles on the push after it, which
-    /// is what it would have done anyway, and the next pass waits for the new capacity, so a run of
-    /// pairs that never repeat pays for a deduplication once per doubling and no more.
-    #[cold]
-    #[inline(never)]
+    /// It only ever runs when the run reaches its limit, so it costs a pass over what the run holds
+    /// once per limit. When it frees less than a quarter, the limit doubles, which is what a vector
+    /// would have done anyway, so a run of pairs that never repeat pays for a deduplication once per
+    /// doubling and no more.
+    ///
+    /// It is called with every row in `full` and the tail empty, and leaves the last chunk it kept
+    /// as the tail.
     fn compact(&mut self) {
-        let len = self.rows.len();
+        let len = self.full.len() * CHUNK;
         let capacity = len.saturating_mul(2).next_power_of_two();
         let mask = capacity - 1;
         let mut buckets = vec![EMPTY; capacity];
         let all_valid = self.validity.is_empty();
         let mut kept = 0;
         for at in 0..len {
-            let row = self.rows[at];
+            let row = self.full[at / CHUNK][at % CHUNK];
             let valid = all_valid || self.validity[at];
             let mut slot = row.pair_hash as usize & mask;
             loop {
@@ -217,30 +279,33 @@ impl Run {
                 if held == EMPTY {
                     // `kept` is at most `at`, so the row lands on a slot this loop has already read.
                     buckets[slot] = kept as u32;
-                    self.rows[kept] = row;
+                    self.full[kept / CHUNK][kept % CHUNK] = row;
                     if !all_valid {
                         self.validity[kept] = valid;
                     }
                     kept += 1;
                     break;
                 }
-                let other = self.rows[held as usize];
+                let held = held as usize;
+                let other = self.full[held / CHUNK][held % CHUNK];
                 if other.user == row.user
                     && other.group == row.group
-                    && (all_valid || self.validity[held as usize] == valid)
+                    && (all_valid || self.validity[held] == valid)
                 {
                     break;
                 }
                 slot = (slot + 1) & mask;
             }
         }
-        self.rows.truncate(kept);
+        // The chunks past the rows that were kept go back to the allocator, where they are the size
+        // the next chunk this instance opens will ask for.
+        self.full.truncate(kept.div_ceil(CHUNK));
+        self.tail = self.full.pop().unwrap_or_default();
+        self.tail.truncate(kept - self.full.len() * CHUNK);
         self.validity.truncate(kept);
         // A run that folded away less than a quarter would fill again within a few pushes and be
         // walked again, so it grows instead, and the next compaction waits for twice as many.
-        if kept * 4 > len * 3 {
-            self.rows.reserve(len);
-        }
+        self.limit = if kept * 4 > len * 3 { len * 2 } else { len };
     }
 
     fn valid_at(&self, row: usize) -> bool {
@@ -248,7 +313,9 @@ impl Run {
     }
 
     pub(crate) fn footprint(&self) -> usize {
-        self.rows.capacity() * size_of::<Record>() + self.validity.capacity() * size_of::<bool>()
+        (self.full.len() * CHUNK + self.tail.capacity()) * size_of::<Record>()
+            + self.full.capacity() * size_of::<Vec<Record>>()
+            + self.validity.capacity() * size_of::<bool>()
     }
 }
 
@@ -275,7 +342,7 @@ pub(crate) struct Held {
 
 impl Held {
     pub(crate) fn rows(&self) -> usize {
-        self.runs.iter().map(|run| run.rows.len()).sum()
+        self.runs.iter().map(Run::len).sum()
     }
 }
 
@@ -517,7 +584,7 @@ pub(crate) fn distinct_pairs(
 
     let timing = stage::Timing::start(Stage::Fold);
     for run in &partition.runs {
-        for (source, &row) in run.rows.iter().enumerate() {
+        for (source, &row) in run.chunks().flatten().enumerate() {
             let valid = all_valid || run.valid_at(source);
             let tag = row.pair_hash & tag_mask;
             let mut at = row.pair_hash as usize & pair_mask;
@@ -587,8 +654,8 @@ fn poisoned<T>(_: T) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPACT_FROM, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs, folded,
-        group_hash, group_seed, merged, mix, scatter, scatter_seeded, shift, spread, used,
+        CHUNK, COMPACT_FROM, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs,
+        folded, group_hash, group_seed, merged, mix, scatter, scatter_seeded, shift, spread, used,
     };
 
     /// The fan out the finishing pass picks, and that what it drops is merged rather than lost.
@@ -643,13 +710,34 @@ mod tests {
             let pair_hash = folded(spread(mix(seed, user as u64)));
             run.push(Record { user, group: 7, pair_hash }, valid);
         }
-        assert!(run.rows.capacity() <= COMPACT_FROM * 2, "grew to {}", run.rows.capacity());
+        assert!(run.footprint() <= COMPACT_FROM * 2 * size_of::<Record>() + 4_096, "grew");
         let mut partition = Held { runs: vec![run] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("a pair partition");
         assert_eq!(counted.splits[0].len(), 200);
         let nulls = counted.splits[0].iter().filter(|pair| !pair.valid).count();
         assert_eq!(nulls, 100);
+    }
+
+    /// A run that holds more pairs than one chunk keeps every one of them through its compactions,
+    /// and keeps nothing past its last chunk.
+    #[test]
+    fn a_run_longer_than_a_chunk_keeps_every_pair_across_its_chunks() {
+        let mut run = Run::default();
+        let users = CHUNK * 5 + 17;
+        for round in 0..3 {
+            for user in 0..users as i64 {
+                let seed = group_seed(round % 2, true);
+                let pair_hash = folded(spread(mix(seed, user as u64)));
+                run.push(Record { user, group: round % 2, pair_hash }, true);
+            }
+        }
+        assert!(run.chunks().all(|chunk| !chunk.is_empty()));
+        assert!(run.full.iter().all(|chunk| chunk.len() == CHUNK));
+        let mut partition = Held { runs: vec![run] };
+        let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
+            .expect("a pair partition");
+        assert_eq!(counted.splits[0].len(), users * 2);
     }
 
     /// The null group and the group whose key really is zero are two groups, not one.
@@ -689,11 +777,11 @@ mod tests {
                         user,
                     );
                     let at = |runs: &[Run]| {
-                        runs.iter().position(|run| !run.rows.is_empty()).expect("a row landed")
+                        runs.iter().position(|run| !run.is_empty()).expect("a row landed")
                     };
                     let left = at(&plain);
                     assert_eq!(left, at(&seeded), "{group} {valid} {user}");
-                    assert_eq!(plain[left].rows[0].pair_hash, seeded[left].rows[0].pair_hash);
+                    assert_eq!(plain[left].at(0).pair_hash, seeded[left].at(0).pair_hash);
                     assert_eq!(plain[left].validity, seeded[left].validity);
                 }
             }
