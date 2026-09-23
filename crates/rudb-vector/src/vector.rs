@@ -3852,14 +3852,14 @@ fn span_of(data: &Data, len: usize) -> Option<(i128, i128)> {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
                 $(Data::$variant(values) => {
-                    let mut low = i128::MAX;
-                    let mut high = i128::MIN;
-                    for &value in values.as_slice().iter().take(len) {
-                        let value = i128::from(value);
-                        low = low.min(value);
-                        high = high.max(value);
-                    }
-                    (low <= high).then_some((low, high))
+                    // In the value's own type and one end at a time, which the compiler turns
+                    // into vector compares. Widening each value to `i128` first kept both ends in
+                    // register pairs and made this two percent of a ClickBench load.
+                    let values = values.as_slice();
+                    let values = &values[..len.min(values.len())];
+                    let low = values.iter().copied().min()?;
+                    let high = values.iter().copied().max()?;
+                    Some((i128::from(low), i128::from(high)))
                 })+
                 _ => None,
             }
