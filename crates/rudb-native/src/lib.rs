@@ -13590,6 +13590,55 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn time_frequency_parts() {
+        let n = 10_000_000_u64;
+        let values: Vec<u64> =
+            (0..n).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i >> 3)).collect();
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let mut d = distinct::ExactDistinct::new();
+            for &v in &values {
+                d.insert(v);
+            }
+            eprintln!("distinct {:?} {:?}", d.count(), t.elapsed());
+            let t = std::time::Instant::now();
+            let mut cand = Candidates::default();
+            let mut run = Run::default();
+            for &v in &values {
+                if let Some((b, t2)) = run.push(Some(v)) {
+                    cand.add(b, t2);
+                }
+            }
+            eprintln!("candidates {} {} {:?}", cand.held, cand.decrements, t.elapsed());
+        }
+        let path = path("time-frequency");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::BigInt)])
+                .expect("new file");
+        for part in values.chunks(122_880) {
+            let vector = Vector::flat(
+                LogicalType::BigInt,
+                Data::Int64(part.iter().map(|&v| v as i64).collect::<Vec<_>>().into()),
+            )
+            .expect("big integers");
+            writer.append(&Chunk::new(vec![vector]).expect("one column")).expect("one stripe");
+        }
+        writer.flush_pending().expect("flushed");
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let mut rows = 0_u64;
+            writer.visit_numeric(0, true, |_, _| rows += 1).expect("visit");
+            eprintln!("visit {rows} {:?}", t.elapsed());
+            let t = std::time::Instant::now();
+            let got = writer.numeric_frequency(0).expect("frequency");
+            eprintln!("numeric_frequency {:?} {:?}", got.1, t.elapsed());
+        }
+        drop(writer);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn numeric_frequency_candidates_keep_bounded_row_ordinals() {
         let path = path("frequency-ordinals");
         let mut writer =
