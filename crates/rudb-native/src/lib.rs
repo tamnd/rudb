@@ -4267,6 +4267,15 @@ struct NativeText {
     grams: Option<NativeGrams>,
     /// The payload, read and decoded a block at a time and kept after that.
     blocks: Vec<OnceLock<Result<Vec<u8>>>>,
+    /// The length in characters of every value of a block, worked out the first time `length` asks
+    /// for a value in that block.
+    ///
+    /// Kept instead of the block it was counted out of. `length` reads every row of a column, and
+    /// reading the bytes through [`Self::payload_block`] kept every block it touched, which is every
+    /// distinct value of the column decoded: seven string columns of ClickBench held 13.9 GB to
+    /// answer seven `max(length(...))`. The counts are four bytes a value, so the same scan keeps
+    /// the counts and decodes each block once, the same number of times it did before.
+    char_lens: Vec<OnceLock<Box<[u32]>>>,
     /// How many decoded payload bytes this column keeps before a sweep stops keeping what it reads.
     /// [`TEXT_KEEP_BUDGET`] everywhere but in the test of the ceiling.
     keep_budget: usize,
@@ -4589,6 +4598,51 @@ impl NativeText {
         let Some(slot) = self.blocks.get(block) else { return Ok(None) };
         let bytes = slot.get_or_init(|| self.decode_block(block)).as_ref().map_err(Clone::clone)?;
         Ok(Some(bytes.as_slice()))
+    }
+
+    /// The character length of every value in one block, counted the first time it is asked for.
+    ///
+    /// The block is read out of [`Self::blocks`] where something already kept it and decoded and
+    /// dropped where nothing did, so counting never adds a block to what this column holds. Two
+    /// threads asking for the same block at once both count it and one of the two answers is kept,
+    /// which costs a decode and is cheaper than a lock on every lookup.
+    fn block_chars(&self, block: usize) -> Result<&[u32]> {
+        let slot = self
+            .char_lens
+            .get(block)
+            .ok_or_else(|| invalid("a block past the global dictionary"))?;
+        if let Some(lens) = slot.get() {
+            return Ok(lens);
+        }
+        let decoded;
+        let bytes: &[u8] = match self.blocks.get(block).and_then(OnceLock::get) {
+            Some(Ok(kept)) => kept,
+            _ => {
+                decoded = self.decode_block(block)?;
+                &decoded
+            }
+        };
+        let first = block * TEXT_PAYLOAD_VALUES;
+        let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
+        let ends = self.ends_within(first, last)?;
+        if ends.len() != last - first {
+            return Err(invalid("global dictionary offsets are short"));
+        }
+        let mut lens = Vec::with_capacity(ends.len());
+        let mut start = u64::from(self.start_within(first)?);
+        for &end in &ends {
+            let value = usize::try_from(start)
+                .ok()
+                .zip(usize::try_from(end).ok())
+                .and_then(|(from, to)| bytes.get(from..to))
+                .ok_or_else(|| invalid("global dictionary value is past its block"))?;
+            // A continuation byte of UTF-8 is `0b10xx_xxxx` and every other byte starts a
+            // character, so the bytes that are not continuations are the characters.
+            let characters = value.iter().filter(|byte| (**byte as i8) >= -0x40).count();
+            lens.push(u32::try_from(characters).unwrap_or(u32::MAX));
+            start = end;
+        }
+        Ok(slot.get_or_init(|| lens.into_boxed_slice()))
     }
 
     /// Reads and decodes one block of the payload, without deciding who keeps it.
@@ -4987,6 +5041,26 @@ impl TextSource for NativeText {
         Ok(())
     }
 
+    /// Every length in characters out of the counts kept a block at a time, which is what keeps a
+    /// scan of `length` from holding the column decoded. See [`NativeText::char_lens`].
+    fn chars_lens_at(&self, indices: &[u32], into: &mut Vec<i64>) -> Result<()> {
+        into.reserve(indices.len());
+        for &index in indices {
+            let index = index as usize;
+            // Past the end is no value and so no length, which is what a row at a time read says.
+            if index >= self.values {
+                into.push(0);
+                continue;
+            }
+            let lens = self.block_chars(index / TEXT_PAYLOAD_VALUES)?;
+            let len = lens
+                .get(index % TEXT_PAYLOAD_VALUES)
+                .ok_or_else(|| invalid("global dictionary block holds the wrong value count"))?;
+            into.push(i64::from(*len));
+        }
+        Ok(())
+    }
+
     /// The rest of the block holding `first`, decoded into a buffer that may die with the call.
     ///
     /// A block is the unit this format decodes, so a walk that wants every value is going to decode
@@ -5208,6 +5282,13 @@ impl TextSource for NativeText {
                 .map(Vec::capacity)
                 .sum::<usize>()
             + self.blocks.capacity() * size_of::<OnceLock<Result<Vec<u8>>>>()
+            + self.char_lens.capacity() * size_of::<OnceLock<Box<[u32]>>>()
+            + self
+                .char_lens
+                .iter()
+                .filter_map(OnceLock::get)
+                .map(|lens| lens.len() * size_of::<u32>())
+                .sum::<usize>()
             + self.hashes.capacity() * size_of::<u64>()
             + self.starts.capacity() * size_of::<u64>()
             + self.lengths.capacity() * size_of::<u64>()
@@ -11162,6 +11243,7 @@ fn open_global_dictionary(
             hashes,
             grams,
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
+            char_lens: (0..blocks).map(|_| OnceLock::new()).collect(),
             keep_budget,
             payload_kept: AtomicUsize::new(0),
             swept: (0..blocks).map(|_| AtomicBool::new(false)).collect(),
@@ -15229,6 +15311,58 @@ mod tests {
         assert_eq!(dictionary.footprint(), resting, "reading the synopsis kept a decoded block");
         let again = reader.frequency_prefix(0).expect("a readable synopsis").expect("one");
         assert_eq!(again.entries, prefix.entries);
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// `length` over a stored column keeps a count a value rather than the blocks it counted.
+    ///
+    /// Reading the bytes a row at a time keeps every block it touches, so a scan of `length` over a
+    /// whole column used to end up holding the column decoded. The counts are what is kept now, and
+    /// they have to be the counts of characters rather than bytes, which is why the values here are
+    /// not ASCII.
+    #[test]
+    fn character_lengths_are_counted_without_keeping_the_dictionary_blocks() {
+        let path = path("character-lengths");
+        let spellings = (0..2_500)
+            .map(|index| Value::Varchar(format!("héllo {index:05} {}", "ü".repeat(index % 30))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        let resting = dictionary.footprint();
+        let mut lens = Vec::new();
+        assert!(dictionary.try_chars_lens(&mut lens).expect("counted"), "a stored source counts");
+        let counted = dictionary.footprint() - resting;
+        let blocks = dictionary.len().div_ceil(TEXT_PAYLOAD_VALUES);
+        assert!(
+            counted <= blocks * TEXT_PAYLOAD_VALUES * size_of::<u32>(),
+            "counting kept {counted} bytes, more than a count a value"
+        );
+        let expected = (0..dictionary.len())
+            .map(|code| {
+                let bytes = dictionary.try_bytes_at(code).expect("read").expect("a value");
+                i64::try_from(std::str::from_utf8(bytes).expect("utf-8").chars().count())
+                    .expect("small")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lens, expected, "a count is the number of characters, not of bytes");
+        let mut again = Vec::new();
+        assert!(dictionary.try_chars_lens(&mut again).expect("counted"));
+        assert_eq!(again, lens, "the kept counts answer the second time");
         fs::remove_file(path).expect("remove scratch file");
     }
 

@@ -731,7 +731,23 @@ fn length_of<A: Fn(usize) -> usize>(
     if returns != &LogicalType::BigInt {
         return Ok(None);
     }
-    let mut out = vec![0i64; rows];
+    // A stored column answers the whole vector in one call where it can, the way `strlen` does in
+    // `bytes_of`. That matters more here than there: reading the bytes a row at a time makes a
+    // stored dictionary decode each block a row lands in and keep it for as long as the table is
+    // open, so a scan of `length` over a whole column held every distinct value of it decoded, 13.9
+    // GB for seven string columns of ClickBench. The source keeps the counts instead.
+    let mut out = Vec::new();
+    let whole = match text {
+        Text::Read(vector) if matches!(base, Validity::AllValid) => {
+            vector.try_chars_lens(&mut out)?
+        }
+        _ => false,
+    };
+    if whole {
+        return finish(returns, Data::Int64(out.into()), Validity::AllValid);
+    }
+    out.clear();
+    out.resize(rows, 0);
     let validity = over_valid(rows, base, |index| {
         let bytes = text.bytes(index)?;
         // A character in UTF-8 is one lead byte and some continuation bytes, and a continuation

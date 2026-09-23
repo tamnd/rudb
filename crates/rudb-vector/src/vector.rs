@@ -606,6 +606,26 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         }
         Ok(())
     }
+    /// The length in characters at each of `indices`, appended to `into` in the same order, and
+    /// zero for a position the source does not have.
+    ///
+    /// What `length` asks for, where [`bytes_lens_at`](Self::bytes_lens_at) is what `strlen` asks
+    /// for. Counting characters means looking at the bytes, and the default does that through
+    /// [`bytes_at`](Self::bytes_at), which is right for a source that keeps its values anyway. A
+    /// source that decodes a block to answer `bytes_at` keeps that block for as long as it lives,
+    /// so a scan of `length` over a whole column ends up holding the whole column decoded. Such a
+    /// source overrides this and keeps the counts instead of the bytes.
+    fn chars_lens_at(&self, indices: &[u32], into: &mut Vec<i64>) -> Result<()> {
+        into.reserve(indices.len());
+        for &index in indices {
+            let bytes = self.bytes_at(index as usize)?.unwrap_or_default();
+            // A continuation byte of UTF-8 is `0b10xx_xxxx`, and every other byte starts a
+            // character, so counting the bytes that are not continuations counts the characters.
+            let characters = bytes.iter().filter(|byte| (**byte as i8) >= -0x40).count();
+            into.push(i64::try_from(characters).unwrap_or(i64::MAX));
+        }
+        Ok(())
+    }
     /// Hands `body` the values from `first` up to at most `limit`, and answers where it stopped.
     ///
     /// The point of it is what it does not do, which is keep what it read.
@@ -2463,6 +2483,34 @@ impl Vector {
     ///
     /// Whatever reading the lengths out of storage raises.
     pub fn try_bytes_lens(&self, into: &mut Vec<i64>) -> Result<bool> {
+        self.lens_through(into, |source, indices, into| source.bytes_lens_at(indices, into))
+    }
+
+    /// The character length of every row, in one call to whatever holds the text, when that is
+    /// possible.
+    ///
+    /// The same shapes and the same answer as [`Self::try_bytes_lens`], counting characters rather
+    /// than bytes, which is `length` where that one is `strlen`. It goes through
+    /// [`TextSource::chars_lens_at`] so that a source reading its text out of a file can keep the
+    /// counts rather than the text, which is the difference between a scan of `length` over a
+    /// stored column holding four bytes a distinct value and holding every distinct value decoded.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the text out of storage raises.
+    pub fn try_chars_lens(&self, into: &mut Vec<i64>) -> Result<bool> {
+        self.lens_through(into, |source, indices, into| source.chars_lens_at(indices, into))
+    }
+
+    /// One call to `ask` for every row, over the source this vector reads its text from.
+    ///
+    /// `false` for a vector with nulls or one whose text does not come from a [`TextSource`], for
+    /// the reasons [`Self::try_bytes_lens`] gives.
+    fn lens_through(
+        &self,
+        into: &mut Vec<i64>,
+        ask: impl Fn(&dyn TextSource, &[u32], &mut Vec<i64>) -> Result<()>,
+    ) -> Result<bool> {
         if !matches!(self.validity, Validity::AllValid) {
             return Ok(false);
         }
@@ -2471,13 +2519,13 @@ impl Vector {
             Body::ExternalText { source } => {
                 let Ok(rows) = u32::try_from(self.len) else { return Ok(false) };
                 let indices = (0..rows).collect::<Vec<_>>();
-                source.bytes_lens_at(&indices, into)?;
+                ask(source.as_ref(), &indices, into)?;
                 Ok(true)
             }
             Body::Dictionary { codes, values, .. } => match &values.body {
                 Body::ExternalText { source } if matches!(values.validity, Validity::AllValid) => {
                     let Some(codes) = codes.get(..self.len) else { return Ok(false) };
-                    source.bytes_lens_at(codes, into)?;
+                    ask(source.as_ref(), codes, into)?;
                     Ok(true)
                 }
                 _ => Ok(false),
