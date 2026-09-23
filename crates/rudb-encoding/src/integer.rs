@@ -165,6 +165,31 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
     Ok(values)
 }
 
+/// Decodes selected row positions from a chunk written by [`encode`].
+///
+/// Positions must be sorted and unique. Packed chunks read only the words holding those positions,
+/// and run length chunks walk their run boundaries without expanding the output. Other cascade
+/// shapes use the full decoder and select afterward until they have a point form of their own.
+///
+/// # Errors
+///
+/// As [`decode`], or if a position is outside the chunk or the positions are not strictly
+/// increasing.
+pub fn decode_selected(bytes: &[u8], positions: &[usize]) -> Result<Vec<i64>> {
+    if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::internal("selected integer positions are not sorted and unique"));
+    }
+    let mut reader = Reader::new(bytes);
+    let values = with_decoding(|scratch| decode_selected_chunk(&mut reader, positions, scratch))?;
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding selected values",
+            reader.remaining()
+        )));
+    }
+    Ok(values)
+}
+
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
 ///
 /// A string column holds integer chunks inside its own body, and the reader on that side cannot
@@ -630,6 +655,169 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
             Ok(values)
         }
     }
+}
+
+fn decode_selected_chunk(
+    reader: &mut Reader<'_>,
+    positions: &[usize],
+    scratch: &mut Decoding,
+) -> Result<Vec<i64>> {
+    let Some(&tag) = reader.rest().first() else {
+        return Err(Error::internal("a chunk ended before its encoding tag"));
+    };
+    let kind = Kind::from_tag(tag)?;
+    if !matches!(kind, Kind::Constant | Kind::Packed | Kind::Rle) {
+        let values = decode_chunk(reader, scratch)?;
+        return positions
+            .iter()
+            .map(|&position| {
+                values.get(position).copied().ok_or_else(|| {
+                    Error::internal(format!(
+                        "selected integer position {position} is outside {} values",
+                        values.len()
+                    ))
+                })
+            })
+            .collect();
+    }
+
+    let decoded = Kind::from_tag(reader.u8()?)?;
+    debug_assert_eq!(decoded, kind);
+    let count = reader.u32()? as usize;
+    if positions.last().is_some_and(|&position| position >= count) {
+        return Err(Error::internal(format!(
+            "selected integer position {} is outside {count} values",
+            positions.last().expect("a last position exists")
+        )));
+    }
+    match kind {
+        Kind::Constant => {
+            let value = reader.i64()?;
+            Ok(vec![value; positions.len()])
+        }
+        Kind::Packed => {
+            let mut out = Vec::with_capacity(positions.len());
+            let mut from = 0;
+            let mut done = 0;
+            while done < count {
+                let base = reader.i64()?;
+                let width = reader.u8()? as usize;
+                let wanted = (count - done).min(VALUES);
+                let upto = positions.partition_point(|&position| position < done + wanted);
+                if wanted == VALUES {
+                    let bytes = reader.bytes(bitpack::packed_len::<u64>(width) * 8)?;
+                    for &position in &positions[from..upto] {
+                        let offset = bitpack::unpack_u64_at(bytes, width, position - done)?;
+                        out.push(value_from(offset, base));
+                    }
+                } else {
+                    let bytes = reader.bytes(bitpack::tail_len(wanted, width))?;
+                    for &position in &positions[from..upto] {
+                        let offset = bitpack::tail_at(bytes, width, position - done)?;
+                        out.push(value_from(offset, base));
+                    }
+                }
+                from = upto;
+                done += wanted;
+            }
+            Ok(out)
+        }
+        Kind::Rle => {
+            let run_value_bytes = reader.rest();
+            let mut run_value_reader = Reader::new(run_value_bytes);
+            let run_value_count = skip_chunk(&mut run_value_reader)?;
+            let run_value_len = run_value_reader.used();
+            reader.skip(run_value_len)?;
+            let run_lengths = decode_chunk(reader, scratch)?;
+            if run_value_count != run_lengths.len() {
+                return Err(Error::internal("an RLE chunk has more runs than run lengths"));
+            }
+            let mut wanted_runs = Vec::new();
+            let mut selected_per_run = Vec::new();
+            let mut selected = 0;
+            let mut at = 0usize;
+            for (run, length) in run_lengths.into_iter().enumerate() {
+                let length = usize::try_from(length)
+                    .map_err(|_| Error::internal("a negative RLE run length"))?;
+                let end = at
+                    .checked_add(length)
+                    .filter(|end| *end <= count)
+                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
+                let before = selected;
+                while selected < positions.len() && positions[selected] < end {
+                    if positions[selected] < at {
+                        return Err(Error::internal("selected integer positions went backwards"));
+                    }
+                    selected += 1;
+                }
+                if selected != before {
+                    wanted_runs.push(run);
+                    selected_per_run.push(selected - before);
+                }
+                at = end;
+            }
+            check_count(at, count)?;
+            if selected != positions.len() {
+                return Err(Error::internal("an RLE chunk ended before a selected position"));
+            }
+            let run_values = decode_selected(&run_value_bytes[..run_value_len], &wanted_runs)?;
+            let mut out = Vec::with_capacity(positions.len());
+            for (value, repeat) in run_values.into_iter().zip(selected_per_run) {
+                out.extend(std::iter::repeat_n(value, repeat));
+            }
+            Ok(out)
+        }
+        _ => unreachable!("unsupported kinds used the full decoder"),
+    }
+}
+
+/// Advances over one encoded chunk without materializing its values and returns its row count.
+fn skip_chunk(reader: &mut Reader<'_>) -> Result<usize> {
+    let kind = Kind::from_tag(reader.u8()?)?;
+    let count = reader.u32()? as usize;
+    match kind {
+        Kind::Constant => reader.skip(8)?,
+        Kind::Packed => {
+            let mut done = 0;
+            while done < count {
+                reader.skip(8)?;
+                let width = reader.u8()? as usize;
+                if width > 64 {
+                    return Err(Error::internal(format!(
+                        "a packed integer width of {width} is past 64"
+                    )));
+                }
+                let wanted = (count - done).min(VALUES);
+                let bytes = if wanted == VALUES {
+                    bitpack::packed_len::<u64>(width)
+                        .checked_mul(8)
+                        .ok_or_else(|| Error::internal("packed integer size overflow"))?
+                } else {
+                    bitpack::tail_len(wanted, width)
+                };
+                reader.skip(bytes)?;
+                done += wanted;
+            }
+        }
+        Kind::Delta => {
+            reader.skip(8)?;
+            skip_chunk(reader)?;
+        }
+        Kind::Rle | Kind::Dict => {
+            skip_chunk(reader)?;
+            skip_chunk(reader)?;
+        }
+        Kind::Sparse => {
+            reader.skip(12)?;
+            skip_chunk(reader)?;
+            skip_chunk(reader)?;
+        }
+        Kind::Strided => {
+            reader.skip(16)?;
+            skip_chunk(reader)?;
+        }
+    }
+    Ok(count)
 }
 
 fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
@@ -1220,6 +1408,34 @@ mod tests {
         let described = describe(&bytes).unwrap();
         assert!(described.contains('('), "expected a cascade, got {described}");
         assert_eq!(decode(&bytes).unwrap(), values, "{described}");
+    }
+
+    #[test]
+    fn selected_positions_agree_with_a_full_decode_for_packed_and_run_length_chunks() {
+        let positions = [0, 1, 17, 1023, 1024, 4097, 8191];
+        let packed: Vec<i64> = (0..8192).map(|index| index * 31 % 1_000_003).collect();
+        let mut runs = Vec::new();
+        for run in 0..160i64 {
+            runs.extend(std::iter::repeat_n(run * 13, (run as usize % 71) + 2));
+        }
+        runs.resize(8192, -7);
+
+        for (kind, values) in [(Kind::Packed, packed), (Kind::Rle, runs)] {
+            let bytes = encode_only(kind, &values).unwrap().expect("encoding applies");
+            let selected = decode_selected(&bytes, &positions).unwrap();
+            let expected = positions.iter().map(|&position| values[position]).collect::<Vec<_>>();
+            assert_eq!(selected, expected, "{}", kind.name());
+        }
+    }
+
+    #[test]
+    fn selected_positions_must_be_ordered_and_inside_the_chunk() {
+        let bytes = encode_only(Kind::Packed, &(0..2048).collect::<Vec<_>>())
+            .unwrap()
+            .expect("packed applies");
+        assert!(decode_selected(&bytes, &[7, 7]).is_err());
+        assert!(decode_selected(&bytes, &[8, 3]).is_err());
+        assert!(decode_selected(&bytes, &[2048]).is_err());
     }
 
     #[test]
