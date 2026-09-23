@@ -42,6 +42,27 @@
 //! the floor column of `cargo xtask ablate`: a per query delta smaller than the noise is not a
 //! result, and the only honest way to know the noise is to measure something that cannot have moved.
 //!
+//! A floor query also checks this harness rather than the engine. Its two sides run the same plan, so
+//! its interval should contain zero, and one that does not means the pairing is favouring whichever
+//! side runs first or second and every other row of the table is suspect. That is printed where it
+//! happens.
+//!
+//! # The pair is the unit
+//!
+//! Every repeat keeps both of its timings and the statistics are taken over the differences, rather
+//! than the fastest of each side being taken and one delta made from the two minima. The two halves
+//! of a pair ran a moment apart on the same machine under whatever else that machine was doing, so
+//! most of what a loaded box does to a timing is in both of them and cancels in the difference. Two
+//! minima come from two unrelated moments and carry the whole spread of the machine into the answer.
+//!
+//! This is not a refinement, it is the difference between a run that says something and a run that
+//! does not. The first version of this harness took minima, and on a box at load fifteen where each
+//! arm spread eight to one it could not resolve a hundred percent. Paired, the same kind of data on
+//! the same kind of box resolves ten. So every query gets an interval as well as a delta, and a
+//! query whose interval spans zero is reported as unresolved rather than as a win or a loss. A
+//! harness that cannot tell should say so, because the alternative is a table of signs read off
+//! noise.
+//!
 //! # What is not here
 //!
 //! Anything about answers being equal beyond this run's own check. The byte for byte differential
@@ -60,23 +81,98 @@ use crate::sections::{link_joins, load, queries, say, scratch};
 struct Outcome {
     /// How many joins of the plan read a link. Zero means the query is the floor and not evidence.
     links: usize,
-    /// Milliseconds with the link join available, fastest of the repeats.
-    with: f64,
-    /// Milliseconds with `link_join` disabled, fastest of the repeats.
-    without: f64,
+    /// One pair of milliseconds per repeat: the link join's run and the forced hash join's run.
+    pairs: Vec<(f64, f64)>,
     /// What went wrong, where something did.
     complaint: Option<String>,
     /// Whether the two sides answered the same thing.
     agreed: bool,
 }
 
+/// What the table's last column says about one query.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The link join was faster by more than this run can explain as noise.
+    Won,
+    /// The link join was slower by more than this run can explain as noise.
+    Lost,
+    /// The interval spans zero, so this run does not know which way it went.
+    Unresolved,
+    /// No link join was planned, so the two sides ran the same plan and this row is the noise.
+    Floor,
+}
+
+impl Verdict {
+    /// What the column prints.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Won => "won",
+            Self::Lost => "lost",
+            Self::Unresolved => "inside noise",
+            Self::Floor => "no link, floor",
+        }
+    }
+}
+
 impl Outcome {
-    /// The share of the forced hash join run that the link join takes off, so positive is a win.
+    /// The share of the forced hash join run that the link join took off, one per pair.
+    ///
+    /// Per pair and dimensionless, so a repeat that ran while the machine was busy and a repeat that
+    /// ran while it was not contribute the same kind of number and can be averaged together.
+    fn deltas(&self) -> Vec<f64> {
+        self.pairs
+            .iter()
+            .filter(|(_, without)| *without > 0.0)
+            .map(|(with, without)| (without - with) / without)
+            .collect()
+    }
+
+    /// The mean of those, so positive means the link join won.
     fn delta(&self) -> Option<f64> {
-        if self.without <= 0.0 {
+        let deltas = self.deltas();
+        let count = deltas.len();
+        (count > 0).then(|| deltas.iter().sum::<f64>() / count as f64)
+    }
+
+    /// The ninety five percent interval around that mean, or nothing from a single pair.
+    ///
+    /// One pair has no spread to estimate a width from. Two or three have one and it comes out very
+    /// wide, which is the honest answer rather than a shortcoming: a run of three repeats on a loaded
+    /// machine does not know what happened, and an interval that says so is better than a delta that
+    /// does not.
+    fn interval(&self) -> Option<(f64, f64)> {
+        let deltas = self.deltas();
+        if deltas.len() < 2 {
             return None;
         }
-        Some((self.without - self.with) / self.without)
+        let count = deltas.len() as f64;
+        let mean = deltas.iter().sum::<f64>() / count;
+        let variance =
+            deltas.iter().map(|delta| (delta - mean).powi(2)).sum::<f64>() / (count - 1.0);
+        let error = (variance / count).sqrt() * critical(deltas.len() - 1);
+        Some((mean - error, mean + error))
+    }
+
+    /// Which of the four things this query is, once the interval has been consulted.
+    fn verdict(&self) -> Verdict {
+        if self.links == 0 {
+            return Verdict::Floor;
+        }
+        match self.interval() {
+            Some((low, _)) if low > 0.0 => Verdict::Won,
+            Some((_, high)) if high < 0.0 => Verdict::Lost,
+            _ => Verdict::Unresolved,
+        }
+    }
+
+    /// The middle of the link join's timings, which is the milliseconds column.
+    fn link(&self) -> Option<f64> {
+        middle(&self.pairs.iter().map(|(with, _)| *with).collect::<Vec<_>>())
+    }
+
+    /// The middle of the forced hash join's timings.
+    fn hash(&self) -> Option<f64> {
+        middle(&self.pairs.iter().map(|(_, without)| *without).collect::<Vec<_>>())
     }
 }
 
@@ -105,70 +201,112 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
 
     println!();
     println!("corpus   {}", data.display());
-    println!("repeats  {repeats}, fastest of each taken, the order of the pair alternating");
+    println!("repeats  {repeats}, paired, the order of the pair alternating");
     println!("control  SET disabled_optimizers = 'link_join'");
+    if repeats < 8 {
+        println!(
+            "note     {repeats} pairs is few enough that most intervals will span zero. ask for \
+             twenty or more where the answer matters"
+        );
+    }
     println!();
-    println!("{:<7}{:>8}{:>12}{:>12}{:>10}", "query", "links", "link ms", "hash ms", "delta");
-    println!("{}", "-".repeat(70));
+    println!(
+        "{:<7}{:>8}{:>10}{:>10}{:>9}{:>20}  verdict",
+        "query", "links", "link ms", "hash ms", "delta", "95% interval"
+    );
+    println!("{}", "-".repeat(84));
 
     let mut won = Vec::new();
     let mut lost = Vec::new();
+    let mut unresolved = Vec::new();
     let mut floor = Vec::new();
+    let mut biased = Vec::new();
     let mut wrong = Vec::new();
     let mut refused = Vec::new();
     for (name, sql) in &queries {
         let outcome = one(&database, sql, repeats);
         if let Some(complaint) = &outcome.complaint {
             refused.push((name.clone(), complaint.clone()));
-            println!("{name:<7}{:>8}{:>12}{:>12}{:>10}  refused", "", "", "", "");
+            println!("{name:<7}{:>8}{:>10}{:>10}{:>9}{:>20}  refused", "-", "-", "-", "-", "-");
             continue;
         }
         let delta = outcome.delta();
+        let verdict = outcome.verdict();
         println!(
-            "{name:<7}{:>8}{:>12.1}{:>12.1}{:>10}  {}",
+            "{name:<7}{:>8}{:>10}{:>10}{:>9}{:>20}  {}",
             outcome.links,
-            outcome.with,
-            outcome.without,
+            milliseconds(outcome.link()),
+            milliseconds(outcome.hash()),
             percent(delta),
-            if outcome.links == 0 { "no link, floor" } else { "" }
+            band(outcome.interval()),
+            verdict.label()
         );
         if !outcome.agreed {
             wrong.push(name.clone());
             continue;
         }
         let Some(delta) = delta else { continue };
-        if outcome.links == 0 {
-            floor.push(delta);
-        } else if delta < 0.0 {
-            lost.push((name.clone(), delta));
-        } else {
-            won.push((name.clone(), delta));
+        match verdict {
+            Verdict::Won => won.push((name.clone(), delta)),
+            Verdict::Lost => lost.push((name.clone(), delta)),
+            Verdict::Unresolved => unresolved.push(name.clone()),
+            Verdict::Floor => {
+                floor.push(delta);
+                // The two sides of a floor query ran the same plan, so an interval that misses zero
+                // is this harness leaning rather than the engine moving.
+                if let Some((low, high)) = outcome.interval() {
+                    if low > 0.0 || high < 0.0 {
+                        biased.push((name.clone(), delta));
+                    }
+                }
+            }
         }
     }
-    println!("{}", "-".repeat(70));
+    println!("{}", "-".repeat(84));
     println!(
         "delta is the share of the forced hash join run that the link join takes off, so positive \
          means the link join won"
     );
+    println!(
+        "the verdict is read off the interval and not off the delta, so a query whose interval \
+         spans zero is unresolved however large its delta looks"
+    );
 
-    let band = spread(&floor);
-    if let Some((low, high)) = band {
+    if let Some((low, high)) = spread(&floor) {
         println!(
-            "the queries that planned no link join ran the same plan twice, and they came out \
-             between {} and {}, which is this run's noise",
+            "the queries that planned no link join ran the same plan twice, and their deltas came \
+             out between {} and {}, which is this run's noise",
             percent(Some(low)),
             percent(Some(high))
         );
     }
     println!(
-        "\n{} queries planned a link join, {} of them faster and {} of them slower",
-        won.len() + lost.len(),
+        "\n{} queries planned a link join, {} faster, {} slower and {} this run cannot resolve",
+        won.len() + lost.len() + unresolved.len(),
         won.len(),
-        lost.len()
+        lost.len(),
+        unresolved.len()
     );
     if !lost.is_empty() {
         println!("\nwhere the link join lost, which section 9 calls a planner rule to fix");
         for (name, delta) in &lost {
+            println!("  {name:<5} {}", percent(Some(*delta)));
+        }
+    }
+    if !unresolved.is_empty() {
+        println!(
+            "\nwhere this run does not know, which is more repeats or a quieter machine and not a \
+             result either way: {}",
+            unresolved.join(" ")
+        );
+    }
+    if !biased.is_empty() {
+        println!(
+            "\nthese queries planned no link join, so both their sides ran the same plan, and their \
+             intervals still missed zero. that is this harness favouring one side of the pair and \
+             not the engine, and it makes every other row above doubtful"
+        );
+        for (name, delta) in &biased {
             println!("  {name:<5} {}", percent(Some(*delta)));
         }
     }
@@ -215,40 +353,35 @@ fn one(database: &Database, sql: &str, repeats: usize) -> Outcome {
         Err(complaint) => {
             return Outcome {
                 links: 0,
-                with: 0.0,
-                without: 0.0,
+                pairs: Vec::new(),
                 complaint: Some(complaint),
                 agreed: false,
             };
         }
     };
-    let bare = |complaint| Outcome {
-        links,
-        with: 0.0,
-        without: 0.0,
-        complaint: Some(complaint),
-        agreed: false,
-    };
+    let bare =
+        |complaint| Outcome { links, pairs: Vec::new(), complaint: Some(complaint), agreed: false };
     // The warm up, both ways, before anything is timed.
     for forced in [false, true] {
         if let Err(complaint) = once(database, sql, forced) {
             return bare(complaint);
         }
     }
-    let mut with = f64::INFINITY;
-    let mut without = f64::INFINITY;
+    let mut pairs = Vec::with_capacity(repeats);
     let mut agreed = true;
     for repeat in 0..repeats {
         // The subject first on even repeats and the control first on odd ones.
         let order = if repeat % 2 == 0 { [false, true] } else { [true, false] };
         let mut answers = Vec::new();
+        let mut with = 0.0;
+        let mut without = 0.0;
         for forced in order {
             match once(database, sql, forced) {
                 Ok((rows, taken)) => {
                     if forced {
-                        without = without.min(taken);
+                        without = taken;
                     } else {
-                        with = with.min(taken);
+                        with = taken;
                     }
                     answers.push(rows);
                 }
@@ -258,8 +391,9 @@ fn one(database: &Database, sql: &str, repeats: usize) -> Outcome {
         if answers[0] != answers[1] {
             agreed = false;
         }
+        pairs.push((with, without));
     }
-    Outcome { links, with, without, complaint: None, agreed }
+    Outcome { links, pairs, complaint: None, agreed }
 }
 
 /// One run of one query, with the rule taken away or left alone, as its rows and its milliseconds.
@@ -303,6 +437,43 @@ fn spread(floor: &[f64]) -> Option<(f64, f64)> {
     Some((low, high))
 }
 
+/// The middle value of some timings, or nothing from none of them.
+///
+/// The middle rather than the mean, because one repeat that ran while something else on the machine
+/// woke up moves a mean of five and does not move their middle. An even count takes the upper of the
+/// two in the middle, which is one row of a table being a tenth of a millisecond out and nothing
+/// reads the column arithmetically anyway. The comparison is the delta and the delta is paired.
+fn middle(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    Some(sorted[sorted.len() / 2])
+}
+
+/// The two sided ninety five percent Student t multiplier for `df` degrees of freedom.
+///
+/// A table rather than a computation. The only thing read off the interval is whether it clears
+/// zero, and between a step of this table and the exact value there is far less than the timings
+/// themselves are doing. The rows thin out above thirty because the value has almost stopped moving
+/// by then.
+fn critical(df: usize) -> f64 {
+    const SMALL: [f64; 30] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+        2.052, 2.048, 2.045, 2.042,
+    ];
+    match df {
+        0 => f64::INFINITY,
+        1..=30 => SMALL[df - 1],
+        31..=40 => 2.021,
+        41..=60 => 2.000,
+        61..=120 => 1.980,
+        _ => 1.960,
+    }
+}
+
 /// A delta as the table prints it, or a dash where there was nothing to take one from.
 fn percent(delta: Option<f64>) -> String {
     match delta {
@@ -311,26 +482,82 @@ fn percent(delta: Option<f64>) -> String {
     }
 }
 
+/// An interval as the table prints it, or a dash where there were too few pairs for one.
+fn band(interval: Option<(f64, f64)>) -> String {
+    match interval {
+        Some((low, high)) => format!("{} to {}", percent(Some(low)), percent(Some(high))),
+        None => "-".to_string(),
+    }
+}
+
+/// A timing as the table prints it, or a dash where the query never ran.
+fn milliseconds(taken: Option<f64>) -> String {
+    match taken {
+        Some(taken) => format!("{taken:.1}"),
+        None => "-".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, percent, spread};
+    use super::{Outcome, Verdict, band, critical, middle, percent, spread};
 
-    fn timed(with: f64, without: f64) -> Outcome {
-        Outcome { links: 1, with, without, complaint: None, agreed: true }
+    fn timed(pairs: &[(f64, f64)]) -> Outcome {
+        Outcome { links: 1, pairs: pairs.to_vec(), complaint: None, agreed: true }
     }
 
     #[test]
     fn the_delta_is_the_share_of_the_forced_hash_join_the_link_join_takes_off() {
         // Half the time with the link join, so it takes half of the hash join's run off.
-        let delta = timed(50.0, 100.0).delta().expect("both sides were timed");
+        let delta = timed(&[(50.0, 100.0)]).delta().expect("a pair was timed");
         assert!((delta - 0.5).abs() < 1e-9, "{delta}");
         // A link join that cost something is negative, which is the case the table names by query.
-        assert!(timed(120.0, 100.0).delta().expect("both sides were timed") < 0.0);
+        assert!(timed(&[(120.0, 100.0)]).delta().expect("a pair was timed") < 0.0);
+    }
+
+    #[test]
+    fn the_delta_is_the_mean_of_the_pairs_and_not_of_the_two_middles() {
+        // One busy repeat where both sides were slow and one quiet one where both were fast. Each
+        // pair says the link join took a fifth off, and so does the mean of them. A harness that
+        // took the fastest of each side separately would compare 40 against 200 and say eighty.
+        let delta = timed(&[(200.0, 250.0), (40.0, 50.0)]).delta().expect("two pairs were timed");
+        assert!((delta - 0.2).abs() < 1e-9, "{delta}");
     }
 
     #[test]
     fn a_query_that_never_ran_has_no_delta_rather_than_a_division() {
-        assert_eq!(timed(0.0, 0.0).delta(), None);
+        assert_eq!(timed(&[]).delta(), None);
+        assert_eq!(timed(&[(0.0, 0.0)]).delta(), None);
+    }
+
+    #[test]
+    fn one_pair_has_no_interval_and_so_cannot_be_a_win() {
+        let outcome = timed(&[(50.0, 100.0)]);
+        assert_eq!(outcome.interval(), None);
+        // Fifty percent faster and still unresolved, because nothing here says what the spread was.
+        assert_eq!(outcome.verdict(), Verdict::Unresolved);
+    }
+
+    #[test]
+    fn a_verdict_is_read_off_the_interval_and_not_off_the_delta() {
+        // Four pairs that all agree the link join is about a fifth faster. The interval clears zero.
+        let agreeing = timed(&[(80.0, 100.0), (81.0, 100.0), (79.0, 100.0), (80.0, 100.0)]);
+        assert_eq!(agreeing.verdict(), Verdict::Won);
+        // The same mean out of pairs that disagree wildly, which is a machine and not an engine.
+        let scattered = timed(&[(20.0, 100.0), (140.0, 100.0), (30.0, 100.0), (130.0, 100.0)]);
+        let mean = scattered.delta().expect("four pairs were timed");
+        assert!((mean - 0.2).abs() < 1e-9, "{mean}");
+        assert_eq!(scattered.verdict(), Verdict::Unresolved);
+        // And a loss is the same test with the sign turned around.
+        let losing = timed(&[(125.0, 100.0), (124.0, 100.0), (126.0, 100.0), (125.0, 100.0)]);
+        assert_eq!(losing.verdict(), Verdict::Lost);
+    }
+
+    #[test]
+    fn a_query_with_no_link_join_is_the_floor_however_fast_it_looked() {
+        let mut outcome = timed(&[(80.0, 100.0), (81.0, 100.0), (79.0, 100.0), (80.0, 100.0)]);
+        outcome.links = 0;
+        assert_eq!(outcome.verdict(), Verdict::Floor);
     }
 
     #[test]
@@ -342,9 +569,25 @@ mod tests {
     }
 
     #[test]
+    fn the_middle_of_some_timings_ignores_the_one_repeat_the_machine_ruined() {
+        assert_eq!(middle(&[]), None);
+        assert_eq!(middle(&[10.0, 11.0, 900.0]), Some(11.0));
+    }
+
+    #[test]
+    fn the_t_multiplier_falls_as_the_pairs_pile_up_and_then_stops() {
+        assert!(critical(1) > critical(5));
+        assert!(critical(5) > critical(29));
+        assert!(critical(29) > critical(1000));
+        assert!((critical(1000) - 1.96).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_column_with_nothing_in_it_prints_a_dash_and_not_a_zero() {
         assert_eq!(percent(None), "-");
         assert_eq!(percent(Some(0.0)), "+0.0%");
         assert_eq!(percent(Some(-0.031)), "-3.1%");
+        assert_eq!(band(None), "-");
+        assert_eq!(band(Some((-0.02, 0.14))), "-2.0% to +14.0%");
     }
 }

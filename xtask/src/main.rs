@@ -216,7 +216,10 @@ fn usage() {
     println!("           not are timed too because between them they say what the machine was");
     println!("           doing meanwhile. the cache bytes is the same knob sections takes, and at");
     println!("           scale factor one it is the difference between evidence and no evidence,");
-    println!("           because every parent side of TPC-H fits in the default cache");
+    println!("           because every parent side of TPC-H fits in the default cache. every repeat");
+    println!("           keeps both of its timings and the verdict is read off the interval over");
+    println!("           their differences, so ask for twenty repeats or more: a query whose");
+    println!("           interval spans zero is reported unresolved however large its delta looks");
     println!("  ablate <hits.parquet> [repeats]  the forty three ClickBench queries once with");
     println!("           every statistics rule on and once per rule with that rule off, which is");
     println!("           the per rule table of spec/stats/09-measurement.md section 9.4. the file");
