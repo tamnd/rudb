@@ -188,6 +188,47 @@ fn native_three_aggregate_shape(ast: &Ast) -> Option<(&str, &str, &str, [String;
     Some((table, sum_column, average_column, names))
 }
 
+fn native_single_average_shape(ast: &Ast) -> Option<(&str, &str, String)> {
+    use ast::{Distinct, QueryBody, Source, Statement};
+    use rudb_parse::NONE;
+
+    let [Statement::Query(query_ref)] = ast.statements.as_slice() else { return None };
+    let query = ast.query(*query_ref);
+    if query.ctes.len != 0
+        || query.order_by.len != 0
+        || query.order_by_all
+        || query.limit != NONE
+        || query.offset != NONE
+        || query.limit_percent
+    {
+        return None;
+    }
+    let QueryBody::Select(select_ref) = query.body else { return None };
+    let select = ast.select(select_ref);
+    if select.distinct != Distinct::No
+        || select.filter != NONE
+        || select.group_by.len != 0
+        || select.group_by_all
+        || select.having != NONE
+    {
+        return None;
+    }
+    let [target] = ast.target_list(select.targets) else { return None };
+    let column = native_column_aggregate(ast, target.expr, "avg")?;
+    let [source] = ast.source_list(select.from) else { return None };
+    let Source::Table { name, alias: NONE, columns } = ast.source(*source) else { return None };
+    if name.len != 1 || columns.len != 0 {
+        return None;
+    }
+    let table = ast.name(name).next()?;
+    let name = if target.alias == NONE {
+        format!("avg({column})")
+    } else {
+        ast.string(target.alias).into()
+    };
+    Some((table, column, name))
+}
+
 /// An in process database.
 ///
 /// One catalog, held in memory, with no file behind it. `ATTACH` and the storage format are E2, and
@@ -330,9 +371,11 @@ impl Database {
         let ast = rudb_parse::parse_ast(sql)?;
         let nonzero = native_nonzero_shape(&ast);
         let three = native_three_aggregate_shape(&ast);
+        let average = native_single_average_shape(&ast);
         let Some(table) = nonzero
             .map(|(table, _, _)| table)
             .or_else(|| three.as_ref().map(|(table, _, _, _)| *table))
+            .or_else(|| average.as_ref().map(|(table, _, _)| *table))
         else {
             return Ok(None);
         };
@@ -361,6 +404,27 @@ impl Database {
             return Ok(Some(QueryResult::new(
                 vec![name.to_string()],
                 vec![LogicalType::BigInt],
+                vec![chunk],
+                Memory::unlimited().reservation(),
+            )));
+        }
+        if let Some((_, column, name)) = average {
+            let Some(index) =
+                fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+            else {
+                return Ok(None);
+            };
+            let Some(sums) = native.aggregate_sums(stored_name, &[index])? else {
+                return Ok(None);
+            };
+            let (sum, count) = sums.columns[0];
+            let value =
+                if count == 0 { Value::Null } else { Value::Double(sum as f64 / count as f64) };
+            let vector = Vector::from_values(LogicalType::Double, &[value])?;
+            let chunk = Chunk::new(vec![vector])?;
+            return Ok(Some(QueryResult::new(
+                vec![name],
+                vec![LogicalType::Double],
                 vec![chunk],
                 Memory::unlimited().reservation(),
             )));
@@ -2742,7 +2806,60 @@ mod tests {
 
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
-    use super::{Database, native_nonzero_shape, native_three_aggregate_shape, publish};
+    use super::{
+        Database, native_nonzero_shape, native_single_average_shape, native_three_aggregate_shape,
+        publish,
+    };
+
+    #[test]
+    fn cold_average_shape_accepts_only_a_direct_aggregate() {
+        let parsed = rudb_parse::parse_ast("SELECT AVG(UserID) FROM hits").unwrap();
+        assert_eq!(
+            native_single_average_shape(&parsed),
+            Some(("hits", "UserID", "avg(UserID)".into()))
+        );
+        let aliased = rudb_parse::parse_ast("SELECT AVG(UserID) AS mean_user FROM hits").unwrap();
+        assert_eq!(
+            native_single_average_shape(&aliased),
+            Some(("hits", "UserID", "mean_user".into()))
+        );
+        for sql in [
+            "SELECT AVG(UserID) FROM hits WHERE UserID > 0",
+            "SELECT AVG(DISTINCT UserID) FROM hits",
+            "SELECT AVG(UserID + 1) FROM hits",
+            "SELECT AVG(UserID) FROM hits LIMIT 1",
+            "SELECT AVG(UserID) FROM hits GROUP BY RegionID",
+        ] {
+            let parsed = rudb_parse::parse_ast(sql).unwrap();
+            assert_eq!(native_single_average_shape(&parsed), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cold_average_matches_regular_execution_for_bigints_and_nulls() {
+        let path = std::env::temp_dir().join(format!("rudb-q4-{}.rdb", std::process::id()));
+        let name = path.to_str().unwrap();
+        let database = Database::open(name).unwrap();
+        database.execute("CREATE TABLE hits (UserID BIGINT)").unwrap();
+        database
+            .execute("INSERT INTO hits VALUES (2414420660257356000), (2534231104689841000), (NULL)")
+            .unwrap();
+        database.execute("CREATE TABLE empty_hits (UserID BIGINT)").unwrap();
+        database.execute("CREATE TABLE null_hits (UserID BIGINT)").unwrap();
+        database.execute("INSERT INTO null_hits VALUES (NULL)").unwrap();
+        let cases = [
+            "SELECT AVG(UserID) FROM hits",
+            "SELECT AVG(UserID) FROM empty_hits",
+            "SELECT AVG(UserID) FROM null_hits",
+        ];
+        let expected = cases.map(|sql| database.query(sql).unwrap().rows().collect::<Vec<_>>());
+        drop(database);
+        for (sql, expected) in cases.into_iter().zip(expected) {
+            let actual = Database::query_native_once(name, sql).unwrap().unwrap();
+            assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn cold_three_aggregate_shape_accepts_only_the_certified_query() {
