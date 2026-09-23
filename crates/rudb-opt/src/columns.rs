@@ -51,6 +51,7 @@ impl Pass for UnusedColumns {
 
     fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
         prune(plan);
+        forward(plan);
         Ok(())
     }
 }
@@ -166,6 +167,104 @@ fn narrow(
             moved.insert(index, positions(wanted, held));
         }
         _ => {}
+    }
+}
+
+/// Takes out every interior projection that only hands columns of its input on.
+///
+/// Pruning leaves a projection holding what is read of it, and over a view that is very often a list
+/// of plain column references: `SELECT count(DISTINCT UserID) FROM hits` over a view that selects
+/// `*` from a table arrives as an aggregate over `[#0.3 AS UserID]` over the scan. The projection
+/// computes nothing, and it is not free either, because every rule that answers from what a table
+/// stores looks for the aggregate or the filter directly over the scan and finds a projection
+/// there instead. Measured on a ten million row native table on server3, that one query took 0.09
+/// seconds and 10 MiB with the table named directly and 1.10 seconds and 133 MiB through `SELECT *`.
+///
+/// Such a projection goes, and whatever read its column `i` reads the column its `i`th expression
+/// named instead. A chain of them resolves to the column at the bottom.
+///
+/// Only where both neighbours are known to bind rather than count positions: the input is a scan,
+/// or a filter over one, and the operator above is one of the few that read their input through
+/// bindings alone. A decorrelated subquery and a late materialisation both read the layout of the
+/// operator under them in ways a binding does not show, and taking the projection out from under
+/// either of those answered wrongly, so they keep it. A sort, a limit and a top N keep it too,
+/// because late materialisation puts exactly this projection under a top N on purpose, and taking
+/// it out again on the next round is a plan that never settles.
+pub fn forward(plan: &mut Plan) {
+    let order = top_down(plan);
+    let untouched = untouched(plan, &order);
+    let mut above: HashMap<NodeRef, NodeRef> = HashMap::new();
+    for &node in &order {
+        for child in plan.node(node).children().into_iter().flatten() {
+            above.insert(child, node);
+        }
+    }
+    let mut forwarded: HashMap<u32, Vec<ColumnBinding>> = HashMap::new();
+    // Bottom up, so that a projection over one that goes is judged by what is under both.
+    let mut spliced = Vec::new();
+    let mut gone: HashMap<NodeRef, NodeRef> = HashMap::new();
+    for &node in order.iter().rev() {
+        let Node::Project { input, index, exprs, .. } = *plan.node(node) else { continue };
+        let under = gone.get(&input).copied().unwrap_or(input);
+        if untouched.contains(&node) || !scanned(plan, under) {
+            continue;
+        }
+        let Some(&parent) = above.get(&node) else { continue };
+        if !matches!(
+            plan.node(parent),
+            Node::Aggregate { .. } | Node::Filter { .. } | Node::Project { .. }
+        ) {
+            continue;
+        }
+        let bindings: Option<Vec<ColumnBinding>> = plan
+            .expr_list(exprs)
+            .iter()
+            .map(|&expr| match *plan.expr(expr) {
+                Expr::Column(binding) => Some(binding),
+                _ => None,
+            })
+            .collect();
+        let Some(bindings) = bindings else { continue };
+        forwarded.insert(index, bindings);
+        gone.insert(node, under);
+        spliced.push((node, input));
+    }
+    if spliced.is_empty() {
+        return;
+    }
+    let mut found = Found::default();
+    for &node in &order {
+        expressions(plan, node, &mut found);
+    }
+    for &expr in &found.order {
+        let Expr::Column(mut binding) = *plan.expr(expr) else { continue };
+        let mut moved = false;
+        while let Some(to) =
+            forwarded.get(&binding.table).and_then(|columns| columns.get(binding.column as usize))
+        {
+            binding = *to;
+            moved = true;
+        }
+        if moved {
+            plan.rebind(expr, binding);
+        }
+    }
+    // Bottom up, which is the order they were found in, so that a projection over another one
+    // copies the node that already replaced the one under it.
+    for &(node, input) in &spliced {
+        let below = plan.node(input).clone();
+        *plan.node_mut(node) = below;
+    }
+}
+
+/// Whether `node` is a scan, or a filter over one.
+fn scanned(plan: &Plan, node: NodeRef) -> bool {
+    match *plan.node(node) {
+        Node::Get { .. } | Node::TableFunction { .. } => true,
+        Node::Filter { input, .. } => {
+            matches!(plan.node(input), Node::Get { .. } | Node::TableFunction { .. })
+        }
+        _ => false,
     }
 }
 
