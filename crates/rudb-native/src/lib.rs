@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -3355,6 +3356,13 @@ const TEXT_RANK_BLOCK: usize = 512;
 /// and the codes.
 const RANK_BLOCK_HEADER: usize = size_of::<u64>() + 1;
 
+thread_local! {
+    /// A dictionary sweep decodes thousands of payload blocks on each worker.
+    /// The stored bytes are overwritten by every read, so keeping this buffer avoids clearing and
+    /// allocating another one for every block without retaining decoded dictionary values.
+    static TEXT_READ_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 impl NativeText {
     /// One block of the payload, read and decoded the first time anything asks for a value in it.
     ///
@@ -3374,28 +3382,28 @@ impl NativeText {
     /// of the whole dictionary must not do. Both call this and they differ in nothing else.
     fn decode_block(&self, block: usize) -> Result<Vec<u8>> {
         let len = self.lengths[block];
-        let mut stored = vec![
-            0;
-            usize::try_from(len).map_err(|_| invalid(
-                "global dictionary block does not fit in memory"
-            ))?
-        ];
-        read_at(&self.file, self.starts[block], &mut stored)?;
-        if checksum(&stored) != self.hashes[block] {
-            return Err(invalid("global dictionary payload checksum differs"));
-        }
-        let first = block * TEXT_PAYLOAD_VALUES;
-        let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
-        let want = self.end_within(last - 1)? as usize;
-        let values = string::decode_flat(&stored)?;
-        if values.len() != last - first {
-            return Err(invalid("global dictionary block holds the wrong value count"));
-        }
-        let bytes = values.into_bytes();
-        if bytes.len() != want {
-            return Err(invalid("global dictionary block decodes to the wrong length"));
-        }
-        Ok(bytes)
+        let len = usize::try_from(len)
+            .map_err(|_| invalid("global dictionary block does not fit in memory"))?;
+        TEXT_READ_BUFFER.with(|buffer| {
+            let mut stored = buffer.borrow_mut();
+            stored.resize(len, 0);
+            read_at(&self.file, self.starts[block], &mut stored)?;
+            if checksum(&stored) != self.hashes[block] {
+                return Err(invalid("global dictionary payload checksum differs"));
+            }
+            let first = block * TEXT_PAYLOAD_VALUES;
+            let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
+            let want = self.end_within(last - 1)? as usize;
+            let values = string::decode_flat(&stored)?;
+            if values.len() != last - first {
+                return Err(invalid("global dictionary block holds the wrong value count"));
+            }
+            let bytes = values.into_bytes();
+            if bytes.len() != want {
+                return Err(invalid("global dictionary block decodes to the wrong length"));
+            }
+            Ok(bytes)
+        })
     }
 
     /// How many single offset reads make [`Self::value_ends`] worth building.
