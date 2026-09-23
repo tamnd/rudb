@@ -67,6 +67,20 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             ExitCode::FAILURE
         }
         Action::Run(options) => {
+            if options.readonly
+                && options.stop_after_commands
+                && options.sets.is_empty()
+                && options.metrics.is_none()
+                && !options.fallbacks
+                && !options.echo
+                && let [Command::Sql(sql)] = options.commands.as_slice()
+                && !sql.starts_with('.')
+                && let Ok(Some(result)) = Database::query_native_once(&options.database, sql)
+            {
+                let mut out = out;
+                let _ = write!(out, "{}", format::render(&result, &options.settings));
+                return ExitCode::SUCCESS;
+            }
             // The library decides what a database name means, here and behind `.open`, so there is
             // one rule about it rather than a copy of the rule in the shell.
             let config = Config::default().with_read_only(options.readonly);
