@@ -247,3 +247,39 @@ fn a_key_wider_than_the_small_map_still_counts_every_row_once() {
         .expect("counts the groups that did not get three rows");
     assert_eq!(uneven, Value::BigInt(0), "every key holds exactly three of the rows");
 }
+
+/// A small group by on a timestamp key, which the table stores wider than the rows arrive in.
+///
+/// A few hundred groups sit in a table small enough to be probed a row at a time, and a timestamp
+/// is kept as a 128 bit value there while each chunk hands it over as 64 bit microseconds. The
+/// comparison between the two widths is the part this watches: got wrong, a group splits in two
+/// and the count of groups comes out high.
+#[test]
+fn a_timestamp_key_in_a_small_table_groups_every_row_once() {
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("SET threads = 4").expect("sets the thread count");
+    connection
+        .execute(
+            "CREATE TABLE t AS SELECT TIMESTAMP '2013-07-14 00:00:00' + INTERVAL (i % 300) MINUTE \
+             AS m, i AS v FROM range(0, 200000) AS r(i)",
+        )
+        .expect("builds the table");
+    let grouped =
+        connection.value("SELECT COUNT(*) FROM (SELECT m FROM t GROUP BY m)").expect("groups");
+    assert_eq!(grouped, Value::BigInt(300));
+    let counted = connection
+        .value("SELECT SUM(c) FROM (SELECT m, COUNT(*) AS c FROM t GROUP BY m)")
+        .expect("counts");
+    assert_eq!(counted, Value::HugeInt(200_000));
+    let one = connection
+        .value("SELECT COUNT(*) FROM t WHERE m = TIMESTAMP '2013-07-14 00:07:00'")
+        .expect("counts one minute");
+    let grouped_one = connection
+        .value(
+            "SELECT c FROM (SELECT m, COUNT(*) AS c FROM t GROUP BY m) \
+             WHERE m = TIMESTAMP '2013-07-14 00:07:00'",
+        )
+        .expect("counts one group");
+    assert_eq!(grouped_one, one);
+}
