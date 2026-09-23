@@ -199,15 +199,29 @@ struct Combined {
     chunks: Vec<Chunk>,
     /// One entry a row, pointing into `chunks`.
     rows: Keyed,
-    /// Where each instance's rows start in `rows`, which on the normalized arm are in order within
-    /// each instance already, because an instance sorts its own before it combines.
-    runs: Vec<usize>,
+    /// Each instance's rows on the normalized arm, sorted by that instance before it combined, and
+    /// how far along `chunks` that instance's chunks start.
+    ///
+    /// Kept as the instances handed them over rather than appended to `rows`. The instances run out
+    /// of input at about the same time and combine under one lock, so copying each one's rows in
+    /// there had them waiting on each other: on the sorted SF1 `lineitem` CTAS that was 1640 of
+    /// about 22,000 samples of the busy threads spent waiting for the lock. The merge reads the
+    /// runs where they are, and only a sort that spilled lays them end to end.
+    sorted: Vec<(u32, Vec<Normalized>)>,
 }
 
 impl Combined {
     /// Nothing held, with rows of the same arm as `rows`.
     fn empty(rows: &Keyed) -> Self {
-        Self { chunks: Vec::new(), rows: rows.empty(), runs: Vec::new() }
+        Self { chunks: Vec::new(), rows: rows.empty(), sorted: Vec::new() }
+    }
+
+    /// Every row in `rows`, with the instances' sorted runs appended there too.
+    fn laid(mut self) -> Result<(Vec<Chunk>, Keyed)> {
+        for (base, run) in self.sorted {
+            self.rows.absorb(Keyed::Normal(run), base)?;
+        }
+        Ok((self.chunks, self.rows))
     }
 }
 
@@ -401,7 +415,7 @@ impl Sort {
             keys,
             types: input.types(),
             memory: memory.clone(),
-            gathered: Mutex::new(Combined { chunks: Vec::new(), rows, runs: Vec::new() }),
+            gathered: Mutex::new(Combined { chunks: Vec::new(), rows, sorted: Vec::new() }),
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
             runs: Mutex::new(Vec::new()),
@@ -528,7 +542,7 @@ impl Sink for Sort {
         };
         self.instances.fetch_add(1, Atomic::Relaxed);
         Gathered {
-            held: Combined { chunks: Vec::new(), rows, runs: Vec::new() },
+            held: Combined { chunks: Vec::new(), rows, sorted: Vec::new() },
             scratch: self.exprs.scratch(),
             charged: self.memory.reservation(),
             place: Place::default(),
@@ -616,16 +630,17 @@ impl Sink for Sort {
         // instances combine in does not decide anything, since every row carries where it arrived
         // and the comparison falls back to that when the keys tie.
         let base = u32::try_from(gathered.chunks.len()).map_err(|_| too_many())?;
-        let start = gathered.rows.len();
-        gathered.runs.push(start);
-        gathered.rows.absorb(local.held.rows, base)?;
+        match local.held.rows {
+            Keyed::Normal(rows) => gathered.sorted.push((base, rows)),
+            valued @ Keyed::Valued(_) => gathered.rows.absorb(valued, base)?,
+        }
         gathered.chunks.extend(local.held.chunks);
         self.charged.lock().map_err(poisoned)?.push(local.charged);
         Ok(())
     }
 
     fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
-        let Combined { chunks, mut rows, runs } = {
+        let combined = {
             let mut gathered = self.gathered.lock().map_err(poisoned)?;
             let empty = Combined::empty(&gathered.rows);
             std::mem::replace(&mut *gathered, empty)
@@ -635,6 +650,7 @@ impl Sink for Sort {
         let mut charged = std::mem::take(&mut *self.charged.lock().map_err(poisoned)?);
         let mut files = std::mem::take(&mut *self.runs.lock().map_err(poisoned)?);
         if !files.is_empty() {
+            let (chunks, rows) = combined.laid()?;
             // Something spilled, so what is left here is the last batch and it becomes the last
             // run. No chunks are built and nothing is held: the answer is produced by the merge as
             // the rows are read, which is the whole point and is why this returns before the path
@@ -644,12 +660,17 @@ impl Sink for Sort {
             }
             return self.out.merge(files, self.types.clone());
         }
-        let total = rows.len();
+        let Combined { chunks, mut rows, sorted } = combined;
+        let total = rows.len() + sorted.iter().map(|(_, run)| run.len()).sum::<usize>();
         if u32::try_from(total).is_err() {
             return Err(too_many());
         }
         let order = match &rows {
-            Keyed::Normal(normal) => merged(normal, &runs, &starts(&chunks), threads)?,
+            Keyed::Normal(_) => {
+                let runs: Vec<(u32, &[Normalized])> =
+                    sorted.iter().map(|(base, run)| (*base, run.as_slice())).collect();
+                merged(&runs, total, &starts(&chunks), threads)?
+            }
             Keyed::Valued(_) => {
                 rows.sort(&self.keys)?;
                 order(&chunks, &rows)?
@@ -657,8 +678,10 @@ impl Sink for Sort {
         };
         // The rows have said everything they had to say. Holding them through the assembly is
         // holding a key and an arrival a row for the sake of a number that is already in `order`.
-        let taken = rows.footprint();
+        let taken = rows.footprint()
+            + u64::try_from(total - rows.len()).unwrap_or(u64::MAX).saturating_mul(NORMALIZED);
         drop(rows);
+        drop(sorted);
         give(&mut charged, taken);
         let inverse = placed(&order, threads)?;
         let order = Placing { order: &order, inverse: inverse.as_deref() };
@@ -720,22 +743,20 @@ fn starts(chunks: &[Chunk]) -> Vec<usize> {
 ///
 /// If a row points outside the chunks it came from.
 fn merged(
-    rows: &[Normalized],
-    runs: &[usize],
+    runs: &[(u32, &[Normalized])],
+    total: usize,
     starts: &[usize],
     threads: &Lease<'_>,
 ) -> Result<Vec<usize>> {
-    let ends = runs.iter().skip(1).copied().chain(std::iter::once(rows.len()));
-    let runs: Vec<&[Normalized]> = runs
-        .iter()
-        .zip(ends)
-        .filter_map(|(&start, end)| rows.get(start..end))
-        .filter(|run| !run.is_empty())
-        .collect();
-    let at = |row: &Normalized| -> Result<usize> {
+    let bases: Vec<u32> =
+        runs.iter().filter(|(_, run)| !run.is_empty()).map(|&(base, _)| base).collect();
+    let runs: Vec<&[Normalized]> =
+        runs.iter().map(|&(_, run)| run).filter(|run| !run.is_empty()).collect();
+    // A row's chunk is its instance's, so it moves along by where that instance's chunks start.
+    let at = |base: u32, row: &Normalized| -> Result<usize> {
         let (chunk, row) = row.2;
         starts
-            .get(chunk as usize)
+            .get(chunk.saturating_add(base) as usize)
             .map(|start| start + row as usize)
             .ok_or_else(|| Error::internal("a sorted row pointing outside the chunks it came from"))
     };
@@ -749,7 +770,7 @@ fn merged(
     // because the sample is spread over every run in proportion to its length.
     let mut sample: Vec<&Normalized> = Vec::new();
     for run in &runs {
-        let take = (run.len() * SAMPLE * parts / rows.len().max(1)).clamp(1, run.len());
+        let take = (run.len() * SAMPLE * parts / total.max(1)).clamp(1, run.len());
         sample.extend((0..take).filter_map(|index| run.get(index * run.len() / take)));
     }
     sample.sort_unstable_by(|left, right| first(left, right));
@@ -769,7 +790,7 @@ fn merged(
             })
             .collect();
     let parts = splitters.len() + 1;
-    let mut out = vec![0usize; rows.len()];
+    let mut out = vec![0usize; total];
     let mut slots: Vec<Mutex<&mut [usize]>> = Vec::with_capacity(parts);
     let mut rest: &mut [usize] = &mut out;
     for part in 0..parts {
@@ -781,15 +802,16 @@ fn merged(
     in_parallel(threads, parts, degree, "merged sorted part", |part| {
         let slot = slots.get(part).ok_or_else(|| Error::internal("a merged part past the end"))?;
         let mut into = slot.lock().map_err(poisoned)?;
-        let pieces: Vec<&[Normalized]> = runs
+        let pieces: Vec<(u32, &[Normalized])> = runs
             .iter()
+            .zip(&bases)
             .zip(&cuts)
-            .filter_map(|(run, cut)| run.get(cut[part]..cut[part + 1]))
-            .filter(|piece| !piece.is_empty())
+            .filter_map(|((run, &base), cut)| Some((base, run.get(cut[part]..cut[part + 1])?)))
+            .filter(|(_, piece)| !piece.is_empty())
             .collect();
-        if let [piece] = pieces.as_slice() {
+        if let [(base, piece)] = pieces.as_slice() {
             for (slot, row) in into.iter_mut().zip(piece.iter()) {
-                *slot = at(row)?;
+                *slot = at(*base, row)?;
             }
             return Ok(());
         }
@@ -798,16 +820,20 @@ fn merged(
         let mut heads: std::collections::BinaryHeap<Head<'_>> = pieces
             .iter()
             .enumerate()
-            .filter_map(|(piece, rows)| rows.first().map(|row| Head { row, piece, index: 0 }))
+            .filter_map(|(piece, (_, rows))| rows.first().map(|row| Head { row, piece, index: 0 }))
             .collect();
         let mut written = 0;
         while let Some(Head { row, piece, index }) = heads.pop() {
             let slot = into
                 .get_mut(written)
                 .ok_or_else(|| Error::internal("a merged part longer than its cut"))?;
-            *slot = at(row)?;
+            let (base, rows) = pieces
+                .get(piece)
+                .copied()
+                .ok_or_else(|| Error::internal("a merged piece past the end"))?;
+            *slot = at(base, row)?;
             written += 1;
-            if let Some(next) = pieces.get(piece).and_then(|rows| rows.get(index + 1)) {
+            if let Some(next) = rows.get(index + 1) {
                 heads.push(Head { row: next, piece, index: index + 1 });
             }
         }
@@ -1265,25 +1291,25 @@ mod tests {
             ] {
                 let total: usize = lengths.iter().sum();
                 let keys = shuffled(total);
-                // Every run is its own chunk, so where a row reads from is its chunk's start plus
-                // its row, and the chunk starts are the run starts.
-                let (mut rows, mut runs, mut starts) = (Vec::new(), Vec::new(), Vec::new());
+                // Every run is its own instance with one chunk, which its rows call chunk 0 and
+                // which sits along the chunks at the run's base. So where a row reads from is that
+                // chunk's start plus its row, and the chunk starts are the run starts.
+                let (mut runs, mut starts) = (Vec::new(), Vec::new());
                 let mut at = 0;
                 for (chunk, &length) in lengths.iter().enumerate() {
-                    runs.push(rows.len());
                     starts.push(at);
                     let mut run: Vec<Normalized> = (0..length)
                         .map(|row| {
                             let (key, arrival) = keys[at + row];
                             let mut normal = [0; WIDTH];
                             normal[..8].copy_from_slice(&key.to_be_bytes());
-                            (normal, (arrival, 0), (chunk as u32, row as u32))
+                            (normal, (arrival, 0), (0, row as u32))
                         })
                         .collect();
                     run.sort_unstable_by(|left, right| {
                         left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
                     });
-                    rows.extend(run);
+                    runs.push((chunk as u32, run));
                     at += length;
                 }
                 let mut expected: Vec<(u64, u64, usize)> = keys
@@ -1294,7 +1320,9 @@ mod tests {
                 expected.sort_unstable();
                 let expected: Vec<usize> =
                     expected.into_iter().map(|(_, _, index)| index).collect();
-                let got = merged(&rows, &runs, &starts, &threads).expect("merged");
+                let runs: Vec<(u32, &[Normalized])> =
+                    runs.iter().map(|(base, run)| (*base, run.as_slice())).collect();
+                let got = merged(&runs, total, &starts, &threads).expect("merged");
                 assert_eq!(got, expected, "runs of {lengths:?} on {} threads", threads.degree());
             }
         }
