@@ -7410,12 +7410,12 @@ fn a_join_a_certificate_says_changes_nothing_is_deleted_and_the_row_counts_agree
     assert_eq!(rows(&db, partial), vec![vec![Value::BigInt(10000)]], "the stray row is dropped");
 
     // And the outer join over the total relationship is an inner join, which is a cheaper operator
-    // answering the same question. The parent's column is read here, so the join stays and only
-    // its kind changes.
-    let outer = "SELECT count(c_name) FROM orders LEFT JOIN customer ON o_custkey = c_custkey";
+    // answering the same question. The parent's column is read here, and read for its value rather
+    // than counted, so the join stays and only its kind changes.
+    let outer = "SELECT max(c_name) FROM orders LEFT JOIN customer ON o_custkey = c_custkey";
     let plan = explained(outer);
     assert!(plan.contains("Join INNER"), "nothing was padded, so nothing was preserved:\n{plan}");
-    assert_eq!(rows(&db, outer), vec![vec![Value::BigInt(10000)]]);
+    assert_eq!(rows(&db, outer), vec![vec![Value::Varchar("c999".into())]]);
     // The one that is not total keeps its left join, and the difference in the answer is the row
     // the left join pads and the inner join would have dropped.
     let partial_outer = "SELECT count(*) FROM returns LEFT JOIN customer ON r_custkey = c_custkey";

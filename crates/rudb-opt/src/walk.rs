@@ -231,6 +231,37 @@ pub(crate) fn fresh_index(plan: &Plan) -> u32 {
     next
 }
 
+/// The scan of `index` under `at`, through the operators that cannot put a null in a column.
+///
+/// A filter drops rows, an inner join drops them and repeats them, and a cross product repeats
+/// them. None of the three changes what is in a column of a row it kept, so a value that came out of
+/// the base table before one of them came out of it after. Everything else stops the walk, and a
+/// projection stops it because the column it produces is its own.
+///
+/// Two passes ask this, for the two things that follow from it. [`crate::eliminate`] wants a key
+/// that is still the base table's key, so that a certificate about the base table is a certificate
+/// about the rows the join sees. [`crate::estimate::never_null`] wants a value that is still the
+/// base table's value, so that a null count the file wrote is a null count of what a predicate up
+/// here is reading.
+///
+/// An outer join stops the walk for both of them, and for a different reason each. The side it pads
+/// comes out holding nulls the base table does not have, which is the null count's problem. The side
+/// it preserves comes out holding as many copies of a row as the other side had matches, which is
+/// the key's problem. Neither caller is served by a walk that goes past one, so neither side of one
+/// is walked.
+pub(crate) fn scan_of(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
+    match *plan.node(at) {
+        Node::Get { index: found, .. } if found == index => Some(at),
+        Node::Filter { input, .. } => scan_of(plan, input, index),
+        Node::Join { left, right, kind: JoinKind::Inner, .. }
+        | Node::LinkJoin { child: left, parent: right, kind: JoinKind::Inner, .. }
+        | Node::CrossProduct { left, right } => {
+            scan_of(plan, left, index).or_else(|| scan_of(plan, right, index))
+        }
+        _ => None,
+    }
+}
+
 /// Rewrites the operands of one expression, rebuilding it only if one of them moved.
 ///
 /// One level deep, and `child` decides whether to go further. The two callers want different

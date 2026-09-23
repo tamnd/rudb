@@ -83,14 +83,24 @@ impl Pass for JoinElimination {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        if context.links().is_empty() || !context.allows(Rule::JoinElimination) {
-            return Ok(());
-        }
-        let consumers = consumers(plan);
-        for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
-            rewrite(plan, node, &consumers, context);
-        }
+        sweep(plan, context);
         Ok(())
+    }
+}
+
+/// One look at every join, deleting or narrowing the ones a certificate says change nothing.
+///
+/// Asked for again by [`crate::nonulls`], which runs after this and can be the thing that makes a
+/// join eliminable: a `count(x)` it turns into a `count(*)` may have been the only reader of the
+/// parent side. Without the second look, the plan that comes out of one run of the sequence is one
+/// more run away from settling, and `spec/09-optimizer.md` section 9.1 asks that it not be.
+pub(crate) fn sweep(plan: &mut Plan, context: &Context) {
+    if context.links().is_empty() || !context.allows(Rule::JoinElimination) {
+        return;
+    }
+    let consumers = consumers(plan);
+    for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        rewrite(plan, node, &consumers, context);
     }
 }
 
@@ -138,12 +148,20 @@ fn rewrite(plan: &mut Plan, at: NodeRef, consumers: &[Option<NodeRef>], context:
     }
 }
 
-/// Points whatever read the join at the join's child instead.
+/// Points whatever read a node at one of the node's children instead.
 ///
-/// The join node is left behind rather than removed, because a plan is an arena and a node nothing
-/// points at is a node nothing runs. Taking it out would renumber every node above it, and the
-/// numbering is what every other pass in this walk is holding.
-fn stand_in(plan: &mut Plan, at: NodeRef, child: NodeRef, consumers: &[Option<NodeRef>]) {
+/// The node is left behind rather than removed, because a plan is an arena and a node nothing points
+/// at is a node nothing runs. Taking it out would renumber every node above it, and the numbering is
+/// what every other pass in this walk is holding.
+///
+/// Shared with [`crate::nonulls`], which does the same thing to a filter whose predicate it just
+/// proved is always true.
+pub(crate) fn stand_in(
+    plan: &mut Plan,
+    at: NodeRef,
+    child: NodeRef,
+    consumers: &[Option<NodeRef>],
+) {
     let Some(above) = consumers.get(at as usize).copied().flatten() else {
         if plan.root() == at {
             plan.set_root(child);
@@ -184,7 +202,7 @@ fn verified(
             (true, false) => [keys[1], keys[0]],
             _ => return false,
         };
-    let Some(scan) = scan_of(plan, child, child_key.table) else {
+    let Some(scan) = walk::scan_of(plan, child, child_key.table) else {
         return false;
     };
     let Node::Get { table: child_name, columns: child_columns, .. } = *plan.node(scan) else {
@@ -252,25 +270,6 @@ fn mark(plan: &Plan, at: NodeRef, inside: &mut [bool]) {
     }
     for child in plan.node(at).children().into_iter().flatten() {
         mark(plan, child, inside);
-    }
-}
-
-/// The scan of `index` under `at`, through the operators that cannot put a null in a column.
-///
-/// A filter drops rows, an inner join drops them and repeats them, and a cross product repeats
-/// them. None of the three changes what is in a column of a row it kept, so a key that was a key of
-/// the base table before one of them is still one after. Everything else stops the walk, an outer
-/// join because it pads, and a projection because the column it produces is its own.
-fn scan_of(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
-    match *plan.node(at) {
-        Node::Get { index: found, .. } if found == index => Some(at),
-        Node::Filter { input, .. } => scan_of(plan, input, index),
-        Node::Join { left, right, kind: JoinKind::Inner, .. }
-        | Node::LinkJoin { child: left, parent: right, kind: JoinKind::Inner, .. }
-        | Node::CrossProduct { left, right } => {
-            scan_of(plan, left, index).or_else(|| scan_of(plan, right, index))
-        }
-        _ => None,
     }
 }
 
