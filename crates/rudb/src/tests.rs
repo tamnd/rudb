@@ -8348,6 +8348,82 @@ fn a_boolean_column_casts_to_a_number_as_a_zero_or_a_one() {
 }
 
 #[test]
+fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
+    let db = database();
+    let row = |sql: &str| rows(&db, sql)[0][0].to_string();
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    let answers = [
+        ("SELECT range(5)", "[0, 1, 2, 3, 4]"),
+        ("SELECT range(2, 5)", "[2, 3, 4]"),
+        ("SELECT range(10, 2, -3)", "[10, 7, 4]"),
+        ("SELECT range(0, 0)", "[]"),
+        ("SELECT range(5, 1)", "[]"),
+        ("SELECT range(5, 1, -1)", "[5, 4, 3, 2]"),
+        ("SELECT range(1, 5, 0)", "[]"),
+        ("SELECT range(-3)", "[]"),
+        ("SELECT range(1, 6, 2)", "[1, 3, 5]"),
+        ("SELECT typeof(range(5))", "BIGINT[]"),
+        ("SELECT range(NULL)", "NULL"),
+        ("SELECT range(1, NULL)", "NULL"),
+        ("SELECT generate_series(5)", "[0, 1, 2, 3, 4, 5]"),
+        ("SELECT generate_series(2, 5)", "[2, 3, 4, 5]"),
+        ("SELECT generate_series(10, 2, -3)", "[10, 7, 4]"),
+        ("SELECT generate_series(5, 1, -1)", "[5, 4, 3, 2, 1]"),
+        ("SELECT generate_series(1, 5, 0)", "[]"),
+        ("SELECT generate_series(1, 6, 2)", "[1, 3, 5]"),
+        ("SELECT range(9223372036854775807 - 1, 9223372036854775807)", "[9223372036854775806]"),
+        (
+            "SELECT generate_series(9223372036854775806, 9223372036854775807)",
+            "[9223372036854775806, 9223372036854775807]",
+        ),
+        ("SELECT range(-9223372036854775807, -9223372036854775808, -1)", "[-9223372036854775807]"),
+        (
+            "SELECT range(DATE '2020-01-01', DATE '2020-01-04', INTERVAL 1 DAY)",
+            "[2020-01-01 00:00:00, 2020-01-02 00:00:00, 2020-01-03 00:00:00]",
+        ),
+        (
+            "SELECT generate_series(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 6 HOUR)",
+            "[2020-01-01 00:00:00, 2020-01-01 06:00:00, 2020-01-01 12:00:00, \
+             2020-01-01 18:00:00, 2020-01-02 00:00:00]",
+        ),
+        (
+            "SELECT typeof(range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 6 HOUR))",
+            "TIMESTAMP[]",
+        ),
+        ("SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 0 HOUR)", "[]"),
+        (
+            "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-03-01', INTERVAL '1 month 1 day')",
+            "[2020-01-01 00:00:00, 2020-02-02 00:00:00]",
+        ),
+    ];
+    for (sql, answer) in answers {
+        assert_eq!(row(sql), answer, "{sql}");
+    }
+    assert_eq!(
+        error("SELECT range(0, 100000000000)"),
+        "Invalid Input Error: Lists larger than 2^32 elements are not supported"
+    );
+    assert_eq!(
+        error(
+            "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-03-01', INTERVAL '1 month -1 day')"
+        ),
+        "Invalid Input Error: Interval with mix of negative/positive entries not supported"
+    );
+    let refused = error("SELECT range(1.5)");
+    assert!(refused.contains("\"range\"(col0 BIGINT) -> BIGINT[]"), "{refused}");
+    // Over a column the series is built for each row, and the table function of the same name is
+    // still what a FROM clause gets.
+    db.execute("CREATE TABLE ends AS SELECT * FROM (VALUES (1, 3), (2, NULL), (3, 0)) v(id, e)")
+        .expect("created");
+    let column: Vec<String> = rows(&db, "SELECT generate_series(e) FROM ends ORDER BY id")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert_eq!(column, ["[0, 1, 2, 3]", "NULL", "[0]"]);
+    assert_eq!(row("SELECT count(*) FROM range(4)"), "4");
+}
+
+#[test]
 fn list_grade_up_and_contains_answer_the_way_the_pin_does() {
     let db = database();
     let row = |sql: &str| rows(&db, sql)[0][0].to_string();

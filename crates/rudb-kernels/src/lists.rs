@@ -25,6 +25,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Buffer, Data, Live, Validity, Vector, interleave};
 
 use crate::compare::order;
+use crate::datetime;
 use crate::number::integral;
 
 /// What the pin says when the mask of `list_where` or the indexes of `list_select` hold a null.
@@ -84,6 +85,7 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
+        ("range" | "generate_series", _) => ranged(name == "generate_series", args).and_then(list),
         ("list_grade_up", [Value::List { values, .. }, spelled @ ..]) => {
             let order = spelled.first().map(spelled_order).transpose();
             let nulls = spelled.get(1).map(spelled_nulls).transpose();
@@ -122,6 +124,102 @@ fn listed(values: Vec<Value>, returns: &LogicalType) -> Result<Value> {
         return Err(Error::internal(format!("a list function returning {returns}")));
     };
     Ok(Value::List { element: (**element).clone(), values })
+}
+
+/// `range` and `generate_series` as scalars: the series from the start toward the stop as a list.
+///
+/// `generate_series` takes the stop when a step lands on it and `range` stops short of it. One
+/// argument is the stop, with a start of zero and a step of one. A step of zero, or one that points
+/// away from the stop, is an empty list rather than an error, which is the pin's answer.
+fn ranged(inclusive: bool, args: &[Value]) -> Result<Vec<Value>> {
+    if let [start, stop, Value::Interval { months, days, micros }] = args {
+        return stepped(inclusive, start, stop, (*months, *days, *micros));
+    }
+    let whole = |value: &Value| {
+        integral(value)
+            .and_then(|held| i64::try_from(held).ok())
+            .ok_or_else(|| Error::internal(format!("a range over a {}", value.logical_type())))
+    };
+    let (start, stop, step) = match args {
+        [stop] => (0, whole(stop)?, 1),
+        [start, stop] => (whole(start)?, whole(stop)?, 1),
+        [start, stop, step] => (whole(start)?, whole(stop)?, whole(step)?),
+        _ => return Err(Error::internal(format!("a range over {} arguments", args.len()))),
+    };
+    let count = series_length(start, stop, step, inclusive)?;
+    // Every value is between the start and the stop, both of which are BIGINTs, so none of these
+    // can leave the type.
+    let mut at = start;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(Value::BigInt(at));
+        at = at.wrapping_add(step);
+    }
+    Ok(values)
+}
+
+/// How many values an integer series has, counted wide so the gap between the two ends of BIGINT
+/// does not overflow.
+fn series_length(start: i64, stop: i64, step: i64, inclusive: bool) -> Result<usize> {
+    if step == 0 || (start > stop && step > 0) || (start < stop && step < 0) {
+        return Ok(0);
+    }
+    let apart = (i128::from(stop) - i128::from(start)).unsigned_abs();
+    let by = i128::from(step).unsigned_abs();
+    let mut count = apart / by;
+    if inclusive || apart % by != 0 {
+        count += 1;
+    }
+    usize::try_from(count).ok().filter(|&count| count <= MAX_SERIES).ok_or_else(too_long)
+}
+
+/// A series of moments, each one the last with the interval added, which is how the pin steps and
+/// why a step of a month from the thirty first lands where adding a month would.
+fn stepped(
+    inclusive: bool,
+    start: &Value,
+    stop: &Value,
+    (months, days, micros): (i32, i32, i64),
+) -> Result<Vec<Value>> {
+    let forward = months > 0 || days > 0 || micros > 0;
+    let backward = months < 0 || days < 0 || micros < 0;
+    if forward && backward {
+        return Err(Error::invalid_input(
+            "Interval with mix of negative/positive entries not supported",
+        ));
+    }
+    let moment = |value: &Value| match value {
+        Value::Timestamp(stamp) | Value::TimestampTz(stamp) => Ok(*stamp),
+        other => Err(Error::internal(format!("a range from a {}", other.logical_type()))),
+    };
+    let end = moment(stop)?;
+    let step = Value::Interval { months, days, micros };
+    let mut values = Vec::new();
+    let mut at = start.clone();
+    if !forward && !backward {
+        return Ok(values);
+    }
+    loop {
+        let stamp = moment(&at)?;
+        let past = if forward { stamp > end } else { stamp < end };
+        if past || (stamp == end && !inclusive) {
+            return Ok(values);
+        }
+        if values.len() == MAX_SERIES {
+            return Err(too_long());
+        }
+        let next = datetime::shift(&at, &step, false)?;
+        values.push(at);
+        at = next;
+    }
+}
+
+/// The longest list the pin builds for a series, which is the most entries a list can hold.
+const MAX_SERIES: usize = u32::MAX as usize;
+
+/// The pin's refusal of a series longer than [`MAX_SERIES`].
+fn too_long() -> Error {
+    Error::invalid_input("Lists larger than 2^32 elements are not supported")
 }
 
 /// Whether two values are the same value, with a null the same as another null.
