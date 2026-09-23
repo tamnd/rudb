@@ -3837,6 +3837,9 @@ struct NativeText {
     /// starts at zero by construction. Relative to the block rather than to the payload, because a
     /// reader decodes a whole block and slices it, so an offset into the payload is a number it
     /// would have to subtract a base from anyway.
+    ///
+    /// The vector is the index as it was read, so the offsets start after the header, and
+    /// [`Self::packed`] is where they are read from.
     offsets: Vec<u8>,
     /// Bits one offset is packed at, which is what the largest block of this column spans and is the
     /// same for every block of it.
@@ -4242,7 +4245,7 @@ impl NativeText {
     fn unpack_ends(&self) -> Option<Vec<u32>> {
         let mut ends = vec![0u32; self.values];
         for (run, into) in ends.chunks_mut(TEXT_OFFSET_RUN).enumerate() {
-            let bytes = self.offsets.get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)?;
+            let bytes = self.packed().get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)?;
             bitpack::unpack_tail_into(bytes, self.offset_bits, into, |bits| {
                 u32::try_from(bits).unwrap_or(u32::MAX)
             })
@@ -4251,6 +4254,11 @@ impl NativeText {
         // An end that did not fit was stored as the sentinel, and a real one cannot reach it because
         // a payload block is far smaller than four gigabytes. So the column keeps the packed reader.
         if ends.contains(&u32::MAX) { None } else { Some(ends) }
+    }
+
+    /// The packed offsets, which is the index past its header.
+    fn packed(&self) -> &[u8] {
+        self.offsets.get(DICTIONARY_HEADER..).unwrap_or_default()
     }
 
     /// Where the value at `index` ends inside its payload block.
@@ -4263,7 +4271,7 @@ impl NativeText {
         }
         let run = index / TEXT_OFFSET_RUN;
         let bytes = self
-            .offsets
+            .packed()
             .get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)
             .ok_or_else(|| invalid("global dictionary offsets are short"))?;
         let end = bitpack::tail_at(bytes, self.offset_bits, index % TEXT_OFFSET_RUN)
@@ -4297,7 +4305,7 @@ impl NativeText {
             let stop = ((run + 1) * TEXT_OFFSET_RUN).min(last);
             let held = self.values.saturating_sub(run * TEXT_OFFSET_RUN).min(TEXT_OFFSET_RUN);
             let bytes = self
-                .offsets
+                .packed()
                 .get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)
                 .ok_or_else(|| invalid("global dictionary offsets are short"))?;
             let from = at % TEXT_OFFSET_RUN;
@@ -4351,7 +4359,7 @@ impl NativeText {
         } else {
             let run = index / TEXT_OFFSET_RUN;
             let bytes = self
-                .offsets
+                .packed()
                 .get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)
                 .ok_or_else(|| invalid("global dictionary offsets are short"))?;
             let (start, end) = bitpack::tail_pair(bytes, self.offset_bits, within)
@@ -10447,7 +10455,6 @@ fn open_global_dictionary(
     if checksum(&index) != page.hash {
         return Err(invalid("global dictionary index checksum differs"));
     }
-    let offsets = index[DICTIONARY_HEADER..DICTIONARY_HEADER + offset_len].to_vec();
     let word_end = index_len - usize::from(has_grams) * 8;
     let gram_hash = has_grams
         .then(|| u64::from_le_bytes(index[word_end..index_len].try_into().expect("eight bytes")));
@@ -10484,6 +10491,11 @@ fn open_global_dictionary(
         hash,
         verdicts: Mutex::new(Vec::new()),
     });
+    // The offsets stay where they were read, behind the header, rather than being copied out. On a
+    // dictionary of millions of values they are megabytes, and a copy is as many fresh pages to
+    // fault in again on a query that may want a handful of strings.
+    let mut offsets = index;
+    offsets.truncate(DICTIONARY_HEADER + offset_len);
     let hashes = words.split_off(blocks * (payload_words - 1));
     let (starts, lengths) = if scattered {
         let mut starts = Vec::with_capacity(blocks);
