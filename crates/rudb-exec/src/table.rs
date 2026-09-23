@@ -3924,10 +3924,11 @@ mod tests {
         assert_eq!(places[2] - places[0], 2);
         let mut held = Vec::new();
         coded.hold(&mut held);
+        let null_place = coded.combos() - 1;
         let nothing = [integers(&[None, None])];
         let over = coded_within(&nothing, 2, &held, Some(&mut values)).expect("read by value");
         assert!(over.same_as(&held));
-        assert_eq!(placed(&over, 2), [coded.combos() - 1; 2]);
+        assert_eq!(placed(&over, 2), [null_place; 2]);
     }
 
     /// Values further apart than the map allows are hashed, and so is a pair of columns whose
