@@ -72,6 +72,7 @@ mod vm;
 use rudb_common::{Error, Result};
 
 use crate::compile::Program;
+use crate::parse::{Assertion, Ast};
 
 /// The letters DuckDB accepts after the pattern.
 ///
@@ -120,6 +121,8 @@ impl Options {
 #[derive(Debug, Clone)]
 pub struct Regex {
     program: Program,
+    /// The pattern less a trailing `.*$`, where it has one, and whether that dot takes a newline.
+    head: Option<(Program, bool)>,
 }
 
 impl Regex {
@@ -143,7 +146,11 @@ impl Regex {
         } else {
             parse::parse(pattern, options.case_insensitive, options.dot_matches_newline)?
         };
-        Ok(Self { program: compile::compile(&ast, groups)? })
+        let head = match trailing_rest(&ast) {
+            Some((head, newline)) => Some((compile::compile(&head, groups)?, newline)),
+            None => None,
+        };
+        Ok(Self { program: compile::compile(&ast, groups)?, head })
     }
 
     /// How many capturing groups the pattern has, not counting the whole match.
@@ -174,15 +181,24 @@ impl Regex {
         self.search(text, 0, true).is_some()
     }
 
-    /// Runs whichever machine suits the size of the problem.
+    /// Finds the first match, through [`run`].
     ///
-    /// This is the only place the choice is made and it is made on size alone, because the two
-    /// machines give the same answer and differ only in what they spend to get it.
+    /// A pattern that ends in `.*$` is first run without it. The tail reads nothing but the rest of
+    /// the text, so it holds exactly where no newline is left, which a byte search answers without
+    /// the machine stepping and memoizing every character of a URL's path. Where the head's own
+    /// answer passes that check it is the whole pattern's answer too: the head's match comes first
+    /// in priority among the head's matches, and the whole pattern's first is the first of those
+    /// the tail accepts. Where it does not, the whole pattern runs as it would have.
     fn search(&self, text: &str, start: usize, whole: bool) -> Option<Vec<Option<usize>>> {
-        if bitstate::fits(&self.program, text) {
-            return bitstate::search(&self.program, text, start, whole);
+        if let (Some((head, newline)), false) = (&self.head, whole) {
+            let mut slots = run(head, text, start, false)?;
+            let end = slots.get(1).copied().flatten()?;
+            if *newline || !text.as_bytes()[end..].contains(&b'\n') {
+                slots[1] = Some(text.len());
+                return Some(slots);
+            }
         }
-        vm::search(&self.program, text, start, whole)
+        run(&self.program, text, start, whole)
     }
 
     /// The text of one group of the first match, which is `regexp_extract`.
@@ -268,6 +284,33 @@ impl Regex {
         }
         out.push_str(&text[at..]);
     }
+}
+
+/// Runs whichever machine suits the size of the problem.
+///
+/// This is the only place the choice is made and it is made on size alone, because the two machines
+/// give the same answer and differ only in what they spend to get it.
+fn run(program: &Program, text: &str, start: usize, whole: bool) -> Option<Vec<Option<usize>>> {
+    if bitstate::fits(program, text) {
+        return bitstate::search(program, text, start, whole);
+    }
+    vm::search(program, text, start, whole)
+}
+
+/// The pattern before a trailing `.*$`, and whether that dot matches a newline.
+///
+/// Only a top level sequence counts, so the tail follows everything else the pattern does. It has
+/// no group in it, which keeps the capture numbering of what is left the same.
+fn trailing_rest(ast: &Ast) -> Option<(Ast, bool)> {
+    let Ast::Concat(parts) = ast else { return None };
+    let mut kept: Vec<&Ast> = parts.iter().filter(|part| !matches!(part, Ast::Empty)).collect();
+    if !matches!(kept.pop()?, Ast::Assert(Assertion::TextEnd)) {
+        return None;
+    }
+    let Ast::Repeat { inner, least: 0, most: None, .. } = kept.pop()? else { return None };
+    let Ast::Any(newline) = **inner else { return None };
+    // The empty parts are the inline flags and match nothing, so leaving them out changes nothing.
+    Some((Ast::Concat(kept.into_iter().cloned().collect()), newline))
 }
 
 /// Where a match and its groups are, as byte offsets into the text.
@@ -567,6 +610,51 @@ mod tests {
         let found = regex.find_at("aéés", 0).expect("matches");
         assert_eq!((found.start(), found.end()), (1, 5));
         assert_eq!(regex.replace("aéés", "x", false), "axs");
+    }
+
+    /// The head and its byte search have to give every slot the whole pattern gives, including
+    /// where a newline in the rest sends the search back to the whole pattern.
+    #[test]
+    fn a_pattern_ending_in_dot_star_dollar_answers_as_it_would_without_the_shortcut() {
+        let patterns = [
+            "^https?://(?:www\\.)?([^/]+)/.*$",
+            "a(b*).*$",
+            "a.*?$",
+            "(?s)a.*$",
+            "(a|ab)(c|bcd).*$",
+            "x*.*$",
+            "(?i)B.*$",
+        ];
+        let texts = [
+            "",
+            "a",
+            "abbb",
+            "xab\nc",
+            "a\nab",
+            "ab\nabcd",
+            "abcd",
+            "http://www.example.com/a/b",
+            "https://example.com/",
+            "http://example.com",
+            "http://example.com/a\nb",
+            "zzBq",
+        ];
+        for pattern in patterns {
+            let regex = Regex::new(pattern).expect("compiles");
+            assert!(regex.head.is_some(), "{pattern:?} has a tail");
+            for text in texts {
+                for start in 0..=text.len() {
+                    assert_eq!(
+                        regex.search(text, start, false),
+                        run(&regex.program, text, start, false),
+                        "{pattern:?} over {text:?} from {start}"
+                    );
+                }
+            }
+        }
+        assert!(Regex::new("a.*$|b").expect("compiles").head.is_none());
+        assert!(Regex::new("(?m)a.*$").expect("compiles").head.is_none());
+        assert!(Regex::new("a.+$").expect("compiles").head.is_none());
     }
 
     #[test]
