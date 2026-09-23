@@ -473,6 +473,7 @@ dependencies = [
  "rudb-common",
  "rudb-encoding",
  "rudb-graph",
+ "rudb-io",
  "rudb-metrics",
  "rudb-stats",
  "rudb-storage",

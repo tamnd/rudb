@@ -14,6 +14,7 @@ readme.workspace = true
 
 [dependencies]
 rudb-common.workspace = true
+rudb-io.workspace = true
 rudb-encoding.workspace = true
 rudb-graph.workspace = true
 rudb-metrics.workspace = true

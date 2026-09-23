@@ -199,6 +199,15 @@ fn close_workers() -> usize {
 /// the rest of them on the Parquet read, which is still one thread and is the other half of #808.
 const MAX_ENCODE_WORKERS: usize = 32;
 
+/// How much a writer appends before it asks the kernel to start writing it to the device.
+///
+/// Without it every byte of a load waits in the page cache for the sync at the commit, and that
+/// sync was 1.3 to 1.7 s of a ClickBench `hits` 10M load of 8 to 9 s on the 32 core box. With it
+/// the device writes while the load is still encoding. Thirty two megabytes is a few stripes of
+/// `hits`, big enough that the call costs nothing next to the write, and small enough that what
+/// is left for the commit is one stretch.
+const WRITEBACK_STRETCH: u64 = 32 << 20;
+
 /// The most bytes one column of one part may spend on a membership sieve.
 ///
 /// A part is a thousand rows, so a filter sized for every one of them being distinct is about
@@ -1619,6 +1628,8 @@ pub struct Writer {
     /// it read. A writer that asked the file where it was would then write the directory over a
     /// page it had already written, which is what it did.
     at: u64,
+    /// How far into the file the kernel has been asked to start writing, see [`WRITEBACK_STRETCH`].
+    written_back: u64,
     table: Table,
     generation: u64,
     /// The first and the last source position in every stripe, in the order the stripes were
@@ -1839,6 +1850,7 @@ impl Writer {
             // The end of the file, so that the committed generation's catalog stays where its slot
             // says it is and keeps naming a file a reader can still open.
             at: size,
+            written_back: size,
             dictionaries: fields
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
@@ -1897,6 +1909,7 @@ impl Writer {
         Ok(Self {
             file,
             at: HEADER,
+            written_back: HEADER,
             dictionaries: fields
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
@@ -2001,6 +2014,7 @@ impl Writer {
         closed.push(entry);
         Ok(Self {
             file,
+            written_back: at,
             at,
             generation,
             closed,
@@ -2099,6 +2113,10 @@ impl Writer {
             .at
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| invalid("native file length overflow"))?;
+        if self.at - self.written_back >= WRITEBACK_STRETCH {
+            rudb_io::start_writeback(&self.file, self.written_back, self.at - self.written_back);
+            self.written_back = self.at;
+        }
         Ok(())
     }
 
