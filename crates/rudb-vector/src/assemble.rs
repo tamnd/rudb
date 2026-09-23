@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value};
 
-use crate::string::StringView;
+use crate::string::{Arenas, StringView};
 use crate::validity::Validity;
 use crate::vector::{Data, Form, NOWHERE, Vector, copy_of, data_for, empty_data_for, layout_of};
 
@@ -138,7 +138,7 @@ impl Assembly {
             return Err(Error::internal("a flattened vector with no run of data in it"));
         };
         let start = self.data.len();
-        let appended = extend(&mut self.data, from)?;
+        let appended = extend(&mut self.data, from, &mut Arenas::default())?;
         for (slot, &row) in positions.iter().enumerate() {
             let row = row as usize;
             // A piece whose data is empty is the untyped null, so it claims its rows and they are
@@ -247,11 +247,12 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
     // rows that went into it. Growing from empty instead ends at the next power of two, which on a
     // full row group is eight thousand values of slack carried for the life of the table.
     let mut data = data_for(ty, rows)?;
+    let mut arenas = arenas_of(pieces);
     for piece in pieces {
         let from = piece
             .data()
             .ok_or_else(|| Error::internal("a flat vector with no run of data in it"))?;
-        let appended = extend(&mut data, from)?;
+        let appended = extend(&mut data, from, &mut arenas)?;
         if appended != piece.len() {
             return Err(Error::internal(format!(
                 "a piece of {} rows laid {appended} values end to end",
@@ -311,6 +312,7 @@ pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Resul
     }
     // Each piece's validity, taken after it is flattened, because a constant null keeps its null in
     // its value rather than in its mask and a flattened one has it in the mask like any other row.
+    let mut arenas = arenas_of(pieces);
     let mut masks = Vec::with_capacity(pieces.len());
     for piece in pieces {
         // flatten: the gather below reads one run of data, and a piece can arrive dictionary
@@ -318,7 +320,7 @@ pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Resul
         // not copied by it, and one piece is flattened at a time so a column is never held twice.
         let flat = piece.flatten()?;
         let from = flat.data().ok_or_else(|| Error::internal("a flattened vector with no data"))?;
-        let appended = extend(&mut data, from)?;
+        let appended = extend(&mut data, from, &mut arenas)?;
         if appended != piece.len() {
             return Err(Error::internal(format!(
                 "a piece of {} rows laid {appended} values end to end",
@@ -471,12 +473,23 @@ fn straight(at: &[usize]) -> bool {
     at.iter().enumerate().all(|(row, &index)| row == index)
 }
 
+/// The arenas the flat string pieces among `pieces` share, counted before any of them is laid.
+fn arenas_of(pieces: &[Vector]) -> Arenas {
+    let mut arenas = Arenas::default();
+    for piece in pieces {
+        if let Some(Data::Varlen(column)) = piece.data() {
+            arenas.count(column);
+        }
+    }
+    arenas
+}
+
 /// Lays a run of data end to end after another, answering how many values it appended.
 ///
 /// The typed loop per layout is the whole point: an append of a thousand `i64` is one `memcpy` and
-/// an append of a thousand strings is one arena growth and a thousand sixteen byte views, neither of
-/// which touches a `Value`.
-fn extend(into: &mut Data, from: &Data) -> Result<usize> {
+/// an append of a thousand strings is at most one copy of an arena and a thousand sixteen byte views,
+/// neither of which touches a `Value`. `arenas` is what says whether the arena is copied whole.
+fn extend(into: &mut Data, from: &Data, arenas: &mut Arenas) -> Result<usize> {
     macro_rules! extended {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match (&mut *into, from) {
@@ -488,21 +501,9 @@ fn extend(into: &mut Data, from: &Data) -> Result<usize> {
                     Ok(values.len())
                 })+
                 // The one layout where an append is a copy of bytes rather than a copy of fixed
-                // width slots. The arena is grown once for all of them, because a view carries its
-                // length so the total is known before any of the bytes move.
+                // width slots, and the column decides whether that is one copy or one a string.
                 (Data::Varlen(out), Data::Varlen(values)) => {
-                    out.reserve_views(values.len());
-                    out.reserve_bytes(
-                        values
-                            .views()
-                            .iter()
-                            .filter(|view| !view.is_inline())
-                            .map(StringView::len)
-                            .sum(),
-                    );
-                    for index in 0..values.len() {
-                        out.push_from(values, index);
-                    }
+                    out.push_column(values, arenas);
                     Ok(values.len())
                 }
                 (out, from) => Err(Error::internal(format!(
