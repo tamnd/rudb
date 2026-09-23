@@ -90,6 +90,31 @@ pub(crate) struct Frequencies {
 }
 
 impl Frequencies {
+    /// Builds exact aggregate rows supplied by a certified native derived-group synopsis.
+    pub(crate) fn records(schema: Schema, records: Vec<Vec<Value>>) -> Result<Self> {
+        let types = schema.types();
+        let mut chunks = Vec::with_capacity(records.len().div_ceil(VECTOR_SIZE));
+        for records in records.chunks(VECTOR_SIZE) {
+            let mut columns = vec![Vec::with_capacity(records.len()); types.len()];
+            for record in records {
+                if record.len() != types.len() {
+                    return Err(Error::internal("a stored aggregate row has the wrong width"));
+                }
+                for (values, value) in columns.iter_mut().zip(record) {
+                    values.push(value.clone());
+                }
+            }
+            let vectors = columns
+                .into_iter()
+                .zip(&types)
+                .map(|(values, ty)| Vector::from_values(ty.clone(), &values))
+                .collect::<Result<Vec<_>>>()?;
+            chunks.push(Chunk::with_rows(vectors, records.len())?);
+        }
+        let handout = Handout::new(chunks.len());
+        Ok(Self { chunks, handout })
+    }
+
     /// Builds already evaluated multi-column grouped counts.
     pub(crate) fn grouped(schema: Schema, entries: Vec<(Vec<Value>, u64)>) -> Result<Self> {
         let output_types = schema.types();
