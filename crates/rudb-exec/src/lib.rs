@@ -128,6 +128,7 @@ mod table;
 mod topn;
 mod typenames;
 mod window;
+mod writemetrics;
 mod written;
 
 #[cfg(test)]
