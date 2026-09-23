@@ -110,6 +110,23 @@ impl Record {
     }
 }
 
+/// The key of a run of rows whose group is valid, from the seed the run already hashed.
+fn run_key(group: i32, seed: u64) -> Key {
+    Key { group, hash: pairs::folded(seed), valid: true }
+}
+
+/// What a run of rows with no nulls adds to its group.
+fn run_state(count: i64, sum: i64, mean: i64) -> State {
+    State {
+        count,
+        sum: i128::from(sum),
+        sum_seen: true,
+        mean: i128::from(mean),
+        mean_count: count,
+        distinct: 0,
+    }
+}
+
 #[derive(Debug, Default)]
 struct Partition {
     rows: Vec<Record>,
@@ -242,6 +259,9 @@ impl Exchange {
             held_user.cut(rows)?,
         );
         let mut repeat = Repeat::default();
+        if !(null_group || null_sum || null_mean || null_user) && !local.spread {
+            return Self::fold_runs(held_group, held_sum, held_mean, held_user, shift, local);
+        }
         if !(null_group || null_sum || null_mean || null_user) {
             for row in 0..rows {
                 let key = held_group[row] as i32;
@@ -297,6 +317,56 @@ impl Exchange {
             if !(null_user && user.is_null_at(row)) && repeat.fresh(key, held, held_user[row]) {
                 scatter_seeded(&mut local.pairs, shift, seed, key, held, held_user[row]);
             }
+        }
+        Ok(())
+    }
+
+    /// The loop without nulls for an instance still folding into its own table, which folds a run
+    /// of rows with the same group into the table once rather than once a row.
+    ///
+    /// The ClickBench file is sorted on the counter, the date and the user, so a user's rows sit
+    /// together and so does their region: most rows of `GROUP BY RegionID` have the group of the row
+    /// before. Such a row now adds to a total held in registers and neither hashes its group nor
+    /// probes the table, and the run's total is folded in when the group changes. The fold is the
+    /// one the owners use to add up what the instances hand them, so the answer is the one folding a
+    /// row at a time gives.
+    ///
+    /// A run's totals are sums of SMALLINT values over at most one chunk of rows, so they fit in
+    /// sixty four bits, and the fold checks what they are added to the way a row would have.
+    fn fold_runs(
+        held_group: &[i64],
+        held_sum: &[i64],
+        held_mean: &[i64],
+        held_user: &[i64],
+        shift: u32,
+        local: &mut Local,
+    ) -> Result<()> {
+        let mut repeat = Repeat::default();
+        let mut run: Option<(i32, u64)> = None;
+        let (mut count, mut sum, mut mean) = (0_i64, 0_i64, 0_i64);
+        for (row, &group) in held_group.iter().enumerate() {
+            let key = group as i32;
+            let seed = match run {
+                Some((held, seed)) if held == key => seed,
+                _ => {
+                    if let Some((held, seed)) = run {
+                        local.table.fold(run_key(held, seed), &run_state(count, sum, mean))?;
+                    }
+                    (count, sum, mean) = (0, 0, 0);
+                    let seed = pairs::group_seed(key, true);
+                    run = Some((key, seed));
+                    seed
+                }
+            };
+            count += 1;
+            sum += i64::from(held_sum[row] as i16);
+            mean += i64::from(held_mean[row] as i16);
+            if repeat.fresh(key, true, held_user[row]) {
+                scatter_seeded(&mut local.pairs, shift, seed, key, true, held_user[row]);
+            }
+        }
+        if let Some((held, seed)) = run {
+            local.table.fold(run_key(held, seed), &run_state(count, sum, mean))?;
         }
         Ok(())
     }
@@ -722,7 +792,7 @@ mod tests {
 
     use crate::pairs::{Held, PARTITIONS, Run, distinct_pairs, group_hash, scatter, shift};
 
-    use super::{Key, LOCAL_GROUPS, Local, Record, State, Table};
+    use super::{Exchange, Key, LOCAL_GROUPS, Local, Record, State, Table};
 
     #[test]
     fn one_owner_combines_numeric_and_distinct_states() {
@@ -787,6 +857,29 @@ mod tests {
             }
         }
         assert_eq!(emitted(&mut owner, &memory), emitted(&mut straight, &memory));
+    }
+
+    /// Folding a run of rows with one group at once gives what folding them one at a time gives.
+    #[test]
+    fn folding_runs_of_one_group_gives_what_folding_each_row_gives() {
+        let groups = [3_i64, 3, 3, 4, 4, 3, 7, 7, 7, 7, 3];
+        let sums: Vec<i64> = (0..groups.len() as i64).map(|at| at * 3 - 5).collect();
+        let means: Vec<i64> = (0..groups.len() as i64).map(|at| 20 - at).collect();
+        let users = [1_i64, 1, 2, 1, 1, 1, 5, 5, 6, 5, 2];
+        let memory = Memory::unlimited();
+        let mut local = Local::new(&memory);
+        Exchange::fold_runs(&groups, &sums, &means, &users, shift(), &mut local)
+            .expect("the runs fold");
+
+        let all = Record::GROUP | Record::SUM | Record::MEAN;
+        let mut rows: Vec<Record> = (0..groups.len())
+            .map(|at| row(groups[at] as i32, sums[at] as i16, means[at] as i16, all))
+            .collect();
+        let mut straight = Table::new(&memory);
+        straight.add_all(&mut rows).expect("rows enter one table");
+        assert_eq!(emitted(&mut local.table, &memory), emitted(&mut straight, &memory));
+        let pairs: usize = local.pairs.iter().map(Run::len).sum();
+        assert_eq!(pairs, 8, "a pair repeating the row before is not scattered");
     }
 
     /// An instance stops keeping a table of its own once the table is too big to be worth it.
