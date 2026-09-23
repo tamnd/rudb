@@ -42,8 +42,6 @@
 //! than the first, because several symbols share a three byte prefix and taking the first would make
 //! the ratio depend on insertion order.
 
-use std::collections::HashMap;
-
 use rudb_common::{Error, Result};
 
 /// The code that means the next byte is a literal. 255 rather than 0 so that the 255 real codes are
@@ -184,8 +182,9 @@ impl SymbolTable {
     #[must_use]
     pub fn train(samples: &[&[u8]]) -> Self {
         let mut table = Self::empty();
+        let mut counts = Counts::new();
         for _ in 0..GENERATIONS {
-            let mut counts = Counts::new();
+            counts.clear();
             for sample in samples {
                 table.count(sample, &mut counts);
             }
@@ -447,12 +446,27 @@ fn hash_of(word: u64) -> usize {
 /// have yet.
 struct Counts {
     single: Vec<u32>,
-    pairs: HashMap<(u16, u16), u32>,
+    /// Indexed by `first * IDS + second`. Flat rather than hashed because every id is under 512, so
+    /// every pair fits in a quarter million slots, and counting pairs is most of what training does.
+    pairs: Vec<u32>,
+    /// The pair slots that are not zero, so that reading and clearing them costs the pairs seen
+    /// rather than the whole array.
+    seen: Vec<u32>,
 }
+
+/// How many symbol ids there are: 256 codes and 256 escaped bytes.
+const IDS: usize = 512;
 
 impl Counts {
     fn new() -> Self {
-        Self { single: vec![0; 512], pairs: HashMap::new() }
+        Self { single: vec![0; IDS], pairs: vec![0; IDS * IDS], seen: Vec::new() }
+    }
+
+    fn clear(&mut self) {
+        self.single.fill(0);
+        for slot in self.seen.drain(..) {
+            self.pairs[slot as usize] = 0;
+        }
     }
 
     fn one(&mut self, id: u16) {
@@ -460,7 +474,11 @@ impl Counts {
     }
 
     fn two(&mut self, first: u16, second: u16) {
-        *self.pairs.entry((first, second)).or_insert(0) += 1;
+        let slot = first as usize * IDS + second as usize;
+        if self.pairs[slot] == 0 {
+            self.seen.push(slot as u32);
+        }
+        self.pairs[slot] += 1;
     }
 
     /// The 255 best symbols for the next generation.
@@ -470,24 +488,42 @@ impl Counts {
     /// symbols scores as eight and a pair of six byte ones also scores as eight, because that is
     /// what it would be cut down to.
     fn best(&self, table: &SymbolTable) -> Vec<Symbol> {
-        let mut gains: HashMap<Symbol, u64> = HashMap::new();
+        let mut gains: Vec<(Symbol, u64)> = Vec::with_capacity(IDS + self.seen.len());
         for (id, count) in self.single.iter().enumerate() {
             if *count == 0 {
                 continue;
             }
             let symbol = symbol_of(table, id as u16);
-            *gains.entry(symbol).or_insert(0) += u64::from(*count) * symbol.len() as u64;
+            gains.push((symbol, u64::from(*count) * symbol.len() as u64));
         }
-        for ((first, second), count) in &self.pairs {
-            let symbol = symbol_of(table, *first).concat(symbol_of(table, *second));
-            *gains.entry(symbol).or_insert(0) += u64::from(*count) * symbol.len() as u64;
+        for slot in &self.seen {
+            let slot = *slot as usize;
+            let (first, second) = ((slot / IDS) as u16, (slot % IDS) as u16);
+            let symbol = symbol_of(table, first).concat(symbol_of(table, second));
+            gains.push((symbol, u64::from(self.pairs[slot]) * symbol.len() as u64));
         }
-        let mut ranked: Vec<(Symbol, u64)> = gains.into_iter().collect();
+        // Different ids can spell the same symbol, a code and the pair it was learned from for one,
+        // so the gains are summed per symbol before anything is ranked.
+        gains.sort_unstable_by_key(|(symbol, _)| *symbol);
+        gains.dedup_by(|next, kept| {
+            let same = next.0 == kept.0;
+            if same {
+                kept.1 += next.1;
+            }
+            same
+        });
         // Gain first, then the symbol itself, so that two symbols with the same gain come out in the
-        // same order on every host and the table is a function of the sample and nothing else.
-        ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-        ranked.truncate(MAX_SYMBOLS);
-        ranked.into_iter().map(|(symbol, _)| symbol).collect()
+        // same order on every host and the table is a function of the sample and nothing else. The
+        // symbols are distinct by now, so the order is total and an unstable sort gives one answer.
+        let order = |left: &(Symbol, u64), right: &(Symbol, u64)| {
+            right.1.cmp(&left.1).then(left.0.cmp(&right.0))
+        };
+        if gains.len() > MAX_SYMBOLS {
+            gains.select_nth_unstable_by(MAX_SYMBOLS - 1, order);
+            gains.truncate(MAX_SYMBOLS);
+        }
+        gains.sort_unstable_by(order);
+        gains.into_iter().map(|(symbol, _)| symbol).collect()
     }
 }
 
@@ -716,8 +752,7 @@ mod tests {
 
     #[test]
     fn training_twice_on_the_same_sample_gives_the_same_table() {
-        // Iteration order of a hash map is not stable, and a table that differs run to run would
-        // make every size in the M1 report unreproducible.
+        // A table that differs run to run would make every size in the M1 report unreproducible.
         let strings = urls();
         let first = SymbolTable::train(&borrow(&strings));
         let second = SymbolTable::train(&borrow(&strings));
@@ -750,5 +785,76 @@ mod tests {
         let long = Symbol::new(b"abcdef");
         assert_eq!(long.concat(Symbol::new(b"ghijkl")).bytes(), b"abcdefgh");
         assert_eq!(Symbol::new(b"ab").concat(Symbol::new(b"cd")).bytes(), b"abcd");
+    }
+
+    /// The trainer the way it was written first, with the pairs and the gains in hash maps and one
+    /// stable sort over everything, kept here to check the flat counts pick the same symbols.
+    fn train_with_maps(samples: &[&[u8]]) -> SymbolTable {
+        use std::collections::HashMap;
+        let mut table = SymbolTable::empty();
+        for _ in 0..GENERATIONS {
+            let mut single = [0u32; IDS];
+            let mut pairs: HashMap<(u16, u16), u32> = HashMap::new();
+            for sample in samples {
+                let mut at = 0;
+                let mut previous: Option<u16> = None;
+                while at < sample.len() {
+                    let (code, len) = table.match_at(sample, at);
+                    let id =
+                        if code == ESCAPE { 256 + u16::from(sample[at]) } else { u16::from(code) };
+                    single[id as usize] += 1;
+                    if let Some(previous) = previous {
+                        *pairs.entry((previous, id)).or_insert(0) += 1;
+                    }
+                    previous = Some(id);
+                    at += len;
+                }
+            }
+            let mut gains: HashMap<Symbol, u64> = HashMap::new();
+            for (id, count) in single.iter().enumerate().filter(|(_, count)| **count > 0) {
+                let symbol = symbol_of(&table, id as u16);
+                *gains.entry(symbol).or_insert(0) += u64::from(*count) * symbol.len() as u64;
+            }
+            for ((first, second), count) in &pairs {
+                let symbol = symbol_of(&table, *first).concat(symbol_of(&table, *second));
+                *gains.entry(symbol).or_insert(0) += u64::from(*count) * symbol.len() as u64;
+            }
+            let mut ranked: Vec<(Symbol, u64)> = gains.into_iter().collect();
+            ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+            ranked.truncate(MAX_SYMBOLS);
+            if ranked.is_empty() {
+                break;
+            }
+            table = SymbolTable::build(ranked.into_iter().map(|(symbol, _)| symbol).collect());
+        }
+        table
+    }
+
+    #[test]
+    fn flat_counts_train_the_same_table_as_hash_maps() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut shapes: Vec<Vec<Vec<u8>>> = vec![urls(), Vec::new(), vec![Vec::new(); 3]];
+        // Few letters, so that many pairs tie on gain and the tie break decides the table.
+        shapes.push(
+            (0..400).map(|_| (0..12).map(|_| b"abc"[(next() % 3) as usize]).collect()).collect(),
+        );
+        // Every byte value, so that escapes of all 256 bytes are counted.
+        shapes.push((0..300).map(|_| (0..40).map(|_| next() as u8).collect()).collect());
+        // Long repeats, so that concatenations reach eight bytes and get cut.
+        shapes.push(
+            (0..200)
+                .map(|index| format!("prefix-{}-suffix-{}", index % 7, index % 5).into_bytes())
+                .collect(),
+        );
+        for strings in &shapes {
+            let samples = borrow(strings);
+            assert_eq!(SymbolTable::train(&samples).symbols, train_with_maps(&samples).symbols);
+        }
     }
 }
