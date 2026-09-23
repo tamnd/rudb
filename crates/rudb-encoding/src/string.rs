@@ -486,7 +486,29 @@ fn total_len(values: &[&[u8]]) -> usize {
     values.iter().map(|value| value.len()).sum()
 }
 
+/// probe: nanoseconds by depth and kind tag, inclusive of deeper levels.
+pub static PROBE_KIND: [[std::sync::atomic::AtomicU64; 8]; 3] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 8] }; 3];
+/// probe: calls by depth and kind tag.
+pub static PROBE_CALLS: [[std::sync::atomic::AtomicU64; 8]; 3] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 8] }; 3];
+/// probe: fsst train nanoseconds.
+pub static PROBE_TRAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn encode_as(
+    kind: Kind,
+    values: &[&[u8]],
+    depth: u8,
+    chooser: &dyn Chooser,
+) -> Result<Option<Vec<u8>>> {
+    let t = std::time::Instant::now();
+    let r = encode_as_inner(kind, values, depth, chooser);
+    let d = (depth as usize).min(2);
+    let k = (kind.tag() as usize) % 8;
+    PROBE_KIND[d][k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    PROBE_CALLS[d][k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+fn encode_as_inner(
     kind: Kind,
     values: &[&[u8]],
     depth: u8,
@@ -513,7 +535,9 @@ fn encode_as(
         }
         Kind::Fsst => {
             let sample = sample_of(values);
+            let t = std::time::Instant::now();
             let table = SymbolTable::train(&sample);
+            PROBE_TRAIN.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             if table.is_empty() {
                 return Ok(None);
             }

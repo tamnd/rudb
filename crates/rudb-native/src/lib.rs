@@ -3027,6 +3027,21 @@ impl Writer {
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
         let entry = self.close()?;
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            for (k, v) in SHAPES.lock().unwrap().iter() {
+                eprintln!("SHAPE {k} ns {:.2}s blocks {} raw {} out {}", v.0 as f64 / 1e9, v.1, v.2, v.3);
+            }
+            eprintln!("GRAMS {:.2}s TRAIN {:.2}s", GRAMS_NS.load(Relaxed) as f64 / 1e9, string::PROBE_TRAIN.load(Relaxed) as f64 / 1e9);
+            for d in 0..3 {
+                for k in 0..8 {
+                    let ns = string::PROBE_KIND[d][k].load(Relaxed);
+                    if ns > 0 {
+                        eprintln!("KIND depth {d} tag {k} {:.2}s calls {}", ns as f64 / 1e9, string::PROBE_CALLS[d][k].load(Relaxed));
+                    }
+                }
+            }
+        }
         let profile = self.profile.take();
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
@@ -9706,7 +9721,20 @@ impl Unencoded {
     /// The encoded block and its signature.
     pub(crate) fn encode(&self) -> Result<EncodedBlock> {
         let values = block_values(&self.ends, &self.bytes);
-        Ok((string::encode_with(&values, &self.shape)?, block_grams(&values)))
+        let t = std::time::Instant::now();
+        let out = string::encode_with(&values, &self.shape)?;
+        let key = format!("{:?}", self.shape.strings());
+        let mut m = SHAPES.lock().unwrap();
+        let e = m.entry(key).or_insert((0, 0, 0, 0));
+        e.0 += t.elapsed().as_nanos() as u64;
+        e.1 += 1;
+        e.2 += self.bytes.len() as u64;
+        e.3 += out.len() as u64;
+        drop(m);
+        let t = std::time::Instant::now();
+        let grams = block_grams(&values);
+        GRAMS_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok((out, grams))
     }
 
     /// The column and the block number the encoded block goes back to.
@@ -9715,6 +9743,8 @@ impl Unencoded {
     }
 }
 
+pub static SHAPES: Mutex<std::collections::BTreeMap<String, (u64, u64, u64, u64)>> = Mutex::new(std::collections::BTreeMap::new());
+pub static GRAMS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// One encoded dictionary block and the signature of the values in it.
 ///
 /// Boxed because it is carried around in things that are otherwise small.
