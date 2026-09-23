@@ -61,9 +61,13 @@ impl Binder<'_> {
         let name = written.to_ascii_lowercase();
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
-        // A subscript on a map is `map_extract_value`, and a subscript on anything else is left
-        // to the list and struct calls that already take it.
-        let subscript = matches!(name.as_str(), "array_extract" | "list_extract" | "list_element");
+        // A subscript on a map is `map_extract_value`, and so is `(m).a`, which arrives as
+        // `struct_extract`. On anything else both are left to the list and struct calls that
+        // already take them.
+        let subscript = matches!(
+            name.as_str(),
+            "array_extract" | "list_extract" | "list_element" | "struct_extract"
+        );
         if subscript && !matches!(types.first(), Some(LogicalType::Map(_, _))) {
             return Ok(None);
         }

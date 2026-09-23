@@ -391,7 +391,8 @@ impl Binder<'_> {
         self.call("list_value", args)
     }
 
-    /// `s.a` or `t.s.a.b` read as fields of a struct column, once no column answers to the name.
+    /// `s.a` or `t.s.a.b` read as fields of a struct column or keys of a map column, once no column
+    /// answers to the name.
     ///
     /// The longest front of the name that is a column wins, which is the pin's order: a table
     /// called `s` with a column `a` is read as that column before a struct column `s` is looked
@@ -402,12 +403,20 @@ impl Binder<'_> {
             let Ok(mut expr) = self.bind_column_parts(&parts[..split], scope) else {
                 continue;
             };
-            if !matches!(self.plan().expr_type(expr), LogicalType::Struct(_)) {
+            if !matches!(self.plan().expr_type(expr), LogicalType::Struct(_) | LogicalType::Map(..))
+            {
                 continue;
             }
+            // A name after a map is a key, as `m['a']` would be, and a key missing from the map is
+            // null.
             for field in &parts[split..] {
                 let key = self.add_constant(Value::Varchar((*field).to_string()));
-                let Some(picked) = self.struct_field("struct_extract", &[expr, key])? else {
+                let picked = if matches!(self.plan().expr_type(expr), LogicalType::Map(..)) {
+                    self.map_call("map_extract_value", &[expr, key])?
+                } else {
+                    self.struct_field("struct_extract", &[expr, key])?
+                };
+                let Some(picked) = picked else {
                     return Ok(None);
                 };
                 expr = picked;

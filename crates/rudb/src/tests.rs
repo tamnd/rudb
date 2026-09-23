@@ -8877,6 +8877,14 @@ fn maps_build_and_read_back_the_way_the_pin_has_them() {
         db.query("SELECT MAP {1: 'a'}").unwrap().names(),
         ["\"map\"(list_value(1), list_value('a'))"]
     );
+    let inner = "(SELECT MAP {'a': 1} m, {'n': MAP {'b': MAP {'x': 5}}} s)";
+    assert_eq!(column(&format!("SELECT m.a, m.b FROM {inner}")), "1");
+    assert_eq!(column(&format!("SELECT m.b FROM {inner}")), "NULL");
+    assert_eq!(column(&format!("SELECT s.n.b.x FROM {inner}")), "5");
+    assert_eq!(column("SELECT (MAP {'a': 1}).a"), "1");
+    assert_eq!(column("SELECT m.\"1\" FROM (SELECT MAP {1: 1} m)"), "1");
+    assert!(error("SELECT m.a FROM (SELECT MAP {1: 1} m)").starts_with("Conversion Error"));
+    assert_eq!(db.query(&format!("SELECT m.a FROM {inner}")).unwrap().names(), ["a"]);
 }
 
 /// The struct calls that take a struct apart or put two together, with the answers the pin gives.
