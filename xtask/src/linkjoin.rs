@@ -81,6 +81,15 @@ use rudb::Database;
 
 use crate::sections::{link_joins, load, queries, say, scratch};
 
+/// How many floor queries have to clear zero the same way before it is called a lean.
+///
+/// A ninety five percent interval misses about one row in twenty when everything is working, so on a
+/// twenty two query suite one floor query clearing zero is the expected rate and two is unremarkable.
+/// Reading a direction off fewer than three of them is reading a direction off one or two coin
+/// flips, and the first run of this did exactly that: one floor query cleared, upward, and the report
+/// announced that every row of the table was leaning upward on the strength of it.
+const LEANING: usize = 3;
+
 /// What one query's line of the table is printed from.
 struct Outcome {
     /// How many joins of the plan read a link. Zero means the query is the floor and not evidence.
@@ -333,18 +342,23 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         for (name, delta) in &cleared {
             println!("  {name:<5} {}", percent(Some(*delta)));
         }
-        // Both directions is what a ninety five percent interval does one row in twenty and says
-        // nothing about the harness. One direction is the harness favouring whichever side of the
-        // pair runs first or second, which would put the same lean under every other row too.
-        if up == 0 || down == 0 {
+        // A ninety five percent interval misses about one row in twenty with nothing wrong, so a
+        // couple of these is the expected rate and not a finding. It is a lean in the harness only
+        // when there are more of them than that and they agree in sign, and one of them agrees in
+        // sign with itself, which is why the count has to clear a floor before the sign is read at
+        // all.
+        if leaning(&cleared.iter().map(|(_, delta)| *delta).collect::<Vec<_>>()) {
             println!(
-                "they all lean the same way, which is this harness favouring one side of the pair \
-                 rather than the engine moving, and it puts that lean under every row above"
+                "they all lean the same way and there are more of them than chance explains, which \
+                 is this harness favouring one side of the pair rather than the engine moving, and \
+                 it puts that lean under every row above"
             );
         } else {
             println!(
-                "they lean both ways, so this is an interval being wrong at the rate a ninety five \
-                 percent interval is wrong and not a lean in the harness"
+                "an interval like this misses zero about one time in twenty with nothing wrong, so \
+                 {} of {} is the rate to expect rather than something the harness is doing",
+                cleared.len(),
+                floor.len()
             );
         }
         println!(
@@ -469,6 +483,22 @@ fn once(database: &Database, sql: &str, forced: bool) -> Result<(Vec<String>, f6
     Ok((rendered, taken))
 }
 
+/// Whether the floor queries that cleared zero did it in a way that points at the harness.
+///
+/// True only when there are more of them than chance explains and they all went the same way. A
+/// floor query runs the same plan on both sides, so the engine cannot have moved it and the pairing
+/// is the only thing left that could: if it favours whichever side of the pair runs first, every
+/// floor query leans the same way and so does every other row of the table. One or two of them
+/// clearing in whatever direction is just a ninety five percent interval being wrong at the rate it
+/// is supposed to be wrong.
+fn leaning(cleared: &[f64]) -> bool {
+    if cleared.len() < LEANING {
+        return false;
+    }
+    let up = cleared.iter().filter(|delta| **delta > 0.0).count();
+    up == 0 || up == cleared.len()
+}
+
 /// The lowest and the highest of the floor deltas, or nothing when there were none.
 fn spread(floor: &[f64]) -> Option<(f64, f64)> {
     if floor.is_empty() {
@@ -542,7 +572,23 @@ fn milliseconds(taken: Option<f64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, Verdict, band, critical, middle, percent, spread};
+    use super::{Outcome, Verdict, band, critical, leaning, middle, percent, spread};
+
+    #[test]
+    fn one_floor_query_clearing_zero_is_the_expected_rate_and_not_a_lean() {
+        // Nothing cleared, which is the usual run.
+        assert!(!leaning(&[]));
+        // One cleared, upward. It agrees in sign with itself and that means nothing at all, which is
+        // what the first run of this reported as every row of the table leaning upward.
+        assert!(!leaning(&[0.069]));
+        // Two, both upward, is still about what a ninety five percent interval does over nineteen.
+        assert!(!leaning(&[0.069, 0.04]));
+        // Three going the same way is more than chance explains and is the harness.
+        assert!(leaning(&[0.069, 0.04, 0.05]));
+        // Three going different ways is not, however many there are.
+        assert!(!leaning(&[0.069, -0.04, 0.05]));
+        assert!(leaning(&[-0.069, -0.04, -0.05]));
+    }
 
     fn timed(pairs: &[(f64, f64)]) -> Outcome {
         Outcome { links: 1, pairs: pairs.to_vec(), complaint: None, agreed: true }
