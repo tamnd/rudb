@@ -228,10 +228,15 @@ mod tests {
     #[test]
     fn the_budget_is_shared_between_the_columns_of_one_parent() {
         let mut rows = MemoryTable::new(vec![LogicalType::Integer, LogicalType::Integer]);
-        let held: Vec<Value> = (0..2000).map(Value::Integer).collect();
-        let first = Vector::from_values(LogicalType::Integer, &held).expect("a column");
-        let second = first.clone();
-        rows.append(Chunk::new(vec![first, second]).expect("a chunk")).expect("appended");
+        // Two parts of a thousand rows each, so that each column is laid end to end into a run of
+        // its own. A column of one part comes back as a share of the table's page, and since #1491
+        // a share of a page the table is holding anyway is charged as the share it is.
+        for part in 0..2 {
+            let held: Vec<Value> = (part * 1000..part * 1000 + 1000).map(Value::Integer).collect();
+            let first = Vector::from_values(LogicalType::Integer, &held).expect("a column");
+            let second = Vector::from_values(LogicalType::Integer, &held).expect("a column");
+            rows.append(Chunk::new(vec![first, second]).expect("a chunk")).expect("appended");
+        }
         let rows = Rows::Memory(rows);
         // Room for one column of eight thousand bytes and not for two.
         let parent = Parent::new(rows, 12 * 1024);
