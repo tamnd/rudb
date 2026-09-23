@@ -77,7 +77,7 @@ use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
-use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
+use crate::join::{Broadcast, CrossProduct, Gathered, Join, Marking, Padding, Probe};
 use crate::key::Digest;
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
@@ -1883,6 +1883,16 @@ impl<'a> Building<'a, '_> {
             let pad = pad.watched(Arc::clone(&counters));
             left.after.push(gathering);
             return Ok(left.then(Arc::new(Watched::new(pad, counters)), schema));
+        }
+        // A scalar subquery with nothing to correlate on. The gathered row goes beside every
+        // driving chunk, in the driving pipeline, rather than through the nested loop below,
+        // which gathers the driving side as rows on one thread. See `crate::join::Broadcast`.
+        if kind == JoinKind::Single && conditions.is_empty() && !swapped {
+            let broadcast = Broadcast::new(&left.schema, side.schema, side.chunks.clone());
+            let schema = broadcast.schema().clone();
+            let counters = self.watch(reference, id, pipeline, "Broadcast", None);
+            left.after.push(gathering);
+            return Ok(left.then(Arc::new(Watched::new(broadcast, counters)), schema));
         }
         if let Some(probe) =
             Probe::new(plan, &left.schema, &side, kind, conditions, self.cancel, memory)

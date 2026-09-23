@@ -690,6 +690,95 @@ fn poisoned<T>(_: T) -> Error {
     Error::internal("a thread panicked while holding the rows a join gathered")
 }
 
+/// A single join with no condition, which is what an uncorrelated scalar subquery becomes.
+///
+/// TPC-H q22 compares every customer's balance with one average, and the plan says that as a single
+/// join of the customers against the one row the average comes out as. The nested loop [`Join`]
+/// answered it by gathering every customer as a row of values on one thread and pairing each one
+/// with the build side, which was 18 ms of a 23 ms query. With no condition there is nothing to
+/// search for: every driving row gets the one gathered row, or nulls when there is none, and more
+/// than one is the error a scalar subquery raises. So this reads the gathered side once and puts
+/// its row beside each driving chunk as constant columns, in the pipeline the driving rows came
+/// from and on every thread it has.
+#[derive(Debug)]
+pub(crate) struct Broadcast {
+    types: Vec<LogicalType>,
+    right_types: Vec<LogicalType>,
+    schema: Schema,
+    /// The gathered side, filled by the pipeline this one depends on.
+    right: Buffered,
+    /// The gathered row, or nulls for none, and `None` when there were too many to pick one.
+    row: OnceLock<Option<Vec<Value>>>,
+}
+
+impl Broadcast {
+    /// `right` is the handle on the chunks the other pipeline kept.
+    pub(crate) fn new(left: &Schema, right_schema: &Schema, right: Buffered) -> Self {
+        let schema = Schema::concat(left, right_schema);
+        Self {
+            types: schema.types(),
+            right_types: right_schema.types(),
+            schema,
+            right,
+            row: OnceLock::new(),
+        }
+    }
+
+    /// What this operator produces, which is both sides' columns.
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// The row every driving row is given, read out of the gathered side the first time.
+    fn row(&self) -> Result<&Option<Vec<Value>>> {
+        if let Some(row) = self.row.get() {
+            return Ok(row);
+        }
+        let chunks = held(&self.right)?;
+        let mut rows = chunks.iter().filter(|chunk| !chunk.is_empty());
+        let row = match (rows.next(), rows.next()) {
+            (None, _) => Some(vec![Value::Null; self.right_types.len()]),
+            (Some(chunk), None) if chunk.len() == 1 => Some(chunk.row(0).collect()),
+            _ => None,
+        };
+        Ok(self.row.get_or_init(|| row))
+    }
+}
+
+impl Stream for Broadcast {
+    type Local = ();
+
+    fn local(&self) {}
+
+    /// More than one gathered row is an error whether or not a driving row ever arrives, which is
+    /// what DuckDB does: `SELECT count(*) FROM empty WHERE x > (SELECT a FROM t)` raises it.
+    fn prepare(&self, _threads: &Lease<'_>) -> Result<()> {
+        match self.row()? {
+            Some(_) => Ok(()),
+            None => Err(too_many_rows()),
+        }
+    }
+
+    fn push(&self, chunk: &mut Chunk, _local: &mut ()) -> Result<Progress> {
+        let rows = chunk.len();
+        if rows == 0 {
+            *chunk = Chunk::empty(&self.types);
+            return Ok(Progress::More);
+        }
+        let Some(row) = self.row()? else {
+            return Err(too_many_rows());
+        };
+        let mut columns = std::mem::replace(chunk, Chunk::empty(&[])).into_columns();
+        columns.extend(
+            row.iter()
+                .zip(&self.right_types)
+                .map(|(value, ty)| Vector::constant(ty.clone(), value.clone(), rows)),
+        );
+        *chunk = Chunk::with_rows(columns, rows)?;
+        Ok(Progress::More)
+    }
+}
+
 /// An unconditional cross product.
 ///
 /// The only join shaped operator here that does not hold its left side. It holds the right side,
