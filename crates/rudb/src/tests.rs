@@ -9322,6 +9322,108 @@ fn a_with_ahead_of_a_write_is_in_scope_for_all_of_it() {
 }
 
 #[test]
+fn an_insert_that_meets_a_held_key_does_what_its_conflict_clause_says() {
+    let db = scripted(&[
+        "CREATE TABLE t (i INTEGER PRIMARY KEY, j INTEGER, k INTEGER)",
+        "INSERT INTO t VALUES (1, 1, 1), (2, 2, 2)",
+    ]);
+    let all = |db: &Database| {
+        db.query("SELECT i, j, k FROM t ORDER BY i")
+            .unwrap()
+            .rows()
+            .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // The first row with a key is the one that counts, held or not.
+    let count = db
+        .execute("INSERT INTO t VALUES (1, 6, 6), (1, 5, 5), (3, 3, 3), (3, 4, 4) ON CONFLICT DO NOTHING")
+        .unwrap();
+    assert_eq!(count.rows().next().unwrap()[0], Value::BigInt(1));
+    assert_eq!(all(&db), "1,1,1 2,2,2 3,3,3");
+    db.execute(
+        "INSERT INTO t VALUES (1, 6, 6), (1, 5, 5) ON CONFLICT (i) DO UPDATE SET j = excluded.j",
+    )
+    .unwrap();
+    assert_eq!(all(&db), "1,6,1 2,2,2 3,3,3");
+    // An unqualified name is the held row, the insert alias names it too, and the condition picks
+    // which rows are updated and counted.
+    let count = db
+        .execute(
+            "INSERT INTO t AS x VALUES (1, 0, 10), (2, 0, 20), (4, 4, 4) ON CONFLICT DO UPDATE \
+             SET k = x.k + excluded.k WHERE j > 5",
+        )
+        .unwrap();
+    assert_eq!(count.rows().next().unwrap()[0], Value::BigInt(2));
+    assert_eq!(all(&db), "1,6,11 2,2,2 3,3,3 4,4,4");
+    // Replace takes only the columns the insert names.
+    db.execute("INSERT OR REPLACE INTO t (i, j) VALUES (2, 9)").unwrap();
+    db.execute("INSERT OR IGNORE INTO t VALUES (3, 0, 0)").unwrap();
+    assert_eq!(all(&db), "1,6,11 2,9,2 3,3,3 4,4,4");
+    // A key column can be set, and a set that repeats a key is refused.
+    db.execute("INSERT INTO t VALUES (4, 0, 0) ON CONFLICT DO UPDATE SET i = 7").unwrap();
+    assert_eq!(all(&db), "1,6,11 2,9,2 3,3,3 7,4,4");
+    assert_eq!(
+        refusal(&db, "INSERT INTO t VALUES (7, 0, 0) ON CONFLICT DO UPDATE SET i = 1"),
+        "Duplicate key \"i: 1\" violates primary key constraint."
+    );
+    let returned = db
+        .execute("INSERT INTO t VALUES (8, 8, 8), (1, 0, 0) ON CONFLICT DO UPDATE SET j = 0 RETURNING i, j")
+        .unwrap()
+        .rows()
+        .map(|row| format!("{}:{}", row[0], row[1]))
+        .collect::<Vec<_>>();
+    assert_eq!(returned, ["1:0", "8:8"]);
+}
+
+#[test]
+fn a_conflict_clause_that_names_no_key_is_refused_the_way_the_pin_refuses_it() {
+    let db = scripted(&[
+        "CREATE TABLE plain (i INTEGER)",
+        "CREATE TABLE t (i INTEGER PRIMARY KEY, j INTEGER UNIQUE)",
+        "INSERT INTO t VALUES (1, 1)",
+    ]);
+    for (statement, message) in [
+        (
+            "INSERT OR IGNORE INTO plain VALUES (1)",
+            "There are no UNIQUE/PRIMARY KEY constraints that refer to this table, specify ON \
+             CONFLICT columns manually",
+        ),
+        (
+            "INSERT INTO plain VALUES (1) ON CONFLICT (i) DO NOTHING",
+            "The specified columns as conflict target are not referenced by a UNIQUE/PRIMARY KEY \
+             CONSTRAINT or INDEX",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 1) ON CONFLICT DO UPDATE SET j = 2",
+            "Conflict target has to be provided for a DO UPDATE operation when the table has \
+             multiple UNIQUE/PRIMARY KEY constraints",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 1) ON CONFLICT (zz) DO NOTHING",
+            "Table \"t\" does not have a column with name \"zz\"",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 1) ON CONFLICT (i) DO UPDATE SET zz = 1",
+            "Referenced update column zz not found in table!",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 1) ON CONFLICT (i) DO UPDATE SET j = 1, j = 2",
+            "Multiple assignments to same column \"\"j\"\"",
+        ),
+        (
+            "INSERT INTO t VALUES (2, 1) ON CONFLICT (i) DO NOTHING",
+            "Duplicate key \"j: 1\" violates unique constraint.",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    db.execute("INSERT INTO t VALUES (2, 1) ON CONFLICT DO NOTHING").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5) ON CONFLICT (i) DO UPDATE SET j = excluded.j").unwrap();
+    assert_eq!(db.query("SELECT j FROM t").unwrap().rows().next().unwrap()[0], Value::Integer(5));
+}
+
+#[test]
 fn a_key_refuses_a_write_that_would_repeat_it_the_way_the_pin_does() {
     let db = scripted(&[
         "CREATE TABLE t (i INTEGER PRIMARY KEY, s VARCHAR UNIQUE)",

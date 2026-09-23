@@ -38,6 +38,9 @@ pub(crate) struct Visible {
     /// `PRI` or `UNI` when the column it came from is in a key of its table, carried the same way
     /// and for the same reader as `not_null`.
     pub(crate) key: Option<&'static str>,
+    /// Whether only a name with the table in front of it reaches the column, which is what the
+    /// `excluded` of an `ON CONFLICT DO UPDATE` is: a bare name there means the held row's column.
+    pub(crate) qualified: bool,
     /// A second name the column answers to when no column has the one asked for.
     ///
     /// Only `range` and `generate_series` set it. `FROM range(3) r` names the one column `r`, the
@@ -118,6 +121,7 @@ impl Scope {
             .iter()
             .filter(|held| {
                 same_name(&held.name, column)
+                    && (table.is_some() || !held.qualified)
                     && table.is_none_or(|table| same_name(&held.table, table))
             })
             .collect();
@@ -303,6 +307,7 @@ mod tests {
             ty: LogicalType::BigInt,
             not_null: false,
             key: None,
+            qualified: false,
             also: None,
         });
         scope.push(Visible {
@@ -312,6 +317,7 @@ mod tests {
             ty: LogicalType::Varchar,
             not_null: false,
             key: None,
+            qualified: false,
             also: None,
         });
         scope.push(Visible {
@@ -321,6 +327,7 @@ mod tests {
             ty: LogicalType::Varchar,
             not_null: false,
             key: None,
+            qualified: false,
             also: None,
         });
         scope
