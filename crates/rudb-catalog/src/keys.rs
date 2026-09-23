@@ -58,8 +58,8 @@ fn encode(chunk: &Chunk, key: &Key, row: usize, out: &mut Vec<u8>) -> Result<boo
             }
             // A float key is equal to itself whatever sign its zero has, which is what the pin's
             // comparison says too.
-            Value::Double(v) if v == 0.0 => out.extend_from_slice(b"d0"),
-            Value::Float(v) if v == 0.0 => out.extend_from_slice(b"d0"),
+            Value::Double(0.0) => out.extend_from_slice(b"d0"),
+            Value::Float(0.0) => out.extend_from_slice(b"d0"),
             other => {
                 let text = format!("{other:?}");
                 out.push(b'v');
