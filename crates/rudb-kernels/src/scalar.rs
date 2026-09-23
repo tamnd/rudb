@@ -2456,6 +2456,20 @@ pub fn call_values(
         ("||", [left, right]) => Ok(Value::Varchar(format!("{left}{right}"))),
         ("lower", [only]) => Ok(Value::Varchar(only.to_string().to_lowercase())),
         ("upper", [only]) => Ok(Value::Varchar(only.to_string().to_uppercase())),
+        // A list is counted at its top level, and a null element is an element.
+        ("length" | "array_length", [Value::List { values, .. }]) => {
+            Ok(Value::BigInt(elements(values)))
+        }
+        ("array_length", [Value::List { values, .. }, dimension]) => {
+            // The signature cast the dimension to a BIGINT, so anything but 1 here is a number the
+            // pin has no answer for either, and this is its sentence for it.
+            if dimension.as_i64() != Some(1) {
+                return Err(Error::not_implemented(
+                    "array_length for lists with dimensions other than 1 not implemented",
+                ));
+            }
+            Ok(Value::BigInt(elements(values)))
+        }
         ("length", [only]) => Ok(Value::BigInt(count_characters(only))),
         ("strlen", [only]) => Ok(Value::BigInt(count_bytes(only))),
         ("substring" | "substr", [held, start]) => text::substring(held, start, None),
@@ -2845,6 +2859,11 @@ fn absolute(value: &Value, ty: &LogicalType) -> Result<Value> {
 }
 
 /// `length`, which counts characters rather than bytes, the way DuckDB does.
+/// How many elements a list holds, as the BIGINT `length` answers with.
+fn elements(values: &[Value]) -> i64 {
+    i64::try_from(values.len()).unwrap_or(i64::MAX)
+}
+
 fn count_characters(value: &Value) -> i64 {
     let text = match value.as_str() {
         Some(text) => text.chars().count(),

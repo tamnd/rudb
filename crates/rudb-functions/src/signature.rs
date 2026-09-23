@@ -161,6 +161,21 @@ enum Shape {
     /// `[1]` upstream and `[1] || NULL` is null. A null argument here is a list with nothing in it
     /// and is skipped, which is the same rule `concat` follows over strings.
     ListConcatenated,
+    /// One string or one list, and how long it is. `length`.
+    ///
+    /// Characters for a string and elements for a list, and the two are separate overloads on the
+    /// pin that happen to share a name. A list is counted at its top level only, so
+    /// `length([[1], [2]])` is 2, and a null element is an element, so `length([1, NULL])` is 2.
+    /// Anything else is refused rather than turned into a string first, which is what this row
+    /// used to do: `length([1, 2, 3])` counted the nine characters of `[1, 2, 3]`.
+    Counted,
+    /// A list, and a dimension to count it along. `array_length`.
+    ///
+    /// The list half of [`Shape::Counted`] with no string reading, so `array_length('abc')` is
+    /// refused, and a second argument that is a whole number and is not cast to one, the way a
+    /// slice's step is not. Only the first dimension is implemented upstream and asking for any
+    /// other is a runtime error there, so it is one here too, in the same words.
+    ListCounted,
     /// The first `n` arguments have to be strings already, the rest are indexes, and the result is
     /// fixed. `substring(s, a, b)` and `overlay(s, r, a, b)`.
     ///
@@ -392,7 +407,20 @@ const TABLE: &[Entry] = &[
     },
     text("lower", Arity::exactly(1), Fixed::Varchar),
     text("upper", Arity::exactly(1), Fixed::Varchar),
-    text("length", Arity::exactly(1), Fixed::BigInt),
+    Entry {
+        name: "length",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Counted,
+        numeric_only: false,
+    },
+    Entry {
+        name: "array_length",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 2),
+        shape: Shape::ListCounted,
+        numeric_only: false,
+    },
     // `strlen` is bytes where `length` is characters, and it is a separate row rather than an alias
     // for that reason. `strlen('héllo')` is 6 upstream and `length('héllo')` is 5. It is here
     // because DuckDB's own ClickBench entry writes `AVG(STRLEN(URL))` in query 28, so a rudb
@@ -1035,6 +1063,33 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             }
             (vec![wanted.clone(); arguments.len()], wanted)
         }
+        Shape::Counted => {
+            // A null goes to the string overload, which is the one the pin lists first, and it is
+            // a null answer whichever overload it went to.
+            let taken = match &arguments[0] {
+                LogicalType::Varchar | LogicalType::Null => LogicalType::Varchar,
+                list @ (LogicalType::List(_) | LogicalType::Array(_, _)) => list.clone(),
+                _ => return Err(no_match(entry.name, arguments)),
+            };
+            (vec![taken], LogicalType::BigInt)
+        }
+        Shape::ListCounted => {
+            let target = &arguments[0];
+            if !matches!(
+                target,
+                LogicalType::List(_) | LogicalType::Array(_, _) | LogicalType::Null
+            ) {
+                return Err(no_match(entry.name, arguments));
+            }
+            if let Some(dimension) = arguments.get(1) {
+                if !dimension.is_integer() && *dimension != LogicalType::Null {
+                    return Err(no_match(entry.name, arguments));
+                }
+            }
+            let mut cast_to = vec![LogicalType::BigInt; arguments.len()];
+            cast_to[0] = target.clone();
+            (cast_to, LogicalType::BigInt)
+        }
         Shape::Extracted => {
             let target = &arguments[0];
             let index = &arguments[1];
@@ -1264,6 +1319,10 @@ const CANDIDATES: &[(&str, &[&str])] = &[
             "length(col0 BIT) -> BIGINT",
             "length(col0 ANY[]) -> BIGINT",
         ],
+    ),
+    (
+        "array_length",
+        &["array_length(col0 ANY[]) -> BIGINT", "array_length(col0 ANY[], col1 BIGINT) -> BIGINT"],
     ),
     ("strlen", &["strlen(col0 VARCHAR) -> BIGINT"]),
     ("chr", &["chr(col0 INTEGER) -> VARCHAR"]),
@@ -1754,6 +1813,11 @@ impl Shape {
             // The pin's row, which is one variadic overload over lists of anything. The element type
             // is not `T` because the arguments do not have to agree on it, they promote to it.
             Self::ListConcatenated => (all(ANY_LIST), ANY_LIST),
+            // The string row, which is the one the pin lists first for `length`. The list row is
+            // the same name at the same count and an entry here has only one row per count.
+            Self::Counted => (all(Fixed::Varchar.name()), Fixed::BigInt.name()),
+            // Both of the pin's rows, the list alone and the list with a dimension.
+            Self::ListCounted => (leading(1, ANY_LIST, "BIGINT"), Fixed::BigInt.name()),
             // No arguments, so `all` is empty whatever it is handed and only the result is named.
             Self::Constant(fixed) => (Vec::new(), fixed.name()),
         }
@@ -1998,7 +2062,7 @@ mod tests {
 
     /// The wrong answer this shape was added for. `length([1,2,3])` used to cast the list to a
     /// string and count the nine characters of `[1, 2, 3]`, where DuckDB counts three elements.
-    /// rudb has no list type in the executor yet, so refusing is the honest end of it for now.
+    /// A list is counted now and anything that is neither a list nor a string is still refused.
     #[test]
     fn length_of_something_that_is_not_a_string_is_refused_rather_than_stringified() {
         let error = resolve("length", &[LogicalType::Blob]).expect_err("length takes strings");
@@ -2228,7 +2292,9 @@ mod tests {
                         | Shape::WidenedTogether(argument, _),
                     ) => argument.ty(),
                     // Only lists go in, so it is asked with a list of the same string the rest are.
-                    (_, Shape::ListConcatenated) => LogicalType::list(LogicalType::Varchar),
+                    (_, Shape::ListConcatenated | Shape::ListCounted) => {
+                        LogicalType::list(LogicalType::Varchar)
+                    }
                     (true, _) => LogicalType::Integer,
                     (false, _) => LogicalType::Varchar,
                 };
@@ -2238,7 +2304,7 @@ mod tests {
                 // number, so a row of strings is not a call either one accepts and not a call worth
                 // asserting it accepts.
                 let leading = match entry.shape {
-                    Shape::Extracted | Shape::Sliced => 1,
+                    Shape::Extracted | Shape::Sliced | Shape::ListCounted => 1,
                     Shape::TextThenIndex(leading, _) => leading,
                     _ => count,
                 };

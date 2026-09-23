@@ -1627,6 +1627,54 @@ fn two_lists_concatenate_with_the_operator_and_with_the_name() {
     );
 }
 
+/// `length` counts a list's elements and still counts a string's characters. Per #467.
+///
+/// It used to cast the list to a string first and count the characters of that, so
+/// `length([1, 2, 3])` was 9. Every row here is the pin's.
+#[test]
+fn the_length_of_a_list_is_how_many_elements_it_has() {
+    let db = database();
+    let count = |sql: &str| rows(&db, sql);
+    assert_eq!(count("SELECT length([1, 2, 3])"), vec![vec![Value::BigInt(3)]]);
+    assert_eq!(count("SELECT length([])"), vec![vec![Value::BigInt(0)]]);
+    assert_eq!(count("SELECT length([1, NULL])"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(count("SELECT length([[1], [2]])"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(count("SELECT length(NULL::INT[])"), vec![vec![Value::Null]]);
+    assert_eq!(count("SELECT len([1, 2])"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(count("SELECT char_length([1, 2])"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(count("SELECT length('héllo')"), vec![vec![Value::BigInt(5)]]);
+    assert_eq!(count("SELECT length(NULL)"), vec![vec![Value::Null]]);
+    // A list column, and not only a literal the folder answers.
+    db.execute("CREATE TABLE ns (x INTEGER[])").unwrap();
+    db.execute("INSERT INTO ns VALUES ([1, 2]), ([]), (NULL)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT length(x) FROM ns"),
+        vec![vec![Value::BigInt(2)], vec![Value::BigInt(0)], vec![Value::Null]]
+    );
+    assert!(failure(&db, "SELECT length(123)").contains("length(col0 ANY[]) -> BIGINT"));
+}
+
+/// `array_length` is the list half of `length`, with a dimension. Per #467.
+#[test]
+fn array_length_counts_a_list_along_its_first_dimension_and_only_that_one() {
+    let db = database();
+    assert_eq!(rows(&db, "SELECT array_length([1, 2, 3])"), vec![vec![Value::BigInt(3)]]);
+    assert_eq!(rows(&db, "SELECT array_length([[1, 2], [3]], 1)"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(rows(&db, "SELECT array_length([1, 2, 3], NULL)"), vec![vec![Value::Null]]);
+    assert_eq!(rows(&db, "SELECT array_length(NULL, 1)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        failure(&db, "SELECT array_length([1, 2], 2)"),
+        "array_length for lists with dimensions other than 1 not implemented"
+    );
+    // No string reading, and a dimension that is not a whole number is not rounded into one.
+    for refused in ["SELECT array_length('abc')", "SELECT array_length([1, 2], 1.5)"] {
+        assert!(
+            failure(&db, refused).contains("array_length(col0 ANY[], col1 BIGINT) -> BIGINT"),
+            "{refused}"
+        );
+    }
+}
+
 /// A list against something that is not a list is neither reading of `||`. Per #467.
 ///
 /// It has to be refused rather than falling back to the string reading, because the string reading
