@@ -31,6 +31,13 @@ pub struct Field {
 }
 
 impl Field {
+    /// Whether these are the fields of an unnamed struct, which is what `row(1, 'x')` builds and
+    /// what the pin calls a TUPLE. Its fields are found by position and not by name.
+    #[must_use]
+    pub fn unnamed(fields: &[Self]) -> bool {
+        !fields.is_empty() && fields.iter().all(|field| field.name.is_empty())
+    }
+
     /// A field with a name and a type, which accepts nulls.
     pub fn new(name: impl Into<String>, ty: LogicalType) -> Self {
         Self { name: name.into(), ty, not_null: false }
@@ -442,6 +449,21 @@ impl LogicalType {
         match (self, other) {
             (Self::Null, ty) | (ty, Self::Null) => Some(ty.clone()),
             (Self::List(left), Self::List(right)) => Some(Self::list(left.promote(right)?)),
+            // An unnamed struct meets any struct of its size field by field, and takes the names
+            // of the other side when it has some.
+            (Self::Struct(left), Self::Struct(right))
+                if Field::unnamed(left) || Field::unnamed(right) =>
+            {
+                if left.len() != right.len() {
+                    return None;
+                }
+                let named = if Field::unnamed(left) { right } else { left };
+                let mut fields = Vec::with_capacity(left.len());
+                for ((one, other), name) in left.iter().zip(right).zip(named) {
+                    fields.push(Field::new(name.name.clone(), one.ty.promote(&other.ty)?));
+                }
+                Some(Self::Struct(fields))
+            }
             (Self::Struct(left), Self::Struct(right)) => {
                 let mut fields = left.clone();
                 for field in right {
@@ -539,6 +561,16 @@ impl fmt::Display for LogicalType {
             Self::List(inner) => write!(f, "{inner}[]"),
             Self::Array(inner, length) => write!(f, "{inner}[{length}]"),
             Self::Map(key, value) => write!(f, "MAP({key}, {value})"),
+            Self::Struct(fields) if Field::unnamed(fields) => {
+                f.write_str("TUPLE(")?;
+                for (index, field) in fields.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", field.ty)?;
+                }
+                f.write_str(")")
+            }
             Self::Struct(fields) => write_fields(f, "STRUCT", fields),
             Self::Union(fields) => write_fields(f, "UNION", fields),
         }
@@ -882,6 +914,19 @@ impl TypeParser<'_> {
         match upper.as_str() {
             "STRUCT" | "ROW" => return self.parse_fields().map(LogicalType::Struct),
             "UNION" => return self.parse_fields().map(LogicalType::Union),
+            // An unnamed struct prints as a tuple of its types, and the plan text reads it back.
+            "TUPLE" => {
+                expect(self.eat(&Token::LeftParen), "(")?;
+                let mut fields = Vec::new();
+                loop {
+                    fields.push(Field::new("", self.parse_type()?));
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                expect(self.eat(&Token::RightParen), ")")?;
+                return Ok(LogicalType::Struct(fields));
+            }
             "MAP" => {
                 expect(self.eat(&Token::LeftParen), "(")?;
                 let key = self.parse_type()?;
@@ -1416,6 +1461,8 @@ mod tests {
         assert!(error.message().contains("INTEGRE"), "{error}");
         assert!(LogicalType::parse("INTEGER JUNK").is_err());
         assert!(LogicalType::parse("STRUCT(a)").is_err());
+        let tuple = LogicalType::parse("TUPLE(INTEGER, VARCHAR)").unwrap();
+        assert_eq!(tuple.to_string(), "TUPLE(INTEGER, VARCHAR)");
         assert!(LogicalType::parse("").is_err());
     }
 }

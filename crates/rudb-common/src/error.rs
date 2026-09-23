@@ -89,6 +89,8 @@ pub enum ErrorCode {
     /// A value is one the function refuses outright rather than one of the wrong type, for example
     /// an empty list handed to `list_reduce` with nothing to start from.
     ParameterNotAllowed,
+    /// Two types were asked to meet and cannot, for example two structs of different sizes.
+    MismatchType,
     /// An invariant this code is responsible for does not hold. Always a bug here, never in the
     /// query.
     Internal,
@@ -119,6 +121,7 @@ impl ErrorCode {
             Self::Settings => "Settings Error",
             Self::Interrupt => "Interrupt Error",
             Self::ParameterNotAllowed => "Parameter Not Allowed Error",
+            Self::MismatchType => "Mismatch Type Error",
             Self::Internal => "INTERNAL Error",
         }
     }
@@ -142,6 +145,7 @@ impl ErrorCode {
                 | Self::Transaction
                 | Self::Settings
                 | Self::ParameterNotAllowed
+                | Self::MismatchType
         )
     }
 }
@@ -299,6 +303,11 @@ impl Error {
         Self::new(ErrorCode::ParameterNotAllowed, message)
     }
 
+    /// Two types that cannot meet.
+    pub fn mismatch_type(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::MismatchType, message)
+    }
+
     /// The query was cancelled.
     pub fn interrupt(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Interrupt, message)
@@ -340,6 +349,7 @@ impl ErrorCode {
             Self::Settings => "Settings",
             Self::Interrupt => "Interrupt",
             Self::ParameterNotAllowed => "Parameter Not Allowed",
+            Self::MismatchType => "Mismatch Type",
             Self::Internal => "INTERNAL",
         }
     }

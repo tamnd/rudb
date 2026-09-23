@@ -981,9 +981,9 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
 #[test]
 fn a_function_that_is_not_implemented_does_not_answer_its_own_argument() {
     let db = database();
-    let message = failure(&db, "SELECT row(1)");
+    let message = failure(&db, "SELECT unnest([1], recursive := true)");
     assert!(message.contains("not supported yet"), "{message}");
-    assert!(message.ends_with("RowExpression"), "{message}");
+    assert!(message.starts_with("recursive := true is not supported yet"), "{message}");
     assert!(failure(&db, "SELECT length(try('a'))").contains("not supported yet"));
 }
 
@@ -8753,5 +8753,64 @@ fn structs_cast_and_compare_by_field_name_the_way_the_pin_does() {
              GROUP BY k ORDER BY k"
         ),
         "0:2;1:2"
+    );
+}
+
+/// `row(...)` and a bracketed list of values are unnamed structs, which the pin calls a TUPLE and
+/// prints as one, and `struct_pack(a := 1)` is the named struct `{'a': 1}` is.
+#[test]
+fn rows_are_unnamed_structs_and_struct_pack_takes_names_the_way_the_pin_does() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT row(1, 'x')"), "(1, x)");
+    assert_eq!(column("SELECT row(1)"), "(1,)");
+    assert_eq!(column("SELECT (1, 'it''s')"), "(1, 'it\\'s')");
+    assert_eq!(column("SELECT typeof(row(1, row(2)))"), "TUPLE(INTEGER, TUPLE(INTEGER))");
+    assert_eq!(column("SELECT row(row(1), 2)"), "((1,), 2)");
+    assert_eq!(column("SELECT row(i, i + 1) FROM range(2) t(i)"), "(0, 1);(1, 2)");
+    assert_eq!(column("SELECT struct_extract(row(i, 2), 1) FROM range(2) t(i)"), "0;1");
+    assert_eq!(column("SELECT row(1, 2)[2]"), "2");
+    assert_eq!(column("SELECT row(1, 2)::STRUCT(x INT, y INT)"), "{'x': 1, 'y': 2}");
+    assert_eq!(column("SELECT row(1, 2)::VARCHAR"), "(1, 2)");
+    assert_eq!(
+        column("SELECT [row(1, 2), {'a': 3, 'b': 4}]"),
+        "[{'a': 1, 'b': 2}, {'a': 3, 'b': 4}]"
+    );
+    assert_eq!(column("SELECT {'a': 1} = row(1)"), "true");
+    assert_eq!(column("SELECT (1, 2) < (1, 3)"), "true");
+    assert_eq!(column("SELECT (1, 2) IN ((1, 2), (3, 4))"), "true");
+    assert_eq!(
+        error("SELECT struct_extract(row(1, 2), 3)"),
+        "Binder Error: Key index 3 for struct_extract out of range - expected an index between 1 \
+         and 2"
+    );
+    assert_eq!(
+        error("SELECT row(1, 2)::STRUCT(x INT)"),
+        "Mismatch Type Error: Type TUPLE(INTEGER, INTEGER) does not match with STRUCT(x INTEGER). \
+         Cannot cast STRUCTs of different size"
+    );
+    assert_eq!(column("SELECT struct_pack(A := 1, b => 'x')"), "{'A': 1, 'b': x}");
+    assert_eq!(column("SELECT typeof(struct_pack(a := 1))"), "STRUCT(a INTEGER)");
+    assert_eq!(column("SELECT struct_pack(x := 1).x"), "1");
+    assert_eq!(column("SELECT struct_pack()"), "{}");
+    assert_eq!(
+        error("SELECT struct_pack(1, a := 2)"),
+        "Binder Error: Need named argument for struct pack, e.g. STRUCT_PACK(a := b)"
+    );
+    assert_eq!(
+        error("SELECT struct_pack(a := 1, 2)"),
+        "Binder Error: Positional argument '2' cannot follow named arguments in function call."
+    );
+    assert_eq!(
+        error("SELECT struct_pack(A := 1, a := 2)"),
+        "Binder Error: Duplicate named argument \"a\" in function call to '\"struct_pack\"'"
+    );
+    assert_eq!(
+        db.query("SELECT row(1, 2), struct_pack(a := 1)").unwrap().names(),
+        ["\"row\"(1, 2)", "struct_pack(a := 1)"]
     );
 }

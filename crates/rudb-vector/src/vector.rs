@@ -880,11 +880,17 @@ impl Vector {
     /// there is nothing underneath to keep, so the children get the null.
     fn struct_from_values(fields: &[Field], values: &[Value]) -> Result<Self> {
         let mut children = Vec::with_capacity(fields.len());
-        for field in fields {
+        // An unnamed struct has no names to match on, so its fields are taken by place.
+        let unnamed = Field::unnamed(fields);
+        for (at, field) in fields.iter().enumerate() {
             let mut column = Vec::with_capacity(values.len());
             for value in values {
                 column.push(match value {
                     Value::Null => Value::Null,
+                    Value::Struct(held) if unnamed => held
+                        .get(at)
+                        .map(|(_, held)| held.clone())
+                        .ok_or_else(|| Error::internal("a tuple row shorter than its type"))?,
                     Value::Struct(held) => held
                         .iter()
                         .find(|(name, _)| *name == field.name)

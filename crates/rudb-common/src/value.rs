@@ -315,6 +315,19 @@ impl fmt::Display for Value {
                 }
                 f.write_str("]")
             }
+            // An unnamed struct is written as a tuple, with the trailing comma a tuple of one needs.
+            Self::Struct(fields)
+                if !fields.is_empty() && fields.iter().all(|(n, _)| n.is_empty()) =>
+            {
+                f.write_str("(")?;
+                for (index, (_, value)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write_element(f, value)?;
+                }
+                f.write_str(if fields.len() == 1 { ",)" } else { ")" })
+            }
             Self::Struct(fields) => {
                 f.write_str("{")?;
                 for (index, (name, value)) in fields.iter().enumerate() {

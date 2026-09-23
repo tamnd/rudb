@@ -29,7 +29,9 @@ impl Binder<'_> {
     /// second of the two.
     pub(crate) fn pack_struct(&mut self, names: &[String], values: &[ExprRef]) -> Result<ExprRef> {
         for (at, name) in names.iter().enumerate() {
-            if names[..at].iter().any(|earlier| earlier.eq_ignore_ascii_case(name)) {
+            if !name.is_empty()
+                && names[..at].iter().any(|earlier| earlier.eq_ignore_ascii_case(name))
+            {
                 return Err(Error::binder(format!(
                     "Duplicate named argument \"{name}\" in function call to '\"struct_pack\"'"
                 )));
@@ -70,8 +72,19 @@ impl Binder<'_> {
         if !extract && !subscript {
             return Ok(None);
         }
-        let name = match fold::value_of(self.plan(), key) {
-            Ok(Some(Value::Varchar(name))) => name,
+        let at = match fold::value_of(self.plan(), key) {
+            Ok(Some(Value::Varchar(name))) => self.field_named(&fields, &name)?,
+            Ok(Some(value)) if value.logical_type().is_integer() && Field::unnamed(&fields) => {
+                let index = value.as_i64().unwrap_or(0);
+                if index < 1 || index > fields.len() as i64 {
+                    return Err(Error::binder(format!(
+                        "Key index {index} for struct_extract out of range - expected an index \
+                         between 1 and {}",
+                        fields.len()
+                    )));
+                }
+                index as usize - 1
+            }
             Ok(Some(value)) if value.logical_type().is_integer() => {
                 return Err(Error::binder(
                     "struct_extract with an integer key can only be used on unnamed structs, use \
@@ -84,18 +97,23 @@ impl Binder<'_> {
                 ));
             }
         };
-        let Some(at) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(&name))
-        else {
-            let entries: Vec<String> =
-                fields.iter().map(|field| format!("\"{}\"", field.name)).collect();
-            return Err(Error::binder(format!(
-                "Could not find key \"{name}\" in struct\n\nCandidate Entries: {}",
-                entries.join(", ")
-            )));
-        };
-        let key = self.add_constant(Value::Varchar(fields[at].name.clone()));
+        // The plan records the field by its place, counted from one, so the kernel does not look
+        // a name up again and an unnamed struct is picked from the same way.
+        let key = self.add_constant(Value::BigInt(at as i64 + 1));
         let args = self.plan_mut().add_expr_list(&[input, key]);
         let recorded = self.plan_mut().intern(STRUCT_EXTRACT);
         Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, fields[at].ty.clone())))
+    }
+
+    /// Where the field of that name is, found without case, or the pin's refusal naming them all.
+    fn field_named(&self, fields: &[Field], name: &str) -> Result<usize> {
+        fields.iter().position(|field| field.name.eq_ignore_ascii_case(name)).ok_or_else(|| {
+            let entries: Vec<String> =
+                fields.iter().map(|field| format!("\"{}\"", field.name)).collect();
+            Error::binder(format!(
+                "Could not find key \"{name}\" in struct\n\nCandidate Entries: {}",
+                entries.join(", ")
+            ))
+        })
     }
 }

@@ -814,6 +814,14 @@ fn to_list(values: &[Value], wanted: &LogicalType, try_cast: bool) -> Result<Val
 /// `{'A': 1}`. That no field at all matches is the binder's to refuse, before a row is read.
 fn to_struct(fields: &[(String, Value)], wanted: &[Field], try_cast: bool) -> Result<Value> {
     let mut out = Vec::with_capacity(wanted.len());
+    // A struct with no names on either side is matched by place, which the binder has checked
+    // is the same size on both.
+    if Field::unnamed(wanted) || (!fields.is_empty() && fields.iter().all(|(n, _)| n.is_empty())) {
+        for ((_, value), field) in fields.iter().zip(wanted) {
+            out.push((field.name.clone(), cast_value(value, &field.ty, try_cast)?));
+        }
+        return Ok(Value::Struct(out));
+    }
     for field in wanted {
         let source = fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(&field.name));
         let value = match source {

@@ -2000,6 +2000,7 @@ impl<'a> Transform<'a> {
                 "IntervalLiteral" => return self.interval_literal(node),
                 "CaseExpression" => return self.case(node),
                 "ParenthesisExpression" => return self.row(node),
+                "RowExpression" => return self.row_expression(node),
                 // `ParensExpression <- Parens(Expression)` covers more text than its child and
                 // still says nothing about the value, because the brackets are grouping. It is the
                 // one rule of that shape, which is why it is an arm rather than a second rule in
@@ -2319,7 +2320,11 @@ impl<'a> Transform<'a> {
                                 let arguments = self.find(inner, "MethodFunctionArguments");
                                 if arguments != NONE {
                                     for kid in self.kids(arguments) {
-                                        args.push(self.argument(kid)?);
+                                        let (named, arg) = self.argument(kid)?;
+                                        if named != NONE {
+                                            return self.unsupported(kid);
+                                        }
+                                        args.push(arg);
                                     }
                                 }
                             }
@@ -2522,11 +2527,44 @@ impl<'a> Transform<'a> {
         let ignore_nulls = nulls != NONE && self.name(self.first(nulls)) == "IgnoreNulls";
         let distinct = self.quantifier(self.find(list, "DistinctOrAll")) == Quantifier::Distinct;
         let mut args = Vec::new();
+        let mut names = Vec::new();
+        let mut first_named = NONE;
         let arguments = self.find(list, "FunctionArgumentList");
         if arguments != NONE {
             for kid in self.kids(arguments) {
-                args.push(self.argument(kid)?);
+                let (name, arg) = self.argument(kid)?;
+                if name == NONE && !names.is_empty() {
+                    return Err(Error::binder(format!(
+                        "Positional argument '{}' cannot follow named arguments in function call.",
+                        self.text(kid)
+                    )));
+                }
+                if name != NONE {
+                    if names.is_empty() {
+                        first_named = kid;
+                    }
+                    names.push(name);
+                }
+                args.push(arg);
             }
+        }
+        // `struct_pack(a := 1)` is the one call whose names are part of its value, and it is the
+        // same struct `{'a': 1}` is, so it becomes that. A name on any other call is a parameter
+        // the binder does not have yet. `struct_pack()` is the empty struct and a call with any
+        // positional argument stays a call, for the binder to turn down in the pin's words.
+        let packs = name.len == 1
+            && self
+                .ast
+                .name(name)
+                .last()
+                .is_some_and(|part| part.eq_ignore_ascii_case("struct_pack"));
+        if packs && over == NONE && names.len() == args.len() {
+            let names = self.part_slice(names);
+            let values = self.expr_slice(args);
+            return Ok(self.push(Expr::Struct { names, values }));
+        }
+        if !names.is_empty() && (!packs || names.len() == args.len()) {
+            return self.unsupported(first_named);
         }
         // A call with an `OVER` on it is a window call and none of the rewrites below apply to it.
         // The reference binary agrees on the one case where that is visible: `ifnull(1) OVER ()`
@@ -3001,11 +3039,20 @@ impl<'a> Transform<'a> {
         Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
-    /// `FunctionArgument <- NamedFunctionArgument / PositionalFunctionArgument`.
-    fn argument(&mut self, node: u32) -> Result<ExprRef> {
+    /// `FunctionArgument <- NamedFunctionArgument / PositionalFunctionArgument`, with the name the
+    /// argument was given or `NONE` for a positional one.
+    fn argument(&mut self, node: u32) -> Result<(u32, ExprRef)> {
         let inner = self.first(node);
         match self.name(inner) {
-            "PositionalFunctionArgument" => self.expr(self.first(inner)),
+            "PositionalFunctionArgument" => Ok((NONE, self.expr(self.first(inner))?)),
+            "NamedFunctionArgument" => {
+                let named = self.first(inner);
+                if self.count(named) != 3 {
+                    return self.unsupported(named);
+                }
+                let name = self.identifier(self.first(named));
+                Ok((name, self.expr(self.nth(named, 2))?))
+            }
             _ => self.unsupported(inner),
         }
     }
@@ -3166,6 +3213,17 @@ impl<'a> Transform<'a> {
         }
         if items.len() == 1 {
             return Ok(items[0]);
+        }
+        let items = self.expr_slice(items);
+        Ok(self.push(Expr::Row { items }))
+    }
+
+    /// `RowExpression <- 'ROW' Parens(List(Expression)?)`, which is a row whatever its length, so
+    /// `row(1)` is a row of one where `(1)` is the number.
+    fn row_expression(&mut self, node: u32) -> Result<ExprRef> {
+        let mut items = Vec::new();
+        for kid in self.kids(node) {
+            items.push(self.expr(kid)?);
         }
         let items = self.expr_slice(items);
         Ok(self.push(Expr::Row { items }))
@@ -4882,7 +4940,6 @@ mod tests {
     #[test]
     fn a_keyword_is_not_stepped_through_on_the_way_to_its_one_argument() {
         for (sql, rule) in [
-            ("SELECT row(1)", "RowExpression"),
             ("SELECT try(1)", "TryExpression"),
             ("SELECT unpack([1])", "UnpackExpression"),
             ("SELECT columns('a')", "ColumnsExpression"),
