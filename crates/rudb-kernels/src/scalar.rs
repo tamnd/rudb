@@ -860,6 +860,9 @@ fn binary(
         if let Some(moved) = shift_of(name == "-", left, right, returns)? {
             return Ok(Some(moved));
         }
+        if let Some(moved) = count_of(name == "-", left, right, returns)? {
+            return Ok(Some(moved));
+        }
     }
     if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
         return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
@@ -986,6 +989,69 @@ fn shift_of(
     by_form!(left, right, shift_runs, subtract, stamp_first, left, right, returns)
 }
 
+/// A date with a count of days added to it or taken off it, over runs of both.
+///
+/// The benchmark view's `EventDate` is the epoch plus the stored day count, and this is
+/// [`datetime::counted`] on each row, which is what the row at a time path reaches. ClickBench q41
+/// hands the answer's seventy five thousand rows to that path one `Value` at a time without it.
+/// A count can only be taken off a date and not the other way round, the same as the signature.
+fn count_of(
+    subtract: bool,
+    left: &Vector,
+    right: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    if returns != &LogicalType::Date {
+        return Ok(None);
+    }
+    let date_first = match (left.logical_type(), right.logical_type()) {
+        (LogicalType::Date, LogicalType::Integer) => true,
+        (LogicalType::Integer, LogicalType::Date) if !subtract => false,
+        _ => return Ok(None),
+    };
+    by_form!(left, right, count_runs, subtract, date_first, left, right, returns)
+}
+
+/// The loop under [`count_of`], once each side's form has been turned into a mapping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "two sides with an index each, the direction, which side is the date, and the \
+              vectors and type the answer is built from"
+)]
+fn count_runs<L, R>(
+    one: &Data,
+    at_left: L,
+    other: &Data,
+    at_right: R,
+    subtract: bool,
+    date_first: bool,
+    left: &Vector,
+    right: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>>
+where
+    L: Fn(usize) -> usize,
+    R: Fn(usize) -> usize,
+{
+    let (Data::Int32(one), Data::Int32(other)) = (one, other) else {
+        return Ok(None);
+    };
+    let rows = left.len();
+    let base = nulls_of(left).and(&nulls_of(right), rows);
+    let mut out = vec![0i32; rows];
+    let validity = over_valid(rows, base, |index| {
+        let (day, count) = if date_first {
+            (one[at_left(index)], other[at_right(index)])
+        } else {
+            (other[at_right(index)], one[at_left(index)])
+        };
+        let count = i64::from(count);
+        out[index] = datetime::shifted_days(day, 0, if subtract { -count } else { count })?;
+        Ok(())
+    })?;
+    finish(returns, Data::Int32(out.into()), validity)
+}
+
 /// The loop under [`shift_of`], once each side's form has been turned into a mapping.
 #[expect(
     clippy::too_many_arguments,
@@ -1074,6 +1140,26 @@ fn arithmetic_of(
         (_, one, other) => one == returns && other == returns,
     };
     if !lined_up {
+        return Ok(None);
+    }
+    // A side none of the pairings can read, which is a packed column or a dictionary over one, is
+    // opened once here rather than read a `Value` at a time by the path below, and so is the left
+    // side when both are dictionaries, since no pairing has a mapping on each side. Only an integer
+    // side, since that is what those forms hold. See [`Vector::opened`].
+    let direct = |side: &Vector| side.data().is_some() || side.constant_value().is_some();
+    let mapped =
+        |side: &Vector| side.positions().is_some_and(|(_, values)| values.data().is_some());
+    let integer = |side: &Vector| side.logical_type().is_integer();
+    let open_left = integer(left) && !direct(left) && (!mapped(left) || !direct(right));
+    let open_right = integer(right) && !direct(right) && !mapped(right);
+    if open_left || open_right {
+        let opened_left = if open_left { Some(left.opened()?) } else { None };
+        let opened_right = if open_right { Some(right.opened()?) } else { None };
+        let left = opened_left.as_ref().unwrap_or(left);
+        let right = opened_right.as_ref().unwrap_or(right);
+        if (direct(left) || mapped(left)) && (direct(right) || mapped(right)) {
+            return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
+        }
         return Ok(None);
     }
     by_form!(left, right, arithmetic_runs, op, floating_zero_errors, left, right, returns, written)
@@ -4229,6 +4315,53 @@ mod tests {
         let before = fallback::count(Kernel::Scalar, Form::Flat, Form::Flat);
         agrees("~~", &[text, pattern], &LogicalType::Boolean);
         assert!(fallback::count(Kernel::Scalar, Form::Flat, Form::Flat) > before);
+    }
+
+    /// Two dictionaries side by side, and a packed column, are what a filtered scan hands an
+    /// expression over its narrow integer columns. No pairing has a mapping on both sides or reads
+    /// packed bits, so one side is opened and the loop runs rather than a `Value` per row.
+    #[test]
+    fn integer_arithmetic_over_dictionaries_and_packed_runs_has_a_loop() {
+        let small = |values: &[i16]| {
+            Vector::from_values(
+                LogicalType::SmallInt,
+                &values.iter().map(|&value| Value::SmallInt(value)).collect::<Vec<_>>(),
+            )
+            .expect("small integers")
+        };
+        let one = Vector::dictionary(vec![0, 1, 1, 2], small(&[-1, 4, 7])).expect("codes");
+        let other = Vector::dictionary(vec![2, 0, 1, 1], small(&[3, 0, 9])).expect("codes");
+        // 900, 901, 903 and 900, as two bit codes over a base of 900.
+        let packed =
+            Vector::packed(LogicalType::SmallInt, vec![0b11_0100], 2, 900, 4).expect("packs");
+        assert_eq!(packed.form(), Form::BitPacked);
+        for args in [[one.clone(), other.clone()], [packed.clone(), other], [one, packed]] {
+            let forms = (args[0].form(), args[1].form());
+            let before = fallback::count(Kernel::Scalar, forms.0, forms.1);
+            agrees("+", &args, &LogicalType::SmallInt);
+            let sum = call("+", &args, &LogicalType::SmallInt, None).expect("adds");
+            assert_eq!(sum.len(), 4);
+            assert_eq!(fallback::count(Kernel::Scalar, forms.0, forms.1), before);
+        }
+    }
+
+    #[test]
+    fn a_date_with_days_added_has_a_loop_and_keeps_the_range_check() {
+        let epoch = Vector::constant(LogicalType::Date, Value::Date(0), 3);
+        let days = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(15_887), Value::Null, Value::Integer(-3)],
+        )
+        .expect("days");
+        let before = fallback::count(Kernel::Scalar, Form::Constant, Form::Flat);
+        agrees("+", &[epoch.clone(), days.clone()], &LogicalType::Date);
+        agrees("+", &[days.clone(), epoch.clone()], &LogicalType::Date);
+        agrees("-", &[epoch.clone(), days], &LogicalType::Date);
+        assert_eq!(fallback::count(Kernel::Scalar, Form::Constant, Form::Flat), before);
+        let far = Vector::from_values(LogicalType::Integer, &[Value::Integer(i32::MAX)])
+            .expect("one day count");
+        let one = Vector::constant(LogicalType::Date, Value::Date(0), 1);
+        agrees("+", &[one, far], &LogicalType::Date);
     }
 
     #[test]

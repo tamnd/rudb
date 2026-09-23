@@ -2878,6 +2878,26 @@ impl Vector {
     ///
     /// # Errors
     ///
+    /// The same values flat, for a kernel that has a loop over runs and was handed a form it has
+    /// no way to index into.
+    ///
+    /// This is [`Self::flatten`] without the count against [`Cause::Flatten`], and the difference
+    /// is who is calling. A flatten is counted because it is usually a shortcut past a loop nobody
+    /// wrote. This is for the caller that has the loop and whose alternative is a `Value` per row,
+    /// which costs a good deal more than the copy. ClickBench q40 adds three `SMALLINT` columns out
+    /// of Parquet, a packed one and runs over the others after the filter, and every `+` went a
+    /// row at a time.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the copy raises.
+    pub fn opened(&self) -> Result<Self> {
+        if let Body::Flat(_) = self.body {
+            return Ok(self.clone());
+        }
+        self.copied((0..self.len).collect(), false)
+    }
+
     /// The same as [`Self::flatten`].
     pub fn into_flat(self) -> Result<Self> {
         if let Body::Flat(_) = self.body {
