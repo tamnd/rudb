@@ -1341,8 +1341,11 @@ const DICTIONARY_CHECK_SEED: u64 = 11_400_714_819_323_198_485;
 /// block base before writing.
 #[derive(Debug)]
 struct GlobalDictionary {
-    primary: HashMap<u64, u32>,
-    collisions: HashMap<u64, Vec<u32>>,
+    /// Keyed by the value's hash, which is already well spread, so the maps hash it once more
+    /// with a multiply rather than with SipHash. SipHash here was one percent of a ClickBench load,
+    /// and every stripe's merge of a column waits on the one before it.
+    primary: HashMap<u64, u32, Spread>,
+    collisions: HashMap<u64, Vec<u32>, Spread>,
     /// Every value's hash under [`DICTIONARY_CHECK_SEED`], in code order.
     checks: Vec<u64>,
     /// Where every value ends inside the payload block it is in, in code order.
@@ -1403,8 +1406,8 @@ type RankedDictionary = (Vec<(u64, u32)>, Vec<u8>, Vec<u64>);
 impl GlobalDictionary {
     fn new() -> Self {
         Self {
-            primary: HashMap::new(),
-            collisions: HashMap::new(),
+            primary: HashMap::default(),
+            collisions: HashMap::default(),
             checks: Vec::new(),
             ends: Vec::new(),
             counts: Vec::new(),
