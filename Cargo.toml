@@ -26,6 +26,7 @@ readme = "README.md"
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 chrono-tz = "0.10.4"
 iana-time-zone = "0.1.65"
+libm = "0.2.16"
 # The one outside crate that is not a library dependency. Only `rudb-cli` names it, only its binary
 # uses it, and spec/18-package-layout.md section 18.5 says why that is allowed. The bindings rather
 # than the `mimalloc` crate that wraps them, because the shell writes its own `GlobalAlloc` over

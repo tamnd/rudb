@@ -13,6 +13,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
+libm.workspace = true
 rudb-common.workspace = true
 rudb-io.workspace = true
 rudb-vector.workspace = true

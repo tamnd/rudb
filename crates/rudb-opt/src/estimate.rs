@@ -996,7 +996,7 @@ fn landed_on(values: u64, rows: u64, total: u64) -> u64 {
     }
     let kept = rows as f64 / total as f64;
     let each = total as f64 / values as f64;
-    let survives = 1.0 - (1.0 - kept).powf(each);
+    let survives = 1.0 - libm::pow(1.0 - kept, each);
     ((values as f64 * survives).round() as u64).clamp(1, ceiling)
 }
 

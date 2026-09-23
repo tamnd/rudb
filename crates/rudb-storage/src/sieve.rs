@@ -385,7 +385,7 @@ impl Counter {
         if clear < 1.0 {
             return COUNTER_BITS;
         }
-        let estimate = -bits * (clear / bits).ln();
+        let estimate = -bits * libm::log(clear / bits);
         // A hash the bitmap saw at all is one value, so the floor is one rather than zero.
         (estimate.round() as usize).max(1)
     }
