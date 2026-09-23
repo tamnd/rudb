@@ -57,6 +57,7 @@ use rudb_common::stat::Use;
 use rudb_common::{Field, LogicalType, Result, Value};
 use rudb_plan::{ColumnBinding, Expr, Node, NodeRef, Plan};
 
+use crate::fold::days_after;
 use crate::pass::{Context, Pass};
 
 /// What a zone map bound is read for when it stands in for the query's answer.
@@ -165,10 +166,20 @@ fn extreme(
     end: End,
     ty: &LogicalType,
 ) -> Option<Value> {
-    let (index, name) = scanned(plan, input, table, column, 16)?;
+    let (index, name, origin) = scanned(plan, input, table, column, None, 16)?;
     let zones = plan.zones(index)?;
     let stat = zones.extreme(zones.column(&name)?, end);
-    stat.read(EXTREME)?.into_value(ty)
+    let bound = stat.read(EXTREME)?;
+    match origin {
+        None => bound.into_value(ty),
+        Some(origin) => {
+            // The count of days under a date made from it, and adding a constant keeps the order,
+            // so the smallest date is the origin plus the smallest count and the same at the top.
+            let &Bound::Int(count) = bound else { return None };
+            let day = i32::try_from(i128::from(origin) + count).ok()?;
+            (*ty == LogicalType::Date).then_some(Value::Date(day))
+        }
+    }
 }
 
 /// The two ends of the integer column a binding names, as a range its values are inside of.
@@ -237,19 +248,35 @@ fn scanned(
     at: NodeRef,
     table: u32,
     column: usize,
+    origin: Option<i32>,
     depth: u32,
-) -> Option<(u32, String)> {
+) -> Option<(u32, String, Option<i32>)> {
     let depth = depth.checked_sub(1)?;
     match *plan.node(at) {
         Node::Get { index, columns, .. } | Node::TableFunction { index, columns, .. }
             if index == table =>
         {
-            Some((index, plan.field_list(columns).get(column)?.name.clone()))
+            Some((index, plan.field_list(columns).get(column)?.name.clone(), origin))
         }
         Node::Project { index, input, exprs, .. } if index == table => {
             let &carried = plan.expr_list(exprs).get(column)?;
-            let &Expr::Column(binding) = plan.expr(carried) else { return None };
-            scanned(plan, input, binding.table, binding.column as usize, depth)
+            let (binding, origin) = match *plan.expr(carried) {
+                Expr::Column(binding) => (binding, origin),
+                // A date made from a stored count of days, which is how a Parquet file keeps one
+                // and how the ClickBench view turns it back. Only one, since a second origin on top
+                // of the first is a date plus a date.
+                _ if origin.is_none() => {
+                    let (day, count) = days_after(plan, carried)?;
+                    let count = match *plan.expr(count) {
+                        Expr::Cast { input, .. } => input,
+                        _ => count,
+                    };
+                    let &Expr::Column(binding) = plan.expr(count) else { return None };
+                    (binding, Some(day))
+                }
+                _ => return None,
+            };
+            scanned(plan, input, binding.table, binding.column as usize, origin, depth)
         }
         _ => None,
     }
@@ -338,6 +365,25 @@ mod tests {
             folded(text, &Stub::exact(3, 91)),
             "Values #2 [min::INTEGER] rows=[[3::INTEGER]]\n"
         );
+    }
+
+    #[test]
+    fn a_date_made_from_a_count_of_days_answers_from_the_counts_bounds_moved_by_the_origin() {
+        let text = "Aggregate #2 groups=[] aggregates=[min(#1.0::DATE)::DATE, max(#1.0::DATE)::DATE]\n  \
+                    Project #1 [\"+\"(10::DATE, CAST(#0.0::USMALLINT)::INTEGER)::DATE AS d]\n    \
+                    Get memory.main.t AS t #0 [d::USMALLINT]\n";
+        assert_eq!(
+            folded(text, &Stub::exact(15_887, 15_917)),
+            "Values #2 [min::DATE, max::DATE] rows=[[15897::DATE, 15927::DATE]]\n"
+        );
+    }
+
+    #[test]
+    fn a_date_made_from_a_bare_integer_is_left_to_the_scan_since_the_sum_could_raise() {
+        let text = "Aggregate #2 groups=[] aggregates=[min(#1.0::DATE)::DATE]\n  \
+                    Project #1 [\"+\"(0::DATE, #0.0::INTEGER)::DATE AS d]\n    \
+                    Get memory.main.t AS t #0 [d::INTEGER]\n";
+        assert_eq!(folded(text, &Stub::exact(3, 91)), text);
     }
 
     #[test]
