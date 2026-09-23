@@ -20,6 +20,7 @@ use rudb_parse::{Ast, NONE};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
 
 use crate::binder::{Binder, PendingSubquery, WindowCall};
+use crate::fold;
 use crate::scope::Scope;
 
 /// The pin's list macros over `list_concat`: the name, its parameters as the pin prints them, which
@@ -845,6 +846,21 @@ impl Binder<'_> {
         let types: Vec<LogicalType> =
             args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
         let resolved = resolve(resolved_name, &types)?;
+        // The sort order and the null order of a list sort are read once for the whole call on the
+        // pin, which is why it refuses one that could change from row to row.
+        let settled: &[&str] = match resolved.name {
+            "list_sort" => &["sort_order", "null_order"],
+            "list_reverse_sort" => &["null_order"],
+            _ => &[],
+        };
+        for (&arg, parameter) in args.iter().skip(1).zip(settled) {
+            if !matches!(fold::value_of(self.plan(), arg), Ok(Some(_))) {
+                return Err(Error::binder(format!(
+                    "The \"{parameter}\" argument in function \"{}\" must be a constant expression",
+                    resolved.name
+                )));
+            }
+        }
         let mut cast = Vec::with_capacity(args.len());
         for (arg, wanted) in args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);

@@ -59,6 +59,7 @@ use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
+use crate::lists;
 use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
@@ -2642,8 +2643,16 @@ pub fn call_values(
         }
         return Ok(Value::List { element: (**element).clone(), values });
     }
+    // `list_position` and `list_resize` are the last two above the null rule. A null needle finds
+    // the first null element and a null size is the empty list, and both are answers the pin gives.
+    if let Some(answer) = lists::before_nulls(name, args, returns) {
+        return answer;
+    }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
+    }
+    if let Some(answer) = lists::value(name, args, returns) {
+        return answer;
     }
     // `list_aggr` over one list. The binder resolved the aggregate and put its name second, and
     // cast the list to the element type it takes, so this is the accumulator a `GROUP BY` would use

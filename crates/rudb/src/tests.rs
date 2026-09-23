@@ -8175,3 +8175,146 @@ fn an_aggregate_over_a_list_is_refused_the_way_the_pin_refuses_it() {
          given name and argument types 'sum(INTEGER, INTEGER)'."
     ));
 }
+
+#[test]
+fn the_list_functions_that_look_inside_a_list_answer_the_way_the_pin_does() {
+    let db = database();
+    let shown = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows[0].iter().map(ToString::to_string).collect::<Vec<_>>().join("|")
+    };
+    assert_eq!(
+        shown(
+            "SELECT list_position([1, 2, NULL], NULL), list_position([1, 2], 2::BIGINT), \
+             typeof(list_position([1], 1)), list_position(NULL, 1), list_position([1.5, 2], 2), \
+             array_indexof([3, 4], 4), list_position([1, 2], 3)"
+        ),
+        "3|2|INTEGER|NULL|2|2|NULL"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_contains([1, 2, NULL], NULL), list_contains([1, 2], 3), \
+             list_contains(NULL, 1), list_contains([], 1), list_contains([[1]], [1]), \
+             array_has(['a'], 'a')"
+        ),
+        "NULL|false|NULL|false|true|true"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_has_any([1, 2], [2, 3]), list_has_any([1, NULL], [NULL]), \
+             list_has_any(NULL, [1]), list_has_all([1, 2], [1]), list_has_all([1], [NULL]), \
+             list_has_all([1], []), list_has_any([], []), list_has_all([1], [1, 2])"
+        ),
+        "true|false|NULL|true|true|true|false|false"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_distinct([3, 1, 3, NULL, 2]), list_distinct(NULL), list_distinct([]), \
+             list_unique([1, 1, NULL, 2]), typeof(list_unique([1])), list_unique(NULL), \
+             list_unique([[1], [1], NULL])"
+        ),
+        "[3, 1, 2]|NULL|[]|2|UBIGINT|NULL|1"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_intersect([1, 2, 2, 3, NULL], [2, 3, 3, NULL]), \
+             list_intersect(NULL, [1]), list_intersect([1], NULL), \
+             typeof(list_intersect([1::BIGINT], [1]))"
+        ),
+        "[2, 3]|NULL|[]|BIGINT[]"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_where([1, 2, 3], [true, false, true]), list_where([1, 2], [true]), \
+             list_where([1], [true, true]), list_where(NULL, [true]), \
+             list_select([10, 20, 30], [3, 1, 5, 0, -1]), list_select([1, NULL], [2, 2]), \
+             list_select([1], NULL)"
+        ),
+        "[1, 3]|[1]|[1, NULL]|NULL|[30, 10, NULL, NULL, NULL]|[NULL, NULL]|NULL"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_reverse([1, 2, NULL]), list_reverse(NULL), typeof(list_reverse(NULL)), \
+             flatten([[1, 2], NULL, [3]]), flatten(NULL), flatten([]), flatten([NULL]), \
+             typeof(flatten([[1]]))"
+        ),
+        "[NULL, 2, 1]|NULL|\"NULL\"|[1, 2, 3]|NULL|[]|[]|INTEGER[]"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_resize([1, 2], 3), list_resize([1], 3, 9), list_resize([1, 2, 3], 1), \
+             list_resize(NULL, 2), list_resize([1], NULL), list_resize([1], 2, NULL), \
+             list_resize([1], 2.7)"
+        ),
+        "[1, 2, NULL]|[1, 9, 9]|[1]|NULL|[]|[1, NULL]|[1, NULL, NULL]"
+    );
+    assert_eq!(
+        shown(
+            "SELECT list_sort([3, NULL, 1, 2]), list_sort([3, NULL, 1], 'DESC'), \
+             list_sort([3, NULL, 1], 'asc', 'nulls first'), list_reverse_sort([3, NULL, 1]), \
+             list_reverse_sort([3, NULL, 1], 'NULLS FIRST'), list_sort(NULL), list_sort([]), \
+             list_sort([1], NULL), array_sort(['b', 'a', NULL, 'C'])"
+        ),
+        "[1, 2, 3, NULL]|[3, 1, NULL]|[NULL, 1, 3]|[3, 1, NULL]|[NULL, 3, 1]|NULL|[]|NULL|\
+         [C, a, b, NULL]"
+    );
+}
+
+#[test]
+fn the_list_functions_that_look_inside_a_list_refuse_the_way_the_pin_does() {
+    let db = database();
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert!(error("SELECT list_position([1], 'a'::VARCHAR)").starts_with(
+        "Binder Error: Cannot deduce template type 'T' in function: 'list_position(T[], T) -> \
+         INTEGER'\nType 'T' was inferred to be:\n - 'INTEGER', from first occurrence\n - \
+         'VARCHAR', which is incompatible with previously inferred type!"
+    ));
+    assert!(error("SELECT list_intersect([1], ['1'])").starts_with(
+        "Binder Error: Cannot deduce template type 'T' in function: 'list_intersect(T[], T[]) -> \
+         T[]'"
+    ));
+    assert!(
+        error("SELECT list_distinct(1)")
+            .contains("\n\tCandidate functions:\n\tlist_distinct(col0 T[]) -> T[]\n")
+    );
+    assert!(error("SELECT list_where([1], [1])").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'list_where(INTEGER[], INTEGER[])'."
+    ));
+    assert!(error("SELECT list_select([1, 2], [2.9])").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'list_select(INTEGER[], DECIMAL(2,1)[])'."
+    ));
+    assert!(error("SELECT flatten([1, 2])").starts_with(
+        "Binder Error: No function matches the given name and argument types \
+         'flatten(INTEGER[])'."
+    ));
+    assert!(error("SELECT list_where([1, 2], [true, NULL])").starts_with(
+        "Invalid Input Error: NULLs are not allowed as list elements in the second input \
+         parameter."
+    ));
+    assert!(error("SELECT list_select([1], [NULL])").starts_with("Invalid Input Error: NULLs"));
+    assert_eq!(
+        error("SELECT list_resize([1, 2, 3], 4000999999999999999)"),
+        "Out of Range Error: Cannot resize vector to 4000999999999999999 rows: maximum allowed \
+         vector size is 128.0 GiB"
+    );
+    assert!(
+        error("SELECT list_reverse(1)")
+            .starts_with("Binder Error: ARRAY_SLICE can only operate on LISTs and VARCHARs")
+    );
+    assert!(error("SELECT list_reverse('abc')").starts_with(
+        "Not implemented Error: Slice with steps has not been implemented for string types"
+    ));
+    assert!(error("SELECT list_sort([1], 'up')").starts_with(
+        "Not implemented Error: Enum value: unrecognized value \"UP\" for enum \"OrderType\""
+    ));
+    assert!(error("SELECT list_reverse_sort([1], 'DESC')").starts_with(
+        "Not implemented Error: Enum value: unrecognized value \"DESC\" for enum \
+         \"OrderByNullType\""
+    ));
+    assert!(error("SELECT list_sort([1], x) FROM (SELECT 'ASC' AS x)").starts_with(
+        "Binder Error: The \"sort_order\" argument in function \"list_sort\" must be a constant \
+         expression"
+    ));
+}
