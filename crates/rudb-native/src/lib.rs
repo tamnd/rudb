@@ -1865,6 +1865,48 @@ struct ColumnStripe {
     ranges: Vec<Range>,
 }
 
+/// One piece of the numeric frequency phase, as a worker takes it off the queue.
+enum Work {
+    /// A column's frequency pass, counting its distinct values too unless they are split off.
+    Column { column: usize, distinct: bool },
+    /// One part of a near unique column's distinct count.
+    Distinct { column: usize, part: usize, parts: usize, total: Arc<AtomicUsize> },
+}
+
+/// What a [`Work`] came back with.
+enum Done {
+    Column(usize, (Option<FrequencySummary>, Option<u64>)),
+    Distinct(usize, Option<u64>),
+}
+
+/// How many distinct values the sketch has to estimate for a column before its exact count is
+/// split, and how many parts it may be split into at most.
+///
+/// Two million because a set of that many is about the time a frequency pass over the same column
+/// takes without it, so below that one worker finishes the count before the pass that feeds it
+/// would. Eight because ten million distinct values in eight parts is already under the pass
+/// itself, and the parts compete with every other column for the same workers.
+const DISTINCT_PER_PART: u64 = 1 << 21;
+const MAX_DISTINCT_PARTS: usize = 8;
+
+/// Whether an integer column's values are read as signed, or `None` for a column that is not one
+/// of the integer types the numeric frequency pass reads.
+fn integer_signed(ty: &LogicalType) -> Option<bool> {
+    match ty {
+        LogicalType::TinyInt
+        | LogicalType::SmallInt
+        | LogicalType::Integer
+        | LogicalType::BigInt
+        | LogicalType::Date
+        | LogicalType::Timestamp => Some(true),
+        LogicalType::UTinyInt
+        | LogicalType::USmallInt
+        | LogicalType::UInteger
+        | LogicalType::UBigInt => Some(false),
+        _ => None,
+    }
+}
+
 /// Roughly what encoding a column of this type costs, for ordering the encode queue.
 ///
 /// Only the order matters and only roughly. A string column hashes and copies every value into a
@@ -2636,19 +2678,16 @@ impl Writer {
     /// entry keeps the whole candidate table in the second level cache where the forty eight byte
     /// one did not. The null takes part in the candidate table exactly as a key would: it holds a
     /// place while its count is above zero, and it is decremented with the rest.
-    fn numeric_frequency(&self, column: usize) -> Result<(Option<FrequencySummary>, Option<u64>)> {
-        let signed = match self.table.fields[column].ty {
-            LogicalType::TinyInt
-            | LogicalType::SmallInt
-            | LogicalType::Integer
-            | LogicalType::BigInt
-            | LogicalType::Date
-            | LogicalType::Timestamp => true,
-            LogicalType::UTinyInt
-            | LogicalType::USmallInt
-            | LogicalType::UInteger
-            | LogicalType::UBigInt => false,
-            _ => return Ok((None, None)),
+    ///
+    /// `count_distinct` is false for a column whose distinct count is taken in parts beside this,
+    /// see [`Self::numeric_distinct`], and then the count that comes back is `None`.
+    fn numeric_frequency(
+        &self,
+        column: usize,
+        count_distinct: bool,
+    ) -> Result<(Option<FrequencySummary>, Option<u64>)> {
+        let Some(signed) = integer_signed(&self.table.fields[column].ty) else {
+            return Ok((None, None));
         };
         let value_of = |bits: Option<u64>| match bits {
             None => FrequencyValue::Null,
@@ -2658,14 +2697,14 @@ impl Writer {
         // Rows arrive a run of equal values at a time, because a sorted column is runs and a flag
         // column is mostly one value, so a run is counted and inserted once rather than per row.
         let mut first = Candidates::default();
-        let mut distinct = distinct::ExactDistinct::new();
+        let mut distinct = count_distinct.then(distinct::ExactDistinct::new);
         let mut run = Run::default();
         self.visit_numeric(column, signed, |_, bits| {
             if let Some((bits, times)) = run.push(bits) {
                 first.add(bits, times);
             }
             if run.times == 1 {
-                if let Some(bits) = bits {
+                if let (Some(bits), Some(distinct)) = (bits, distinct.as_mut()) {
                     distinct.insert(bits);
                 }
             }
@@ -2689,7 +2728,7 @@ impl Writer {
             if lower.len() < FREQUENCY_BUILD_RANK
                 || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
             {
-                return Ok((None, distinct.count()));
+                return Ok((None, distinct.as_mut().and_then(distinct::ExactDistinct::count)));
             }
             // Counted beside the slot each candidate sits in, since the table is not changed again
             // and a lookup in it is the one probe the first pass made.
@@ -2762,8 +2801,57 @@ impl Writer {
         }
         Ok((
             Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries }),
-            distinct.count(),
+            distinct.as_mut().and_then(distinct::ExactDistinct::count),
         ))
+    }
+
+    /// Counts one part of a near unique column's distinct values, the part whose hashes fall in
+    /// share `part` of `parts`.
+    ///
+    /// Counting the distinct values was most of what the frequency pass cost on such a column, and
+    /// the pass is one column to a worker, so the phase lasted as long as the slowest of `WatchID`,
+    /// `UserID` and the other near unique columns of `hits` while the other workers had finished.
+    /// Every part reads and decodes the whole column and keeps only its share, which costs a decode
+    /// a part, about a twentieth of what the set costs, and lets the set be filled on as many
+    /// workers as there are parts.
+    fn numeric_distinct(
+        &self,
+        column: usize,
+        part: usize,
+        parts: usize,
+        total: Arc<AtomicUsize>,
+    ) -> Result<Option<u64>> {
+        let Some(signed) = integer_signed(&self.table.fields[column].ty) else {
+            return Ok(None);
+        };
+        let mut distinct = distinct::ExactDistinct::part(part, parts, total);
+        let mut last = None;
+        self.visit_numeric(column, signed, |_, bits| {
+            if bits != last {
+                last = bits;
+                if let Some(bits) = bits {
+                    distinct.insert(bits);
+                }
+            }
+        })?;
+        Ok(distinct.count())
+    }
+
+    /// How many parts a column's distinct count is split into, from the estimate the load's own
+    /// sketch holds for it.
+    ///
+    /// One for a column with fewer than [`DISTINCT_PER_PART`] distinct values, which is every
+    /// column whose set is small enough that splitting it would cost more in decodes than it saved.
+    fn distinct_parts(&self, column: usize) -> usize {
+        let estimate = self
+            .gathers
+            .get(column)
+            .and_then(Option::as_ref)
+            .and_then(stats::Gather::distinct)
+            .unwrap_or(0);
+        usize::try_from(estimate / DISTINCT_PER_PART)
+            .unwrap_or(MAX_DISTINCT_PARTS)
+            .clamp(1, MAX_DISTINCT_PARTS)
     }
 
     /// Hands every row of an integer column to `visit` as its ordinal and its sixty four bits, or
@@ -2848,27 +2936,12 @@ impl Writer {
     /// sits together in `hits`, so a worker that was handed the wrong six columns finishes long
     /// after one that was handed the right six and the whole phase waits for it.
     fn numeric_frequencies(&self) -> Result<Vec<(Option<FrequencySummary>, Option<u64>)>> {
-        let mut columns = self
+        let columns = self
             .table
             .fields
             .iter()
             .enumerate()
-            .filter_map(|(column, field)| {
-                matches!(
-                    field.ty,
-                    LogicalType::TinyInt
-                        | LogicalType::SmallInt
-                        | LogicalType::Integer
-                        | LogicalType::BigInt
-                        | LogicalType::UTinyInt
-                        | LogicalType::USmallInt
-                        | LogicalType::UInteger
-                        | LogicalType::UBigInt
-                        | LogicalType::Date
-                        | LogicalType::Timestamp
-                )
-                .then_some(column)
-            })
+            .filter_map(|(column, field)| integer_signed(&field.ty).map(|_| column))
             .collect::<Vec<_>>();
         let workers = std::thread::available_parallelism()
             .map_or(1, usize::from)
@@ -2879,14 +2952,36 @@ impl Writer {
             let _timing = profile.map(|profile| profile.span(Stage::Publish));
             let mut frequencies = vec![(None, None); self.table.fields.len()];
             for column in columns {
-                frequencies[column] = self.numeric_frequency(column)?;
+                frequencies[column] = self.numeric_frequency(column, true)?;
             }
             return Ok(frequencies);
         }
-        // Popped from the back, so the expensive columns are the ones taken first and the cheap ones
-        // are what is left to fill in behind them.
-        columns.sort_by_key(|&column| weight(&self.table.fields[column].ty));
-        let queue = Mutex::new(columns);
+        // A near unique column goes in as its frequency pass and its distinct count in parts, and
+        // those go first, since they are the ones the phase would otherwise wait for. The rest are
+        // popped from the back as well, so the expensive columns are the ones taken first and the
+        // cheap ones are what is left to fill in behind them.
+        let mut work = Vec::new();
+        let mut totals = vec![None; self.table.fields.len()];
+        for &column in &columns {
+            let parts = self.distinct_parts(column);
+            let weight = weight(&self.table.fields[column].ty);
+            if parts == 1 {
+                work.push((false, weight, Work::Column { column, distinct: true }));
+                continue;
+            }
+            let total = Arc::new(AtomicUsize::new(0));
+            work.push((true, weight, Work::Column { column, distinct: false }));
+            for part in 0..parts {
+                work.push((
+                    true,
+                    weight,
+                    Work::Distinct { column, part, parts, total: total.clone() },
+                ));
+            }
+            totals[column] = Some(total);
+        }
+        work.sort_by_key(|(split, weight, _)| (*split, *weight));
+        let queue = Mutex::new(work.into_iter().map(|(_, _, work)| work).collect::<Vec<_>>());
         let pieces = std::thread::scope(|scope| {
             (0..workers)
                 .map(|_| {
@@ -2898,8 +2993,16 @@ impl Writer {
                                 .lock()
                                 .map_err(|_| Error::internal("a native frequency worker panicked"))?
                                 .pop();
-                            let Some(column) = taken else { break };
-                            mine.push((column, self.numeric_frequency(column)?));
+                            let Some(work) = taken else { break };
+                            mine.push(match work {
+                                Work::Column { column, distinct } => {
+                                    Done::Column(column, self.numeric_frequency(column, distinct)?)
+                                }
+                                Work::Distinct { column, part, parts, total } => Done::Distinct(
+                                    column,
+                                    self.numeric_distinct(column, part, parts, total)?,
+                                ),
+                            });
                         }
                         Ok(mine)
                     })
@@ -2914,9 +3017,26 @@ impl Writer {
                 .collect::<Result<Vec<_>>>()
         })?;
         let mut frequencies = vec![(None, None); self.table.fields.len()];
+        // A split column's count is the sum of its parts, and nothing if any part gave up.
+        let mut counts: Vec<Option<Option<u64>>> =
+            totals.iter().map(|total| total.as_ref().map(|_| Some(0))).collect();
         for piece in pieces {
-            for (column, summary) in piece {
-                frequencies[column] = summary;
+            for done in piece {
+                match done {
+                    Done::Column(column, summary) => {
+                        frequencies[column] = summary;
+                    }
+                    Done::Distinct(column, part) => {
+                        if let Some(count) = &mut counts[column] {
+                            *count = count.zip(part).map(|(count, part)| count + part);
+                        }
+                    }
+                }
+            }
+        }
+        for (column, count) in counts.into_iter().enumerate() {
+            if let Some(count) = count {
+                frequencies[column].1 = count;
             }
         }
         Ok(frequencies)
@@ -13579,6 +13699,38 @@ mod tests {
                 assert!(table.position(bits).is_some(), "seed {seed} lost {bits}");
             }
         }
+    }
+
+    #[test]
+    fn a_near_unique_column_is_counted_in_parts_to_the_same_answer() {
+        // Enough distinct values that the sketch sends the count to two workers, with a zero, a
+        // null and repeats in it, which are the values a part could count twice or not at all.
+        let rows = 2 * DISTINCT_PER_PART as usize + 300_000;
+        let values = (0..rows)
+            .map(|row| match row % 1_000 {
+                0 => None,
+                1 => Some(0),
+                2 => Some(7),
+                _ => Some((row as i64).wrapping_mul(0x0123_4567_89AB_CDEF)),
+            })
+            .collect::<Vec<_>>();
+        let distinct = values.iter().flatten().collect::<std::collections::HashSet<_>>().len() as u64;
+        let path = path("distinct-parts");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("id", LogicalType::BigInt)])
+                .expect("new file");
+        for part in values.chunks(8_192) {
+            let values = part.iter().map(|value| value.map_or(Value::Null, Value::BigInt));
+            let vector = Vector::from_values(LogicalType::BigInt, &values.collect::<Vec<_>>())
+                .expect("big integers");
+            writer.append(&Chunk::new(vec![vector]).expect("one column")).expect("one stripe");
+        }
+        writer.flush_pending().expect("flushed");
+        assert_eq!(writer.distinct_parts(0), 2, "the column was not split");
+        writer.finish().expect("finish");
+        let catalog = Catalog::open(&path).expect("catalog");
+        assert_eq!(catalog.entries[0].distincts, vec![Some(distinct)]);
+        fs::remove_file(path).expect("remove scratch file");
     }
 
     #[test]

@@ -1164,6 +1164,12 @@ impl Gather {
         self.counts.absorb(later.counts);
     }
 
+    /// How many distinct values the column holds, exactly or as the sketch estimates it, or `None`
+    /// for a column that went blind.
+    pub(crate) fn distinct(&self) -> Option<u64> {
+        self.counts.distinct(0).map(|(count, _)| count)
+    }
+
     /// How many rows went past, which is what the caller checks against the table's own count.
     pub(crate) fn rows(&self) -> u64 {
         self.pass.rows

@@ -18,6 +18,9 @@
 //! column rather than shared across the frequency workers, so the file a load writes does not depend
 //! on which worker reached which column first.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// The most slots one column's sets may hold between them, which is 256 MiB of keys.
 ///
 /// At the load factor below that is a little over twenty nine million distinct values, which covers
@@ -64,6 +67,11 @@ fn hash(value: u64) -> u64 {
 }
 
 /// An exact set of one column's distinct non-null values, or the record that there were too many.
+///
+/// Or of the part of them whose hashes fall in one range of the sets, which is how a near unique
+/// column is counted on several workers at once. The parts share the running total, so the cap is
+/// on the column and not on the part: a column gives up at the same count split or whole, and a
+/// part stops holding its table as soon as any part has seen the column pass it.
 #[derive(Debug)]
 pub(crate) struct ExactDistinct {
     /// One open addressed set per top eight bits of the hash. Zero marks an empty slot, so a zero
@@ -74,21 +82,43 @@ pub(crate) struct ExactDistinct {
     /// [`BUFFERED`] hashes per set waiting to go in, and how many of each are there.
     buffered: Vec<u64>,
     waiting: Vec<u8>,
+    /// The sets this part counts, as a half open range of set numbers.
+    from: usize,
+    to: usize,
     zero: bool,
     len: usize,
+    /// How many values every part of the column has placed between them.
+    total: Arc<AtomicUsize>,
     /// Set when the cap was passed. The sets are released at that point rather than at the end.
     gave_up: bool,
 }
 
 impl ExactDistinct {
     pub(crate) fn new() -> Self {
+        Self::part(0, 1, Arc::default())
+    }
+
+    /// Part `part` of `parts` of one column's set, sharing `total` with the others.
+    ///
+    /// Each part keeps the sets in its share of the range and lets every other value go past, so
+    /// the parts together hold what one whole set would, and their counts add up to its count. The
+    /// zero is counted by the first part only, for the same reason.
+    pub(crate) fn part(part: usize, parts: usize, total: Arc<AtomicUsize>) -> Self {
+        let (from, to) = (SETS * part / parts, SETS * (part + 1) / parts);
         Self {
-            sets: vec![vec![0; FIRST_SLOTS]; SETS],
+            sets: (0..SETS)
+                .map(
+                    |set| if (from..to).contains(&set) { vec![0; FIRST_SLOTS] } else { Vec::new() },
+                )
+                .collect(),
             held: vec![0; SETS],
             buffered: vec![0; SETS * BUFFERED],
             waiting: vec![0; SETS],
+            from,
+            to,
             zero: false,
             len: 0,
+            total,
             gave_up: false,
         }
     }
@@ -99,11 +129,14 @@ impl ExactDistinct {
             return;
         }
         if value == 0 {
-            self.zero = true;
+            self.zero = self.from == 0;
             return;
         }
         let hash = hash(value);
         let set = (hash >> (64 - SET_BITS)) as usize;
+        if set < self.from || set >= self.to {
+            return;
+        }
         let waiting = usize::from(self.waiting[set]);
         self.buffered[set * BUFFERED + waiting] = hash;
         self.waiting[set] = (waiting + 1) as u8;
@@ -113,8 +146,12 @@ impl ExactDistinct {
     }
 
     /// The count, or `None` for a column that went past the cap.
+    ///
+    /// For a part this is the part's own count. The parts of a column that did not give up add up
+    /// to the column's count, and a column that went past the cap has at least one part that says
+    /// so, the one whose values took the total over it.
     pub(crate) fn count(&mut self) -> Option<u64> {
-        for set in 0..SETS {
+        for set in self.from..self.to {
             if self.gave_up {
                 break;
             }
@@ -126,18 +163,20 @@ impl ExactDistinct {
     /// Moves one set's waiting hashes into it.
     ///
     /// Whether a column gives up depends only on how many distinct values it has, never on the
-    /// order they were drained in, because the count only goes up and the cap is on the total.
+    /// order they were drained in or on how the column was split, because the total only goes up
+    /// and the cap is on the total.
     fn drain(&mut self, set: usize) {
         let waiting = usize::from(std::mem::take(&mut self.waiting[set]));
         let from = set * BUFFERED;
         touch(&self.sets[set], &self.buffered[from..from + waiting]);
+        let mut added = 0;
         for at in from..from + waiting {
             let hash = self.buffered[at];
             if !place(&mut self.sets[set], hash) {
                 continue;
             }
             self.held[set] += 1;
-            self.len += 1;
+            added += 1;
             if full(self.held[set], self.sets[set].len()) {
                 let wanted = self.sets[set].len() * 2;
                 let old = std::mem::replace(&mut self.sets[set], vec![0; wanted]);
@@ -146,7 +185,13 @@ impl ExactDistinct {
                 }
             }
         }
-        if self.len >= MAX_DISTINCT {
+        self.len += added;
+        let total = if added == 0 {
+            self.total.load(Ordering::Relaxed)
+        } else {
+            self.total.fetch_add(added, Ordering::Relaxed) + added
+        };
+        if total >= MAX_DISTINCT {
             self.gave_up = true;
             self.sets = Vec::new();
             self.buffered = Vec::new();
@@ -229,5 +274,49 @@ mod tests {
         set.insert(MAX_DISTINCT as u64);
         assert_eq!(set.count(), None, "counted past the cap");
         assert!(set.sets.is_empty(), "a column that gave up still holds its table");
+    }
+
+    #[test]
+    fn the_parts_of_a_split_column_add_up_to_the_whole() {
+        let whole = |values: &[u64]| {
+            let mut set = ExactDistinct::new();
+            values.iter().for_each(|&value| set.insert(value));
+            set.count()
+        };
+        let values = (0..200_000_u64)
+            .map(|value| (value % 70_001).wrapping_mul(0x0123_4567_89AB_CDEF))
+            .collect::<Vec<_>>();
+        for parts in [1, 2, 3, 8] {
+            let total = Arc::new(AtomicUsize::new(0));
+            let mut sum = 0;
+            for part in 0..parts {
+                let mut set = ExactDistinct::part(part, parts, total.clone());
+                values.iter().for_each(|&value| set.insert(value));
+                sum += set.count().expect("under the cap");
+            }
+            assert_eq!(Some(sum), whole(&values), "{parts} parts");
+        }
+    }
+
+    #[test]
+    fn a_split_column_past_the_cap_records_nothing_in_any_part() {
+        // The cap is on the column, so the parts together give up where the whole would have, and
+        // every part says so once one of them has taken the total over it.
+        let total = Arc::new(AtomicUsize::new(0));
+        let mut parts =
+            (0..4).map(|part| ExactDistinct::part(part, 4, total.clone())).collect::<Vec<_>>();
+        for value in 0..MAX_DISTINCT as u64 {
+            for part in &mut parts {
+                part.insert(value);
+            }
+        }
+        let counts = parts.iter_mut().map(ExactDistinct::count).collect::<Vec<_>>();
+        assert_eq!(counts.iter().copied().sum::<Option<u64>>(), Some(MAX_DISTINCT as u64));
+        for part in &mut parts {
+            part.insert(MAX_DISTINCT as u64);
+        }
+        for part in &mut parts {
+            assert_eq!(part.count(), None, "a part counted past the cap");
+        }
     }
 }
