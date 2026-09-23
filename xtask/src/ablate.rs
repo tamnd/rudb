@@ -67,6 +67,11 @@
 //! floor of the run, and a fired delta smaller than it is not a result. That column is the reason
 //! this tool prints two numbers rather than one.
 //!
+//! The third is the same share over the summed time of the whole suite. Claim S5 of document 09 is
+//! killed by the ClickBench total not moving, and a total is not something a median can be read off:
+//! a rule worth a fifth on the three shortest queries has moved the median and has moved the suite
+//! by almost nothing. The milestones ask for both, so both are printed.
+//!
 //! # What is not here
 //!
 //! The space and the build cost of the statistic each rule consumes, which section 9.4 also asks for
@@ -119,6 +124,14 @@ struct Row {
     earned: Vec<f64>,
     /// The deltas on the queries where the plan did not change, which is the noise floor.
     floor: Vec<f64>,
+    /// Milliseconds the whole suite took with the rule on, summed over every query that was timed.
+    ///
+    /// Summed and not medianed, because the claim this answers is about the total. A rule that is
+    /// worth a tenth on three short queries and nothing on the long one has moved the median and has
+    /// not moved the suite, and section 9.4's question is which of those happened.
+    on: f64,
+    /// Milliseconds the same queries took with the rule off.
+    off: f64,
 }
 
 /// Loads the file, then runs the suite once per rule and prints the table.
@@ -164,10 +177,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
 
     println!(
-        "{:<28}{:>7}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}",
-        "rule", "fired", "quiet", "tied", "cut", "wrong", "median", "floor"
+        "{:<28}{:>7}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}{:>10}",
+        "rule", "fired", "quiet", "tied", "cut", "wrong", "median", "floor", "suite"
     );
-    println!("{}", "-".repeat(83));
+    println!("{}", "-".repeat(93));
     let mut rows = Vec::new();
     for rule in Rule::ALL {
         // The graph sections start off rather than on, so turning them off ablates nothing, and this
@@ -177,7 +190,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         }
         let row = ablate(&database, rule, &baseline, repeats);
         println!(
-            "{:<28}{:>7}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}",
+            "{:<28}{:>7}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}{:>10}",
             rule.name(),
             row.fired.len(),
             row.quiet,
@@ -186,13 +199,18 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
             row.differ.len() + row.broke.len(),
             percent(median(&row.earned)),
             percent(median(&row.floor)),
+            percent(suite(&row)),
         );
         rows.push((rule, row));
     }
-    println!("{}", "-".repeat(83));
+    println!("{}", "-".repeat(93));
     println!(
         "median is over the queries the rule fired on and floor is over the ones it left alone, \
          both as the share of the run without the rule that the rule takes off"
+    );
+    println!(
+        "suite is the same share of the summed time of every query timed, which is the total \
+         claim S5 of spec/stats/09-measurement.md is killed by not moving"
     );
     println!(
         "tied is the same rows in another order and cut is a different set of the rows tied at the \
@@ -336,6 +354,8 @@ fn ablate(database: &Database, rule: Rule, baseline: &[Query], repeats: usize) -
             }
         }
         let delta = delta(pair.on, pair.off);
+        row.on += pair.on;
+        row.off += pair.off;
         if planned == query.plan {
             row.quiet += 1;
             row.floor.push(delta);
@@ -561,6 +581,19 @@ fn delta(on: f64, off: f64) -> f64 {
     (off - on) / off
 }
 
+/// What the rule took off the whole suite, or nothing when nothing was timed.
+///
+/// The same share the other two columns report, over the summed time of every query rather than over
+/// one query at a time. This is the column that answers claim S5, and it is a different question
+/// from the median beside it: the median says what a typical query the rule touched got, and this
+/// says whether the suite is faster, which is what somebody running the suite would notice.
+fn suite(row: &Row) -> Option<f64> {
+    if row.off <= 0.0 {
+        return None;
+    }
+    Some(delta(row.on, row.off))
+}
+
 /// The middle of a list of deltas, or nothing when the list is empty.
 ///
 /// The median and not the mean, because one query that spilled differently is enough to move a mean
@@ -703,7 +736,8 @@ fn say(error: rudb_common::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Answer, Query, Rule, compare, delta, fingerprint, median, percent, switch, unlimited,
+        Answer, Query, Row, Rule, compare, delta, fingerprint, median, percent, suite, switch,
+        unlimited,
     };
 
     /// A baseline query that answered those rows, and that either was or was not reproducible.
@@ -819,6 +853,22 @@ mod tests {
         assert_eq!(median(&[0.25]), Some(0.25));
         assert_eq!(median(&[0.4, 0.1, 0.3]), Some(0.3));
         assert_eq!(median(&[0.0, 0.1, 0.3, 0.4]), Some(0.2));
+    }
+
+    #[test]
+    fn the_suite_column_is_the_total_and_not_the_middle_of_the_queries() {
+        // Three queries the rule halved and one long one it left alone. Every query the rule touched
+        // got a half off, so the median says a half, and the suite is 30 ms out of 1030 and says
+        // three percent. That gap is the whole reason the column is there.
+        let row = Row { on: 1000.0 + 3.0 * 10.0, off: 1000.0 + 3.0 * 20.0, ..Row::default() };
+        let taken = suite(&row).expect("a row with time on both sides has a share");
+        assert!((taken - 30.0 / 1060.0).abs() < 1e-9, "{taken}");
+        assert!(taken < 0.05, "the suite barely moved even though every query the rule hit halved");
+    }
+
+    #[test]
+    fn a_rule_that_was_never_timed_has_no_suite_share_rather_than_a_zero() {
+        assert_eq!(suite(&Row::default()), None);
     }
 
     #[test]
