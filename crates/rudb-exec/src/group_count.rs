@@ -267,11 +267,8 @@ fn count_partition(runs: Vec<Run>, bound: usize, memory: &Memory) -> Result<Vec<
     let mut output = Vec::new();
     // Without splitting, the runs of every instance are one split between them and share a table.
     let groups_of = |parts: &[Run]| parts.iter().map(Run::len).sum::<usize>();
-    let batches: Vec<Vec<Run>> = if splits == 1 {
-        vec![parts]
-    } else {
-        parts.into_iter().map(|part| vec![part]).collect()
-    };
+    let batches: Vec<Vec<Run>> =
+        if splits == 1 { vec![parts] } else { parts.into_iter().map(|part| vec![part]).collect() };
     for batch in batches {
         let rows = groups_of(&batch);
         let size = rows.saturating_mul(2).max(64).next_power_of_two();

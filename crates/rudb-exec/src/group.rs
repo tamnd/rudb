@@ -4493,7 +4493,9 @@ impl Sink for Aggregate<'_> {
         }
         if self.counted_top_count() {
             let [key] = rows.keys.as_slice() else {
-                return Err(Error::internal("a counted radix exchange received the wrong key width"));
+                return Err(Error::internal(
+                    "a counted radix exchange received the wrong key width",
+                ));
             };
             group_count::Exchange::buffer(
                 &self.counted,
