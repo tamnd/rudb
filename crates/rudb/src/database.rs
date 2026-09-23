@@ -2990,9 +2990,52 @@ mod tests {
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
     use super::{
-        Database, native_nonzero_shape, native_single_average_shape, native_single_distinct_shape,
-        native_three_aggregate_shape, publish,
+        Database, FIRST_STRIPES, Gathering, native_nonzero_shape, native_single_average_shape,
+        native_single_distinct_shape, native_three_aggregate_shape, publish,
     };
+
+    /// A stripe that would take the rows past the budget waits for one to be given back, and a
+    /// stripe that fails before it is gathered gives its share back too.
+    #[test]
+    fn a_stripe_past_the_row_budget_waits_for_one_to_finish() {
+        let gathering = Gathering::new(FIRST_STRIPES * 100);
+        let first: Vec<_> = (0..FIRST_STRIPES).map(|_| gathering.share()).collect();
+        let (told, heard) = mpsc::channel();
+        let waiting = {
+            let gathering = std::sync::Arc::clone(&gathering);
+            std::thread::spawn(move || {
+                let share = gathering.share();
+                told.send(share.charge).unwrap();
+            })
+        };
+        assert!(heard.recv_timeout(Duration::from_millis(100)).is_err(), "the budget is full");
+        let mut shares = first.into_iter();
+        let mut finished = shares.next().unwrap();
+        finished.gathered = 300;
+        drop(finished);
+        assert!(
+            heard.recv_timeout(Duration::from_millis(100)).is_err(),
+            "one stripe of 300 does not fit in the 100 given back"
+        );
+        drop(shares.next());
+        drop(shares.next());
+        assert_eq!(heard.recv_timeout(Duration::from_secs(10)).unwrap(), 300);
+        waiting.join().unwrap();
+        drop(shares);
+        let counts = gathering.counts.lock().unwrap();
+        assert_eq!((counts.open, counts.charged), (0, 0), "every share was given back");
+    }
+
+    /// One stripe always gets in, so a budget smaller than a stripe loads a stripe at a time.
+    #[test]
+    fn a_stripe_larger_than_the_budget_still_loads_alone() {
+        let gathering = Gathering::new(10);
+        let mut share = gathering.share();
+        share.gathered = 1_000;
+        drop(share);
+        let share = gathering.share();
+        assert_eq!(share.charge, 1_000);
+    }
 
     #[test]
     fn cold_distinct_shape_accepts_only_a_direct_count() {
