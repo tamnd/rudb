@@ -1455,7 +1455,20 @@ impl Vector {
         if width == 0 || width > PACKED_WIDTH_MAX {
             return Ok(self.clone());
         }
-        if words_for(self.len, width) * size_of::<u64>() * PACKING_PAYS_AT > data.footprint() {
+        // Against the bytes the rows take and not the footprint, because a window of a shared page
+        // reports its share of the page. That made the answer, and so the file a load writes,
+        // depend on how big the page was and how many readers it had.
+        if words_for(self.len, width) * size_of::<u64>() * PACKING_PAYS_AT
+            > flat_bytes(data, self.len)
+        {
+            return Ok(self.clone());
+        }
+        // A range can fit the type while the width that covers it does not: `-2^31 + 5` to
+        // `2^31 - 9` needs 32 bits, and 32 bits up from the low end runs past `i32::MAX`. The
+        // packed form checks both ends of what its width can say, so this is a column it cannot
+        // hold, and the answer is to leave it flat rather than fail the caller.
+        let top = low + i128::from(u64::MAX >> (64 - width));
+        if layout_range(&self.ty).is_none_or(|(_, highest)| top > highest) {
             return Ok(self.clone());
         }
         let words = pack(data, self.len, low, width);
@@ -3363,6 +3376,19 @@ fn layout_range(ty: &LogicalType) -> Option<(i128, i128)> {
     crate::for_each_layout!(exact, ranges)
 }
 
+/// The bytes the first `len` slots of a run take laid flat, whether the run is owned or a window.
+fn flat_bytes(data: &Data, len: usize) -> usize {
+    macro_rules! widths {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                Data::Empty => 0,
+                $(Data::$variant(_) => len * size_of::<$native>(),)+
+            }
+        };
+    }
+    crate::for_each_layout!(all, widths)
+}
+
 /// The lowest and highest value in the first `len` slots of a run of integer data.
 ///
 /// `None` for data that is not integers, which is what says a column cannot be packed. The null
@@ -5158,6 +5184,32 @@ mod tests {
                 signed_of(&sequence.value_at(index)),
                 "sequence {index}"
             );
+        }
+    }
+
+    /// A window of a shared page packs exactly when the same rows owned would, and a range its
+    /// type cannot hold at the width it needs stays flat rather than failing. A load of ClickBench
+    /// `hits` hit both: its windows were judged by their share of the page, packed at 32 bits, and
+    /// the packed form refused a range that ran past `i32::MAX`.
+    #[test]
+    fn a_window_of_a_page_packs_the_way_the_same_rows_owned_do() {
+        let wide: Vec<i32> = (0..122_880)
+            .map(|at| if at % 2 == 0 { i32::MIN + 5 + at } else { i32::MAX - 9 - at })
+            .collect();
+        let narrow: Vec<i32> = (0..122_880).map(|at| 1_000 + at % 200).collect();
+        for values in [wide, narrow] {
+            let page = integers(&values).into_pages();
+            let window = page.slice(0, 8_192).unwrap();
+            let owned = integers(&values[..8_192]);
+            let packed_window = window.bit_packed().unwrap();
+            let packed_owned = owned.bit_packed().unwrap();
+            assert_eq!(
+                packed_window.packed_parts().is_some(),
+                packed_owned.packed_parts().is_some()
+            );
+            for at in [0, 1, 4_095, 8_191] {
+                assert_eq!(packed_window.value_at(at), owned.value_at(at));
+            }
         }
     }
 
