@@ -872,6 +872,9 @@ fn binary(
             return Ok(Some(moved));
         }
     }
+    if name == "__rudb_stamp_seconds" {
+        return stamp_seconds_of(left, right, returns);
+    }
     if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
         return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
     }
@@ -995,6 +998,78 @@ fn shift_of(
         return Ok(None);
     };
     by_form!(left, right, shift_runs, subtract, stamp_first, left, right, returns)
+}
+
+/// `stamp + to_seconds(CAST(count AS DOUBLE))` with a whole count, which the prepared expression
+/// writes as one call to `__rudb_stamp_seconds` so the doubles and the intervals in between are
+/// never built.
+///
+/// The benchmark view's `EventTime` is this, and on ClickBench 43 the cast, the interval and the
+/// shift were three passes and three vectors for every row the filter kept. A count of seconds
+/// under 2^53 microseconds is exact as a double and exact once multiplied, so it is the integer
+/// product. Anything larger takes the double the way the three calls would have.
+fn stamp_seconds(stamp: i64, count: i64) -> Result<i64> {
+    const EXACT: u64 = (1 << 53) / datetime::MICROS_PER_SECOND.unsigned_abs();
+    if count.unsigned_abs() <= EXACT {
+        return datetime::nudged_stamp(stamp, count * datetime::MICROS_PER_SECOND);
+    }
+    #[expect(clippy::cast_precision_loss, reason = "the double is what the cast would have made")]
+    let (_, _, micros) = datetime::interval("to_seconds", Count::Real(count as f64))?;
+    datetime::nudged_stamp(stamp, micros)
+}
+
+/// [`stamp_seconds`] over runs of timestamps and counts.
+fn stamp_seconds_of(
+    stamp: &Vector,
+    count: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    if returns != &LogicalType::Timestamp || stamp.logical_type() != &LogicalType::Timestamp {
+        return Ok(None);
+    }
+    by_form!(stamp, count, stamp_seconds_runs, stamp, count, returns)
+}
+
+/// The loop under [`stamp_seconds_of`], once each side's form has been turned into a mapping.
+fn stamp_seconds_runs<S, C>(
+    stamps: &Data,
+    at_stamp: S,
+    counts: &Data,
+    at_count: C,
+    stamp: &Vector,
+    count: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>>
+where
+    S: Fn(usize) -> usize,
+    C: Fn(usize) -> usize,
+{
+    let Data::Int64(stamps) = stamps else {
+        return Ok(None);
+    };
+    let rows = stamp.len();
+    let base = nulls_of(stamp).and(&nulls_of(count), rows);
+    let mut out = vec![0i64; rows];
+    macro_rules! over {
+        ($counts:expr) => {
+            over_valid(rows, base, |index| {
+                let seconds = i64::from($counts[at_count(index)]);
+                out[index] = stamp_seconds(stamps[at_stamp(index)], seconds)?;
+                Ok(())
+            })?
+        };
+    }
+    let validity = match counts {
+        Data::Int64(counts) => over!(counts),
+        Data::Int32(counts) => over!(counts),
+        Data::Int16(counts) => over!(counts),
+        Data::Int8(counts) => over!(counts),
+        Data::UInt32(counts) => over!(counts),
+        Data::UInt16(counts) => over!(counts),
+        Data::UInt8(counts) => over!(counts),
+        _ => return Ok(None),
+    };
+    finish(returns, Data::Int64(out.into()), validity)
 }
 
 /// A date with a count of days added to it or taken off it, over runs of both.
@@ -2676,6 +2751,19 @@ pub fn call_values(
 ) -> Result<Value> {
     if let ("__rudb_zero_to_null", [value]) = (name, args) {
         return Ok(if approximate(value) == Some(0.0) { Value::Null } else { value.clone() });
+    }
+    if let ("__rudb_stamp_seconds", [stamp, count]) = (name, args) {
+        if stamp.is_null() || count.is_null() {
+            return Ok(Value::Null);
+        }
+        let (Value::Timestamp(stamp), Some(count)) = (stamp, count.as_i64()) else {
+            return Err(Error::internal(format!(
+                "{name} of a {} and a {}",
+                stamp.logical_type(),
+                count.logical_type()
+            )));
+        };
+        return stamp_seconds(*stamp, count).map(Value::Timestamp);
     }
     if name == "coalesce" {
         let found = args.iter().find(|value| !value.is_null());

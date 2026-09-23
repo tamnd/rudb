@@ -1081,6 +1081,16 @@ impl Prepared {
                 return Ok(self.place(plan, expr, step, ty));
             }
         }
+        if let Some((stamp, count)) = stamped_seconds(plan, expr) {
+            let (start, len) = self.push_list(plan, &[stamp, count], schema)?;
+            let step = Step::Function {
+                recipe: Recipe::new("__rudb_stamp_seconds", &self.literals(start, len)),
+                written: written(plan, expr, schema),
+                start,
+                len,
+            };
+            return Ok(self.place(plan, expr, step, ty));
+        }
         let step = match *plan.expr(expr) {
             Expr::Column(binding) => {
                 let position = schema.position_of(binding).ok_or_else(|| {
@@ -1303,6 +1313,39 @@ impl Prepared {
 /// and a call, which is TPC-H query 22 asking whether the first two digits of a phone number are in
 /// a list. Anything else answers no, which costs a fold that could have happened rather than a wrong
 /// one. The walk is bounded by the size of the subject and a subject is small.
+/// The timestamp and the whole count of `stamp + to_seconds(CAST(count AS DOUBLE))`, the shape the
+/// benchmark view writes `INTERVAL (EventTime) SECOND` in, and `None` for anything else.
+///
+/// It runs as one call, [`rudb_kernels`]'s `__rudb_stamp_seconds`, rather than as a cast to a
+/// double, an interval per row and a shift by it.
+fn stamped_seconds(plan: &Plan, expr: ExprRef) -> Option<(ExprRef, ExprRef)> {
+    let Expr::Function { name, args } = *plan.expr(expr) else { return None };
+    if plan.string(name) != "+" || plan.expr_type(expr) != &LogicalType::Timestamp {
+        return None;
+    }
+    let &[one, other] = plan.expr_list(args) else { return None };
+    let (stamp, interval) =
+        if plan.expr_type(one) == &LogicalType::Timestamp { (one, other) } else { (other, one) };
+    if plan.expr_type(stamp) != &LogicalType::Timestamp {
+        return None;
+    }
+    let Expr::Function { name, args } = *plan.expr(interval) else { return None };
+    let &[cast] = plan.expr_list(args) else { return None };
+    let Expr::Cast { input, try_cast: false } = *plan.expr(cast) else { return None };
+    let whole = matches!(
+        plan.expr_type(input),
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+    );
+    (plan.string(name) == "to_seconds" && plan.expr_type(cast) == &LogicalType::Double && whole)
+        .then_some((stamp, input))
+}
+
 fn same(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
     if left == right {
         return true;
@@ -1635,6 +1678,53 @@ mod tests {
         let fused = fused.expect("fits");
         assert_eq!(fused, unfused.expect("fits"));
         assert_eq!(fused, walked.expect("fits"));
+    }
+
+    /// The epoch plus a whole count of seconds runs as one call, and agrees with the cast, the
+    /// interval and the shift it stands for, on both sides of the count where the double stops
+    /// being exact and on a count that takes the answer out of range.
+    #[test]
+    fn a_timestamp_plus_whole_seconds_agrees_with_the_interval_it_stands_for() {
+        let schema = Schema::numbered(vec![Field::new("x", LogicalType::BigInt)], 0);
+        let counts = [
+            Value::BigInt(1_373_000_000),
+            Value::BigInt(-5),
+            Value::Null,
+            Value::BigInt(9_007_199_254),
+            Value::BigInt(9_007_199_255),
+            Value::BigInt(9_000_000_000_123),
+        ];
+        let x = Vector::from_values(LogicalType::BigInt, &counts).expect("six counts");
+        let chunk = Chunk::new(vec![x]).expect("one column");
+        let text = "Project #1 [\"+\"(0::TIMESTAMP, to_seconds(CAST(#0.0::BIGINT)::DOUBLE)::INTERVAL)::TIMESTAMP AS e]\n  Get memory.main.t AS t #0 [x::BIGINT]";
+        let plan = Plan::parse(text).expect("a well formed plan");
+        let Node::Project { exprs, .. } = *plan.node(plan.root()) else {
+            panic!("the root of that text is a projection");
+        };
+        let list = plan.expr_list(exprs).to_vec();
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the expression resolves");
+        assert!(
+            prepared.steps.iter().any(
+                |step| matches!(step, super::Step::Function { recipe, .. } if recipe.name() == "__rudb_stamp_seconds")
+            ),
+            "the shift is one call"
+        );
+        let mut scratch = prepared.scratch();
+        let mut fast = Vec::new();
+        prepared.evaluate(&chunk, &mut scratch, &mut fast).expect("the prepared form runs");
+        let slow = evaluate(&plan, list[0], &schema, &chunk).expect("the tree walk runs");
+        for row in 0..chunk.len() {
+            assert_eq!(fast[0].value_at(row), slow.value_at(row), "row {row}");
+        }
+        assert_eq!(fast[0].value_at(0), Value::Timestamp(1_373_000_000_000_000));
+
+        let far = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(9_300_000_000_000)])
+            .expect("one count");
+        let chunk = Chunk::new(vec![far]).expect("one column");
+        let mut fast = Vec::new();
+        let fused = prepared.evaluate(&chunk, &mut scratch, &mut fast);
+        let slow = evaluate(&plan, list[0], &schema, &chunk).map(|_| ());
+        assert!(fused.is_err() && slow.is_err(), "past the last timestamp both raise");
     }
 
     #[test]
