@@ -48,10 +48,17 @@
 //! # The shape a sink has
 //!
 //! [`Sort`] is a [`Sink`], so the rows arrive through `sink`, one instance's rows are handed over
-//! through `combine`, and `finalize` does the sort once after every instance has combined. On one
-//! thread that is the same work in the same order as reading the input in a loop would be. On
-//! several it is the shape that makes the sort possible at all, and having it now is why F4 changes
-//! no operator.
+//! through `combine`, and `finalize` runs once after every instance has combined. On one thread
+//! that is the same work in the same order as reading the input in a loop would be. On several it
+//! is the shape that makes the sort possible at all, and having it now is why F4 changes no
+//! operator.
+//!
+//! On the normalized arm each instance sorts its own rows in `combine`, on its own thread, and
+//! `finalize` merges the sorted runs. The instances run out of input at about the same time, so
+//! their sorts run side by side rather than one sort of everything running after the last of them
+//! has finished. On SF1 `lineitem` that took the sort from 125ms to 150ms after the scan down to a
+//! merge of about 30ms, with each instance's own sort taking 70ms to 100ms while the others did the
+//! same. The valued arm is still sorted once in `finalize`.
 //!
 //! The finished chunks go into a [`Sorted`], which is a separate source rather than something
 //! `finalize` hands back, for the reason [`Sink::finalize`] gives.
@@ -189,6 +196,16 @@ struct Combined {
     chunks: Vec<Chunk>,
     /// One entry a row, pointing into `chunks`.
     rows: Keyed,
+    /// Where each instance's rows start in `rows`, which on the normalized arm are in order within
+    /// each instance already, because an instance sorts its own before it combines.
+    runs: Vec<usize>,
+}
+
+impl Combined {
+    /// Nothing held, with rows of the same arm as `rows`.
+    fn empty(rows: &Keyed) -> Self {
+        Self { chunks: Vec::new(), rows: rows.empty(), runs: Vec::new() }
+    }
 }
 
 /// The rows of a sort, with their keys held whichever way this key list allows.
@@ -260,19 +277,6 @@ impl Keyed {
                 rows.sort_by(|left, right| settled(keys, left, right, &mut failure));
                 failure.map_or(Ok(()), Err)
             }
-        }
-    }
-
-    /// The same order as [`Keyed::sort`], put in place on the lease's threads.
-    ///
-    /// Only the normalized arm is spread. The valued arm compares through a function that can fail
-    /// and is left on this thread, which is also where it would be for the types it covers anyway.
-    fn sort_across(&mut self, keys: &[SortKey], threads: &Lease<'_>) -> Result<()> {
-        match self {
-            Self::Normal(rows) => spread(rows, threads, |left, right| {
-                left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
-            }),
-            Self::Valued(_) => self.sort(keys),
         }
     }
 
@@ -394,7 +398,7 @@ impl Sort {
             keys,
             types: input.types(),
             memory: memory.clone(),
-            gathered: Mutex::new(Combined { chunks: Vec::new(), rows }),
+            gathered: Mutex::new(Combined { chunks: Vec::new(), rows, runs: Vec::new() }),
             charged: Mutex::new(Vec::new()),
             held: Mutex::new(memory.reservation()),
             runs: Mutex::new(Vec::new()),
@@ -449,8 +453,8 @@ impl Sort {
     /// them. What is left in it afterwards is whatever rounding the give back did not account for,
     /// and it carries on from there.
     fn spill(&self, local: &mut Gathered) -> Result<()> {
-        let empty = Combined { chunks: Vec::new(), rows: local.held.rows.empty() };
-        let Combined { chunks, rows } = std::mem::replace(&mut local.held, empty);
+        let empty = Combined::empty(&local.held.rows);
+        let Combined { chunks, rows, .. } = std::mem::replace(&mut local.held, empty);
         let mut charged = vec![std::mem::replace(&mut local.charged, self.memory.reservation())];
         let file = self.run(chunks, rows, &mut charged)?;
         if let Some(left) = charged.pop() {
@@ -521,7 +525,7 @@ impl Sink for Sort {
         };
         self.instances.fetch_add(1, Atomic::Relaxed);
         Gathered {
-            held: Combined { chunks: Vec::new(), rows },
+            held: Combined { chunks: Vec::new(), rows, runs: Vec::new() },
             scratch: self.exprs.scratch(),
             charged: self.memory.reservation(),
             place: Place::default(),
@@ -593,13 +597,24 @@ impl Sink for Sort {
         Ok(Progress::More)
     }
 
-    fn combine(&self, local: Gathered) -> Result<()> {
+    fn combine(&self, mut local: Gathered) -> Result<()> {
+        // Sorted here, on the thread that gathered the rows and before the lock, so every instance
+        // sorts its own at once as the scan runs out, rather than one sort of all of them after
+        // the last instance is done. `finalize` merges the runs. The valued arm is left for
+        // `finalize`, which sorts it the way it always has.
+        if let Keyed::Normal(rows) = &mut local.held.rows {
+            rows.sort_unstable_by(|left, right| {
+                left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+            });
+        }
         self.runs.lock().map_err(poisoned)?.extend(local.runs);
         let mut gathered = self.gathered.lock().map_err(poisoned)?;
         // Appended rather than merged, because the sort has not happened yet. The order the
         // instances combine in does not decide anything, since every row carries where it arrived
         // and the comparison falls back to that when the keys tie.
         let base = u32::try_from(gathered.chunks.len()).map_err(|_| too_many())?;
+        let start = gathered.rows.len();
+        gathered.runs.push(start);
         gathered.rows.absorb(local.held.rows, base)?;
         gathered.chunks.extend(local.held.chunks);
         self.charged.lock().map_err(poisoned)?.push(local.charged);
@@ -607,9 +622,9 @@ impl Sink for Sort {
     }
 
     fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
-        let Combined { chunks, mut rows } = {
+        let Combined { chunks, mut rows, runs } = {
             let mut gathered = self.gathered.lock().map_err(poisoned)?;
-            let empty = Combined { chunks: Vec::new(), rows: gathered.rows.empty() };
+            let empty = Combined::empty(&gathered.rows);
             std::mem::replace(&mut *gathered, empty)
         };
         // What the instances took, moved out so that it can be given back a column at a time rather
@@ -626,12 +641,17 @@ impl Sink for Sort {
             }
             return self.out.merge(files, self.types.clone());
         }
-        rows.sort_across(&self.keys, threads)?;
         let total = rows.len();
         if u32::try_from(total).is_err() {
             return Err(too_many());
         }
-        let order = order(&chunks, &rows)?;
+        let order = match &rows {
+            Keyed::Normal(normal) => merged(normal, &runs, &starts(&chunks), threads)?,
+            Keyed::Valued(_) => {
+                rows.sort(&self.keys)?;
+                order(&chunks, &rows)?
+            }
+        };
         // The rows have said everything they had to say. Holding them through the assembly is
         // holding a key and an arrival a row for the sake of a number that is already in `order`.
         let taken = rows.footprint();
@@ -644,41 +664,6 @@ impl Sink for Sort {
     }
 }
 
-/// Sorts `rows` on the lease's threads, in place and without a second copy of them.
-///
-/// Cut at the median until there is a piece a thread, which leaves every row of a piece ordered
-/// before every row of the piece after it, and then each piece is sorted on its own. Finding a
-/// median is one pass over the piece, so the only step that reads every row on one thread is the
-/// first cut. `order` has to be total with no two rows equal, which the arrival makes it, or the
-/// halves would not be where the rows belong.
-fn spread<T: Send>(
-    rows: &mut [T],
-    threads: &Lease<'_>,
-    order: impl Fn(&T, &T) -> Ordering + Sync,
-) -> Result<()> {
-    let degree = threads.degree();
-    let mut pieces: Vec<&mut [T]> = vec![rows];
-    while pieces.len() < degree && pieces.iter().all(|piece| piece.len() > VECTOR_SIZE) {
-        let held: Vec<Mutex<&mut [T]>> = pieces.into_iter().map(Mutex::new).collect();
-        let halves = in_parallel(threads, held.len(), degree, "halved sorted piece", |at| {
-            let slot =
-                held.get(at).ok_or_else(|| Error::internal("a sorted piece past the end"))?;
-            let piece = std::mem::take(&mut *slot.lock().map_err(poisoned)?);
-            let middle = piece.len() / 2;
-            piece.select_nth_unstable_by(middle, &order);
-            Ok(piece.split_at_mut(middle))
-        })?;
-        pieces = halves.into_iter().flat_map(|(left, right)| [left, right]).collect();
-    }
-    let held: Vec<Mutex<&mut [T]>> = pieces.into_iter().map(Mutex::new).collect();
-    in_parallel(threads, held.len(), degree, "sorted piece", |at| {
-        let slot = held.get(at).ok_or_else(|| Error::internal("a sorted piece past the end"))?;
-        slot.lock().map_err(poisoned)?.sort_unstable_by(&order);
-        Ok(())
-    })?;
-    Ok(())
-}
-
 /// Where each row of the answer reads from, as a row of the chunks that arrived laid end to end.
 ///
 /// Worked out once for the whole sort and read by every column, which is the point of it. It used
@@ -686,12 +671,7 @@ fn spread<T: Send>(
 /// scatter into a map of its own before it could gather anything: on SF1 `lineitem` that was a
 /// column taking 0.6s to 1.3s on its own, most of it in pages of maps being faulted in (#1365).
 fn order(chunks: &[Chunk], rows: &Keyed) -> Result<Vec<usize>> {
-    let mut starts = Vec::with_capacity(chunks.len());
-    let mut start = 0;
-    for chunk in chunks {
-        starts.push(start);
-        start += chunk.len();
-    }
+    let starts = starts(chunks);
     rows.sources()
         .map(|(chunk, row)| {
             let (Some(&start), Some(len)) =
@@ -710,6 +690,160 @@ fn order(chunks: &[Chunk], rows: &Keyed) -> Result<Vec<usize>> {
         })
         .collect()
 }
+
+/// Where each chunk's first row is, with the chunks laid end to end.
+fn starts(chunks: &[Chunk]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(chunks.len());
+    let mut start = 0;
+    for chunk in chunks {
+        starts.push(start);
+        start += chunk.len();
+    }
+    starts
+}
+
+/// The same as [`order`], for rows that are in order within each of `runs` already, merged across
+/// them on the lease's threads.
+///
+/// Each instance sorts its own rows as it combines, so what is left here is a merge. The runs are
+/// cut at splitters drawn from a sample of every run, so that each part of the answer is a range of
+/// keys and the rows in it are a slice of every run, and the parts are merged on their own with
+/// nothing shared. The answer is written straight into the order the gather reads rather than into
+/// a sorted copy of the rows, which would be forty eight bytes a row more to hold for nothing.
+///
+/// # Errors
+///
+/// If a row points outside the chunks it came from.
+fn merged(
+    rows: &[Normalized],
+    runs: &[usize],
+    starts: &[usize],
+    threads: &Lease<'_>,
+) -> Result<Vec<usize>> {
+    let ends = runs.iter().skip(1).copied().chain(std::iter::once(rows.len()));
+    let runs: Vec<&[Normalized]> = runs
+        .iter()
+        .zip(ends)
+        .filter_map(|(&start, end)| rows.get(start..end))
+        .filter(|run| !run.is_empty())
+        .collect();
+    let at = |row: &Normalized| -> Result<usize> {
+        let (chunk, row) = row.2;
+        starts
+            .get(chunk as usize)
+            .map(|start| start + row as usize)
+            .ok_or_else(|| Error::internal("a sorted row pointing outside the chunks it came from"))
+    };
+    let first = |left: &Normalized, right: &Normalized| {
+        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+    };
+    let degree = threads.degree().max(1);
+    let parts = if runs.len() > 1 { degree * PARTS_A_THREAD } else { 1 };
+    // Evenly spaced rows of every run, sorted, and every so many of them is a splitter. A part is
+    // then the rows between two splitters, which is close to the same number of rows in each
+    // because the sample is spread over every run in proportion to its length.
+    let mut sample: Vec<&Normalized> = Vec::new();
+    for run in &runs {
+        let take = (run.len() * SAMPLE * parts / rows.len().max(1)).clamp(1, run.len());
+        sample.extend((0..take).filter_map(|index| run.get(index * run.len() / take)));
+    }
+    sample.sort_unstable_by(|left, right| first(left, right));
+    let splitters: Vec<&Normalized> =
+        (1..parts).filter_map(|part| sample.get(part * sample.len() / parts).copied()).collect();
+    // Where each splitter cuts each run, a row per run and a column per part boundary.
+    let cuts: Vec<Vec<usize>> =
+        runs.iter()
+            .map(|run| {
+                let mut cut = Vec::with_capacity(splitters.len() + 2);
+                cut.push(0);
+                cut.extend(splitters.iter().map(|splitter| {
+                    run.partition_point(|row| first(row, splitter) == Ordering::Less)
+                }));
+                cut.push(run.len());
+                cut
+            })
+            .collect();
+    let parts = splitters.len() + 1;
+    let mut out = vec![0usize; rows.len()];
+    let mut slots: Vec<Mutex<&mut [usize]>> = Vec::with_capacity(parts);
+    let mut rest: &mut [usize] = &mut out;
+    for part in 0..parts {
+        let len = cuts.iter().map(|cut| cut[part + 1].saturating_sub(cut[part])).sum();
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        slots.push(Mutex::new(head));
+        rest = tail;
+    }
+    in_parallel(threads, parts, degree, "merged sorted part", |part| {
+        let slot = slots.get(part).ok_or_else(|| Error::internal("a merged part past the end"))?;
+        let mut into = slot.lock().map_err(poisoned)?;
+        let pieces: Vec<&[Normalized]> = runs
+            .iter()
+            .zip(&cuts)
+            .filter_map(|(run, cut)| run.get(cut[part]..cut[part + 1]))
+            .filter(|piece| !piece.is_empty())
+            .collect();
+        if let [piece] = pieces.as_slice() {
+            for (slot, row) in into.iter_mut().zip(piece.iter()) {
+                *slot = at(row)?;
+            }
+            return Ok(());
+        }
+        // A heap of the next row of each piece, smallest first. There are as many pieces as there
+        // were instances, which is a handful, so this is a few comparisons a row.
+        let mut heads: std::collections::BinaryHeap<Head<'_>> = pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(piece, rows)| rows.first().map(|row| Head { row, piece, index: 0 }))
+            .collect();
+        let mut written = 0;
+        while let Some(Head { row, piece, index }) = heads.pop() {
+            let slot = into
+                .get_mut(written)
+                .ok_or_else(|| Error::internal("a merged part longer than its cut"))?;
+            *slot = at(row)?;
+            written += 1;
+            if let Some(next) = pieces.get(piece).and_then(|rows| rows.get(index + 1)) {
+                heads.push(Head { row: next, piece, index: index + 1 });
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// How many parts a merge cuts its runs into for each thread, so that a part that turns out large
+/// is not the whole of what one thread is waiting on.
+const PARTS_A_THREAD: usize = 4;
+
+/// How many rows of the runs a merge samples for each part, to find the splitters with.
+const SAMPLE: usize = 64;
+
+/// The next row of one piece of a merge, ordered so that a max heap hands out the smallest.
+struct Head<'a> {
+    row: &'a Normalized,
+    piece: usize,
+    index: usize,
+}
+
+impl Ord for Head<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.row.0.cmp(&self.row.0).then_with(|| other.row.1.cmp(&self.row.1))
+    }
+}
+
+impl PartialOrd for Head<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Head<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Head<'_> {}
 
 /// Gives `bytes` back across the reservations the instances handed over.
 ///
@@ -966,7 +1100,8 @@ mod tests {
     use rudb_pipeline::{Lease, Pool};
     use rudb_vector::VECTOR_SIZE;
 
-    use super::spread;
+    use super::{Normalized, merged};
+    use crate::normal::WIDTH;
 
     /// Rows with keys that repeat a lot and an arrival that settles every tie, shuffled.
     fn shuffled(count: usize) -> Vec<(u64, u64)> {
@@ -981,17 +1116,50 @@ mod tests {
             .collect()
     }
 
-    /// Spread over threads, the order is the one a single sort gives, for sizes around the cuts.
+    /// Runs sorted on their own and merged are the order one sort of all of them gives, for runs
+    /// of lengths that do and do not divide evenly, an empty run, and a single run.
     #[test]
-    fn a_spread_sort_puts_the_rows_where_one_sort_would() {
+    fn merged_runs_read_in_the_order_one_sort_would() {
         let pool = Pool::new(4);
         for threads in [Lease::alone(), pool.lease(4)] {
-            for count in [0, 1, VECTOR_SIZE, VECTOR_SIZE + 1, VECTOR_SIZE * 9 + 7] {
-                let mut spread_out = shuffled(count);
-                let mut expected = spread_out.clone();
+            for lengths in [
+                vec![],
+                vec![VECTOR_SIZE * 3 + 1],
+                vec![5, 0, VECTOR_SIZE, 3 * VECTOR_SIZE + 11, 1],
+            ] {
+                let total: usize = lengths.iter().sum();
+                let keys = shuffled(total);
+                // Every run is its own chunk, so where a row reads from is its chunk's start plus
+                // its row, and the chunk starts are the run starts.
+                let (mut rows, mut runs, mut starts) = (Vec::new(), Vec::new(), Vec::new());
+                let mut at = 0;
+                for (chunk, &length) in lengths.iter().enumerate() {
+                    runs.push(rows.len());
+                    starts.push(at);
+                    let mut run: Vec<Normalized> = (0..length)
+                        .map(|row| {
+                            let (key, arrival) = keys[at + row];
+                            let mut normal = [0; WIDTH];
+                            normal[..8].copy_from_slice(&key.to_be_bytes());
+                            (normal, (arrival, 0), (chunk as u32, row as u32))
+                        })
+                        .collect();
+                    run.sort_unstable_by(|left, right| {
+                        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+                    });
+                    rows.extend(run);
+                    at += length;
+                }
+                let mut expected: Vec<(u64, u64, usize)> = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &(key, arrival))| (key, arrival, index))
+                    .collect();
                 expected.sort_unstable();
-                spread(&mut spread_out, &threads, Ord::cmp).expect("sorted");
-                assert_eq!(spread_out, expected, "{count} rows on {} threads", threads.degree());
+                let expected: Vec<usize> =
+                    expected.into_iter().map(|(_, _, index)| index).collect();
+                let got = merged(&rows, &runs, &starts, &threads).expect("merged");
+                assert_eq!(got, expected, "runs of {lengths:?} on {} threads", threads.degree());
             }
         }
     }
