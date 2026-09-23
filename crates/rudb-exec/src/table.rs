@@ -1192,14 +1192,20 @@ pub(crate) fn coded_within<'a>(
 
 /// Whether a column's own places come from a packed page other than the one `held` was built on.
 ///
-/// Only a packed page, because a dictionary is shared from one chunk to the next and its codes keep
-/// the map for as long as it is, and only once there is a map, since a first page is as good a
-/// place as any to start one.
+/// Only once there is a map, since a first page is as good a place as any to start one. A shared
+/// dictionary is the same dictionary from one chunk to the next and keeps its codes, and a string
+/// column that moves off one is refused by value at once and keeps its codes too.
 fn moved_off(places: &Places<'_>, held: Option<&Origin>) -> bool {
     match (places, held) {
         (Places::Bits { packed } | Places::CodedBits { packed, .. }, Some(held)) => {
             !matches!(held, Origin::Bits(base, width)
                 if *base == packed.base() && *width == packed.width())
+        }
+        // A dictionary the map was not built on. The rows a filter kept out of a flat column are
+        // one of these, with a payload of its own each chunk and the row number for a code, and
+        // an integer column in that shape keeps a map across chunks only when it is read by value.
+        (Places::Codes { values, .. }, Some(held)) => {
+            !matches!(held, Origin::Dictionary(dictionary) if Arc::ptr_eq(dictionary, values))
         }
         _ => false,
     }
@@ -1301,8 +1307,11 @@ fn signed_rows(key: &Vector, rows: usize, into: &mut Vec<i64>) -> bool {
         return false;
     }
     if let Some((at, values)) = key.dictionary_parts() {
-        let (Some(packed), Some(at)) = (values.packed_parts(), at.get(..rows)) else {
+        let Some(at) = at.get(..rows) else {
             return false;
+        };
+        let Some(packed) = values.packed_parts() else {
+            return gathered(at, values, into);
         };
         let Ok(base) = i64::try_from(packed.base()) else {
             return false;
@@ -1318,6 +1327,27 @@ fn signed_rows(key: &Vector, rows: usize, into: &mut Vec<i64>) -> bool {
         return false;
     }
     into.truncate(rows);
+    true
+}
+
+/// The values a filter kept out of a flat integer column, which is a dictionary whose codes are the
+/// rows that got through.
+///
+/// Widened whole and then gathered down in place, which is safe for as long as no row reads from
+/// before itself, and that is what a selection's rows always do since they only ever go forward.
+/// `false` for codes that go back, which a selection never hands over.
+fn gathered(at: &[u32], values: &Vector, into: &mut Vec<i64>) -> bool {
+    if at.iter().enumerate().any(|(row, &code)| (code as usize) < row) {
+        return false;
+    }
+    if !values.signed_block(into) || at.iter().any(|&code| code as usize >= into.len()) {
+        into.clear();
+        return false;
+    }
+    for (row, &code) in at.iter().enumerate() {
+        into[row] = into[code as usize];
+    }
+    into.truncate(at.len());
     true
 }
 
@@ -4168,6 +4198,43 @@ mod tests {
         let places = placed(&coded, 3);
         assert_eq!(places[0], places[2]);
         assert_eq!(places[1] - places[0], 262_029 - 62);
+    }
+
+    /// The rows a filter kept out of a flat integer column are a dictionary of their own every
+    /// chunk, and the second of them is read by value so that the map outlives the first.
+    #[test]
+    fn a_selection_over_a_flat_column_is_read_by_value_once_it_moves() {
+        let chunk = |values: &[Option<i32>], kept: Vec<u32>| {
+            [Vector::dictionary(kept, integers(values)).expect("the rows a filter kept")]
+        };
+        let mut values = Vec::new();
+        let mut held = Vec::new();
+        let first = chunk(&[Some(5), Some(9), None, Some(5)], vec![0, 2, 3]);
+        let coded = coded_within(&first, 3, &held, Some(&mut values)).expect("codes of its own");
+        coded.hold(&mut held);
+        let second = chunk(&[Some(1), Some(7), Some(5), None, Some(7)], vec![1, 2, 3, 4]);
+        let coded = coded_within(&second, 4, &held, Some(&mut values)).expect("read by value");
+        assert!(coded.by_value());
+        let places = placed(&coded, 4);
+        assert_eq!(places[0], places[3]);
+        assert_eq!(places[0] - places[1], 2);
+        assert_eq!(places[2], coded.combos() - 1, "the null takes the place past the window");
+        coded.hold(&mut held);
+        let third = chunk(&[Some(6), Some(8)], vec![0, 1]);
+        let coded = coded_within(&third, 2, &held, Some(&mut values)).expect("read by value");
+        assert!(coded.by_value() && coded.same_as(&held), "the window outlives the chunk");
+        let back = [Vector::dictionary(vec![1, 0], integers(&[Some(3), Some(4)])).expect("codes")];
+        let coded = coded_within(&back, 2, &held, Some(&mut values)).expect("codes of its own");
+        assert!(!coded.by_value(), "codes that go back are not a selection");
+        let text = |words: &[&str]| {
+            let words: Vec<Value> = words.iter().map(|&word| Value::Varchar(word.into())).collect();
+            [Vector::dictionary(vec![1, 0, 1], flat(LogicalType::Varchar, &words)).expect("codes")]
+        };
+        let first = text(&["a", "b"]);
+        coded_within(&first, 3, &[], Some(&mut values)).expect("codes").hold(&mut held);
+        let next = text(&["c", "d"]);
+        let coded = coded_within(&next, 3, &held, Some(&mut values)).expect("codes of its own");
+        assert!(!coded.by_value(), "a string column keeps its codes");
     }
 
     /// A second packed page is read by value against the window rather than by its own codes,
