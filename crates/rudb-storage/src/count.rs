@@ -124,6 +124,41 @@ struct Column {
     blind: bool,
 }
 
+impl Column {
+    /// Counts one vector, and gives up on the column if this is a form with no hash rule.
+    fn add(&mut self, vector: &Vector) {
+        if self.blind {
+            return;
+        }
+        if !walk(vector, &mut Sink::of(&mut self.sketch, &mut self.tally)) {
+            self.blind();
+        }
+    }
+
+    /// Gives up on the column, which is what a form with no hash rule leaves behind.
+    fn blind(&mut self) {
+        self.blind = true;
+        // The hashes taken so far describe some of the rows and no question is going to be answered
+        // from them, so they are dropped rather than carried. The tally forgets rather than gives
+        // up, because there is no sketch left for it to hand anything to.
+        self.sketch = Sketch::of(&[]);
+        self.tally.forget();
+    }
+}
+
+/// One column of a [`Counts`], borrowed apart from the others. See [`Counts::columns_mut`].
+#[derive(Debug)]
+pub struct Counting<'a> {
+    column: &'a mut Column,
+}
+
+impl Counting<'_> {
+    /// Counts one vector into this column, the same as [`Counts::add_column`] does.
+    pub fn add(&mut self, vector: &Vector) {
+        self.column.add(vector);
+    }
+}
+
 impl Counts {
     /// A counter for a table of `width` columns, holding nothing yet.
     #[must_use]
@@ -166,24 +201,25 @@ impl Counts {
     ///
     /// Out of range is ignored rather than blinding anything, because there is no column to blind.
     pub fn add_column(&mut self, at: usize, vector: &Vector) {
-        let Some(column) = self.columns.get_mut(at) else { return };
-        if column.blind {
-            return;
+        if let Some(column) = self.columns.get_mut(at) {
+            column.add(vector);
         }
-        if !walk(vector, &mut Sink::of(&mut column.sketch, &mut column.tally)) {
-            self.blind(at);
-        }
+    }
+
+    /// Every column on its own, in order, so that each can be counted on a thread of its own.
+    ///
+    /// The columns share nothing, and a chunk counted a column at a time on several threads leaves
+    /// each column exactly as [`Self::add`] would have, as long as each column still sees the chunks
+    /// in the order they arrived. `MemoryTable::append_all` is the caller.
+    pub fn columns_mut(&mut self) -> Vec<Counting<'_>> {
+        self.columns.iter_mut().map(|column| Counting { column }).collect()
     }
 
     /// Gives up on a column, which is what a form with no hash rule leaves behind.
     fn blind(&mut self, at: usize) {
-        let Some(column) = self.columns.get_mut(at) else { return };
-        column.blind = true;
-        // The hashes taken so far describe some of the rows and no question is going to be answered
-        // from them, so they are dropped rather than carried. The tally forgets rather than gives
-        // up, because there is no sketch left for it to hand anything to.
-        column.sketch = Sketch::of(&[]);
-        column.tally.forget();
+        if let Some(column) = self.columns.get_mut(at) {
+            column.blind();
+        }
     }
 
     /// How many distinct non-null values one column holds, when that number is exact.

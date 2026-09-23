@@ -1566,10 +1566,8 @@ impl Shared {
                 let under = Under::new(self.budget(), facts, &seams, &session, Rows::ForATable)
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
-                let table = catalog.table_mut(&insert.name)?;
-                for chunk in result.into_chunks() {
-                    table.append(chunk)?;
-                }
+                let workers = self.inner.pool.threads();
+                catalog.table_mut(&insert.name)?.append_all(result.into_chunks(), workers)?;
                 Ok(QueryResult::empty())
             }
         }
@@ -2002,10 +2000,7 @@ fn create_table(
     }
     catalog.create_table(create.name.clone(), create.columns)?;
     if let Some(rows) = rows {
-        let table = catalog.table_mut(&create.name)?;
-        for chunk in rows.into_chunks() {
-            table.append(chunk)?;
-        }
+        catalog.table_mut(&create.name)?.append_all(rows.into_chunks(), budget.pool.threads())?;
     }
     Ok(())
 }

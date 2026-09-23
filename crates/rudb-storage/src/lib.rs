@@ -15,7 +15,7 @@ pub mod sieve;
 pub mod tally;
 pub mod zone;
 
-pub use count::Counts;
+pub use count::{Counting, Counts};
 pub use memory::MemoryTable;
 pub use sieve::{Blocked, Sieve};
 pub use tally::{TALLY_VALUES, Tally};
