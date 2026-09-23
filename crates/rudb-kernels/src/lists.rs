@@ -19,10 +19,13 @@
 //! which is one of the orders the pin could have given.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_vector::{Buffer, Data, Live, Validity, Vector, interleave};
 
 use crate::compare::order;
+use crate::number::integral;
 
 /// What the pin says when the mask of `list_where` or the indexes of `list_select` hold a null.
 const NULL_PICK: &str = "NULLs are not allowed as list elements in the second input parameter.";
@@ -77,6 +80,16 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
             match (order, nulls) {
                 (Ok(order), Ok(nulls)) => {
                     sort(values, order.unwrap_or(false), nulls.unwrap_or(false)).and_then(list)
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+        ("list_grade_up", [Value::List { values, .. }, spelled @ ..]) => {
+            let order = spelled.first().map(spelled_order).transpose();
+            let nulls = spelled.get(1).map(spelled_nulls).transpose();
+            match (order, nulls) {
+                (Ok(order), Ok(nulls)) => {
+                    graded(values, order.unwrap_or(false), nulls.unwrap_or(false)).and_then(list)
                 }
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
@@ -333,15 +346,33 @@ fn unrecognized(spelled: &str, kind: &str) -> Error {
 }
 
 /// `list_sort`: the values in order, with the nulls kept together at one end.
+fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
+    Ok(grade(values, descending, nulls_first)?.into_iter().map(|at| values[at].clone()).collect())
+}
+
+/// `list_grade_up`: the one based place of each value in the order `list_sort` would put it.
+fn graded(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
+    grade(values, descending, nulls_first)?
+        .into_iter()
+        .map(|at| {
+            Ok(Value::BigInt(
+                i64::try_from(at + 1).map_err(|error| Error::internal(error.to_string()))?,
+            ))
+        })
+        .collect()
+}
+
+/// The places of the values in sorted order, with the nulls kept together at one end.
 ///
 /// The nulls go last unless asked otherwise whichever way the rest are sorted, which is the pin's
-/// default and not the reverse of an ascending sort.
-fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
-    let mut held: Vec<Value> = values.iter().filter(|value| !value.is_null()).cloned().collect();
-    let nulls = values.len() - held.len();
+/// default and not the reverse of an ascending sort. The sort is stable, so equal values keep the
+/// order they came in, which is what makes the grade of a list with repeats the pin's.
+fn grade(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<usize>> {
+    let (mut held, nulls): (Vec<usize>, Vec<usize>) =
+        (0..values.len()).partition(|&at| !values[at].is_null());
     let mut failed = None;
-    held.sort_by(|left, right| {
-        let ordering = order(left, right).unwrap_or_else(|error| {
+    held.sort_by(|&left, &right| {
+        let ordering = order(&values[left], &values[right]).unwrap_or_else(|error| {
             failed.get_or_insert(error);
             Ordering::Equal
         });
@@ -350,13 +381,400 @@ fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Val
     if let Some(error) = failed {
         return Err(error);
     }
-    let mut sorted = Vec::with_capacity(values.len());
-    if nulls_first {
-        sorted.resize(nulls, Value::Null);
+    Ok(if nulls_first { [nulls, held].concat() } else { [held, nulls].concat() })
+}
+
+/// A loop over whole vectors for the list calls that have one, or `None` for a call that goes
+/// through the row at a time path.
+///
+/// A list vector is entries over one child, so building a list, reversing one or searching one for
+/// a constant can be a gather or a scan of the child with no `Value` made for any row. These are
+/// the calls that were furthest behind the pin when measured, and each one here gives the same
+/// answer as its arm in [`value`], which the tests in the facade check row for row.
+pub(crate) fn vectorized<V: AsRef<Vector>>(
+    name: &str,
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    match (name, args) {
+        ("list_value", [_, ..]) => built(args, returns, rows),
+        ("list_reverse", [list]) => reversed(list.as_ref()),
+        ("length" | "array_length", [list]) => counted(list.as_ref()),
+        ("list_distinct", [list]) => deduplicated(false, list.as_ref()),
+        ("list_unique", [list]) => deduplicated(true, list.as_ref()),
+        ("list_contains" | "list_position", [list, needle]) => {
+            searched(name == "list_position", list.as_ref(), needle.as_ref())
+        }
+        ("list_sort" | "list_grade_up", [list, spelled @ ..]) => ordered(
+            list.as_ref(),
+            spelled.first().map(AsRef::as_ref),
+            spelled.get(1).map(AsRef::as_ref),
+            false,
+            name == "list_grade_up",
+        ),
+        ("list_reverse_sort", [list, spelled @ ..]) => {
+            ordered(list.as_ref(), None, spelled.first().map(AsRef::as_ref), true, false)
+        }
+        _ => Ok(None),
     }
-    sorted.append(&mut held);
-    if !nulls_first {
-        sorted.resize(values.len(), Value::Null);
+}
+
+/// `list_value` over columns: every argument laid end to end and read back a row at a time.
+///
+/// Left to the row path when the element is nested, because laying a nested column is a row at a
+/// time there too, or when an argument is not already of the element type.
+fn built<V: AsRef<Vector>>(
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let LogicalType::List(element) = returns else {
+        return Ok(None);
+    };
+    if nested_or_null(element) || args.iter().any(|arg| arg.as_ref().logical_type() != &**element) {
+        return Ok(None);
     }
-    Ok(sorted)
+    let pieces: Vec<Vector> =
+        args.iter().map(|arg| arg.as_ref().flatten()).collect::<Result<_>>()?;
+    let width = args.len();
+    let order: Vec<usize> =
+        (0..rows).flat_map(|row| (0..width).map(move |at| at * rows + row)).collect();
+    let child = interleave(element, &pieces, &order)?;
+    let count = entry(width)?;
+    let entries = (0..rows).map(|row| Ok((entry(row * width)?, count))).collect::<Result<_>>()?;
+    Vector::list(entries, child).map(Some)
+}
+
+/// `length` of a list column, which is every entry's length with the column's nulls.
+fn counted(list: &Vector) -> Result<Option<Vector>> {
+    let Some((entries, _)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !matches!(list.logical_type(), LogicalType::List(_)) {
+        return Ok(None);
+    }
+    let lengths: Vec<i64> = entries.iter().map(|&(_, len)| i64::from(len)).collect();
+    let answer = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(lengths)))?;
+    Ok(Some(answer.with_validity(list.validity().clone())))
+}
+
+/// `list_reverse` over a column: one gather of the child with every row's run turned round.
+fn reversed(list: &Vector) -> Result<Option<Vector>> {
+    let Some((entries, child)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !matches!(list.logical_type(), LogicalType::List(_)) {
+        return Ok(None);
+    }
+    let live = list.validity().live();
+    let mut indices = Vec::with_capacity(child.len());
+    let mut placed = Vec::with_capacity(entries.len());
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        let at = entry(indices.len())?;
+        if live.at(row) {
+            indices.extend((start..start + len).rev());
+            placed.push((at, len));
+        } else {
+            placed.push((at, 0));
+        }
+    }
+    let child = child.gather(&indices)?;
+    Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
+}
+
+/// `list_contains` and `list_position` over an integer column with a constant needle, as one scan
+/// of the child.
+///
+/// A null needle is left to the row path, since `list_position` finds a null element with it and
+/// `list_contains` is null, and so is anything that is not a plain integer, where equality is not
+/// the same thing as equal bits.
+fn searched(position: bool, list: &Vector, needle: &Vector) -> Result<Option<Vector>> {
+    let (Some((entries, child)), Some(wanted)) = (list.list_parts(), needle.constant_value())
+    else {
+        return Ok(None);
+    };
+    let plain = plain(child.logical_type());
+    let Some(wanted) =
+        integral(wanted).filter(|_| plain && needle.logical_type() == child.logical_type())
+    else {
+        return Ok(None);
+    };
+    let elements = child.validity().live();
+    macro_rules! scan {
+        ($($variant:ident),+) => {
+            match child.data() {
+                $(Some(Data::$variant(values)) => {
+                    first_places(entries, values.as_slice(), elements, wanted)
+                })+
+                _ => return Ok(None),
+            }
+        };
+    }
+    let found = scan!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
+    let rows = list.validity().live();
+    if position {
+        let validity = Validity::from_iter(entries.len(), |row| rows.at(row) && found[row] != 0);
+        let data =
+            Data::Int32(Buffer::from(found.iter().map(|&place| place as i32).collect::<Vec<_>>()));
+        let answer = Vector::flat(LogicalType::Integer, data)?;
+        return Ok(Some(answer.with_validity(validity.normalize(entries.len()))));
+    }
+    let data = Data::Bool(Buffer::from(found.iter().map(|&place| place != 0).collect::<Vec<_>>()));
+    let answer = Vector::flat(LogicalType::Boolean, data)?;
+    Ok(Some(answer.with_validity(list.validity().clone())))
+}
+
+/// `list_sort`, `list_reverse_sort` and `list_grade_up` over an integer column: each row's run of
+/// the child sorted as indices, and the child gathered once in that order. A grade answers with the
+/// places themselves and gathers nothing.
+///
+/// The order and null order are constants, which the binder insists on, so they are read once for
+/// the whole vector. A null one is left to the row path, where it makes every row null. So is a
+/// vector with no row that is not null, because the row path never reads the order for those and
+/// so never refuses a bad one.
+fn ordered(
+    list: &Vector,
+    order: Option<&Vector>,
+    nulls: Option<&Vector>,
+    reverse: bool,
+    grade: bool,
+) -> Result<Option<Vector>> {
+    let Some((entries, child)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !plain(child.logical_type()) || list.validity().count_valid(list.len()) == 0 {
+        return Ok(None);
+    }
+    let spelled = |arg: Option<&Vector>| match arg.map(Vector::constant_value) {
+        None => Some(None),
+        Some(Some(value @ Value::Varchar(_))) => Some(Some(value.clone())),
+        Some(_) => None,
+    };
+    let (Some(order), Some(nulls)) = (spelled(order), spelled(nulls)) else {
+        return Ok(None);
+    };
+    let descending = reverse || order.as_ref().map(spelled_order).transpose()?.unwrap_or(false);
+    let nulls_first = nulls.as_ref().map(spelled_nulls).transpose()?.unwrap_or(false);
+    let rows = list.validity().live();
+    let elements = child.validity().live();
+    macro_rules! permute {
+        ($($variant:ident),+) => {
+            match child.data() {
+                $(Some(Data::$variant(values)) => {
+                    let values = values.as_slice();
+                    permutation(entries, rows, elements, nulls_first, |left, right| {
+                        let ordering = values[left as usize].cmp(&values[right as usize]);
+                        if descending { ordering.reverse() } else { ordering }
+                    })?
+                })+
+                _ => return Ok(None),
+            }
+        };
+    }
+    let (placed, indices) = permute!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
+    let child = if grade {
+        // A grade is each index less the start of its row's run, counted from one.
+        let mut places = Vec::with_capacity(indices.len());
+        for (&(at, len), &(start, _)) in placed.iter().zip(entries) {
+            let run = &indices[at as usize..(at + len) as usize];
+            places.extend(run.iter().map(|&index| i64::from(index - start) + 1));
+        }
+        Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(places)))?
+    } else {
+        child.gather(&indices)?
+    };
+    Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
+}
+
+/// `list_distinct` and `list_unique` over an integer column, as one pass over each row's run that
+/// keeps the first appearance of every value that is not null.
+fn deduplicated(unique: bool, list: &Vector) -> Result<Option<Vector>> {
+    let Some((entries, child)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !plain(child.logical_type()) {
+        return Ok(None);
+    }
+    let rows = list.validity().live();
+    let elements = child.validity().live();
+    macro_rules! keep {
+        ($($variant:ident),+) => {
+            match child.data() {
+                $(Some(Data::$variant(values)) => {
+                    let values = values.as_slice();
+                    firsts(entries, rows, elements, |at| i128::from(values[at as usize]))?
+                })+
+                _ => return Ok(None),
+            }
+        };
+    }
+    let (placed, indices) = keep!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
+    if unique {
+        let counts: Vec<u64> = placed.iter().map(|&(_, len)| u64::from(len)).collect();
+        let answer = Vector::flat(LogicalType::UBigInt, Data::UInt64(Buffer::from(counts)))?;
+        return Ok(Some(answer.with_validity(list.validity().clone())));
+    }
+    let child = child.gather(&indices)?;
+    Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
+}
+
+/// The new entries and the child indices that keep the first element of every `key` in each row's
+/// run and drop the nulls, which is what [`distinct`] does with values.
+///
+/// A short run is checked against what it has kept so far, which for the lists people write is a
+/// handful of comparisons and no allocation. A long one goes through a set.
+fn firsts(
+    entries: &[(u32, u32)],
+    rows: Live<'_>,
+    elements: Live<'_>,
+    key: impl Fn(u32) -> i128,
+) -> Result<Permuted> {
+    const SHORT: u32 = 32;
+    let mut indices = Vec::new();
+    let mut placed = Vec::with_capacity(entries.len());
+    let mut kept: Vec<i128> = Vec::new();
+    let mut seen: HashSet<i128> = HashSet::new();
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        let at = entry(indices.len())?;
+        if !rows.at(row) {
+            placed.push((at, 0));
+            continue;
+        }
+        let from = indices.len();
+        kept.clear();
+        seen.clear();
+        for index in start..start + len {
+            if !elements.at(index as usize) {
+                continue;
+            }
+            let value = key(index);
+            let fresh = if len <= SHORT {
+                let fresh = !kept.contains(&value);
+                if fresh {
+                    kept.push(value);
+                }
+                fresh
+            } else {
+                seen.insert(value)
+            };
+            if fresh {
+                indices.push(index);
+            }
+        }
+        placed.push((at, entry(indices.len() - from)?));
+    }
+    Ok((placed, indices))
+}
+
+/// A list column rearranged but not yet gathered: its new entries, and the child index each new
+/// element is read from.
+type Permuted = (Vec<(u32, u32)>, Vec<u32>);
+
+/// The new entries and the child indices in order, for sorting every row's run with `compare`.
+///
+/// The nulls in a run are set aside, the rest are sorted stably, and the nulls go back in at the
+/// front or the back, which is what [`sort`] does with values.
+fn permutation(
+    entries: &[(u32, u32)],
+    rows: Live<'_>,
+    elements: Live<'_>,
+    nulls_first: bool,
+    compare: impl Fn(u32, u32) -> Ordering,
+) -> Result<Permuted> {
+    let mut indices = Vec::new();
+    let mut placed = Vec::with_capacity(entries.len());
+    let mut nulls = Vec::new();
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        let at = entry(indices.len())?;
+        if !rows.at(row) {
+            placed.push((at, 0));
+            continue;
+        }
+        nulls.clear();
+        let from = indices.len();
+        for index in start..start + len {
+            if elements.at(index as usize) {
+                indices.push(index);
+            } else {
+                nulls.push(index);
+            }
+        }
+        indices[from..].sort_by(|&left, &right| compare(left, right));
+        if nulls_first {
+            indices.splice(from..from, nulls.iter().copied());
+        } else {
+            indices.extend_from_slice(&nulls);
+        }
+        placed.push((at, len));
+    }
+    Ok((placed, indices))
+}
+
+/// Whether equal values of `ty` are equal bits, which is what lets a search or a sort compare the
+/// child's native values instead of going through [`order`].
+fn plain(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+    )
+}
+
+/// The one based place in each row's run of the first element equal to `wanted` that is not null,
+/// or 0 for none.
+///
+/// The needle is narrowed to the child's own type once, so the scan compares native values and a
+/// child with no nulls is a plain search of each run. A needle that does not fit the type is in no
+/// run at all.
+fn first_places<T: Copy + PartialEq + TryFrom<i128>>(
+    entries: &[(u32, u32)],
+    values: &[T],
+    elements: Live<'_>,
+    wanted: i128,
+) -> Vec<u32> {
+    let Ok(wanted) = T::try_from(wanted) else {
+        return vec![0; entries.len()];
+    };
+    let place = |at: Option<usize>| at.map_or(0, |at| at as u32 + 1);
+    entries
+        .iter()
+        .map(|&(start, len)| {
+            let start = start as usize;
+            let run = &values[start..start + len as usize];
+            match elements {
+                Live::All => place(run.iter().position(|&value| value == wanted)),
+                _ => place(
+                    run.iter()
+                        .enumerate()
+                        .position(|(at, &value)| value == wanted && elements.at(start + at)),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Whether a list of `element` has to be laid a row at a time.
+fn nested_or_null(element: &LogicalType) -> bool {
+    matches!(
+        element,
+        LogicalType::Null
+            | LogicalType::List(_)
+            | LogicalType::Array(..)
+            | LogicalType::Struct(_)
+            | LogicalType::Map(..)
+            | LogicalType::Union(_)
+    )
+}
+
+/// A child offset as a list entry holds it.
+fn entry(offset: usize) -> Result<u32> {
+    u32::try_from(offset)
+        .map_err(|_| Error::out_of_range(format!("a list child of {offset} elements")))
 }

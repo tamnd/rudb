@@ -849,7 +849,7 @@ impl Binder<'_> {
         // The sort order and the null order of a list sort are read once for the whole call on the
         // pin, which is why it refuses one that could change from row to row.
         let settled: &[&str] = match resolved.name {
-            "list_sort" => &["sort_order", "null_order"],
+            "list_sort" | "list_grade_up" => &["sort_order", "null_order"],
             "list_reverse_sort" => &["null_order"],
             _ => &[],
         };

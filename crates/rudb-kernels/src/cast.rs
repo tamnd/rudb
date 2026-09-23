@@ -100,6 +100,9 @@ pub fn cast_in_time_zone(
     if let Some(vector) = swept(input, target) {
         return Ok(vector);
     }
+    if let Some(vector) = flagged(input, target) {
+        return Ok(vector);
+    }
     // A cast reads one vector, so its form goes in both halves of the report rather than leaving a
     // column of zeros next to every row of it.
     fallback::record(Kernel::Cast, input.form(), input.form());
@@ -185,6 +188,34 @@ fn swept(input: &Vector, target: &LogicalType) -> Option<Vector> {
         _ => return None,
     };
     Some(Vector::flat(target.clone(), converted).ok()?.with_validity(nulls_of(input)))
+}
+
+/// A flat boolean column cast to an integer or a float, as a zero or a one for each row.
+///
+/// [`numeric`] leaves `BOOLEAN` out for the reason it gives, but that is about a boolean as the
+/// target. As the source a flag is always a zero or a one, which fits every integer and every float
+/// type, so there is nothing to check and nothing that can fail. `sum(flag::INTEGER)` is how a
+/// count of matches is usually written, and it went through the row at a time path before this.
+fn flagged(input: &Vector, target: &LogicalType) -> Option<Vector> {
+    if *input.logical_type() != LogicalType::Boolean || !matches!(input.form(), Form::Flat) {
+        return None;
+    }
+    let Some(Data::Bool(flags)) = input.data() else {
+        return None;
+    };
+    let flags = flags.as_slice().get(..input.len())?;
+    let data = match numeric(target)? {
+        Numeric::Exact { scale: 0, width: None } => exact_out(
+            flags.iter().map(|&flag| i128::from(flag)).collect(),
+            None,
+            target.physical(),
+        )?,
+        Numeric::Approximate { single } => {
+            approximate_out(flags.iter().map(|&flag| f64::from(u8::from(flag))).collect(), single)?
+        }
+        Numeric::Exact { .. } => return None,
+    };
+    Some(Vector::flat(target.clone(), data).ok()?.with_validity(input.validity().clone()))
 }
 
 /// What a specialized loop needs to know about one side of a numeric cast.

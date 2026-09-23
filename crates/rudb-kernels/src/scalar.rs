@@ -196,6 +196,9 @@ fn specialized<V: AsRef<Vector>>(
     if matches!(name, "substring" | "substr") {
         return substring_of(args, returns, rows);
     }
+    if let Some(vector) = lists::vectorized(name, args, returns, rows)? {
+        return Ok(Some(vector));
+    }
     match args {
         [only] => unary(name, only.as_ref(), returns, rows),
         [left, right] => {
@@ -2759,6 +2762,7 @@ pub fn call_values(
             text::substring(held, start, Some(length))
         }
         ("position" | "strpos" | "instr", [haystack, needle]) => text::position(haystack, needle),
+        ("contains", [haystack, needle]) => text::contains(haystack, needle),
         ("left" | "right", [held, count]) => text::end(name, held, count),
         ("replace", [held, needle, replacement]) => text::replace(held, needle, replacement),
         ("chr", [code]) => text::chr(code),
