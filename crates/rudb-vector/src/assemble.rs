@@ -516,12 +516,13 @@ fn placed_fixed(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Result<
                             mark(piece.validity(), places);
                             continue;
                         }
-                        // flatten: a piece that is neither flat nor a dictionary over a flat run,
-                        // which a sort's input rarely is. A flat piece is read where it lies.
+                        // A flat piece is read where it lies.
                         let flat;
                         let piece = if piece.form() == Form::Flat {
                             piece
                         } else {
+                            // flatten: a piece that is neither flat nor a dictionary over a flat
+                            // run, which a sort's input rarely is.
                             flat = piece.flatten()?;
                             &flat
                         };

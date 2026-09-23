@@ -8,9 +8,11 @@ The count does not restart at a handover, because a version number cannot go bac
 
 ## 0.4.15
 
-A patch release of two pull requests, and the one to take instead of 0.4.14. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.14 read each other's files.
+A patch release of three pull requests, and the one to take instead of 0.4.14, which was tagged but whose release run stops at the gate, because the gate finds a flatten in #1494 with its reason one line too far from the call. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.14 read each other's files.
 
 #1504 fixes a load that 0.4.14 can fail. #1491 made the chunks the Parquet reader hands out windows of one shared page, and `bit_packed` judged whether packing pays by the window's share of that page rather than by its rows. An INTEGER column whose values span nearly the whole `i32` range was then packed at 32 bits and refused, so `CREATE TABLE ... AS SELECT * FROM read_parquet(...)` over ClickBench `hits` could stop with `packed values from ... which a INTEGER cannot hold`, depending on the thread count. The same decision also let the bytes of a file depend on how many readers a page had. #1505 holds a distinct count's pair runs in fixed size chunks, so a chunk one instance frees is the one it asks for next, which took ClickBench q9 on the 10M file from about 116 MB to 102 MB resident and q10 from 118 MB to 106 MB.
+
+The third pull request moves that reason next to the call so the gate passes, and changes no code.
 
 ## 0.4.14
 
