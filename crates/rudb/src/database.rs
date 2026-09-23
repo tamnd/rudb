@@ -1898,6 +1898,21 @@ fn appended(
     Ok(true)
 }
 
+/// How many rows an `UPDATE` changed, read off the flag column it put after the table's columns,
+/// and the chunks with that column taken off so what is stored is only the table.
+fn unflag(chunks: &mut [Chunk]) -> Result<usize> {
+    let mut changed = 0;
+    for chunk in chunks.iter_mut() {
+        let width = chunk.width().saturating_sub(1);
+        changed += (0..chunk.len())
+            .filter(|&row| chunk.value_at(row, width) == Value::Boolean(true))
+            .count();
+        let kept: Vec<usize> = (0..width).collect();
+        *chunk = std::mem::replace(chunk, Chunk::empty(&[])).project(&kept)?;
+    }
+    Ok(changed)
+}
+
 /// Whether a table can be written straight into the file as its own generation.
 ///
 /// The writer carries forward the tables the file names and nothing else, so the file and the
@@ -2994,8 +3009,9 @@ impl Shared {
                         // By name out of the file's catalog rather than as the one table in the
                         // file, because after an append it is not the one table in the file.
                         let reader = rudb_native::Catalog::open(path)?.table(&table)?;
+                        let added = reader.table().rows();
                         catalog.table_mut(&insert.name)?.commit_native(reader)?;
-                        return Ok(QueryResult::empty());
+                        return QueryResult::changed(added);
                     }
                 }
                 let facts = context.facts();
@@ -3004,12 +3020,18 @@ impl Shared {
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let workers = self.inner.pool.threads();
                 let table = catalog.table_mut(&insert.name)?;
-                if insert.replace {
-                    table.replace_all(result.into_chunks(), workers)?;
+                let before = table.rows().len();
+                let mut chunks = result.into_chunks();
+                let flagged = if insert.flagged { Some(unflag(&mut chunks)?) } else { None };
+                let changed = if insert.replace {
+                    table.replace_all(chunks, workers)?;
+                    flagged.unwrap_or_else(|| before.saturating_sub(table.rows().len()))
                 } else {
-                    table.append_all(result.into_chunks(), workers)?;
-                }
-                Ok(QueryResult::empty())
+                    let added = chunks.iter().map(Chunk::len).sum();
+                    table.append_all(chunks, workers)?;
+                    added
+                };
+                QueryResult::changed(changed)
             }
         }
     }
