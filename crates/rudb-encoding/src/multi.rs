@@ -639,9 +639,16 @@ mod tests {
 
     #[test]
     fn unrelated_columns_are_left_alone() {
+        // The numbers are mixed rather than a multiple of the index, because a multiple of the index
+        // is a sequence with leading zeros and repeated tails that a table trained on the group
+        // can use, and then sharing is the smaller choice and the right one.
         let urls = urls("www.example.com", 4_000, 0);
         let numbers: Vec<Vec<u8>> = (0..4_000)
-            .map(|index| format!("{:016x}", index * 2_654_435_761u64).into_bytes())
+            .map(|index: u64| {
+                let mut mixed = (index + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                mixed ^= mixed >> 29;
+                format!("{:016x}", mixed.wrapping_mul(0xBF58_476D_1CE4_E5B9)).into_bytes()
+            })
             .collect();
         let columns = [borrow(&urls), borrow(&numbers)];
         let group = group(&columns);
