@@ -692,6 +692,13 @@ impl<'a> Scan<'a> {
     fn testing(&self) -> &[Probe] {
         self.testing.get_or_init(|| {
             let Some(sideways) = self.sideways.as_ref() else { return self.probes.clone() };
+            // Here because this is the one moment every instance of the scan passes through after
+            // the build side has finished and before a row is read.
+            if let (Some(counters), Some(reduced)) =
+                (&self.counters, sideways.reduction(self.index))
+            {
+                counters.reducing(reduced);
+            }
             let mut probes = self.probes.clone();
             probes.extend(onto(&self.columns, sideways.tests(self.index)));
             probes

@@ -71,7 +71,8 @@ use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{Result, SessionTimeZone};
-use rudb_graph::{KeyMap, Link, Rids};
+use rudb_graph::{KeyMap, Link, Pushed, Rids};
+use rudb_metrics::Reduced;
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
 use rudb_vector::{Chunk, Vector};
@@ -127,6 +128,9 @@ pub(crate) struct Found {
     /// When this is there the filter is not, because it answers the same question with no false
     /// positives and a bit test in place of a hash.
     rows: Option<Rids>,
+    /// What the exact reduction came to, for the scan to report, including one that stopped early
+    /// and so left `rows` empty.
+    reduced: Option<Reduced>,
 }
 
 /// What turns a build side's keys into the set of driving rows that can match them, exactly.
@@ -274,6 +278,17 @@ impl<'a> Sideways<'a> {
         }
         self.found.get()?.rows.as_ref()
     }
+
+    /// What the exact reduction came to for a scan of `index`, for `EXPLAIN ANALYZE` to show.
+    ///
+    /// Asked once by the scan rather than kept up to date, because it is settled when the build side
+    /// finishes and nothing changes it after.
+    pub(crate) fn reduction(&self, index: u32) -> Option<Reduced> {
+        if self.binding.get()?.table != index {
+            return None;
+        }
+        self.found.get()?.reduced
+    }
 }
 
 /// The same column as `binding`, named the way the scan at the bottom of `node` names it.
@@ -329,12 +344,21 @@ pub(crate) fn beneath(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Opt
 /// raised over the same rows a moment later.
 pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) -> Result<Found> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
-    let exact = exact.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten();
+    let pushed = exact.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten();
+    let reduced = pushed.as_ref().map(|pushed| Reduced {
+        kept: pushed.rids.len(),
+        rows: pushed.rids.rows(),
+        stopped: pushed.stopped,
+    });
+    // The exact rows answer everything the filter would, with no false positives, so a side that
+    // has them does not pay for building the filter too. Nor does a side whose reduction stopped
+    // early, because it stopped on finding that the first third of the driving table all matches,
+    // and a filter over the same keys would pass the same rows at the price of a hash each.
+    let stopped = pushed.as_ref().is_some_and(|pushed| pushed.stopped);
+    let exact = pushed.filter(|pushed| !pushed.stopped).map(|pushed| pushed.rids);
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     let mut extremes = Extremes::default();
-    // The exact rows answer everything the filter would, with no false positives, so a side that
-    // has them does not pay for building the filter too.
-    let mut filter = if exact.is_some() { None } else { Blocked::sized(rows, BUDGET) };
+    let mut filter = if exact.is_some() || stopped { None } else { Blocked::sized(rows, BUDGET) };
     let mut hashes = Vec::new();
     for chunk in chunks {
         let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
@@ -353,7 +377,7 @@ pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) 
             filter.add(word);
         }
     }
-    Ok(Found { range: extremes.into_range(), filter, rows: exact })
+    Ok(Found { range: extremes.into_range(), filter, rows: exact, reduced })
 }
 
 /// The driving rows whose link points at a parent row the build side holds.
@@ -365,8 +389,9 @@ pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) 
 ///
 /// `None` when a key does not read as an integer or is not in the key map. Neither should happen,
 /// because the build side is a subset of the parent's rows and the map is over all of them. If one
-/// does, the join gets the filter instead, which is slower and is never wrong.
-fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Rids>> {
+/// does, the join gets the filter instead, which is slower and is never wrong. The push stops early
+/// when the first third of the driving table all matches, see [`Rids::forward_or_stop`].
+fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushed>> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let parents = exact.link.parents();
     let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).unwrap_or(usize::MAX)];
@@ -388,7 +413,7 @@ fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<R
         }
     }
     let held = Rids::from_words(parents, words)?;
-    Ok(Some(held.forward(&exact.link)?.rids))
+    Ok(Some(held.forward_or_stop(&exact.link)?))
 }
 
 /// The smallest and largest key one side of a join holds, widened a chunk at a time.
@@ -437,13 +462,13 @@ impl Found {
     /// A build side that turned out to hold this, for the tests that stand in for one.
     #[cfg(test)]
     pub(crate) fn of(range: Option<(Bound, Bound)>, filter: Option<Blocked>) -> Self {
-        Self { range, filter, rows: None }
+        Self { range, filter, rows: None, reduced: None }
     }
 
     /// The same, with an exact set of driving rows.
     #[cfg(test)]
     pub(crate) fn exactly(range: Option<(Bound, Bound)>, rows: Rids) -> Self {
-        Self { range, filter: None, rows: Some(rows) }
+        Self { range, filter: None, rows: Some(rows), reduced: None }
     }
 }
 
