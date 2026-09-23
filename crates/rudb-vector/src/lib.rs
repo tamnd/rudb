@@ -51,7 +51,7 @@ pub mod string;
 pub mod validity;
 pub mod vector;
 
-pub use assemble::{Assembly, concat, interleave};
+pub use assemble::{Assembly, concat, interleave, interleave_placed};
 pub use buffer::{Buffer, Pin};
 pub use chunk::Chunk;
 pub use selection::Selection;

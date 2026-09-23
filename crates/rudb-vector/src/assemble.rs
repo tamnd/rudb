@@ -46,7 +46,9 @@ use rudb_common::{Error, LogicalType, Result, Value};
 
 use crate::string::{Arenas, StringView};
 use crate::validity::Validity;
-use crate::vector::{Data, Form, NOWHERE, Vector, copy_of, data_for, empty_data_for, layout_of};
+use crate::vector::{
+    Data, Form, NOWHERE, Vector, copy_of, data_for, empty_data_for, layout_of, placed_of,
+};
 
 /// A vector being built out of pieces, each landing at the positions it is given.
 ///
@@ -286,7 +288,45 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
 /// If the type has no layout this can lay, if a piece holds fewer values than it has rows, or if
 /// an entry of `order` is past the end of the pieces.
 pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Result<Vector> {
+    interleave_placed(ty, pieces, order, None)
+}
+
+/// The same as [`interleave()`], writing each row where it goes rather than reading each row from
+/// where it came when the caller also has `inverse`, the place in the answer of every row laid.
+///
+/// Which of the two is cheaper is decided by how many ascending runs `order` is made of, and only
+/// the caller knows that without a pass of its own. Reading through `order` jumps between the runs,
+/// so when there are few of them each row of the answer costs a cache line of the laid column to
+/// use eight bytes of it, and with a dozen columns on a dozen threads that is the memory bus full.
+/// Writing through `inverse` reads the laid column front to back and writes one stream per run,
+/// each of them front to back too. On SF1 `lineitem` sorted by ship month, 84 runs, twelve columns
+/// on twelve threads went from 145ms to 50ms in a standalone test of just these loops. With runs
+/// in the tens of thousands the two come out even and with a run every few rows the writes are the
+/// ones that miss, so a caller with an order like that passes `None`.
+///
+/// This is not the scatter #1365 took out. That one built a map of the whole column per column to
+/// scatter into. This one writes into the answer's own run and the inverse is worked out once.
+///
+/// # Errors
+///
+/// As [`interleave()`], or if `inverse` is given and `order` and `inverse` are not both as long as
+/// the pieces, which is the only shape in which one can be the other turned round.
+pub fn interleave_placed(
+    ty: &LogicalType,
+    pieces: &[Vector],
+    order: &[usize],
+    inverse: Option<&[u32]>,
+) -> Result<Vector> {
     let rows: usize = pieces.iter().map(Vector::len).sum();
+    if let Some(inverse) = inverse
+        && (inverse.len() != rows || order.len() != rows)
+    {
+        return Err(Error::internal(format!(
+            "{} places and {} positions for a permutation of {rows} rows",
+            inverse.len(),
+            order.len()
+        )));
+    }
     if let Some(&past) = order.iter().find(|&&index| index >= rows) {
         return Err(Error::internal(format!("row {past} read out of pieces of {rows} rows")));
     }
@@ -343,23 +383,47 @@ pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Resul
     if laid.count_valid(rows) == 0 {
         return Ok(Vector::constant(ty.clone(), Value::Null, order.len()));
     }
-    let validity = match laid {
-        Validity::AllValid => Validity::AllValid,
-        laid => Validity::from_iter(order.len(), |row| {
+    let validity = match (laid, inverse) {
+        (Validity::AllValid, _) => Validity::AllValid,
+        (laid, Some(inverse)) => {
+            let mut live = vec![false; order.len()];
+            for (row, &to) in inverse.iter().enumerate() {
+                if let Some(slot) = live.get_mut(to as usize) {
+                    *slot = laid.is_valid(row);
+                }
+            }
+            Validity::from_run(&live)
+        }
+        (laid, None) => Validity::from_iter(order.len(), |row| {
             order.get(row).is_some_and(|&index| laid.is_valid(index))
         }),
     };
     if let Data::Varlen(column) = data {
         let (views, arena) = column.into_parts();
-        let gathered = order
-            .iter()
-            .map(|&index| views.get(index).copied().unwrap_or_else(StringView::empty))
-            .collect();
+        let gathered = match inverse {
+            Some(inverse) => {
+                let mut placed = vec![StringView::empty(); order.len()];
+                for (view, &to) in views.iter().zip(inverse) {
+                    if let Some(slot) = placed.get_mut(to as usize) {
+                        *slot = *view;
+                    }
+                }
+                placed
+            }
+            None => order
+                .iter()
+                .map(|&index| views.get(index).copied().unwrap_or_else(StringView::empty))
+                .collect(),
+        };
         return Ok(
             Vector::string_views(ty.clone(), gathered, Arc::new(arena))?.with_validity(validity)
         );
     }
-    Ok(Vector::flat(ty.clone(), copy_of(&data, order))?.with_validity(validity))
+    let data = match inverse {
+        Some(inverse) => placed_of(&data, inverse),
+        None => copy_of(&data, order),
+    };
+    Ok(Vector::flat(ty.clone(), data)?.with_validity(validity))
 }
 
 /// How many rows a merged dictionary entry has to stand for on average before a string column is
@@ -908,6 +972,34 @@ mod tests {
             assert_eq!(values(&got), expected, "{ty}");
         }
         assert!(interleave(&LogicalType::BigInt, &numbers, &[5]).is_err(), "row 5 of 5 rows");
+        // The same answers written through the inverse of a permutation, which is the way round a
+        // sort takes when its order is a few long runs.
+        let order = [4, 0, 3, 1, 2];
+        let mut inverse = [0u32; 5];
+        for (at, &row) in order.iter().enumerate() {
+            inverse[row] = at as u32;
+        }
+        let texts: Vec<Value> = ["a string past the twelve bytes of a view", "short", "x"]
+            .iter()
+            .map(|text| Value::Varchar((*text).to_string()))
+            .chain([Value::Varchar("another long string for the arena".to_string())])
+            .collect();
+        let valid = [
+            Vector::from_values(LogicalType::Varchar, &texts[..2]).expect("flat"),
+            Vector::from_values(LogicalType::Varchar, &texts[2..]).expect("flat"),
+            Vector::constant(LogicalType::Varchar, Value::Varchar("one more".to_string()), 1),
+        ];
+        for pieces in [&strings[..], &numbers[..], &lists[..], &valid[..]] {
+            let ty = pieces[0].logical_type().clone();
+            let pulled = interleave(&ty, pieces, &order).expect("an interleave");
+            let pushed =
+                interleave_placed(&ty, pieces, &order, Some(&inverse)).expect("a placed one");
+            assert_eq!(values(&pushed), values(&pulled), "{ty}");
+        }
+        assert!(
+            interleave_placed(&LogicalType::BigInt, &numbers, &order, Some(&inverse[..4])).is_err(),
+            "four places for five rows"
+        );
         let untyped = [Vector::constant(LogicalType::Null, Value::Null, 3)];
         let got = interleave(&LogicalType::Null, &untyped, &[2, 0]).expect("an untyped null");
         assert_eq!(values(&got), vec![Value::Null, Value::Null]);
