@@ -444,9 +444,9 @@ impl<'a> Transform<'a> {
             }
             "CreateStatement" => self.create_statement(inner),
             "DropStatement" => self.drop_statement(inner),
-            "InsertStatement" => self.insert_statement(inner),
-            "UpdateStatement" => self.update_statement(inner),
-            "DeleteStatement" => self.delete_statement(inner),
+            "InsertStatement" | "UpdateStatement" | "DeleteStatement" => {
+                self.write_statement(inner)
+            }
             "TruncateStatement" => {
                 let name = self.name_parts(self.find(inner, "BaseTableName"));
                 self.changed_rows(inner, name, NONE, Vec::new(), true)
@@ -1019,9 +1019,6 @@ impl<'a> Transform<'a> {
             }
             return self.unsupported(kid);
         }
-        if self.find(node, "WithClause") != NONE {
-            return self.unsupported(self.find(node, "WithClause"));
-        }
         let target = self.find(node, "InsertTarget");
         let name = self.name_parts(self.find(target, "BaseTableName"));
         let alias = self.find(target, "InsertAlias");
@@ -1073,15 +1070,44 @@ impl<'a> Transform<'a> {
         Slice { start, len: 1 }
     }
 
+    /// An `INSERT`, `UPDATE` or `DELETE`, with the definitions of a `WITH` ahead of it in scope.
+    ///
+    /// A definition is inlined where it is named unless it was written `MATERIALIZED`, which is
+    /// what a query nested in another gets too, and one that is held is carried by the source and
+    /// by the `RETURNING` query both, since each is bound on its own.
+    fn write_statement(&mut self, node: u32) -> Result<Statement> {
+        let mark = self.ctes.len();
+        let once = self.definitions(node, self.find(node, "WithClause"))?;
+        let statement = match self.name(node) {
+            "InsertStatement" => self.insert_statement(node),
+            "UpdateStatement" => self.update_statement(node),
+            _ => self.delete_statement(node),
+        };
+        self.ctes.truncate(mark);
+        let statement = statement?;
+        if let (
+            false,
+            Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index),
+        ) = (once.is_empty(), &statement)
+        {
+            let insert = self.ast.inserts[*index as usize];
+            for query in std::iter::once(insert.source).chain(insert.returning) {
+                // Outermost first, so the statement's own come ahead of any the query wrote.
+                let own = self.ast.queries[query as usize].ctes;
+                let mut all = once.clone();
+                all.extend_from_slice(self.ast.cte_list(own));
+                let slice = self.cte_slice(all);
+                self.ast.queries[query as usize].ctes = slice;
+            }
+        }
+        Ok(statement)
+    }
+
     /// `UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause FromClause?
     /// WhereClause? ReturningClause?`.
     ///
-    /// `WITH` is a refusal for now. A qualified name after `SET` is the pin's own refusal.
+    /// A qualified name after `SET` is the pin's own refusal.
     fn update_statement(&mut self, node: u32) -> Result<Statement> {
-        let with = self.find(node, "WithClause");
-        if with != NONE {
-            return self.unsupported(with);
-        }
         let target = self.first(self.find(node, "UpdateTarget"));
         let name = self.name_parts(self.find(target, "BaseTableName"));
         let alias = self.find(target, "UpdateAlias");
@@ -1147,12 +1173,8 @@ impl<'a> Transform<'a> {
     }
 
     /// `DeleteStatement <- WithClause? 'DELETE' 'FROM' TargetOptAlias DeleteUsingClause?
-    /// WhereClause? ReturningClause?`, with `WITH` refused for now.
+    /// WhereClause? ReturningClause?`.
     fn delete_statement(&mut self, node: u32) -> Result<Statement> {
-        let with = self.find(node, "WithClause");
-        if with != NONE {
-            return self.unsupported(with);
-        }
         let target = self.find(node, "TargetOptAlias");
         let name = self.name_parts(self.find(target, "BaseTableName"));
         let alias = self.find(target, "ColId");
@@ -1304,63 +1326,8 @@ impl<'a> Transform<'a> {
 
     fn query_inner(&mut self, node: u32) -> Result<QueryRef> {
         let mark = self.ctes.len();
-        let mut once = Vec::new();
         let with = self.find(node, "WithClause");
-        if with != NONE {
-            if self.find(with, "Recursive") != NONE {
-                return self.unsupported(self.find(with, "Recursive"));
-            }
-            let written: Vec<u32> =
-                self.kids(with).filter(|&kid| self.name(kid) == "WithStatement").collect();
-            for (at, &statement) in written.iter().enumerate() {
-                // `MATERIALIZED` says the definition runs once and every reference reads the rows
-                // it produced and `NOT MATERIALIZED` says the query goes into each place the name
-                // is used. Neither word was written for most definitions, and what the plain form
-                // means is a decision rather than a default: the pinned build holds the rows of a
-                // plain definition that is named more than once and puts one named once into the
-                // place it is named, so that is what happens here. It is settled at the parse
-                // rather than left to the optimizer because the pin settles it there too, which is
-                // visible in its `EXPLAIN`.
-                //
-                // Holding rather than inlining is also what makes a definition holding a volatile
-                // call answer the way the pin answers it. `WITH c AS (SELECT random() AS r) SELECT
-                // a.r, b.r FROM c a, c b` gives the same number twice on the pin, which is what a
-                // definition run once gives, and two numbers is what inlining gives. The function
-                // table has no `random`, no `nextval` and no `now` in it yet, so nothing reaches
-                // that today, but the rule is now the one that will be right when something does.
-                let word = self.find(statement, "Materialized");
-                let asked =
-                    word != NONE && !self.text(word).eq_ignore_ascii_case("NOT MATERIALIZED");
-                let refused = word != NONE && !asked;
-                let name = self.identifier(self.first(statement));
-                let materialized =
-                    asked || (!refused && self.worth_holding(node, &written[..=at], name));
-                let list = self.find(statement, "InsertColumnList");
-                let columns = if list == NONE {
-                    Slice::default()
-                } else {
-                    let mut names = Vec::new();
-                    for kid in self.kids(self.find(list, "ColumnList")) {
-                        names.push(self.identifier(kid));
-                    }
-                    self.part_slice(names)
-                };
-                let body = self.find(statement, "CTEBody");
-                let select = self.first(body);
-                if self.name(select) != "CTESelectBody" {
-                    return self.unsupported(body);
-                }
-                let query = self.query(self.first(select))?;
-                if materialized {
-                    let index = self.ast.ctes.len() as u32;
-                    self.ast.ctes.push(Cte { name, query, columns });
-                    once.push(index);
-                    self.ctes.push((name, Held::Once(index), columns));
-                } else {
-                    self.ctes.push((name, Held::Inline(query), columns));
-                }
-            }
-        }
+        let once = self.definitions(node, with)?;
         let chain = self.find(node, "SelectSetOpChain");
         if chain == NONE {
             return self.unsupported(node);
@@ -1376,6 +1343,69 @@ impl<'a> Transform<'a> {
         }
         self.ctes.truncate(mark);
         Ok(query)
+    }
+
+    /// The definitions of a `WITH`, put in scope for what follows, with the ones held once
+    /// returned so the query they belong to can carry them. `NONE` for no clause is no definitions.
+    /// The caller truncates `ctes` back to where it was once the query is read.
+    fn definitions(&mut self, node: u32, with: u32) -> Result<Vec<u32>> {
+        let mut once = Vec::new();
+        if with == NONE {
+            return Ok(once);
+        }
+        if self.find(with, "Recursive") != NONE {
+            return self.unsupported(self.find(with, "Recursive"));
+        }
+        let written: Vec<u32> =
+            self.kids(with).filter(|&kid| self.name(kid) == "WithStatement").collect();
+        for (at, &statement) in written.iter().enumerate() {
+            // `MATERIALIZED` says the definition runs once and every reference reads the rows
+            // it produced and `NOT MATERIALIZED` says the query goes into each place the name
+            // is used. Neither word was written for most definitions, and what the plain form
+            // means is a decision rather than a default: the pinned build holds the rows of a
+            // plain definition that is named more than once and puts one named once into the
+            // place it is named, so that is what happens here. It is settled at the parse
+            // rather than left to the optimizer because the pin settles it there too, which is
+            // visible in its `EXPLAIN`.
+            //
+            // Holding rather than inlining is also what makes a definition holding a volatile
+            // call answer the way the pin answers it. `WITH c AS (SELECT random() AS r) SELECT
+            // a.r, b.r FROM c a, c b` gives the same number twice on the pin, which is what a
+            // definition run once gives, and two numbers is what inlining gives. The function
+            // table has no `random`, no `nextval` and no `now` in it yet, so nothing reaches
+            // that today, but the rule is now the one that will be right when something does.
+            let word = self.find(statement, "Materialized");
+            let asked = word != NONE && !self.text(word).eq_ignore_ascii_case("NOT MATERIALIZED");
+            let refused = word != NONE && !asked;
+            let name = self.identifier(self.first(statement));
+            let materialized =
+                asked || (!refused && self.worth_holding(node, &written[..=at], name));
+            let list = self.find(statement, "InsertColumnList");
+            let columns = if list == NONE {
+                Slice::default()
+            } else {
+                let mut names = Vec::new();
+                for kid in self.kids(self.find(list, "ColumnList")) {
+                    names.push(self.identifier(kid));
+                }
+                self.part_slice(names)
+            };
+            let body = self.find(statement, "CTEBody");
+            let select = self.first(body);
+            if self.name(select) != "CTESelectBody" {
+                return self.unsupported(body);
+            }
+            let query = self.query(self.first(select))?;
+            if materialized {
+                let index = self.ast.ctes.len() as u32;
+                self.ast.ctes.push(Cte { name, query, columns });
+                once.push(index);
+                self.ctes.push((name, Held::Once(index), columns));
+            } else {
+                self.ctes.push((name, Held::Inline(query), columns));
+            }
+        }
+        Ok(once)
     }
 
     /// Whether a plain `WITH` definition is one to hold the rows of rather than to inline.
