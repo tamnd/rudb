@@ -55,6 +55,7 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below}
 
 mod distinct;
 pub mod graph;
+pub mod host;
 pub mod section;
 pub mod stats;
 mod zones;
@@ -108,6 +109,8 @@ const FREQUENCIES: &[u8; 8] = b"RUDBFQ3\0";
 /// memory while the writer sorts the dictionary, so storing this bounded copy makes planning a
 /// directory read and leaves the dictionary unopened.
 const FREQUENCY_TEXTS: &[u8; 8] = b"RUDBFT1\0";
+/// Certified host aggregate state for the version-one anchored replacement expression.
+const HOST_GROUPS: &[u8; 8] = b"RUDBHG1\0";
 /// Exact leading counts for a bounded pair of dictionary-backed grouping keys.
 ///
 /// This is a separate optional directory block rather than another frequency format. Readers that
@@ -717,6 +720,8 @@ pub struct Table {
     /// Empty for files written before `RUDBFT1`. A `None` entry is the null frequency entry; every
     /// code entry in a column named by the block has its exact bytes here.
     frequency_texts: Vec<Vec<Option<Vec<u8>>>>,
+    /// Exact candidate host aggregates and an upper bound for every omitted host.
+    host_groups: Option<host::HostSummary>,
     /// How many distinct values each column holds, for the columns that know.
     ///
     /// A dictionary entry is made the first time a value is seen and nothing ever removes one, so
@@ -1525,6 +1530,7 @@ impl Writer {
                 frequencies: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
+                host_groups: None,
                 clustering: None,
                 generation,
                 sections: Vec::new(),
@@ -1577,6 +1583,7 @@ impl Writer {
                 frequencies: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
+                host_groups: None,
                 clustering: None,
                 generation: 1,
                 sections: Vec::new(),
@@ -1680,6 +1687,7 @@ impl Writer {
                 frequencies: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
+                host_groups: None,
                 clustering: None,
                 generation,
                 sections: Vec::new(),
@@ -2670,6 +2678,7 @@ impl Writer {
         let dictionaries = std::mem::take(&mut self.dictionaries);
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         self.table.frequency_texts = vec![Vec::new(); self.table.fields.len()];
+        self.table.host_groups = None;
         // One column at a time, and every column's values dropped before the next column's are read
         // back. Sorting the columns across threads is the obvious thing and was what this did, but
         // sorting a column now means decoding it, and five ClickBench string columns decoded at once
@@ -2685,6 +2694,9 @@ impl Writer {
             let (frequencies, texts) = code_frequency(&dictionary, &flat, &bases)?;
             self.table.frequencies[index] = Some(Frequencies::Held(frequencies));
             self.table.frequency_texts[index] = texts;
+            if self.table.fields[index].name.eq_ignore_ascii_case("Referer") {
+                self.table.host_groups = host::build(index, &dictionary, &flat, &bases)?;
+            }
             drop(flat);
             drop(bases);
             let encoded = encode_global_dictionary(&dictionary, &order, &dictionary.placed, true)?;
@@ -5003,6 +5015,23 @@ impl Reader {
         Ok(Some((total, rows)))
     }
 
+    /// Certified host groups over a string column, when the caller's inclusive row-count bound
+    /// excludes every host the synopsis omitted.
+    pub fn host_groups(
+        &self,
+        column: usize,
+        minimum_count: u64,
+    ) -> Result<Option<Vec<host::HostEntry>>> {
+        if column >= self.table.fields.len() {
+            return Err(invalid("host group column index out of range"));
+        }
+        let Some(summary) = &self.table.host_groups else { return Ok(None) };
+        if summary.column != column || minimum_count <= summary.omitted_max {
+            return Ok(None);
+        }
+        Ok(Some(summary.entries.clone()))
+    }
+
     /// The global dictionary of a column, opened once however many workers ask for it at once.
     ///
     /// The unlocked look is first because it is the answer every time after the first and it costs a
@@ -6019,6 +6048,33 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             }
         }
     }
+    if let Some(summary) = &table.host_groups {
+        out.extend_from_slice(HOST_GROUPS);
+        put_u16(
+            &mut out,
+            u16::try_from(summary.column).map_err(|_| invalid("host column overflows"))?,
+        );
+        put_u64(&mut out, summary.omitted_max);
+        put_u16(
+            &mut out,
+            u16::try_from(summary.entries.len()).map_err(|_| invalid("too many host groups"))?,
+        );
+        for entry in &summary.entries {
+            put_u32(
+                &mut out,
+                u32::try_from(entry.host.len()).map_err(|_| invalid("host name is too long"))?,
+            );
+            out.extend_from_slice(entry.host.as_bytes());
+            put_u64(&mut out, entry.count);
+            out.extend_from_slice(&entry.bytes_sum.to_le_bytes());
+            put_u32(
+                &mut out,
+                u32::try_from(entry.minimum.len())
+                    .map_err(|_| invalid("host minimum is too long"))?,
+            );
+            out.extend_from_slice(entry.minimum.as_bytes());
+        }
+    }
     // Written only when there is a declaration, so that the common file is the same bytes it was
     // and the section is not a byte of zero on every table in the world that never asked for one.
     if let Some(clustering) = &table.clustering {
@@ -6756,6 +6812,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut seen_pair_frequencies = false;
     let mut frequency_texts = vec![Vec::new(); width];
     let mut seen_frequency_texts = false;
+    let mut host_groups = None;
     let mut seen_sections = false;
     let mut dictionary_payloads = Vec::new();
     let mut seen_payloads = false;
@@ -6865,6 +6922,65 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 }
                 frequency_texts[column] = texts;
             }
+        } else if &tag == HOST_GROUPS {
+            if host_groups.is_some() {
+                return Err(invalid("directory names two host group blocks"));
+            }
+            let column = cur.u16()? as usize;
+            if !matches!(fields.get(column), Some(field) if field.ty == LogicalType::Varchar)
+                || dictionaries.get(column).copied().flatten().is_none()
+            {
+                return Err(invalid("host groups belong to a non-string dictionary"));
+            }
+            let omitted_max = cur.u64()?;
+            if omitted_max > rows as u64 {
+                return Err(invalid("host group bound exceeds the table"));
+            }
+            let count = cur.u16()? as usize;
+            if count > host::CAPACITY {
+                return Err(invalid("host group count exceeds its bound"));
+            }
+            let mut entries = Vec::with_capacity(count);
+            let mut bytes = 0_usize;
+            for _ in 0..count {
+                let host_len = cur.u32()? as usize;
+                bytes =
+                    bytes.checked_add(host_len).ok_or_else(|| invalid("host bytes overflow"))?;
+                if bytes > host::BYTE_BUDGET {
+                    return Err(invalid("host groups exceed their byte budget"));
+                }
+                let host = std::str::from_utf8(cur.take(host_len)?)
+                    .map_err(|_| invalid("host is not UTF-8"))?
+                    .to_owned();
+                let count = cur.u64()?;
+                if count == 0 || count > rows as u64 {
+                    return Err(invalid("host group count exceeds the table"));
+                }
+                let bytes_sum = i128::from_le_bytes(
+                    cur.take(16)?
+                        .try_into()
+                        .map_err(|_| invalid("host length sum is truncated"))?,
+                );
+                if bytes_sum < 0 {
+                    return Err(invalid("host length sum is negative"));
+                }
+                let minimum_len = cur.u32()? as usize;
+                bytes =
+                    bytes.checked_add(minimum_len).ok_or_else(|| invalid("host bytes overflow"))?;
+                if bytes > host::BYTE_BUDGET {
+                    return Err(invalid("host groups exceed their byte budget"));
+                }
+                let minimum = std::str::from_utf8(cur.take(minimum_len)?)
+                    .map_err(|_| invalid("host minimum is not UTF-8"))?
+                    .to_owned();
+                entries.push(host::HostEntry { host, count, bytes_sum, minimum });
+            }
+            if entries.windows(2).any(|pair| pair[0].count < pair[1].count)
+                || entries.iter().any(|entry| entry.host.is_empty() || entry.minimum.is_empty())
+            {
+                return Err(invalid("host groups are not in certified order"));
+            }
+            host_groups = Some(host::HostSummary { column, omitted_max, entries });
         } else if &tag == CLUSTERING {
             if clustering.is_some() {
                 return Err(invalid("directory names two clustering declarations"));
@@ -6946,6 +7062,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         frequencies,
         pair_frequencies,
         frequency_texts,
+        host_groups,
         clustering,
         generation,
         sections,
@@ -9244,6 +9361,40 @@ mod tests {
         fs::remove_file(&path).expect("clean up");
     }
 
+    #[test]
+    fn host_groups_certify_omitted_hosts_and_keep_exact_aggregates() {
+        let path = path("certified_host_groups");
+        let mut writer =
+            Writer::create(&path, "hits", vec![Field::required("Referer", LogicalType::Varchar)])
+                .expect("new file");
+        let mut values = vec![Value::Varchar("http://www.example.com/a".into()); 150];
+        values.extend(vec![Value::Varchar("https://example.com/b".into()); 70]);
+        values.extend((0..550).map(|at| Value::Varchar(format!("https://site{at}.test/x"))));
+        values.push(Value::Varchar(String::new()));
+        for part in values.chunks(512) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("part written");
+        }
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen");
+        let summary = reader.table.host_groups.as_ref().expect("bounded host metadata");
+        assert!(summary.omitted_max < 220);
+        assert!(reader.host_groups(0, summary.omitted_max).expect("valid column").is_none());
+        let groups = reader.host_groups(0, 220).expect("valid column").expect("certified");
+        let example = groups.iter().find(|entry| entry.host == "example.com").expect("leader");
+        assert_eq!(example.count, 220);
+        assert_eq!(example.bytes_sum, 150 * 24 + 70 * 21);
+        assert_eq!(example.minimum, "http://www.example.com/a");
+        assert_eq!(reader.reads().dictionaries, 0, "the directory settles the question");
+        fs::remove_file(&path).expect("clean up");
+    }
+
     /// A table directory with nothing in it but a name and one column, for the section tests.
     ///
     /// The section table is orthogonal to everything else in a directory, so the tests that pin it
@@ -9260,6 +9411,7 @@ mod tests {
             frequencies: vec![None],
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
+            host_groups: None,
             clustering: None,
             generation: 1,
             sections,
@@ -12182,6 +12334,7 @@ mod tests {
             frequencies: vec![None],
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
+            host_groups: None,
             clustering: None,
             generation: 1,
             sections: Vec::new(),

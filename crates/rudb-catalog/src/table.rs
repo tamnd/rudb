@@ -172,6 +172,19 @@ impl Rows {
         }
     }
 
+    /// Certified host aggregates kept by a native file when its omitted bound is below the
+    /// inclusive `HAVING COUNT(*)` threshold. Other row sources use the ordinary aggregate.
+    pub fn host_groups(
+        &self,
+        column: usize,
+        minimum_count: u64,
+    ) -> Result<Option<Vec<rudb_native::host::HostEntry>>> {
+        match self {
+            Self::Native(reader) => reader.host_groups(column, minimum_count),
+            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+        }
+    }
+
     /// Every value of one column with its exact row count, when something has all of them.
     ///
     /// Only ever an answer for a column with few enough distinct values. A file answers when the
