@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rudb_common::{Cause, Spent, Stage, Tally};
 
-use crate::document::{Implementation, Joined, Memory, Operator};
+use crate::document::{Implementation, Joined, Memory, Operator, Reduced};
 
 /// The counters for one operator.
 #[derive(Debug)]
@@ -61,6 +61,9 @@ pub struct Counters {
     /// gathered side and read once at the end. Every other instance of that operator finds the
     /// table already built and has nothing to say that the first one did not.
     joined: OnceLock<Joined>,
+    /// What a join's exact reduction left a scan, written once by whichever instance settles its
+    /// tests first, for the reason `joined` is written once.
+    reduced: OnceLock<Reduced>,
     /// One clock and one byte count per [`Stage`], in the order [`Stage::ALL`] lists them.
     ///
     /// Only a scan fills these in. Everything else reports a row of zeroes, which costs nothing to
@@ -94,6 +97,7 @@ impl Counters {
             reserved: AtomicU64::new(0),
             high_water: AtomicU64::new(0),
             joined: OnceLock::new(),
+            reduced: OnceLock::new(),
             fallbacks: [const { AtomicU64::new(0) }; Cause::ALL.len()],
             stages: [const { AtomicU64::new(0) }; Stage::ALL.len()],
             stage_bytes: [const { AtomicU64::new(0) }; Stage::ALL.len()],
@@ -253,6 +257,12 @@ impl Counters {
         let _ = self.joined.set(joined);
     }
 
+    /// Records what a join's exact reduction left this scan. The first call wins, as in
+    /// [`Counters::joining`].
+    pub fn reducing(&self, reduced: Reduced) {
+        let _ = self.reduced.set(reduced);
+    }
+
     /// What this operator holds now, which also moves the high water mark when it is a new most.
     ///
     /// Reported rather than added, because memory is a level and not a total. An operator that
@@ -295,6 +305,7 @@ impl Counters {
             high_water: self.high_water.load(Ordering::Relaxed),
         };
         operator.joined = self.joined.get().cloned();
+        operator.reduced = self.reduced.get().copied();
         operator
     }
 }

@@ -458,6 +458,16 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
     } else {
         format!(", {} of {parts} parts skipped", operator.parts_pruned)
     };
+    // The reduction goes next to the parts it skipped, since those are where most of what it saved
+    // shows. A reduction that stopped says so in words, because its row count is the whole table
+    // and a reader would otherwise take it for a set that happened to hold every row.
+    let reduced = match &operator.reduced {
+        None => String::new(),
+        Some(reduced) if reduced.stopped => {
+            ", link reduction stopped after a third of the rows removed nothing".to_owned()
+        }
+        Some(reduced) => format!(", link kept {} of {} rows", reduced.kept, reduced.rows),
+    };
     // Both clocks, named, because one number here was read as the other three times. The wall
     // figure is the operator's elapsed time summed over its instances, so on a plan that runs eight
     // ways it can exceed the whole statement's CPU and is not a share of anything. The CPU figure is
@@ -469,7 +479,10 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
     } else {
         format!("{} wall, {} cpu", duration(operator.wall_ns), duration(operator.cpu_ns))
     };
-    format!("  [{} rows{after}, {spent}{joined}{skipped}{memory}{slow}]", operator.rows_out)
+    format!(
+        "  [{} rows{after}, {spent}{joined}{skipped}{reduced}{memory}{slow}]",
+        operator.rows_out
+    )
 }
 
 /// The operator row with this id.

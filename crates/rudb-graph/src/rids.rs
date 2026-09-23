@@ -42,6 +42,13 @@ use crate::rid::{NO_PARENT, PART_ROWS, Rid};
 /// sixty four, so the threshold is on the side of the bitmap. That side is the one a scan wants.
 pub const SPARSE_RATIO: u64 = 1000;
 
+/// A push that stops early decides at the first part past one in this many child rows.
+///
+/// Section 5.4's third. Less and a set that removes rows only toward the end of a table clustered
+/// by its parent is given up on while it is still about to pay. More and the push that removes
+/// nothing costs most of what finishing it would have.
+pub const STOP_AFTER: u64 = 3;
+
 /// Which form a set is held in, for a plan output to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Form {
@@ -278,6 +285,26 @@ impl Rids {
     ///
     /// If this set is not over the link's parent table.
     pub fn forward(&self, link: &Link) -> Result<Pushed> {
+        self.push(link, false)
+    }
+
+    /// The same push, giving up once it is plain that the set removes nothing.
+    ///
+    /// Section 5.4's early stop. A push that has covered the first [`STOP_AFTER`]th of the child and
+    /// kept every row of it stops there and hands back every row, so a reduction that was never
+    /// going to remove anything costs a third of a push and then nothing, where finishing would
+    /// cost the rest of the push and a bit test per row of the scan. The answer is then a superset
+    /// of the children that point into the set, which is all a join that still matches every row
+    /// needs, and [`Pushed::stopped`] says so.
+    ///
+    /// # Errors
+    ///
+    /// If this set is not over the link's parent table.
+    pub fn forward_or_stop(&self, link: &Link) -> Result<Pushed> {
+        self.push(link, true)
+    }
+
+    fn push(&self, link: &Link, stopping: bool) -> Result<Pushed> {
         if self.rows != link.parents() {
             return Err(Error::internal(format!(
                 "a set over {} rows pushed through a link whose parent has {}",
@@ -289,13 +316,30 @@ impl Rids {
         let parts = children.div_ceil(count(PART_ROWS));
         // Every child that has a parent is a member, which is every child when every child matched.
         if self.is_full() && link.linked() == children {
-            return Ok(Pushed { rids: Self::full(children), parts, skipped: 0 });
+            return Ok(Pushed { rids: Self::full(children), parts, skipped: 0, stopped: false });
         }
         let mut words = vec![0_u64; index(children.div_ceil(64))];
         let mut parents = vec![NO_PARENT; PART_ROWS];
         let mut skipped = 0_u64;
+        // Asked once, at the first part boundary past the mark, because a push that has removed a
+        // row by then has shown the set is worth finishing and asking again later would only give up
+        // work already paid for.
+        let mark = children.div_ceil(STOP_AFTER);
+        let mut asked = !stopping;
+        let mut kept = 0_u64;
         for part in 0..parts {
             let first = part * count(PART_ROWS);
+            if !asked && first >= mark {
+                asked = true;
+                if kept == first {
+                    return Ok(Pushed {
+                        rids: Self::full(children),
+                        parts,
+                        skipped,
+                        stopped: true,
+                    });
+                }
+            }
             let reach = match link.part_bounds(index(part)) {
                 Some(Some((low, high))) => self.any_between(low, high),
                 _ => false,
@@ -310,10 +354,11 @@ impl Rids {
                 if parent != NO_PARENT && self.contains(parent) {
                     let child = first + count(at);
                     words[index(child / 64)] |= 1 << (child % 64);
+                    kept += 1;
                 }
             }
         }
-        Ok(Pushed { rids: Self::settle_dense(children, words), parts, skipped })
+        Ok(Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false })
     }
 
     /// Pushes a set of child rows backward through `link`, to the parents they point at.
@@ -413,6 +458,9 @@ pub struct Pushed {
     pub parts: u64,
     /// Parts the zone map ruled out without their link being decoded.
     pub skipped: u64,
+    /// Whether the push gave up early, so that `rids` is every row rather than exactly the ones
+    /// that point into the set. Only [`Rids::forward_or_stop`] does.
+    pub stopped: bool,
 }
 
 /// Which form `members` rows out of `rows` belong in.
@@ -459,7 +507,7 @@ fn index(rows: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Form, Rids, SPARSE_RATIO};
+    use super::{Form, Rids, SPARSE_RATIO, STOP_AFTER};
     use crate::link::Link;
     use crate::rid::{NO_PARENT, PART_ROWS, Rid};
 
@@ -608,6 +656,39 @@ mod tests {
 
     fn count(rows: usize) -> u64 {
         u64::try_from(rows).expect("small")
+    }
+
+    /// A set that holds every parent a child points at stops at the first part past the third and
+    /// hands back every row, and a set that removes one row before the third finishes and is exact.
+    #[test]
+    fn a_push_that_removes_nothing_by_the_third_stops_and_one_that_removes_something_finishes() {
+        let parents = 3000;
+        let children = 4 * STOP_AFTER * count(PART_ROWS);
+        let clustered = link(children, parents, |child| child * parents / children);
+        let every = Rids::full(parents);
+        let all_but_last: Vec<Rid> = (0..parents - 1).collect();
+        let most = Rids::from_sorted(parents, all_but_last).expect("sorted");
+        let stopped = most.forward_or_stop(&clustered).expect("the same table");
+        assert!(stopped.stopped, "nothing was removed in the first third");
+        assert!(stopped.rids.is_full(), "a stopped push keeps every row");
+        assert_eq!(stopped.parts, 4 * STOP_AFTER);
+        // The full set never reaches the loop, since it cannot remove anything to begin with.
+        assert!(!every.forward_or_stop(&clustered).expect("the same table").stopped);
+
+        let all_but_first: Vec<Rid> = (1..parents).collect();
+        let early = Rids::from_sorted(parents, all_but_first).expect("sorted");
+        let finished = early.forward_or_stop(&clustered).expect("the same table");
+        assert!(!finished.stopped, "the first parent's children were removed before the third");
+        assert_eq!(finished, early.forward(&clustered).expect("the same table"));
+        assert_eq!(
+            finished.rids.len(),
+            children - count((0..children).filter(|child| child * parents / children == 0).count())
+        );
+
+        // A child with no parent is a row removed, the same as a child whose parent is not held.
+        let orphans =
+            link(children, parents, |child| if child == 5 { NO_PARENT } else { child % parents });
+        assert!(!every.forward_or_stop(&orphans).expect("the same table").stopped);
     }
 
     /// Section 5.5's claim, on the shape it is made about: a child clustered by its parent, and a

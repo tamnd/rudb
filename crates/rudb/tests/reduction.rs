@@ -71,6 +71,10 @@ fn a_filtered_parent_skips_the_child_parts_it_has_no_rows_in_and_answers_the_sam
     assert_eq!(reduced[0][0], Value::BigInt(30), "the query should match something");
     let line = orders_scan(&database, QUERY);
     assert!(line.contains("parts skipped"), "the reduction should skip parts of orders: {line}");
+    assert!(
+        line.contains("link kept 30 of 300000 rows"),
+        "the reduction says what it kept: {line}"
+    );
 
     database.execute("SET graph_reduction = 'off'").expect("the rule has a switch");
     assert_eq!(rows(&database, QUERY), reduced, "the reduction changed an answer");
@@ -89,6 +93,26 @@ fn a_filtered_parent_skips_the_child_parts_it_has_no_rows_in_and_answers_the_sam
         "the reduction is under the layer's switch"
     );
 
+    drop(database);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A filter that drops only the last customer removes orders only in the last part, so the push
+/// has removed nothing by the time it is a third of the way through `orders` and stops there.
+#[test]
+fn a_reduction_that_removes_nothing_early_stops_and_says_so() {
+    let (database, path) = database("stops");
+    let sql = "SELECT count(*), sum(o_orderkey) FROM orders JOIN customer ON o_custkey = c_custkey \
+               WHERE c_custkey < 30000";
+    let stopped = rows(&database, sql);
+    assert_eq!(stopped[0][0], Value::BigInt(299_990));
+    let line = orders_scan(&database, sql);
+    assert!(line.contains("link reduction stopped"), "the push should have stopped: {line}");
+    assert!(!line.contains("link kept"), "{line}");
+
+    database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
+    assert_eq!(rows(&database, sql), stopped, "stopping changed an answer");
+    assert!(!orders_scan(&database, sql).contains("link"), "no reduction with the layer off");
     drop(database);
     std::fs::remove_file(&path).ok();
 }
