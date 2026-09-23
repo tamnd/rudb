@@ -66,6 +66,18 @@ enum Run {
     Packed { start: usize, total: usize, done: usize },
 }
 
+/// Where a [`Hybrid`] stopped, kept apart from the bytes it was reading.
+///
+/// A reader borrows its bytes, and something that wants to read a page a window at a time owns
+/// those bytes and cannot also hold a reader into them. So it holds this instead and asks
+/// [`Hybrid::resume`] for a reader each time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Mark {
+    at: usize,
+    width: u8,
+    run: Run,
+}
+
 impl<'a> Hybrid<'a> {
     /// A reader over `bytes` whose bit-packed values are `width` bits each.
     ///
@@ -80,6 +92,16 @@ impl<'a> Hybrid<'a> {
             )));
         }
         Ok(Self { bytes, at: 0, width, run: Run::Done })
+    }
+
+    /// Where this reader is, for [`Hybrid::resume`] to carry on from.
+    pub(crate) fn mark(&self) -> Mark {
+        Mark { at: self.at, width: self.width, run: self.run }
+    }
+
+    /// A reader over the same `bytes` a [`Hybrid::mark`] was taken from, where it left off.
+    pub(crate) fn resume(bytes: &'a [u8], mark: Mark) -> Self {
+        Self { bytes, at: mark.at, width: mark.width, run: mark.run }
     }
 
     /// Reads exactly `count` values onto the end of `out`.

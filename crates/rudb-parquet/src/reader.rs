@@ -84,6 +84,7 @@ use crate::chunk::Pages;
 use crate::metadata::{Metadata, SchemaColumn};
 use crate::page::Body;
 use crate::prune::Footer;
+use crate::values::Coded;
 
 type PickedColumns = Vec<(usize, usize, Vec<Value>)>;
 
@@ -973,6 +974,9 @@ struct Cursor {
     /// with.
     cached: Option<Cached>,
     page: Option<Vector>,
+    /// A long dictionary encoded page still being handed out a window at a time, which `page` is
+    /// the current window of.
+    coded: Option<Coded>,
     queued: Vec<Vector>,
     offset: usize,
     /// The ordinal, inside this column chunk, of the first value of the page at [`Self::at`].
@@ -1016,6 +1020,7 @@ impl Cursor {
             dictionary: None,
             cached,
             page: None,
+            coded: None,
             queued: Vec::new(),
             offset: 0,
             row: 0,
@@ -1043,6 +1048,7 @@ impl Cursor {
             dictionary: None,
             cached: None,
             page: None,
+            coded: None,
             queued: pages,
             offset: 0,
             row: 0,
@@ -1062,6 +1068,18 @@ impl Cursor {
             if let Some(page) = self.queued.pop() {
                 self.page = Some(page);
                 continue;
+            }
+            if let Some(coded) = self.coded.as_mut() {
+                let timing = Timing::start(Stage::Decode);
+                let window = coded.next();
+                timing.stop(0);
+                if let Some(window) = window? {
+                    self.page = Some(window.into_pages());
+                    continue;
+                }
+                if let Some(done) = self.coded.take() {
+                    self.spare = done.into_body();
+                }
             }
             if self.left <= 0 {
                 return Ok(0);
@@ -1112,6 +1130,13 @@ impl Cursor {
             self.left -= i64::from(page.header.values());
             let bytes = u64::try_from(page.body.len()).unwrap_or(u64::MAX);
             let timing = Timing::start(Stage::Decode);
+            let windowed = page.windowed(&self.column, self.dictionary.as_ref());
+            if let Some(coded) = windowed? {
+                // Counted as decoded here, all of it, and each window after this as none.
+                timing.stop(bytes);
+                self.coded = Some(coded);
+                continue;
+            }
             let decoded = page.decode(&self.column, self.dictionary.as_ref());
             timing.stop(bytes);
             self.spare = page.body;
@@ -1178,12 +1203,22 @@ impl Cursor {
             self.row = self.row.saturating_add(values);
             self.left -= i64::from(header.values());
         }
-        let inside = target.saturating_sub(self.row);
-        if inside > 0 {
-            // The page the target is in, decoded by the streaming walk so that there is one piece of
-            // code that knows how to turn a page into a vector, and then started part way in.
-            self.left(Some(file))?;
-            self.offset = inside;
+        let mut inside = target.saturating_sub(self.row);
+        // The page the target is in, decoded by the streaming walk so that there is one piece of
+        // code that knows how to turn a page into a vector, and then started part way in. A long
+        // dictionary encoded page comes out a window at a time, so the windows before the one the
+        // target is in are stepped over whole.
+        while inside > 0 {
+            let here = self.left(Some(file))?;
+            if here == 0 {
+                return Err(Error::io(format!(
+                    "the column {} ran out {inside} rows before a morsel's start",
+                    self.column.name
+                )));
+            }
+            let step = here.min(inside);
+            self.offset += step;
+            inside -= step;
         }
         Ok(())
     }
@@ -1472,5 +1507,38 @@ mod tests {
         let mut cursor = Cursor::decoded(Vec::new());
         assert_eq!(cursor.left(None).unwrap(), 0);
         assert!(cursor.take(1).is_err());
+    }
+
+    #[test]
+    fn a_morsel_that_starts_past_the_first_window_of_a_long_page_starts_where_it_should() {
+        use rudb_io::{Filesystem, OpenMode, RealFilesystem};
+
+        use super::Reader;
+
+        // Each column of the fixture is one page of fifty thousand rows, which the cursor hands
+        // out sixteen thousand at a time. A morsel from 20,000 has to step over the first window
+        // whole and start 3,616 rows into the second.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/long.parquet");
+        let open = || RealFilesystem::new().open(&path, OpenMode::Read).expect("the fixture opens");
+        let reader = Reader::open(open()).expect("the footer reads");
+        for (from, to) in [(0, 50_000), (20_000, 40_000), (16_384, 16_385), (49_000, 50_000)] {
+            let mut piece = reader.split_rows(0, from..to).expect("a piece of the group");
+            let mut row = from;
+            while let Some(chunk) = piece.next_chunk().expect("a chunk reads") {
+                let small = chunk.column(0).expect("the first column");
+                let words = chunk.column(1).expect("the second column");
+                for at in 0..chunk.len() {
+                    assert_eq!(small.value_at(at), Value::Integer((row % 7) as i32));
+                    let word = if row % 5 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Varchar(format!("v{}", row % 11))
+                    };
+                    assert_eq!(words.value_at(at), word, "row {row}");
+                    row += 1;
+                }
+            }
+            assert_eq!(row, to, "the piece from {from} ends at {to}");
+        }
     }
 }

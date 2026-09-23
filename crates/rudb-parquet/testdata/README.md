@@ -174,3 +174,18 @@ COPY (
 All three columns ascend, so a filter on any of them rules groups out and the groups that survive are narrow enough to interpolate inside. `d` is stored as an `INT64` of hundredths, which is what makes reading its bounds as plain integers wrong: the footer's 7 is 0.07. `t` and `ms` are the same instants in two units, microseconds and milliseconds, which is what makes reading a timestamp's bounds without the unit wrong the same way.
 
 DuckDB reads it as n=8192 with `d` from 0.00 to 81.91 and `t` from 2020-01-01 00:00:00 to 2020-01-06 16:31:00, and answers 1000 rows for `d < 10.00`, 3192 for `d >= 50.00`, 1001 for `d BETWEEN 20.00 AND 30.00`, none for `d > 999.00`, 1440 for `t < '2020-01-02 00:00:00'` and 2432 for `t >= '2020-01-05 00:00:00'`.
+
+## long.parquet
+
+Written by DuckDB v2.0, Snappy, one row group of 50,000 rows. DuckDB writes one page per column chunk, so each column is a single dictionary encoded page of 50,000 rows, which is longer than the window the reader decodes a long page in and so is read three whole windows and a short one at a time.
+
+```sql
+COPY (
+  SELECT
+    (i % 7)::INTEGER AS small,
+    CASE WHEN i % 5 = 0 THEN NULL ELSE 'v' || (i % 11)::VARCHAR END AS word
+  FROM range(50000) t(i)
+) TO 'long.parquet' (FORMAT parquet, ROW_GROUP_SIZE 50000, COMPRESSION snappy);
+```
+
+`small` is required in all but name and never null, and `word` is null on every fifth row, so the windows of the second column have to line the codes up across the nulls.

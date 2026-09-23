@@ -31,11 +31,142 @@ use rudb_common::{Error, LogicalType, PhysicalType, Result};
 use rudb_vector::{Buffer, Data, StringColumn, Validity, Vector};
 
 use crate::chunk::Page;
-use crate::hybrid::Hybrid;
+use crate::hybrid::{Hybrid, Mark};
 use crate::metadata::{Encoding, Physical, SchemaColumn};
 use crate::page::Body;
 
+/// How many rows of a long dictionary encoded page are decoded at a time.
+///
+/// A writer that caps a page by its encoded bytes and not its rows puts a whole row group of a
+/// narrow column in one page. The ClickBench `hits.parquet` is written that way: in its second row
+/// group ninety of the hundred and five columns are one dictionary encoded page of 612,174 rows,
+/// and decoded to a four byte code a row those pages come to 222 MiB, against 21 MiB for the page
+/// bodies they came from. A reader holds its page until every row of it has been taken, so every
+/// pipeline of a load held that much for as long as it was in the group. Decoded this many rows at
+/// a time, a page costs its body and one window, and what a reader holds follows the chunks its
+/// consumer keeps rather than the row group.
+pub(crate) const CODE_WINDOW: usize = 16_384;
+
+/// A dictionary encoded page longer than [`CODE_WINDOW`], decoded a window of rows at a time.
+///
+/// The body is kept, which is the page at its encoded width, and so is where the index stream got
+/// to. The validity is worked out for the whole page up front, because the levels are a stream of
+/// their own that would otherwise need a second mark, and at one bit a row it is small beside the
+/// codes.
+#[derive(Debug)]
+pub(crate) struct Coded {
+    body: Vec<u8>,
+    /// Where the index stream starts in `body`, after the byte that gives its width.
+    start: usize,
+    mark: Mark,
+    validity: Validity,
+    dictionary: Arc<Vector>,
+    /// How many rows the page holds, and how many of them have been handed out.
+    total: usize,
+    row: usize,
+}
+
+impl Coded {
+    /// The next window of the page, or nothing once every row of it has been handed out.
+    ///
+    /// # Errors
+    ///
+    /// If the index stream runs out before the page's rows do, or if an index is past the end of
+    /// the dictionary.
+    pub(crate) fn next(&mut self) -> Result<Option<Vector>> {
+        if self.row >= self.total {
+            return Ok(None);
+        }
+        let rows = CODE_WINDOW.min(self.total - self.row);
+        let validity = self.validity.slice(self.row, rows);
+        let valid = validity.count_valid(rows);
+        let mut dense = Vec::with_capacity(valid);
+        let mut stream = Hybrid::resume(&self.body[self.start..], self.mark);
+        stream.read(&mut dense, valid)?;
+        self.mark = stream.mark();
+        let distinct = self.dictionary.len();
+        if let Some(&bad) = dense.iter().find(|&&code| code as usize >= distinct) {
+            return Err(Error::io(format!(
+                "a dictionary index of {bad} into a dictionary of {distinct} values"
+            )));
+        }
+        let codes = if valid == rows {
+            dense
+        } else {
+            let mut out = vec![0; rows];
+            let mut next = dense.into_iter();
+            for (index, slot) in out.iter_mut().enumerate() {
+                if validity.is_valid(index) {
+                    *slot = next.next().unwrap_or_default();
+                }
+            }
+            out
+        };
+        self.row += rows;
+        Ok(Some(
+            Vector::dictionary_over(codes, Arc::clone(&self.dictionary))?.with_validity(validity),
+        ))
+    }
+
+    /// The page body, to read the next page into once this one is done.
+    pub(crate) fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+}
+
 impl Page {
+    /// The page as a [`Coded`], when it is dictionary encoded and longer than [`CODE_WINDOW`].
+    ///
+    /// Nothing comes back for any other page, and its body is left where it was for
+    /// [`Page::decode`]. The body of a page that does come back moves into it.
+    ///
+    /// # Errors
+    ///
+    /// If the levels cannot be read, if the page has no dictionary to point into, or if the byte
+    /// that gives the index width is missing or gives a width past thirty two.
+    pub(crate) fn windowed(
+        &mut self,
+        column: &SchemaColumn,
+        dictionary: Option<&Arc<Vector>>,
+    ) -> Result<Option<Coded>> {
+        let encoding = match &self.header.body {
+            Body::DataV1(page) => page.encoding,
+            Body::DataV2(page) => page.encoding,
+            Body::Dictionary(_) | Body::Index => return Ok(None),
+        };
+        if !matches!(encoding, Encoding::PlainDictionary | Encoding::RleDictionary) {
+            return Ok(None);
+        }
+        let total = usize::try_from(self.header.values())
+            .map_err(|_| Error::io("a page with a negative value count".to_string()))?;
+        if total <= CODE_WINDOW {
+            return Ok(None);
+        }
+        let dictionary = dictionary.ok_or_else(|| {
+            Error::io("a dictionary encoded page in a chunk with no dictionary page".to_string())
+        })?;
+        let (levels, at) = self.definitions(column.optional)?;
+        let (validity, _) = presence(&levels, total);
+        drop(levels);
+        let &width = self.body.get(at).ok_or_else(|| {
+            Error::io(format!(
+                "a dictionary page whose bit width is at {at} in a body of {}",
+                self.body.len()
+            ))
+        })?;
+        let start = at + 1;
+        let mark = Hybrid::new(&self.body[start..], width)?.mark();
+        Ok(Some(Coded {
+            body: std::mem::take(&mut self.body),
+            start,
+            mark,
+            validity,
+            dictionary: Arc::clone(dictionary),
+            total,
+            row: 0,
+        }))
+    }
+
     /// The page's values, as a vector.
     ///
     /// `dictionary` is the vector the chunk's dictionary page decoded to, which a dictionary
@@ -1109,5 +1240,75 @@ mod tests {
         assert!(error.message().contains("holds no rows"), "{}", error.message());
         let error = data.decode_dictionary(&schema).unwrap_err();
         assert!(error.message().contains("asked of a data page"), "{}", error.message());
+    }
+
+    /// What row `row` of each column of `long.parquet` holds.
+    fn long_row(column: usize, row: usize) -> Value {
+        match column {
+            0 => Value::Integer((row % 7) as i32),
+            _ if row % 5 == 0 => Value::Null,
+            _ => Value::Varchar(format!("v{}", row % 11)),
+        }
+    }
+
+    #[test]
+    fn a_long_dictionary_page_comes_out_a_window_at_a_time_with_every_value_in_place() {
+        // Both columns of the fixture are one dictionary encoded page of fifty thousand rows, and
+        // the second has a null every fifth row, so the windows have to find the right codes
+        // across the nulls as well as across the runs of the index stream.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/long.parquet");
+        let file = RealFilesystem::new().open(&path, OpenMode::Read).expect("the fixture opens");
+        let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
+        let mut checked = 0;
+        for (at, schema) in metadata.schema.iter().enumerate() {
+            let chunk = &metadata.row_groups[0].columns[at];
+            let mut bytes = vec![0u8; chunk.compressed_size as usize];
+            file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
+            let mut dictionary = None;
+            for page in Pages::new(&bytes, chunk.compression, chunk.values) {
+                let mut page = page.expect("every page of the fixture walks");
+                if matches!(page.header.body, Body::Dictionary(_)) {
+                    dictionary = Some(Arc::new(
+                        page.decode_dictionary(schema).expect("the dictionary decodes"),
+                    ));
+                    continue;
+                }
+                let mut coded = page
+                    .windowed(schema, dictionary.as_ref())
+                    .expect("the page reads")
+                    .expect("a page of fifty thousand rows is decoded in windows");
+                assert!(page.body.is_empty(), "the body moved into the windows");
+                let mut lengths = Vec::new();
+                let mut row = 0;
+                while let Some(window) = coded.next().expect("a window decodes") {
+                    lengths.push(window.len());
+                    for value in window.iter() {
+                        assert_eq!(value, long_row(at, row), "column {at} row {row}");
+                        row += 1;
+                    }
+                }
+                assert_eq!(lengths, [16_384, 16_384, 16_384, 848]);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 2);
+    }
+
+    #[test]
+    fn a_short_page_is_left_to_be_decoded_whole() {
+        let file = open();
+        let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
+        let chunk = &metadata.row_groups[0].columns[0];
+        let mut bytes = vec![0u8; chunk.compressed_size as usize];
+        file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
+        for page in Pages::new(&bytes, chunk.compression, chunk.values) {
+            let mut page = page.expect("every page of the fixture walks");
+            if matches!(page.header.body, Body::Dictionary(_) | Body::Index) {
+                continue;
+            }
+            let length = page.body.len();
+            assert!(page.windowed(&metadata.schema[0], None).expect("reads").is_none());
+            assert_eq!(page.body.len(), length, "the body is still there to decode");
+        }
     }
 }
