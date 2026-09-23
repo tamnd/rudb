@@ -731,6 +731,10 @@ struct Partition {
 const RADIX_PARTITIONS: usize = 64;
 const DENSE_PARTITIONS: usize = 4;
 
+/// How many codes a dense partition has to have per row that arrived before its rows are sorted
+/// rather than counted into an array a code wide.
+const SPARSE_DENSE: usize = 16;
+
 /// Which of an aggregate's tables is being built, which is what says how much room it wants.
 ///
 /// A presize is a number of groups for the whole aggregate, and one aggregate builds tables of four
@@ -5530,21 +5534,36 @@ fn dense_partition(
     group_types: &[LogicalType],
 ) -> Result<Vec<Chunk>> {
     let width = dictionary.len().saturating_add(DENSE_PARTITIONS - 1 - number) / DENSE_PARTITIONS;
-    let mut dense = vec![0_i64; width];
-    for run in &partition.runs {
-        for &code in run {
-            dense[code as usize / DENSE_PARTITIONS] += 1;
+    let rows: usize = partition.runs.iter().map(Vec::len).sum();
+    // The groups in code order either way, as a count per code of the partition's share of the
+    // dictionary or, when far fewer rows arrived than there are codes, as the rows sorted and
+    // counted in runs. ClickBench 38 groups by `Title`, whose dictionary is millions of codes, and a
+    // filter leaves it a few thousand rows, so the array was megabytes of fresh pages to fault in
+    // and zero and then read back to find those rows in.
+    let groups: Vec<(u32, i64)> = if rows.saturating_mul(SPARSE_DENSE) < width {
+        let mut sorted: Vec<u32> = partition.runs.iter().flatten().copied().collect();
+        sorted.sort_unstable();
+        sorted.chunk_by(|left, right| left == right).map(|run| (run[0], run.len() as i64)).collect()
+    } else {
+        let mut dense = vec![0_i64; width];
+        for run in &partition.runs {
+            for &code in run {
+                dense[code as usize / DENSE_PARTITIONS] += 1;
+            }
         }
-    }
+        dense
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(slot, &count)| ((slot * DENSE_PARTITIONS + number) as u32, count))
+            .collect()
+    };
     let mut chunks = Vec::new();
     let mut codes = Vec::with_capacity(VECTOR_SIZE);
     let mut counts = Vec::with_capacity(VECTOR_SIZE);
     let mut valid = Vec::with_capacity(VECTOR_SIZE);
-    for (slot, &count) in dense.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-        codes.push((slot * DENSE_PARTITIONS + number) as u32);
+    for (code, count) in groups {
+        codes.push(code);
         counts.push(count);
         valid.push(true);
         if codes.len() == VECTOR_SIZE {
@@ -7487,6 +7506,46 @@ mod tests {
         assert_eq!(super::largest(counts.len(), 20, |slot| counts[slot]), [2, 4, 0, 3, 7, 6, 1, 5]);
         // Every slot against a bound of one, which only a strictly larger count displaces.
         assert_eq!(super::largest(counts.len(), 1, |slot| counts[slot]), [2]);
+    }
+
+    #[test]
+    fn a_dense_partition_sorts_a_few_rows_into_the_answer_the_array_gives() {
+        let spellings =
+            (0..1_000).map(|code| Value::Varchar(format!("v{code}"))).collect::<Vec<_>>();
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &spellings).expect("a dictionary"));
+        let answer = |runs: Vec<Vec<u32>>| {
+            let mut partition = super::DensePartition { runs, nulls: 0 };
+            let chunks = super::dense_partition(
+                &dictionary,
+                1,
+                &mut partition,
+                &[None],
+                &[LogicalType::Varchar],
+            )
+            .expect("the dense partition");
+            let mut rows: Vec<(Value, Value)> = Vec::new();
+            for chunk in chunks {
+                for row in 0..chunk.len() {
+                    rows.push((chunk.value_at(row, 0), chunk.value_at(row, 1)));
+                }
+            }
+            rows
+        };
+        let codes = [405, 9, 5, 9, 405, 405, 997];
+        // Seven rows against 250 codes is the sorted path, and the same codes seven hundred times
+        // over is the array. Both answer in code order.
+        let few = answer(vec![codes[..4].to_vec(), codes[4..].to_vec()]);
+        let many = answer(vec![codes.repeat(100)]);
+        let expected = |times: i64| {
+            [(5, 1), (9, 2), (405, 3), (997, 1)]
+                .map(|(code, count)| {
+                    (Value::Varchar(format!("v{code}")), Value::BigInt(count * times))
+                })
+                .to_vec()
+        };
+        assert_eq!(few, expected(1));
+        assert_eq!(many, expected(100));
     }
 
     #[test]
