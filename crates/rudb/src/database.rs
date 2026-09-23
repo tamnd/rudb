@@ -950,6 +950,9 @@ const GATHER_ROWS: usize = 131_072;
 #[derive(Debug)]
 struct NativeSink {
     writer: Mutex<Option<rudb_native::Writer>>,
+    /// Encodes a stripe as far as it can be without the writer, so that the lock is held for the
+    /// dictionary merge and the write rather than the whole encode.
+    preparer: rudb_native::Preparer,
     /// The file being written, when it is not the database itself, and what gets renamed over the
     /// database at the end. `None` for an append, which writes the database in place and has
     /// nothing to rename: the bytes go past the catalog the committed generation points at, and
@@ -977,6 +980,7 @@ impl NativeSink {
             .with_profile(Arc::clone(&profile));
         let writer = declared(writer, clustering)?;
         Ok(Self {
+            preparer: writer.preparer(),
             writer: Mutex::new(Some(writer)),
             temporary: Some(temporary),
             target: target.to_path_buf(),
@@ -999,6 +1003,7 @@ impl NativeSink {
             .with_profile(Arc::clone(&profile));
         let writer = declared(writer, clustering)?;
         Ok(Self {
+            preparer: writer.preparer(),
             writer: Mutex::new(Some(writer)),
             temporary: None,
             target: target.to_path_buf(),
@@ -1006,6 +1011,19 @@ impl NativeSink {
             fields,
             profile,
         })
+    }
+
+    /// Runs `work` on the writer under its lock, charging the wait for the lock as a write wait.
+    fn locked<T>(&self, work: impl FnOnce(&mut rudb_native::Writer) -> Result<T>) -> Result<T> {
+        let waiting = Instant::now();
+        let mut writer =
+            self.writer.lock().map_err(|_| Error::internal("native writer panicked"))?;
+        self.profile.waited(Stage::Write, elapsed_ns(waiting));
+        work(
+            writer
+                .as_mut()
+                .ok_or_else(|| Error::internal("native writer was already committed"))?,
+        )
     }
 
     /// Hands whatever this instance is holding to the writer as one stripe.
@@ -1017,20 +1035,19 @@ impl NativeSink {
         place.bytes = parts
             .iter()
             .fold(place.bytes, |bytes, (_, chunk)| bytes.saturating_add(chunk.footprint() as u64));
-        // Once a stripe, so both clocks. The wait for the lock is a write wait: it is the time one
-        // instance spent while another was encoding and writing its stripe, which is the cost of
-        // the writer being one file behind one lock and the number the parallel writer of W1 has
-        // to make go away.
+        // Once a stripe, so both clocks. The waits for the lock are write waits: they are the time
+        // one instance spent while another was merging or writing its stripe, which is the cost of
+        // the writer being one file behind one lock.
+        //
+        // The lock is taken twice, once to merge the stripe's dictionaries and once to write it,
+        // and neither the encode before the first nor the pages between the two need it. That is
+        // what lets thirty two instances encode at once rather than one at a time.
         let inside = Span::start();
-        let waiting = Instant::now();
-        let mut writer =
-            self.writer.lock().map_err(|_| Error::internal("native writer panicked"))?;
-        self.profile.waited(Stage::Write, elapsed_ns(waiting));
-        let appended = writer
-            .as_mut()
-            .ok_or_else(|| Error::internal("native writer was already committed"))?
-            .append_stripe(parts);
-        drop(writer);
+        let appended = self.preparer.prepare(parts).and_then(|prepared| {
+            let merged = self.locked(|writer| writer.merge(prepared))?;
+            let paged = merged.pages()?;
+            self.locked(|writer| writer.write(paged))
+        });
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
         place.inside_cpu = place.inside_cpu.saturating_add(cpu);
@@ -1042,11 +1059,11 @@ impl Sink for NativeSink {
     type Local = NativePlace;
 
     fn parallel(&self) -> bool {
-        // The writer is one file behind one lock, so the encode and the write of a stripe still
-        // happen one at a time. What more than one instance buys is the read: the source is a
-        // Parquet scan and decoding a row group is the single largest thing this pipeline does on
-        // one thread. Saying yes here lets the instances that are not holding the lock decode the
-        // next row groups while the one that is encodes the last stripe.
+        // The writer is one file behind one lock, but a stripe is encoded before the lock is taken
+        // and its pages are built between the two times it is, so what one instance holds the
+        // lock for is the dictionary merge and the write. More than one instance buys the read,
+        // which is decoding a row group of the Parquet source, and the encode, which is most of
+        // what a load costs.
         true
     }
 

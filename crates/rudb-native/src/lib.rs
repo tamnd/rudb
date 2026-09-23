@@ -40,7 +40,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::slice;
-use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
@@ -56,10 +56,12 @@ use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below}
 mod distinct;
 pub mod graph;
 pub mod host;
+mod prepare;
 pub mod section;
 pub mod stats;
 mod zones;
 
+pub use prepare::{Merged, Paged, Prepared, Preparer};
 pub use section::Section;
 pub use zones::{Common, Stripes, ascending, distincts};
 
@@ -187,7 +189,7 @@ const MAX_ENCODE_WORKERS: usize = 32;
 /// A part is a thousand rows, so a filter sized for every one of them being distinct is about
 /// thirteen hundred bytes and this never binds in practice. It is here so that a part that somehow
 /// arrives much wider than a vector cannot put an unbounded index in the file. What does bind is the
-/// rule in `encode_column` that a sieve may not be as large as the part it indexes, which is a cap
+/// rule in `Writer::encode_pages` that a sieve may not be as large as the part it indexes, which is a cap
 /// per column rather than one number for the whole file.
 const SIEVE_BUDGET: usize = 8 * 1024;
 
@@ -1092,9 +1094,18 @@ impl GlobalDictionary {
         self.placed.len() + self.blocks.len()
     }
 
+    #[cfg(test)]
     fn code(&mut self, text: &str) -> Result<u32> {
-        let hash = checksum(text.as_bytes());
-        let check = seeded_checksum(text.as_bytes(), DICTIONARY_CHECK_SEED);
+        let bytes = text.as_bytes();
+        self.code_hashed(bytes, checksum(bytes), seeded_checksum(bytes, DICTIONARY_CHECK_SEED))
+    }
+
+    /// The code for a value whose two hashes the caller already has.
+    ///
+    /// A stripe prepared outside the writer's lock hashed every value it holds while it was coding
+    /// them, and merging it into this dictionary is one of these a distinct value rather than two
+    /// hashes of every row. See [`prepare`].
+    fn code_hashed(&mut self, text: &[u8], hash: u64, check: u64) -> Result<u32> {
         if let Some(&code) = self.primary.get(&hash) {
             if self.checks.get(code as usize) == Some(&check) {
                 return Ok(code);
@@ -1115,10 +1126,10 @@ impl GlobalDictionary {
         Ok(code)
     }
 
-    fn insert(&mut self, text: &str, check: u64) -> Result<u32> {
+    fn insert(&mut self, text: &[u8], check: u64) -> Result<u32> {
         let code = u32::try_from(self.ends.len())
             .map_err(|_| invalid("global dictionary has too many values"))?;
-        self.filling.extend_from_slice(text.as_bytes());
+        self.filling.extend_from_slice(text);
         self.ends.push(
             u32::try_from(self.filling.len())
                 .map_err(|_| invalid("a global dictionary value exceeds 4 GiB"))?,
@@ -1289,19 +1300,6 @@ impl GlobalDictionary {
     fn ranked(&self, file: Option<&File>) -> Result<Vec<(u64, u32)>> {
         self.ranked_with_values(file).map(|(order, _, _)| order)
     }
-
-    fn observe(&mut self, code: u32, null: bool) -> Result<()> {
-        if null {
-            self.nulls = self.nulls.saturating_add(1);
-            return Ok(());
-        }
-        let count = self
-            .counts
-            .get_mut(code as usize)
-            .ok_or_else(|| invalid("global dictionary count code is out of range"))?;
-        *count = count.saturating_add(1);
-        Ok(())
-    }
 }
 
 /// Appends pages and commits a new directory.
@@ -1329,6 +1327,9 @@ pub struct Writer {
     order: Vec<((u64, u64), (u64, u64))>,
     next_order: u64,
     dictionaries: Vec<Option<GlobalDictionary>>,
+    /// Which columns still have a global dictionary, shared with every [`Preparer`] this writer
+    /// hands out so that a stripe prepared after a column lost its dictionary is not coded for it.
+    coded: Arc<[AtomicBool]>,
     /// One per column, folding the rows into a summary and a sketch as they go past.
     ///
     /// `None` for a column with no hash rule, which is the interval and the nested types. See
@@ -1419,7 +1420,7 @@ pub const STRIPE_PARTS: usize = 64;
 /// How many rows the writer wants to see before it decides whether a varchar column gets to keep
 /// its global dictionary.
 ///
-/// See [`Writer::encode_column`]. A stripe is up to [`STRIPE_PARTS`] parts, so most tables give it
+/// See [`prepare::drops_dictionary`]. A stripe is up to [`STRIPE_PARTS`] parts, so most tables give it
 /// far more than this and it binds only on a table that is smaller than one stripe. A handful of
 /// rows says nothing about whether a column repeats itself, and the answer that costs nothing when
 /// the sample is that small is the one the writer has always given, which is to keep the dictionary.
@@ -1428,7 +1429,7 @@ const DICTIONARY_DECIDE_ROWS: usize = 4_096;
 /// Out of ten. A varchar column loses its dictionary when more than this many rows in ten of the
 /// first stripe held a value that stripe had not seen before.
 ///
-/// See [`Writer::encode_column`]. Nine and not five, because the properties a dictionary buys are
+/// See [`prepare::drops_dictionary`]. Nine and not five, because the properties a dictionary buys are
 /// worth keeping everywhere they are real. On ClickBench the widest string column is `Referer` at
 /// 0.131 of its first stripe and every other one is below that, so nothing there is near this and
 /// every one of them keeps its dictionary, which is what a group by on codes wants. On TPC-H
@@ -1518,6 +1519,10 @@ impl Writer {
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
                 .collect(),
+            coded: fields
+                .iter()
+                .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
+                .collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             table: Table {
                 name,
@@ -1570,6 +1575,10 @@ impl Writer {
             dictionaries: fields
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .collect(),
+            coded: fields
+                .iter()
+                .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
                 .collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, 1)).collect(),
             table: Table {
@@ -1674,6 +1683,10 @@ impl Writer {
             dictionaries: fields
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
+                .collect(),
+            coded: fields
+                .iter()
+                .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
                 .collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             table: Table {
@@ -1852,65 +1865,8 @@ impl Writer {
         Ok(())
     }
 
-    /// Encodes one column's parts of a stripe, and on the first stripe decides whether the column
-    /// should have a dictionary at all.
-    ///
-    /// Every varchar column starts with one, because the writer cannot know what is in a column
-    /// before it has seen some of it. A global dictionary is the right shape for a column of a few
-    /// dozen values repeated down the table: the pages become small integers, a filter against a
-    /// literal is one search of the sorted order rather than a comparison a row, and a group by is
-    /// on the codes. It is the wrong shape for a column whose values are nearly all different.
-    /// There the codes are as wide as row numbers, nothing is saved on the pages, and the
-    /// membership index of a stripe is a list of very nearly every code in the column. On TPC-H the
-    /// orders table written on its own goes from 52.3 MB to 41.4 MB, the load from 6.9 s to 5.8 s,
-    /// and `select o_comment from orders` from 1.810 G instructions to 1.213 G, which is what the
-    /// rudb parquet reader takes over the same values.
-    ///
-    /// So the first stripe of a column is the sample and the decision is made once on it. Once,
-    /// rather than per stripe, because the codes of one column have to mean the same thing in every
-    /// page of it, and a column that changed its mind halfway would need its earlier stripes
-    /// rewritten. The first stripe is re-encoded when the answer comes out against the dictionary,
-    /// which is the one stripe that pays for the decision.
-    ///
-    /// The threshold is deliberately near the top. [`DICTIONARY_DISTINCT_IN_TEN`] of the sample has
-    /// to be values never seen before, which is a column with essentially no repeats. Everything
-    /// with real repetition keeps its dictionary and keeps every property that hangs off it, and
-    /// nothing is claimed here about where between the two the crossover really sits.
-    ///
-    /// Nothing here is shared with another column. The dictionary belongs to this one, the sieve
-    /// reads only this one, and the page bytes go in a vector of this one's own. That is why the
-    /// fan out below can hand a whole column to a thread and take a plain `&mut` on the dictionary
-    /// rather than making it something several threads can grow at once, which is the harder half
-    /// of #808 and is still open.
-    fn encode_column(
-        index: usize,
-        held: &[PendingChunk],
-        dictionary: &mut Option<GlobalDictionary>,
-    ) -> Result<ColumnStripe> {
-        // Empty means nothing has been written through it yet, so this is the column's first stripe
-        // and the only stripe the decision below is allowed to be made on.
-        let deciding = dictionary.as_ref().is_some_and(|held| held.values() == 0);
-        let stripe = Self::encode_pages(index, held, dictionary.as_mut())?;
-        if !deciding {
-            return Ok(stripe);
-        }
-        let rows: usize = held.iter().map(|pending| pending.chunk.len()).sum();
-        let distinct = dictionary.as_ref().map_or(0, GlobalDictionary::values);
-        if rows < DICTIONARY_DECIDE_ROWS
-            || distinct.saturating_mul(10) <= rows.saturating_mul(DICTIONARY_DISTINCT_IN_TEN)
-        {
-            return Ok(stripe);
-        }
-        *dictionary = None;
-        Self::encode_pages(index, held, None)
-    }
-
-    /// One column's parts of a stripe, with whatever dictionary it was given.
-    fn encode_pages(
-        index: usize,
-        held: &[PendingChunk],
-        mut dictionary: Option<&mut GlobalDictionary>,
-    ) -> Result<ColumnStripe> {
+    /// One column's parts of a stripe as pages, for a column with no global dictionary.
+    fn encode_pages(index: usize, held: &[PendingChunk]) -> Result<ColumnStripe> {
         let mut stripe = ColumnStripe {
             pages: Vec::with_capacity(held.len()),
             codes: Vec::with_capacity(held.len()),
@@ -1919,18 +1875,13 @@ impl Writer {
         };
         for pending in held {
             let column = pending.chunk.column(index)?;
-            let (bytes, unique) = encode(column, dictionary.as_deref_mut())?;
+            let bytes = encode(column)?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
             // The range is built first because the sieve reads it rather than walking the column a
             // second time to find out how wide it is.
             let range = Range::of(column);
-            // A column with a global dictionary already has an exact membership index per stripe,
-            // so an approximate one beside it would cost a hash of every string in the table to
-            // answer a question that is already answered. What it would buy is the finer grain, a
-            // part rather than a stripe, and that is worth coming back for on its own.
-            //
             // A sieve at least as large as the part it indexes is not written. A reader reads the
             // sieve to decide whether to read the part, so when the sieve is the larger of the two
             // it has already spent more than the read it is trying to avoid, and that holds even if
@@ -1938,123 +1889,17 @@ impl Writer {
             // is that a sieve pays when its bytes are under the rejection rate times the part's,
             // but the rejection rate depends on what a query probes for and the writer does not
             // know that. The necessary half needs two numbers that are both in hand here.
-            let sieve = match dictionary {
-                Some(_) => None,
-                None => Sieve::of(column, &range, SIEVE_BUDGET)
-                    .filter(|sieve| sieve.len() < bytes.len()),
-            };
+            //
+            // A column with a global dictionary gets none, because it already has an exact
+            // membership index per stripe. Those do not come through here. See [`prepare`].
+            let sieve =
+                Sieve::of(column, &range, SIEVE_BUDGET).filter(|sieve| sieve.len() < bytes.len());
             stripe.pages.push(bytes);
-            stripe.codes.push(unique);
+            stripe.codes.push(None);
             stripe.sieves.push(sieve);
             stripe.ranges.push(range);
         }
         Ok(stripe)
-    }
-
-    /// Encodes a whole stripe, one column to a worker.
-    ///
-    /// The columns are handed out through a queue rather than dealt in equal piles, because they
-    /// are nothing like equal: `URL` on ClickBench is a global dictionary of sixty one million
-    /// strings and `IsMobile` is a byte. A pile that happened to hold the four large string columns
-    /// would be the whole stripe and the other workers would be waiting on it. The queue is sorted
-    /// so the expensive ones are taken first, which is the classic answer to a last job that runs
-    /// longer than everything after it.
-    /// One column of one stripe: the pages it encodes to, and the statistics it folds into.
-    ///
-    /// The two together rather than in two passes, because the stripe's rows are in memory once and
-    /// this is the moment they are. Reading them back afterwards is what `stats::build_summary`
-    /// does and what [`stats::Gather`] exists to avoid.
-    ///
-    /// A column whose vector the chunk cannot produce is skipped rather than refused, because
-    /// `encode_column` below is about to fail on the same chunk and its message is the better one.
-    fn encode_one(
-        index: usize,
-        held: &[PendingChunk],
-        dictionary: &mut Option<GlobalDictionary>,
-        gather: &mut Option<stats::Gather>,
-    ) -> Result<ColumnStripe> {
-        if let Some(gather) = gather {
-            let key = held.first().map_or((0, 0), |pending| pending.order);
-            gather.stripe(key, held.iter().filter_map(|pending| pending.chunk.column(index).ok()));
-        }
-        Self::encode_column(index, held, dictionary)
-    }
-
-    fn encode_columns(&mut self, held: &[PendingChunk]) -> Result<Vec<ColumnStripe>> {
-        let width = self.table.fields.len();
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(MAX_ENCODE_WORKERS)
-            .min(width);
-        let profile = self.profile.clone();
-        if workers <= 1 || held.len() <= 1 {
-            let _span = profile.as_deref().map(|profile| profile.span(Stage::Pages));
-            return self
-                .dictionaries
-                .iter_mut()
-                .zip(self.gathers.iter_mut())
-                .enumerate()
-                .map(|(index, (dictionary, gather))| {
-                    Self::encode_one(index, held, dictionary, gather)
-                })
-                .collect();
-        }
-        // The dictionaries are moved out and back rather than borrowed, because a worker that takes
-        // the next column off a queue cannot be holding a borrow of the vector the queue came from.
-        // The gathers ride along with them for the same reason and so that one column's statistics
-        // are folded on the thread that is already walking that column.
-        let mut jobs: Vec<(usize, Option<GlobalDictionary>, Option<stats::Gather>)> =
-            std::mem::take(&mut self.dictionaries)
-                .into_iter()
-                .zip(std::mem::take(&mut self.gathers))
-                .enumerate()
-                .map(|(index, (dictionary, gather))| (index, dictionary, gather))
-                .collect();
-        // Popped from the back, so the expensive columns go last in the vector.
-        jobs.sort_by_key(|(index, _, _)| weight(&self.table.fields[*index].ty));
-        let queue = Mutex::new(jobs);
-        let pieces = std::thread::scope(|scope| {
-            (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let _span = profile.as_deref().map(|profile| profile.span(Stage::Pages));
-                        let mut mine = Vec::new();
-                        loop {
-                            let taken = queue
-                                .lock()
-                                .map_err(|_| Error::internal("a native encode worker panicked"))?
-                                .pop();
-                            let Some((index, mut dictionary, mut gather)) = taken else { break };
-                            let encoded =
-                                Self::encode_one(index, held, &mut dictionary, &mut gather)?;
-                            mine.push((index, dictionary, gather, encoded));
-                        }
-                        Ok(mine)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle.join().map_err(|_| Error::internal("a native encode worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        let mut dictionaries: Vec<Option<GlobalDictionary>> = (0..width).map(|_| None).collect();
-        let mut gathers: Vec<Option<stats::Gather>> = (0..width).map(|_| None).collect();
-        let mut encoded: Vec<Option<ColumnStripe>> = (0..width).map(|_| None).collect();
-        for piece in pieces {
-            for (index, dictionary, gather, stripe) in piece {
-                dictionaries[index] = dictionary;
-                gathers[index] = gather;
-                encoded[index] = Some(stripe);
-            }
-        }
-        self.dictionaries = dictionaries;
-        self.gathers = gathers;
-        encoded
-            .into_iter()
-            .map(|stripe| stripe.ok_or_else(|| Error::internal("a column was never encoded")))
-            .collect()
     }
 
     /// Writes every encoded dictionary block that is not in the file yet and forgets its bytes.
@@ -2080,16 +1925,31 @@ impl Writer {
     }
 
     /// Writes the buffered parts as one stripe, each column's parts contiguous on disk.
+    ///
+    /// The same four steps a caller holding this writer behind a lock takes, with nobody else
+    /// waiting between them. See [`prepare`].
     fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let held = std::mem::take(&mut self.pending);
+        let prepared = self.preparer().prepare_held(held)?;
+        let merged = self.merge_held(prepared)?;
+        let paged = merged.pages()?;
+        self.write_paged(paged)
+    }
+
+    /// Writes one stripe whose pages are built, each column's parts contiguous on disk.
+    fn write_stripe(
+        &mut self,
+        mut held: Vec<PendingChunk>,
+        encoded: Vec<ColumnStripe>,
+    ) -> Result<()> {
         let width = self.table.fields.len();
-        // Held here rather than read off the writer, because writing a page needs the writer and
-        // the borrow checker is right that those are two different uses of it.
-        let mut held = std::mem::take(&mut self.pending);
         let parts = held.len();
-        let encoded = self.encode_columns(&held)?;
+        if encoded.len() != width {
+            return Err(Error::internal("a stripe came to the writer with the wrong columns"));
+        }
         let profile = self.profile.clone();
         if let Some(profile) = &profile {
             let rows = held.iter().map(|pending| pending.chunk.len() as u64).sum();
@@ -2234,7 +2094,9 @@ impl Writer {
             profile.moved(Stage::Write, 0, self.at - before, rows as u64);
         }
         // Back where it came from, empty, so the next stripe buffers into the same allocation.
-        self.pending = held;
+        if self.pending.is_empty() {
+            self.pending = held;
+        }
         Ok(())
     }
 
@@ -7432,61 +7294,73 @@ fn encoded_codes(codes: &[u32]) -> Result<Option<Vec<u8>>> {
     Ok((coded.len() < plain).then_some(coded))
 }
 
-fn encode(
-    vector: &Vector,
-    global: Option<&mut GlobalDictionary>,
-) -> Result<(Vec<u8>, Option<Vec<u32>>)> {
+/// The validity of a page, which is a flag and then, when some rows are null and some are not, a
+/// bit a row with the valid ones set.
+fn push_validity(out: &mut Vec<u8>, flat: &Vector) {
+    let flag = match flat.validity() {
+        Validity::AllValid => 0,
+        Validity::AllInvalid => 1,
+        Validity::Mask(_) => 2,
+    };
+    out.push(flag);
+    if flag == 2 {
+        for group in (0..flat.len()).step_by(8) {
+            let mut bits = 0_u8;
+            for bit in 0..8 {
+                if group + bit < flat.len() && !flat.is_null_at(group + bit) {
+                    bits |= 1 << bit;
+                }
+            }
+            out.push(bits);
+        }
+    }
+}
+
+/// One part of a column coded against its global dictionary as a page, from the codes and the
+/// validity [`push_validity`] wrote for it.
+///
+/// The codes go through the integer cascade when that comes out smaller than four bytes a code,
+/// which on a column that repeats itself it nearly always does, and are written as they are when it
+/// does not.
+fn coded_page(codes: &[u32], validity: &[u8]) -> Result<Vec<u8>> {
+    let coded = encoded_codes(codes)?;
+    let mut out = Vec::with_capacity(
+        1 + validity.len() + coded.as_ref().map_or(size_of_val(codes), Vec::len),
+    );
+    out.push(if coded.is_some() { 4 } else { 3 });
+    out.extend_from_slice(validity);
+    match coded {
+        Some(coded) => out.extend_from_slice(&coded),
+        None => {
+            for &code in codes {
+                put_u32(&mut out, code);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One part of one column as a page, for every column that is not coded against a global
+/// dictionary. Those are built by [`coded_page`] from codes [`prepare`] handed out.
+fn encode(vector: &Vector) -> Result<Vec<u8>> {
     let ty = vector.logical_type();
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
     let mut out = Vec::new();
-    let mut global_codes = None;
-    if let Some(global) = global {
-        let mut codes = Vec::with_capacity(flat.len());
-        for row in 0..flat.len() {
-            let text = flat.text_at(row).unwrap_or("");
-            let code = global.code(text)?;
-            global.observe(code, flat.is_null_at(row))?;
-            codes.push(code);
-        }
-        global_codes = Some(codes);
-    }
-    let membership = global_codes.as_deref().map(unique_codes);
-    let dictionary = if global_codes.is_none() && ty == &LogicalType::Varchar {
-        string_dictionary(&flat)?
+    let dictionary = if ty == &LogicalType::Varchar { string_dictionary(&flat)? } else { None };
+    let compressed_text = if dictionary.is_none() && ty == &LogicalType::Varchar {
+        text_compressed(&flat)?
     } else {
         None
     };
-    let compressed_text =
-        if global_codes.is_none() && dictionary.is_none() && ty == &LogicalType::Varchar {
-            text_compressed(&flat)?
-        } else {
-            None
-        };
-    let packed_vector = if dictionary.is_none() && global_codes.is_none() {
-        Some(flat.bit_packed()?)
-    } else {
-        None
-    };
+    let packed_vector = if dictionary.is_none() { Some(flat.bit_packed()?) } else { None };
     let packed = packed_vector.as_ref().and_then(Vector::packed_parts);
-    let coded = match global_codes.as_deref() {
-        Some(codes) => encoded_codes(codes)?,
-        None => None,
-    };
     // Only where nothing else has claimed the page, which is the plain integer case. A packed part
     // is still on the table because the cascade has to beat it too: the bit pack takes a part only
     // when it halves it, so a column that shrinks by a third was coming out whole.
-    let cascade = if dictionary.is_none() && global_codes.is_none() {
-        cascaded(&flat, ty, packed.as_ref())?
-    } else {
-        None
-    };
-    out.push(if coded.is_some() {
-        4
-    } else if cascade.is_some() {
+    let cascade = if dictionary.is_none() { cascaded(&flat, ty, packed.as_ref())? } else { None };
+    out.push(if cascade.is_some() {
         5
-    } else if global_codes.is_some() {
-        3
     } else if dictionary.is_some() {
         1
     } else if compressed_text.is_some() {
@@ -7496,45 +7370,18 @@ fn encode(
     } else {
         0
     });
-    let nulls = flat.validity();
-    let flag = match nulls {
-        Validity::AllValid => 0,
-        Validity::AllInvalid => 1,
-        Validity::Mask(_) => 2,
-    };
-    out.push(flag);
-    if flag == 2 {
-        for group in (0..vector.len()).step_by(8) {
-            let mut bits = 0_u8;
-            for bit in 0..8 {
-                if group + bit < vector.len() && !flat.is_null_at(group + bit) {
-                    bits |= 1 << bit;
-                }
-            }
-            out.push(bits);
-        }
-    }
-    if let Some(coded) = coded {
-        out.extend_from_slice(&coded);
-        return Ok((out, membership));
-    }
+    push_validity(&mut out, &flat);
     if let Some(cascade) = cascade {
         out.extend_from_slice(&cascade);
-        return Ok((out, membership));
-    }
-    if let Some(codes) = global_codes {
-        for code in codes {
-            put_u32(&mut out, code);
-        }
-        return Ok((out, membership));
+        return Ok(out);
     }
     if let Some(dictionary) = dictionary {
         out.extend_from_slice(&dictionary);
-        return Ok((out, membership));
+        return Ok(out);
     }
     if let Some(compressed_text) = compressed_text {
         out.extend_from_slice(&compressed_text);
-        return Ok((out, membership));
+        return Ok(out);
     }
     if let Some(packed) = packed {
         if packed.offset() != 0 {
@@ -7549,7 +7396,7 @@ fn encode(
         for word in packed.words() {
             put_u64(&mut out, *word);
         }
-        return Ok((out, membership));
+        return Ok(out);
     }
     let data = flat.data().ok_or_else(|| invalid("scalar column did not flatten"))?;
     match (ty, data) {
@@ -7684,7 +7531,7 @@ fn encode(
         }
         _ => return Err(Error::not_implemented(format!("native page for {ty}"))),
     }
-    Ok((out, membership))
+    Ok(out)
 }
 
 fn put_varint(out: &mut Vec<u8>, mut value: u32) {
