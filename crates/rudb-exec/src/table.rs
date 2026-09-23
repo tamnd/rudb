@@ -1033,6 +1033,12 @@ impl<'a> Coded<'a> {
         self.columns.iter().flatten().all(|column| matches!(column.places, Places::Values { .. }))
     }
 
+    /// Whether any key column is read by its value, so that the map's places are a window of
+    /// values the caller chose rather than codes a page came with.
+    pub(crate) fn reads_values(&self) -> bool {
+        self.columns.iter().flatten().any(|column| matches!(column.places, Places::Values { .. }))
+    }
+
     /// The hash [`hash`] gives `row`, worked out for that row alone.
     ///
     /// Only for a key [`Self::by_value`] says is read by value, which is a narrow integer in every
