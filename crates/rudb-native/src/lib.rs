@@ -10069,8 +10069,7 @@ mod tests {
         assert!(dictionary.try_bytes_lens(&mut whole).expect("read"), "the text answers whole");
         assert_eq!(whole, lens, "a vector of lengths answers what a length at a time answers");
         let codes = (0..4_000_u32).map(|row| (7 * (4_000 - row)) % 2_800).collect::<Vec<_>>();
-        let coded =
-            Vector::dictionary_over(codes.clone(), dictionary).expect("codes in range");
+        let coded = Vector::dictionary_over(codes.clone(), dictionary).expect("codes in range");
         let mut through = vec![0i64; codes.len()];
         assert!(coded.try_bytes_lens(&mut through).expect("read"), "the codes answer whole");
         for (row, &code) in codes.iter().enumerate() {
