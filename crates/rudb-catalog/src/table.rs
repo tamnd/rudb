@@ -686,6 +686,19 @@ impl Rows {
         }
     }
 
+    /// The columns whose values never go down in row order and hold no null, by name.
+    ///
+    /// Only a file can say, because only a file keeps a summary of each column's order. A table in
+    /// memory, or a file with rows grown past it, answers nothing, which reads back as a table whose
+    /// order nobody knows.
+    #[must_use]
+    pub fn ascending(&self) -> Vec<String> {
+        match self {
+            Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
+            Self::Native(reader) => rudb_native::ascending(reader),
+        }
+    }
+
     /// One whole in-memory chunk, used by checkpointing and tests.
     ///
     /// Owned rather than borrowed, because a chunk of an in memory table is a window cut out of its
@@ -888,6 +901,12 @@ impl Table {
     /// the sketch `count.rs` built as the rows arrived, exact for a column under the sketch's k and
     /// estimated at about one and a half percent above it. A column neither of them can say anything
     /// about is left out, and a column left out is the estimator's `Unknown`.
+    /// The columns the rows are stored in ascending order of, which [`Rows::ascending`] answers.
+    #[must_use]
+    pub fn ascending(&self) -> Vec<String> {
+        self.rows.ascending()
+    }
+
     #[must_use]
     pub fn distincts(&self) -> Vec<(String, Stat<u64>)> {
         let Rows::Memory(rows) = &self.rows else { return self.rows.distincts() };
