@@ -1770,6 +1770,7 @@ impl<'a> Aggregate<'a> {
                 || coded_spent.saturating_add(codes.combos())
                     <= coded_read.saturating_mul(WINDOW_RATE).saturating_add(WINDOW_SLACK)
         });
+        let mut runs_found = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
                 if codes.reads_values() {
@@ -1779,25 +1780,78 @@ impl<'a> Aggregate<'a> {
                 coded_map.clear();
                 coded_map.resize(codes.combos(), NOWHERE);
             }
-            // One pass that finds every row's slot straight out of the map when the key is one or
-            // two dictionary columns, which is the whole chunk once a row group's first rows are in.
-            // Only a chunk where some row found nothing goes through the places and the loop below.
-            let answered = codes.look_up(coded_map, slots) == Some(false);
-            if !answered {
+            // A row the map has nothing for goes through the probe and the insert every row used to
+            // go through, there and then, and what comes back is written into the map before the
+            // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
+            // run, so the first row of the run is the only one that misses and the rest of it is
+            // answered by the map. Put aside for a second pass, every row of the run missed and was
+            // looked at twice, which was half the rows of ClickBench 28.
+            //
+            // The chunk is hashed at the first miss, because a chunk the map answers whole is the
+            // ordinary case once the first rows of a row group have been through. A key read by
+            // value is not hashed as a chunk at all, since the rows that miss are a few dozen and
+            // are hashed one at a time. `NOWHERE` is a row the group limit turned away.
+            let one_at_a_time = prehashed.is_none() && codes.by_value();
+            let mut hashed = false;
+            let mut resolve = |row: usize| -> Result<usize> {
+                let hash = match prehashed {
+                    Some(prehashed) => prehashed[row],
+                    None if one_at_a_time => codes.hash_of(row),
+                    None => {
+                        if !hashed {
+                            crate::table::hash(
+                                keys,
+                                *length,
+                                hashes,
+                                crate::table::Across::OneInput,
+                            );
+                            hashed = true;
+                        }
+                        hashes[row]
+                    }
+                };
+                match table.probe(hash, keys, row) {
+                    Probe::Found(slot) => Ok(slot),
+                    Probe::Vacant(_)
+                        if self.max_groups.is_some_and(|limit| table.len() >= limit) =>
+                    {
+                        Ok(NOWHERE)
+                    }
+                    Probe::Vacant(bucket) => {
+                        let slot = table.insert(bucket, hash, keys, row)?;
+                        *groups = table.len();
+                        self.fresh(states, counts, compact)?;
+                        if self.sets {
+                            self.fresh_seen(seen);
+                        }
+                        Ok(slot)
+                    }
+                }
+            };
+            // A key that comes in runs is read out of the map once a run, and the runs it was cut
+            // into are the ones the aggregates fold by below. On ClickBench 28 the pass that wrote
+            // every row's place, the one that read the map with it and the one that found the runs
+            // again in the slots were two fifths of the fold.
+            if codes.place_runs(*length, *length / RUN_ROWS, slot_runs) {
+                let mut start = 0;
+                for run in slot_runs.iter_mut() {
+                    let (place, end) = *run;
+                    let mut slot = coded_map[place];
+                    if slot == NOWHERE {
+                        slot = resolve(start)?;
+                        coded_map[place] = slot;
+                    }
+                    slots[start..end].fill(slot);
+                    *run = (slot, end);
+                    start = end;
+                }
+                runs_found = true;
+            } else if codes.look_up(coded_map, slots) != Some(false) {
+                // One pass that finds every row's slot straight out of the map when the key is one
+                // or two dictionary columns, which is the whole chunk once a row group's first rows
+                // are in. Only a chunk where some row found nothing, or a key the pass does not
+                // read, goes through the places and the loop here.
                 codes.places(*length, coded_places);
-                // A row the map has nothing for goes through the probe and the insert every row used to
-                // go through, there and then, and what comes back is written into the map before the
-                // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
-                // run, so the first row of the run is the only one that misses and the rest of it is
-                // answered by the map. Put aside for a second pass, every row of the run missed and
-                // was looked at twice, which was half the rows of ClickBench 28.
-                //
-                // The chunk is hashed at the first miss, because a chunk the map answers whole is the
-                // ordinary case once the first rows of a row group have been through. A key read by
-                // value is not hashed as a chunk at all, since the rows that miss are a few dozen and
-                // are hashed one at a time.
-                let one_at_a_time = prehashed.is_none() && codes.by_value();
-                let mut hashed = false;
                 let mut row = 0;
                 loop {
                     while row < *length {
@@ -1811,40 +1865,9 @@ impl<'a> Aggregate<'a> {
                     if row == *length {
                         break;
                     }
-                    let index = coded_places[row];
-                    let hash = match prehashed {
-                        Some(prehashed) => prehashed[row],
-                        None if one_at_a_time => codes.hash_of(row),
-                        None => {
-                            if !hashed {
-                                crate::table::hash(
-                                    keys,
-                                    *length,
-                                    hashes,
-                                    crate::table::Across::OneInput,
-                                );
-                                hashed = true;
-                            }
-                            hashes[row]
-                        }
-                    };
-                    match table.probe(hash, keys, row) {
-                        Probe::Found(slot) => {
-                            slots[row] = slot;
-                            coded_map[index] = slot;
-                        }
-                        Probe::Vacant(bucket) => {
-                            if !self.max_groups.is_some_and(|limit| table.len() >= limit) {
-                                slots[row] = table.insert(bucket, hash, keys, row)?;
-                                coded_map[index] = slots[row];
-                                *groups = table.len();
-                                self.fresh(states, counts, compact)?;
-                                if self.sets {
-                                    self.fresh_seen(seen);
-                                }
-                            }
-                        }
-                    }
+                    let slot = resolve(row)?;
+                    slots[row] = slot;
+                    coded_map[coded_places[row]] = slot;
                     row += 1;
                 }
             }
@@ -2032,7 +2055,7 @@ impl<'a> Aggregate<'a> {
         // and then each aggregate takes a run of rows into one group at once rather than a row at
         // a time. The pass that finds out is one compare a row, so it is only taken where the
         // slots can come in runs at all, which is a key whose rows are grouped together.
-        let by_runs = slot_runs_of(slots, slot_runs);
+        let by_runs = runs_found || slot_runs_of(slots, slot_runs);
         if self.count_only {
             if by_runs {
                 let mut start = 0;
