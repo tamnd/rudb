@@ -450,6 +450,37 @@ fn write_float<T: Real>(f: &mut fmt::Formatter<'_>, value: T) -> fmt::Result {
     write!(f, "{mantissa}e{sign}{:02}", exponent.abs())
 }
 
+/// Formats a DOUBLE with the same spelling used by SQL values, without formatting a tagged Value.
+#[must_use]
+pub fn format_double(value: f64) -> String {
+    if !value.is_finite() {
+        return Value::Double(value).to_string();
+    }
+    let text = value.to_string();
+    let unsigned = text.strip_prefix('-').unwrap_or(&text);
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let (exponent, digits) = if integer != "0" {
+        let exponent = integer.len() as i32 - 1;
+        (exponent, format!("{integer}{fraction}"))
+    } else if let Some(first) = fraction.bytes().position(|byte| byte != b'0') {
+        (-1 - first as i32, fraction[first..].to_string())
+    } else {
+        return if value.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+    };
+    if (-4..16).contains(&exponent) {
+        return if text.contains('.') { text } else { format!("{text}.0") };
+    }
+    let digits = digits.trim_end_matches('0');
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let exponent_sign = if exponent < 0 { '-' } else { '+' };
+    let mantissa = if digits.len() == 1 {
+        digits.to_string()
+    } else {
+        format!("{}.{}", &digits[..1], &digits[1..])
+    };
+    format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.abs())
+}
+
 fn write_decimal(f: &mut fmt::Formatter<'_>, unscaled: i128, scale: u8) -> fmt::Result {
     if scale == 0 {
         return write!(f, "{unscaled}");
@@ -630,7 +661,7 @@ fn plural(n: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Value, civil_from_days, days_from_civil};
+    use super::{Value, civil_from_days, days_from_civil, format_double};
     use crate::types::LogicalType;
 
     #[test]
@@ -740,6 +771,19 @@ mod tests {
         assert_eq!(Value::Double(1e-4).to_string(), "0.0001");
         assert_eq!(Value::Double(1e-5).to_string(), "1e-05");
         assert_eq!(Value::Double(1.234_567_890_123_456_8e17).to_string(), "1.2345678901234568e+17");
+    }
+
+    #[test]
+    fn direct_double_format_matches_a_sql_value() {
+        for value in [0.0, -0.0, 1.0, 1e-5, 1e16, 2.414420660257356e18, f64::INFINITY] {
+            assert_eq!(format_double(value), Value::Double(value).to_string());
+        }
+        let mut bits = 0x9e3779b97f4a7c15_u64;
+        for _ in 0..100_000 {
+            bits = bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let value = f64::from_bits(bits);
+            assert_eq!(format_double(value), Value::Double(value).to_string(), "bits={bits:016x}");
+        }
     }
 
     #[test]
