@@ -42,6 +42,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod device;
 pub mod glob;
 pub mod machine;
 pub mod pool;

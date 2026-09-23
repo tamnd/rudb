@@ -62,6 +62,7 @@ use rudb_seam::Settings;
 
 use crate::buffer::Buffered;
 use crate::cutoff::{self, Cutoff};
+use crate::devicecard::device_card;
 use crate::enginenames::{
     database_size, dialects, extensions, grammar_extensions, optimizers, platform, user_agent,
     version,
@@ -1326,6 +1327,18 @@ impl<'a> Building<'a, '_> {
                     pipeline,
                     "Metadata",
                     Some(TableFunction::PragmaStorageInfo.name()),
+                );
+                Segment::new(Arc::new(Watched::new(table, counters)), schema)
+            }
+            Some(TableFunction::RudbDeviceCard) => {
+                let table = device_card(plan, args, index, columns)?;
+                let schema = table.schema().clone();
+                let counters = self.watch(
+                    reference,
+                    id,
+                    pipeline,
+                    "Metadata",
+                    Some(TableFunction::RudbDeviceCard.name()),
                 );
                 Segment::new(Arc::new(Watched::new(table, counters)), schema)
             }

@@ -83,6 +83,7 @@
 mod buffer;
 mod build;
 mod cutoff;
+mod devicecard;
 mod enginenames;
 mod entrynames;
 mod expr;
