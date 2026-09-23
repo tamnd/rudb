@@ -1463,6 +1463,11 @@ fn window_of(
     // after a block rather than after the whole chunk. Its rows are hashed after all of this, and
     // a whole pass here that ends in a refusal was five percent of ClickBench 18.
     let (mut lowest, mut highest) = (i64::MAX, i64::MIN);
+    // The last value taken in, so that a stretch repeating it is passed over. There is no compare of
+    // two 64 bit integers on the baseline x86 this is built for, so the lowest and highest are a
+    // compare and a branch a value, where a test for equal is a vector compare. A sorted key such
+    // as `CounterID` comes in runs of hundreds, and this pass was a third of its fold.
+    let mut current = into.first().copied().unwrap_or_default();
     for (block, values) in into.chunks(128).enumerate() {
         if nullable {
             for (row, &value) in values.iter().enumerate() {
@@ -1472,9 +1477,16 @@ fn window_of(
                 }
             }
         } else {
-            for &value in values {
-                lowest = lowest.min(value);
-                highest = highest.max(value);
+            lowest = lowest.min(current);
+            highest = highest.max(current);
+            for stretch in values.chunks(16) {
+                if stretch.iter().fold(false, |differ, &value| differ | (value != current)) {
+                    for &value in stretch {
+                        lowest = lowest.min(value);
+                        highest = highest.max(value);
+                    }
+                    current = stretch[stretch.len() - 1];
+                }
             }
         }
         if lowest <= highest && (i128::from(highest) - i128::from(lowest)) >= limit as i128 {
