@@ -95,15 +95,21 @@ pub(crate) fn evaluate_in_time_zone(
             combine(connective(op), &children)
         }
         Expr::Function { name, args } => {
-            if let Some((list, lambda)) = crate::lambda::lambda_call(plan, args) {
+            if let Some((list, lambda, initial)) = crate::lambda::lambda_call(plan, args) {
                 let runner =
                     crate::lambda::Lambda::new(plan, plan.string(name), list, lambda, schema)?;
                 let Expr::Lambda { body, .. } = *plan.expr(lambda) else {
                     return Err(Error::internal("a lambda call without a lambda"));
                 };
                 let list = evaluate_in_time_zone(plan, list, schema, chunk, time_zone)?;
+                let initial = match initial {
+                    Some(initial) => {
+                        Some(evaluate_in_time_zone(plan, initial, schema, chunk, time_zone)?)
+                    }
+                    None => None,
+                };
                 return runner
-                    .run(&list, chunk, &mut |inner| {
+                    .run(&list, initial.as_ref(), chunk, &mut |inner| {
                         evaluate_in_time_zone(plan, body, runner.schema(), inner, time_zone)
                     })
                     .map_err(|error| error.with_fallback_span(plan.expr_span(expr)));
