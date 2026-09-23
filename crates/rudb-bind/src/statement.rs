@@ -486,6 +486,9 @@ fn foreign_key(
         (made.clone(), columns.to_vec(), keys.to_vec())
     } else {
         let resolved = catalog.resolve(parts)?;
+        if catalog.view(&resolved).is_ok() {
+            return Err(Error::binder("cannot reference a VIEW with a FOREIGN KEY"));
+        }
         let table = catalog.table(&resolved)?;
         (resolved, table.columns().to_vec(), table.keys().to_vec())
     };
