@@ -402,8 +402,28 @@ fn shifted_comparison(
         _ => return None,
     };
     let Value::Date(bound) = constant(plan, bound)? else { return None };
+    let (origin, count) = days_after(plan, sum)?;
+    let apart = integer_of(&LogicalType::Integer, i128::from(bound) - i128::from(origin))?;
+    let held = plan.add_value(apart);
+    let constant =
+        plan.add_expr_at(Expr::Constant(held), LogicalType::Integer, plan.expr_span(right));
+    let ty = plan.expr_type(expr).clone();
+    Some(plan.add_expr_at(
+        Expr::Compare { op, left: count, right: constant },
+        ty,
+        plan.expr_span(expr),
+    ))
+}
+
+/// A date made by adding a count of days to a constant date, as the date and the count.
+///
+/// `None` unless no value the count can hold takes the sum out of the range of a date, which is read
+/// off the integer type under a widening cast. The sum is checked by the kernel and raises when it
+/// leaves the range, so a rule that answers the sum without computing it has to know it could not
+/// have raised. A bare `INTEGER` count is refused, since its extremes do leave the range.
+pub(crate) fn days_after(plan: &Plan, sum: ExprRef) -> Option<(i32, ExprRef)> {
     let Expr::Function { name, args } = *plan.expr(sum) else { return None };
-    if plan.string(name) != "+" {
+    if plan.string(name) != "+" || *plan.expr_type(sum) != LogicalType::Date {
         return None;
     }
     let &[first, second] = plan.expr_list(args) else { return None };
@@ -422,20 +442,10 @@ fn shifted_comparison(
     let (low, high) = integer_range(&held)?;
     // Far inside the kernel's range on both sides, so no sum a count of this type makes can fail.
     let room = 1_i128 << 30;
-    let origin = i128::from(origin);
-    if origin.abs() >= room || low <= -room || high >= room {
+    if i128::from(origin).abs() >= room || low <= -room || high >= room {
         return None;
     }
-    let apart = integer_of(&LogicalType::Integer, i128::from(bound) - origin)?;
-    let held = plan.add_value(apart);
-    let constant =
-        plan.add_expr_at(Expr::Constant(held), LogicalType::Integer, plan.expr_span(right));
-    let ty = plan.expr_type(expr).clone();
-    Some(plan.add_expr_at(
-        Expr::Compare { op, left: count, right: constant },
-        ty,
-        plan.expr_span(expr),
-    ))
+    Some((origin, count))
 }
 
 /// The inclusive range of an integer type, in the widest signed integer a plan value holds.

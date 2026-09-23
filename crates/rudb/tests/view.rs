@@ -258,13 +258,14 @@ fn a_view_over_a_parquet_file_runs_the_published_benchmark_sql_unmodified() {
 
 #[test]
 fn a_date_filter_through_the_benchmark_view_counts_what_a_filter_on_the_stored_days_counts() {
-    // The view turns the stored count of days into a date, and the filter on that date is moved back
-    // onto the count so a row group can be skipped on it. Every comparison has to count the same rows
-    // either way, including the ones no row satisfies and the ones every row does.
-    let sql = format!(
-        "CREATE VIEW hits AS SELECT * REPLACE (DATE '1970-01-01' + EventDate::INTEGER AS EventDate) FROM read_parquet('{HITS}')"
-    );
-    let database = ran(&[&sql]);
+    // The view turns a stored count of days into a date the way the ClickBench view does, and the
+    // filter on that date is moved back onto the count so a zone can be skipped on it. Every
+    // comparison has to count the same rows either way, including one no row satisfies.
+    let database = ran(&[
+        "CREATE TABLE t AS SELECT (15700 + i % 400)::USMALLINT AS EventDate FROM range(20000) r(i)",
+        "INSERT INTO t VALUES (NULL)",
+        "CREATE VIEW hits AS SELECT * REPLACE (DATE '1970-01-01' + EventDate::INTEGER AS EventDate) FROM t",
+    ]);
     let pairs = [
         ("EventDate >= '2013-07-01' AND EventDate <= '2013-07-31'", "d >= 15887 AND d <= 15917"),
         ("EventDate = '2013-07-15'", "d = 15901"),
@@ -279,7 +280,7 @@ fn a_date_filter_through_the_benchmark_view_counts_what_a_filter_on_the_stored_d
             .unwrap_or_else(|error| panic!("{dated}: {error}"));
         let raw = database
             .value(&format!(
-                "SELECT COUNT(*) FROM (SELECT EventDate::INTEGER AS d FROM read_parquet('{HITS}')) WHERE {counted}"
+                "SELECT COUNT(*) FROM (SELECT EventDate::INTEGER AS d FROM t) WHERE {counted}"
             ))
             .unwrap_or_else(|error| panic!("{counted}: {error}"));
         assert_eq!(through, raw, "{dated} against {counted}");
@@ -287,6 +288,10 @@ fn a_date_filter_through_the_benchmark_view_counts_what_a_filter_on_the_stored_d
     let plan =
         database.plan("SELECT COUNT(*) FROM hits WHERE EventDate >= '2013-07-01'").expect("a plan");
     assert!(plan.contains(">= 15887::USMALLINT"), "the filter is not on the stored days:\n{plan}");
+
+    let result = database.query("SELECT MIN(EventDate), MAX(EventDate) FROM hits").expect("q7");
+    assert_eq!(result.value_at(0, 0), Value::Date(15_700));
+    assert_eq!(result.value_at(0, 1), Value::Date(16_099));
 }
 
 /// A file holding a database the statements were run against, and the path it is at.
