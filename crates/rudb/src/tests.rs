@@ -8354,6 +8354,14 @@ fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
     let error = |sql: &str| db.query(sql).unwrap_err().to_string();
     let answers = [
         ("SELECT range(5)", "[0, 1, 2, 3, 4]"),
+        (
+            "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-03', INTERVAL '1 day 12 hours')",
+            "[2020-01-01 00:00:00, 2020-01-02 12:00:00]",
+        ),
+        (
+            "SELECT range(TIMESTAMP '2020-01-03', TIMESTAMP '2020-01-01', INTERVAL '-1 day -12 hours')",
+            "[2020-01-03 00:00:00, 2020-01-01 12:00:00]",
+        ),
         ("SELECT range(2, 5)", "[2, 3, 4]"),
         ("SELECT range(10, 2, -3)", "[10, 7, 4]"),
         ("SELECT range(0, 0)", "[]"),

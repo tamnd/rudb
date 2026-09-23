@@ -211,9 +211,23 @@ fn step_stamps(
             "Interval with mix of negative/positive entries not supported",
         ));
     }
+    // The two infinities are the two ends of the `i64`, less one at the bottom as upstream has it.
+    if [start, end].iter().any(|&stamp| stamp == i64::MAX || stamp == -i64::MAX) {
+        return Err(Error::invalid_input("Interval infinite bounds not supported"));
+    }
     let from = out.len();
     if !forward && !backward {
         return Ok(0);
+    }
+    // Without months every step is the same number of microseconds, so the series is counted and
+    // written the way an integer one is, and every moment in it is between the start and the end.
+    let whole = i128::from(days) * i128::from(datetime::MICROS_PER_DAY) + i128::from(micros);
+    if let (0, Ok(step)) = (months, i64::try_from(whole)) {
+        let count = series_length(start, end, step, inclusive)?;
+        let steps = i64::try_from(count).map_err(|_| too_long())?;
+        out.reserve(count);
+        out.extend((0..steps).map(|at| start.wrapping_add(at.wrapping_mul(step))));
+        return Ok(count);
     }
     let (months, days, micros) = (i64::from(months), i64::from(days), i128::from(micros));
     let mut at = start;
