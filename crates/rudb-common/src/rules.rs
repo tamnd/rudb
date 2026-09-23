@@ -70,11 +70,14 @@ pub enum Rule {
     MemoryReservation,
     /// Every stored graph section. Off means the sections are not read and no plan uses one.
     GraphSections,
+    /// Turning a join's build side into an exact set of driving rows through a stored link, rather
+    /// than into a Bloom filter. Under [`Rule::GraphSections`], so it is off whenever the layer is.
+    GraphReduction,
 }
 
 impl Rule {
     /// Every rule, in the order a report lists them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::StatsAll,
         Self::Presize,
         Self::DirectAddressing,
@@ -85,6 +88,7 @@ impl Rule {
         Self::JoinElimination,
         Self::MemoryReservation,
         Self::GraphSections,
+        Self::GraphReduction,
     ];
 
     /// The canonical name, which is what a setting reads back as.
@@ -101,6 +105,7 @@ impl Rule {
             Self::JoinElimination => "stats.join_elimination",
             Self::MemoryReservation => "stats.memory_reservation",
             Self::GraphSections => "graph.sections",
+            Self::GraphReduction => "graph.reduction",
         }
     }
 
@@ -112,6 +117,7 @@ impl Rule {
     pub const fn master(self) -> Option<Self> {
         match self {
             Self::StatsAll | Self::GraphSections => None,
+            Self::GraphReduction => Some(Self::GraphSections),
             _ => Some(Self::StatsAll),
         }
     }
@@ -173,7 +179,7 @@ fn canonical(key: &str) -> String {
 
 /// Which switches are on, as the statements have left them.
 ///
-/// A bitset rather than a map, because there are ten of them, because a session copies this once
+/// A bitset rather than a map, because there are eleven of them, because a session copies this once
 /// per statement, and because the set is fixed at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rules(u16);
@@ -301,8 +307,8 @@ mod tests {
     fn every_statistics_rule_starts_on_and_the_graph_sections_start_off() {
         let rules = Rules::new();
         for rule in Rule::ALL {
-            if rule == Rule::GraphSections {
-                assert!(!rules.enabled(rule), "the graph sections should start off");
+            if rule == Rule::GraphSections || rule == Rule::GraphReduction {
+                assert!(!rules.enabled(rule), "{} should start off", rule.name());
             } else {
                 assert!(rules.enabled(rule), "{} should start on", rule.name());
             }
