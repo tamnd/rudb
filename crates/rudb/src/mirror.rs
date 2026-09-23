@@ -142,9 +142,11 @@ fn build(
         ))?;
         database.execute("CHECKPOINT")?;
         drop(database);
-        std::fs::rename(&temporary, mirror).map_err(|error| {
-            Error::io(format!("could not publish the mirror {}: {error}", mirror.display()))
-        })
+        crate::database::publish(&rudb_io::RealFilesystem::new(), &temporary, mirror).map_err(
+            |error| {
+                Error::io(format!("could not publish the mirror {}: {error}", mirror.display()))
+            },
+        )
     })();
     if loaded.is_err() {
         let _ = std::fs::remove_file(&temporary);
