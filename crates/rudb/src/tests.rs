@@ -5582,7 +5582,7 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     // clause ignored, which is the rule the front end follows everywhere else.
     let db = scripted(&["CREATE TABLE t (a INTEGER)"]);
     for statement in [
-        "CREATE TABLE u (a INTEGER CHECK (a > 0))",
+        "CREATE TABLE u (a INTEGER REFERENCES t (a))",
         "INSERT INTO t (a, a) VALUES (1, 2)",
         "CREATE TABLE u (a INTEGER, a VARCHAR)",
     ] {
@@ -9364,6 +9364,49 @@ fn a_column_default_fills_what_an_insert_leaves_out_the_way_the_pin_does() {
     let updated = db.query("SELECT i, s, k FROM t WHERE s = 'w'").unwrap();
     let row: Vec<String> = updated.rows().next().unwrap().iter().map(|v| v.to_string()).collect();
     assert_eq!(row, ["3", "w", "NULL"]);
+}
+
+#[test]
+fn a_check_constraint_refuses_a_row_that_fails_it_the_way_the_pin_does() {
+    let db = scripted(&[
+        "CREATE TABLE c (i INT CHECK (i > 0), j INT, CHECK (j < i))",
+        "INSERT INTO c VALUES (1, 0)",
+        "INSERT INTO c VALUES (NULL, NULL)",
+        "CREATE TABLE e (i INT CHECK (i > 0) CHECK (i < 10), s VARCHAR CHECK (length(s) < 3))",
+    ]);
+    let failed = |table: &str, text: &str| {
+        format!("CHECK constraint failed on table \"{table}\" with expression CHECK({text})")
+    };
+    for (statement, message) in [
+        ("INSERT INTO c VALUES (0, -1)", failed("c", "(i > 0)")),
+        ("INSERT INTO c VALUES (5, 6)", failed("c", "(j < i)")),
+        ("UPDATE c SET i = -1 WHERE i = 1", failed("c", "(i > 0)")),
+        ("UPDATE c SET j = 10", failed("c", "(j < i)")),
+        ("INSERT INTO e VALUES (11, 'a')", failed("e", "(i < 10)")),
+        ("INSERT INTO e VALUES (1, 'abcd')", failed("e", "(length(s) < 3)")),
+        (
+            "CREATE TABLE d (i INT CHECK (i > (SELECT 1)))",
+            "subqueries prohibited in CHECK constraints".into(),
+        ),
+        (
+            "CREATE TABLE d (i INT CHECK (sum(i) > 1))",
+            "aggregate functions are not allowed in check constraints".into(),
+        ),
+        (
+            "CREATE TABLE d (i INT CHECK (k > 1))",
+            "Table does not contain column \"k\" referenced in check constraint!".into(),
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    db.execute("INSERT INTO e VALUES (1, 'ab')").unwrap();
+    let all = db
+        .query("SELECT i, j FROM c")
+        .unwrap()
+        .rows()
+        .map(|row| format!("{},{}", row[0], row[1]))
+        .collect::<Vec<_>>();
+    assert_eq!(all, ["1,0", "NULL,NULL"]);
 }
 
 #[test]

@@ -976,6 +976,8 @@ pub struct Table {
     seen: Vec<Option<Seen>>,
     /// The `DEFAULT` of each column as the SQL of its expression, or empty when no column has one.
     defaults: Vec<Option<String>>,
+    /// The SQL of each `CHECK` constraint, in the order written.
+    checks: Vec<String>,
 }
 
 impl Table {
@@ -1000,6 +1002,7 @@ impl Table {
             keys: Vec::new(),
             seen: Vec::new(),
             defaults: Vec::new(),
+            checks: Vec::new(),
         })
     }
 
@@ -1021,6 +1024,7 @@ impl Table {
             keys: Vec::new(),
             seen: Vec::new(),
             defaults: Vec::new(),
+            checks: Vec::new(),
         })
     }
 
@@ -1313,6 +1317,17 @@ impl Table {
     /// Declares the columns' defaults, one per column.
     pub fn set_defaults(&mut self, defaults: Vec<Option<String>>) {
         self.defaults = defaults;
+    }
+
+    /// The SQL of each `CHECK` constraint, in the order written.
+    #[must_use]
+    pub fn checks(&self) -> &[String] {
+        &self.checks
+    }
+
+    /// Declares the table's `CHECK` constraints.
+    pub fn set_checks(&mut self, checks: Vec<String>) {
+        self.checks = checks;
     }
 
     /// Declares the table's keys, which makes the columns of a primary key `NOT NULL` as well.

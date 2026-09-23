@@ -1917,7 +1917,7 @@ impl<'a> Binder<'a> {
 
     /// A table the catalog holds, under the name `label`, which is where [`Self::bind_table`] ends
     /// and where a Parquet file with a native mirror goes instead of to its reader.
-    fn bind_catalog_table(
+    pub(crate) fn bind_catalog_table(
         &mut self,
         ast: &Ast,
         resolved: &QualifiedName,

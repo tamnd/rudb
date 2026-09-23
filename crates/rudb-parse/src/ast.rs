@@ -195,6 +195,9 @@ pub struct CreateTable {
     pub keys: Slice,
     /// Which of `keys` is the primary key, or `NONE`.
     pub primary: u32,
+    /// Every `CHECK` expression, as a run of expressions in the order they were written, whether on
+    /// a column or on the table.
+    pub checks: Slice,
 }
 
 /// One column of a `CREATE TABLE`.
