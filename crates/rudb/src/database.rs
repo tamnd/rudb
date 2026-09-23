@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
@@ -15,6 +16,7 @@ use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
 use rudb_native::graph::Edge;
 use rudb_parse::ast::Ast;
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
+use rudb_plan::{Expr, Node, Plan};
 use rudb_vector::{Chunk, Form, Vector};
 
 use crate::config::Config;
@@ -85,6 +87,17 @@ struct Inner {
     /// read under, so that a file whose load fails pays for the failure once and not on every
     /// query. See [`crate::mirror`].
     declined: Mutex<BTreeSet<(String, bool)>>,
+    /// A successful setting statement invalidates the one cached native count plan.
+    settings_revision: AtomicU64,
+    native_count_plan: Mutex<Option<CachedCount>>,
+}
+
+#[derive(Debug)]
+struct CachedCount {
+    sql: String,
+    catalog_generation: u64,
+    settings_revision: u64,
+    plan: Arc<Plan>,
 }
 
 /// The file is written when the last handle on the database goes away.
@@ -149,6 +162,8 @@ impl Database {
             facts: Mutex::default(),
             relationships: Mutex::default(),
             declined: Mutex::default(),
+            settings_revision: AtomicU64::new(0),
+            native_count_plan: Mutex::default(),
         };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
@@ -280,6 +295,8 @@ impl Database {
             facts: Mutex::default(),
             relationships: Mutex::default(),
             declined: Mutex::default(),
+            settings_revision: AtomicU64::new(0),
+            native_count_plan: Mutex::default(),
         };
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
@@ -1204,7 +1221,48 @@ impl Shared {
     /// since printing a plan changes nothing. A statement that writes is refused here rather than
     /// run under a read lock.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
+        if let Some(answer) = self.cached_native_count(sql, cancel)? {
+            return Ok(answer);
+        }
         self.query_mirrored(sql, cancel, true)
+    }
+
+    /// Reuse the bound plan for a plain native row count while the table and settings are unchanged.
+    /// Execution still runs for every call, producing a fresh answer and metrics document.
+    fn cached_native_count(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
+        let catalog = self.read();
+        let revision = self.inner.settings_revision.load(Ordering::Relaxed);
+        let cached = self
+            .inner
+            .native_count_plan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|cached| {
+                cached.sql == sql
+                    && cached.catalog_generation == catalog.generation()
+                    && cached.settings_revision == revision
+            })
+            .map(|cached| Arc::clone(&cached.plan));
+        let Some(plan) = cached else { return Ok(None) };
+        let seams = self.seams(sql)?;
+        let context = self.optimizer(&catalog)?;
+        let session = self.session();
+        let under = Under::new(self.budget(), context.facts(), &seams, &session, Rows::ForACaller);
+        run(sql, &plan, &catalog, cancel, under).map(Some)
+    }
+
+    fn remember_native_count(&self, sql: &str, plan: &Plan, catalog: &Catalog) {
+        if !is_native_count(plan, catalog) {
+            return;
+        }
+        *self.inner.native_count_plan.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(CachedCount {
+                sql: sql.to_string(),
+                catalog_generation: catalog.generation(),
+                settings_revision: self.inner.settings_revision.load(Ordering::Relaxed),
+                plan: Arc::new(plan.clone()),
+            });
     }
 
     /// [`Shared::query`], asking for the Parquet mirrors the statement wants when `mirror` is set.
@@ -1232,6 +1290,7 @@ impl Shared {
         match bound {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                self.remember_native_count(sql, &plan, &catalog);
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
@@ -1533,6 +1592,9 @@ impl Shared {
     /// SELECT * FROM t` would otherwise read the table under a read lock, let go, and append to
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
+        if let Some(answer) = self.cached_native_count(sql, cancel)? {
+            return Ok(answer);
+        }
         let session = self.session();
         let (ast, parse_ns) =
             timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
@@ -1587,6 +1649,9 @@ impl Shared {
         match bound {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                if parameters.is_empty() {
+                    self.remember_native_count(sql, &plan, &catalog);
+                }
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
@@ -1610,6 +1675,7 @@ impl Shared {
             }
             Bound::Setting(setting) if setting.pragma => {
                 self.inner.settings.toggle(&setting.name)?;
+                self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
                 Ok(QueryResult::empty())
             }
             Bound::Setting(setting) => {
@@ -1622,6 +1688,7 @@ impl Shared {
                     setting.scope,
                     value,
                 )?;
+                self.inner.settings_revision.fetch_add(1, Ordering::Relaxed);
                 Ok(QueryResult::empty())
             }
             Bound::Checkpoint => {
@@ -1786,7 +1853,7 @@ fn planned(
     catalog: &Catalog,
     context: &rudb_opt::pass::Context,
     session: &Session,
-) -> Result<rudb_plan::Plan> {
+) -> Result<Plan> {
     let mut plan = rudb_bind::bind_sql_with(sql, catalog, session)?;
     rudb_opt::optimize_with(&mut plan, context)?;
     Ok(plan)
@@ -1977,9 +2044,41 @@ impl<'a> Under<'a> {
     }
 }
 
+/// Only a single, unfiltered `count_star` over one immutable native table can use this cache.
+/// The projection may rename the count, but may not compute anything from it.
+fn is_native_count(plan: &Plan, catalog: &Catalog) -> bool {
+    let Node::Project { input, exprs, .. } = *plan.node(plan.root()) else { return false };
+    let [projected] = plan.expr_list(exprs) else { return false };
+    let &Expr::Column(projected) = plan.expr(*projected) else { return false };
+    let Node::Aggregate { input, index, groups, aggregates } = *plan.node(input) else {
+        return false;
+    };
+    if projected.table != index || projected.column != 0 || !plan.expr_list(groups).is_empty() {
+        return false;
+    }
+    let [aggregate] = plan.expr_list(aggregates) else { return false };
+    let &Expr::Aggregate { name, args, distinct: false, filter: None } = plan.expr(*aggregate)
+    else {
+        return false;
+    };
+    if plan.string(name) != "count_star" || !plan.expr_list(args).is_empty() {
+        return false;
+    }
+    let Node::Get { catalog: source_catalog, schema, table, columns, .. } = *plan.node(input)
+    else {
+        return false;
+    };
+    if !plan.field_list(columns).is_empty() {
+        return false;
+    }
+    let source =
+        QualifiedName::new(plan.string(source_catalog), plan.string(schema), plan.string(table));
+    catalog.table(&source).is_ok_and(|table| table.rows().is_native())
+}
+
 fn run(
     sql: &str,
-    plan: &rudb_plan::Plan,
+    plan: &Plan,
     catalog: &Catalog,
     cancel: &Cancel,
     under: Under<'_>,
@@ -2071,7 +2170,7 @@ fn run(
 /// rows back from an `EXPLAIN` has no way to tell which it asked for.
 #[allow(clippy::too_many_arguments)]
 fn explaining(
-    plan: &rudb_plan::Plan,
+    plan: &Plan,
     catalog: &Catalog,
     cancel: &Cancel,
     budget: Budget<'_>,
