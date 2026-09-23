@@ -53,6 +53,37 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
+/// Throwaway timing probe.
+#[allow(missing_docs, clippy::missing_panics_doc)]
+pub mod probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SPENT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    const NAMES: [&str; 8] = [
+        "gather",
+        "code_column",
+        "encode_pages",
+        "block_encode",
+        "code_pages",
+        "plain_pages",
+        "merge",
+        "settle",
+    ];
+    pub fn time<R>(at: usize, work: impl FnOnce() -> R) -> R {
+        let started = std::time::Instant::now();
+        let out = work();
+        add(at, started);
+        out
+    }
+    pub fn add(at: usize, started: std::time::Instant) {
+        SPENT[at].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    pub fn dump() {
+        for (name, spent) in NAMES.iter().zip(&SPENT) {
+            eprintln!("PROBE {name} {} ms", spent.swap(0, Ordering::Relaxed) / 1000);
+        }
+    }
+}
+
 mod distinct;
 pub mod graph;
 pub mod host;
@@ -2924,6 +2955,7 @@ impl Writer {
     fn close(&mut self) -> Result<Entry> {
         self.reclaim()?;
         self.flush_pending()?;
+        crate::probe::dump();
         // The rest of a table is its statistics, its dictionaries and its directory. The dictionary
         // work is charged as its own stage, because ranking a global dictionary can be most of what
         // this costs, and the rest as publish.

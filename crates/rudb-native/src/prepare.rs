@@ -475,16 +475,20 @@ impl Preparer {
             let gather = stats::Gather::new(&self.types[index], 0)
                 .filter(|_| !held.is_empty())
                 .map(|mut gather| {
-                    gather.stripe(
-                        key,
-                        held.iter().filter_map(|pending| pending.chunk.column(index).ok()),
-                    );
+                    crate::probe::time(0, || {
+                        gather.stripe(
+                            key,
+                            held.iter().filter_map(|pending| pending.chunk.column(index).ok()),
+                        )
+                    });
                     gather
                 });
             let column = if self.coded[index].load(Atomic::Relaxed) {
-                Column::Coded(Local::code_column(index, &held)?)
+                Column::Coded(crate::probe::time(1, || Local::code_column(index, &held))?)
             } else {
-                Column::Pages(Writer::encode_pages(&column_of(&held, index)?)?)
+                Column::Pages(crate::probe::time(2, || {
+                    Writer::encode_pages(&column_of(&held, index)?)
+                })?)
             };
             Ok((column, gather))
         })?;
@@ -566,6 +570,7 @@ fn merge_column(
     if let (Some(mine), Some(stripe)) = (gather.as_mut(), stripe) {
         mine.absorb(stripe);
     }
+    let merge_started = std::time::Instant::now();
     let merge = match (column, dictionary.as_mut()) {
         (Column::Pages(stripe), None) => Merge::Pages(stripe),
         (Column::Pages(_), Some(_)) => {
@@ -591,9 +596,10 @@ fn merge_column(
     // out with it already knowing their shape. A column still too small to settle one keeps its
     // blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them, because encoding them
     // now would be encoding them without having looked at the column.
+    crate::probe::add(6, merge_started);
     let blocks = match dictionary {
         Some(dictionary) => {
-            dictionary.settle()?;
+            crate::probe::time(7, || dictionary.settle())?;
             dictionary.hand_out(index)
         }
         None => Vec::new(),
@@ -788,13 +794,15 @@ impl Merged {
         let share = Share::take(jobs.len(), parts.len());
         let built = fan_out(jobs, share.0, profile.as_deref(), |index| {
             let Some(column) = columns.get(index) else {
-                return Ok(Built::Block(blocks[index - width].encode()?));
+                return Ok(Built::Block(crate::probe::time(3, || blocks[index - width].encode())?));
             };
             Ok(Built::Stripe(match column {
-                Merge::Codes { parts, global } => code_pages(parts, global)?,
-                Merge::Plain(local) => {
-                    Writer::encode_pages(&local.rows()?.iter().collect::<Vec<_>>())?
+                Merge::Codes { parts, global } => {
+                    crate::probe::time(4, || code_pages(parts, global))?
                 }
+                Merge::Plain(local) => crate::probe::time(5, || {
+                    Writer::encode_pages(&local.rows()?.iter().collect::<Vec<_>>())
+                })?,
                 Merge::Pages(_) => {
                     return Err(Error::internal("a finished column was queued to be built"));
                 }
