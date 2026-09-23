@@ -9219,3 +9219,35 @@ fn update_from_and_delete_using_change_each_row_once_however_many_rows_match_it(
     assert_eq!(answer("DELETE FROM t USING s"), "1");
     assert_eq!(answer("SELECT count(*) FROM t"), "0");
 }
+
+#[test]
+fn a_set_of_several_columns_takes_a_row_one_value_each_or_one_value_for_all() {
+    let db = Database::new();
+    let answer = |sql: &str| {
+        let result = db.execute(sql).unwrap();
+        (0..result.len())
+            .map(|row| {
+                (0..result.width()).map(|at| result.text_at(row, at)).collect::<Vec<_>>().join(",")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    db.execute("CREATE TABLE t (k INTEGER, f VARCHAR, c INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'apple', 2), (2, 'orange', 3)").unwrap();
+    db.execute("UPDATE t SET (k, f, c) = (1, 'pear', 2)").unwrap();
+    assert_eq!(answer("SELECT * FROM t"), "1,pear,2;1,pear,2");
+    db.execute("UPDATE t SET (k, f, c) = ROW(2, 'fig', 3)").unwrap();
+    assert_eq!(answer("SELECT * FROM t"), "2,fig,3;2,fig,3");
+    db.execute("UPDATE t SET (k, f, c) = k + c").unwrap();
+    assert_eq!(answer("SELECT * FROM t"), "5,5,5;5,5,5");
+    for (sql, message) in [
+        ("UPDATE t SET (k, f, c) = (1, 2)", "expected 3 values, got 2"),
+        (
+            "UPDATE t SET (k, f) = ()",
+            "Parser Error: Could not perform assignment, expected 2 values, got 0",
+        ),
+    ] {
+        let error = db.execute(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+}

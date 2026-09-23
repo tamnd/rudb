@@ -1076,8 +1076,7 @@ impl<'a> Transform<'a> {
     /// `UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause FromClause?
     /// WhereClause? ReturningClause?`.
     ///
-    /// `WITH` and the `(a, b) = row` form are each a refusal for now, since both change which rows
-    /// change or what comes back. A qualified name after `SET` is the pin's own refusal.
+    /// `WITH` is a refusal for now. A qualified name after `SET` is the pin's own refusal.
     fn update_statement(&mut self, node: u32) -> Result<Statement> {
         let with = self.find(node, "WithClause");
         if with != NONE {
@@ -1088,8 +1087,9 @@ impl<'a> Transform<'a> {
         let alias = self.find(target, "UpdateAlias");
         let alias = if alias == NONE { NONE } else { self.identifier(alias) };
         let set = self.first(self.find(node, "UpdateSetClause"));
-        if self.name(set) != "UpdateSetElementList" {
-            return self.unsupported(set);
+        if self.name(set) == "UpdateSetTuple" {
+            let sets = self.set_tuple(set)?;
+            return self.changed_rows(node, name, alias, sets, false);
         }
         let mut sets = Vec::new();
         for element in self.kids(set).collect::<Vec<_>>() {
@@ -1103,6 +1103,47 @@ impl<'a> Transform<'a> {
             sets.push((written, value));
         }
         self.changed_rows(node, name, alias, sets, false)
+    }
+
+    /// `UpdateSetTuple <- Parens(List(ColumnName)) '=' Expression`.
+    ///
+    /// A row on the right, `(1, 'x')` or `ROW(1, 'x')`, hands one value to each column and has to
+    /// have as many as there are columns. Anything else is handed to every column whole, so
+    /// `(a, b) = 3` sets both to 3, which is how the pin reads it.
+    fn set_tuple(&mut self, set: u32) -> Result<Vec<(StrRef, ExprRef)>> {
+        let mut names = Vec::new();
+        let mut pending: Vec<u32> = self.kids(set).collect();
+        pending.reverse();
+        while let Some(node) = pending.pop() {
+            if self.name(node) == "ColumnName" {
+                names.push(self.identifier(node));
+            } else if self.name(node) != "Expression" {
+                let kids: Vec<u32> = self.kids(node).collect();
+                pending.extend(kids.into_iter().rev());
+            }
+        }
+        let value = self.expr(self.find(set, "Expression"))?;
+        let items = match self.ast.exprs[value as usize] {
+            Expr::Row { items } => Some(items),
+            Expr::Function { name, args, .. }
+                if name.len == 1 && self.ast.name_text(name).eq_ignore_ascii_case("row") =>
+            {
+                Some(args)
+            }
+            _ => None,
+        };
+        let Some(items) = items else {
+            return Ok(names.into_iter().map(|name| (name, value)).collect());
+        };
+        let items = self.ast.expr_list(items).to_vec();
+        if items.len() != names.len() {
+            return Err(Error::parser(format!(
+                "Could not perform assignment, expected {} values, got {}",
+                names.len(),
+                items.len()
+            )));
+        }
+        Ok(names.into_iter().zip(items).collect())
     }
 
     /// `DeleteStatement <- WithClause? 'DELETE' 'FROM' TargetOptAlias DeleteUsingClause?
