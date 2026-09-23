@@ -1139,7 +1139,26 @@ impl<'a> Aggregate<'a> {
         let mut evaluated = Vec::new();
         self.inputs.evaluate(chunk, scratch, &mut evaluated)?;
         let mut values = evaluated.into_iter();
-        let keys = values.by_ref().take(self.keys.len()).collect();
+        let mut keys: Vec<Vector> = values.by_ref().take(self.keys.len()).collect();
+        // An integer key a filter left as a dictionary over its page, or one still packed, is
+        // opened into a flat run once for the chunk when there is more than one key. Every row is
+        // hashed and then compared against a stored group once per probe step, and both read the
+        // key through [`Vector::signed_at`], which on those forms works out the form, the code and
+        // the value again for each row. Flat, it is an index. `GROUP BY TraficSourceID,
+        // SearchEngineID, AdvEngineID` under the q40 filter is 87 thousand combinations, too many
+        // for the direct map, and its probe read the three keys that way for all six hundred
+        // thousand rows. One key is left alone, since the map is wide enough for most of those and
+        // reads a packed page by its codes.
+        if keys.len() > 1 {
+            for key in &mut keys {
+                if key.logical_type().is_integer()
+                    && key.data().is_none()
+                    && key.constant_value().is_none()
+                {
+                    *key = key.opened()?;
+                }
+            }
+        }
         let mut arguments = Vec::with_capacity(self.calls.len());
         let mut filters = Vec::with_capacity(self.calls.len());
         for call in &self.calls {
