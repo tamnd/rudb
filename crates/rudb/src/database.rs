@@ -229,6 +229,58 @@ fn native_single_average_shape(ast: &Ast) -> Option<(&str, &str, String)> {
     Some((table, column, name))
 }
 
+fn native_single_distinct_shape(ast: &Ast) -> Option<(&str, &str, String)> {
+    use ast::{Distinct, Expr, QueryBody, Source, Statement};
+    use rudb_parse::NONE;
+
+    let [Statement::Query(query_ref)] = ast.statements.as_slice() else { return None };
+    let query = ast.query(*query_ref);
+    if query.ctes.len != 0
+        || query.order_by.len != 0
+        || query.order_by_all
+        || query.limit != NONE
+        || query.offset != NONE
+        || query.limit_percent
+    {
+        return None;
+    }
+    let QueryBody::Select(select_ref) = query.body else { return None };
+    let select = ast.select(select_ref);
+    if select.distinct != Distinct::No
+        || select.filter != NONE
+        || select.group_by.len != 0
+        || select.group_by_all
+        || select.having != NONE
+    {
+        return None;
+    }
+    let [target] = ast.target_list(select.targets) else { return None };
+    let Expr::Function { name, args, distinct: true, filter: NONE } = ast.expr(target.expr) else {
+        return None;
+    };
+    if name.len != 1 || !ast.name(name).next()?.eq_ignore_ascii_case("count") {
+        return None;
+    }
+    let [argument] = ast.expr_list(args) else { return None };
+    let Expr::Column { name } = ast.expr(*argument) else { return None };
+    if name.len != 1 {
+        return None;
+    }
+    let column = ast.name(name).next()?;
+    let [source] = ast.source_list(select.from) else { return None };
+    let Source::Table { name, alias: NONE, columns } = ast.source(*source) else { return None };
+    if name.len != 1 || columns.len != 0 {
+        return None;
+    }
+    let table = ast.name(name).next()?;
+    let name = if target.alias == NONE {
+        format!("count(DISTINCT {column})")
+    } else {
+        ast.string(target.alias).into()
+    };
+    Some((table, column, name))
+}
+
 /// An in process database.
 ///
 /// One catalog, held in memory, with no file behind it. `ATTACH` and the storage format are E2, and
@@ -372,10 +424,12 @@ impl Database {
         let nonzero = native_nonzero_shape(&ast);
         let three = native_three_aggregate_shape(&ast);
         let average = native_single_average_shape(&ast);
+        let distinct = native_single_distinct_shape(&ast);
         let Some(table) = nonzero
             .map(|(table, _, _)| table)
             .or_else(|| three.as_ref().map(|(table, _, _, _)| *table))
             .or_else(|| average.as_ref().map(|(table, _, _)| *table))
+            .or_else(|| distinct.as_ref().map(|(table, _, _)| *table))
         else {
             return Ok(None);
         };
@@ -425,6 +479,27 @@ impl Database {
             return Ok(Some(QueryResult::new(
                 vec![name],
                 vec![LogicalType::Double],
+                vec![chunk],
+                Memory::unlimited().reservation(),
+            )));
+        }
+        if let Some((_, column, name)) = distinct {
+            let Some(index) =
+                fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+            else {
+                return Ok(None);
+            };
+            let Some(count) = native.distinct_count(stored_name, index)? else {
+                return Ok(None);
+            };
+            let Ok(count) = i64::try_from(count) else {
+                return Ok(None);
+            };
+            let vector = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(count)])?;
+            let chunk = Chunk::new(vec![vector])?;
+            return Ok(Some(QueryResult::new(
+                vec![name],
+                vec![LogicalType::BigInt],
                 vec![chunk],
                 Memory::unlimited().reservation(),
             )));
@@ -2807,9 +2882,52 @@ mod tests {
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
     use super::{
-        Database, native_nonzero_shape, native_single_average_shape, native_three_aggregate_shape,
-        publish,
+        Database, native_nonzero_shape, native_single_average_shape, native_single_distinct_shape,
+        native_three_aggregate_shape, publish,
     };
+
+    #[test]
+    fn cold_distinct_shape_accepts_only_a_direct_count() {
+        let parsed = rudb_parse::parse_ast("SELECT COUNT(DISTINCT UserID) FROM hits").unwrap();
+        assert_eq!(
+            native_single_distinct_shape(&parsed),
+            Some(("hits", "UserID", "count(DISTINCT UserID)".into()))
+        );
+        for sql in [
+            "SELECT COUNT(DISTINCT UserID) FROM hits WHERE UserID > 0",
+            "SELECT COUNT(DISTINCT UserID + 1) FROM hits",
+            "SELECT COUNT(UserID) FROM hits",
+            "SELECT COUNT(DISTINCT UserID) FROM hits LIMIT 1",
+            "SELECT COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID",
+        ] {
+            let parsed = rudb_parse::parse_ast(sql).unwrap();
+            assert_eq!(native_single_distinct_shape(&parsed), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cold_distinct_matches_regular_execution_with_nulls() {
+        let path = std::env::temp_dir().join(format!("rudb-q5-{}.rdb", std::process::id()));
+        let name = path.to_str().unwrap();
+        let database = Database::open(name).unwrap();
+        database.execute("CREATE TABLE hits (UserID BIGINT)").unwrap();
+        database.execute("INSERT INTO hits VALUES (1), (2), (1), (NULL)").unwrap();
+        database.execute("CREATE TABLE empty_hits (UserID BIGINT)").unwrap();
+        database.execute("CREATE TABLE null_hits (UserID BIGINT)").unwrap();
+        database.execute("INSERT INTO null_hits VALUES (NULL)").unwrap();
+        let cases = [
+            "SELECT COUNT(DISTINCT UserID) FROM hits",
+            "SELECT COUNT(DISTINCT UserID) FROM empty_hits",
+            "SELECT COUNT(DISTINCT UserID) FROM null_hits",
+        ];
+        let expected = cases.map(|sql| database.query(sql).unwrap().rows().collect::<Vec<_>>());
+        drop(database);
+        for (sql, expected) in cases.into_iter().zip(expected) {
+            let actual = Database::query_native_once(name, sql).unwrap().unwrap();
+            assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn cold_average_shape_accepts_only_a_direct_aggregate() {
