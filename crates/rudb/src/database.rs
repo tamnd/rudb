@@ -44,6 +44,13 @@ fn native_simple_identifier(text: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+/// A bare name in a simple SQL shape cannot be one of the grammar's reserved words. The native
+/// catalog also contains quoted names, so merely finding the name there is not syntax validation.
+fn native_simple_unquoted_identifier(text: &str) -> bool {
+    native_simple_identifier(text)
+        && rudb_parse::classes(rudb_parse::lookup(text)) & rudb_parse::RESERVED == 0
+}
+
 /// A deliberately small recognizer for a single unquoted AVG(column) statement. Anything with
 /// another clause, expression, or quoting rule goes through the SQL parser instead.
 fn native_simple_average_statement(sql: &str) -> Option<(&str, &str)> {
@@ -166,17 +173,15 @@ fn native_simple_three_statement(sql: &str) -> Option<(&str, &str, &str)> {
         || !count.eq_ignore_ascii_case("count(*),")
         || !average.get(..4)?.eq_ignore_ascii_case("avg(")
         || !from.eq_ignore_ascii_case("from")
-        || !native_simple_identifier(table)
+        || !native_simple_unquoted_identifier(table)
     {
         return None;
     }
     let sum_column = sum.strip_suffix("),")?.get(4..)?;
     let average_column = average.strip_suffix(')')?.get(4..)?;
-    (native_simple_identifier(sum_column) && native_simple_identifier(average_column)).then_some((
-        table,
-        sum_column,
-        average_column,
-    ))
+    (native_simple_unquoted_identifier(sum_column)
+        && native_simple_unquoted_identifier(average_column))
+    .then_some((table, sum_column, average_column))
 }
 
 /// Recognizes one unquoted numeric key grouped and ordered by its nonzero frequency.
@@ -213,8 +218,8 @@ fn native_simple_frequency_statement(sql: &str) -> Option<(&str, &str)> {
         && order_by.eq_ignore_ascii_case("by")
         && order_count.eq_ignore_ascii_case("count(*)")
         && descending.eq_ignore_ascii_case("desc")
-        && native_simple_identifier(table)
-        && native_simple_identifier(key)
+        && native_simple_unquoted_identifier(table)
+        && native_simple_unquoted_identifier(key)
         && filtered.eq_ignore_ascii_case(key)
         && grouped.eq_ignore_ascii_case(key))
     .then_some((table, key))
@@ -3736,6 +3741,8 @@ mod tests {
             "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY SourceID DESC",
             "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC LIMIT 1",
             "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC; SELECT 1",
+            "SELECT select, COUNT(*) FROM other_events WHERE select <> 0 GROUP BY select ORDER BY COUNT(*) DESC",
+            "SELECT SourceID, COUNT(*) FROM from WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC",
         ] {
             assert_eq!(native_simple_frequency_statement(sql), None, "{sql}");
         }
@@ -4065,6 +4072,8 @@ mod tests {
             "SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements LIMIT 1",
             "SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements; SELECT 1",
             "SELECT SUM(Points), COUNT(*), AVG(Width + 1) FROM measurements",
+            "SELECT SUM(select), COUNT(*), AVG(Width) FROM measurements",
+            "SELECT SUM(Points), COUNT(*), AVG(Width) FROM from",
         ] {
             assert_eq!(native_simple_three_statement(sql), None, "{sql}");
         }
