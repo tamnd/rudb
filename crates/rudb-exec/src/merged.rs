@@ -378,32 +378,34 @@ mod tests {
     use rudb_common::{LogicalType, Value};
     use rudb_vector::{Data, Vector};
 
-    use super::{Chunk, KEY, ORDER, Progress, Runs, Sorted, Source, order_of, ordering};
+    use super::{
+        Chunk, KEY, ORDER, Progress, Runs, Sorted, Source, VECTOR_SIZE, order_of, ordering,
+    };
 
     /// A run of the given keys, each one a row whose payload is the key as a `BIGINT`.
     ///
     /// The arrival is the run's number and the row's place in it, which is what a real spill would
     /// have written and is what settles a tie between two runs.
-    fn run(number: u64, keys: &[i64], per: usize) -> Runs {
+    fn run(number: u64, keys: &[i64]) -> Runs {
         let types = vec![LogicalType::BigInt, LogicalType::Blob];
         let mut file = Runs::new("test", types).expect("a run file");
-        for (block, rows) in keys.chunks(per).enumerate() {
-            let payload = Vector::flat(LogicalType::BigInt, Data::Int64(rows.to_vec().into()))
-                .expect("bigints are an i64 layout");
-            let orders: Vec<[u8; ORDER]> = rows
-                .iter()
-                .enumerate()
-                .map(|(at, key)| {
-                    let mut bytes = [0u8; KEY];
-                    // Flipped top bit, which is what `normal` writes for a signed key so that the
-                    // byte order is the numeric order.
-                    bytes[..8].copy_from_slice(&(*key as u64 ^ (1 << 63)).to_be_bytes());
-                    order_of(&bytes, (number, (block * per + at) as u64))
-                })
-                .collect();
-            let chunk = Chunk::new(vec![payload, ordering(&orders).expect("blobs")])
-                .expect("two columns of a length");
-            file.write(&chunk).expect("written");
+        file.begin(keys.len()).expect("the row count");
+        let payload = Vector::flat(LogicalType::BigInt, Data::Int64(keys.to_vec().into()))
+            .expect("bigints are an i64 layout");
+        file.column(&payload).expect("the payload column");
+        let orders: Vec<[u8; ORDER]> = keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| {
+                let mut bytes = [0u8; KEY];
+                // Flipped top bit, which is what `normal` writes for a signed key so that the byte
+                // order is the numeric order.
+                bytes[..8].copy_from_slice(&(*key as u64 ^ (1 << 63)).to_be_bytes());
+                order_of(&bytes, (number, at as u64))
+            })
+            .collect();
+        for block in orders.chunks(VECTOR_SIZE) {
+            file.part(&ordering(block).expect("blobs")).expect("the ordering column");
         }
         file
     }
@@ -433,7 +435,7 @@ mod tests {
 
     #[test]
     fn two_runs_come_out_in_one_order() {
-        let answer = merged(vec![run(0, &[1, 4, 7, 9], 2), run(1, &[2, 3, 8], 2)]);
+        let answer = merged(vec![run(0, &[1, 4, 7, 9]), run(1, &[2, 3, 8])]);
         assert_eq!(answer, vec![1, 2, 3, 4, 7, 8, 9]);
     }
 
@@ -445,35 +447,38 @@ mod tests {
         // Both rows are 5, so the payload cannot say which came first and the ordering bytes have
         // to. The run written second is handed to the merge first, so a merge that took the runs in
         // the order it was given them would get this backwards.
-        assert_eq!(merged(vec![run(1, &[5, 5], 4), run(0, &[5, 5], 4)]).len(), 4);
+        assert_eq!(merged(vec![run(1, &[5, 5]), run(0, &[5, 5])]).len(), 4);
         assert!(order_of(&[0; KEY], (0, 0)) < order_of(&[0; KEY], (1, 0)));
         assert!(order_of(&[0; KEY], (0, 0)) < order_of(&[0; KEY], (0, 1)));
     }
 
-    /// A run longer than a block, so the merge has to read the next chunk of it partway through.
+    /// Runs longer than a block, so the merge has to read the next chunk of each of them partway
+    /// through and the two runs run out of blocks at different points.
     #[test]
     fn a_run_of_several_chunks_is_read_through() {
-        let long: Vec<i64> = (0..20).map(|value| value * 2).collect();
-        let short: Vec<i64> = (0..20).map(|value| value * 2 + 1).collect();
-        let answer = merged(vec![run(0, &long, 3), run(1, &short, 7)]);
-        assert_eq!(answer, (0..40).collect::<Vec<i64>>());
+        let rows = VECTOR_SIZE * 2 + 5;
+        let long: Vec<i64> = (0..rows as i64).map(|value| value * 2).collect();
+        let short: Vec<i64> = (0..rows as i64 - VECTOR_SIZE as i64).map(|v| v * 2 + 1).collect();
+        let mut want: Vec<i64> = long.iter().chain(short.iter()).copied().collect();
+        want.sort_unstable();
+        assert_eq!(merged(vec![run(0, &long), run(1, &short)]), want);
     }
 
     #[test]
     fn one_run_comes_back_as_itself() {
-        assert_eq!(merged(vec![run(0, &[3, 4, 5], 2)]), vec![3, 4, 5]);
+        assert_eq!(merged(vec![run(0, &[3, 4, 5])]), vec![3, 4, 5]);
     }
 
     #[test]
     fn runs_with_nothing_in_them_merge_to_nothing() {
-        assert!(merged(vec![run(0, &[], 2), run(1, &[], 2)]).is_empty());
+        assert!(merged(vec![run(0, &[]), run(1, &[])]).is_empty());
     }
 
     /// Negative keys sort below positive ones, which is the flipped sign bit doing its job and is
     /// worth a test here because the merge never looks at the payload.
     #[test]
     fn the_key_bytes_order_the_way_the_numbers_do() {
-        let answer = merged(vec![run(0, &[-9, -1, 3], 2), run(1, &[-5, 0, 7], 2)]);
+        let answer = merged(vec![run(0, &[-9, -1, 3]), run(1, &[-5, 0, 7])]);
         assert_eq!(answer, vec![-9, -5, -1, 0, 3, 7]);
     }
 
