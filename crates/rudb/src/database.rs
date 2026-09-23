@@ -2774,7 +2774,8 @@ impl Shared {
                 // Same as the create above: rows going into a temporary table are rows the file
                 // never sees, and a read only database writes no file at all.
                 let writable = self.inner.writable && !insert.name.temporary();
-                if let Some(path) = self.inner.path.as_ref().filter(|_| writable) {
+                if let Some(path) = self.inner.path.as_ref().filter(|_| writable && !insert.replace)
+                {
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
                     // the way, which is the difference between loading a table and having to fit
@@ -2825,7 +2826,12 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let workers = self.inner.pool.threads();
-                catalog.table_mut(&insert.name)?.append_all(result.into_chunks(), workers)?;
+                let table = catalog.table_mut(&insert.name)?;
+                if insert.replace {
+                    table.replace_all(result.into_chunks(), workers)?;
+                } else {
+                    table.append_all(result.into_chunks(), workers)?;
+                }
                 Ok(QueryResult::empty())
             }
         }

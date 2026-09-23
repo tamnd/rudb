@@ -8983,3 +8983,55 @@ fn text_and_nested_values_cast_to_lists_structs_and_maps_the_way_the_pin_does() 
     assert_eq!(column("SELECT {'a': 1, 'b': 'x'}::MAP(VARCHAR, VARCHAR)"), "{a=1, b=x}");
     assert!(error("SELECT (MAP {'a': 'x'})::MAP(INT, INT)").starts_with("Conversion Error"));
 }
+
+#[test]
+fn update_and_delete_change_rows_in_place_the_way_the_pin_does() {
+    let db = database();
+    let table = |db: &Database| {
+        let rows = rows(db, "SELECT * FROM t");
+        rows.iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let error = |sql: &str| db.execute(sql).unwrap_err().to_string();
+    let fresh = |db: &Database| {
+        db.execute("CREATE OR REPLACE TABLE t (a INTEGER NOT NULL, b VARCHAR)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'z')").unwrap();
+    };
+    fresh(&db);
+    db.execute("UPDATE t SET a = a + 10, b = 'q' WHERE a >= 2").unwrap();
+    assert_eq!(table(&db), "1,x;12,q;13,q");
+    fresh(&db);
+    db.execute("UPDATE t AS x SET a = x.a * 2 WHERE b IS NULL").unwrap();
+    assert_eq!(table(&db), "1,x;4,NULL;3,z");
+    db.execute("UPDATE t SET b = '7'").unwrap();
+    assert_eq!(table(&db), "1,7;4,7;3,7");
+    fresh(&db);
+    db.execute("DELETE FROM t WHERE b = 'x'").unwrap();
+    assert_eq!(table(&db), "2,NULL;3,z");
+    db.execute("DELETE FROM t AS x WHERE x.b IS NULL").unwrap();
+    assert_eq!(table(&db), "3,z");
+    db.execute("DELETE FROM t").unwrap();
+    assert_eq!(table(&db), "");
+    fresh(&db);
+    db.execute("TRUNCATE t").unwrap();
+    assert_eq!(table(&db), "");
+    fresh(&db);
+    assert_eq!(
+        error("UPDATE t SET c = 1"),
+        "Binder Error: Referenced update column c not found in table!"
+    );
+    assert_eq!(
+        error("UPDATE t SET a = 1, A = 2"),
+        "Binder Error: Multiple assignments to same column \"\"A\"\""
+    );
+    assert_eq!(error("UPDATE t SET a = NULL"), "Constraint Error: NOT NULL constraint failed: t.a");
+    assert_eq!(table(&db), "1,x;2,NULL;3,z");
+    assert_eq!(
+        error("UPDATE t SET t.a = 5"),
+        "Parser Error: Qualified column names in UPDATE .. SET not supported"
+    );
+    db.execute("CREATE VIEW v AS SELECT 1 AS a").unwrap();
+    assert_eq!(error("UPDATE v SET a = 2"), "Binder Error: Can only update base table");
+}
