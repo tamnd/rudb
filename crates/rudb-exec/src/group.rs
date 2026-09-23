@@ -38,6 +38,7 @@ use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
+use crate::group_count;
 use crate::group_distinct;
 use crate::group_mixed;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
@@ -249,6 +250,8 @@ pub(crate) struct Aggregate<'a> {
     grouped_distinct: OnceLock<Option<group_distinct::Exchange>>,
     /// Fixed rows exchanged for one mixed aggregate state per INTEGER group.
     mixed: OnceLock<group_mixed::Exchange>,
+    /// Keys and run weights exchanged for a single signed integer key's `COUNT(*)`.
+    counted: OnceLock<group_count::Exchange>,
     out: Buffered,
 }
 
@@ -1025,6 +1028,7 @@ impl<'a> Aggregate<'a> {
             encoded_count: OnceLock::new(),
             grouped_distinct: OnceLock::new(),
             mixed: OnceLock::new(),
+            counted: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -1084,6 +1088,7 @@ impl<'a> Aggregate<'a> {
             && !self.encoded_top_count()
             && !self.grouped_distinct_top_count()
             && !self.mixed_top_count()
+            && !self.counted_top_count()
     }
 
     /// Rows into this instance's own table or the partitions, which is every row that is not in a
@@ -1286,6 +1291,23 @@ impl<'a> Aggregate<'a> {
                         | LogicalType::Varchar
                 )
             })
+    }
+
+    /// Whether the counted radix exchange can own this aggregate: a `COUNT(*)` grouped by one
+    /// signed integer with no known range, under a TopN on the count.
+    ///
+    /// A key with a known range is left to the dense pass's table, which is an array indexed by the
+    /// key and cheaper than any exchange.
+    fn counted_top_count(&self) -> bool {
+        self.count_only
+            && self.top_counts.is_some()
+            && self.span.is_none()
+            && self.having_count.is_none()
+            && self.max_groups.is_none()
+            && !self.sets
+            && self.constants.iter().all(Option::is_none)
+            && self.keys.len() == 1
+            && signed_key(self.plan.expr_type(self.keys[0]))
     }
 
     fn mixed_top_count(&self) -> bool {
@@ -3622,6 +3644,7 @@ struct Agreed {
 #[derive(Debug)]
 pub(crate) struct Partitioned {
     mixed: group_mixed::Local,
+    counted: group_count::Local,
     grouped_distinct: group_distinct::Local,
     encoded: bool,
     encoded_records: Vec<EncodedCountPartition>,
@@ -4344,6 +4367,7 @@ impl Sink for Aggregate<'_> {
         self.started.fetch_add(1, Ordering::Relaxed);
         Partitioned {
             mixed: group_mixed::Local::new(&self.memory),
+            counted: group_count::Local::new(&self.memory),
             grouped_distinct: group_distinct::Local::new(&self.memory),
             encoded: false,
             encoded_records: (0..RADIX_PARTITIONS)
@@ -4417,6 +4441,7 @@ impl Sink for Aggregate<'_> {
     fn sink(&self, chunk: &Chunk, local: &mut Partitioned) -> Result<Progress> {
         let Partitioned {
             mixed,
+            counted,
             grouped_distinct,
             encoded,
             encoded_records,
@@ -4464,6 +4489,21 @@ impl Sink for Aggregate<'_> {
                 mixed,
             );
             buffered?;
+            return Ok(Progress::More);
+        }
+        if self.counted_top_count() {
+            let [key] = rows.keys.as_slice() else {
+                return Err(Error::internal(
+                    "a counted radix exchange received the wrong key width",
+                ));
+            };
+            group_count::Exchange::buffer(
+                &self.counted,
+                self.plan.expr_type(self.keys[0]),
+                key,
+                rows.rows,
+                counted,
+            )?;
             return Ok(Progress::More);
         }
         if self.grouped_distinct_top_count() {
@@ -4651,6 +4691,7 @@ impl Sink for Aggregate<'_> {
     fn combine(&self, local: Partitioned) -> Result<()> {
         let Partitioned {
             mixed,
+            counted,
             grouped_distinct,
             encoded,
             mut encoded_records,
@@ -4689,6 +4730,12 @@ impl Sink for Aggregate<'_> {
         if mixed.used() {
             let state = self.mixed.get().expect("a mixed exchange exists after its sink");
             state.combine(mixed)?;
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
+        if counted.used() {
+            let state = self.counted.get().expect("a counted exchange exists after its sink");
+            state.combine(counted)?;
             self.built.lock().map_err(poisoned)?.instances += 1;
             return Ok(());
         }
@@ -4847,6 +4894,12 @@ impl Sink for Aggregate<'_> {
                 self.top_counts.expect("a mixed exchange has a TopN bound").0,
                 &self.memory,
             )?;
+            return self.out.fill(chunks);
+        }
+        if let Some(counted) = self.counted.get() {
+            let bound = self.top_counts.expect("a counted exchange has a TopN bound").0;
+            let degree = fixed_degree(counted.records()?, threads);
+            let chunks = counted.finish(threads, degree, bound, &self.memory)?;
             return self.out.fill(chunks);
         }
         if let Some(Some(distinct)) = self.grouped_distinct.get() {
@@ -6685,7 +6738,11 @@ mod tests {
     /// right: reducing here is an optimisation and never the thing that gives the answer.
     #[test]
     fn an_aggregate_under_a_pushed_down_bound_is_split_all_the_same() {
-        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        // Two calls, so that the counted exchange, which owns a lone count, leaves this to the
+        // partitions this test is about.
+        let plan = parsed(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT, count_star()::BIGINT]",
+        );
         let (aggregate, out) = aggregate(&plan);
         let aggregate = aggregate.top_counts(1_000, 0);
         let mut left = aggregate.local();
@@ -6708,6 +6765,42 @@ mod tests {
             5_000,
             "a bound over what a partition holds throws nothing away"
         );
+    }
+
+    /// A lone count over one integer key under a bound goes to the counted exchange, which has to add
+    /// up what two instances saw of the same groups, keep the nulls as one group and hand back at
+    /// least the largest groups.
+    #[test]
+    fn a_counted_exchange_adds_instances_and_keeps_the_largest_groups() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let aggregate = aggregate.top_counts(2, 0);
+        assert!(aggregate.counted_top_count());
+        let mut left = aggregate.local();
+        let mut right = aggregate.local();
+        let values: Vec<i32> = (0..50_000).collect();
+        for part in values.chunks(1_024) {
+            aggregate.sink(&chunk(part), &mut left).expect("a chunk of groups");
+        }
+        aggregate.sink(&chunk(&[7, 7, 7, 9, 7]), &mut right).expect("a run and a repeat");
+        let nulls = Vector::from_values(LogicalType::Integer, &[Value::Null, Value::Integer(9)])
+            .expect("INTEGER values");
+        aggregate
+            .sink(&Chunk::new(vec![nulls]).expect("one column"), &mut right)
+            .expect("a null key");
+        aggregate.combine(left).expect("the first instance");
+        aggregate.combine(right).expect("the second instance");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| match row[1] {
+            Value::BigInt(count) => std::cmp::Reverse(count),
+            ref other => panic!("a count of {other:?}"),
+        });
+        assert_eq!(rows[0], vec![Value::Integer(7), Value::BigInt(5)]);
+        assert_eq!(rows[1], vec![Value::Integer(9), Value::BigInt(3)]);
+        assert!(rows.contains(&vec![Value::Null, Value::BigInt(1)]), "the null group is kept");
+        assert!(rows.len() < 50_000, "each split keeps its two largest and no more");
     }
 
     /// An ungrouped aggregate has no key to probe, so the merge is the accumulators on their own and

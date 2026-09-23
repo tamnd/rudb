@@ -92,6 +92,7 @@ mod functionnames;
 mod fused;
 mod gather;
 mod group;
+mod group_count;
 mod group_distinct;
 mod group_mixed;
 mod join;
