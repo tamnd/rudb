@@ -703,14 +703,7 @@ fn emit(
     memory: &Memory,
 ) -> Result<Output> {
     let timing = stage::Timing::start(Stage::Emit);
-    let mut best: Vec<usize> = Vec::with_capacity(bound.min(groups.len()));
-    for slot in 0..groups.len() {
-        let at = best.partition_point(|&kept| counts[kept] >= counts[slot]);
-        if at < bound {
-            best.insert(at, slot);
-            best.truncate(bound);
-        }
-    }
+    let mut best = crate::group::largest(groups.len(), bound, |slot| counts[slot]);
     best.sort_unstable();
     let mut output = Vec::with_capacity(best.len());
     for slot in best {

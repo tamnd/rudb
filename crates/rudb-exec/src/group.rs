@@ -345,6 +345,34 @@ struct FixedRuns {
     runs: Vec<FixedPartition>,
 }
 
+/// The slots of the `bound` largest of `groups` counts, largest first and, among equal counts, in
+/// slot order.
+///
+/// Kept as a sorted list rather than a heap because the callers want it in that order, and a slot
+/// that cannot make the list is ruled out against its last entry before any search. That is most of
+/// them: on ClickBench 40 a partition is thousands of groups under a bound of 1010, nearly all of
+/// them seen once, and every one used to pay a binary search through the list to be told so.
+pub(crate) fn largest<T: Ord>(
+    groups: usize,
+    bound: usize,
+    count: impl Fn(usize) -> T,
+) -> Vec<usize> {
+    let mut best: Vec<usize> = Vec::with_capacity(bound.min(groups));
+    if bound == 0 {
+        return best;
+    }
+    for slot in 0..groups {
+        let value = count(slot);
+        if best.len() == bound && best.last().is_some_and(|&last| count(last) >= value) {
+            continue;
+        }
+        let at = best.partition_point(|&kept| count(kept) >= value);
+        best.insert(at, slot);
+        best.truncate(bound);
+    }
+    best
+}
+
 /// How many of a bucket's bits hold the slot its group sits at, the rest being the tag.
 ///
 /// Twenty four, which is sixteen million groups in one radix partition and a billion across the
@@ -2287,14 +2315,7 @@ impl<'a> Aggregate<'a> {
             // bound of 1010 and eighty five of them to a partition.
             (Some((bound, _)), _) if bound >= groups => None,
             (Some((bound, ranks)), _) => {
-                let mut best = Vec::with_capacity(bound.min(groups));
-                for slot in 0..groups {
-                    let at = best.partition_point(|&kept| count(kept, ranks) >= count(slot, ranks));
-                    if at < bound {
-                        best.insert(at, slot);
-                        best.truncate(bound);
-                    }
-                }
+                let mut best = largest(groups, bound, |slot| count(slot, ranks));
                 // The downstream TopN settles equal keys by arrival. Preserve the order this
                 // partition would have emitted without the reduction.
                 best.sort_unstable();
@@ -5141,14 +5162,7 @@ fn encoded_count_partition(
                 .checked_add(weight)
                 .ok_or_else(|| Error::out_of_range("a grouped COUNT overflowed BIGINT"))?;
         }
-        let mut best = Vec::with_capacity(bound.min(counts.len()));
-        for slot in 0..counts.len() {
-            let at = best.partition_point(|&kept| counts[kept] >= counts[slot]);
-            if at < bound {
-                best.insert(at, slot);
-                best.truncate(bound);
-            }
-        }
+        let best = largest(counts.len(), bound, |slot| counts[slot]);
         for slot in best {
             let key = partition.rows[slot];
             let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
@@ -5464,14 +5478,7 @@ fn fixed_partition(
                 &mut overflow,
             )?;
         }
-        let mut best: Vec<usize> = Vec::with_capacity(bound.min(states.len()));
-        for slot in 0..states.len() {
-            let at = best.partition_point(|&kept| states[kept].count() >= states[slot].count());
-            if at < bound {
-                best.insert(at, slot);
-                best.truncate(bound);
-            }
-        }
+        let best = largest(states.len(), bound, |slot| states[slot].count());
         for slot in best {
             let key = partition.rows[slot];
             let valid = if all_valid { FixedRecord::ALL } else { partition.validity[slot] };
@@ -7470,6 +7477,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(rows, expected, "the four largest groups, largest first");
+    }
+
+    #[test]
+    fn the_largest_counts_come_back_largest_first_and_in_slot_order_among_equals() {
+        let counts = [3, 1, 5, 3, 5, 1, 2, 3];
+        assert_eq!(super::largest(counts.len(), 4, |slot| counts[slot]), [2, 4, 0, 3]);
+        assert_eq!(super::largest(counts.len(), 0, |slot| counts[slot]), [0_usize; 0]);
+        assert_eq!(super::largest(counts.len(), 20, |slot| counts[slot]), [2, 4, 0, 3, 7, 6, 1, 5]);
+        // Every slot against a bound of one, which only a strictly larger count displaces.
+        assert_eq!(super::largest(counts.len(), 1, |slot| counts[slot]), [2]);
     }
 
     #[test]
