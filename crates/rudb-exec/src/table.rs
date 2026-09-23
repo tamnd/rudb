@@ -1187,6 +1187,42 @@ impl<'a> Coded<'a> {
         Some(missed)
     }
 
+    /// Cuts the chunk into runs of one place, each given as its place and the row it ends before,
+    /// for a key of one column with no nulls, and says whether it could.
+    ///
+    /// A key the rows are sorted on, the way `CounterID` is, reaches a chunk as a few dozen runs.
+    /// Found here, in one pass over the column where it already is, the map is read once a run
+    /// rather than once a row, and the runs are what the aggregates fold by without a pass over
+    /// the slots to find them again. `false`, with `into` cleared, for more than `most` runs, where
+    /// a row at a time costs less, and for a key this does not read.
+    pub(crate) fn place_runs(
+        &self,
+        rows: usize,
+        most: usize,
+        into: &mut Vec<(usize, usize)>,
+    ) -> bool {
+        into.clear();
+        let mut columns = self.columns.iter().flatten();
+        let (Some(column), None) = (columns.next(), columns.next()) else {
+            return false;
+        };
+        if column.nullable {
+            return false;
+        }
+        let stride = column.stride;
+        match column.places {
+            Places::Values { values, low } => values.get(..rows).is_some_and(|values| {
+                runs_in(values, most, into, |value| {
+                    value.wrapping_sub(low) as u64 as usize * stride
+                })
+            }),
+            Places::Codes { codes, .. } => codes
+                .get(..rows)
+                .is_some_and(|codes| runs_in(codes, most, into, |code| code as usize * stride)),
+            _ => false,
+        }
+    }
+
     /// Whether these are the same things `held` was filled from, so the map still means what it
     /// meant.
     pub(crate) fn same_as(&self, held: &[Origin]) -> bool {
@@ -1476,6 +1512,43 @@ fn signed_rows(key: &Vector, rows: usize, into: &mut Vec<i64>) -> bool {
         return false;
     }
     into.truncate(rows);
+    true
+}
+
+/// The runs of equal values in `values`, each as the place `place` gives its value and the row it
+/// ends before, or `false` with `into` cleared once there are more than `most` of them.
+///
+/// Sixteen rows are compared against the current value at once, which the compiler turns into a
+/// few vector compares, and only a block where something changed is walked a row at a time.
+fn runs_in<T: Copy + Eq>(
+    values: &[T],
+    most: usize,
+    into: &mut Vec<(usize, usize)>,
+    place: impl Fn(T) -> usize,
+) -> bool {
+    let Some(&first) = values.first() else {
+        return false;
+    };
+    let mut current = first;
+    let mut row = 0;
+    while row < values.len() {
+        let end = (row + 16).min(values.len());
+        let block = &values[row..end];
+        if block.iter().fold(false, |differ, &value| differ | (value != current)) {
+            for (at, &value) in block.iter().enumerate() {
+                if value != current {
+                    if into.len() >= most {
+                        into.clear();
+                        return false;
+                    }
+                    into.push((place(current), row + at));
+                    current = value;
+                }
+            }
+        }
+        row = end;
+    }
+    into.push((place(current), values.len()));
     true
 }
 
@@ -3076,6 +3149,23 @@ mod tests {
     #[test]
     fn a_stored_group_key_is_narrower_than_a_general_recursive_value() {
         assert!(size_of::<Stored>() < size_of::<Value>());
+    }
+
+    /// Runs across the edges of the sixteen row blocks come out whole, and too many runs is a
+    /// refusal with nothing left behind.
+    #[test]
+    fn runs_are_cut_where_the_value_changes_and_refused_past_the_limit() {
+        let values: Vec<i64> = [5; 15].into_iter().chain([7; 20]).chain([5, 9]).collect();
+        let mut runs = Vec::new();
+        assert!(runs_in(&values, 8, &mut runs, |value| value as usize * 2));
+        assert_eq!(runs, vec![(10, 15), (14, 35), (10, 36), (18, 37)]);
+
+        assert!(!runs_in(&values, 3, &mut runs, |value| value as usize));
+        assert!(runs.is_empty());
+
+        assert!(runs_in(&[3u32; 40], 0, &mut runs, |code| code as usize));
+        assert_eq!(runs, vec![(3, 40)]);
+        assert!(!runs_in::<u32>(&[], 8, &mut runs, |code| code as usize));
     }
 
     /// The hash of one column of values, in whatever form the vector is in.
