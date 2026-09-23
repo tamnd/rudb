@@ -7344,14 +7344,21 @@ impl Remembered {
     /// `values` in the remembered shape, or `None` when they should be searched instead.
     fn shaped(&mut self, values: &[i64]) -> Result<Option<Vec<u8>>> {
         let Some(shape) = &self.shape else { return Ok(None) };
-        if self.since >= RESEARCH_EVERY || values.is_empty() {
+        static KNOBS: OnceLock<(usize, usize)> = OnceLock::new();
+        let (every, slack) = *KNOBS.get_or_init(|| {
+            let read = |name: &str, default: usize| {
+                std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+            };
+            (read("RUDB_SHAPE_EVERY", RESEARCH_EVERY), read("RUDB_SHAPE_SLACK", 10))
+        });
+        if self.since >= every || values.is_empty() {
             return Ok(None);
         }
         let Some(out) = integer::encode_shaped(values, shape)? else { return Ok(None) };
         // Within a tenth of the bytes a row the search got, in integers so a part of one row
         // against one of thousands is not a question of rounding.
-        let fits = out.len().saturating_mul(self.rows).saturating_mul(10)
-            <= self.bytes.saturating_mul(values.len()).saturating_mul(11);
+        let fits = out.len().saturating_mul(self.rows).saturating_mul(100)
+            <= self.bytes.saturating_mul(values.len()).saturating_mul(100 + slack);
         if !fits {
             return Ok(None);
         }
