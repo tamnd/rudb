@@ -350,9 +350,14 @@ pub fn interleave_placed(
     if matches!(data, Data::Empty) {
         return Ok(Vector::constant(ty.clone(), Value::Null, order.len()));
     }
+    let mut arenas = arenas_of(pieces);
+    // Reserved whole, because an arena grown by doubling as the pieces arrive copies what it holds
+    // at every step and faults each new allocation in again. The sorted SF1 comments lay 183MB.
+    if let Data::Varlen(column) = &mut data {
+        column.reserve_bytes(arenas.bytes());
+    }
     // Each piece's validity, taken after it is flattened, because a constant null keeps its null in
     // its value rather than in its mask and a flattened one has it in the mask like any other row.
-    let mut arenas = arenas_of(pieces);
     let mut masks = Vec::with_capacity(pieces.len());
     for piece in pieces {
         // flatten: the gather below reads one run of data, and a piece can arrive dictionary
