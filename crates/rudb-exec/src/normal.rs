@@ -50,8 +50,11 @@
 //! the decimals. A clustered load on `date_trunc('month', l_shipdate), l_orderkey, l_linenumber` is
 //! nineteen bytes of this.
 
-use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
+#[cfg(test)]
+use rudb_common::Value;
+use rudb_common::{Error, LogicalType, PhysicalType, Result};
 use rudb_plan::SortKey;
+use rudb_vector::{Data, Validity, Vector};
 
 /// The widest normalized key, in bytes.
 ///
@@ -120,12 +123,16 @@ fn wide(ty: &LogicalType) -> Option<usize> {
 
 /// Writes one value into `into` at `at`, taking `wide` bytes, under `key`.
 ///
+/// The encoding written out for one value at a time, which is what the sort did before
+/// `write_column` and is kept as the reference the tests hold that one to.
+///
 /// # Errors
 ///
 /// If the value is not one [`layout`] said this key would hold. That is an internal error and not a
 /// user's mistake, because the width came off the same type the vector was built from, and it is
 /// reported rather than encoded wrong because a key that silently took the wrong number of bytes
 /// would push every key after it along and put the rows in an order nobody asked for.
+#[cfg(test)]
 pub(crate) fn write(
     into: &mut Normal,
     at: usize,
@@ -155,6 +162,121 @@ pub(crate) fn write(
     Ok(())
 }
 
+/// Writes one key column into the keys of the rows it belongs to, a row a key, at `at`.
+///
+/// The encoding the top of this file describes, done for a whole column with a typed loop per
+/// layout. The sort used to build a `Value` a key a row and encode that, and on SF1 `lineitem` sorted on
+/// three keys that was 260ms of a 1.6s query on one thread, for eighteen million values that were
+/// already sitting in three flat runs. The encoding is the same one, so a key written either way
+/// is the same bytes.
+///
+/// # Errors
+///
+/// If the column does not have as many rows as there are keys, or is not a layout [`layout`] said
+/// this key would hold. That is an internal error and not a user's mistake, because the width came
+/// off the same type the vector was built from, and it is reported rather than encoded wrong
+/// because a key that silently took the wrong number of bytes would push every key after it along
+/// and put the rows in an order nobody asked for.
+pub(crate) fn write_column<'a>(
+    into: impl ExactSizeIterator<Item = &'a mut Normal>,
+    at: usize,
+    wide: usize,
+    column: &Vector,
+    key: SortKey,
+) -> Result<()> {
+    if into.len() != column.len() {
+        return Err(Error::internal("a sort key column of a different length than its rows"));
+    }
+    // flatten: the keys are read as one run, and a key can arrive constant, dictionary encoded or
+    // bit packed. A flat column is not copied by this, and a key column is one of the few per chunk.
+    let flat = column.flatten()?;
+    let Some(data) = flat.data() else {
+        return Err(Error::internal("a flattened sort key with no run of data"));
+    };
+    let place = Place { at, wide, key, validity: flat.validity() };
+    match data {
+        Data::Bool(values) => place.put(into, values.as_slice(), u128::from),
+        Data::Int8(values) => {
+            place.put(into, values.as_slice(), |value| place.signed(value.into()))
+        }
+        Data::Int16(values) => {
+            place.put(into, values.as_slice(), |value| place.signed(value.into()))
+        }
+        Data::Int32(values) => {
+            place.put(into, values.as_slice(), |value| place.signed(value.into()))
+        }
+        Data::Int64(values) => {
+            place.put(into, values.as_slice(), |value| place.signed(value.into()))
+        }
+        Data::Int128(values) => place.put(into, values.as_slice(), |value| place.signed(value)),
+        Data::UInt8(values) => place.put(into, values.as_slice(), u128::from),
+        Data::UInt16(values) => place.put(into, values.as_slice(), u128::from),
+        Data::UInt32(values) => place.put(into, values.as_slice(), u128::from),
+        Data::UInt64(values) => place.put(into, values.as_slice(), u128::from),
+        Data::UInt128(values) => place.put(into, values.as_slice(), |value| value),
+        _ => Err(Error::internal(format!(
+            "a {} column reached the normalized sort key path",
+            column.logical_type()
+        ))),
+    }
+}
+
+/// Where one key column goes in the rows' keys, and what it needs to encode a value there.
+struct Place<'v> {
+    at: usize,
+    wide: usize,
+    key: SortKey,
+    validity: &'v Validity,
+}
+
+impl Place<'_> {
+    /// A signed value with the sign bit of the width it is written at flipped.
+    ///
+    /// At that width and not at a hundred and twenty eight bits, because only the low bytes are
+    /// written and a flip of the top bit of the widened value would be a flip of a bit that is
+    /// thrown away, leaving the negatives above the positives.
+    fn signed(&self, value: i128) -> u128 {
+        let sign = (self.wide - 1).checked_mul(8).and_then(|bits| bits.checked_sub(1)).unwrap_or(0);
+        (value as u128) ^ (1u128 << sign)
+    }
+
+    /// Writes `values` into `into`, one a row, each turned into its unsigned order by `raw`.
+    fn put<'a, T: Copy>(
+        &self,
+        into: impl Iterator<Item = &'a mut Normal>,
+        values: &[T],
+        raw: impl Fn(T) -> u128,
+    ) -> Result<()> {
+        let payload = self.wide - 1;
+        if payload != size_of::<T>() {
+            return Err(Error::internal("a sort key column wider or narrower than its key"));
+        }
+        let all = matches!(self.validity, Validity::AllValid);
+        let (present, absent) = (u8::from(self.key.nulls_first), u8::from(!self.key.nulls_first));
+        for (row, (normal, &value)) in into.zip(values).enumerate() {
+            let Some(slot) = normal.get_mut(self.at..self.at + self.wide) else {
+                return Err(Error::internal(
+                    "a normalized sort key wider than the buffer holding it",
+                ));
+            };
+            let (tag, bytes) = slot.split_at_mut(1);
+            if !all && !self.validity.is_valid(row) {
+                tag[0] = absent;
+                bytes.fill(0);
+                continue;
+            }
+            tag[0] = present;
+            bytes.copy_from_slice(&raw(value).to_be_bytes()[16 - payload..]);
+            if self.key.descending {
+                for byte in bytes {
+                    *byte = !*byte;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The value as an unsigned number whose low `bytes` bytes compare the way the value compares.
 ///
 /// Only the low `bytes` of the answer mean anything, and the caller takes exactly those off the big
@@ -166,6 +288,7 @@ pub(crate) fn write(
 /// Truncating the widened value is the right thing and not a risk, because the value fits the width
 /// [`wide`] chose for its own type. A `DATE` widened to a hundred and twenty eight bits is a sign
 /// extended `i32`, and its low four bytes are the `i32` back.
+#[cfg(test)]
 fn ordered(value: &Value, bytes: usize) -> Result<u128> {
     let (raw, signed) = match value {
         Value::Boolean(held) => (u128::from(*held), false),
@@ -206,7 +329,10 @@ mod tests {
 
     use rudb_plan::SortKey;
 
-    use super::{Normal, WIDTH, layout, write};
+    use rudb_common::LogicalType;
+    use rudb_vector::Vector;
+
+    use super::{Normal, WIDTH, layout, write, write_column};
 
     /// A key with nothing but the direction and the null placement set, since `write` reads no more.
     fn key(descending: bool, nulls_first: bool) -> SortKey {
@@ -228,7 +354,7 @@ mod tests {
     /// wrong and nothing else does.
     #[test]
     fn a_signed_column_encodes_into_the_order_it_compares_in() {
-        let ty = rudb_common::LogicalType::Integer;
+        let ty = LogicalType::Integer;
         let widths = layout(&[ty]).expect("an integer normalizes");
         let ascending = key(false, false);
         let mut held: Vec<i32> = vec![i32::MIN, -70000, -1, 0, 1, 255, 256, 70000, i32::MAX];
@@ -247,7 +373,7 @@ mod tests {
     /// two independent decisions that a single reversal cannot express.
     #[test]
     fn a_descending_key_reverses_the_values_and_not_the_nulls() {
-        let widths = layout(&[rudb_common::LogicalType::BigInt]).expect("a bigint normalizes");
+        let widths = layout(&[LogicalType::BigInt]).expect("a bigint normalizes");
         let falling = key(true, false);
         let low = one(&Value::BigInt(1), widths[0], falling);
         let high = one(&Value::BigInt(9), widths[0], falling);
@@ -264,7 +390,7 @@ mod tests {
     /// Two nulls are equal whichever way the key faces, because a null payload is never inverted.
     #[test]
     fn two_nulls_encode_the_same_bytes() {
-        let widths = layout(&[rudb_common::LogicalType::Date]).expect("a date normalizes");
+        let widths = layout(&[LogicalType::Date]).expect("a date normalizes");
         for falling in [false, true] {
             for first in [false, true] {
                 let at = key(falling, first);
@@ -276,11 +402,7 @@ mod tests {
     /// Several keys pack in priority order, so an earlier key decides before a later one is read.
     #[test]
     fn the_first_key_decides_before_the_second_is_looked_at() {
-        let types = [
-            rudb_common::LogicalType::Date,
-            rudb_common::LogicalType::BigInt,
-            rudb_common::LogicalType::Integer,
-        ];
+        let types = [LogicalType::Date, LogicalType::BigInt, LogicalType::Integer];
         let widths = layout(&types).expect("the clustered layout normalizes");
         assert_eq!(widths, vec![5, 9, 5], "a tag and the payload, per key");
         let rising = key(false, false);
@@ -304,7 +426,7 @@ mod tests {
     /// A type with no fixed width order, and a list too wide to hold, both refuse the whole list.
     #[test]
     fn a_key_list_this_cannot_hold_takes_the_other_path() {
-        use rudb_common::LogicalType as T;
+        use LogicalType as T;
         assert!(layout(&[T::Varchar]).is_none(), "a string has no fixed width");
         assert!(layout(&[T::Double]).is_none(), "a double does not order like its bytes");
         assert!(layout(&[T::Interval]).is_none(), "an interval orders over its fields folded");
@@ -321,13 +443,62 @@ mod tests {
     /// The unsigned types are not biased, since they are already in the order their bytes are.
     #[test]
     fn an_unsigned_column_encodes_without_the_bias() {
-        let widths = layout(&[rudb_common::LogicalType::UBigInt]).expect("normalizes");
+        let widths = layout(&[LogicalType::UBigInt]).expect("normalizes");
         let rising = key(false, false);
         let held = [0u64, 1, u64::from(u32::MAX), u64::MAX];
         let encoded: Vec<Normal> =
             held.iter().map(|&v| one(&Value::UBigInt(v), widths[0], rising)).collect();
         for pair in encoded.windows(2) {
             assert!(pair[0] < pair[1], "the bytes should rise with the values");
+        }
+    }
+
+    /// A column written at once is the same bytes as its values written one at a time.
+    ///
+    /// Over every width a key can be, both directions and both null placements, with a null in the
+    /// column and a second key after it, so a slot that spilled into its neighbour would show.
+    #[test]
+    fn a_column_writes_the_bytes_its_values_write_one_at_a_time() {
+        let columns = [
+            (LogicalType::Boolean, vec![Value::Boolean(true), Value::Null, Value::Boolean(false)]),
+            (LogicalType::SmallInt, vec![Value::SmallInt(-2), Value::SmallInt(7), Value::Null]),
+            (LogicalType::Date, vec![Value::Date(-1), Value::Null, Value::Date(19000)]),
+            (LogicalType::BigInt, vec![Value::Null, Value::BigInt(i64::MIN), Value::BigInt(3)]),
+            (
+                LogicalType::UInteger,
+                vec![Value::UInteger(0), Value::UInteger(u32::MAX), Value::Null],
+            ),
+            (
+                LogicalType::Decimal { width: 38, scale: 2 },
+                vec![
+                    Value::Decimal { unscaled: -5, width: 38, scale: 2 },
+                    Value::Null,
+                    Value::Decimal { unscaled: 12, width: 38, scale: 2 },
+                ],
+            ),
+        ];
+        for (ty, values) in columns {
+            let widths = layout(&[ty.clone(), LogicalType::Integer]).expect("normalizes");
+            let column = Vector::from_values(ty.clone(), &values).expect("a column of them");
+            let after = Vector::from_values(LogicalType::Integer, &vec![Value::Integer(-9); 3])
+                .expect("a second key");
+            for (descending, nulls_first) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let first = key(descending, nulls_first);
+                let second = key(false, false);
+                let mut together: Vec<Normal> = vec![[0; WIDTH]; values.len()];
+                write_column(together.iter_mut(), 0, widths[0], &column, first).expect("writes");
+                write_column(together.iter_mut(), widths[0], widths[1], &after, second)
+                    .expect("writes");
+                for (row, value) in values.iter().enumerate() {
+                    let mut alone: Normal = [0; WIDTH];
+                    write(&mut alone, 0, widths[0], value, first).expect("writes");
+                    write(&mut alone, widths[0], widths[1], &Value::Integer(-9), second)
+                        .expect("writes");
+                    assert_eq!(together[row], alone, "{ty} row {row} desc {descending}");
+                }
+            }
         }
     }
 }
