@@ -431,9 +431,9 @@ impl LogicalType {
     /// of bug this engine can have.
     ///
     /// Returns `None` when there is no such type, which is the binder's cue to raise rather than to
-    /// guess. Two different structs are `None` and not a struct of promoted fields, because field
-    /// order and field names would have to match and a rule that sometimes works is worse here than
-    /// one that never does.
+    /// guess. Two structs meet at a struct of every field either has, matched by name without case
+    /// and in the order the names first appear, each field at the type its two sides meet at, which
+    /// is the pin's: `[{'a': 1}, {'b': 2}]` is a `STRUCT(a INTEGER, b INTEGER)[]`.
     #[must_use]
     pub fn promote(&self, other: &Self) -> Option<Self> {
         if self == other {
@@ -442,6 +442,18 @@ impl LogicalType {
         match (self, other) {
             (Self::Null, ty) | (ty, Self::Null) => Some(ty.clone()),
             (Self::List(left), Self::List(right)) => Some(Self::list(left.promote(right)?)),
+            (Self::Struct(left), Self::Struct(right)) => {
+                let mut fields = left.clone();
+                for field in right {
+                    let same =
+                        fields.iter_mut().find(|one| one.name.eq_ignore_ascii_case(&field.name));
+                    match same {
+                        Some(one) => one.ty = one.ty.promote(&field.ty)?,
+                        None => fields.push(field.clone()),
+                    }
+                }
+                Some(Self::Struct(fields))
+            }
             _ if self.is_numeric() && other.is_numeric() => {
                 Some(promote_numeric(self.clone(), other.clone()))
             }

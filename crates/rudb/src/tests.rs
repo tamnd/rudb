@@ -8706,3 +8706,52 @@ fn text_inside_a_nested_value_is_quoted_only_when_it_has_to_be() {
     assert_eq!(column("SELECT ['a', NULL]"), "[a, NULL]");
     assert_eq!(column("SELECT [chr(39) || chr(92)]"), "['\\'\\\\']");
 }
+
+/// A struct casts to another by field name, and two structs meet at the struct of every field
+/// either has, which is how a list of differently shaped structs gets one type. Read off the pin.
+#[test]
+fn structs_cast_and_compare_by_field_name_the_way_the_pin_does() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT {'a': 1, 'b': 2}::STRUCT(a INT, c INT)"), "{'a': 1, 'c': NULL}");
+    assert_eq!(column("SELECT {'a': 1, 'b': 2}::STRUCT(A VARCHAR)"), "{'A': 1}");
+    assert_eq!(column("SELECT TRY_CAST({'a': 'x'} AS STRUCT(a INT))"), "{'a': NULL}");
+    assert_eq!(column("SELECT {'a': [1, 2]}::STRUCT(a VARCHAR[])"), "{'a': [1, 2]}");
+    assert_eq!(column("SELECT {'a': 1}::VARCHAR"), "{'a': 1}");
+    assert_eq!(
+        error("SELECT {'a': 1, 'b': 2}::STRUCT(x INT, y INT)"),
+        "Binder Error: STRUCT to STRUCT cast must have at least one matching member, inputs are \
+         (STRUCT(a INTEGER, b INTEGER)) and (STRUCT(x INTEGER, y INTEGER))"
+    );
+    assert_eq!(column("SELECT [{'a': 1}, {'b': 2}]"), "[{'a': 1, 'b': NULL}, {'a': NULL, 'b': 2}]");
+    assert_eq!(
+        column("SELECT typeof([{'a': 1, 'b': 'x'}, {'b': 'y', 'c': 2.5}])"),
+        "STRUCT(a INTEGER, b VARCHAR, c DECIMAL(2,1))[]"
+    );
+    assert_eq!(column("SELECT [{'a': 1}, {'a': 2.5}]"), "[{'a': 1.0}, {'a': 2.5}]");
+    assert_eq!(column("SELECT {'a': 1, 'b': NULL} < {'a': 1, 'b': 2}"), "false");
+    assert_eq!(column("SELECT {'a': 1, 'b': NULL} = {'a': 1, 'b': NULL}"), "true");
+    assert_eq!(column("SELECT {'a': 2} > {'a': 1}"), "true");
+    assert_eq!(column("SELECT {'a': 1} = {'a': 1, 'b': NULL}"), "true");
+    assert_eq!(column("SELECT {'a': 1} = {'b': 1}"), "false");
+    assert_eq!(column("SELECT min({'a': i}) FROM range(3) t(i)"), "{'a': 0}");
+    assert_eq!(
+        column("SELECT {'a': i} FROM range(3) t(i) ORDER BY 1 DESC"),
+        "{'a': 2};{'a': 1};{'a': 0}"
+    );
+    assert_eq!(
+        column("SELECT DISTINCT {'a': i % 2} FROM range(4) t(i) ORDER BY 1"),
+        "{'a': 0};{'a': 1}"
+    );
+    assert_eq!(
+        column(
+            "SELECT k.a || ':' || count(*) FROM (SELECT {'a': i % 2} AS k FROM range(4) t(i)) \
+             GROUP BY k ORDER BY k"
+        ),
+        "0:2;1:2"
+    );
+}

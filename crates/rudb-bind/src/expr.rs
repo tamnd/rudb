@@ -1066,6 +1066,7 @@ impl Binder<'_> {
         if from == ty {
             return Ok(expr);
         }
+        struct_members_meet(from, ty)?;
         Ok(self.add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
     }
 
@@ -1202,6 +1203,35 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         }
         // A subquery has its own aggregation and does not make the outer block aggregate.
         ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => false,
+    }
+}
+
+/// Refuses a cast between two structs that share no field name, anywhere down the two types.
+///
+/// A struct casts to another by name on the pin, so a target field with no source is null and a
+/// source field with no target is dropped. When nothing matches at all the cast would be a struct
+/// of nulls, and the pin refuses that in these words rather than answering it.
+fn struct_members_meet(from: &LogicalType, to: &LogicalType) -> Result<()> {
+    match (from, to) {
+        (LogicalType::List(from), LogicalType::List(to)) => struct_members_meet(from, to),
+        (LogicalType::Struct(source), LogicalType::Struct(target)) => {
+            let mut matched = false;
+            for field in target {
+                let found = source.iter().find(|one| one.name.eq_ignore_ascii_case(&field.name));
+                if let Some(one) = found {
+                    matched = true;
+                    struct_members_meet(&one.ty, &field.ty)?;
+                }
+            }
+            if matched || source.is_empty() || target.is_empty() {
+                return Ok(());
+            }
+            Err(Error::binder(format!(
+                "STRUCT to STRUCT cast must have at least one matching member, inputs are ({from}) \
+                 and ({to})"
+            )))
+        }
+        _ => Ok(()),
     }
 }
 

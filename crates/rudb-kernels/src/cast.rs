@@ -38,8 +38,8 @@ use std::cmp::Ordering;
 use std::str::FromStr;
 
 use rudb_common::{
-    Error, ErrorCode, LogicalType, PhysicalType, Result, SessionTimeZone, Value, civil_from_days,
-    days_from_civil,
+    Error, ErrorCode, Field, LogicalType, PhysicalType, Result, SessionTimeZone, Value,
+    civil_from_days, days_from_civil,
 };
 use rudb_vector::{Data, Form, Vector};
 
@@ -714,6 +714,9 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     if let (LogicalType::List(wanted), Value::List { values, .. }) = (target, value) {
         return to_list(values, wanted, try_cast);
     }
+    if let (LogicalType::Struct(wanted), Value::Struct(fields)) = (target, value) {
+        return to_struct(fields, wanted, try_cast);
+    }
     match convert(value, target) {
         Ok(converted) => Ok(converted),
         Err(error) if try_cast && recoverable(&error) => Ok(Value::Null),
@@ -801,6 +804,25 @@ fn to_list(values: &[Value], wanted: &LogicalType, try_cast: bool) -> Result<Val
         elements.push(cast_value(value, wanted, try_cast)?);
     }
     Ok(Value::List { element: wanted.clone(), values: elements })
+}
+
+/// A struct cast field by field, matched by name without case, which is the pin's rule.
+///
+/// Each field of the target takes the source field of the same name, cast to the target's type,
+/// and takes a null when the source has none, and a source field the target does not name is
+/// dropped. The name that comes out is the target's spelling, so `{'a': 1}::STRUCT(A INTEGER)` is
+/// `{'A': 1}`. That no field at all matches is the binder's to refuse, before a row is read.
+fn to_struct(fields: &[(String, Value)], wanted: &[Field], try_cast: bool) -> Result<Value> {
+    let mut out = Vec::with_capacity(wanted.len());
+    for field in wanted {
+        let source = fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(&field.name));
+        let value = match source {
+            Some((_, value)) => cast_value(value, &field.ty, try_cast)?,
+            None => Value::Null,
+        };
+        out.push((field.name.clone(), value));
+    }
+    Ok(Value::Struct(out))
 }
 
 fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
