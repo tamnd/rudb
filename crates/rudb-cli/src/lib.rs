@@ -139,9 +139,34 @@ fn answer_native_csv_once(options: &Options) -> Option<String> {
         answer_frequency_csv_once(options)
     } else if expression.ends_with(',') {
         answer_grouped_distinct_csv_once(options)
+            .or_else(|| answer_grouped_metrics_csv_once(options))
     } else {
         None
     }
+}
+
+fn answer_grouped_metrics_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
+    let rows =
+        Database::query_native_grouped_metrics_once(&options.database, sql).ok().flatten()?;
+    let mut output = String::new();
+    use std::fmt::Write as _;
+    for row in rows {
+        if let Some(group) = row.group {
+            let _ = write!(output, "{group}");
+        }
+        output.push(',');
+        if let Some(sum) = row.sum {
+            let _ = write!(output, "{sum}");
+        }
+        let _ = write!(output, ",{},", row.rows);
+        if row.average_count != 0 {
+            let average = row.average_sum as f64 / row.average_count as f64;
+            output.push_str(&rudb::format_double(average));
+        }
+        let _ = writeln!(output, ",{}", row.distinct_count);
+    }
+    Some(output)
 }
 
 fn answer_grouped_distinct_csv_once(options: &Options) -> Option<String> {
