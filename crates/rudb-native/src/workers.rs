@@ -21,9 +21,18 @@ use rudb_pipeline::Pool;
 /// The pool every writer in the process borrows from.
 static POOL: OnceLock<Pool> = OnceLock::new();
 
-/// The pool, made the first time a stage asks, with one thread for every core.
+/// The pool, made the first time a stage asks, with two threads for every core.
+///
+/// Two rather than one because the close runs two stages side by side, the numeric frequencies and
+/// the dictionaries, and each asks for a thread a core. A pool of one a core lends all of them to
+/// whichever asks first and leaves the other on the thread that called it, which made the close
+/// of the 10m ClickBench load wait on every dictionary one after another. The scoped threads this
+/// replaced were never capped at all, so two a core is still fewer threads than the close used to
+/// start.
 fn pool() -> &'static Pool {
-    POOL.get_or_init(|| Pool::new(std::thread::available_parallelism().map_or(1, usize::from)))
+    POOL.get_or_init(|| {
+        Pool::new(std::thread::available_parallelism().map_or(1, usize::from).saturating_mul(2))
+    })
 }
 
 /// Runs `worker` on up to `workers` threads, this one among them, and hands back what each returned.
