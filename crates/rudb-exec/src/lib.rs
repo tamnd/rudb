@@ -89,6 +89,7 @@ mod entrynames;
 mod expr;
 mod fetch;
 mod functionnames;
+mod fused;
 mod gather;
 mod group;
 mod group_distinct;
