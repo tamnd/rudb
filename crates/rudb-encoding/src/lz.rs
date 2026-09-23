@@ -62,6 +62,12 @@ const HASH_BITS: u32 = 16;
 /// this buys tenths of a ratio point for a proportional amount of time.
 const MAX_TRIES: usize = 32;
 
+/// A copy this long ends the walk down its chain, since a longer one would save a few bytes of a
+/// copy that already saves this many. Deflate calls this `nice_match` and zlib's default is 128.
+/// Repeated URLs and titles find a copy this long near the head of their chain and would otherwise
+/// walk the rest of it for nothing.
+const NICE_MATCH: usize = 64;
+
 /// What a match finder produced, as three streams rather than one.
 pub(crate) struct Tokens<'a> {
     /// The bytes no copy covered, one run a token, empty where a copy followed a copy.
@@ -170,6 +176,9 @@ fn longest(
         let length = shared(&input[position..end], &input[at..end]);
         if length >= MIN_MATCH && best.is_none_or(|(had, _)| length > had) {
             best = Some((length, at - position));
+            if length >= NICE_MATCH {
+                break;
+            }
         }
         candidate = prev[candidate as usize];
         tries += 1;
@@ -432,9 +441,8 @@ mod tests {
 
     #[test]
     fn the_word_compare_finds_the_same_copies_as_a_byte_compare() {
-        // The matcher as it was before `shared` compared words and `longest` turned candidates
-        // away on one byte, kept to show the tokens have not moved, since every chunk a load has
-        // written was cut by it.
+        // The matcher with a byte compare and no candidate turned away on one byte, kept to show
+        // that those two shortcuts find the same copies the plain walk does.
         fn by_bytes(input: &[u8]) -> (Vec<(usize, usize)>, Vec<i64>, Vec<i64>) {
             let mut raw = Raw::default();
             let mut head = vec![u32::MAX; 1 << HASH_BITS];
@@ -460,6 +468,9 @@ mod tests {
                         }
                         if length >= MIN_MATCH && found.is_none_or(|(had, _)| length > had) {
                             found = Some((length, at - position));
+                            if length >= NICE_MATCH {
+                                break;
+                            }
                         }
                         candidate = prev[candidate as usize];
                         tries += 1;
