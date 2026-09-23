@@ -527,6 +527,10 @@ pub(crate) struct Unit<'a> {
     unit: &'a str,
     field: Field,
     scale: i128,
+    /// [`Self::scale`] as a double, worked out once. Turning an `i128` into a double is a call into
+    /// the runtime, and doing it once a row was eight percent of ClickBench 43, whose view builds
+    /// `EventTime` with `to_seconds` over a double.
+    real: f64,
 }
 
 impl<'a> Unit<'a> {
@@ -549,7 +553,7 @@ impl<'a> Unit<'a> {
             "microseconds" => (Field::Micros, 1),
             _ => return Err(Error::internal(format!("{name} is not an interval constructor"))),
         };
-        Ok(Unit { unit, field, scale })
+        Ok(Unit { unit, field, scale, real: scale as f64 })
     }
 
     /// The interval `count` of this unit makes.
@@ -583,7 +587,7 @@ impl<'a> Unit<'a> {
             // A double that has gone past `i128` comes back as the saturated bound, which is out of
             // every field's range as well, so the check below catches it without a case of its own.
             Count::Real(real) => {
-                let scaled = (real * self.scale as f64).trunc();
+                let scaled = (real * self.real).trunc();
                 if scaled.abs() < 9.0e18 { i128::from(scaled as i64) } else { scaled as i128 }
             }
         };
