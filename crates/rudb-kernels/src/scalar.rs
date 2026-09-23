@@ -2359,10 +2359,47 @@ pub fn call_values(
         }
         return Ok(Value::Varchar(out));
     }
+    // `list_concat` is the fourth one above the null rule and it follows `concat`'s rule rather than
+    // the operator's. A null argument is a list with nothing in it here, so `list_concat([1], NULL)`
+    // is `[1]` upstream while `[1] || NULL` is null, and the two spellings are not the same function
+    // even though they answer the same thing whenever no argument is null.
+    if name == "list_concat" {
+        let LogicalType::List(element) = returns else {
+            return Err(Error::internal(format!("list_concat returning {returns}")));
+        };
+        // Every argument was cast to the answer's type by the signature, so an element reaching here
+        // is already the element type and nothing is cast a second time.
+        let mut values = Vec::new();
+        let mut seen = false;
+        for value in args {
+            let Value::List { values: held, .. } = value else {
+                continue;
+            };
+            seen = true;
+            values.extend(held.iter().cloned());
+        }
+        // Every argument was null, which is a null answer and not an empty list. `list_concat(NULL,
+        // NULL)` is NULL upstream where `list_concat([], [])` is `[]`.
+        if !seen {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::List { element: (**element).clone(), values });
+    }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
     match (name, args) {
+        // Two lists joined end to end, which is the reading of this operator the arguments picked.
+        // It is below the null rule and the named form is above it, which is the whole of the
+        // difference between the two: `[1] || NULL` is null and `list_concat([1], NULL)` is `[1]`.
+        ("||", [Value::List { values: left, .. }, Value::List { values: right, .. }]) => {
+            let LogicalType::List(element) = returns else {
+                return Err(Error::internal(format!("|| returning {returns}")));
+            };
+            let mut values = left.clone();
+            values.extend(right.iter().cloned());
+            Ok(Value::List { element: (**element).clone(), values })
+        }
         ("+", [only]) => Ok(only.clone()),
         ("-", [only @ Value::Interval { .. }]) => datetime::negated(only),
         ("-", [only]) => negate(only, returns),
