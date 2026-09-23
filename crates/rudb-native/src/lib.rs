@@ -2524,17 +2524,18 @@ impl Writer {
                             "column page checksum differs while building pair frequencies",
                         ));
                     }
-                    let Some(codes) = decode_stable_codes(rows as usize, part)? else {
+                    let upto = ordinals.partition_point(|&ordinal| ordinal < part_end);
+                    let positions = ordinals[wanted..upto]
+                        .iter()
+                        .map(|&ordinal| {
+                            usize::try_from(ordinal.saturating_sub(part_start))
+                                .map_err(|_| invalid("frequency row offset does not fit in memory"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if !decode_selected_stable_codes(rows as usize, part, &positions, &mut out)? {
                         return Ok(None);
-                    };
-                    while wanted < ordinals.len() && ordinals[wanted] < part_end {
-                        let row = usize::try_from(ordinals[wanted].saturating_sub(part_start))
-                            .map_err(|_| invalid("frequency row offset does not fit in memory"))?;
-                        out.push(*codes.get(row).ok_or_else(|| {
-                            invalid("frequency row offset is outside its string page")
-                        })?);
-                        wanted += 1;
                     }
+                    wanted = upto;
                 }
                 part_start = part_end;
             }
@@ -8453,59 +8454,66 @@ fn page_encoding(ty: &LogicalType, rows: usize, bytes: &[u8]) -> String {
     }
 }
 
-/// Stable dictionary codes from one page, without opening the dictionary they name.
+/// Selected stable dictionary codes from one page.
 ///
-/// The writer uses this while closing a table to derive bounded composite counts. At that point
-/// the code pages are final but the dictionary index is not in the directory yet, and the values
-/// are irrelevant: equality and nullness are all a grouped count needs.
-fn decode_stable_codes(rows: usize, bytes: &[u8]) -> Result<Option<Vec<Option<u32>>>> {
+/// Pair-frequency construction needs at most the bounded heavy-hitter rows. Reading those code
+/// positions directly avoids materializing every code in each part that contains a candidate.
+fn decode_selected_stable_codes(
+    rows: usize,
+    bytes: &[u8],
+    positions: &[usize],
+    out: &mut Vec<Option<u32>>,
+) -> Result<bool> {
+    if positions.windows(2).any(|pair| pair[0] >= pair[1])
+        || positions.last().is_some_and(|&position| position >= rows)
+    {
+        return Err(invalid("selected code positions are not sorted and in range"));
+    }
     let mut cur = Cursor::new(bytes);
     let codec = cur.u8()?;
+    if codec != 3 && codec != 4 {
+        return Ok(false);
+    }
     let flag = cur.u8()?;
-    let validity = match flag {
-        0 => Validity::AllValid,
-        1 => Validity::AllInvalid,
+    let mask = match flag {
+        0 | 1 => None,
         2 => {
-            let mask = cur.take(rows.div_ceil(8))?;
-            Validity::from_iter(rows, |row| mask[row / 8] >> (row % 8) & 1 == 1)
+            let at = cur.at;
+            let len = rows.div_ceil(8);
+            cur.take(len)?;
+            Some((at, len))
         }
         _ => return Err(invalid("page validity tag differs")),
     };
-    if codec != 3 && codec != 4 {
-        return Ok(None);
-    }
-    let codes = if codec == 4 {
-        let wide = integer::decode(&bytes[cur.at..])?;
-        if wide.len() != rows {
-            return Err(invalid("encoded code page holds the wrong number of rows"));
-        }
-        let mut codes = Vec::with_capacity(wide.len());
-        let mut seen = 0_i64;
-        for &code in &wide {
-            seen |= code;
-            codes.push(code as u32);
-        }
-        if seen < 0 || seen > i64::from(u32::MAX) {
-            return Err(invalid("code is not a code"));
-        }
-        codes
-    } else {
-        let mut codes = Vec::with_capacity(rows);
-        for _ in 0..rows {
-            codes.push(cur.u32()?);
-        }
-        if cur.at != bytes.len() {
-            return Err(invalid("global code page has trailing bytes"));
-        }
-        codes
+    let valid = |row: usize| match flag {
+        0 => true,
+        1 => false,
+        2 => mask.is_some_and(|(at, _)| bytes[at + row / 8] >> (row % 8) & 1 == 1),
+        _ => unreachable!("the validity tag was checked"),
     };
-    Ok(Some(
-        codes
-            .into_iter()
-            .enumerate()
-            .map(|(row, code)| validity.is_valid(row).then_some(code))
-            .collect(),
-    ))
+    if codec == 4 {
+        let wide = integer::decode_selected(&bytes[cur.at..], positions)?;
+        for (&row, code) in positions.iter().zip(wide) {
+            let code = u32::try_from(code).map_err(|_| invalid("code is not a code"))?;
+            out.push(valid(row).then_some(code));
+        }
+        return Ok(true);
+    }
+    let codes_at = cur.at;
+    let codes_len = rows.checked_mul(4).ok_or_else(|| invalid("page size overflow"))?;
+    cur.take(codes_len)?;
+    if cur.at != bytes.len() {
+        return Err(invalid("global code page has trailing bytes"));
+    }
+    let codes = &bytes[codes_at..codes_at + codes_len];
+    for &row in positions {
+        let at = row.checked_mul(4).ok_or_else(|| invalid("dictionary code offset overflow"))?;
+        let code = u32::from_le_bytes(
+            codes[at..at + 4].try_into().map_err(|_| invalid("dictionary code is truncated"))?,
+        );
+        out.push(valid(row).then_some(code));
+    }
+    Ok(true)
 }
 
 fn decode(
