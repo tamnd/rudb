@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.19
+
+A patch release of twelve pull requests. The native directory format number goes from 28 to 29 and the storage format version stays at 9. This build reads files 0.4.18 wrote, and 0.4.18 does not read a format 29 file.
+
+Five make TPC-H joins cheaper. #1592 leaves out of a join's hash table the gathered rows no driving row can match, known from the exact bitmap of an inner or semi join below it on the same column, which took q09 at SF1 from 289 ms to 226 ms of CPU against DuckDB's 254 ms. #1587 runs a scan's exact bitmaps before its pushed filter, and its Bloom filters too once the pushed filter is measured keeping more than half the rows, which took seven queries from 10.60 G to 8.25 G instructions and put q03, q04, q07 and q21 under DuckDB. #1584 deals a join's build rows into their partitions in one pass. #1588 gathers a flat column with no nulls in one typed pass. #1594 lays the parts of a parent string column end to end on the thread lease, which is about the same size as the part reads #1575 already moved there.
+
+Three make other queries faster. #1593 widens the substring signatures of a dictionary block from 2 KiB to 8 KiB and reads them in windows instead of keeping them loaded, which took ClickBench q21 on hits 10M from about 2.6 G to 1.05 G cycles and q22 from 2.8 G to 1.26 G, with the file 4% larger. This is the format change. #1590 widens only the rows a filter kept when an integer group key arrives as a dictionary, which took ClickBench q28 from 1.172 G to 1.101 G instructions. #1591 lets `Vector::signed_block` read a dictionary, which is how most integer columns of a Parquet load reach the writer, and reads string rows as bytes where they were already checked.
+
+Three answer a fresh process from the certified native catalog with less memory. #1581 formats `AVG` from the certified sum and count, #1585 prints a certified distinct count, and #1589 prints certified bounds directly. #1589 also sets `opt-level = "z"` on the `rudb-cli` crate, which makes the binary 11.0 MB instead of 12.2 MB. That setting reaches the engine code inlined into the binary as well, and costs TPC-H queries run through the CLI 10 to 40 percent more instructions, q01 3.46 G against 2.51 G. It is tracked on #1510.
+
+#1583 builds structs from braces, picks fields back out by name, casts between structs by field name, and quotes text inside nested values the way DuckDB does.
+
 ## 0.4.18
 
 A patch release of nineteen pull requests. The native directory format number stays at 28 and the storage format version at 9, so this build and 0.4.17 read each other's files.
