@@ -333,22 +333,6 @@ struct FixedRuns {
     runs: Vec<FixedPartition>,
 }
 
-impl EncodedCountRuns {
-    /// The run the rest fold into, which is the widest so that the most records stay where they are,
-    /// and how many records every run holds between them.
-    fn seed(&mut self) -> (EncodedCountPartition, usize) {
-        let total = self.runs.iter().map(|run| run.rows.len()).sum();
-        let widest = widest_run(self.runs.iter().map(|run| run.rows.len()));
-        let seed = widest.map(|at| self.runs.swap_remove(at)).unwrap_or_default();
-        (seed, total)
-    }
-}
-
-/// Which of these runs holds the most records, or `None` when there are no runs at all.
-fn widest_run(lengths: impl Iterator<Item = usize>) -> Option<usize> {
-    lengths.enumerate().max_by_key(|&(_, rows)| rows).map(|(at, _)| at)
-}
-
 /// How many of a bucket's bits hold the slot its group sits at, the rest being the tag.
 ///
 /// Twenty four, which is sixteen million groups in one radix partition and a billion across the
@@ -486,6 +470,19 @@ impl EncodedCountPartition {
         }
         if !self.weights.is_empty() {
             self.weights.push(1);
+        }
+    }
+
+    /// Takes one record that stands for `weight` rows, and starts keeping weights at the first one
+    /// that is not a single row.
+    fn push_weighted(&mut self, row: EncodedCountRecord, valid: u8, weight: u32) {
+        if weight != 1 && self.weights.is_empty() {
+            self.weights.resize(self.rows.len(), 1);
+        }
+        let weighing = !self.weights.is_empty();
+        self.push(row, valid);
+        if weighing {
+            *self.weights.last_mut().expect("a weight was just pushed") = weight;
         }
     }
 
@@ -5000,6 +4997,20 @@ fn encoded_slot(
     }
 }
 
+/// Which split of `splits` an encoded count record belongs to.
+///
+/// The record carries thirty two bits of hash. The bucket tag reads the top eight and a table sized
+/// for one split reads at most the low sixteen, so the split takes the eight between, and a
+/// partition too large for 256 splits of [`FIXED_SPLIT_ROWS`] gets larger tables instead.
+#[inline]
+fn encoded_split(hash: u32, splits: usize) -> usize {
+    (hash >> 16) as usize & (splits - 1)
+}
+
+/// The most splits an encoded count partition is cut into, which is what [`encoded_split`] has
+/// bits for.
+const ENCODED_SPLITS: usize = 256;
+
 fn encoded_count_partition(
     runs: &mut EncodedCountRuns,
     dictionary: &Vector,
@@ -5011,68 +5022,56 @@ fn encoded_count_partition(
     if !(2..=3).contains(&keys) {
         return Err(Error::internal("an encoded count partition has an unsupported key width"));
     }
+    // Split and folded a cache sized piece at a time, for the reason [`FIXED_SPLIT_ROWS`] gives.
+    // On ClickBench 19 a partition is about a hundred thousand groups and the probe into its table
+    // was a sixth of the query.
     let reserving = stage::Timing::start(Stage::Reserve);
-    let (mut partition, total) = runs.seed();
-    let capacity = total.saturating_mul(2).max(64).next_power_of_two();
+    let total: usize = runs.runs.iter().map(|run| run.rows.len()).sum();
+    let splits = (total / FIXED_SPLIT_ROWS).max(1).next_power_of_two().min(ENCODED_SPLITS);
+    let share = total.div_ceil(splits);
+    let share = (share + share.isqrt() * 4).min(total);
+    let capacity = share.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
-    let room = total.saturating_sub(partition.rows.len());
     working.grow(width_of(
         capacity * size_of::<u32>()
-            + total * size_of::<i64>()
-            + room * size_of::<EncodedCountRecord>(),
+            + share * size_of::<i64>()
+            + total * size_of::<EncodedCountRecord>(),
     ))?;
-    let mut buckets = vec![EMPTY_SLOT; capacity];
-    let mut counts: Vec<i64> = Vec::with_capacity(total);
-    // The table grows by one group per record the other runs hold that this one has not seen, and
-    // reserving for all of them up front is one allocation instead of a doubling walk under a fold.
-    partition.rows.reserve(room);
+    let mut parts: Vec<EncodedCountPartition> = (0..splits)
+        .map(|_| EncodedCountPartition {
+            rows: Vec::with_capacity(share),
+            validity: Vec::new(),
+            weights: Vec::new(),
+        })
+        .collect();
     reserving.stop(0);
-    let timing = stage::Timing::start(Stage::Fold);
-    // The run this took as the table, compacted in place: the group for a record always lands at a
-    // slot at or behind where the record was read from, so nothing unread is ever written over.
-    let seeded = partition.rows.len();
-    let all_valid = partition.validity.is_empty();
-    for source in 0..seeded {
-        let row = partition.rows[source];
-        let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[source] };
-        let weight = partition.weight(source);
-        let slot = match encoded_slot(&buckets, &partition, row, valid) {
-            Ok(slot) => slot,
-            Err(bucket) => {
-                let slot = counts.len();
-                buckets[bucket] = bucket_for(
-                    slot,
-                    u64::from(row.hash),
-                    "an encoded radix partition is too large",
-                )?;
-                partition.rows[slot] = row;
-                if !all_valid {
-                    partition.validity[slot] = valid;
-                }
-                counts.push(0);
-                slot
-            }
-        };
-        counts[slot] = counts[slot]
-            .checked_add(weight)
-            .ok_or_else(|| Error::out_of_range("a grouped COUNT overflowed BIGINT"))?;
-    }
-    partition.rows.truncate(counts.len());
-    if !all_valid {
-        partition.validity.truncate(counts.len());
-    }
-    // The table's records are groups from here on, counted in `counts`, and what they weighed as
-    // records is already in there.
-    partition.weights = Vec::new();
-    timing.stop(0);
-    // Every other instance's run, folded into that table and given back one run at a time rather
-    // than all at the end, so the records this has finished with stop costing anything.
     let timing = stage::Timing::start(Stage::Merge);
     for run in std::mem::take(&mut runs.runs) {
         let all_valid = run.validity.is_empty();
         for (source, &row) in run.rows.iter().enumerate() {
             let valid = if all_valid { EncodedCountRecord::ALL } else { run.validity[source] };
-            let weight = run.weight(source);
+            let weight = run.weights.get(source).copied().unwrap_or(1);
+            parts[encoded_split(row.hash, splits)].push_weighted(row, valid, weight);
+        }
+    }
+    timing.stop(0);
+    let timing = stage::Timing::start(Stage::Fold);
+    let mut buckets: Vec<u32> = Vec::with_capacity(capacity);
+    let mut counts: Vec<i64> = Vec::with_capacity(share);
+    let mut output: Vec<(i64, Vec<Value>)> = Vec::new();
+    for mut partition in parts {
+        let rows = partition.rows.len();
+        buckets.clear();
+        buckets.resize(rows.saturating_mul(2).max(64).next_power_of_two(), EMPTY_SLOT);
+        counts.clear();
+        // The groups are compacted into the front of the split's own records: the group for a
+        // record always lands at a slot at or behind where the record was read from.
+        let all_valid = partition.validity.is_empty();
+        for source in 0..rows {
+            let row = partition.rows[source];
+            let valid =
+                if all_valid { EncodedCountRecord::ALL } else { partition.validity[source] };
+            let weight = partition.weight(source);
             let slot = match encoded_slot(&buckets, &partition, row, valid) {
                 Ok(slot) => slot,
                 Err(bucket) => {
@@ -5082,7 +5081,10 @@ fn encoded_count_partition(
                         u64::from(row.hash),
                         "an encoded radix partition is too large",
                     )?;
-                    partition.push(row, valid);
+                    partition.rows[slot] = row;
+                    if !all_valid {
+                        partition.validity[slot] = valid;
+                    }
                     counts.push(0);
                     slot
                 }
@@ -5091,47 +5093,46 @@ fn encoded_count_partition(
                 .checked_add(weight)
                 .ok_or_else(|| Error::out_of_range("a grouped COUNT overflowed BIGINT"))?;
         }
-    }
-    // Read again because a run past the first can have been what gave this partition its first null.
-    let all_valid = partition.validity.is_empty();
-    timing.stop(0);
-    let timing = stage::Timing::start(Stage::Emit);
-    let mut best = Vec::with_capacity(bound.min(counts.len()));
-    for slot in 0..counts.len() {
-        let at = best.partition_point(|&kept| counts[kept] >= counts[slot]);
-        if at < bound {
-            best.insert(at, slot);
-            best.truncate(bound);
+        let mut best = Vec::with_capacity(bound.min(counts.len()));
+        for slot in 0..counts.len() {
+            let at = best.partition_point(|&kept| counts[kept] >= counts[slot]);
+            if at < bound {
+                best.insert(at, slot);
+                best.truncate(bound);
+            }
         }
-    }
-    best.sort_unstable();
-    let mut output = Vec::with_capacity(best.len());
-    for slot in best {
-        let key = partition.rows[slot];
-        let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
-        let first = if valid & EncodedCountRecord::FIRST != 0 {
-            signed_value(&leading[0], key.first)?
-        } else {
-            Value::Null
-        };
-        let third = if valid & EncodedCountRecord::THIRD != 0 {
-            dictionary.try_value_at(key.third as usize)?
-        } else {
-            Value::Null
-        };
-        let mut row = Vec::with_capacity(keys + 1);
-        row.push(first);
-        if keys == 3 {
-            row.push(if valid & EncodedCountRecord::SECOND != 0 {
-                signed_value(&leading[1], key.second)?
+        for slot in best {
+            let key = partition.rows[slot];
+            let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[slot] };
+            let first = if valid & EncodedCountRecord::FIRST != 0 {
+                signed_value(&leading[0], key.first)?
             } else {
                 Value::Null
-            });
+            };
+            let third = if valid & EncodedCountRecord::THIRD != 0 {
+                dictionary.try_value_at(key.third as usize)?
+            } else {
+                Value::Null
+            };
+            let mut row = Vec::with_capacity(keys + 1);
+            row.push(first);
+            if keys == 3 {
+                row.push(if valid & EncodedCountRecord::SECOND != 0 {
+                    signed_value(&leading[1], key.second)?
+                } else {
+                    Value::Null
+                });
+            }
+            row.push(third);
+            row.push(Value::BigInt(counts[slot]));
+            output.push((counts[slot], row));
         }
-        row.push(third);
-        row.push(Value::BigInt(counts[slot]));
-        output.push(row);
     }
+    timing.stop(0);
+    let timing = stage::Timing::start(Stage::Emit);
+    output.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+    output.truncate(bound);
+    let output = output.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
     let mut held = memory.reservation();
     let mut types = leading.to_vec();
     types.push(LogicalType::Varchar);
@@ -6827,6 +6828,57 @@ mod tests {
         expected.sort_by_key(|row| format!("{row:?}"));
         assert_eq!(rows, expected);
         assert_eq!(size_of::<EncodedCountRecord>(), 24);
+    }
+
+    #[test]
+    fn an_encoded_count_partition_split_for_cache_adds_weights_across_runs_and_splits() {
+        let dictionary = Vector::from_values(LogicalType::Varchar, &[Value::Varchar("one".into())])
+            .expect("a string dictionary");
+        // A hash that spreads the groups over every split, and a first run compacted so that its
+        // records carry weights while the second's are single rows.
+        let groups = (super::FIXED_SPLIT_ROWS * 8) as i64;
+        let row = |first: i64| EncodedCountRecord {
+            first,
+            second: 0,
+            hash: (first as u32).wrapping_mul(0x9e37_79b9),
+            third: 0,
+        };
+        let mut early = EncodedCountPartition::default();
+        let mut late = EncodedCountPartition::default();
+        for first in 0..groups {
+            let times = if first % 10_000 == 0 { 2 + first / 10_000 } else { 1 };
+            for time in 0..times {
+                let into = if time % 2 == 0 { &mut early } else { &mut late };
+                into.push(row(first), EncodedCountRecord::ALL);
+            }
+        }
+        early.compact();
+        let part = encoded_count_partition(
+            &mut EncodedCountRuns { runs: vec![early, late] },
+            &dictionary,
+            &[LogicalType::BigInt],
+            3,
+            &Memory::unlimited(),
+        )
+        .expect("the encoded partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in part.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        let largest = groups / 10_000 * 10_000;
+        let expected = (0..3)
+            .map(|step| {
+                let first = largest - step * 10_000;
+                vec![
+                    Value::BigInt(first),
+                    Value::Varchar("one".into()),
+                    Value::BigInt(2 + first / 10_000),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected, "the three largest groups, largest first");
     }
 
     #[test]
