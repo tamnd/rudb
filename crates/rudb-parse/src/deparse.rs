@@ -384,6 +384,7 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             if negate { format!("(NOT {any})") } else { any }
         }
         Expr::Parameter { name } => format!("${}", ast.string(name)),
+        Expr::Default => "DEFAULT".to_string(),
         // A bracketed list is a call to `list_value`, including when it is empty.
         Expr::List { items } => format!("list_value({})", exprs(ast, items)),
         // And a parenthesised list is a call to `row`, which needs its quotes because it is a

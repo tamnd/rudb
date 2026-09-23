@@ -3789,6 +3789,9 @@ fn create_table(
     if !create.keys.is_empty() {
         catalog.table_mut(&create.name)?.set_keys(create.keys)?;
     }
+    if create.defaults.iter().any(Option::is_some) {
+        catalog.table_mut(&create.name)?.set_defaults(create.defaults);
+    }
     if let Some(rows) = rows {
         catalog.table_mut(&create.name)?.append_all(rows.into_chunks(), budget.pool.threads())?;
     }

@@ -233,6 +233,7 @@ pub(crate) fn columnnames(
                         &column.name,
                         &column.ty,
                         !column.not_null,
+                        table.default(at),
                     ));
                 }
             }
@@ -250,6 +251,7 @@ pub(crate) fn columnnames(
                         &field.name,
                         &field.ty,
                         true,
+                        None,
                     ));
                 }
             }
@@ -277,6 +279,7 @@ fn column_row(
     name: &str,
     ty: &LogicalType,
     nullable: bool,
+    default: Option<&str>,
 ) -> Vec<Value> {
     let (precision, radix, scale) = numeric_facts(ty);
     vec![
@@ -291,7 +294,7 @@ fn column_row(
         Value::Integer(i32::try_from(at + 1).unwrap_or(i32::MAX)),
         Value::Null,
         Value::Boolean(entry_internal(database)),
-        Value::Null,
+        default.map_or(Value::Null, text),
         Value::Boolean(nullable),
         text(&ty.to_string()),
         type_oid(&canonical(ty)).map_or(Value::Null, Value::BigInt),

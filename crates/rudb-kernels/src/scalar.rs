@@ -4519,8 +4519,8 @@ mod tests {
             let before = fallback::count(Kernel::Scalar, Form::Constant, Form::BitPacked);
             let args = [stamp, packed.clone()];
             agrees("__rudb_stamp_seconds", &args, &LogicalType::Timestamp);
-            let moved = call("__rudb_stamp_seconds", &args, &LogicalType::Timestamp, None)
-                .expect("moves");
+            let moved =
+                call("__rudb_stamp_seconds", &args, &LogicalType::Timestamp, None).expect("moves");
             assert_eq!(moved.value_at(2), Value::Timestamp(7 + 903 * 1_000_000));
             if ty == LogicalType::Integer {
                 let epoch = Vector::constant(LogicalType::Date, Value::Date(0), 4);
