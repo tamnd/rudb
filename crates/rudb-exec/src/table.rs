@@ -1118,10 +1118,19 @@ pub(crate) fn coded_within<'a>(
     // The columns with places of their own first, because what they take out of the room is what
     // a window is allowed to be.
     let mut found = [None; KEYS];
+    let mut fallback = [None; KEYS];
     let mut taken: usize = 1;
     let mut wanting = 0;
     for (at, key) in keys.iter().enumerate() {
         match places_of(key, rows, room) {
+            // A packed page whose base is not the one the map was built on, which is every page
+            // after the first when a key is sorted, since each packs against its own minimum. Its
+            // codes would throw the map away, so it is read by value against the window instead,
+            // and falls back on its codes only when the window will not have it.
+            Some(read) if values.is_some() && moved_off(&read.0, held.get(at)) => {
+                fallback[at] = Some(read);
+                wanting += 1;
+            }
             Some(read) => {
                 taken = taken.checked_mul(read.1).filter(|&taken| taken <= room)?;
                 found[at] = Some(read);
@@ -1140,9 +1149,18 @@ pub(crate) fn coded_within<'a>(
                 continue;
             }
             let window =
-                window_of(key, rows, held.get(at), room / taken, wanting == 1, &mut values[at])?;
-            taken = taken.checked_mul(window.1).filter(|&taken| taken <= room)?;
-            windows[at] = Some(window);
+                window_of(key, rows, held.get(at), room / taken, wanting == 1, &mut values[at]);
+            match (window, fallback[at]) {
+                (Some(window), _) => {
+                    taken = taken.checked_mul(window.1).filter(|&taken| taken <= room)?;
+                    windows[at] = Some(window);
+                }
+                (None, Some(read)) => {
+                    taken = taken.checked_mul(read.1).filter(|&taken| taken <= room)?;
+                    found[at] = Some(read);
+                }
+                (None, None) => return None,
+            }
         }
         values
     };
@@ -1170,6 +1188,21 @@ pub(crate) fn coded_within<'a>(
         combos *= span;
     }
     Some(Coded { columns, combos })
+}
+
+/// Whether a column's own places come from a packed page other than the one `held` was built on.
+///
+/// Only a packed page, because a dictionary is shared from one chunk to the next and its codes keep
+/// the map for as long as it is, and only once there is a map, since a first page is as good a
+/// place as any to start one.
+fn moved_off(places: &Places<'_>, held: Option<&Origin>) -> bool {
+    match (places, held) {
+        (Places::Bits { packed } | Places::CodedBits { packed, .. }, Some(held)) => {
+            !matches!(held, Origin::Bits(base, width)
+                if *base == packed.base() && *width == packed.width())
+        }
+        _ => false,
+    }
 }
 
 /// Widens an integer key column into `into` and settles the window its values are placed against.
@@ -4135,6 +4168,38 @@ mod tests {
         let places = placed(&coded, 3);
         assert_eq!(places[0], places[2]);
         assert_eq!(places[1] - places[0], 262_029 - 62);
+    }
+
+    /// A second packed page is read by value against the window rather than by its own codes,
+    /// which would mean a new map at every page, and the window it opens is kept by the page after.
+    #[test]
+    fn a_packed_page_other_than_the_one_held_is_read_by_value() {
+        let first = [packed_numbers(&[100, 101, 102, 101], 2, 100)];
+        let mut values = Vec::new();
+        let mut held = Vec::new();
+        let coded = coded_within(&first, 4, &held, Some(&mut values)).expect("places of its own");
+        assert!(!coded.by_value(), "a first page keeps its codes");
+        coded.hold(&mut held);
+        let same = [packed_numbers(&[102, 100, 100, 103], 2, 100)];
+        let coded = coded_within(&same, 4, &held, Some(&mut values)).expect("places of its own");
+        assert!(!coded.by_value() && coded.same_as(&held), "the same base keeps the map");
+        let next = [packed_numbers(&[104, 105, 106, 104], 2, 104)];
+        let coded = coded_within(&next, 4, &held, Some(&mut values)).expect("read by value");
+        assert!(coded.by_value());
+        let places = placed(&coded, 4);
+        assert_eq!(places[0], places[3]);
+        assert_eq!(places[2] - places[0], 2);
+        coded.hold(&mut held);
+        let after = [packed_numbers(&[107, 105, 104, 106], 2, 104)];
+        let coded = coded_within(&after, 4, &held, Some(&mut values)).expect("read by value");
+        assert!(coded.by_value() && coded.same_as(&held), "the window outlives the page");
+        let filtered = [Vector::dictionary(vec![3, 0], packed_numbers(&[108, 109, 110, 111], 2, 108))
+            .expect("the rows a filter kept")];
+        let coded = coded_within(&filtered, 2, &held, Some(&mut values)).expect("read by value");
+        assert!(coded.by_value() && coded.same_as(&held), "a filtered page lands in it too");
+        assert_eq!(placed(&coded, 2)[0] - placed(&coded, 2)[1], 3);
+        let wide = [packed_numbers(&[0, 1 << 20, 0, 1], 21, 0)];
+        assert!(coded_within(&wide, 4, &held, Some(&mut values)).is_none(), "no places either");
     }
 
     /// A row hashed on its own is the row hashed with its chunk, which is what lets a probe of one
