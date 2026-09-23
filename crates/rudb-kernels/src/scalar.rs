@@ -1809,7 +1809,9 @@ fn like_stable(
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {
         return like_vector_run(dictionary, codes, like, base, rows, returns);
     }
-    let bulk = rows >= LIKE_GROUP;
+    // Experiment: decide only the codes selected by each chunk. This tests whether
+    // decoding every value in a 1,024-code group dominates the selective scans.
+    let bulk = false;
     let mut out = vec![false; rows];
     let mut characters = Vec::new();
     let validity = over_valid(rows, base, |index| {
