@@ -201,7 +201,27 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
 /// side runs second over a file that was written a moment ago is reading a warmer file, and that bias
 /// was larger than the effects this table is looking for. Each side also runs once untimed first.
 fn one(database: &Database, sql: &str, repeats: usize) -> Outcome {
-    let links = link_joins(database, sql);
+    // Counted with the rule back on. `disabled_optimizers` is a session setting and the last thing
+    // the query before this one did was turn the rule off, so counting first and clearing afterwards
+    // reads every plan through the control and reports a corpus that plans no link joins at all.
+    // That is exactly what the first run of this said, and it said it about a corpus where
+    // `cargo xtask sections` finds four.
+    let counted = database
+        .execute("SET graph_sections = 'on'")
+        .and_then(|_| database.execute("SET disabled_optimizers = ''"))
+        .map_err(say);
+    let links = match counted {
+        Ok(_) => link_joins(database, sql),
+        Err(complaint) => {
+            return Outcome {
+                links: 0,
+                with: 0.0,
+                without: 0.0,
+                complaint: Some(complaint),
+                agreed: false,
+            };
+        }
+    };
     let bare = |complaint| Outcome {
         links,
         with: 0.0,
