@@ -444,6 +444,12 @@ impl<'a> Transform<'a> {
             "CreateStatement" => self.create_statement(inner),
             "DropStatement" => self.drop_statement(inner),
             "InsertStatement" => self.insert_statement(inner),
+            "UpdateStatement" => self.update_statement(inner),
+            "DeleteStatement" => self.delete_statement(inner),
+            "TruncateStatement" => {
+                let name = self.name_parts(self.find(inner, "BaseTableName"));
+                self.changed_rows(name, NONE, NONE, Vec::new(), true)
+            }
             "SetStatement" => self.set_statement(inner),
             "ResetStatement" => self.reset_statement(inner),
             "PragmaStatement" => self.pragma_statement(inner),
@@ -1017,6 +1023,96 @@ impl<'a> Transform<'a> {
         let index = self.ast.inserts.len() as u32;
         self.ast.inserts.push(Insert { name, columns, source });
         Ok(Statement::Insert(index))
+    }
+
+    /// `UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause FromClause?
+    /// WhereClause? ReturningClause?`.
+    ///
+    /// `WITH`, `FROM`, `RETURNING` and the `(a, b) = row` form are each a refusal for now, since
+    /// every one of them changes which rows change or what comes back. A qualified name after `SET`
+    /// is the pin's own refusal.
+    fn update_statement(&mut self, node: u32) -> Result<Statement> {
+        for name in ["WithClause", "FromClause", "ReturningClause"] {
+            let clause = self.find(node, name);
+            if clause != NONE {
+                return self.unsupported(clause);
+            }
+        }
+        let target = self.first(self.find(node, "UpdateTarget"));
+        let name = self.name_parts(self.find(target, "BaseTableName"));
+        let alias = self.find(target, "UpdateAlias");
+        let alias = if alias == NONE { NONE } else { self.identifier(alias) };
+        let set = self.first(self.find(node, "UpdateSetClause"));
+        if self.name(set) != "UpdateSetElementList" {
+            return self.unsupported(set);
+        }
+        let mut sets = Vec::new();
+        for element in self.kids(set).collect::<Vec<_>>() {
+            let column = self.find(element, "UpdateSetColumnTarget");
+            let dotted = self.find(column, "DotIdentifier");
+            if dotted != NONE {
+                return Err(Error::parser("Qualified column names in UPDATE .. SET not supported"));
+            }
+            let written = self.identifier(self.find(column, "ColumnName"));
+            let value = self.expr(self.find(element, "Expression"))?;
+            sets.push((written, value));
+        }
+        let filter = self.find(node, "WhereClause");
+        self.changed_rows(name, alias, filter, sets, false)
+    }
+
+    /// `DeleteStatement <- WithClause? 'DELETE' 'FROM' TargetOptAlias DeleteUsingClause?
+    /// WhereClause? ReturningClause?`, with `WITH`, `USING` and `RETURNING` refused for now.
+    fn delete_statement(&mut self, node: u32) -> Result<Statement> {
+        for name in ["WithClause", "DeleteUsingClause", "ReturningClause"] {
+            let clause = self.find(node, name);
+            if clause != NONE {
+                return self.unsupported(clause);
+            }
+        }
+        let target = self.find(node, "TargetOptAlias");
+        let name = self.name_parts(self.find(target, "BaseTableName"));
+        let alias = self.find(target, "ColId");
+        let alias = if alias == NONE { NONE } else { self.identifier(alias) };
+        let filter = self.find(node, "WhereClause");
+        self.changed_rows(name, alias, filter, Vec::new(), true)
+    }
+
+    /// The source an `UPDATE` or a `DELETE` is held with, which is `SELECT *, condition, values...
+    /// FROM table`. With no `WHERE` the condition is `TRUE`, since every row is the one meant.
+    fn changed_rows(
+        &mut self,
+        name: Slice,
+        alias: StrRef,
+        filter: u32,
+        sets: Vec<(StrRef, ExprRef)>,
+        delete: bool,
+    ) -> Result<Statement> {
+        let hit = if filter == NONE {
+            self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
+        } else {
+            self.expr(self.first(filter))?
+        };
+        let star =
+            self.push(Expr::Star { qualifier: Slice::default(), replacements: Slice::default() });
+        let mut targets =
+            vec![Target { expr: star, alias: NONE }, Target { expr: hit, alias: NONE }];
+        let mut columns = Vec::with_capacity(sets.len());
+        for (column, value) in sets {
+            columns.push(column);
+            targets.push(Target { expr: value, alias: NONE });
+        }
+        let targets = self.target_slice(targets);
+        let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let start = self.ast.source_lists.len() as u32;
+        self.ast.source_lists.push(source);
+        let from = Slice { start, len: 1 };
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        let source = self.push_query(Query::bare(QueryBody::Select(select)));
+        let columns = self.part_slice(columns);
+        let index = self.ast.inserts.len() as u32;
+        self.ast.inserts.push(Insert { name, columns, source });
+        Ok(if delete { Statement::Delete(index) } else { Statement::Update(index) })
     }
 
     /// `SelectStatementInternal <- WithClause? SelectSetOpChain ResultModifiers?`.
@@ -4078,6 +4174,20 @@ mod tests {
                     out += &format!(" ({columns})");
                 }
                 out + &format!(" {}", show_query(&ast, insert.source))
+            }
+            Statement::Update(index) | Statement::Delete(index) => {
+                let change = ast.insert(index);
+                let columns = ast.name(change.columns).collect::<Vec<_>>().join(", ");
+                format!(
+                    "{} {} ({columns}) {}",
+                    if matches!(ast.statements[0], Statement::Update(_)) {
+                        "UPDATE"
+                    } else {
+                        "DELETE"
+                    },
+                    ast.name_text(change.name),
+                    show_query(&ast, change.source)
+                )
             }
             Statement::Set(index) if ast.setting(index).pragma => {
                 format!("PRAGMA {}", ast.string(ast.setting(index).name))

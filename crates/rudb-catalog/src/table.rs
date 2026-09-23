@@ -1246,6 +1246,26 @@ impl Table {
         self.rows.to_append()?.append_all(chunks, workers)
     }
 
+    /// Swaps every row of the table for these, which is how an `UPDATE` or a `DELETE` lands.
+    ///
+    /// The rows are checked before the old ones are let go, so a refused null leaves the table as
+    /// it was. The new rows live in memory whatever the table was before, and a table that had a
+    /// file behind it is one the file no longer describes, which the next checkpoint writes again.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::append`].
+    pub fn replace_all(&mut self, chunks: Vec<Chunk>, workers: usize) -> Result<()> {
+        for chunk in &chunks {
+            self.refuse_nulls(chunk)?;
+        }
+        let types = self.columns.iter().map(|field| field.ty.clone()).collect();
+        let mut rows = MemoryTable::new(types);
+        rows.append_all(chunks, workers)?;
+        self.rows = Rows::Memory(rows);
+        Ok(())
+    }
+
     /// Adds rows of single values, refusing a null in a column that said it would not have one.
     ///
     /// # Errors

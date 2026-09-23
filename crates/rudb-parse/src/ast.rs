@@ -85,6 +85,15 @@ pub enum Statement {
     DropTable(DropTableRef),
     /// `INSERT INTO`.
     Insert(InsertRef),
+    /// `UPDATE`, held as an [`Insert`] whose columns are the ones `SET` names and whose source is
+    /// `SELECT *, condition, value, ... FROM table`, one value per named column.
+    ///
+    /// The binder knows how wide the table is and the transform does not, so the source carries
+    /// the table's columns, whether the row matched, and the new values side by side, and the
+    /// binder picks each column's new value or its old one out of them.
+    Update(InsertRef),
+    /// `DELETE FROM` and `TRUNCATE`, held the same way as [`Statement::Update`] with no columns.
+    Delete(InsertRef),
     /// `SET name = value`.
     Set(SettingRef),
     /// `RESET name`, which is the same shape with nothing on the right of it.

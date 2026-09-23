@@ -22,7 +22,7 @@ use rudb_common::{
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
-use rudb_plan::{Expr, ExprRef, Node, Plan, SortKey};
+use rudb_plan::{Arm, Expr, ExprRef, Node, Plan, SortKey};
 
 use crate::binder::Binder;
 use crate::parameters::Parameters;
@@ -152,6 +152,9 @@ pub struct Insert {
     /// The rows to append. The output is the table's columns, in the table's order, with the
     /// table's types, so nothing between here and the append has a decision left to make.
     pub source: Plan,
+    /// Whether the rows are the whole table afterwards rather than rows to add to it, which is
+    /// what an `UPDATE` and a `DELETE` bind to.
+    pub replace: bool,
 }
 
 /// Binds one parsed statement against a catalog.
@@ -228,6 +231,8 @@ fn bind_one(
         ast::Statement::CreateView(index) => create_view(ast, catalog, parameters, session, index),
         ast::Statement::DropTable(index) => drop_table(ast, catalog, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
+        ast::Statement::Update(index) => change(ast, catalog, parameters, session, index, false),
+        ast::Statement::Delete(index) => change(ast, catalog, parameters, session, index, true),
         ast::Statement::Set(index) | ast::Statement::Reset(index) => {
             setting(ast, catalog, parameters, session, index)
         }
@@ -676,5 +681,93 @@ fn insert(
     let names = binder.plan_mut().add_name_list(&names);
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
-    Ok(Bound::Insert(Insert { name, source: finish(binder, root)? }))
+    Ok(Bound::Insert(Insert { name, source: finish(binder, root)?, replace: false }))
+}
+
+/// An `UPDATE` or a `DELETE`, bound to the query that produces every row the table has afterwards.
+///
+/// The source the transform built is `SELECT *, condition, values... FROM table`. A row the
+/// condition holds for gets the new values in the named columns, or is left out for a `DELETE`, and
+/// every other row comes through as it was. A null condition is a row that did not match, which is
+/// what a searched `CASE` does with one, so the one expression covers both.
+fn change(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    index: ast::InsertRef,
+    delete: bool,
+) -> Result<Bound> {
+    let written = ast.insert(index);
+    let parts: Vec<&str> = ast.name(written.name).collect();
+    let name = catalog.resolve(&parts)?;
+    if catalog.entry(&name)? == Entry::View {
+        return Err(Error::binder(if delete {
+            "Can only delete from base table"
+        } else {
+            "Can only update base table"
+        }));
+    }
+    let fields: Vec<Field> = catalog.table(&name)?.columns().to_vec();
+    let mut targets: Vec<usize> = Vec::new();
+    for column in ast.name(written.columns) {
+        let at =
+            fields.iter().position(|field| same_name(&field.name, column)).ok_or_else(|| {
+                Error::binder(format!("Referenced update column {column} not found in table!"))
+            })?;
+        if targets.contains(&at) {
+            return Err(Error::binder(format!(
+                "Multiple assignments to same column \"\"{column}\"\""
+            )));
+        }
+        targets.push(at);
+    }
+
+    let mut binder = Binder::with(catalog, parameters, session);
+    let (mut root, scope) = binder.bind_query(ast, written.source)?;
+    let width = fields.len();
+    if scope.len() != width + 1 + targets.len() {
+        return Err(Error::internal(format!(
+            "an UPDATE source of {} columns over a table of {width}",
+            scope.len()
+        )));
+    }
+    let column = |binder: &mut Binder<'_>, at: usize| {
+        let column = &scope.columns[at];
+        binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone())
+    };
+    let hit = column(&mut binder, width);
+    let hit = binder.checked_cast_to(hit, &LogicalType::Boolean, false)?;
+    if delete {
+        let keep = binder.add_constant(Value::Boolean(false));
+        let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then: keep }]);
+        let otherwise = Some(binder.add_constant(Value::Boolean(true)));
+        let predicate =
+            binder.plan_mut().add_expr(Expr::Case { arms, otherwise }, LogicalType::Boolean);
+        root = binder.plan_mut().add_node(Node::Filter { input: root, predicate });
+    }
+    let mut exprs = Vec::with_capacity(width);
+    let mut names = Vec::with_capacity(width);
+    for (at, field) in fields.iter().enumerate() {
+        let old = column(&mut binder, at);
+        let expr = match targets.iter().position(|&target| target == at) {
+            Some(from) => {
+                let new = column(&mut binder, width + 1 + from);
+                let then = binder.checked_cast_to(new, &field.ty, false)?;
+                let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then }]);
+                binder
+                    .plan_mut()
+                    .add_expr(Expr::Case { arms, otherwise: Some(old) }, field.ty.clone())
+            }
+            None => old,
+        };
+        exprs.push(expr);
+        let interned = binder.plan_mut().intern(&field.name);
+        names.push(interned);
+    }
+    let exprs = binder.plan_mut().add_expr_list(&exprs);
+    let names = binder.plan_mut().add_name_list(&names);
+    let index = binder.fresh_index();
+    let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+    Ok(Bound::Insert(Insert { name, source: finish(binder, root)?, replace: true }))
 }
