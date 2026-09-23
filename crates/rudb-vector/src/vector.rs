@@ -2949,7 +2949,47 @@ impl Vector {
         if let Some(gathered) = self.unpacked_at(indices) {
             return Ok(gathered);
         }
+        if let Some(gathered) = self.flat_at(indices) {
+            return Ok(gathered);
+        }
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
+    }
+
+    /// A gather off a flat run of fixed width values with no nulls, every position inside it.
+    ///
+    /// That is what a join hands out on both of its sides, and the general copy below made a run of
+    /// wide positions, walked them for nulls, made a flag per row and a validity out of the flags
+    /// before it moved a value. On q09 at SF1 those passes were about half of the gathers. Here it is
+    /// one pass for the range and one for the values, and `None` for anything else.
+    fn flat_at(&self, indices: &[u32]) -> Option<Self> {
+        let Body::Flat(data) = &self.body else { return None };
+        if self.validity.has_nulls(self.len) {
+            return None;
+        }
+        // The largest position, because a maximum is a loop the compiler vectorizes.
+        if indices.iter().max().is_some_and(|&top| top as usize >= self.len) {
+            return None;
+        }
+        macro_rules! gathered {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match data {
+                    $(Data::$variant(values) => {
+                        let values = values.as_slice();
+                        let out: Vec<$native> =
+                            indices.iter().map(|&index| values[index as usize]).collect();
+                        Data::$variant(Buffer::from_vec(out))
+                    })+
+                    Data::Empty | Data::Varlen(_) => return None,
+                }
+            };
+        }
+        let data = crate::for_each_layout!(fixed, gathered);
+        Some(Self {
+            ty: self.ty.clone(),
+            len: indices.len(),
+            validity: Validity::AllValid,
+            body: Body::Flat(data),
+        })
     }
 
     /// A gather off a stable dictionary, which is its codes gathered over the same values.
@@ -5189,6 +5229,23 @@ mod tests {
             vector.slice(0, 3).unwrap().iter().collect::<Vec<_>>(),
             [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
         );
+    }
+
+    /// The short way through a gather, a flat run with no nulls, answers what the long way does,
+    /// and a position past the end still takes the long way and comes back null.
+    #[test]
+    fn a_gather_off_a_flat_run_with_no_nulls_answers_what_the_general_copy_does() {
+        let rows: Vec<i32> = (0..50).map(|row| row * 3 - 20).collect();
+        let vector = integers(&rows);
+        let positions: Vec<u32> = [49, 0, 7, 7, 31, 2].into_iter().collect();
+        let gathered = vector.gather(&positions).unwrap();
+        assert_eq!(gathered.form(), Form::Flat);
+        assert_eq!(
+            gathered.iter().collect::<Vec<_>>(),
+            positions.iter().map(|&at| Value::Integer(rows[at as usize])).collect::<Vec<_>>()
+        );
+        let past = vector.gather(&[3, 50]).unwrap();
+        assert_eq!(past.iter().collect::<Vec<_>>(), [Value::Integer(-11), Value::Null]);
     }
 
     #[test]
