@@ -14,7 +14,7 @@ use rudb_vector::{Chunk, Form, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
 use crate::held::Held;
-use crate::keys::{Key, Seen};
+use crate::keys::{ForeignKey, Key, Seen};
 use crate::name::{QualifiedName, same_name};
 
 /// Refuses a column list that names the same column twice.
@@ -978,6 +978,8 @@ pub struct Table {
     defaults: Vec<Option<String>>,
     /// The SQL of each `CHECK` constraint, in the order written.
     checks: Vec<String>,
+    /// The foreign keys this table's rows have to meet, in the order written.
+    foreign: Vec<ForeignKey>,
 }
 
 impl Table {
@@ -1003,6 +1005,7 @@ impl Table {
             seen: Vec::new(),
             defaults: Vec::new(),
             checks: Vec::new(),
+            foreign: Vec::new(),
         })
     }
 
@@ -1025,6 +1028,7 @@ impl Table {
             seen: Vec::new(),
             defaults: Vec::new(),
             checks: Vec::new(),
+            foreign: Vec::new(),
         })
     }
 
@@ -1328,6 +1332,17 @@ impl Table {
     /// Declares the table's `CHECK` constraints.
     pub fn set_checks(&mut self, checks: Vec<String>) {
         self.checks = checks;
+    }
+
+    /// The foreign keys this table's rows have to meet, in the order written.
+    #[must_use]
+    pub fn foreign(&self) -> &[ForeignKey] {
+        &self.foreign
+    }
+
+    /// Declares the table's foreign keys.
+    pub fn set_foreign(&mut self, foreign: Vec<ForeignKey>) {
+        self.foreign = foreign;
     }
 
     /// Declares the table's keys, which makes the columns of a primary key `NOT NULL` as well.

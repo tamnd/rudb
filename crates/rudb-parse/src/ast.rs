@@ -198,6 +198,14 @@ pub struct CreateTable {
     /// Every `CHECK` expression, as a run of expressions in the order they were written, whether on
     /// a column or on the table.
     pub checks: Slice,
+    /// The columns of each `FOREIGN KEY`, as a run of name lists in the order written, whether on
+    /// a column or on the table.
+    pub foreign: Slice,
+    /// The table each of `foreign` references, as a run of name lists of its parts.
+    pub foreign_tables: Slice,
+    /// The referenced columns of each of `foreign`, as a run of name lists, an empty one when the
+    /// constraint named none and so means the referenced table's primary key.
+    pub foreign_referenced: Slice,
 }
 
 /// One column of a `CREATE TABLE`.

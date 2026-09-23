@@ -9410,6 +9410,71 @@ fn a_check_constraint_refuses_a_row_that_fails_it_the_way_the_pin_does() {
 }
 
 #[test]
+fn a_foreign_key_holds_from_both_ends_the_way_the_pin_holds_it() {
+    let db = scripted(&[
+        "CREATE TABLE pkt (i INT PRIMARY KEY, j INT UNIQUE, k INT)",
+        "CREATE TABLE fkt (a INT REFERENCES pkt, b INT, FOREIGN KEY (b) REFERENCES pkt (j))",
+        "INSERT INTO pkt VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
+        "INSERT INTO fkt VALUES (1, 20), (NULL, NULL)",
+        "UPDATE pkt SET k = 5 WHERE i = 1",
+        "DELETE FROM pkt WHERE i = 3",
+    ]);
+    let missing = |key: &str| {
+        format!(
+            "Violates foreign key constraint because key \"{key}\" does not exist in the \
+             referenced table"
+        )
+    };
+    let held = |key: &str| {
+        format!(
+            "Violates foreign key constraint because key \"{key}\" is still referenced by a \
+             foreign key in a different table. If this is an unexpected constraint violation, \
+             please refer to our foreign key limitations in the documentation"
+        )
+    };
+    for (statement, message) in [
+        ("INSERT INTO fkt VALUES (4, 10)", missing("i: 4")),
+        ("INSERT INTO fkt VALUES (1, 30)", missing("j: 30")),
+        ("UPDATE fkt SET a = 3 WHERE a = 1", missing("i: 3")),
+        ("UPDATE pkt SET i = 7 WHERE i = 1", held("a: 1")),
+        ("UPDATE pkt SET j = 21 WHERE i = 2", held("b: 20")),
+        ("DELETE FROM pkt", held("a: 1")),
+        (
+            "DROP TABLE pkt",
+            "Could not drop the table because this table is main key table of the table \"fkt\""
+                .into(),
+        ),
+        (
+            "CREATE TABLE f2 (a INT REFERENCES pkt (k))",
+            "Failed to create foreign key: referenced table \"pkt\" does not have a primary key or \
+             unique constraint on the columns k"
+                .into(),
+        ),
+        (
+            "CREATE TABLE f2 (a VARCHAR REFERENCES pkt)",
+            "Failed to create foreign key: incompatible types between column \"i\" (\"INTEGER\") \
+             and column \"a\" (\"VARCHAR\")"
+                .into(),
+        ),
+        (
+            "CREATE TABLE f2 (a INT REFERENCES fkt)",
+            "Failed to create foreign key: there is no primary key for referenced table \"fkt\""
+                .into(),
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    db.execute("DELETE FROM fkt").unwrap();
+    db.execute("DELETE FROM pkt WHERE i = 1").unwrap();
+    db.execute("DROP TABLE fkt").unwrap();
+    db.execute("DROP TABLE pkt").unwrap();
+    let db = scripted(&["CREATE TABLE s (i INT PRIMARY KEY, p INT REFERENCES s (i))"]);
+    assert_eq!(refusal(&db, "INSERT INTO s VALUES (1, 1)"), missing("i: 1"));
+    db.execute("INSERT INTO s VALUES (1, NULL)").unwrap();
+    db.execute("INSERT INTO s VALUES (2, 1)").unwrap();
+}
+
+#[test]
 fn an_insert_that_meets_a_held_key_does_what_its_conflict_clause_says() {
     let db = scripted(&[
         "CREATE TABLE t (i INTEGER PRIMARY KEY, j INTEGER, k INTEGER)",

@@ -425,6 +425,17 @@ impl Catalog {
     /// If there is no such table, or if the name is a view, which is a different sentence because
     /// it is a different mistake.
     pub fn drop_table(&mut self, name: &QualifiedName) -> Result<()> {
+        // A table another one holds a foreign key into stays until that one is gone, which is the
+        // pin's rule and its sentence.
+        let holder = self.tables().find(|table| {
+            table.name() != name && table.foreign().iter().any(|foreign| &foreign.table == name)
+        });
+        if let Some(holder) = holder {
+            return Err(Error::catalog(format!(
+                "Could not drop the table because this table is main key table of the table \"{}\"",
+                holder.name().table
+            )));
+        }
         self.changed();
         self.drop_entry(name, Entry::Table)
     }
