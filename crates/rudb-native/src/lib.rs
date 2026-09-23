@@ -557,11 +557,49 @@ type FrequencyMap<V> = HashMap<u64, V, Spread>;
 
 /// The first pass of [`Writer::numeric_frequency`]: a Misra-Gries candidate table keyed by a value's
 /// sixty four bits, with the null counted beside it.
-#[derive(Debug, Default)]
+///
+/// The table is an open addressed one of its own rather than a `HashMap`. On a column that is near
+/// unique, which `hits` has a dozen of, nearly every row is a value the table has not seen, and a
+/// `HashMap` spent a lookup and then a second hash and probe to insert it, and a `retain` over every
+/// bucket each time the table filled. Those were 6 percent of the CPU of loading the 10m ClickBench
+/// file, and the slowest of those columns decided how long the whole frequency step took. Here a
+/// value is found or given the empty slot it stopped at in one probe, and a decrement rebuilds the
+/// table from the few candidates that outlive it.
+///
+/// What the table holds after a stream of rows is the same set of counts either way, since that is
+/// fixed by the algorithm and not by where the counts live.
+#[derive(Debug)]
 struct Candidates {
-    counts: FrequencyMap<u32>,
+    /// A power of two number of slots, at most half of them in use. A count of zero is an empty
+    /// slot, which no candidate ever is, because one whose count reaches zero is dropped.
+    slots: Vec<Candidate>,
+    held: usize,
     nulls: u32,
     decrements: u64,
+    /// The candidates that outlive a decrement, kept so that each decrement is not an allocation.
+    survivors: Vec<Candidate>,
+}
+
+/// One slot of [`Candidates`], the value's bits beside its count so a probe reads one line.
+#[derive(Debug, Default, Clone, Copy)]
+struct Candidate {
+    bits: u64,
+    count: u32,
+}
+
+/// The slots a candidate table starts with, grown by doubling as it fills.
+const FIRST_CANDIDATE_SLOTS: usize = 64;
+
+impl Default for Candidates {
+    fn default() -> Self {
+        Self {
+            slots: vec![Candidate::default(); FIRST_CANDIDATE_SLOTS],
+            held: 0,
+            nulls: 0,
+            decrements: 0,
+            survivors: Vec::new(),
+        }
+    }
 }
 
 impl Candidates {
@@ -573,33 +611,109 @@ impl Candidates {
     /// can free the place the next row takes.
     fn add(&mut self, bits: Option<u64>, mut times: u32) {
         while times > 0 {
-            let held = match bits {
-                Some(bits) => self.counts.get_mut(&bits),
-                None if self.nulls != 0 => Some(&mut self.nulls),
-                None => None,
-            };
-            if let Some(count) = held {
-                *count = count.saturating_add(times);
-                return;
-            }
-            if self.counts.len() + usize::from(self.nulls != 0) < FREQUENCY_CANDIDATES {
-                match bits {
-                    Some(bits) => {
-                        self.counts.insert(bits, times);
+            let room = self.held + usize::from(self.nulls != 0) < FREQUENCY_CANDIDATES;
+            match bits {
+                Some(bits) => {
+                    let (at, found) = self.find(bits);
+                    if found {
+                        self.slots[at].count = self.slots[at].count.saturating_add(times);
+                        return;
                     }
-                    None => self.nulls = times,
+                    if room {
+                        self.place(at, bits, times);
+                        return;
+                    }
                 }
-                return;
+                None if self.nulls != 0 => {
+                    self.nulls = self.nulls.saturating_add(times);
+                    return;
+                }
+                None if room => {
+                    self.nulls = times;
+                    return;
+                }
+                None => {}
             }
-            self.counts.retain(|_, count| {
-                *count -= 1;
-                *count != 0
-            });
-            self.nulls = self.nulls.saturating_sub(1);
-            self.decrements = self.decrements.saturating_add(1);
+            self.decrement();
             times -= 1;
         }
     }
+
+    /// The slot holding `bits` and `true`, or the empty slot a search for it stopped at and `false`.
+    fn find(&self, bits: u64) -> (usize, bool) {
+        let mask = self.slots.len() - 1;
+        let mut at = home(bits, self.slots.len());
+        loop {
+            let slot = self.slots[at];
+            if slot.count == 0 {
+                return (at, false);
+            }
+            if slot.bits == bits {
+                return (at, true);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Where `bits` is held, for the recount, which reads the table without changing it.
+    fn position(&self, bits: u64) -> Option<usize> {
+        match self.find(bits) {
+            (at, true) => Some(at),
+            (_, false) => None,
+        }
+    }
+
+    /// Puts a new candidate in the empty slot `at`, which a search for it just stopped at, doubling
+    /// the table first when that would fill more than half of it.
+    fn place(&mut self, at: usize, bits: u64, count: u32) {
+        let at = if (self.held + 1) * 2 > self.slots.len() {
+            let wider = self.slots.len() * 2;
+            let old = std::mem::replace(&mut self.slots, vec![Candidate::default(); wider]);
+            for slot in old.into_iter().filter(|slot| slot.count != 0) {
+                let (to, _) = self.find(slot.bits);
+                self.slots[to] = slot;
+            }
+            self.find(bits).0
+        } else {
+            at
+        };
+        self.slots[at] = Candidate { bits, count };
+        self.held += 1;
+    }
+
+    /// Takes one from every candidate and the null, dropping the ones that reach zero.
+    fn decrement(&mut self) {
+        let mut survivors = std::mem::take(&mut self.survivors);
+        survivors.clear();
+        survivors.extend(
+            self.slots
+                .iter()
+                .filter(|slot| slot.count > 1)
+                .map(|slot| Candidate { bits: slot.bits, count: slot.count - 1 }),
+        );
+        self.slots.fill(Candidate::default());
+        self.held = survivors.len();
+        for &slot in &survivors {
+            let (at, _) = self.find(slot.bits);
+            self.slots[at] = slot;
+        }
+        self.survivors = survivors;
+        self.nulls = self.nulls.saturating_sub(1);
+        self.decrements = self.decrements.saturating_add(1);
+    }
+
+    /// Every candidate's bits and count, in no particular order.
+    fn pairs(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
+        self.slots.iter().filter(|slot| slot.count != 0).map(|slot| (slot.bits, slot.count))
+    }
+}
+
+/// The slot a search for `bits` starts at in a table of `slots`, a power of two.
+///
+/// The top bits of a multiply by the golden ratio, which every bit of the value reaches, so a
+/// timestamp column whose values are all multiples of a million still spreads over the table.
+fn home(bits: u64, slots: usize) -> usize {
+    (bits.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - slots.trailing_zeros())) as usize
 }
 
 /// Equal rows in a row, gathered so they are counted once.
@@ -2559,15 +2673,15 @@ impl Writer {
         if let Some((bits, times)) = run.take() {
             first.add(bits, times);
         }
-        let Candidates { counts: candidates, nulls, decrements } = first;
+        let (nulls, decrements) = (first.nulls, first.decrements);
         let (exact, null_count) = if decrements == 0 {
-            let exact = candidates
-                .into_iter()
+            let exact = first
+                .pairs()
                 .map(|(bits, count)| (bits, u64::from(count)))
                 .collect::<FrequencyMap<_>>();
             (exact, (nulls != 0).then_some(u64::from(nulls)))
         } else {
-            let mut lower = candidates.values().copied().collect::<Vec<_>>();
+            let mut lower = first.pairs().map(|(_, count)| count).collect::<Vec<_>>();
             if nulls != 0 {
                 lower.push(nulls);
             }
@@ -2577,12 +2691,13 @@ impl Writer {
             {
                 return Ok((None, distinct.count()));
             }
-            let mut exact =
-                candidates.into_keys().map(|bits| (bits, 0_u64)).collect::<FrequencyMap<_>>();
+            // Counted beside the slot each candidate sits in, since the table is not changed again
+            // and a lookup in it is the one probe the first pass made.
+            let mut recounts = vec![0_u64; first.slots.len()];
             let mut null_count = (nulls != 0).then_some(0_u64);
             let mut recount = |bits: Option<u64>, times: u32| {
                 let held = match bits {
-                    Some(bits) => exact.get_mut(&bits),
+                    Some(bits) => first.position(bits).map(|at| &mut recounts[at]),
                     None => null_count.as_mut(),
                 };
                 if let Some(count) = held {
@@ -2598,6 +2713,13 @@ impl Writer {
             if let Some((bits, times)) = run.take() {
                 recount(bits, times);
             }
+            let exact = first
+                .slots
+                .iter()
+                .zip(&recounts)
+                .filter(|(slot, _)| slot.count != 0)
+                .map(|(slot, &count)| (slot.bits, count))
+                .collect::<FrequencyMap<_>>();
             (exact, null_count)
         };
         let mut entries = exact
@@ -13373,9 +13495,98 @@ mod tests {
         }
         assert!(runs < rows.len() / 2, "the rows came in runs");
         assert!(by_row.decrements > 0, "the table filled and turned values away");
-        assert_eq!(by_run.counts, by_row.counts);
+        assert_eq!(sorted_candidates(&by_run), sorted_candidates(&by_row));
         assert_eq!(by_run.nulls, by_row.nulls);
         assert_eq!(by_run.decrements, by_row.decrements);
+    }
+
+    fn sorted_candidates(candidates: &Candidates) -> Vec<(u64, u32)> {
+        let mut pairs = candidates.pairs().collect::<Vec<_>>();
+        pairs.sort_unstable();
+        assert_eq!(pairs.len(), candidates.held, "the count of held slots drifted");
+        pairs
+    }
+
+    /// The Misra-Gries table as it was written over a `HashMap`, kept as the oracle the open
+    /// addressed one has to agree with.
+    #[derive(Default)]
+    struct MapCandidates {
+        counts: HashMap<u64, u32>,
+        nulls: u32,
+        decrements: u64,
+    }
+
+    impl MapCandidates {
+        fn add(&mut self, bits: Option<u64>, mut times: u32) {
+            while times > 0 {
+                let held = match bits {
+                    Some(bits) => self.counts.get_mut(&bits),
+                    None if self.nulls != 0 => Some(&mut self.nulls),
+                    None => None,
+                };
+                if let Some(count) = held {
+                    *count = count.saturating_add(times);
+                    return;
+                }
+                if self.counts.len() + usize::from(self.nulls != 0) < FREQUENCY_CANDIDATES {
+                    match bits {
+                        Some(bits) => {
+                            self.counts.insert(bits, times);
+                        }
+                        None => self.nulls = times,
+                    }
+                    return;
+                }
+                self.counts.retain(|_, count| {
+                    *count -= 1;
+                    *count != 0
+                });
+                self.nulls = self.nulls.saturating_sub(1);
+                self.decrements = self.decrements.saturating_add(1);
+                times -= 1;
+            }
+        }
+    }
+
+    /// Near unique values, a few heavy ones, nulls, and runs, through enough rows that the table
+    /// fills, grows through every size and is decremented many times over. Both tables have to hold
+    /// the same candidates with the same counts at the end, and at points along the way.
+    #[test]
+    fn the_open_addressed_candidates_agree_with_the_map_they_replaced() {
+        for seed in [0x2545_f491_4f6c_dd1d_u64, 0x9e37_79b9_7f4a_7c15, 7] {
+            let mut table = Candidates::default();
+            let mut oracle = MapCandidates::default();
+            let mut state = seed;
+            for index in 0..300_000_u64 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let bits = match state % 13 {
+                    0 => None,
+                    1..=4 => Some(state % 40),
+                    5 => Some((index % 1000) * 1_000_000),
+                    _ => Some(state),
+                };
+                let times = 1 + (state >> 60) as u32 % 3;
+                table.add(bits, times);
+                oracle.add(bits, times);
+                if index % 50_000 == 0 {
+                    let mut expected =
+                        oracle.counts.iter().map(|(&b, &c)| (b, c)).collect::<Vec<_>>();
+                    expected.sort_unstable();
+                    assert_eq!(sorted_candidates(&table), expected, "seed {seed} row {index}");
+                }
+            }
+            let mut expected = oracle.counts.iter().map(|(&b, &c)| (b, c)).collect::<Vec<_>>();
+            expected.sort_unstable();
+            assert_eq!(sorted_candidates(&table), expected, "seed {seed}");
+            assert_eq!(table.nulls, oracle.nulls, "seed {seed}");
+            assert_eq!(table.decrements, oracle.decrements, "seed {seed}");
+            assert!(table.decrements > 0, "seed {seed} never filled the table");
+            for &(bits, _) in &expected {
+                assert!(table.position(bits).is_some(), "seed {seed} lost {bits}");
+            }
+        }
     }
 
     #[test]
