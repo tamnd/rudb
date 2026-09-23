@@ -14,7 +14,7 @@
 use rudb_common::{Error, LogicalType, Result, Value};
 
 use crate::selection::Selection;
-use crate::vector::{VECTOR_SIZE, Vector};
+use crate::vector::{Form, VECTOR_SIZE, Vector};
 
 /// A batch of columns of equal length.
 #[derive(Debug, Clone, PartialEq)]
@@ -226,7 +226,10 @@ impl Chunk {
         let codes = selection.indices();
         let mut columns = Vec::with_capacity(self.columns.len());
         for column in self.columns {
-            if column.stable_dictionary_parts().is_some() {
+            // A packed column read through a dictionary is unpacked again by every reader, and
+            // unpacking it once here costs what one of those reads does. So it is copied out, which
+            // is never worse than selecting it once anything reads it and better as soon as two do.
+            if column.stable_dictionary_parts().is_some() || column.form() == Form::BitPacked {
                 columns.push(column.gather(codes)?);
             } else {
                 columns.push(Vector::dictionary(codes.to_vec(), column)?);

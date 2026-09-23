@@ -45,6 +45,7 @@ use rudb_vector::{Assembly, Chunk, Selection, Vector};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::fused::Fused;
 use crate::lambda::{Lambda, lambda_call};
 use crate::ordering::Ordering;
 use crate::schema::Schema;
@@ -94,6 +95,9 @@ pub struct Prepared {
     /// The step already compiled for each shared plan expression.
     shared: HashMap<ExprRef, usize>,
     share: bool,
+    /// Whether a tree of decimal arithmetic is run as one [`Fused`] step. Off only for the steps a
+    /// fused one falls back to, which would otherwise fuse themselves again.
+    fuse: bool,
     /// The parsed zone used only by casts whose answer depends on the session.
     time_zone: SessionTimeZone,
 }
@@ -192,6 +196,17 @@ enum Step {
         otherwise: Option<Prepared>,
         /// How to answer it as codes, for the shape that can be. Absent means read the values.
         blend: Option<Blend>,
+    },
+    /// A tree of decimal arithmetic over columns and literals, run as one loop when the columns'
+    /// ranges prove it cannot overflow.
+    ///
+    /// The fallback is the same tree prepared the ordinary way, nested for the reason a case's
+    /// branches are, and it is what runs over a chunk the ranges do not settle.
+    Fused {
+        /// The program.
+        fused: Box<Fused>,
+        /// The steps it replaced.
+        fallback: Box<Prepared>,
     },
     /// A call to a function that takes a lambda, whose body is a prepared expression of its own.
     ///
@@ -307,6 +322,16 @@ impl Prepared {
     }
 
     fn build(plan: &Plan, exprs: &[ExprRef], schema: &Schema, share: bool) -> Result<Self> {
+        Self::built(plan, exprs, schema, share, true)
+    }
+
+    fn built(
+        plan: &Plan,
+        exprs: &[ExprRef],
+        schema: &Schema,
+        share: bool,
+        fuse: bool,
+    ) -> Result<Self> {
         let mut prepared = Self {
             steps: Vec::new(),
             types: Vec::new(),
@@ -316,6 +341,7 @@ impl Prepared {
             roots: Vec::new(),
             shared: HashMap::new(),
             share,
+            fuse,
             time_zone: SessionTimeZone::default(),
         };
         for &expr in exprs {
@@ -337,8 +363,10 @@ impl Prepared {
     fn set_time_zone(&mut self, time_zone: SessionTimeZone) {
         self.time_zone = time_zone;
         for step in &mut self.steps {
-            if let Step::Lambda { body, .. } = step {
-                body.set_time_zone(time_zone);
+            match step {
+                Step::Lambda { body, .. } => body.set_time_zone(time_zone),
+                Step::Fused { fallback, .. } => fallback.set_time_zone(time_zone),
+                _ => {}
             }
         }
     }
@@ -363,8 +391,9 @@ impl Prepared {
     /// Visits the steps one step reads, whatever shape its operands are held in.
     fn for_each_operand(&self, index: usize, mut visit: impl FnMut(usize)) {
         match &self.steps[index] {
-            // A case's branches are arrays of their own and read nothing out of this one.
-            Step::Column(_) | Step::Constant(_) | Step::Case { .. } => {}
+            // A case's branches are arrays of their own and read nothing out of this one, and a
+            // fused tree reads its columns straight out of the chunk.
+            Step::Column(_) | Step::Constant(_) | Step::Case { .. } | Step::Fused { .. } => {}
             Step::Cast { input, .. } | Step::InSet { input, .. } => visit(*input),
             Step::Lambda { inputs, .. } => inputs.iter().for_each(|&input| visit(input)),
             Step::Compare { left, right, .. } => {
@@ -419,6 +448,12 @@ impl Prepared {
     #[cfg(test)]
     fn sets(&self) -> usize {
         self.steps.iter().filter(|step| matches!(step, Step::InSet { .. })).count()
+    }
+
+    /// How many of the steps are a tree of decimal arithmetic run as one loop.
+    #[cfg(test)]
+    fn fused(&self) -> usize {
+        self.steps.iter().filter(|step| matches!(step, Step::Fused { .. })).count()
     }
 
     /// How many of the function steps worked something out when this was built.
@@ -714,6 +749,9 @@ impl Prepared {
             // A run of the body per element, which is several a row, and a list to take apart and
             // put back together around it.
             Step::Lambda { .. } => 16.0,
+            // An integer operation a row per node and no check, which is a quarter of what the
+            // function steps it replaced cost each.
+            Step::Fused { fused, .. } => fused.len() as f64,
         }
     }
 
@@ -848,6 +886,10 @@ impl Prepared {
             Step::Case { arms, otherwise, blend } => {
                 Some(self.case(chunk, arms, otherwise.as_ref(), blend.as_ref(), ty)?)
             }
+            Step::Fused { fused, fallback } => Some(match fused.run(chunk) {
+                Some(answer) => answer,
+                None => fallback.evaluate_one(chunk, &mut fallback.scratch())?.clone(),
+            }),
             Step::Lambda { inputs, runner, body } => {
                 let mut operands = Vec::with_capacity(inputs.len());
                 for &input in inputs {
@@ -1032,6 +1074,13 @@ impl Prepared {
             }
         }
         let ty = plan.expr_type(expr).clone();
+        if self.fuse {
+            if let Some(fused) = Fused::compile(plan, expr, schema) {
+                let fallback = Self::built(plan, &[expr], schema, false, false)?;
+                let step = Step::Fused { fused: Box::new(fused), fallback: Box::new(fallback) };
+                return Ok(self.place(plan, expr, step, ty));
+            }
+        }
         let step = match *plan.expr(expr) {
             Expr::Column(binding) => {
                 let position = schema.position_of(binding).ok_or_else(|| {
@@ -1127,6 +1176,11 @@ impl Prepared {
                 Step::Case { arms: prepared, otherwise, blend }
             }
         };
+        Ok(self.place(plan, expr, step, ty))
+    }
+
+    /// Appends a built step and answers its index.
+    fn place(&mut self, plan: &Plan, expr: ExprRef, step: Step, ty: LogicalType) -> usize {
         self.steps.push(step);
         self.types.push(ty);
         self.spans.push(plan.expr_span(expr));
@@ -1134,7 +1188,7 @@ impl Prepared {
         if self.share {
             self.shared.insert(expr, step);
         }
-        Ok(step)
+        step
     }
 
     /// Flattens a list of expressions and records where its operand run starts and how long it is.
@@ -1526,6 +1580,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Three decimal columns of TPC-H's shape, in the form `form` puts them in.
+    fn decimals(prices: &[i128], form: fn(Vector) -> Vector) -> (Schema, Chunk) {
+        let ty = LogicalType::Decimal { width: 15, scale: 2 };
+        let schema = Schema::numbered(
+            vec![
+                Field::new("p", ty.clone()),
+                Field::new("d", ty.clone()),
+                Field::new("t", ty.clone()),
+            ],
+            0,
+        );
+        let column =
+            |values: Vec<Value>| form(Vector::from_values(ty.clone(), &values).expect("decimals"));
+        let decimal = |unscaled| Value::Decimal { unscaled, width: 15, scale: 2 };
+        let p = column(prices.iter().map(|&v| decimal(v)).collect());
+        let d = column((0..prices.len() as i128).map(|v| decimal(v % 11)).collect());
+        let t = column((0..prices.len() as i128).map(|v| decimal(v % 9)).collect());
+        (schema, Chunk::new(vec![p, d, t]).expect("three columns"))
+    }
+
+    /// q01's charge, as the binder writes it.
+    const CHARGE: &str = "\"*\"(\"*\"(CAST(#0.0::DECIMAL(15,2))::DECIMAL(18,2), \
+        CAST(\"-\"(1.00::DECIMAL(16,2), CAST(#0.1::DECIMAL(15,2))::DECIMAL(16,2))::DECIMAL(16,2))\
+        ::DECIMAL(18,2))::DECIMAL(18,4), CAST(\"+\"(1.00::DECIMAL(16,2), \
+        CAST(#0.2::DECIMAL(15,2))::DECIMAL(16,2))::DECIMAL(16,2))::DECIMAL(18,2))::DECIMAL(18,6) AS a";
+
+    /// The fused answer, the unfused one and the tree walk's, over one chunk.
+    fn three_ways(chunk: &Chunk, schema: &Schema) -> [rudb_common::Result<Vec<Value>>; 3] {
+        let text = format!(
+            "Project #1 [{CHARGE}]\n  Get memory.main.t AS t #0 \
+             [p::DECIMAL(15,2), d::DECIMAL(15,2), t::DECIMAL(15,2)]"
+        );
+        let plan = Plan::parse(&text).expect("a well formed plan");
+        let Node::Project { exprs, .. } = *plan.node(plan.root()) else {
+            panic!("the root of that text is a projection");
+        };
+        let expr = plan.expr_list(exprs)[0];
+        let values = |vector: &Vector| (0..chunk.len()).map(|row| vector.value_at(row)).collect();
+        let fused = Prepared::one(&plan, expr, schema).expect("resolves");
+        assert_eq!(fused.fused(), 1, "the whole tree is one step");
+        let unfused = Prepared::built(&plan, &[expr], schema, false, false).expect("resolves");
+        assert_eq!(unfused.fused(), 0);
+        let run = |prepared: &Prepared| {
+            prepared.evaluate_one(chunk, &mut prepared.scratch()).map(&values)
+        };
+        [run(&fused), run(&unfused), evaluate(&plan, expr, schema, chunk).map(|v| values(&v))]
+    }
+
+    fn all_agree(chunk: &Chunk, schema: &Schema) {
+        let [fused, unfused, walked] = three_ways(chunk, schema);
+        let fused = fused.expect("fits");
+        assert_eq!(fused, unfused.expect("fits"));
+        assert_eq!(fused, walked.expect("fits"));
+    }
+
+    #[test]
+    fn decimal_arithmetic_run_as_one_loop_agrees_in_every_form() {
+        let prices: Vec<i128> = (0..2500).map(|v| 90_000 + v * 37).collect();
+        let packed = |vector: Vector| vector.bit_packed().expect("packs");
+        let coded = |vector: Vector| {
+            let rows = vector.len();
+            let codes = (0..rows as u32).rev().collect();
+            Vector::dictionary(codes, vector.bit_packed().expect("packs")).expect("in range")
+        };
+        // Codes too far apart for a block to unpack the run they cover.
+        let scattered = |vector: Vector| {
+            let rows = vector.len() as u32;
+            let codes = (0..rows).map(|row| row * 997 % rows).collect();
+            Vector::dictionary(codes, vector.bit_packed().expect("packs")).expect("in range")
+        };
+        for form in [std::convert::identity, packed, coded, scattered] {
+            let (schema, chunk) = decimals(&prices, form);
+            all_agree(&chunk, &schema);
+        }
+    }
+
+    #[test]
+    fn a_chunk_the_ranges_cannot_prove_raises_what_the_steps_raise() {
+        // The large price in the second block, so a flat column gets as far as running the first.
+        let mut prices = vec![5; 300];
+        prices.push(999_999_999_999_999);
+        let packed = |vector: Vector| vector.bit_packed().expect("packs");
+        for form in [std::convert::identity, packed] {
+            let (schema, chunk) = decimals(&prices, form);
+            let [fused, unfused, _] = three_ways(&chunk, &schema);
+            let (fused, unfused) = (fused.expect_err("overflows"), unfused.expect_err("overflows"));
+            assert_eq!(fused.message(), unfused.message());
+        }
+    }
+
+    #[test]
+    fn a_chunk_with_a_null_goes_through_the_steps() {
+        let ty = LogicalType::Decimal { width: 15, scale: 2 };
+        let (schema, mut chunk) = decimals(&[100, 200, 300], std::convert::identity);
+        let with_null = Vector::from_values(
+            ty,
+            &[Value::Decimal { unscaled: 5, width: 15, scale: 2 }, Value::Null, Value::Null],
+        )
+        .expect("decimals");
+        chunk = Chunk::new(vec![
+            chunk.column(0).expect("p").clone(),
+            with_null,
+            chunk.column(2).expect("t").clone(),
+        ])
+        .expect("three columns");
+        all_agree(&chunk, &schema);
     }
 
     #[test]

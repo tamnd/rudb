@@ -2946,6 +2946,9 @@ impl Vector {
         if let Body::Dictionary { codes, values, stable: true } = &self.body {
             return self.stable_gathered(codes, values, indices, |index| index as usize);
         }
+        if let Some(gathered) = self.unpacked_at(indices) {
+            return Ok(gathered);
+        }
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
     }
 
@@ -3010,6 +3013,51 @@ impl Vector {
         let highest = (values.is_empty() && !gathered.is_empty()).then_some(0);
         Ok(Self::stable_dictionary_validated(gathered, Arc::clone(values), highest)?
             .with_validity(validity))
+    }
+
+    /// A packed column's rows at `indices`, unpacked in bulk into a flat column.
+    ///
+    /// The general copy reads a packed row a code at a time, which is what [`Packed::codes_at`]
+    /// exists to avoid. `None` for anything but a packed column with no nulls, every index in range
+    /// and both ends of its range inside an `i64`, which is every packed column of TPC-H.
+    fn unpacked_at(&self, indices: &[u32]) -> Option<Self> {
+        let Body::Packed { words, width, base, offset } = &self.body else {
+            return None;
+        };
+        if self.validity.has_nulls(self.len) {
+            return None;
+        }
+        let highest = indices.iter().copied().fold(0, u32::max) as usize;
+        if !indices.is_empty() && highest >= self.len {
+            return None;
+        }
+        let packed = Packed { words, width: *width, base: *base, offset: *offset };
+        let low = i64::try_from(packed.base()).ok()?;
+        i64::try_from(packed.ceiling()).ok()?;
+        let codes = packed.codes_at(|index| indices[index] as usize, indices.len());
+        // Every value is between the two ends, which both fit, so the add lands without wrapping
+        // and the narrowing below keeps every value, since the layout was chosen to hold them.
+        #[expect(clippy::cast_possible_wrap, reason = "a code is below the span, which fits")]
+        let value = |code: u64| low.wrapping_add(code as i64);
+        #[expect(clippy::cast_possible_truncation, reason = "the layout holds every value")]
+        let data = match self.ty.physical() {
+            rudb_common::PhysicalType::Int64 => {
+                Data::Int64(codes.iter().map(|&code| value(code)).collect())
+            }
+            rudb_common::PhysicalType::Int32 => {
+                Data::Int32(codes.iter().map(|&code| value(code) as i32).collect())
+            }
+            rudb_common::PhysicalType::Int16 => {
+                Data::Int16(codes.iter().map(|&code| value(code) as i16).collect())
+            }
+            _ => return None,
+        };
+        Some(Self {
+            ty: self.ty.clone(),
+            len: indices.len(),
+            validity: Validity::AllValid,
+            body: Body::Flat(data),
+        })
     }
 
     /// The copy both [`Self::gather`] and [`Self::flatten`] are.
