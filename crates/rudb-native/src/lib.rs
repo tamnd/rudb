@@ -176,6 +176,11 @@ const FREQUENCY_TEXT_BUDGET: usize = 1024 * 1024;
 /// on a narrow machine would be worse than waiting.
 const MAX_FREQUENCY_WORKERS: usize = 32;
 
+/// How many threads the passes at the end of a commit are spread over on this machine.
+fn close_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from).min(MAX_FREQUENCY_WORKERS)
+}
+
 /// The most threads one stripe's encode is spread over.
 ///
 /// Higher than the frequency cap because this is the load itself rather than a pass at the end of
@@ -1226,30 +1231,90 @@ impl GlobalDictionary {
     /// the worst ClickBench column, and five columns of that at once is the peak this was all meant
     /// to remove.
     ///
-    /// The blocks already written are read back out of `file`, a block at a time, so what this holds
-    /// beyond the answer is one encoded block. They were written moments or minutes ago and are
-    /// almost always still in the page cache, so this is a copy rather than a read of the disk.
+    /// The blocks are spread over threads instead. Each block's decoded length is already known from
+    /// the ends of its values, so the answer is laid out before anything is decoded and every thread
+    /// decodes its own run of blocks straight into its own part of it. On the 10m ClickBench sample
+    /// this was a second of the close for `URL` alone, on one core of thirty two, and the close is
+    /// what a load waits on once its stripes are written.
+    ///
+    /// The blocks already written are read back out of `file`, so what a thread holds beyond the
+    /// answer is one encoded block. They were written moments or minutes ago and are almost always
+    /// still in the page cache, so this is a copy rather than a read of the disk.
     fn decoded(&self, file: Option<&File>) -> Result<(Vec<u8>, Vec<u64>)> {
-        let mut flat = Vec::new();
-        let mut bases = Vec::with_capacity(self.encoded());
-        let mut stored = Vec::new();
-        for place in &self.placed {
-            let file =
-                file.ok_or_else(|| Error::internal("a written dictionary block has no file"))?;
-            let length = usize::try_from(place.length)
-                .map_err(|_| invalid("global dictionary block does not fit in memory"))?;
-            stored.resize(length, 0);
-            read_at(file, place.start, &mut stored)?;
-            if checksum(&stored) != place.hash {
-                return Err(invalid("a global dictionary block did not read back as written"));
+        let count = self.placed.len() + self.blocks.len();
+        if count != self.values().div_ceil(TEXT_PAYLOAD_VALUES) {
+            return Err(invalid("global dictionary blocks do not cover its values"));
+        }
+        let mut bases = Vec::with_capacity(count);
+        let mut total = 0_usize;
+        for block in 0..count {
+            bases.push(total as u64);
+            let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(self.values()) - 1;
+            total = total
+                .checked_add(self.ends[last] as usize)
+                .ok_or_else(|| invalid("global dictionary does not fit in memory"))?;
+        }
+        let mut flat = vec![0_u8; total];
+        let mut outs = Vec::with_capacity(count);
+        let mut rest = flat.as_mut_slice();
+        for block in 0..count {
+            let end = bases.get(block + 1).map_or(total, |&base| base as usize);
+            let (out, after) = rest.split_at_mut(end - bases[block] as usize);
+            outs.push((block, out));
+            rest = after;
+        }
+        let one = |run: &mut [(usize, &mut [u8])]| -> Result<()> {
+            let mut stored = Vec::new();
+            for (block, out) in run {
+                let encoded = match self.placed.get(*block) {
+                    Some(place) => {
+                        let file = file.ok_or_else(|| {
+                            Error::internal("a written dictionary block has no file")
+                        })?;
+                        let length = usize::try_from(place.length).map_err(|_| {
+                            invalid("global dictionary block does not fit in memory")
+                        })?;
+                        stored.resize(length, 0);
+                        read_at(file, place.start, &mut stored)?;
+                        if checksum(&stored) != place.hash {
+                            return Err(invalid(
+                                "a global dictionary block did not read back as written",
+                            ));
+                        }
+                        stored.as_slice()
+                    }
+                    None => &self.blocks[*block - self.placed.len()],
+                };
+                let decoded = string::decode_flat(encoded)?;
+                if decoded.bytes().len() != out.len() {
+                    return Err(invalid(
+                        "a global dictionary block is not the length its ends say",
+                    ));
+                }
+                out.copy_from_slice(decoded.bytes());
             }
-            bases.push(flat.len() as u64);
-            flat.extend_from_slice(&string::decode_flat(&stored)?.into_bytes());
+            Ok(())
+        };
+        // Sixteen blocks a thread at the least, because a thread costs about what decoding a few
+        // blocks does and most columns have one or two.
+        let workers = close_workers().min(count / 16).max(1);
+        if workers <= 1 {
+            one(&mut outs)?;
+        } else {
+            let per = count.div_ceil(workers);
+            std::thread::scope(|scope| {
+                outs.chunks_mut(per)
+                    .map(|run| scope.spawn(|| one(run)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .try_for_each(|handle| {
+                        handle.join().map_err(|_| {
+                            Error::internal("a global dictionary decode worker panicked")
+                        })?
+                    })
+            })?;
         }
-        for block in &self.blocks {
-            bases.push(flat.len() as u64);
-            flat.extend_from_slice(&string::decode_flat(block)?.into_bytes());
-        }
+        drop(outs);
         Ok((flat, bases))
     }
 
@@ -1291,7 +1356,7 @@ impl GlobalDictionary {
             flat.get(from..to).unwrap_or_default()
         };
         let mut codes = (0..self.values() as u32).collect::<Vec<_>>();
-        sort_by_value(&mut codes, value);
+        sort_by_value_across(&mut codes, value, close_workers());
         let order = codes.into_iter().map(|code| (head(value(code)), code)).collect();
         Ok((order, flat, bases))
     }
@@ -7959,6 +8024,111 @@ fn sort_by_value<'a>(codes: &mut [u32], values: impl Fn(u32) -> &'a [u8]) {
     }
 }
 
+/// How few codes are worth sorting on more than one thread.
+const PARALLEL_SORT_MIN: usize = 1 << 16;
+
+/// How many buckets a thread gets in [`sort_by_value_across`], so that a thread that drew a slow
+/// bucket is not what the others wait for.
+const BUCKETS_PER_WORKER: usize = 4;
+
+/// How many sampled codes stand for each bucket when the splitters are picked.
+const SAMPLES_PER_BUCKET: usize = 32;
+
+/// [`sort_by_value`] over `workers` threads, with the same answer.
+///
+/// A sample sort. A sample of the codes is sorted and cut into as many equal runs as there are
+/// buckets, and the values at the cuts are the splitters. Every code goes to the bucket its value
+/// falls in by a binary search of the splitters, the buckets are laid end to end in splitter order,
+/// and each bucket is then sorted on its own by whichever thread takes it. Every value in a bucket
+/// sorts after every value in the bucket before, so the buckets sorted one by one are the codes
+/// sorted.
+///
+/// The answer is the one [`sort_by_value`] gives down to the order of equal values, not only the
+/// order of different ones. A global dictionary holds each value once, so there are none, but the
+/// sort does not rely on it: equal values land in the same bucket in code order, which is the order
+/// [`sort_by_value`] leaves them in, since the code is the last thing it sorts on.
+///
+/// On the 10m ClickBench sample the close sorts five columns of one to three and a half million
+/// distinct values, one column at a time, and until this each sort ran on one thread while the
+/// other thirty one waited for it.
+fn sort_by_value_across<'a>(
+    codes: &mut [u32],
+    values: impl Fn(u32) -> &'a [u8] + Sync,
+    workers: usize,
+) {
+    if workers <= 1 || codes.len() < PARALLEL_SORT_MIN {
+        sort_by_value(codes, values);
+        return;
+    }
+    let buckets = workers * BUCKETS_PER_WORKER;
+    let wanted = buckets * SAMPLES_PER_BUCKET;
+    let mut sample = (0..wanted).map(|at| codes[at * codes.len() / wanted]).collect::<Vec<_>>();
+    sort_by_value(&mut sample, &values);
+    let splitters =
+        (1..buckets).map(|cut| values(sample[cut * sample.len() / buckets])).collect::<Vec<_>>();
+    let values = &values;
+    let splitters = &splitters;
+    let per = codes.len().div_ceil(workers);
+    // Which bucket each code goes to, a run of the codes per thread.
+    let places = std::thread::scope(|scope| {
+        codes
+            .chunks(per)
+            .map(|run| {
+                scope.spawn(move || {
+                    run.iter()
+                        .map(|&code| {
+                            let value = values(code);
+                            splitters.partition_point(|splitter| *splitter <= value) as u32
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|handle| {
+                handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut starts = vec![0_usize; buckets + 1];
+    for &place in &places {
+        starts[place as usize + 1] += 1;
+    }
+    for bucket in 0..buckets {
+        starts[bucket + 1] += starts[bucket];
+    }
+    let mut laid = vec![0_u32; codes.len()];
+    let mut next = starts.clone();
+    for (&code, &place) in codes.iter().zip(&places) {
+        laid[next[place as usize]] = code;
+        next[place as usize] += 1;
+    }
+    drop(places);
+    let mut runs = Vec::with_capacity(buckets);
+    let mut rest = laid.as_mut_slice();
+    for bucket in 0..buckets {
+        let (run, after) = rest.split_at_mut(starts[bucket + 1] - starts[bucket]);
+        runs.push(run);
+        rest = after;
+    }
+    // The largest buckets first, since they are taken from the back.
+    runs.sort_by_key(|run| run.len());
+    let queue = Mutex::new(runs);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let taken =
+                        queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop();
+                    let Some(run) = taken else { break };
+                    sort_by_value(run, values);
+                }
+            });
+        }
+    });
+    codes.copy_from_slice(&laid);
+}
+
 /// The first eight bytes of a value as an integer that sorts the way the bytes sort.
 fn head(bytes: &[u8]) -> u64 {
     let mut word = [0; 8];
@@ -8931,6 +9101,40 @@ mod tests {
         assert_eq!(checksum(b""), 0xef46_db37_51d8_e999);
         assert_eq!(checksum(b"a"), 0xd24e_c4f1_a98c_6e5b);
         assert_eq!(checksum(b"abc"), 0x44bc_2cf5_ad77_0999);
+    }
+
+    #[test]
+    fn sorting_across_threads_matches_sorting_on_one() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut values = Vec::new();
+        for at in 0..150_000_u64 {
+            let value = match next() % 6 {
+                0 => Vec::new(),
+                1 => format!("https://example.com/{}", next() % 5_000).into_bytes(),
+                2 => format!("https://example.com/path/{at}").into_bytes(),
+                3 => b"same".to_vec(),
+                4 => vec![0xff; (next() % 12) as usize],
+                _ => (0..next() % 20).map(|_| (next() % 3) as u8).collect(),
+            };
+            values.push(value);
+        }
+        let value = |code: u32| values[code as usize].as_slice();
+        for workers in [1, 2, 3, 8, 32] {
+            let mut one = (0..values.len() as u32).rev().collect::<Vec<_>>();
+            let mut across = one.clone();
+            sort_by_value(&mut one, value);
+            sort_by_value_across(&mut across, value, workers);
+            assert_eq!(one, across, "{workers} workers");
+        }
+        let mut sorted = (0..values.len() as u32).collect::<Vec<_>>();
+        sort_by_value_across(&mut sorted, value, 8);
+        assert!(sorted.windows(2).all(|pair| value(pair[0]) <= value(pair[1])));
     }
 
     fn path(label: &str) -> PathBuf {
@@ -11530,6 +11734,59 @@ mod tests {
                 );
             }
         }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A dictionary large enough to be decoded and sorted on several threads ranks the way one small
+    /// enough for one thread does.
+    ///
+    /// Seventy thousand values over sixty nine blocks, in no order and each four times over so the
+    /// column is worth a dictionary, written and ranked in the close.
+    /// Some share a long prefix and some differ only in the last byte, so the buckets of the sort cut
+    /// through runs of values that agree for a long way.
+    #[test]
+    fn a_large_dictionary_ranks_in_value_order() {
+        let path = path("dictionary-large-rank");
+        let value = |row: u64| {
+            let mixed = row.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
+            match row % 3 {
+                0 => format!("https://example.com/a/long/shared/path/{mixed:08}"),
+                1 => format!("{mixed}"),
+                _ => format!("x{}", row % 1000).repeat(1 + (row % 4) as usize) + &row.to_string(),
+            }
+        };
+        let distinct = 70_000;
+        let parts = 4 * distinct / 1000;
+        let per_part = 1000;
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in 0..parts {
+            let values = (0..per_part)
+                .map(|row| Value::Varchar(value((part * per_part + row) / 4)))
+                .collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Varchar, &values).expect("strings"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        let count = dictionary.ranks().expect("a ranked dictionary");
+        assert_eq!(count, distinct as usize, "every distinct value has a rank");
+        assert!(count >= PARALLEL_SORT_MIN, "too few values to be sorted on more than one thread");
+        let ranked = (0..count)
+            .map(|rank| {
+                let code = dictionary.code_at_rank(rank).expect("a code");
+                dictionary.try_bytes_at(code as usize).expect("read").expect("a value").to_vec()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = (0..distinct).map(|row| value(row).into_bytes()).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(ranked, expected, "rank order is value order");
         fs::remove_file(path).expect("remove scratch file");
     }
 
