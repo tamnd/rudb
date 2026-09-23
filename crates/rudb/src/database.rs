@@ -101,13 +101,13 @@ struct Inner {
     /// read under, so that a file whose load fails pays for the failure once and not on every
     /// query. See [`crate::mirror`].
     declined: Mutex<BTreeSet<(String, bool)>>,
-    /// A successful setting statement invalidates the one cached native count plan.
+    /// A successful setting statement invalidates the one cached native aggregate plan.
     settings_revision: AtomicU64,
-    native_count_plan: Mutex<Option<CachedCount>>,
+    native_aggregate_plan: Mutex<Option<CachedNativeAggregate>>,
 }
 
 #[derive(Debug)]
-struct CachedCount {
+struct CachedNativeAggregate {
     sql: String,
     catalog_generation: u64,
     settings_revision: u64,
@@ -180,7 +180,7 @@ impl Database {
             relationships: Mutex::default(),
             declined: Mutex::default(),
             settings_revision: AtomicU64::new(0),
-            native_count_plan: Mutex::default(),
+            native_aggregate_plan: Mutex::default(),
         };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
@@ -316,7 +316,7 @@ impl Database {
             relationships: Mutex::default(),
             declined: Mutex::default(),
             settings_revision: AtomicU64::new(0),
-            native_count_plan: Mutex::default(),
+            native_aggregate_plan: Mutex::default(),
         };
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
@@ -1274,20 +1274,20 @@ impl Shared {
     /// since printing a plan changes nothing. A statement that writes is refused here rather than
     /// run under a read lock.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
-        if let Some(answer) = self.cached_native_count(sql, cancel)? {
+        if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
             return Ok(answer);
         }
         self.query_mirrored(sql, cancel, true)
     }
 
-    /// Reuse the bound plan for a plain native row count while the table and settings are unchanged.
+    /// Reuse a simple native aggregate plan while the table and settings are unchanged.
     /// Execution still runs for every call, producing a fresh answer and metrics document.
-    fn cached_native_count(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
+    fn cached_native_aggregate(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
         let catalog = self.read();
         let revision = self.inner.settings_revision.load(Ordering::Relaxed);
         let cached = self
             .inner
-            .native_count_plan
+            .native_aggregate_plan
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
@@ -1305,12 +1305,12 @@ impl Shared {
         run(sql, &plan, &catalog, cancel, under).map(Some)
     }
 
-    fn remember_native_count(&self, sql: &str, ast: &Ast, plan: &Plan, catalog: &Catalog) {
-        if !is_native_count(ast, plan, catalog) {
+    fn remember_native_aggregate(&self, sql: &str, ast: &Ast, plan: &Plan, catalog: &Catalog) {
+        if !is_native_summary_aggregate(ast, plan, catalog) {
             return;
         }
-        *self.inner.native_count_plan.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(CachedCount {
+        *self.inner.native_aggregate_plan.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(CachedNativeAggregate {
                 sql: sql.to_string(),
                 catalog_generation: catalog.generation(),
                 settings_revision: self.inner.settings_revision.load(Ordering::Relaxed),
@@ -1343,7 +1343,7 @@ impl Shared {
         match bound {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
-                self.remember_native_count(sql, &ast, &plan, &catalog);
+                self.remember_native_aggregate(sql, &ast, &plan, &catalog);
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
@@ -1645,7 +1645,7 @@ impl Shared {
     /// SELECT * FROM t` would otherwise read the table under a read lock, let go, and append to
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
-        if let Some(answer) = self.cached_native_count(sql, cancel)? {
+        if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
             return Ok(answer);
         }
         let session = self.session();
@@ -1704,7 +1704,7 @@ impl Shared {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 if parameters.is_empty() {
-                    self.remember_native_count(sql, ast, &plan, &catalog);
+                    self.remember_native_aggregate(sql, ast, &plan, &catalog);
                 }
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
@@ -2109,24 +2109,23 @@ impl<'a> Under<'a> {
     }
 }
 
-/// A single count over one immutable native table can use the cache. A filter is accepted only
-/// when its written form has no calls whose value could change between statements.
-fn is_native_count(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
+/// Direct counts and the three summary-backed Q3 aggregates over one immutable native table can
+/// use the cache. A filter is accepted only when its written form has no changing calls.
+fn is_native_summary_aggregate(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
     let Node::Project { input, exprs, .. } = *plan.node(plan.root()) else { return false };
-    let [projected] = plan.expr_list(exprs) else { return false };
-    let &Expr::Column(projected) = plan.expr(*projected) else { return false };
     let Node::Aggregate { input, index, groups, aggregates } = *plan.node(input) else {
         return false;
     };
-    if projected.table != index || projected.column != 0 || !plan.expr_list(groups).is_empty() {
-        return false;
-    }
-    let [aggregate] = plan.expr_list(aggregates) else { return false };
-    let &Expr::Aggregate { name, args, distinct: false, filter: None } = plan.expr(*aggregate)
-    else {
-        return false;
-    };
-    if plan.string(name) != "count_star" || !plan.expr_list(args).is_empty() {
+    let projected = plan.expr_list(exprs);
+    let aggregates = plan.expr_list(aggregates);
+    if projected.is_empty()
+        || projected.len() != aggregates.len()
+        || !plan.expr_list(groups).is_empty()
+        || !projected.iter().enumerate().all(|(position, expr)| {
+            matches!(plan.expr(*expr), Expr::Column(column)
+                if column.table == index && column.column as usize == position)
+        })
+    {
         return false;
     }
     let filtered = matches!(plan.node(input), Node::Filter { .. });
@@ -2135,11 +2134,37 @@ fn is_native_count(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
         Node::Filter { .. } => return false,
         _ => input,
     };
-    let Node::Get { catalog: source_catalog, schema, table, columns, .. } = *plan.node(input)
+    let Node::Get { catalog: source_catalog, schema, table, index: source_index, columns, .. } =
+        *plan.node(input)
     else {
         return false;
     };
-    if !filtered && !plan.field_list(columns).is_empty() {
+    let direct_aggregate = |expr, expected, arguments| {
+        let Expr::Aggregate { name, args, distinct: false, filter: None } = plan.expr(expr) else {
+            return false;
+        };
+        if plan.string(*name) != expected {
+            return false;
+        }
+        let args = plan.expr_list(*args);
+        args.len() == arguments
+            && args.iter().all(|arg| {
+                matches!(plan.expr(*arg), Expr::Column(column) if column.table == source_index)
+            })
+    };
+    let supported = match aggregates {
+        [count] => {
+            direct_aggregate(*count, "count_star", 0)
+                && (filtered || plan.field_list(columns).is_empty())
+        }
+        [sum, count, avg] if !filtered => {
+            direct_aggregate(*sum, "sum", 1)
+                && direct_aggregate(*count, "count_star", 0)
+                && direct_aggregate(*avg, "avg", 1)
+        }
+        _ => false,
+    };
+    if !supported {
         return false;
     }
     let source =

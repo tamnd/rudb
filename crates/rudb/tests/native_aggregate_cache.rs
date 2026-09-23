@@ -60,3 +60,50 @@ fn a_native_row_count_reuses_its_plan_until_the_table_or_settings_change() {
     database.close().expect("close the file");
     std::fs::remove_file(path).expect("remove the fixture");
 }
+
+#[test]
+fn a_native_three_aggregate_summary_reuses_its_plan_until_the_table_changes() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-summary-plan-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let database = Database::open(name).expect("open the file");
+    database.execute("CREATE TABLE hits (i INTEGER, j INTEGER)").expect("create the table");
+    database.execute("INSERT INTO hits VALUES (1, 10), (2, 20)").expect("insert rows");
+    database.close().expect("persist the native table");
+
+    let database = Database::open(name).expect("reopen the native table");
+    let sql = "SELECT SUM(i), COUNT(*), AVG(j) FROM hits";
+    let first = database.execute(sql).expect("first summary");
+    assert_eq!(first.value_at(0, 1), Value::BigInt(2));
+    assert!(first.metrics().expect("metrics").timing.bind_ns > 0);
+    let repeated = database.execute(sql).expect("repeated summary");
+    assert_eq!(repeated.value_at(0, 0), first.value_at(0, 0));
+    assert_eq!(repeated.value_at(0, 1), first.value_at(0, 1));
+    assert_eq!(repeated.value_at(0, 2), first.value_at(0, 2));
+    assert_eq!(repeated.metrics().expect("metrics").timing.bind_ns, 0);
+
+    let derived = "SELECT SUM(i + 1), COUNT(*), AVG(j) FROM hits";
+    for _ in 0..2 {
+        let answer = database.execute(derived).expect("derived aggregate");
+        assert!(answer.metrics().expect("metrics").timing.bind_ns > 0);
+    }
+
+    database.execute("SET default_order = 'DESC'").expect("change a setting");
+    let after_setting = database.execute(sql).expect("summary after setting");
+    assert!(after_setting.metrics().expect("metrics").timing.bind_ns > 0);
+
+    database.execute("INSERT INTO hits VALUES (3, NULL)").expect("grow the table");
+    let after_insert = database.execute(sql).expect("summary after insert");
+    assert_eq!(after_insert.value_at(0, 1), Value::BigInt(3));
+    assert_eq!(after_insert.value_at(0, 2), first.value_at(0, 2));
+    assert_ne!(after_insert.value_at(0, 0), first.value_at(0, 0));
+    assert!(after_insert.metrics().expect("metrics").timing.bind_ns > 0);
+    database.close().expect("close the file");
+    std::fs::remove_file(path).expect("remove the fixture");
+}
