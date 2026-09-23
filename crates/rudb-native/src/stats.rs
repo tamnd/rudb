@@ -185,8 +185,8 @@ pub fn build_summary_for(reader: &Reader, column: usize, per_stripe: bool) -> Re
     let mut whole = Counts::new(1);
     let mut stripes = Vec::new();
     let mut pass = Pass::new(&field.ty, reader.table().generation());
-    for stripe in reader.stripe_parts() {
-        pass.open_stripe();
+    for (at, stripe) in reader.stripe_parts().into_iter().enumerate() {
+        pass.open_stripe((at as u64, 0));
         let mut counted = per_stripe.then(|| Counts::new(1));
         for part in stripe {
             let chunk = reader.read(part, &[column])?;
@@ -211,6 +211,17 @@ pub fn build_summary_for(reader: &Reader, column: usize, per_stripe: bool) -> Re
     let narrowed =
         stripes.iter().map(|stripe| stripe.narrowed(STRIPE_K)).collect::<Result<Vec<_>>>()?;
     Ok(pass.finish(merged, narrowed))
+}
+
+/// What one stripe says about the order of its rows, kept until every stripe is in.
+#[derive(Debug)]
+struct Piece {
+    key: (u64, u64),
+    first: Option<Bound>,
+    last: Option<Bound>,
+    ascending: bool,
+    descending: bool,
+    runs: u64,
 }
 
 /// One scan of one column, in `rid` order, for everything the sketch does not answer.
@@ -245,6 +256,15 @@ struct Pass {
     stripe_low: Option<Bound>,
     stripe_high: Option<Bound>,
     stripes: Vec<(Bound, Bound)>,
+    /// Where the stripe being read sits in the table, and the first value it held.
+    ///
+    /// A writer fed by several pipeline instances gets its stripes in the order they finished
+    /// rather than the order they sit in, and sorts them by this key when it commits. The order
+    /// fields are about adjacent rows, so they are read a stripe at a time into [`Piece`]s and put
+    /// together in key order at the end, which is the rid order the reader will see.
+    key: (u64, u64),
+    first: Option<Bound>,
+    pieces: Vec<Piece>,
     /// What one value of this column takes, when every value takes the same.
     ///
     /// Read off the type once rather than off each value, because for every fixed width column it is
@@ -276,6 +296,9 @@ impl Pass {
             stripe_low: None,
             stripe_high: None,
             stripes: Vec::new(),
+            key: (0, 0),
+            first: None,
+            pieces: Vec::new(),
             fixed: fixed_width(ty),
             scale: bounds::scale_of(ty),
             coded: None,
@@ -464,7 +487,10 @@ impl Pass {
         self.widest = self.widest.max(one.widest);
         let Some(ends) = one.ends else { return };
         match self.previous.take() {
-            None => self.runs = 1,
+            None => {
+                self.runs = 1;
+                self.first = Some(ends.first.clone());
+            }
             Some(previous) => self.run(Some(previous.order(&ends.first))),
         }
         self.runs += one.descents;
@@ -558,6 +584,9 @@ impl Pass {
     fn value(&mut self, bound: Bound, width: u64) {
         self.measure(width);
         let ordering = self.previous.as_ref().map(|previous| previous.order(&bound));
+        if ordering.is_none() {
+            self.first = Some(bound.clone());
+        }
         self.run(ordering);
         if takes(&self.low, &bound, Ordering::Less) {
             self.low = Some(bound.clone());
@@ -588,7 +617,10 @@ impl Pass {
     fn bytes_value(&mut self, bytes: &[u8]) {
         self.measure(bytes.len() as u64);
         let ordering = match &self.previous {
-            None => None,
+            None => {
+                self.first = Some(Bound::Bytes(bytes.to_vec()));
+                None
+            }
             Some(Bound::Bytes(previous)) => Some(Some(previous.as_slice().cmp(bytes))),
             // A bound of another domain in a byte column, which a column of one type cannot hold.
             Some(_) => Some(None),
@@ -636,9 +668,16 @@ impl Pass {
         }
     }
 
-    fn open_stripe(&mut self) {
+    /// Starts a stripe, which is `key` in the order the table will be read in.
+    fn open_stripe(&mut self, key: (u64, u64)) {
         self.stripe_low = None;
         self.stripe_high = None;
+        self.key = key;
+        self.first = None;
+        self.previous = None;
+        self.ascending = true;
+        self.descending = true;
+        self.runs = 0;
     }
 
     fn close_stripe(&mut self) {
@@ -647,9 +686,60 @@ impl Pass {
         if let (Some(low), Some(high)) = (self.stripe_low.take(), self.stripe_high.take()) {
             self.stripes.push((low, high));
         }
+        self.pieces.push(Piece {
+            key: self.key,
+            first: self.first.take(),
+            last: self.previous.take(),
+            ascending: self.ascending,
+            descending: self.descending,
+            runs: self.runs,
+        });
     }
 
-    fn finish(self, sketch: Sketch, stripes: Vec<Sketch>) -> Stats {
+    /// Puts the stripes' order fields together in the order the table is read in.
+    ///
+    /// A pass that never opened a stripe has nothing here and keeps what it counted as it went.
+    /// Otherwise the pieces are laid end to end by key: each one's own flags hold, and the seam
+    /// between two is one comparison of the last value of the first against the first value of the
+    /// second, which is the comparison the pass would have made had the rows come in that order.
+    /// Every piece that held a value started its run count at one, so a seam that is not a descent
+    /// joins two runs into one and gives one back.
+    fn settle(&mut self) {
+        if self.pieces.is_empty() {
+            return;
+        }
+        let mut pieces = std::mem::take(&mut self.pieces);
+        pieces.sort_by_key(|piece| piece.key);
+        let (mut ascending, mut descending, mut runs) = (true, true, 0_u64);
+        let mut previous: Option<Bound> = None;
+        for piece in pieces {
+            ascending &= piece.ascending;
+            descending &= piece.descending;
+            let (Some(first), Some(last)) = (piece.first, piece.last) else { continue };
+            runs += piece.runs;
+            if let Some(previous) = &previous {
+                match previous.order(&first) {
+                    Some(Ordering::Less) => descending = false,
+                    Some(Ordering::Greater) => ascending = false,
+                    Some(Ordering::Equal) => {}
+                    None => {
+                        ascending = false;
+                        descending = false;
+                    }
+                }
+                if previous.order(&first) != Some(Ordering::Greater) {
+                    runs = runs.saturating_sub(1);
+                }
+            }
+            previous = Some(last);
+        }
+        self.ascending = ascending;
+        self.descending = descending;
+        self.runs = runs;
+    }
+
+    fn finish(mut self, sketch: Sketch, stripes: Vec<Sketch>) -> Stats {
+        self.settle();
         let present = self.rows - self.nulls;
         // The one rule the module doc names. An exact distinct count is one the sketch never had to
         // throw a value away to keep, and everything downstream of the count follows from this
@@ -1024,9 +1114,11 @@ impl Gather {
     /// Folds one whole stripe of this column, in part order.
     ///
     /// A stripe at a time and not a part at a time, because the stripe is the unit the pass opens
-    /// and closes its ends over and a caller that fed it parts would have to know that.
-    pub(crate) fn stripe<'a>(&mut self, parts: impl Iterator<Item = &'a Vector>) {
-        self.pass.open_stripe();
+    /// and closes its ends over and a caller that fed it parts would have to know that. The key is
+    /// where the stripe goes once the writer sorts its stripes, which need not be the order they
+    /// reach this in.
+    pub(crate) fn stripe<'a>(&mut self, key: (u64, u64), parts: impl Iterator<Item = &'a Vector>) {
+        self.pass.open_stripe(key);
         for vector in parts {
             self.counts.add_column(0, vector);
             self.pass.scan(vector);
@@ -1375,6 +1467,41 @@ mod tests {
         path
     }
 
+    #[test]
+    fn stripes_that_arrive_out_of_order_are_summarized_in_the_order_they_are_read() {
+        // What a parallel load does: three pipeline instances each hand the writer a contiguous
+        // run of the source as its own stripe, and they finish in whatever order they finish. The
+        // table reads back sorted by source position, so that is the order the summary is about.
+        // Every key repeats across a seam, the way an order's line items straddle two stripes.
+        let path = path("late-stripes");
+        let mut writer =
+            Writer::create(&path, "t", vec![Field::new("v", LogicalType::BigInt)]).expect("new");
+        let part = |from: i64| {
+            let held = (from..from + 10).map(|v| Value::BigInt(v / 2)).collect::<Vec<_>>();
+            Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &held).expect("values")])
+                .expect("one column")
+        };
+        for stripe in [2_u64, 0, 1] {
+            let parts = (0..3)
+                .map(|at| {
+                    (
+                        (stripe * 3 + at, 0),
+                        part(i64::try_from(stripe * 30 + at * 10).expect("small")),
+                    )
+                })
+                .collect();
+            writer.append_stripe(parts).expect("a stripe");
+        }
+        writer.finish().expect("commit");
+
+        let reader = reopen(&path);
+        let summary = summary(&reader, 0).expect("the summary is in the file");
+        assert_eq!(summary.rows, 90);
+        assert_eq!(summary.order, Order::Ascending, "the stripes are in order once sorted");
+        assert_eq!(summary.runs, 1, "and the seams between them are not descents");
+        assert_eq!(crate::ascending(&reader), vec!["v".to_owned()]);
+    }
+
     /// The vector at a time pass says exactly what the row at a time pass says.
     ///
     /// [`Pass::scan_flat`] and [`Pass::scan_dictionary`] took the ordinary columns off
@@ -1517,8 +1644,8 @@ mod tests {
     /// A whole pass over these vectors, five to a stripe, read by whichever arm the caller names.
     fn drive(ty: &LogicalType, held: &[Vector], mut scan: impl FnMut(&mut Pass, &Vector)) -> Stats {
         let mut pass = Pass::new(ty, 1);
-        for stripe in held.chunks(5) {
-            pass.open_stripe();
+        for (at, stripe) in held.chunks(5).enumerate() {
+            pass.open_stripe((at as u64, 0));
             for vector in stripe {
                 scan(&mut pass, vector);
             }

@@ -191,6 +191,30 @@ pub fn distincts(reader: &Reader) -> Result<Vec<(String, Stat<u64>)>> {
     Ok(counted)
 }
 
+/// The columns whose values never go down in row order and hold no null, by name.
+///
+/// This is what lets an aggregate grouped on one of them close a group as soon as the key changes,
+/// and the claim it rests on is the summary's, which read every value in rid order when the table
+/// was written. A summary that is stale, missing or one this build cannot decode leaves its column
+/// out, so the answer can only be too short and a column left out is grouped the way it always was.
+/// A null anywhere is also out, since the summary's order only speaks for the values that are there
+/// and a null that sat between two of them would split a run the grouping thinks is whole.
+#[must_use]
+pub fn ascending(reader: &Reader) -> Vec<String> {
+    reader
+        .table()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|&(at, _)| {
+            crate::stats::summary(reader, at).is_some_and(|summary| {
+                summary.nulls == 0 && summary.order == rudb_stats::summary::Order::Ascending
+            })
+        })
+        .map(|(_, field)| field.name.clone())
+        .collect()
+}
+
 /// What a native table's frequency synopsis says about one value, as the planner asks for it.
 ///
 /// Holds the reader for the reason [`Stripes`] does. The synopsis is small where it exists at all,
