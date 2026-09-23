@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use rudb_bind::{Bound, Parameters};
@@ -56,6 +56,19 @@ pub(crate) struct Shared {
 #[derive(Debug)]
 struct Inner {
     catalog: RwLock<Catalog>,
+    /// Held by whatever might write the file or change the catalog, for as long as it does, and
+    /// always taken before the catalog lock.
+    ///
+    /// The catalog lock used to be this as well, which meant a load held it for writing from its
+    /// first row to its last and no query could start on the same database until it was done. A
+    /// load into a new table only has to change the catalog at the end, once its rows are in the
+    /// file, so it takes this for the whole load and the catalog lock for writing only for the two
+    /// ends, and reads can run while the rows go in. Every other writer takes this too, which is
+    /// what stops a checkpoint or a second load from writing the file under the first one.
+    writer: Mutex<()>,
+    /// Told when a load has let go of the catalog, so a test can run a query in the middle of one.
+    #[cfg(test)]
+    loading: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     path: Option<PathBuf>,
     /// Whether this database may write its file, which is [`Config::read_only`] turned around.
     ///
@@ -155,6 +168,9 @@ impl Database {
         let settings = Settings::new(config);
         let inner = Inner {
             catalog: RwLock::new(Catalog::new()),
+            writer: Mutex::default(),
+            #[cfg(test)]
+            loading: Mutex::default(),
             path: None,
             writable,
             settings,
@@ -288,6 +304,9 @@ impl Database {
         let settings = Settings::new(config);
         let inner = Inner {
             catalog: RwLock::new(catalog),
+            writer: Mutex::default(),
+            #[cfg(test)]
+            loading: Mutex::default(),
             path: Some(path),
             writable,
             settings,
@@ -329,6 +348,7 @@ impl Database {
             return Ok(());
         };
         let path = path.clone();
+        let _writing = self.shared.writing();
         persist(&path, &mut self.shared.write())
     }
 
@@ -357,6 +377,7 @@ impl Database {
     /// Public because a program that builds its own catalog rather than parsing SQL to build one is
     /// a real thing an embedded database gets used for.
     pub fn with_catalog_mut<T>(&self, write: impl FnOnce(&mut Catalog) -> T) -> T {
+        let _writing = self.shared.writing();
         write(&mut self.shared.write())
     }
 
@@ -372,6 +393,7 @@ impl Database {
     /// table already exists, or if two of the columns have the same name.
     pub fn create_table(&self, name: &str, columns: Vec<Field>) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
+        let _writing = self.shared.writing();
         let mut catalog = self.shared.write();
         let resolved = catalog.resolve_for_create(&parts)?;
         catalog.create_table(resolved, columns)
@@ -384,6 +406,7 @@ impl Database {
     /// If the name does not resolve or the table does not exist.
     pub fn drop_table(&self, name: &str) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
+        let _writing = self.shared.writing();
         let mut catalog = self.shared.write();
         let resolved = catalog.resolve(&parts)?;
         catalog.drop_table(&resolved)
@@ -402,6 +425,7 @@ impl Database {
     /// converted to its column's type.
     pub fn append(&self, name: &str, rows: &[Vec<Value>]) -> Result<()> {
         let parts: Vec<&str> = name.split('.').collect();
+        let _writing = self.shared.writing();
         let mut catalog = self.shared.write();
         let resolved = catalog.resolve(&parts)?;
         catalog.table_mut(&resolved)?.append_rows(rows)
@@ -1220,6 +1244,12 @@ impl Shared {
         self.inner.catalog.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The right to write the file and change the catalog, taken before the catalog lock. See
+    /// `Inner::writer`. Poisoning is ignored for the reason [`Shared::read`] gives.
+    fn writing(&self) -> MutexGuard<'_, ()> {
+        self.inner.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The memory and the threads this database will lend a query.
     fn budget(&self) -> Budget<'_> {
         Budget { memory: &self.inner.memory, pool: &self.inner.pool }
@@ -1642,6 +1672,7 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
     ) -> Result<QueryResult> {
+        let _writing = self.writing();
         self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true)
     }
 
@@ -1755,9 +1786,18 @@ impl Shared {
                         } else {
                             NativeSink::open(path, table.clone(), fields, None)?
                         });
+                        // The rows go in under a read lock, so queries run while they do. Nothing
+                        // else can change the catalog in the gap between the two locks, because
+                        // every writer holds `writer` first and this statement is holding it now.
+                        drop(catalog);
+                        let reading = self.read();
+                        #[cfg(test)]
+                        if let Some(told) = self.inner.loading.lock().unwrap().take() {
+                            let _ = told.send(());
+                        }
                         let query = rudb_exec::build_measured_into(
                             plan,
-                            &catalog,
+                            &reading,
                             cancel,
                             &self.inner.memory,
                             &seams,
@@ -1766,7 +1806,9 @@ impl Shared {
                         )?;
                         query.run(cancel, &self.inner.pool)?;
                         drop(query);
+                        drop(reading);
                         let reader = rudb_native::Catalog::open(path)?.table(&table)?;
+                        let mut catalog = self.write();
                         catalog.create_table(create.name.clone(), create.columns)?;
                         catalog.table_mut(&create.name)?.commit_native(reader)?;
                         return Ok(QueryResult::empty());
@@ -2372,6 +2414,10 @@ fn create_table(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use rudb_common::Value;
 
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
@@ -2393,6 +2439,52 @@ mod tests {
         assert!(matches!(ops[0], Op::Rename { .. }), "{ops:?}");
         assert_eq!(ops[1], Op::SyncDir { path: "/data".into() });
         assert_eq!(fs.contents(Path::new("/data/db")).unwrap(), b"new".to_vec());
+    }
+
+    #[test]
+    fn a_query_runs_while_a_load_into_a_new_table_does() {
+        let path = std::env::temp_dir().join(format!(
+            "rudb-load-lock-{}-{}.rdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock advances")
+                .as_nanos()
+        ));
+        let database = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+        database.execute("CREATE TABLE small AS SELECT 7 AS a").unwrap();
+        let (told, loading) = mpsc::channel();
+        *database.shared.inner.loading.lock().unwrap() = Some(told);
+
+        // An aggregate over a range that does not end in any time a test has, so the load is still
+        // running when the query goes in, and it hands the sink nothing until it is stopped.
+        let connection = database.connect();
+        let stopper = connection.clone();
+        let load = std::thread::spawn(move || {
+            connection.execute("CREATE TABLE big AS SELECT count(*) AS n FROM range(100000000000)")
+        });
+        loading.recv_timeout(Duration::from_secs(60)).expect("the load let go of the catalog");
+
+        let reader = database.clone();
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rows = reader.query("SELECT a FROM small").map(|result| result.rows().collect());
+            let _ = answered.send(rows);
+        });
+        let got = answer.recv_timeout(Duration::from_secs(20));
+        stopper.interrupt();
+        let loaded = load.join().expect("the load thread ran");
+
+        let rows: Vec<Vec<Value>> =
+            got.expect("the query finished while the load ran").expect("the query succeeded");
+        assert_eq!(rows, vec![vec![Value::Integer(7)]]);
+        assert!(loaded.is_err(), "the load was interrupted");
+        assert!(
+            database.query("SELECT * FROM big").is_err(),
+            "an interrupted load leaves no table"
+        );
+        drop(database);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
