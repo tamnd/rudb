@@ -156,8 +156,27 @@ impl<'a> Pipeline<'a> {
     /// for the wider of the two cheap enough to do on every pipeline.
     #[must_use]
     pub fn lease_degree(&self, ceiling: usize) -> usize {
+        self.widths(ceiling).1
+    }
+
+    /// The instance count and the borrow width, from one question to the source.
+    ///
+    /// Both numbers at once because [`Pipeline::degree`] is not a getter. Asking it is how the source
+    /// is told what is about to happen, so a scan of a stored table reads its zone maps in there,
+    /// drops the parts they rule out and cuts its morsels out of what is left. Asking twice does all
+    /// of that twice and keeps the first answer, since the morsels are set once, so the second pass
+    /// over the statistics is read and thrown away.
+    ///
+    /// The caller wants both, because it borrows the wider and runs the narrower, and it had been
+    /// getting them from two calls. On TPC-H 12 that was every one of lineitem's 733 parts tested
+    /// against the filter twice before a row was read. It also made the ruled out parts count double,
+    /// which is how this was found: a scan that could reach nothing reported 1466 parts pruned out of
+    /// a table that has 733.
+    #[must_use]
+    pub fn widths(&self, ceiling: usize) -> (usize, usize) {
+        let degree = self.degree(ceiling);
         let ceiling = ceiling.max(1);
-        self.degree(ceiling).max(self.sink.finalize_width(ceiling)).clamp(1, ceiling)
+        (degree, degree.max(self.sink.finalize_width(ceiling)).clamp(1, ceiling))
     }
 
     /// Fresh local state for one instance of this pipeline.

@@ -125,8 +125,11 @@ impl<'a> Query<'a> {
     /// here holds a token of its own except the join, whose nested loop can outlive a chunk.
     pub fn run(&self, cancel: &Cancel, pool: &Pool) -> Result<()> {
         for (pipeline, driver) in self.pipelines.iter().zip(&self.drivers) {
-            let lease = pool.lease(pipeline.lease_degree(pool.threads()));
-            let degree = pipeline.degree(pool.threads()).min(lease.degree());
+            // Both numbers out of one call, because asking is what makes the source read its
+            // statistics and cut its morsels. See [`Pipeline::widths`].
+            let (wanted, width) = pipeline.widths(pool.threads());
+            let lease = pool.lease(width);
+            let degree = wanted.min(lease.degree());
             let spread = {
                 let _running = driver.running();
                 run_parallel(pipeline, cancel, &lease, degree)?
