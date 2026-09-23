@@ -1264,6 +1264,30 @@ impl<'a> Coded<'a> {
         at == held.len()
     }
 
+    /// The span of the map `held` was built on, when this chunk's places are that map's grown
+    /// upward.
+    ///
+    /// That is one key column read by value, against a window with the same bottom and more places
+    /// than before, and a map of `built` places that is still the one `held` describes. Every value
+    /// then has the place it had, and the one place that means something else is the old last one,
+    /// which was the null place and is now a value's.
+    pub(crate) fn grows(&self, held: &[Origin], built: usize) -> Option<usize> {
+        let [Some(column), rest @ ..] = &self.columns else {
+            return None;
+        };
+        if rest.iter().any(Option::is_some) {
+            return None;
+        }
+        match (held, column.places) {
+            ([Origin::Window(bottom, span)], Places::Values { low, .. })
+                if *bottom == low && *span == built && *span < column.nothing + 1 =>
+            {
+                Some(*span)
+            }
+            _ => None,
+        }
+    }
+
     /// Records what the map about to be built reads its places out of.
     pub(crate) fn hold(&self, into: &mut Vec<Origin>) {
         into.clear();
@@ -1487,8 +1511,11 @@ fn window_of(
         return None;
     }
     let wanted = if alone { (width * 2).max(1024).min(most) } else { width };
-    let low =
-        i64::try_from(bottom - (wanted - width) / 2).or_else(|_| i64::try_from(bottom)).ok()?;
+    // A window that took the old one in from its bottom puts all of its slack above, so that a key
+    // climbing the way a sorted one does keeps the bottom it had and its map can grow in place.
+    let climbing = kept.is_some_and(|(low, _)| i128::from(low) == bottom);
+    let slack_below = if climbing { 0 } else { (wanted - width) / 2 };
+    let low = i64::try_from(bottom - slack_below).or_else(|_| i64::try_from(bottom)).ok()?;
     Some((low, usize::try_from(wanted).ok()?.checked_add(1)?, nullable))
 }
 
