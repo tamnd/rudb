@@ -368,6 +368,9 @@ pub fn interleave_placed(
         if let Some(placed) = placed_strings(ty, pieces, inverse, 0..rows)? {
             return Ok(placed);
         }
+        if let Some(placed) = placed_fixed(ty, pieces, inverse)? {
+            return Ok(placed);
+        }
     }
     let mut data = data_for(ty, rows)?;
     // The untyped null, which has no run of data to lay or to gather out of, and is null whatever
@@ -454,6 +457,108 @@ pub fn interleave_placed(
         None => copy_of(&data, order),
     };
     Ok(Vector::flat(ty.clone(), data)?.with_validity(validity))
+}
+
+/// A fixed width column written through `inverse` straight from its pieces, or `None` for a type
+/// whose layout is not fixed width.
+///
+/// The general path lays every piece end to end first and then writes that run through `inverse`,
+/// and it flattens every piece that is not flat on the way. On the sorted SF1 `lineitem` those were
+/// three passes over every column: the flatten was 7 percent of the busy samples, mostly decoding
+/// the dictionary pieces the Parquet reader hands on, the laying was 5 percent more, and the write
+/// through `inverse` was 6.5. Here each piece is written to its places as it is read, and a
+/// dictionary piece whose values are a flat run with no nulls is written by looking each code up,
+/// so a column is read once and written once. A piece in any other form is flattened on its own and
+/// then written the same way.
+fn placed_fixed(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Result<Option<Vector>> {
+    let rows = inverse.len();
+    let mut live: Option<Vec<bool>> = None;
+    let mut base = 0;
+    // The nulls of one piece written to their places, once a piece with any has arrived.
+    let mut mark = |mask: &Validity, places: &[u32]| {
+        if matches!(mask, Validity::AllValid) {
+            return;
+        }
+        let live = live.get_or_insert_with(|| vec![true; rows]);
+        for (row, &to) in places.iter().enumerate() {
+            if let Some(slot) = live.get_mut(to as usize) {
+                *slot = mask.is_valid(row);
+            }
+        }
+    };
+    macro_rules! placed {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data_for(ty, 0)? {
+                $(Data::$variant(_) => {
+                    let mut out: Vec<$native> = vec![$zero; rows];
+                    for piece in pieces {
+                        let len = piece.len();
+                        let places = inverse.get(base..base + len).ok_or_else(|| {
+                            Error::internal("pieces longer than the places they are written to")
+                        })?;
+                        base += len;
+                        let coded = piece.dictionary_parts().and_then(|(codes, values)| {
+                            match (values.form(), values.validity(), values.data()) {
+                                (Form::Flat, Validity::AllValid, Some(Data::$variant(held))) => {
+                                    Some((codes, held.as_slice()))
+                                }
+                                _ => None,
+                            }
+                        });
+                        if let Some((codes, held)) = coded {
+                            for (&code, &to) in codes.iter().zip(places) {
+                                if let (Some(slot), Some(value)) =
+                                    (out.get_mut(to as usize), held.get(code as usize))
+                                {
+                                    *slot = *value;
+                                }
+                            }
+                            mark(piece.validity(), places);
+                            continue;
+                        }
+                        // flatten: a piece that is neither flat nor a dictionary over a flat run,
+                        // which a sort's input rarely is. A flat piece is read where it lies.
+                        let flat;
+                        let piece = if piece.form() == Form::Flat {
+                            piece
+                        } else {
+                            flat = piece.flatten()?;
+                            &flat
+                        };
+                        let Some(Data::$variant(values)) = piece.data() else {
+                            return Err(Error::internal(format!(
+                                "a piece of {} laid into a column of {ty}",
+                                piece.logical_type()
+                            )));
+                        };
+                        if values.len() != len {
+                            return Err(Error::internal(format!(
+                                "a piece of {len} rows holds {} values",
+                                values.len()
+                            )));
+                        }
+                        for (value, &to) in values.iter().zip(places) {
+                            if let Some(slot) = out.get_mut(to as usize) {
+                                *slot = *value;
+                            }
+                        }
+                        mark(piece.validity(), places);
+                    }
+                    let validity = match live {
+                        None => Validity::AllValid,
+                        Some(live) if !live.contains(&true) => {
+                            return Ok(Some(Vector::constant(ty.clone(), Value::Null, rows)));
+                        }
+                        Some(live) => Validity::from_run(&live),
+                    };
+                    let data = Data::$variant(Buffer::from_vec(out));
+                    Ok(Some(Vector::flat(ty.clone(), data)?.with_validity(validity)))
+                })+
+                _ => Ok(None),
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, placed)
 }
 
 /// The string column written through `inverse` into an arena laid in the order of the result.
@@ -1275,6 +1380,38 @@ mod tests {
         let untyped = [Vector::constant(LogicalType::Null, Value::Null, 3)];
         let got = interleave(&LogicalType::Null, &untyped, &[2, 0]).expect("an untyped null");
         assert_eq!(values(&got), vec![Value::Null, Value::Null]);
+    }
+
+    /// A fixed width column written through `inverse` from pieces of every form the sort sees,
+    /// against the answer read through `order`, and a column of nothing but nulls.
+    #[test]
+    fn a_fixed_width_column_is_written_to_its_places_from_pieces_of_any_form() {
+        let ty = LogicalType::BigInt;
+        let int = Value::BigInt;
+        let flat = Vector::from_values(ty.clone(), &[int(1), Value::Null, int(3)]).expect("flat");
+        let paged = Vector::from_values(ty.clone(), &[int(4), int(5)]).expect("flat").into_pages();
+        let words = Vector::from_values(ty.clone(), &[int(70), int(80)]).expect("values");
+        let coded = Vector::dictionary(vec![1, 0, 1], words).expect("coded");
+        let nulled = Vector::from_values(ty.clone(), &[int(90), Value::Null]).expect("values");
+        let chained = Vector::dictionary(vec![1, 0], nulled).expect("coded over nulls");
+        let constant = Vector::constant(ty.clone(), int(6), 2);
+        let pieces = [flat, paged, coded, chained, constant];
+        let rows: usize = pieces.iter().map(Vector::len).sum();
+        let order: Vec<usize> = (0..rows).map(|at| (at * 5 + 3) % rows).collect();
+        let mut inverse = vec![0u32; rows];
+        for (to, &from) in order.iter().enumerate() {
+            inverse[from] = u32::try_from(to).expect("a small row");
+        }
+        let read = interleave_placed(&ty, &pieces, &order, None).expect("read through order");
+        let written =
+            interleave_placed(&ty, &pieces, &order, Some(&inverse)).expect("written to places");
+        assert_eq!(values(&written), values(&read));
+        assert_eq!(values(&written)[inverse[1] as usize], Value::Null, "the flat piece's null");
+        assert_eq!(values(&written)[inverse[8] as usize], Value::Null, "the dictionary's null");
+
+        let nothing = Vector::from_values(ty.clone(), &[Value::Null, Value::Null]).expect("nulls");
+        let written = interleave_placed(&ty, &[nothing], &[1, 0], Some(&[1, 0])).expect("nulls");
+        assert_eq!(values(&written), [Value::Null, Value::Null]);
     }
 
     #[test]
