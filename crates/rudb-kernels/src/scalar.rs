@@ -1027,7 +1027,24 @@ fn stamp_seconds_of(
     if returns != &LogicalType::Timestamp || stamp.logical_type() != &LogicalType::Timestamp {
         return Ok(None);
     }
+    let opened = opened_integer(count)?;
+    let count = opened.as_ref().unwrap_or(count);
     by_form!(stamp, count, stamp_seconds_runs, stamp, count, returns)
+}
+
+/// An integer side opened into flat values when it is in a form [`by_form!`] has no arm for, which
+/// is a packed column or a dictionary over one, and `None` when it can be read where it lies.
+///
+/// The seconds under the benchmark view's `EventTime` come out of a scan packed about one batch in
+/// twelve, and ClickBench q19 sent those four hundred batches through the row at a time path.
+fn opened_integer(side: &Vector) -> Result<Option<Vector>> {
+    let readable = side.data().is_some()
+        || side.constant_value().is_some()
+        || side.positions().is_some_and(|(_, values)| values.data().is_some());
+    if readable || !side.logical_type().is_integer() {
+        return Ok(None);
+    }
+    side.opened().map(Some)
 }
 
 /// The loop under [`stamp_seconds_of`], once each side's form has been turned into a mapping.
@@ -1092,6 +1109,9 @@ fn count_of(
         (LogicalType::Integer, LogicalType::Date) if !subtract => false,
         _ => return Ok(None),
     };
+    let (opened_left, opened_right) = (opened_integer(left)?, opened_integer(right)?);
+    let left = opened_left.as_ref().unwrap_or(left);
+    let right = opened_right.as_ref().unwrap_or(right);
     by_form!(left, right, count_runs, subtract, date_first, left, right, returns)
 }
 
@@ -4469,6 +4489,29 @@ mod tests {
             .expect("one day count");
         let one = Vector::constant(LogicalType::Date, Value::Date(0), 1);
         agrees("+", &[one, far], &LogicalType::Date);
+    }
+
+    /// The seconds and the days under the benchmark view's times can come out of a scan packed, and
+    /// both loops open that side once rather than handing every row over as a `Value`.
+    #[test]
+    fn a_stamp_or_a_date_moved_by_a_packed_count_has_a_loop() {
+        // 900, 901, 903 and 900, as two bit codes over a base of 900.
+        for ty in [LogicalType::Integer, LogicalType::BigInt] {
+            let packed = Vector::packed(ty.clone(), vec![0b11_0100], 2, 900, 4).expect("packs");
+            assert_eq!(packed.form(), Form::BitPacked);
+            let stamp = Vector::constant(LogicalType::Timestamp, Value::Timestamp(7), 4);
+            let before = fallback::count(Kernel::Scalar, Form::Constant, Form::BitPacked);
+            let args = [stamp, packed.clone()];
+            agrees("__rudb_stamp_seconds", &args, &LogicalType::Timestamp);
+            let moved = call("__rudb_stamp_seconds", &args, &LogicalType::Timestamp, None)
+                .expect("moves");
+            assert_eq!(moved.value_at(2), Value::Timestamp(7 + 903 * 1_000_000));
+            if ty == LogicalType::Integer {
+                let epoch = Vector::constant(LogicalType::Date, Value::Date(0), 4);
+                agrees("+", &[epoch, packed], &LogicalType::Date);
+            }
+            assert_eq!(fallback::count(Kernel::Scalar, Form::Constant, Form::BitPacked), before);
+        }
     }
 
     #[test]
