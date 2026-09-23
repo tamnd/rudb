@@ -109,6 +109,9 @@ pub(crate) struct Sideways<'a> {
     /// What the build side turned out to hold. Written by the sink when the build side finishes and
     /// read by the scan when it is asked for its morsels.
     found: OnceLock<Found>,
+    /// Whether a join above wants the build side's keys as a bitmap even where the scan has
+    /// something better. Written while the query is being built. See [`Sideways::kept`].
+    wanted: OnceLock<()>,
 }
 
 /// What one side of a join holds, as much of it as was worth keeping.
@@ -131,6 +134,9 @@ pub(crate) struct Found {
     /// The build side's keys as a bitmap over the parent's key range, when the join had a key map
     /// and no link. Like `rows`, it takes the place of the filter.
     domain: Option<Domain>,
+    /// The build side's keys as a bitmap over their own range, made only for a join above that
+    /// asked for it and only when `domain` is not there. The scan never reads it.
+    held: Option<Domain>,
     /// What the exact reduction came to, for the scan to report, including one that stopped early
     /// and so left `rows` empty.
     reduced: Option<Reduced>,
@@ -308,6 +314,28 @@ impl<'a> Sideways<'a> {
         self.exact.get()
     }
 
+    /// The driving column this is about, in the scan's own naming, once the join has armed it.
+    pub(crate) fn binding(&self) -> Option<ColumnBinding> {
+        self.binding.get().copied()
+    }
+
+    /// Asks for the build side's keys as a bitmap, for a join above that narrows its own table by
+    /// them. Called while the query is being built.
+    pub(crate) fn wanted(&self) {
+        let _ = self.wanted.set(());
+    }
+
+    /// Whether a join above asked for [`Sideways::kept`].
+    pub(crate) fn is_wanted(&self) -> bool {
+        self.wanted.get().is_some()
+    }
+
+    /// The build side's keys as a bitmap, once the build side has finished and made one.
+    pub(crate) fn kept(&self) -> Option<&Domain> {
+        let found = self.found.get()?;
+        found.domain.as_ref().or(found.held.as_ref())
+    }
+
     /// Records what the build side held. Called once, when the build side's pipeline finishes.
     pub(crate) fn found(&self, found: Found) {
         let _ = self.found.set(found);
@@ -455,7 +483,15 @@ pub(crate) fn through(node: &Node) -> Option<NodeRef> {
 ///
 /// Whatever evaluating the key expression raises, which is what the hash table build would have
 /// raised over the same rows a moment later.
-pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) -> Result<Found> {
+///
+/// With `wanted`, the keys as a bitmap as well when nothing else made one, for a join above that
+/// asked. See [`Sideways::wanted`].
+pub(crate) fn found_for(
+    keyed: &Keyed<'_>,
+    exact: Option<&Exact>,
+    chunks: &[Chunk],
+    wanted: bool,
+) -> Result<Found> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let pushed = exact.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten();
     let mut reduced = pushed.as_ref().map(|pushed| Reduced {
@@ -491,6 +527,9 @@ pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) 
     if !settled && domain.is_none() {
         domain = dense(&keyed, rows);
     }
+    // After the exact rows settled the scan's question, which leaves the join above that asked with
+    // nothing, and the bitmap is one pass over a side that is usually the small one.
+    let held = if wanted && domain.is_none() { dense(&keyed, rows) } else { None };
     let settled = settled || domain.is_some();
     let mut filter = if settled { None } else { Blocked::sized(rows, BUDGET) };
     let mut hashes = Vec::new();
@@ -510,7 +549,7 @@ pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) 
             filter.add(word);
         }
     }
-    Ok(Found { range: extremes.into_range(), filter, rows: exact, domain, reduced })
+    Ok(Found { range: extremes.into_range(), filter, rows: exact, domain, held, reduced })
 }
 
 /// The build side's keys as a [`Domain`] over their own range, when that range is small enough.
@@ -699,13 +738,13 @@ impl Found {
     /// A build side that turned out to hold this, for the tests that stand in for one.
     #[cfg(test)]
     pub(crate) fn of(range: Option<(Bound, Bound)>, filter: Option<Blocked>) -> Self {
-        Self { range, filter, rows: None, domain: None, reduced: None }
+        Self { range, filter, rows: None, domain: None, held: None, reduced: None }
     }
 
     /// The same, with an exact set of driving rows.
     #[cfg(test)]
     pub(crate) fn exactly(range: Option<(Bound, Bound)>, rows: Rids) -> Self {
-        Self { range, filter: None, rows: Some(rows), domain: None, reduced: None }
+        Self { range, filter: None, rows: Some(rows), domain: None, held: None, reduced: None }
     }
 }
 
@@ -719,7 +758,17 @@ mod tests {
 
     use rudb_graph::{KeyMap, Link};
 
-    use super::{Across, Exact, Extremes, Found, Keyed, Schema, Sideways, beneath, found, hash};
+    use super::{
+        Across, Exact, Extremes, Found, Keyed, Schema, Sideways, beneath, found_for, hash,
+    };
+
+    fn found(
+        keyed: &Keyed<'_>,
+        exact: Option<&Exact>,
+        chunks: &[Chunk],
+    ) -> rudb_common::Result<Found> {
+        found_for(keyed, exact, chunks, false)
+    }
 
     fn column(values: &[Option<i32>]) -> Vector {
         let values: Vec<Value> =
@@ -942,6 +991,51 @@ mod tests {
         let expected: Vec<u64> = (300..400).chain(4_000..4_100).collect();
         assert_eq!(kept, expected);
         assert_eq!(found.range, Some((Bound::Int(103), Bound::Int(140))));
+    }
+
+    /// The exact rows answer the scan, which leaves no bitmap behind for a join above that narrows
+    /// its own table by these keys. Asked for, the side makes one anyway, and it holds exactly the
+    /// keys the side holds.
+    #[test]
+    fn an_exact_side_asked_for_its_keys_holds_them_as_a_bitmap_as_well() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let parent_keys: Vec<Option<i128>> = (0..50).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..5_000).map(|child| child / 100).collect();
+        let exact = Exact::new(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Some(Link::build(&parents_of, 50).expect("every parent exists")),
+        );
+        let side = [chunk(&[Some(103), None]), chunk(&[Some(140)])];
+
+        let unasked = found(&keyed, Some(&exact), &side).expect("integers");
+        assert!(unasked.rows.is_some() && unasked.domain.is_none() && unasked.held.is_none());
+
+        let asked = found_for(&keyed, Some(&exact), &side, true).expect("integers");
+        assert!(asked.rows.is_some(), "the scan is still answered by the exact rows");
+        let held = asked.held.expect("a bitmap for the join above");
+        let kept: Vec<i64> = (90..160).filter(|&key| held.holds(key)).collect();
+        assert_eq!(kept, [103, 140]);
+    }
+
+    /// A filter below leaves the key column as codes into the run the scan read, which is the form
+    /// the build side of a join over a filtered table arrives in, and the bitmap is made from it all
+    /// the same.
+    #[test]
+    fn a_side_whose_keys_are_a_dictionary_still_makes_its_bitmap() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let run = column(&[Some(10), Some(11), Some(12), Some(13), Some(14)]);
+        let codes = Vector::dictionary(vec![4, 1, 4], run).expect("codes inside the run");
+        let side = [Chunk::new(vec![codes]).expect("one column")];
+
+        let found = found(&keyed, None, &side).expect("integers");
+
+        let domain = found.domain.expect("a bitmap over the keys the codes name");
+        let kept: Vec<i64> = (0..20).filter(|&key| domain.holds(key)).collect();
+        assert_eq!(kept, [11, 14]);
     }
 
     /// A key the map has never heard of cannot come from the parent, so something upstream is not

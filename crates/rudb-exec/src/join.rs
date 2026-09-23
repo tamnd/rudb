@@ -101,6 +101,7 @@ use crate::lookup::{Lookup, MISS, NONE, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::side::{Build, PAD, laid_out};
+use crate::sideways::Sideways;
 
 /// Why a join that found a key did not walk every pair, for the metrics document.
 const KEYED: &str = "a conjunct of the condition is an equality with one side's columns on each \
@@ -950,6 +951,10 @@ pub(crate) struct Probe<'a> {
     /// driving chunks going past and the row this operator gets in the document would otherwise
     /// have one of its two inputs missing from it. See [`Counters::joining`].
     counters: Option<Arc<Counters>>,
+    /// Runtime filters of joins on the driving side, by the key position they say something about.
+    ///
+    /// See [`Probe::narrowed_by`].
+    narrowing: Vec<(usize, Arc<Sideways<'a>>)>,
 }
 
 /// The gathered side and the table that finds rows in it.
@@ -1247,7 +1252,79 @@ impl<'a> Probe<'a> {
             held: Mutex::new(memory.reservation()),
             time_zone: SessionTimeZone::default(),
             counters: None,
+            narrowing: Vec::new(),
         })
+    }
+
+    /// The driving columns this join compares with `=`, by the position of the key they are in.
+    ///
+    /// Only the ones where the driving key is a bare column, because what is asked about it is
+    /// whether a join further down already dropped every driving row whose value is outside a set,
+    /// and that is a fact about the column rather than about an expression over it.
+    pub(crate) fn driving_columns(&self) -> Vec<(usize, ColumnBinding)> {
+        let equalities = &self.equalities;
+        (0..equalities.null_is_a_value.len())
+            .filter(|&at| !equalities.null_is_a_value[at])
+            .filter_map(|at| match *self.plan.expr(*equalities.left.get(at)?) {
+                Expr::Column(binding) => Some((at, binding)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Leaves out of the table every gathered row whose key one of `narrowing` says no driving
+    /// row can hold.
+    ///
+    /// Each entry is the runtime filter of an inner or a semi join on this join's driving side, and
+    /// the key position it is about. That join has already dropped every driving row whose key is
+    /// outside its build side's keys, so by the time a driving row reaches this one its key is in
+    /// that set, and a gathered row whose key is not can match nothing. Leaving it out of the table
+    /// changes no answer, because this operator never hands out a gathered row that matched
+    /// nothing, and it is what makes the table small. On TPC-H q09 the join to `partsupp` gathers
+    /// all eight hundred thousand rows while the driving rows have already been through the join
+    /// to green parts on the same part key, so only about one in twenty of them could ever match.
+    ///
+    /// The builder only passes filters of joins below this one on the driving side, which are the
+    /// ones whose build sides have finished by the time this table is built, and only the exact
+    /// bitmap is read, since it answers for the integer value whatever the width of the column.
+    ///
+    /// Not for a mark join. It tells a null driving key apart by whether the gathered side has
+    /// rows, and it asks the table, so a table narrowed to nothing would answer false for a row
+    /// whose honest answer is null. An outer join between the two can put that null there.
+    #[must_use]
+    pub(crate) fn narrowed_by(mut self, narrowing: Vec<(usize, Arc<Sideways<'a>>)>) -> Self {
+        if self.kind != JoinKind::Mark {
+            self.narrowing = narrowing;
+        }
+        self
+    }
+
+    /// Which gathered rows can go in the table, by [`Probe::narrowed_by`], or `None` for all.
+    fn allowed(&self, keys: &[Vector], rows: usize) -> Option<Vec<bool>> {
+        let mut allowed: Option<Vec<bool>> = None;
+        let mut block = Vec::new();
+        for (at, sideways) in &self.narrowing {
+            let (Some(domain), Some(key)) = (sideways.kept(), keys.get(*at)) else { continue };
+            let integer = matches!(
+                key.logical_type(),
+                LogicalType::TinyInt
+                    | LogicalType::SmallInt
+                    | LogicalType::Integer
+                    | LogicalType::BigInt
+            );
+            if !integer {
+                continue;
+            }
+            let mask = allowed.get_or_insert_with(|| vec![true; rows]);
+            let mut here = vec![false; rows];
+            for row in domain.keep(key, rows, &mut block) {
+                here[row as usize] = true;
+            }
+            for (flag, here) in mask.iter_mut().zip(here) {
+                *flag = *flag && here;
+            }
+        }
+        allowed
     }
 
     /// Applies the session semantics to the key expressions.
@@ -1425,8 +1502,15 @@ impl<'a> Probe<'a> {
                 // this side is already laid out in `rows` and the table reads it from there.
                 let index = match laid_keys(keying, &rows) {
                     Some(keys) => {
-                        let index =
-                            Lookup::build(&keys, rows.rows(), keying.nulls, threads, &self.cancel)?;
+                        let allowed = self.allowed(&keys, rows.rows());
+                        let index = Lookup::build_among(
+                            &keys,
+                            rows.rows(),
+                            keying.nulls,
+                            allowed.as_deref(),
+                            threads,
+                            &self.cancel,
+                        )?;
                         charged.grow(index.footprint())?;
                         index
                     }

@@ -82,3 +82,36 @@ fn a_filter_does_not_pass_through_a_left_join() {
         .value_at(0, 0);
     assert_eq!(answer.value_at(0, 0), expected, "every fact row the second dimension keeps");
 }
+
+/// A join above an inner join on the same fact column only ever sees the keys the inner join
+/// kept, so it leaves the other rows out of its own table. Each kind that streams through a
+/// lookup answers here what the same question without the lower join answers.
+#[test]
+fn a_join_above_another_on_the_same_column_answers_the_same_with_a_narrowed_table() {
+    let database = database();
+    database
+        .execute("CREATE TABLE dc AS SELECT i AS k, i * 3 AS v FROM range(0, 1000, 2) r(i)")
+        .expect("a third dimension over the even keys");
+    let value =
+        |sql: &str, column: usize| database.query(sql).expect("the query ran").value_at(0, column);
+    let kept = "fact.a % 10 = 3";
+
+    let inner = "SELECT count(*), sum(dc.v) FROM fact JOIN da ON fact.a = da.k JOIN dc ON fact.a = \
+                 dc.k WHERE da.g = 4";
+    let expected = "SELECT count(*), sum(a * 3) FROM fact WHERE a % 10 = 4";
+    assert_eq!(value(inner, 0), value(expected, 0));
+    assert_eq!(value(inner, 1), value(expected, 1));
+
+    let left = "SELECT count(*), count(dc.k) FROM fact JOIN da ON fact.a = da.k LEFT JOIN dc ON \
+                fact.a = dc.k WHERE da.g = 3";
+    let all = format!("SELECT count(*) FROM fact WHERE {kept}");
+    assert_eq!(value(left, 0), value(&all, 0));
+    assert_eq!(value(left, 1), Value::BigInt(0), "an odd key has no partner among the even ones");
+
+    let semi = "SELECT count(*) FROM fact JOIN da ON fact.a = da.k WHERE da.g = 3 AND fact.a IN \
+                (SELECT k + 1 FROM dc)";
+    assert_eq!(value(semi, 0), value(&all, 0), "every odd key is one more than an even one");
+    let anti = "SELECT count(*) FROM fact JOIN da ON fact.a = da.k WHERE da.g = 3 AND fact.a NOT \
+                IN (SELECT k FROM dc)";
+    assert_eq!(value(anti, 0), value(&all, 0));
+}
