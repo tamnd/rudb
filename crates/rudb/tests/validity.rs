@@ -123,7 +123,8 @@ fn counting_a_column_with_no_nulls_is_counting_the_rows() {
     let planned = written.plan(query, true);
     // Which binding the nullable column ended up as is not asserted, because the pass that drops the
     // columns nobody reads runs after this one and renumbers what is left.
-    let aggregates = planned.lines().find(|line| line.contains("Aggregate")).expect("one aggregate");
+    let aggregates =
+        planned.lines().find(|line| line.contains("Aggregate")).expect("one aggregate");
     assert!(aggregates.contains("count_star()"), "the first count is a row count:\n{planned}");
     assert!(aggregates.contains("count(#"), "the second one is not:\n{planned}");
     assert_eq!(written.both_ways(query), vec![vec![Value::BigInt(300), Value::BigInt(297)]]);
