@@ -42,6 +42,8 @@
 //! they were written and disagree some time after. What this module does is ask which operator a
 //! node is and wrap it.
 
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 use rudb_catalog::{Catalog, Parent, QualifiedName, Table};
@@ -76,6 +78,7 @@ use crate::functionnames::functionnames;
 use crate::gather::{Gather, Keep};
 use crate::group::{Aggregate, Distinct};
 use crate::join::{CrossProduct, Gathered, Join, Marking, Padding, Probe};
+use crate::key::Digest;
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
 use crate::linkjoin::LinkJoin;
@@ -442,6 +445,150 @@ fn frequency_column(
 struct NativeFrequencies {
     entries: Vec<(Value, u64)>,
     column: usize,
+}
+
+struct NativePairFrequencies {
+    entries: Vec<(Vec<Value>, u64)>,
+}
+
+/// Exact two-key counts over bounded heavy-hitter rows, certified against the omitted maximum.
+fn native_pair_frequencies(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    top: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    let Node::Get { catalog: database, schema, table, index, columns, .. } = *plan.node(input)
+    else {
+        return Ok(None);
+    };
+    let [first_expr, second_expr] = plan.expr_list(groups) else { return Ok(None) };
+    let Expr::Column(first) = *plan.expr(*first_expr) else { return Ok(None) };
+    let Expr::Column(second) = *plan.expr(*second_expr) else { return Ok(None) };
+    if first.table != index
+        || second.table != index
+        || plan.expr_type(*first_expr) != &LogicalType::BigInt
+        || plan.expr_type(*second_expr) != &LogicalType::Varchar
+    {
+        return Ok(None);
+    }
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    if top == 0
+        || plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return Ok(None);
+    }
+    let fields = plan.field_list(columns);
+    let Some(first_field) = fields.get(first.column as usize) else { return Ok(None) };
+    let Some(second_field) = fields.get(second.column as usize) else { return Ok(None) };
+    let name = QualifiedName::new(plan.string(database), plan.string(schema), plan.string(table));
+    let table = catalog.table(&name)?;
+    let Some(first_column) = table.column_index(&first_field.name) else { return Ok(None) };
+    let Some(second_column) = table.column_index(&second_field.name) else { return Ok(None) };
+    if let Some(entries) = table.rows().top_pair_frequencies(first_column, second_column, top)? {
+        return Ok(Some(NativePairFrequencies { entries }));
+    }
+    let Some(occurrences) = table.rows().frequency_occurrences(first_column)? else {
+        return Ok(None);
+    };
+    let (anchors, anchor_indices, second_values, dictionary) = if !occurrences
+        .anchor_indices
+        .is_empty()
+        && occurrences.anchor_indices.len() == occurrences.ordinals.len()
+    {
+        let Some((second_values, dictionary)) =
+            table.rows().stable_codes_at(second_column, &occurrences.ordinals)?
+        else {
+            return Ok(None);
+        };
+        if occurrences.anchors.iter().any(|value| !matches!(value, Value::BigInt(_) | Value::Null))
+            || occurrences
+                .anchor_indices
+                .iter()
+                .any(|&entry| entry as usize >= occurrences.anchors.len())
+        {
+            return Err(Error::internal("a BIGINT frequency anchor has another type"));
+        }
+        (occurrences.anchors, occurrences.anchor_indices, second_values, dictionary)
+    } else {
+        let Some(rows) = table.rows().stable_pair_codes_at(
+            first_column,
+            second_column,
+            &occurrences.ordinals,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut anchors = Vec::new();
+        let mut by_anchor = HashMap::<Option<i64>, u16, BuildHasherDefault<Digest>>::default();
+        let mut anchor_indices = Vec::with_capacity(rows.first.len());
+        for value in rows.first {
+            let value = value
+                .map(|value| {
+                    i64::try_from(value).map_err(|_| {
+                        Error::internal("a BIGINT frequency occurrence is out of range")
+                    })
+                })
+                .transpose()?;
+            let entry = match by_anchor.get(&value) {
+                Some(&entry) => entry,
+                None => {
+                    let entry = u16::try_from(anchors.len())
+                        .map_err(|_| Error::internal("too many frequency anchors"))?;
+                    anchors.push(value.map_or(Value::Null, Value::BigInt));
+                    by_anchor.insert(value, entry);
+                    entry
+                }
+            };
+            anchor_indices.push(entry);
+        }
+        (anchors, anchor_indices, rows.second, rows.dictionary)
+    };
+    if anchor_indices.len() != second_values.len() {
+        return Err(Error::internal("a stable pair fetch returned columns of different lengths"));
+    }
+    let mut counts = HashMap::<(u16, Option<u32>), u64, BuildHasherDefault<Digest>>::default();
+    for (anchor, second) in anchor_indices.into_iter().zip(second_values) {
+        *counts.entry((anchor, second)).or_default() += 1;
+    }
+    let mut boundaries = counts.values().copied().collect::<Vec<_>>();
+    if boundaries.len() < top {
+        return Ok(None);
+    }
+    boundaries.select_nth_unstable_by(top - 1, |left, right| right.cmp(left));
+    let boundary = boundaries[top - 1];
+    if boundary <= occurrences.omitted_max {
+        return Ok(None);
+    }
+    let mut entries = Vec::new();
+    for ((anchor, second), count) in counts {
+        if count < boundary {
+            continue;
+        }
+        let first = anchors
+            .get(anchor as usize)
+            .cloned()
+            .ok_or_else(|| Error::internal("a frequency anchor index is outside its values"))?;
+        let second = match second {
+            Some(code) => Value::Varchar(
+                dictionary
+                    .try_text_at(code as usize)?
+                    .ok_or_else(|| Error::internal("a string frequency code is null"))?
+                    .to_owned(),
+            ),
+            None => Value::Null,
+        };
+        entries.push((vec![first, second], count));
+    }
+    Ok(Some(NativePairFrequencies { entries }))
 }
 
 /// Exact grouped counts already certified by the table's frequency synopsis.
@@ -1707,6 +1854,26 @@ impl<'a> Building<'a, '_> {
         let pipeline = self.shape.pipeline(reference);
         if bound.max_groups.is_none() && bound.having_count.is_none() {
             let top = bound.top_counts.map(|(bound, _)| bound);
+            if let Some(top) = top {
+                if let Some(frequencies) = native_pair_frequencies(
+                    self.plan,
+                    self.catalog,
+                    input,
+                    groups,
+                    aggregates,
+                    top,
+                )? {
+                    let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                    let counters = self.watch(
+                        reference,
+                        id,
+                        pipeline,
+                        "Aggregate",
+                        Some("native pair frequencies"),
+                    );
+                    return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+                }
+            }
             if let Some(frequencies) =
                 native_frequencies(self.plan, self.catalog, input, groups, aggregates, top)?
             {
@@ -2251,10 +2418,99 @@ impl<'a> Building<'a, '_> {
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::LogicalType;
-    use rudb_plan::{CompareOp, Expr, Node, Plan};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{count_having_aggregate, count_top_aggregate};
+    use rudb_catalog::Catalog;
+    use rudb_common::{Field, LogicalType, Value};
+    use rudb_plan::{CompareOp, Expr, Node, Plan};
+    use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
+
+    use super::{count_having_aggregate, count_top_aggregate, native_pair_frequencies};
+
+    fn native_path(label: &str) -> PathBuf {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("time advances").as_nanos();
+        std::env::temp_dir().join(format!("rudb-exec-{label}-{}-{stamp}.rdb", std::process::id()))
+    }
+
+    fn native_catalog(label: &str, rows: &[(i64, String)]) -> (PathBuf, Catalog) {
+        let path = native_path(label);
+        let fields = vec![
+            Field::required("id", LogicalType::BigInt),
+            Field::required("phrase", LogicalType::Varchar),
+        ];
+        let mut writer = rudb_native::Writer::create(&path, "items", fields).expect("new file");
+        for rows in rows.chunks(VECTOR_SIZE) {
+            let ids = rows.iter().map(|(id, _)| Value::BigInt(*id)).collect::<Vec<_>>();
+            let phrases =
+                rows.iter().map(|(_, phrase)| Value::Varchar(phrase.clone())).collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &ids).expect("big integers"),
+                Vector::from_values(LogicalType::Varchar, &phrases).expect("strings"),
+            ])
+            .expect("matching columns");
+            writer.append(&chunk).expect("rows");
+        }
+        writer.finish().expect("commit");
+        let native = rudb_native::Catalog::open(&path).expect("reopen");
+        let mut catalog = Catalog::new();
+        catalog.create_native_table(native.table("items").expect("stored table")).expect("attach");
+        (path, catalog)
+    }
+
+    fn pair_plan() -> Plan {
+        Plan::parse(
+            "Aggregate #1 groups=[#0.0::BIGINT, #0.1::VARCHAR] \
+             aggregates=[count_star()::BIGINT]\n  \
+             Get memory.main.items AS items #0 [id::BIGINT, phrase::VARCHAR]",
+        )
+        .expect("a two-key grouped count")
+    }
+
+    fn pair_frequencies(
+        plan: &Plan,
+        catalog: &Catalog,
+        top: usize,
+    ) -> Option<super::NativePairFrequencies> {
+        let Node::Aggregate { input, groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        native_pair_frequencies(plan, catalog, input, groups, aggregates, top)
+            .expect("metadata reads")
+    }
+
+    #[test]
+    fn sparse_occurrences_certify_two_key_top_counts() {
+        let mut rows = Vec::new();
+        rows.extend(std::iter::repeat_n((1, "a".to_string()), VECTOR_SIZE + 5));
+        rows.extend(std::iter::repeat_n((1, "b".to_string()), 4));
+        rows.extend(std::iter::repeat_n((2, "x".to_string()), 3));
+        rows.push((3, "y".to_string()));
+        let (path, catalog) = native_catalog("pair-frequencies", &rows);
+        let answer =
+            pair_frequencies(&pair_plan(), &catalog, 2).expect("the top two are certified");
+        assert_eq!(answer.entries.len(), 2);
+        assert!(answer.entries.contains(&(
+            vec![Value::BigInt(1), Value::Varchar("a".to_string())],
+            u64::try_from(VECTOR_SIZE + 5).expect("a small vector width"),
+        )));
+        assert!(
+            answer.entries.contains(&(vec![Value::BigInt(1), Value::Varchar("b".to_string())], 4))
+        );
+        fs::remove_file(path).expect("clean up");
+    }
+
+    #[test]
+    fn sparse_occurrences_refuse_a_pair_tied_with_the_omitted_tail() {
+        let rows = (0..513_i64).map(|id| (id, format!("phrase {id}"))).collect::<Vec<_>>();
+        let (path, catalog) = native_catalog("pair-fallback", &rows);
+        assert!(
+            pair_frequencies(&pair_plan(), &catalog, 10).is_none(),
+            "a count of one cannot beat an omitted first-key count of one"
+        );
+        fs::remove_file(path).expect("clean up");
+    }
 
     fn plan(direction: &str) -> Plan {
         Plan::parse(&format!(
