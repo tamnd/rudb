@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value};
 
+use crate::buffer::Buffer;
 use crate::string::{Arenas, StringView};
 use crate::validity::Validity;
 use crate::vector::{
@@ -359,6 +360,11 @@ pub fn interleave_placed(
     if let Some(merged) = merged_dictionary(ty, pieces, order, inverse)? {
         return Ok(merged);
     }
+    if let Some(inverse) = inverse
+        && let Some(placed) = placed_strings(ty, pieces, inverse)?
+    {
+        return Ok(placed);
+    }
     let mut data = data_for(ty, rows)?;
     // The untyped null, which has no run of data to lay or to gather out of, and is null whatever
     // the order is.
@@ -444,6 +450,84 @@ pub fn interleave_placed(
         None => copy_of(&data, order),
     };
     Ok(Vector::flat(ty.clone(), data)?.with_validity(validity))
+}
+
+/// The string column written through `inverse` into an arena laid in the order of the result.
+///
+/// Laying the pieces' arenas end to end and pushing the views keeps the bytes in the order they
+/// arrived, so everything after the sort that reads the strings in their new order reads the arena
+/// at random. On the sorted `lineitem` that is `l_comment`, whose distinct count in the append
+/// took 550 to 1570 ms of CPU across the threads at full width, nearly all of it waiting on memory,
+/// and takes 190 to 250 ms with the arena in order. A table built by the sort also keeps its strings
+/// in the order it is read in from then on. Here each piece is read once in order, every long
+/// string's length is written to its place first so a prefix sum gives each one its offset, and
+/// then its bytes are copied there. A sort's output is a few long runs of its input, so both
+/// passes write a few streams that each move forward.
+///
+/// `None` when the column is not a string, or when a piece is not flat views and has to be
+/// flattened on the general path first.
+fn placed_strings(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Result<Option<Vector>> {
+    if !matches!(ty, LogicalType::Varchar | LogicalType::Blob)
+        || pieces.iter().any(|piece| piece.text_parts().is_none())
+    {
+        return Ok(None);
+    }
+    let rows = inverse.len();
+    let mut offsets = vec![0u64; rows + 1];
+    let mut places = inverse.iter();
+    for piece in pieces {
+        let (views, _) = piece.text_parts().unwrap_or_default();
+        for (view, &to) in views.iter().zip(places.by_ref()) {
+            if !view.is_inline()
+                && let Some(slot) = offsets.get_mut(to as usize + 1)
+            {
+                *slot = view.len() as u64;
+            }
+        }
+    }
+    let mut total = 0;
+    for offset in &mut offsets {
+        total += *offset;
+        *offset = total;
+    }
+    let mut arena =
+        vec![0u8; usize::try_from(total).map_err(|_| Error::internal("an arena too large"))?];
+    let mut placed = vec![StringView::empty(); rows];
+    let mut live = vec![true; rows];
+    let mut places = inverse.iter();
+    for piece in pieces {
+        let (views, from) = piece.text_parts().unwrap_or_default();
+        let validity = piece.validity();
+        for (row, (view, &to)) in views.iter().zip(places.by_ref()).enumerate() {
+            let to = to as usize;
+            if !validity.is_valid(row) {
+                if let Some(slot) = live.get_mut(to) {
+                    *slot = false;
+                }
+                continue;
+            }
+            let (Some(bytes), Some(&at), Some(slot)) =
+                (view.bytes_in(from), offsets.get(to), placed.get_mut(to))
+            else {
+                continue;
+            };
+            if view.is_inline() {
+                *slot = *view;
+                continue;
+            }
+            if let Some(into) = arena.get_mut(at as usize..at as usize + bytes.len()) {
+                into.copy_from_slice(bytes);
+            }
+            *slot = StringView::over(bytes, at);
+        }
+    }
+    let validity = if live.iter().all(|&valid| valid) {
+        Validity::AllValid
+    } else {
+        Validity::from_run(&live)
+    };
+    let vector = Vector::string_views(ty.clone(), placed, Arc::new(Buffer::from_vec(arena)))?;
+    Ok(Some(vector.with_validity(validity)))
 }
 
 /// How many rows a merged dictionary entry has to stand for on average before a string column is
@@ -1055,6 +1139,37 @@ mod tests {
         let untyped = [Vector::constant(LogicalType::Null, Value::Null, 3)];
         let got = interleave(&LogicalType::Null, &untyped, &[2, 0]).expect("an untyped null");
         assert_eq!(values(&got), vec![Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn placed_strings_are_laid_in_the_order_of_the_result() {
+        let word = |text: &str| Value::Varchar(text.to_string());
+        let flat = Vector::from_values(
+            LogicalType::Varchar,
+            &[word("the first string past twelve bytes"), Value::Null, word("short")],
+        )
+        .expect("flat");
+        let arena = b"xxa second string past twelve bytesyy".to_vec();
+        let views = vec![StringView::over(&arena[2..35], 2), StringView::inline("tiny")];
+        let viewed =
+            Vector::string_views(LogicalType::Varchar, views, Arc::new(Buffer::from_vec(arena)))
+                .expect("views");
+        let pieces = [flat, viewed];
+        let order = [3, 0, 4, 2, 1];
+        let mut inverse = vec![0u32; order.len()];
+        for (to, &from) in order.iter().enumerate() {
+            inverse[from] = u32::try_from(to).expect("a small row");
+        }
+        let laid: Vec<Value> = pieces.iter().flat_map(values).collect();
+        let expected: Vec<Value> = order.iter().map(|&index| laid[index].clone()).collect();
+        let got = interleave_placed(&LogicalType::Varchar, &pieces, &order, Some(&inverse))
+            .expect("a placed interleave");
+        assert_eq!(values(&got), expected);
+        let (_, arena) = got.text_parts().expect("views");
+        assert_eq!(
+            arena, b"a second string past twelve bytesthe first string past twelve bytes",
+            "the long strings in the order they come out, and nothing else"
+        );
     }
 
     #[test]
