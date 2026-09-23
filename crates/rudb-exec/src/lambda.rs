@@ -21,6 +21,9 @@
 //! the step before it made. It runs by position instead: every list's second element in one
 //! chunk, then every list's third, with a row per list that still has one, so a chunk of lists
 //! is as many runs of the body as its longest list is long, and never one per element.
+//!
+//! `invoke` has no list at all. Its body runs once over the chunk as it is, with the arguments as
+//! the parameters, which makes it the same machinery with a row per row instead of per element.
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_kernels::{cast, is_true};
@@ -38,18 +41,24 @@ enum Kind {
     Filter,
     /// The answer is the next step's accumulator, and the last one is the result.
     Reduce,
+    /// The answers are the answer, a row each.
+    Invoke,
 }
 
-/// The list, the lambda and `list_reduce`'s initial value of a call to a function that takes a
-/// lambda, if this call is one.
+/// The lambda of a call to a function that takes one, and the call's other arguments in order, if
+/// this call is one.
 ///
-/// The binder writes these calls with the lambda as the second argument, and it writes a lambda
-/// nowhere else.
-pub(crate) fn lambda_call(plan: &Plan, args: Slice) -> Option<(ExprRef, ExprRef, Option<ExprRef>)> {
+/// The binder writes these calls with the lambda as the second argument, after the list, or as the
+/// first for `invoke`, and it writes a lambda nowhere else. The other arguments are the list and
+/// `list_reduce`'s initial value, or `invoke`'s parameters.
+pub(crate) fn lambda_call(plan: &Plan, args: Slice) -> Option<(ExprRef, Vec<ExprRef>)> {
     let is_lambda = |lambda: ExprRef| matches!(plan.expr(lambda), Expr::Lambda { .. });
-    match *plan.expr_list(args) {
-        [list, lambda] if is_lambda(lambda) => Some((list, lambda, None)),
-        [list, lambda, initial] if is_lambda(lambda) => Some((list, lambda, Some(initial))),
+    let args = plan.expr_list(args);
+    match args {
+        [lambda, rest @ ..] if is_lambda(*lambda) => Some((*lambda, rest.to_vec())),
+        [list, lambda, rest @ ..] if is_lambda(*lambda) && rest.len() <= 1 => {
+            Some((*lambda, [*list].into_iter().chain(rest.iter().copied()).collect()))
+        }
         _ => None,
     }
 }
@@ -78,30 +87,33 @@ impl Lambda {
     pub(crate) fn new(
         plan: &Plan,
         name: &str,
-        list: ExprRef,
         lambda: ExprRef,
+        inputs: &[ExprRef],
         schema: &Schema,
     ) -> Result<Self> {
         let kind = match name {
             "list_transform" => Kind::Transform,
             "list_filter" => Kind::Filter,
             "list_reduce" => Kind::Reduce,
+            "invoke" => Kind::Invoke,
             other => return Err(Error::internal(format!("{other} does not take a lambda"))),
         };
         let Expr::Lambda { table, params, body } = *plan.expr(lambda) else {
             return Err(Error::internal("a lambda call without a lambda"));
         };
-        let LogicalType::List(element) = plan.expr_type(list) else {
-            return Err(Error::internal(format!(
-                "a lambda over a {} rather than a list",
-                plan.expr_type(list)
-            )));
-        };
         let names = plan.name_list(params);
         let body_type = plan.expr_type(body).clone();
-        let mut types = match kind {
-            Kind::Reduce => vec![body_type.clone(), (**element).clone(), LogicalType::BigInt],
-            Kind::Transform | Kind::Filter => vec![(**element).clone(), LogicalType::BigInt],
+        let mut types = if kind == Kind::Invoke {
+            inputs.iter().map(|&input| plan.expr_type(input).clone()).collect()
+        } else {
+            let list = inputs.first().copied();
+            let Some(LogicalType::List(element)) = list.map(|list| plan.expr_type(list)) else {
+                return Err(Error::internal(format!("{name} over something other than a list")));
+            };
+            match kind {
+                Kind::Reduce => vec![body_type.clone(), (**element).clone(), LogicalType::BigInt],
+                _ => vec![(**element).clone(), LogicalType::BigInt],
+            }
         };
         read_types(plan, body, table, &mut types);
         let mut fields = Vec::with_capacity(names.len());
@@ -135,7 +147,8 @@ impl Lambda {
         &self.schema
     }
 
-    /// Runs the call over one chunk, given the list as long as the chunk and a way to run the body.
+    /// Runs the call over one chunk, given the other arguments as long as the chunk and a way to
+    /// run the body.
     ///
     /// A null list is a null answer, and an empty one is an empty answer that ran nothing.
     ///
@@ -144,12 +157,27 @@ impl Lambda {
     /// Whatever the body raises, on the first element that raises it.
     pub(crate) fn run(
         &self,
-        list: &Vector,
-        initial: Option<&Vector>,
+        inputs: &[&Vector],
         chunk: &Chunk,
         body: &mut dyn FnMut(&Chunk) -> Result<Vector>,
     ) -> Result<Vector> {
         let rows = chunk.len();
+        if self.kind == Kind::Invoke {
+            let mut columns = Vec::with_capacity(self.schema.width());
+            for (position, &read) in self.captured.iter().enumerate() {
+                columns.push(if read {
+                    chunk.column(position)?.clone()
+                } else {
+                    let ty = self.schema.fields()[position].ty.clone();
+                    Vector::constant(ty, Value::Null, rows)
+                });
+            }
+            columns.extend(inputs.iter().map(|&input| input.clone()));
+            return body(&Chunk::with_rows(columns, rows)?);
+        }
+        let (Some(list), initial) = (inputs.first(), inputs.get(1).copied()) else {
+            return Err(Error::internal("a lambda over a list without the list"));
+        };
         let flat = list.flatten()?;
         let Some((entries, child)) = flat.list_parts() else {
             return Err(Error::internal(format!("a lambda over a {} vector", list.logical_type())));
@@ -186,7 +214,7 @@ impl Lambda {
         }
         let elements = match self.kind {
             Kind::Transform => joined(&self.body_type, pieces)?,
-            Kind::Filter | Kind::Reduce => child.gather(&kept)?,
+            Kind::Filter | Kind::Reduce | Kind::Invoke => child.gather(&kept)?,
         };
         let mut entries = Vec::with_capacity(rows);
         let mut at = 0u32;
@@ -238,7 +266,9 @@ impl Lambda {
                 }
                 pieces.push(answers);
             }
-            Kind::Reduce => return Err(Error::internal("list_reduce run a batch at a time")),
+            Kind::Reduce | Kind::Invoke => {
+                return Err(Error::internal("a lambda without elements run a batch at a time"));
+            }
             Kind::Filter => {
                 for (at, (&row, &element)) in batch.rows.iter().zip(&batch.elements).enumerate() {
                     if is_true(&answers.value_at(at)) {

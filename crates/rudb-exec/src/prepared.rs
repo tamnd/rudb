@@ -199,10 +199,9 @@ enum Step {
     /// over a chunk with a row per element that [`Lambda`] builds, and a step in the outer array has
     /// no way to say that.
     Lambda {
-        /// The list's step.
-        list: usize,
-        /// The initial value's step, for a `list_reduce` that has one.
-        initial: Option<usize>,
+        /// The steps of the call's other arguments: the list and `list_reduce`'s initial value, or
+        /// `invoke`'s parameters.
+        inputs: Vec<usize>,
         /// The layout of what the body runs over and what to do with its answers.
         runner: Box<Lambda>,
         /// The body, prepared against the runner's schema.
@@ -367,12 +366,7 @@ impl Prepared {
             // A case's branches are arrays of their own and read nothing out of this one.
             Step::Column(_) | Step::Constant(_) | Step::Case { .. } => {}
             Step::Cast { input, .. } | Step::InSet { input, .. } => visit(*input),
-            Step::Lambda { list, initial, .. } => {
-                visit(*list);
-                if let Some(initial) = initial {
-                    visit(*initial);
-                }
-            }
+            Step::Lambda { inputs, .. } => inputs.iter().for_each(|&input| visit(input)),
             Step::Compare { left, right, .. } => {
                 visit(*left);
                 visit(*right);
@@ -826,14 +820,13 @@ impl Prepared {
             Step::Case { arms, otherwise, blend } => {
                 Some(self.case(chunk, arms, otherwise.as_ref(), blend.as_ref(), ty)?)
             }
-            Step::Lambda { list, initial, runner, body } => {
-                let list = self.operand(*list, chunk, slots)?;
-                let initial = match initial {
-                    Some(initial) => Some(self.operand(*initial, chunk, slots)?),
-                    None => None,
-                };
+            Step::Lambda { inputs, runner, body } => {
+                let mut operands = Vec::with_capacity(inputs.len());
+                for &input in inputs {
+                    operands.push(self.operand(input, chunk, slots)?);
+                }
                 let mut scratch = body.scratch();
-                Some(runner.run(list, initial, chunk, &mut |inner| {
+                Some(runner.run(&operands, chunk, &mut |inner| {
                     body.evaluate_one(inner, &mut scratch).cloned()
                 })?)
             }
@@ -1041,20 +1034,19 @@ impl Prepared {
                 }
             }
             Expr::Function { name, args } if lambda_call(plan, args).is_some() => {
-                let Some((list, lambda, initial)) = lambda_call(plan, args) else {
+                let Some((lambda, inputs)) = lambda_call(plan, args) else {
                     return Err(Error::internal("a lambda call without a lambda"));
                 };
                 let Expr::Lambda { body, .. } = *plan.expr(lambda) else {
                     return Err(Error::internal("a lambda call without a lambda"));
                 };
-                let runner = Lambda::new(plan, plan.string(name), list, lambda, schema)?;
+                let runner = Lambda::new(plan, plan.string(name), lambda, &inputs, schema)?;
                 let body = Self::one(plan, body, runner.schema())?;
-                let list = self.push(plan, list, schema)?;
-                let initial = match initial {
-                    Some(initial) => Some(self.push(plan, initial, schema)?),
-                    None => None,
-                };
-                Step::Lambda { list, initial, runner: Box::new(runner), body: Box::new(body) }
+                let mut steps = Vec::with_capacity(inputs.len());
+                for &input in &inputs {
+                    steps.push(self.push(plan, input, schema)?);
+                }
+                Step::Lambda { inputs: steps, runner: Box::new(runner), body: Box::new(body) }
             }
             Expr::LambdaParam(binding) => {
                 let position = schema.position_of(binding).ok_or_else(|| {

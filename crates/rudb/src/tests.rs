@@ -2092,6 +2092,120 @@ fn a_reduction_is_refused_the_way_the_pin_refuses_it() {
     );
 }
 
+/// `invoke` runs a lambda once per row over the arguments after it. Per #467.
+#[test]
+fn an_invoked_lambda_runs_over_its_arguments() {
+    let db = database();
+    let one = |sql: &str| rows(&db, sql);
+    assert_eq!(one("SELECT invoke(lambda x: x * x, 2)"), vec![vec![integer(4)]]);
+    assert_eq!(
+        db.query("SELECT invoke(lambda x: x * x, 2)").unwrap().names(),
+        ["invoke((lambda x: (x * x)), 2)"]
+    );
+    assert_eq!(one("SELECT invoke(lambda x, y: x * y + y, 3, 4)"), vec![vec![integer(16)]]);
+    assert_eq!(
+        one("SELECT invoke(lambda x, y, z, w, v: x + v, 1, 2, 3, 4, 5)"),
+        vec![vec![integer(6)]]
+    );
+    assert_eq!(
+        one("SELECT invoke(lambda a: invoke(lambda b, c: a + b + c, 4, 5), 3)"),
+        vec![vec![integer(12)]]
+    );
+    assert_eq!(
+        one("SELECT invoke(lambda x: invoke(lambda y: y + 5, x + 3), 2)"),
+        vec![vec![integer(10)]]
+    );
+    assert_eq!(
+        one("SELECT invoke(lambda name: invoke(lambda age: name || age, 30), 'Alice, ')"),
+        vec![vec![text("Alice, 30")]]
+    );
+    assert_eq!(
+        one("SELECT invoke(lambda x: list_transform([10, 20], lambda y, i: x + y + i), 100)"),
+        vec![vec![Value::List {
+            element: LogicalType::BigInt,
+            values: vec![Value::BigInt(111), Value::BigInt(122)]
+        }]]
+    );
+    assert_eq!(one("SELECT invoke(lambda x: x IS NULL, NULL)"), vec![vec![Value::Boolean(true)]]);
+    assert_eq!(one("SELECT typeof(invoke(lambda x: x, NULL))"), vec![vec![text("\"NULL\"")]]);
+    assert_eq!(
+        one("SELECT typeof(invoke(lambda x: x, [1, 2]::INT[2]))"),
+        vec![vec![text("INTEGER[2]")]]
+    );
+    db.execute("CREATE TABLE ti AS SELECT * FROM (VALUES (1, 10), (2, NULL), (NULL, 30)) t(a, b)")
+        .unwrap();
+    assert_eq!(
+        one("SELECT invoke(lambda x, y: coalesce(x, 0) + coalesce(y, 0) + a, a, b) FROM ti"),
+        vec![vec![integer(12)], vec![integer(4)], vec![Value::Null]]
+    );
+    assert_eq!(
+        one(
+            "SELECT invoke(lambda x: x + sum(a), 1)::INTEGER, typeof(invoke(lambda x: x + sum(a), 1)) FROM ti"
+        ),
+        vec![vec![integer(4), text("HUGEINT")]]
+    );
+    assert_eq!(
+        one("SELECT i FROM range(0, 10) r(i) WHERE invoke(lambda x: x, i % 2 = 0) ORDER BY i"),
+        [0, 2, 4, 6, 8].map(|i| vec![Value::BigInt(i)])
+    );
+    let long: Vec<Vec<Value>> = (0..3000).map(|i| vec![Value::BigInt(i * 2)]).collect();
+    assert_eq!(one("SELECT invoke(lambda x: x * 2, i) FROM range(3000) r(i)"), long);
+}
+
+/// What the pin refuses about `invoke`, in its words. Per #467.
+#[test]
+fn an_invoked_lambda_is_refused_the_way_the_pin_refuses_it() {
+    let db = database();
+    let candidates = "You might need to add explicit type casts.\n\tCandidate functions:\n\tinvoke(col0 \
+                      LAMBDA, col1 ANY, [ANY...]) -> ANY\n";
+    assert_eq!(
+        failure(&db, "SELECT invoke()"),
+        format!("No function matches the given name and argument types 'invoke()'. {candidates}")
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(NULL)"),
+        format!(
+            "No function matches the given name and argument types 'invoke(\"NULL\")'. {candidates}"
+        )
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(NULL, 1)"),
+        "Invalid lambda expression passed to 'invoke' function."
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(1, lambda x: x)"),
+        "This scalar function requires a lambda expression!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(lambda x: x + x, 2, 4, 6)"),
+        "The number of lambda parameters does not match the number of arguments passed to the \
+         'invoke' function, expected 1, got 3."
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(lambda x, y, z: x, 1)"),
+        "The number of lambda parameters does not match the number of arguments passed to the \
+         'invoke' function, expected at least 2, got 1."
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(lambda x: x + 1)"),
+        "The number of lambda parameters does not match the number of arguments passed to the \
+         'invoke' function, expected at least 1, got 0."
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(lambda x, x: x, 1, 2)"),
+        "table \"0_macro_parameters(x, x)\" has duplicate column name \"x\""
+    );
+    // The pin ends this with " when casting from source column x", which is #1433 and not this.
+    assert!(
+        failure(&db, "SELECT invoke(lambda x: x::INTEGER, 'abc')")
+            .starts_with("Could not convert string 'abc' to INT32")
+    );
+    assert_eq!(
+        failure(&db, "SELECT invoke(lambda x: x * 2, 9223372036854775807::BIGINT)"),
+        "Overflow in multiplication of INT64 (9223372036854775807 * 2)!"
+    );
+}
+
 /// What the struct vector changes that a query can see today. Per #594.
 ///
 /// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put

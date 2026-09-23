@@ -38,6 +38,7 @@ const LAMBDA_FUNCTIONS: &[(&str, &str)] = &[
     ("list_reduce", REDUCE),
     ("array_reduce", REDUCE),
     ("reduce", REDUCE),
+    ("invoke", INVOKE),
 ];
 
 /// Every element through the body, in order.
@@ -48,6 +49,9 @@ pub(crate) const FILTER: &str = "list_filter";
 
 /// Every element folded into one value, left to right.
 pub(crate) const REDUCE: &str = "list_reduce";
+
+/// The body run once per row, over the arguments that follow it.
+pub(crate) const INVOKE: &str = "invoke";
 
 /// The name the plan records for a name written in a call, if it is a function that takes a lambda.
 pub(crate) fn lambda_function(written: &str) -> Option<&'static str> {
@@ -105,7 +109,8 @@ impl Binder<'_> {
         Some(self.add_expr(Expr::LambdaParam(binding), ty))
     }
 
-    /// Binds a call to `list_transform`, `list_filter` or `list_reduce`, by any of their names.
+    /// Binds a call to `list_transform`, `list_filter`, `list_reduce` or `invoke`, by any of their
+    /// names.
     ///
     /// The list is bound first, and its type is what the parameters are typed from. A list that is
     /// the untyped null is the untyped null out, before the body is looked at, which is the pin's
@@ -120,6 +125,9 @@ impl Binder<'_> {
         arguments: &[ast::ExprRef],
         scope: &Scope,
     ) -> Result<ExprRef> {
+        if recorded == INVOKE {
+            return self.bind_invoke(ast, arguments, scope);
+        }
         let reduce = recorded == REDUCE;
         let (list, lambda, initial) = match *arguments {
             [list, lambda] => (list, lambda, None),
@@ -132,30 +140,12 @@ impl Binder<'_> {
         {
             return Err(self.no_lambda_match(ast, recorded, arguments, scope));
         }
-        let ast::Expr::Lambda { params, body } = ast.expr(lambda) else {
-            return Err(Error::binder(
-                "Deprecated lambda arrow (->) detected. Please transition to the new lambda \
-                 syntax, i.e.., lambda x, i: x + i, before DuckDB's next release.\nUse SET \
-                 lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.\nFor \
-                 more information, see https://duckdb.org/docs/current/sql/functions/lambda.html.",
-            ));
-        };
-        let names: Vec<String> = ast.name(params).map(str::to_string).collect();
+        let (names, body) = lambda_parts(ast, lambda)?;
         if names.len() > 3 || (names.len() > 2 && !reduce) {
             return Err(Error::binder(format!(
                 "This lambda function only supports up to {} lambda parameters!",
                 if reduce { "three" } else { "two" }
             )));
-        }
-        // The pin binds the parameters as a table it names after them, and a repeated name is the
-        // error that table raises, in its words.
-        for (at, name) in names.iter().enumerate() {
-            if names[..at].iter().any(|earlier| rudb_catalog::same_name(earlier, name)) {
-                return Err(Error::binder(format!(
-                    "table \"0_macro_parameters({})\" has duplicate column name \"{name}\"",
-                    names.join(", ")
-                )));
-            }
         }
         let mut list = self.bind_expr(ast, list, scope)?;
         let element = match self.plan().expr_type(list).clone() {
@@ -202,6 +192,70 @@ impl Binder<'_> {
             None => self.plan_mut().add_expr_list(&[list, lambda]),
         };
         let name = self.plan_mut().intern(recorded);
+        Ok(self.add_expr(Expr::Function { name, args }, returns))
+    }
+
+    /// Binds a call to `invoke`, which runs its lambda once per row over the arguments after it.
+    ///
+    /// Each parameter is typed as the argument in its place, whatever that is, and the answer is
+    /// the body's. The arguments are evaluated once each and handed to the body, rather than the
+    /// body being written out with the arguments in place of the parameters, so that
+    /// `invoke(lambda x: x = x, random())` is true the way it is on the pin. A lambda with more
+    /// parameters than there are arguments is refused naming the first one that has none, and one
+    /// with fewer naming the count, both in the pin's words.
+    fn bind_invoke(
+        &mut self,
+        ast: &Ast,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let Some((&lambda, rest)) = arguments.split_first() else {
+            return Err(self.no_lambda_match(ast, INVOKE, arguments, scope));
+        };
+        if !any_lambda(ast, lambda) {
+            if rest.iter().any(|&arg| any_lambda(ast, arg)) {
+                return Err(Error::binder("This scalar function requires a lambda expression!"));
+            }
+            // A null is accepted where the lambda goes, since it casts to anything, and refused
+            // only once the call is bound and it turns out not to be a lambda.
+            if !rest.is_empty() {
+                let first = self.bind_expr(ast, lambda, scope)?;
+                if self.plan().expr_type(first) == &LogicalType::Null {
+                    return Err(Error::binder(
+                        "Invalid lambda expression passed to 'invoke' function.",
+                    ));
+                }
+            }
+            return Err(self.no_lambda_match(ast, INVOKE, arguments, scope));
+        }
+        let (names, body) = lambda_parts(ast, lambda)?;
+        let mut args = Vec::with_capacity(rest.len());
+        for &arg in rest {
+            args.push(self.bind_expr(ast, arg, scope)?);
+        }
+        if names.len() != args.len() {
+            let expected = if names.len() > args.len() {
+                format!("at least {}", args.len() + 1)
+            } else {
+                names.len().to_string()
+            };
+            return Err(Error::binder(format!(
+                "The number of lambda parameters does not match the number of arguments passed to \
+                 the 'invoke' function, expected {expected}, got {}.",
+                args.len()
+            )));
+        }
+        let types: Vec<LogicalType> =
+            args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        let table = self.fresh_index();
+        let interned: Vec<_> = names.iter().map(|name| self.plan_mut().intern(name)).collect();
+        let params = self.plan_mut().add_name_list(&interned);
+        let body = self.bind_lambda_body(ast, body, scope, table, &names, types)?;
+        let returns = self.plan().expr_type(body).clone();
+        let lambda = self.add_expr(Expr::Lambda { table, params, body }, returns.clone());
+        args.insert(0, lambda);
+        let args = self.plan_mut().add_expr_list(&args);
+        let name = self.plan_mut().intern(INVOKE);
         Ok(self.add_expr(Expr::Function { name, args }, returns))
     }
 
@@ -312,7 +366,9 @@ impl Binder<'_> {
                 Err(error) => return error,
             }
         }
-        let candidates = if recorded == REDUCE {
+        let candidates = if recorded == INVOKE {
+            "\tinvoke(col0 LAMBDA, col1 ANY, [ANY...]) -> ANY\n".to_string()
+        } else if recorded == REDUCE {
             "\tlist_reduce(col0 ANY[], col1 LAMBDA) -> ANY\n\tlist_reduce(col0 ANY[], col1 LAMBDA, \
              col2 ANY) -> ANY\n"
                 .to_string()
@@ -325,6 +381,32 @@ impl Binder<'_> {
             types.join(", ")
         ))
     }
+}
+
+/// A lambda's parameters as written and its body.
+///
+/// The arrow spelling is refused here, with the pin's sentence, and so is a parameter named twice.
+/// The pin binds the parameters as a table it names after them, and a repeated name is the error
+/// that table raises, in its words.
+fn lambda_parts(ast: &Ast, lambda: ast::ExprRef) -> Result<(Vec<String>, ast::ExprRef)> {
+    let ast::Expr::Lambda { params, body } = ast.expr(lambda) else {
+        return Err(Error::binder(
+            "Deprecated lambda arrow (->) detected. Please transition to the new lambda syntax, \
+             i.e.., lambda x, i: x + i, before DuckDB's next release.\nUse SET \
+             lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.\nFor more \
+             information, see https://duckdb.org/docs/current/sql/functions/lambda.html.",
+        ));
+    };
+    let names: Vec<String> = ast.name(params).map(str::to_string).collect();
+    for (at, name) in names.iter().enumerate() {
+        if names[..at].iter().any(|earlier| rudb_catalog::same_name(earlier, name)) {
+            return Err(Error::binder(format!(
+                "table \"0_macro_parameters({})\" has duplicate column name \"{name}\"",
+                names.join(", ")
+            )));
+        }
+    }
+    Ok((names, body))
 }
 
 /// The type two types meet at, which is the pin's `TryGetMaxLogicalType` for what a lambda body
