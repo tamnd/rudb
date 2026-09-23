@@ -2060,6 +2060,8 @@ struct NativePlace {
     morsel: u64,
     chunk: u64,
     held: Vec<((u64, u64), Chunk)>,
+    /// What `held` was charged to the load profile, given back once its stripe is written.
+    holding: u64,
     started: Option<Span>,
     inside_wall: u64,
     inside_cpu: u64,
@@ -2196,9 +2198,7 @@ impl NativeSink {
             return Ok(());
         }
         let parts = std::mem::take(&mut place.held);
-        place.bytes = parts
-            .iter()
-            .fold(place.bytes, |bytes, (_, chunk)| bytes.saturating_add(chunk.footprint() as u64));
+        let holding = std::mem::take(&mut place.holding);
         // Once a stripe, so both clocks. The waits for the lock are write waits: they are the time
         // one instance spent while another was writing its stripe, which is the cost of the writer
         // being one file behind one lock.
@@ -2214,6 +2214,9 @@ impl NativeSink {
             self.merger.give_back(&mut paged)?;
             self.locked(|writer| writer.write(paged))
         });
+        // The rows are charged until their stripe is in the file, since the encode keeps them
+        // until every column is done and the pages it built are bytes on top of that.
+        self.profile.release(holding);
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
         place.inside_cpu = place.inside_cpu.saturating_add(cpu);
@@ -2269,6 +2272,10 @@ impl Sink for NativeSink {
         }
         place.start();
         place.rows = place.rows.saturating_add(chunk.len() as u64);
+        let footprint = chunk.footprint() as u64;
+        place.bytes = place.bytes.saturating_add(footprint);
+        place.holding = place.holding.saturating_add(footprint);
+        self.profile.hold(footprint);
         place.held.push(((place.morsel, place.chunk), chunk.clone()));
         place.chunk = place.chunk.saturating_add(1);
         if place.held.len() == rudb_native::STRIPE_PARTS {

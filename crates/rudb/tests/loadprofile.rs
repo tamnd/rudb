@@ -69,6 +69,43 @@ fn a_create_table_as_leaves_a_profile_that_adds_up_to_the_file() {
 }
 
 #[test]
+fn a_load_reports_what_it_held_on_its_total_row() {
+    let path = scratch("memory");
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let database = Database::open(&name).expect("a file name starts a native database");
+    database
+        .execute(
+            "CREATE TABLE remembered AS SELECT range AS a, 'v' || (range % 1000) AS b \
+             FROM range(300000)",
+        )
+        .expect("loads");
+    let result = database
+        .query(
+            "SELECT stage, accounted_peak, peak_rss FROM rudb_write_metrics() \
+             WHERE target = 'remembered'",
+        )
+        .expect("the load profile reads");
+    let mut totals = 0;
+    for row in result.rows() {
+        if row[0].to_string() != "total" {
+            assert!(row[1].is_null() && row[2].is_null(), "a stage row has a peak: {row:?}");
+            continue;
+        }
+        totals += 1;
+        // At least the rows of one stripe's first column were held at once before it was written.
+        let accounted = number(&row[1]);
+        assert!(accounted >= 8 * 65_536, "{accounted} bytes accounted for 300,000 rows");
+        if cfg!(target_os = "linux") {
+            let resident = number(&row[2]);
+            assert!(resident >= accounted, "{resident} resident under {accounted} accounted");
+        }
+    }
+    assert_eq!(totals, 1);
+    drop(database);
+    std::fs::remove_file(path).expect("removes the temporary database");
+}
+
+#[test]
 fn a_statement_that_never_loaded_leaves_no_profile() {
     let database = Database::new();
     database
