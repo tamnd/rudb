@@ -43,6 +43,7 @@
 //! the ratio depend on insertion order.
 
 use std::cell::RefCell;
+use std::sync::OnceLock;
 
 use rudb_common::{Error, Result};
 
@@ -120,6 +121,17 @@ fn mask_of(len: usize) -> u64 {
 pub struct SymbolTable {
     /// Code to symbol. At most [`MAX_SYMBOLS`] long.
     symbols: Vec<Symbol>,
+    /// What compressing looks symbols up in, built the first time something is compressed.
+    ///
+    /// Decompressing only ever reads `symbols`, and a table read back from a file is almost always
+    /// read back to decompress. Building these eagerly filled a hundred and thirty kilobytes of
+    /// pair slots and sorted the symbols for every block of a text column a scan decoded, which on
+    /// `SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'` was six percent of the query.
+    lookup: OnceLock<Lookup>,
+}
+
+/// The three tables the matcher reads, all of them built from the symbols and holding nothing else.
+struct Lookup {
     /// First byte to code, or [`ESCAPE`] when no one byte symbol covers it.
     single: Vec<u8>,
     /// First two bytes to code, or `u16::MAX` when there is no two byte symbol for them.
@@ -164,9 +176,11 @@ impl SymbolTable {
     pub fn footprint(&self) -> usize {
         size_of::<Self>()
             + self.symbols.capacity() * size_of::<Symbol>()
-            + self.single.capacity()
-            + self.pair.capacity() * size_of::<u16>()
-            + self.hash.capacity() * size_of::<Option<(Symbol, u8)>>()
+            + self.lookup.get().map_or(0, |lookup| {
+                lookup.single.capacity()
+                    + lookup.pair.capacity() * size_of::<u16>()
+                    + lookup.hash.capacity() * size_of::<Option<(Symbol, u8)>>()
+            })
     }
 
     /// A table with no symbols, which escapes everything and doubles its input. The starting point
@@ -337,12 +351,12 @@ impl SymbolTable {
             }
         }
         if remaining >= 2 {
-            let code = self.pair[(word & 0xffff) as usize];
+            let code = self.lookup().pair[(word & 0xffff) as usize];
             if code != u16::MAX {
                 return (code as u8, 2);
             }
         }
-        let code = self.single[(word & 0xff) as usize];
+        let code = self.lookup().single[(word & 0xff) as usize];
         if code == ESCAPE { (ESCAPE, 1) } else { (code, 1) }
     }
 
@@ -352,10 +366,11 @@ impl SymbolTable {
     /// whichever the probe reached first would make the compression ratio depend on the order the
     /// table was built in.
     fn probe(&self, word: u64, remaining: usize) -> Option<(Symbol, u8)> {
+        let hash = &self.lookup().hash;
         let mut slot = hash_of(word);
         let mut best: Option<(Symbol, u8)> = None;
         for _ in 0..PROBE {
-            match self.hash[slot] {
+            match hash[slot] {
                 None => break,
                 Some((symbol, code)) => {
                     if symbol.len() <= remaining
@@ -389,8 +404,17 @@ impl SymbolTable {
     }
 
     fn build(symbols: Vec<Symbol>) -> Self {
+        Self { symbols, lookup: OnceLock::new() }
+    }
+
+    fn lookup(&self) -> &Lookup {
+        self.lookup.get_or_init(|| Lookup::of(&self.symbols))
+    }
+}
+
+impl Lookup {
+    fn of(symbols: &[Symbol]) -> Self {
         let mut table = Self {
-            symbols,
             single: vec![ESCAPE; 256],
             pair: vec![u16::MAX; 65536],
             hash: vec![None; HASH_SLOTS],
@@ -398,7 +422,7 @@ impl SymbolTable {
         // Longest first, so that a short symbol never displaces a long one out of the probe window
         // and the flat tables get the lowest code for a duplicate.
         let mut order: Vec<(Symbol, u8)> =
-            table.symbols.iter().enumerate().map(|(code, symbol)| (*symbol, code as u8)).collect();
+            symbols.iter().enumerate().map(|(code, symbol)| (*symbol, code as u8)).collect();
         order.sort_by_key(|(symbol, code)| (std::cmp::Reverse(symbol.len()), *code));
         for (symbol, code) in order {
             match symbol.len() {
@@ -608,6 +632,23 @@ fn truncated(what: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_table_read_back_to_decompress_builds_no_lookup_tables() {
+        let urls = urls();
+        let samples: Vec<&[u8]> = urls.iter().map(Vec::as_slice).collect();
+        let trained = SymbolTable::train(&samples);
+        let mut compressed = Vec::new();
+        trained.compress(&urls[7], &mut compressed);
+        let mut stored = Vec::new();
+        trained.serialize(&mut stored);
+        let (read, _) = SymbolTable::deserialize(&stored).expect("a table it wrote");
+        let mut out = Vec::new();
+        read.decompress(&compressed, &mut out).expect("a string it compressed");
+        assert_eq!(out, urls[7]);
+        assert!(read.lookup.get().is_none(), "decompressing reads the symbols alone");
+        assert!(read.footprint() < trained.footprint());
+    }
 
     /// A few hundred URLs in the shape ClickBench `hits` has them, which is the workload this
     /// encoding was chosen for. Repetitive in the way real URLs are: a handful of hosts, a handful
