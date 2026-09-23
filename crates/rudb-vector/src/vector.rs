@@ -2611,9 +2611,15 @@ impl Vector {
     ///
     /// `false`, with `out` left empty, for a vector this cannot hand over as a block: `HUGEINT` and
     /// the wide decimals, whose values do not fit an `i64`, the string and nested forms, the
-    /// compressed form, and the dictionary and run forms, which are a gather rather than a copy and
-    /// are left until something wants them. A caller that gets `false` reads the vector the way it
+    /// compressed form, and the run form. A caller that gets `false` reads the vector the way it
     /// read it before, with [`Self::signed_at`].
+    ///
+    /// A dictionary is read as its entries widened once and then a gather through the codes. That
+    /// is the form a Parquet integer column arrives in, because DuckDB writes most of them with a
+    /// dictionary, and reading one a row at a time was 4 percent of the CPU of loading the 10m
+    /// ClickBench file, all of it in the sieve the writer builds for each part. A dictionary whose
+    /// entries hold a null is refused, since the row that points at one is null and the only null
+    /// check a caller of this makes on a dictionary may be on its codes.
     #[must_use]
     pub fn signed_block(&self, out: &mut Vec<i64>) -> bool {
         out.clear();
@@ -2651,8 +2657,27 @@ impl Vector {
                 }
                 Err(_) => false,
             },
-            Body::Dictionary { .. }
-            | Body::Runs { .. }
+            Body::Dictionary { codes, values, .. } => {
+                let mut entries = Vec::new();
+                if !values.none_null() || !values.signed_block(&mut entries) {
+                    return false;
+                }
+                let Some(codes) = codes.get(..self.len) else {
+                    return false;
+                };
+                out.reserve(codes.len());
+                for &code in codes {
+                    match entries.get(code as usize) {
+                        Some(&entry) => out.push(entry),
+                        None => {
+                            out.clear();
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            Body::Runs { .. }
             | Body::Gathered { .. }
             | Body::Coded { .. }
             | Body::Views { .. }
@@ -5689,6 +5714,12 @@ mod tests {
             Vector::constant(LogicalType::BigInt, Value::BigInt(11), 3),
             Vector::sequence(100, 5, 4),
             integers(&[1, 2, 3, 1]).bit_packed().unwrap(),
+            Vector::dictionary(vec![1, 0, 1, 3], integers(&[7, -3, 0, 2])).unwrap(),
+            Vector::dictionary(
+                vec![2, 2, 0],
+                Vector::flat(LogicalType::SmallInt, Data::Int16(vec![9, -9, 4].into())).unwrap(),
+            )
+            .unwrap(),
         ];
         for column in &shapes {
             assert!(column.signed_block(&mut out), "{:?} hands over a block", column.form());
@@ -5710,8 +5741,12 @@ mod tests {
     #[test]
     fn a_block_is_refused_for_the_shapes_it_would_have_to_gather_or_widen() {
         let mut out = Vec::new();
-        let flat = integers(&[7, -3, 0, 2]);
-        assert!(!Vector::dictionary(vec![1, 0], flat.clone()).unwrap().signed_block(&mut out));
+        let nulled =
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(4), Value::Null]).unwrap();
+        assert!(
+            !Vector::dictionary(vec![1, 0], nulled).unwrap().signed_block(&mut out),
+            "a dictionary with a null entry would hand its row over as a number"
+        );
         assert!(!Vector::runs(vec![2, 5], integers(&[4, 9])).unwrap().signed_block(&mut out));
         let wide = Vector::flat(LogicalType::HugeInt, Data::Int128(vec![1, 2].into())).unwrap();
         assert!(!wide.signed_block(&mut out), "a hugeint does not fit sixty four bits");
