@@ -7975,3 +7975,17 @@ fn the_conjunct_the_statistics_call_selective_runs_first_and_the_answer_does_not
     assert_eq!(rows(&db, query), answer, "the order the conjuncts run in is not an answer");
     assert_eq!(answer, vec![vec![Value::BigInt(1)]]);
 }
+
+#[test]
+fn a_decimal_sum_is_as_wide_as_a_decimal_goes() {
+    let db = database();
+    let one = |sql: &str| rows(&db, sql);
+    assert_eq!(
+        one("SELECT sum(99.9::DECIMAL(3,1)) FROM range(100)"),
+        vec![vec![Value::Decimal { unscaled: 99_900, width: 38, scale: 1 }]]
+    );
+    assert_eq!(
+        one("SELECT typeof(sum(x)) FROM (SELECT 1.5::DECIMAL(4,1) x)"),
+        vec![vec![text("DECIMAL(38,1)")]]
+    );
+}
