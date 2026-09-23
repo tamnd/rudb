@@ -2397,11 +2397,10 @@ struct NativeText {
     /// the wrong price for `STRLEN` over a column, which asks for one per row and nothing else, and
     /// where a million of them was a third of ClickBench 28.
     ///
-    /// Unpacking a run into an array costs about three instructions a value, so once the reads reach
-    /// a fraction of the dictionary the table has already paid for itself and every read after it is
-    /// a load. [`Self::ends_worth_unpacking`] is that fraction and [`Self::ends_asked`] counts
-    /// against it, because a table built for a reader that wanted three values is four bytes a value
-    /// spent on nothing.
+    /// With the ends unpacked every read is a load, and a vector of lengths is one loop over them.
+    /// The table is built only once the reads say it will be used, which is what
+    /// [`Self::ends_worth_unpacking`] decides and [`Self::ends_asked`] counts towards, because a
+    /// table built for a reader that wanted three values is four bytes a value spent on nothing.
     value_ends: OnceLock<Option<Vec<u32>>>,
     /// How many single offset reads have come in while the table is not built.
     ///
@@ -2616,13 +2615,22 @@ impl NativeText {
 
     /// How many single offset reads make [`Self::value_ends`] worth building.
     ///
-    /// A sixteenth of the dictionary. Unpacking costs about three instructions a value and a packed
-    /// read costs about fifty, so the reads have repaid the build by then several times over, and a
-    /// reader that wants fewer than that is left on the packed form rather than made to pay four
-    /// bytes a value for a table it will not finish using. The floor is there because a sixteenth of
-    /// a short dictionary is a handful of reads, and a table nobody needed is still an allocation.
+    /// As many reads as the dictionary has values. Building the table costs about thirty
+    /// instructions a value once the fresh pages it lands in are counted, and a read out of it saves
+    /// about thirty five, so it repays itself after roughly one read per value. The reads so far are
+    /// the only guess there is at the reads to come, and waiting until they match the size of the
+    /// dictionary is betting that a column read that much will be read that much again.
+    ///
+    /// A sixteenth was the first answer, from counting the unpacking alone at three instructions a
+    /// value. ClickBench 38 showed what that missed: it reads about twenty thousand titles a
+    /// statement out of a dictionary of three hundred and fifty thousand, crossed a sixteenth in its
+    /// second statement and was two percent slower for a table it did not read enough to repay. A
+    /// scan asking for the length of every row crosses it part way through its first statement on
+    /// ClickBench, where a string column has about two rows for every value, and a filter that keeps
+    /// a few thousand rows never does. The floor is there
+    /// because a short dictionary would otherwise build a table for a handful of reads.
     fn ends_worth_unpacking(&self) -> usize {
-        (self.values / 16).max(TEXT_PAYLOAD_VALUES)
+        self.values.max(TEXT_PAYLOAD_VALUES)
     }
 
     /// The unpacked ends, if they are built or if this read is the one that makes them worth it.
@@ -9952,13 +9960,13 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
-        // Two thousand five hundred point reads is past what makes the unpacked ends worth
-        // building, so they are the one thing that grows, by four bytes a value, and nothing of the
-        // payload does.
-        assert_eq!(
-            dictionary.footprint(),
-            after + dictionary.len() * size_of::<u32>(),
-            "a point read of a kept block decodes nothing"
+        // A read per value is about what makes the unpacked ends worth building, so whether they
+        // are built here depends on how many reads the sweep made on the way. They are the one thing
+        // allowed to grow, by four bytes a value, and nothing of the payload is.
+        let grown = dictionary.footprint() - after;
+        assert!(
+            grown == 0 || grown == dictionary.len() * size_of::<u32>(),
+            "a point read of a kept block decodes nothing, and {grown} bytes grew"
         );
         fs::remove_file(path).expect("remove scratch file");
     }
