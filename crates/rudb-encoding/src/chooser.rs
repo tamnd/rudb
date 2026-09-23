@@ -37,8 +37,10 @@
 //! yet. Until there is, this is a plain trait with two implementations and an ablation, which is
 //! the part that can be measured today.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
+use crate::fsst::SymbolTable;
 use crate::{integer, string};
 
 /// Which of the candidates that apply are worth encoding in full.
@@ -80,6 +82,17 @@ pub trait Chooser: std::fmt::Debug + Sync {
     fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
         let _ = (kind, depth);
         true
+    }
+
+    /// A symbol table already trained for FSST at `depth`, or `None` to train one on the chunk.
+    ///
+    /// Training is five passes over a sample of up to 64 KiB, and a caller encoding thousands of
+    /// chunks cut out of one column trains the same table thousands of times. Such a caller trains
+    /// it once over the column and hands it out here. The table travels with every chunk either
+    /// way, so a chunk compressed against a table it was not trained on still reads back.
+    fn symbols(&self, depth: u8) -> Option<&SymbolTable> {
+        let _ = depth;
+        None
     }
 }
 
@@ -276,13 +289,23 @@ impl Chooser for Sampled {
 pub struct Settled {
     strings: Vec<string::Kind>,
     integers: Vec<integer::Kind>,
+    /// The level FSST runs at and the table it compresses against there, when one was trained for
+    /// the whole column. See [`string::with_symbols`].
+    symbols: Option<(u8, Arc<SymbolTable>)>,
 }
 
 impl Settled {
     /// A shape, outermost level first, for the string levels and the integer levels.
     #[must_use]
     pub fn new(strings: Vec<string::Kind>, integers: Vec<integer::Kind>) -> Self {
-        Self { strings, integers }
+        Self { strings, integers, symbols: None }
+    }
+
+    /// The same shape, compressing against `table` wherever FSST is tried at `depth`.
+    #[must_use]
+    pub fn with_symbols(mut self, depth: u8, table: SymbolTable) -> Self {
+        self.symbols = Some((depth, Arc::new(table)));
+        self
     }
 
     /// The string kinds of the shape, outermost first, which is what a report prints.
@@ -319,6 +342,10 @@ impl Chooser for Settled {
             Some(kind) if offered.contains(kind) => vec![*kind],
             _ => offered.to_vec(),
         }
+    }
+
+    fn symbols(&self, depth: u8) -> Option<&SymbolTable> {
+        self.symbols.as_ref().filter(|(at, _)| *at == depth).map(|(_, table)| &**table)
     }
 }
 

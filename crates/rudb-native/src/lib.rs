@@ -1409,7 +1409,7 @@ impl GlobalDictionary {
         }
         let sample =
             self.sample.iter().map(|(at, bytes)| self.slices(*at, bytes)).collect::<Vec<_>>();
-        self.shape = Some(settle_shape(&sample)?);
+        self.shape = Some(string::with_symbols(settle_shape(&sample)?, &sample));
         self.settled = complete;
         Ok(())
     }
@@ -9656,21 +9656,6 @@ fn payload_shapes() -> Vec<chooser::Settled> {
     .collect()
 }
 
-/// Encodes every payload block that filled during the stripe just written, across threads.
-///
-/// This is where the load's dictionary work happens, and where it happens matters more than it
-/// looks. It used to happen in [`Writer::close`], over every block of a column at once, which meant
-/// the raw bytes of every block had to still exist when the load ended. Doing it a block at a time
-/// inside the stripe encode instead was measured at 2.2 times the wall clock for the same user time:
-/// a stripe is a barrier the parquet reader waits on, one column's blocks are one thread, and two of
-/// `hits`'s five dictionary columns hold most of the distinct values, so the whole load ran at less
-/// than one core.
-///
-/// Here is neither. The stripe's columns have all been encoded and handed back by the time this
-/// runs, so every waiting block of every column is one flat queue and it fans out over all of them
-/// the way [`Writer::close`] used to fan out over one column's. The work and the parallelism are
-/// what they were. It happens sixty times during the load rather than once at the end of it, and the
-/// raw bytes go as it goes.
 /// Syncs the file, and counts the sync and how long it took as a publish wait when a load is being
 /// profiled.
 ///
