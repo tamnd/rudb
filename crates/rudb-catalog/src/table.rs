@@ -780,6 +780,23 @@ impl Rows {
         }
     }
 
+    /// Reads only selected positions of one part and the requested columns.
+    ///
+    /// A native reader can avoid decoding a whole string page when an earlier predicate left only
+    /// a few positions. The other stores use their ordinary part read and gather the same rows.
+    pub fn read_selected(&self, at: usize, columns: &[usize], positions: &[u32]) -> Result<Chunk> {
+        let part = match self {
+            Self::Native(reader) => reader.read_sparse(at, columns)?,
+            Self::Grown(reader, _) if at < reader.parts() => reader.read_sparse(at, columns)?,
+            Self::Memory(_) | Self::Grown(_, _) => self.read(at, columns)?,
+        };
+        let mut selected = Vec::with_capacity(part.width());
+        for column in 0..part.width() {
+            selected.push(part.column(column)?.gather(positions)?);
+        }
+        Chunk::with_rows(selected, positions.len())
+    }
+
     /// Whether statistics prove this chunk cannot match.
     #[must_use]
     pub fn skips(&self, at: usize, probes: &[Probe]) -> bool {

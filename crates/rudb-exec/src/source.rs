@@ -24,7 +24,7 @@ use rudb_kernels::cast;
 use rudb_metrics::Counters;
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
-use rudb_plan::{ExprRef, Plan, Slice};
+use rudb_plan::{ConjunctionOp, Expr, ExprRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
 use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Vector};
@@ -509,6 +509,8 @@ fn reader() -> usize {
 #[derive(Debug)]
 struct Pushed {
     predicate: Prepared,
+    /// A necessary single-column LIKE that can run before the other projected column is read.
+    late: Option<Late>,
     compaction: &'static dyn Compaction,
     passes: u32,
     /// The same conjuncts as probes, or `None` when they are not the whole predicate or one of them
@@ -547,7 +549,51 @@ struct Pushed {
 #[derive(Debug)]
 struct Working {
     scratch: Scratch,
+    late_scratch: Option<Scratch>,
     gauge: Gauge,
+}
+
+/// The first predicate and column of a two-column selective scan.
+#[derive(Debug)]
+struct Late {
+    input: usize,
+    predicate: Prepared,
+}
+
+/// A LIKE conjunct followed by a simple comparison on another column.
+///
+/// Only a necessary conjunct of an AND is allowed here. The full predicate still runs after the
+/// sparse read, so this choice cannot accept a row the ordinary scan would reject.
+fn late_like(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<(usize, ExprRef)> {
+    if schema.width() != 2 {
+        return None;
+    }
+    let Expr::Conjunction { op: ConjunctionOp::And, children } = *plan.expr(predicate) else {
+        return None;
+    };
+    let [left, right] = plan.expr_list(children) else { return None };
+    for (candidate, other) in [(*left, *right), (*right, *left)] {
+        let Expr::Function { name, args } = *plan.expr(candidate) else { continue };
+        if plan.string(name) != "~~" {
+            continue;
+        }
+        let [column, constant] = plan.expr_list(args) else { continue };
+        let Expr::Column(binding) = *plan.expr(*column) else { continue };
+        if !matches!(*plan.expr(*constant), Expr::Constant(_)) {
+            continue;
+        }
+        let Some(input) = schema.position_of(binding) else { continue };
+        let Expr::Compare { left, right, .. } = *plan.expr(other) else { continue };
+        let compared = match (plan.expr(left), plan.expr(right)) {
+            (Expr::Column(binding), Expr::Constant(_))
+            | (Expr::Constant(_), Expr::Column(binding)) => *binding,
+            _ => continue,
+        };
+        if schema.position_of(compared) == Some(1 - input) {
+            return Some((input, candidate));
+        }
+    }
+    None
 }
 
 impl Pushed {
@@ -576,8 +622,21 @@ impl Pushed {
         let whole = pushdown.whole;
         let wanted = pushdown.tests.len();
         let probes = onto(columns, pushdown.tests);
+        let late = if columns.len() == 2 && columns.iter().all(Option::is_some) {
+            late_like(plan, schema, pushdown.predicate)
+                .map(|(input, expr)| {
+                    Ok::<_, Error>(Late {
+                        input,
+                        predicate: Prepared::one(plan, expr, schema)?.in_session(session),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
         Ok(Self {
             predicate: Prepared::one(plan, pushdown.predicate, schema)?.in_session(session),
+            late,
             compaction,
             passes: later_passes(plan, pushdown.node),
             probes: (whole && probes.len() == wanted).then_some(probes),
@@ -590,6 +649,7 @@ impl Pushed {
         let waiting = self.spare[slot].lock().ok().and_then(|mut spare| spare.take());
         waiting.unwrap_or_else(|| Working {
             scratch: self.predicate.scratch(),
+            late_scratch: self.late.as_ref().map(|late| late.predicate.scratch()),
             gauge: Gauge::new(self.passes),
         })
     }
@@ -735,6 +795,55 @@ impl<'a> Scan<'a> {
         }
         pushed.give(slot, working);
         Ok(())
+    }
+
+    /// Reads the first LIKE column before the other projected column when it can reject most rows.
+    ///
+    /// The full filter runs on the survivors after the sparse read. A dense result falls back to
+    /// the ordinary two-column read, and a scan with a sideways filter keeps its original row
+    /// positions rather than entering this path.
+    fn read_late(&self, at: usize, out: &mut Chunk) -> Result<bool> {
+        let Some(pushed) = &self.pushed else { return Ok(false) };
+        let Some(late) = &pushed.late else { return Ok(false) };
+        if self.sideways.is_some() {
+            return Ok(false);
+        }
+        let Some(primary) = self.columns[late.input] else { return Ok(false) };
+        let Some(secondary) = self.columns[1 - late.input] else { return Ok(false) };
+        let read = self.table.rows().read(at, &[primary])?;
+        let len = read.len();
+        let mut columns = self
+            .schema
+            .types()
+            .into_iter()
+            .map(|ty| Vector::constant(ty, Value::Null, len))
+            .collect::<Vec<_>>();
+        columns[late.input] = read.column(0)?.clone();
+        let first = Chunk::with_rows(columns, len)?;
+        let slot = reader();
+        let mut working = pushed.take(slot);
+        let selected = late.predicate.evaluate_filter(
+            &first,
+            working
+                .late_scratch
+                .as_mut()
+                .ok_or_else(|| Error::internal("a late filter has no scratch"))?,
+        )?;
+        pushed.give(slot, working);
+        if selected.len().saturating_mul(4) > len {
+            return Ok(false);
+        }
+        if selected.is_empty() {
+            *out = Chunk::empty(&self.schema.types());
+            return Ok(true);
+        }
+        let fetched = self.table.rows().read_selected(at, &[secondary], selected.indices())?;
+        let first = read.column(0)?.gather(selected.indices())?;
+        let second = fetched.column(0)?.clone();
+        let columns = if late.input == 0 { vec![first, second] } else { vec![second, first] };
+        *out = Chunk::with_rows(columns, selected.len())?;
+        self.apply(at, out)?;
+        Ok(true)
     }
 
     /// Drops the rows of one chunk that a join above this scan cannot hold a match for.
@@ -1136,6 +1245,9 @@ impl Source for Scan<'_> {
         };
         if let Some(counters) = &self.counters {
             counters.part_read();
+        }
+        if self.read_late(at, out)? {
+            return Ok(more(morsel));
         }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
         let read = self.table.rows().read(at, &projected)?;
