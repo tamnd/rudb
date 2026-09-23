@@ -7,9 +7,13 @@
 //! A stage nothing charged is left out rather than printed as zeros. Split, the structural index,
 //! transcoding and the extent allocator are stages of the v4 bulk path that the writer does not
 //! have yet, and a row of zeros for them would read as a stage that ran and cost nothing.
+//!
+//! `rudb_codec_metrics()` is here too, since it is the page builder's row of the same profile split
+//! by codec. The counting is in `rudb_encoding::tally`.
 
 use rudb_common::{Result, Value};
-use rudb_functions::write_metric_fields;
+use rudb_encoding::tally;
+use rudb_functions::{codec_metric_fields, write_metric_fields};
 use rudb_metrics::{LoadProfile, Stage, StageTotals, recent_loads};
 use rudb_plan::{Plan, Slice};
 
@@ -48,6 +52,42 @@ pub(crate) fn write_metrics(plan: &Plan, index: u32, columns: Slice) -> Result<M
         rows.push(row(&load, "total", &total, true));
     }
     Metadata::new("rudb_write_metrics", &write_metric_fields(), &rows, plan, index, columns)
+}
+
+/// Every codec of both families with what it cost and how often it was kept.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn codec_metrics(plan: &Plan, index: u32, columns: Slice) -> Result<Metadata> {
+    let codecs = tally::codecs();
+    let family_nanos = |family: &str| -> u64 {
+        codecs
+            .iter()
+            .filter(|codec| codec.family == family)
+            .map(|codec| codec.nanos)
+            .fold(0, u64::saturating_add)
+    };
+    let rows: Vec<Vec<Value>> = codecs
+        .iter()
+        .map(|codec| {
+            vec![
+                text(codec.family),
+                text(codec.name),
+                Value::BigInt(signed(codec.offers)),
+                Value::BigInt(signed(codec.kept)),
+                ratio(codec.kept, codec.offers),
+                Value::Double(millis(codec.nanos)),
+                ratio(codec.nanos, family_nanos(codec.family)),
+            ]
+        })
+        .collect();
+    Metadata::new("rudb_codec_metrics", &codec_metric_fields(), &rows, plan, index, columns)
+}
+
+#[expect(clippy::cast_precision_loss, reason = "a share does not need 53 bits")]
+fn ratio(part: u64, whole: u64) -> Value {
+    if whole == 0 { Value::Null } else { Value::Double(part as f64 / whole as f64) }
 }
 
 fn row(load: &LoadProfile, stage: &str, spent: &StageTotals, total: bool) -> Vec<Value> {

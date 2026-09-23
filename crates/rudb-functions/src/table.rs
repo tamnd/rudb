@@ -97,6 +97,8 @@ pub enum TableFunction {
     RudbDeviceCard,
     /// `rudb_write_metrics()`, what each stage of the recent bulk loads cost.
     RudbWriteMetrics,
+    /// `rudb_codec_metrics()`, what each codec cost the process and how often it was kept.
+    RudbCodecMetrics,
     /// `duckdb_keywords()`, every word the grammar knows and which class each one is in.
     DuckdbKeywords,
     /// `duckdb_types()`, every type name the engine knows and what each one stands for.
@@ -166,6 +168,7 @@ impl TableFunction {
             Self::RudbLinks => "rudb_links",
             Self::RudbDeviceCard => "rudb_device_card",
             Self::RudbWriteMetrics => "rudb_write_metrics",
+            Self::RudbCodecMetrics => "rudb_codec_metrics",
             Self::DuckdbKeywords => "duckdb_keywords",
             Self::DuckdbTypes => "duckdb_types",
             Self::DuckdbFunctions => "duckdb_functions",
@@ -307,6 +310,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("rudb_write_metrics") {
             return Some(Self::RudbWriteMetrics);
+        }
+        if name.eq_ignore_ascii_case("rudb_codec_metrics") {
+            return Some(Self::RudbCodecMetrics);
         }
         if name.eq_ignore_ascii_case("duckdb_keywords") {
             return Some(Self::DuckdbKeywords);
@@ -616,6 +622,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::RudbLinks
         | TableFunction::RudbDeviceCard
         | TableFunction::RudbWriteMetrics
+        | TableFunction::RudbCodecMetrics
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions
@@ -649,6 +656,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::RudbStrategies => Some(strategy_fields()),
         TableFunction::RudbLinks => Some(link_fields()),
         TableFunction::RudbWriteMetrics => Some(write_metric_fields()),
+        TableFunction::RudbCodecMetrics => Some(codec_metric_fields()),
         TableFunction::DuckdbKeywords => Some(keyword_fields()),
         TableFunction::DuckdbTypes => Some(type_fields()),
         TableFunction::DuckdbFunctions => Some(function_fields()),
@@ -898,6 +906,27 @@ pub fn strategy_fields() -> Vec<Field> {
         Field::new("determinism", LogicalType::Varchar),
         Field::new("is_reference", LogicalType::Boolean),
         Field::new("is_default", LogicalType::Boolean),
+    ]
+}
+
+/// The columns `rudb_codec_metrics()` produces.
+///
+/// One row per codec of the integer and string cascades, and one `(choosing)` row per family for
+/// the time spent deciding what to offer. Only the top level of a cascade is counted, so a codec's
+/// `time_ms` is everything its offers cost with what they cascaded into, and a family's rows add up
+/// to its encode time. `share` is a row's part of its family's time and `kept_share` is the part of
+/// its offers that were written, both between 0 and 1, and null where there is nothing to divide.
+/// The counts are for the whole process since it started.
+#[must_use]
+pub fn codec_metric_fields() -> Vec<Field> {
+    vec![
+        Field::new("family", LogicalType::Varchar),
+        Field::new("codec", LogicalType::Varchar),
+        Field::new("offers", LogicalType::BigInt),
+        Field::new("kept", LogicalType::BigInt),
+        Field::new("kept_share", LogicalType::Double),
+        Field::new("time_ms", LogicalType::Double),
+        Field::new("share", LogicalType::Double),
     ]
 }
 
@@ -1393,6 +1422,14 @@ mod tests {
         // Not run, only counted. The point is that the count is worked out in i128, so this comes
         // out as a huge number rather than as a negative one that becomes a capacity panic.
         assert_eq!(length(TableFunction::Range, i64::MIN, i64::MAX, 1), usize::MAX);
+    }
+
+    #[test]
+    fn rudb_codec_metrics_takes_no_arguments() {
+        let resolved = resolve_table("rudb_codec_metrics", &[]).unwrap();
+        assert_eq!(resolved.function, TableFunction::RudbCodecMetrics);
+        assert_eq!(resolved.columns, Columns::Fixed(codec_metric_fields()));
+        assert!(resolve_table("rudb_codec_metrics", &[LogicalType::BigInt]).is_err());
     }
 
     #[test]

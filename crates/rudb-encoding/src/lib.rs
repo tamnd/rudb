@@ -21,6 +21,7 @@ pub mod multi;
 mod reader;
 pub mod sketch;
 pub mod string;
+pub mod tally;
 
 /// The symbol table and the code, which live a layer down now that a vector can be in FSST form.
 ///
