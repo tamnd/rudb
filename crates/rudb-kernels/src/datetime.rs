@@ -566,11 +566,24 @@ impl<'a> Unit<'a> {
             };
             Error::out_of_range(format!("Interval value {written} {unit} out of range"))
         };
+        // Both arms try an `i64` first, because the same step on an `i128` is a call into the
+        // runtime and this runs once a row of the benchmark view's `EventTime`. Whatever does not
+        // fit takes the wide step, which gives the same answer or the same error.
         let total = match count {
-            Count::Whole(whole) => whole.checked_mul(self.scale).ok_or_else(refuse)?,
+            Count::Whole(whole) => {
+                match (i64::try_from(whole), i64::try_from(self.scale)) {
+                    (Ok(narrow), Ok(scale)) if let Some(total) = narrow.checked_mul(scale) => {
+                        i128::from(total)
+                    }
+                    _ => whole.checked_mul(self.scale).ok_or_else(refuse)?,
+                }
+            }
             // A double that has gone past `i128` comes back as the saturated bound, which is out of
             // every field's range as well, so the check below catches it without a case of its own.
-            Count::Real(real) => (real * self.scale as f64).trunc() as i128,
+            Count::Real(real) => {
+                let scaled = (real * self.scale as f64).trunc();
+                if scaled.abs() < 9.0e18 { i128::from(scaled as i64) } else { scaled as i128 }
+            }
         };
         match self.field {
             Field::Months => Ok((i32::try_from(total).map_err(|_| refuse())?, 0, 0)),
