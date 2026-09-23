@@ -23,6 +23,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -277,7 +278,7 @@ struct Memo {
     host: bool,
     groups: Vec<OnceLock<Replaced>>,
     /// Each distinct answer seen so far and the first value that gave it.
-    firsts: Vec<Mutex<HashMap<Box<[u8]>, u32>>>,
+    firsts: Vec<Mutex<Seen>>,
     /// Bytes held so far, across every group and every answer.
     kept: AtomicUsize,
 }
@@ -321,6 +322,8 @@ impl Memo {
         let mut ends = Vec::with_capacity(last - first);
         let mut bytes = Vec::new();
         let mut added = 0;
+        let mut previous = Vec::new();
+        let mut previous_found = None;
         let mut at = first;
         while at < last {
             let stopped = self.dictionary.sweep_text(at, last, &mut |_, text: &[u8]| {
@@ -334,7 +337,18 @@ impl Memo {
                     text,
                     &mut buffer,
                 )?;
-                let found = self.first_of(answer, own, &mut added)?;
+                // Neighbouring values often give the same answer, the pages of one host, and the
+                // one before is still at hand, so a repeat skips the table and its lock.
+                let found = match previous_found {
+                    Some(found) if previous.as_slice() == answer => found,
+                    _ => {
+                        let found = self.first_of(answer, own, &mut added)?;
+                        previous.clear();
+                        previous.extend_from_slice(answer);
+                        previous_found = Some(found);
+                        found
+                    }
+                };
                 if found == own {
                     bytes.extend_from_slice(answer);
                 }
@@ -365,10 +379,9 @@ impl Memo {
 
     /// The code standing for `answer`, which is `own` when no value before it gave that answer.
     fn first_of(&self, answer: &[u8], own: u32, added: &mut usize) -> Result<u32> {
-        let spread = answer.iter().fold(0xcbf2_9ce4_8422_2325_u64, |state, &byte| {
-            (state ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-        });
-        let shard = &self.firsts[(spread >> 32) as usize % REPLACE_SHARDS];
+        let mut words = Words::default();
+        answer.hash(&mut words);
+        let shard = &self.firsts[(words.finish() >> 32) as usize % REPLACE_SHARDS];
         let mut seen =
             shard.lock().map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
         if let Some(&found) = seen.get(answer) {
@@ -388,6 +401,52 @@ impl Memo {
     fn answer(&self, code: usize) -> Result<&[u8]> {
         let first = self.first(code)? as usize;
         Ok(self.group(first)?.get(first % REPLACE_GROUP))
+    }
+}
+
+/// The answers one shard has seen, each with the code of the first value that gave it.
+type Seen = HashMap<Box<[u8]>, u32, BuildHasherDefault<Words>>;
+
+/// A hash over a word at a time, for the replace memo's table of answers.
+///
+/// The standard hasher resists keys chosen by an attacker and pays a few rounds a word for it, which
+/// on q29's 2.7 million answers showed up at 3.6% of the query. The shard takes bits from the
+/// middle, since the table buckets on the low bits and tags each slot with the top seven, and a
+/// shard picked from either would leave every key in it agreeing there.
+#[derive(Debug, Default)]
+struct Words(u64);
+
+impl Words {
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+impl Hasher for Words {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            let mut held = [0; 8];
+            held.copy_from_slice(word);
+            self.mix(u64::from_le_bytes(held));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut held = [0; 8];
+            held[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(held));
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        let mut spread = self.0;
+        spread ^= spread >> 32;
+        spread = spread.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        spread ^ (spread >> 29)
     }
 }
 
@@ -436,7 +495,7 @@ fn replace_stable(
             groups: (0..dictionary.len().div_ceil(REPLACE_GROUP))
                 .map(|_| OnceLock::new())
                 .collect(),
-            firsts: (0..REPLACE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            firsts: (0..REPLACE_SHARDS).map(|_| Mutex::new(HashMap::default())).collect(),
             kept: AtomicUsize::new(0),
         });
         let source = Arc::new(ReplacedText { memo: Arc::clone(&memo) });
