@@ -9418,6 +9418,7 @@ fn a_foreign_key_holds_from_both_ends_the_way_the_pin_holds_it() {
         "INSERT INTO fkt VALUES (1, 20), (NULL, NULL)",
         "UPDATE pkt SET k = 5 WHERE i = 1",
         "DELETE FROM pkt WHERE i = 3",
+        "CREATE VIEW pkv AS SELECT * FROM pkt",
     ]);
     let missing = |key: &str| {
         format!(
@@ -9456,6 +9457,7 @@ fn a_foreign_key_holds_from_both_ends_the_way_the_pin_holds_it() {
              and column \"a\" (\"VARCHAR\")"
                 .into(),
         ),
+        ("CREATE TABLE f2 (a INT REFERENCES pkv (i))", "cannot reference a VIEW with a FOREIGN KEY".into()),
         (
             "CREATE TABLE f2 (a INT REFERENCES fkt)",
             "Failed to create foreign key: there is no primary key for referenced table \"fkt\""
