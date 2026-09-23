@@ -71,6 +71,7 @@ const CATALOG: &[u8; 8] = b"RUDBCA10";
 const NONZERO_COUNTS: &[u8; 8] = b"RUDBNZ10";
 const AGGREGATE_SUMS: &[u8; 8] = b"RUDBAG10";
 const DISTINCT_COUNTS: &[u8; 8] = b"RUDBDC10";
+const INTEGER_EXTREMES: &[u8; 8] = b"RUDBEX10";
 const FORMAT: u32 = 28;
 
 /// Formats this build can open.
@@ -996,7 +997,11 @@ struct Entry {
     aggregates: Vec<Option<(i128, u64)>>,
     /// Exact non-null distinct values when the writer finished counting the column.
     distincts: Vec<Option<u64>>,
+    /// Exact integer or date bounds; the inner `None` means every row is null.
+    extremes: Vec<StoredIntegerExtremes>,
 }
+
+type StoredIntegerExtremes = Option<Option<(i128, i128)>>;
 
 /// One view's line in the catalog directory.
 ///
@@ -2894,6 +2899,7 @@ impl Writer {
             nonzero: table_nonzero_counts(&self.table),
             aggregates: table_aggregate_sums(&self.table),
             distincts: self.table.distincts.clone(),
+            extremes: table_integer_extremes(&self.table),
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -3056,7 +3062,7 @@ impl Writer {
         Ok(())
     }
 
-    /// Adds exact count, sum, and distinct certificates to an older file's catalog without
+    /// Adds exact count, sum, distinct, and integer-bound certificates to an older file without
     /// rewriting table pages. The old slot remains readable until the new catalog is synced.
     pub fn certify_summaries(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
@@ -3070,6 +3076,7 @@ impl Writer {
             entry.distincts = (0..entry.fields.len())
                 .map(|column| reader.distinct_values(column))
                 .collect::<Result<Vec<_>>>()?;
+            entry.extremes = reader_integer_extremes(&reader)?;
         }
         let generation = slot
             .generation
@@ -4583,6 +4590,13 @@ pub struct CertifiedSums {
     pub rows: u64,
 }
 
+/// Exact ends of an integer or date column, including a certified all-null column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerExtremes {
+    Null,
+    Values { low: i128, high: i128 },
+}
+
 impl Catalog {
     /// Reads the highest valid catalog slot and nothing under it.
     ///
@@ -4767,6 +4781,27 @@ impl Catalog {
             return Err(invalid(&format!("the directory of table {name} does not checksum")));
         }
         Ok(Some(count))
+    }
+
+    /// Exact integer or date ends from the small catalog after checking the table directory.
+    pub fn integer_extremes(&self, name: &str, column: usize) -> Result<Option<IntegerExtremes>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(extremes) = entry.extremes.get(column).copied() else {
+            return Err(invalid("extremes column index out of range"));
+        };
+        let Some(extremes) = extremes else { return Ok(None) };
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
+        }
+        Ok(Some(match extremes {
+            None => IntegerExtremes::Null,
+            Some((low, high)) => IntegerExtremes::Values { low, high },
+        }))
     }
 
     /// The schema copied into the small file catalog, available without opening the table directory.
@@ -6762,6 +6797,70 @@ fn signed_integer(ty: &LogicalType) -> bool {
     )
 }
 
+fn integer_or_date(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+            | LogicalType::Date
+    )
+}
+
+fn table_integer_extremes(table: &Table) -> Vec<StoredIntegerExtremes> {
+    table
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column, field)| {
+            if !integer_or_date(&field.ty) {
+                return None;
+            }
+            let mut low: Option<i128> = None;
+            let mut high: Option<i128> = None;
+            for stripe in &table.stripes {
+                let range = stripe.zone.column(column)?;
+                if !range.exact {
+                    return None;
+                }
+                match (range.low.as_ref(), range.high.as_ref()) {
+                    (Some(Bound::Int(small)), Some(Bound::Int(large))) => {
+                        low = Some(low.map_or(*small, |held| held.min(*small)));
+                        high = Some(high.map_or(*large, |held| held.max(*large)));
+                    }
+                    (None, None) if stripe.rows == range.nulls => {}
+                    _ => return None,
+                }
+            }
+            Some(low.zip(high))
+        })
+        .collect()
+}
+
+fn reader_integer_extremes(reader: &Reader) -> Result<Vec<StoredIntegerExtremes>> {
+    reader
+        .table
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column, field)| {
+            if !integer_or_date(&field.ty) {
+                return Ok(None);
+            }
+            match reader.exact_extremes(column)? {
+                Some((Bound::Int(low), Bound::Int(high))) => Ok(Some(Some((low, high)))),
+                None if reader.null_count(column)? == reader.table.rows as u64 => Ok(Some(None)),
+                _ => Ok(None),
+            }
+        })
+        .collect()
+}
+
 fn table_exact_sum(table: &Table, column: usize) -> Option<(i128, u64)> {
     table.stripes.iter().try_fold((0_i128, 0_u64), |(sum, count), stripe| {
         let range = stripe.zone.column(column)?;
@@ -6943,6 +7042,24 @@ fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
             }
         }
     }
+    out.extend_from_slice(INTEGER_EXTREMES);
+    for entry in entries {
+        if entry.extremes.len() != entry.fields.len() {
+            return Err(invalid("integer extremes width differs from schema"));
+        }
+        for (field, extremes) in entry.fields.iter().zip(&entry.extremes) {
+            match extremes {
+                None => out.push(0),
+                Some(None) if integer_or_date(&field.ty) => out.push(1),
+                Some(Some((low, high))) if integer_or_date(&field.ty) && low <= high => {
+                    out.push(2);
+                    out.extend_from_slice(&low.to_le_bytes());
+                    out.extend_from_slice(&high.to_le_bytes());
+                }
+                _ => return Err(invalid("integer extremes type or range differs")),
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -6996,7 +7113,17 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
         let nonzero = vec![None; fields.len()];
         let aggregates = vec![None; fields.len()];
         let distincts = vec![None; fields.len()];
-        entries.push(Entry { name, fields, rows, directory, nonzero, aggregates, distincts });
+        let extremes = vec![None; fields.len()];
+        entries.push(Entry {
+            name,
+            fields,
+            rows,
+            directory,
+            nonzero,
+            aggregates,
+            distincts,
+            extremes,
+        });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
     // file written before format 25. That is why the count is allowed to be missing rather than
@@ -7108,6 +7235,36 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
                         Some(value)
                     }
                     _ => return Err(invalid("distinct count tag differs")),
+                };
+            }
+        }
+    }
+    if !cur.done() {
+        if cur.take(8)? != INTEGER_EXTREMES {
+            return Err(invalid("integer extremes catalog extension magic differs"));
+        }
+        for entry in &mut entries {
+            for (field, extremes) in entry.fields.iter().zip(&mut entry.extremes) {
+                *extremes = match cur.u8()? {
+                    0 => None,
+                    1 if integer_or_date(&field.ty) => Some(None),
+                    2 if integer_or_date(&field.ty) => {
+                        let low = i128::from_le_bytes(
+                            cur.take(16)?
+                                .try_into()
+                                .map_err(|_| invalid("minimum is truncated"))?,
+                        );
+                        let high = i128::from_le_bytes(
+                            cur.take(16)?
+                                .try_into()
+                                .map_err(|_| invalid("maximum is truncated"))?,
+                        );
+                        if low > high {
+                            return Err(invalid("integer extremes are reversed"));
+                        }
+                        Some(Some((low, high)))
+                    }
+                    _ => return Err(invalid("integer extremes tag or type differs")),
                 };
             }
         }
@@ -11504,6 +11661,7 @@ mod tests {
                 nonzero: vec![None],
                 aggregates: vec![None],
                 distincts: vec![None],
+                extremes: vec![None],
             }],
             &[sample_view("items")],
         )
@@ -12772,6 +12930,10 @@ mod tests {
         assert_eq!(catalog.entries[0].distincts, vec![Some(1), Some(3)]);
         assert_eq!(catalog.distinct_count("items", 1).expect("distinct count"), Some(3));
         assert_eq!(
+            catalog.integer_extremes("items", 1).expect("extremes"),
+            Some(IntegerExtremes::Values { low: 0, high: 7 })
+        );
+        assert_eq!(
             catalog.aggregate_sums("items", &[1]).expect("catalog sums"),
             Some(CertifiedSums { columns: vec![(10, 4)], rows: 6 })
         );
@@ -12792,6 +12954,10 @@ mod tests {
         assert_eq!(
             Catalog::open(&path).expect("reopen").distinct_count("items", 1).expect("distinct"),
             Some(3)
+        );
+        assert_eq!(
+            Catalog::open(&path).expect("reopen").integer_extremes("items", 1).expect("ends"),
+            Some(IntegerExtremes::Values { low: 0, high: 7 })
         );
         assert_eq!(catalog.table("items").expect("reader").null_count(1).expect("nulls"), 2);
         fs::remove_file(path).expect("remove scratch file");

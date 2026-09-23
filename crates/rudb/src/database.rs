@@ -281,6 +281,73 @@ fn native_single_distinct_shape(ast: &Ast) -> Option<(&str, &str, String)> {
     Some((table, column, name))
 }
 
+fn native_extrema_shape(ast: &Ast) -> Option<(&str, &str, [String; 2])> {
+    use ast::{Distinct, QueryBody, Source, Statement};
+    use rudb_parse::NONE;
+
+    let [Statement::Query(query_ref)] = ast.statements.as_slice() else { return None };
+    let query = ast.query(*query_ref);
+    if query.ctes.len != 0
+        || query.order_by.len != 0
+        || query.order_by_all
+        || query.limit != NONE
+        || query.offset != NONE
+        || query.limit_percent
+    {
+        return None;
+    }
+    let QueryBody::Select(select_ref) = query.body else { return None };
+    let select = ast.select(select_ref);
+    if select.distinct != Distinct::No
+        || select.filter != NONE
+        || select.group_by.len != 0
+        || select.group_by_all
+        || select.having != NONE
+    {
+        return None;
+    }
+    let [minimum, maximum] = ast.target_list(select.targets) else { return None };
+    let column = native_column_aggregate(ast, minimum.expr, "min")?;
+    let other = native_column_aggregate(ast, maximum.expr, "max")?;
+    if !column.eq_ignore_ascii_case(other) {
+        return None;
+    }
+    let [source] = ast.source_list(select.from) else { return None };
+    let Source::Table { name, alias: NONE, columns } = ast.source(*source) else { return None };
+    if name.len != 1 || columns.len != 0 {
+        return None;
+    }
+    let table = ast.name(name).next()?;
+    let names = [
+        if minimum.alias == NONE {
+            format!("min({column})")
+        } else {
+            ast.string(minimum.alias).into()
+        },
+        if maximum.alias == NONE {
+            format!("max({column})")
+        } else {
+            ast.string(maximum.alias).into()
+        },
+    ];
+    Some((table, column, names))
+}
+
+fn native_integer_value(ty: &LogicalType, value: i128) -> Option<Value> {
+    Some(match ty {
+        LogicalType::TinyInt => Value::TinyInt(i8::try_from(value).ok()?),
+        LogicalType::SmallInt => Value::SmallInt(i16::try_from(value).ok()?),
+        LogicalType::Integer => Value::Integer(i32::try_from(value).ok()?),
+        LogicalType::BigInt => Value::BigInt(i64::try_from(value).ok()?),
+        LogicalType::UTinyInt => Value::UTinyInt(u8::try_from(value).ok()?),
+        LogicalType::USmallInt => Value::USmallInt(u16::try_from(value).ok()?),
+        LogicalType::UInteger => Value::UInteger(u32::try_from(value).ok()?),
+        LogicalType::UBigInt => Value::UBigInt(u64::try_from(value).ok()?),
+        LogicalType::Date => Value::Date(i32::try_from(value).ok()?),
+        _ => return None,
+    })
+}
+
 /// An in process database.
 ///
 /// One catalog, held in memory, with no file behind it. `ATTACH` and the storage format are E2, and
@@ -425,11 +492,13 @@ impl Database {
         let three = native_three_aggregate_shape(&ast);
         let average = native_single_average_shape(&ast);
         let distinct = native_single_distinct_shape(&ast);
+        let extrema = native_extrema_shape(&ast);
         let Some(table) = nonzero
             .map(|(table, _, _)| table)
             .or_else(|| three.as_ref().map(|(table, _, _, _)| *table))
             .or_else(|| average.as_ref().map(|(table, _, _)| *table))
             .or_else(|| distinct.as_ref().map(|(table, _, _)| *table))
+            .or_else(|| extrema.as_ref().map(|(table, _, _)| *table))
         else {
             return Ok(None);
         };
@@ -500,6 +569,35 @@ impl Database {
             return Ok(Some(QueryResult::new(
                 vec![name],
                 vec![LogicalType::BigInt],
+                vec![chunk],
+                Memory::unlimited().reservation(),
+            )));
+        }
+        if let Some((_, column, names)) = extrema {
+            let Some(index) =
+                fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+            else {
+                return Ok(None);
+            };
+            let Some(ends) = native.integer_extremes(stored_name, index)? else {
+                return Ok(None);
+            };
+            let ty = fields[index].ty.clone();
+            let (low, high) = match ends {
+                rudb_native::IntegerExtremes::Null => (Value::Null, Value::Null),
+                rudb_native::IntegerExtremes::Values { low, high } => {
+                    let Some(low) = native_integer_value(&ty, low) else { return Ok(None) };
+                    let Some(high) = native_integer_value(&ty, high) else { return Ok(None) };
+                    (low, high)
+                }
+            };
+            let chunk = Chunk::new(vec![
+                Vector::from_values(ty.clone(), &[low])?,
+                Vector::from_values(ty.clone(), &[high])?,
+            ])?;
+            return Ok(Some(QueryResult::new(
+                names.into(),
+                vec![ty.clone(), ty],
                 vec![chunk],
                 Memory::unlimited().reservation(),
             )));
@@ -2882,9 +2980,58 @@ mod tests {
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
     use super::{
-        Database, native_nonzero_shape, native_single_average_shape, native_single_distinct_shape,
-        native_three_aggregate_shape, publish,
+        Database, native_extrema_shape, native_nonzero_shape, native_single_average_shape,
+        native_single_distinct_shape, native_three_aggregate_shape, publish,
     };
+
+    #[test]
+    fn cold_extrema_shape_accepts_only_direct_bounds() {
+        let parsed =
+            rudb_parse::parse_ast("SELECT MIN(EventDate), MAX(EventDate) FROM hits").unwrap();
+        assert_eq!(
+            native_extrema_shape(&parsed),
+            Some(("hits", "EventDate", ["min(EventDate)".into(), "max(EventDate)".into()]))
+        );
+        for sql in [
+            "SELECT MIN(EventDate), MAX(EventDate) FROM hits WHERE EventDate > 0",
+            "SELECT MIN(EventDate), MAX(EventDate) FROM hits LIMIT 1",
+            "SELECT MIN(EventDate + 1), MAX(EventDate) FROM hits",
+            "SELECT MIN(EventDate), MAX(OtherDate) FROM hits",
+            "SELECT MIN(DISTINCT EventDate), MAX(EventDate) FROM hits",
+        ] {
+            let parsed = rudb_parse::parse_ast(sql).unwrap();
+            assert_eq!(native_extrema_shape(&parsed), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cold_extrema_matches_regular_execution_for_dates_and_nulls() {
+        let path = std::env::temp_dir().join(format!("rudb-q7-{}.rdb", std::process::id()));
+        let name = path.to_str().unwrap();
+        let database = Database::open(name).unwrap();
+        database.execute("CREATE TABLE hits (EventDate DATE)").unwrap();
+        database
+            .execute("INSERT INTO hits VALUES (DATE '2013-07-31'), (NULL), (DATE '2013-07-02')")
+            .unwrap();
+        database.execute("CREATE TABLE small_hits (EventDate USMALLINT)").unwrap();
+        database.execute("INSERT INTO small_hits VALUES (15917), (15888), (NULL)").unwrap();
+        database.execute("CREATE TABLE empty_hits (EventDate DATE)").unwrap();
+        database.execute("CREATE TABLE null_hits (EventDate DATE)").unwrap();
+        database.execute("INSERT INTO null_hits VALUES (NULL)").unwrap();
+        let cases = [
+            "SELECT MIN(EventDate), MAX(EventDate) FROM hits",
+            "SELECT MIN(EventDate), MAX(EventDate) FROM small_hits",
+            "SELECT MIN(EventDate), MAX(EventDate) FROM empty_hits",
+            "SELECT MIN(EventDate), MAX(EventDate) FROM null_hits",
+        ];
+        let expected = cases.map(|sql| database.query(sql).unwrap().rows().collect::<Vec<_>>());
+        drop(database);
+        for (sql, expected) in cases.into_iter().zip(expected) {
+            let actual = Database::query_native_once(name, sql).unwrap().unwrap();
+            assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn cold_distinct_shape_accepts_only_a_direct_count() {
