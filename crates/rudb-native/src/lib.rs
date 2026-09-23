@@ -2215,26 +2215,16 @@ impl Writer {
         ) {
             return Ok((None, None));
         }
-        let mut candidates: FrequencyMap<u32> = FrequencyMap::default();
-        let mut decrements = 0_u64;
+        let mut candidates = Candidates::default();
         let mut distinct = distinct::ExactDistinct::new();
-        self.visit_numeric(column, |_, value| {
+        self.visit_numeric(column, |_, value, times| {
             // The low sixty four bits, which is every bit any integer column stores.
             if let FrequencyValue::Integer(value) = value {
                 distinct.insert(value as u64);
             }
-            if let Some(count) = candidates.get_mut(&value) {
-                *count = count.saturating_add(1);
-            } else if candidates.len() < FREQUENCY_CANDIDATES {
-                candidates.insert(value, 1);
-            } else {
-                candidates.retain(|_, count| {
-                    *count -= 1;
-                    *count != 0
-                });
-                decrements = decrements.saturating_add(1);
-            }
+            candidates.add(value, times);
         })?;
+        let Candidates { counts: candidates, decrements } = candidates;
         let exact = if decrements == 0 {
             candidates
                 .into_iter()
@@ -2250,9 +2240,9 @@ impl Writer {
             }
             let mut exact =
                 candidates.into_keys().map(|value| (value, 0_u64)).collect::<FrequencyMap<_>>();
-            self.visit_numeric(column, |_, value| {
+            self.visit_numeric(column, |_, value, times| {
                 if let Some(count) = exact.get_mut(&value) {
-                    *count = count.saturating_add(1);
+                    *count = count.saturating_add(times);
                 }
             })?;
             exact
@@ -2281,10 +2271,10 @@ impl Writer {
                 .collect::<Result<FrequencyMap<_>>>()?;
             ordinals.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
             ordinal_entries.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
-            self.visit_numeric(column, |ordinal, value| {
+            self.visit_numeric(column, |ordinal, value, times| {
                 if let Some(&entry) = kept.get(&value) {
-                    ordinals.push(ordinal);
-                    ordinal_entries.push(entry);
+                    ordinals.extend(ordinal..ordinal.saturating_add(times));
+                    ordinal_entries.extend(std::iter::repeat_n(entry, times as usize));
                 }
             })?;
         }
@@ -2294,11 +2284,17 @@ impl Writer {
         ))
     }
 
+    /// Hands every value of one numeric column to `visit` in row order, a run of equal values at a
+    /// time: the first row's ordinal, the value, and how many rows in a row hold it.
+    ///
+    /// Runs rather than rows because `hits` is sorted on a handful of its columns and flat for
+    /// stretches in most of the rest, and every visit costs a hash probe that a run pays once.
     fn visit_numeric(
         &self,
         column: usize,
-        mut visit: impl FnMut(u64, FrequencyValue),
+        visit: impl FnMut(u64, FrequencyValue, u64),
     ) -> Result<()> {
+        let mut runs = Runs { run: None, visit };
         let ty = &self.table.fields[column].ty;
         let mut start = 0_u64;
         let mut block = Vec::new();
@@ -2336,7 +2332,7 @@ impl Writer {
                         } else {
                             FrequencyValue::Null
                         };
-                        visit(start.saturating_add(row as u64), value);
+                        runs.push(start.saturating_add(row as u64), value);
                     }
                     start = start.saturating_add(rows as u64);
                     continue;
@@ -2363,11 +2359,12 @@ impl Writer {
                             invalid("numeric frequency page did not contain an integer value")
                         })?)
                     };
-                    visit(start.saturating_add(row as u64), value);
+                    runs.push(start.saturating_add(row as u64), value);
                 }
                 start = start.saturating_add(rows as u64);
             }
         }
+        runs.finish();
         Ok(())
     }
 
@@ -5785,6 +5782,68 @@ fn frequency_order(left: FrequencyValue, right: FrequencyValue) -> Ordering {
 /// report as the largest one omitted, and then only the part that survives is sorted. The order that
 /// comes out is the order the sort gave, because the tie break makes the comparison total: two
 /// entries never hold the same value.
+/// The Misra-Gries candidate table of the first frequency pass.
+#[derive(Default)]
+struct Candidates {
+    counts: FrequencyMap<u32>,
+    /// How many times every count was taken down by one to make room, which bounds how far any
+    /// count can be below the truth.
+    decrements: u64,
+}
+
+impl Candidates {
+    /// Counts `value` `times` times over, leaving the table exactly as that many single adds in a
+    /// row would. A value that is already held, or that finds room, takes the whole run at once. A
+    /// value that finds the table full is turned away once per decrement, the way a single add is,
+    /// until a decrement has made room for it.
+    fn add(&mut self, value: FrequencyValue, mut times: u64) {
+        while times > 0 {
+            let weight = u32::try_from(times).unwrap_or(u32::MAX);
+            if let Some(count) = self.counts.get_mut(&value) {
+                *count = count.saturating_add(weight);
+                return;
+            }
+            if self.counts.len() < FREQUENCY_CANDIDATES {
+                self.counts.insert(value, weight);
+                return;
+            }
+            self.counts.retain(|_, count| {
+                *count -= 1;
+                *count != 0
+            });
+            self.decrements = self.decrements.saturating_add(1);
+            times -= 1;
+        }
+    }
+}
+
+/// Folds a stream of values into runs of equal ones for a frequency visitor.
+struct Runs<F: FnMut(u64, FrequencyValue, u64)> {
+    /// The first ordinal, the value and the length of the run still being extended.
+    run: Option<(u64, FrequencyValue, u64)>,
+    visit: F,
+}
+
+impl<F: FnMut(u64, FrequencyValue, u64)> Runs<F> {
+    fn push(&mut self, ordinal: u64, value: FrequencyValue) {
+        if let Some((_, current, len)) = &mut self.run {
+            if *current == value {
+                *len += 1;
+                return;
+            }
+        }
+        if let Some((first, current, len)) = self.run.replace((ordinal, value, 1)) {
+            (self.visit)(first, current, len);
+        }
+    }
+
+    fn finish(mut self) {
+        if let Some((first, current, len)) = self.run.take() {
+            (self.visit)(first, current, len);
+        }
+    }
+}
+
 fn keep_most_frequent(entries: &mut Vec<FrequencyEntry>) -> u64 {
     let order = |left: &FrequencyEntry, right: &FrequencyEntry| {
         right.count.cmp(&left.count).then_with(|| frequency_order(left.value, right.value))
@@ -11331,6 +11390,53 @@ mod tests {
             assert_eq!(back.bytes(row), expected.bytes(row), "row {row} of the bit column");
         }
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn counting_a_run_at_once_leaves_the_candidates_as_counting_it_row_by_row_does() {
+        // Past the candidate cap, so that runs arrive at a full table and have to be turned away
+        // decrement by decrement, with long runs mixed in among the unique values.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut values = Vec::new();
+        for index in 0..(FREQUENCY_CANDIDATES as u64 * 3) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let run = if index % 97 == 0 { 1 + state % 40 } else { 1 + state % 3 };
+            let value =
+                if state % 5 == 0 { i128::from(index as i64 % 13) } else { i128::from(index) };
+            values.extend(std::iter::repeat_n(FrequencyValue::Integer(value), run as usize));
+        }
+        values.extend(std::iter::repeat_n(FrequencyValue::Null, 70));
+
+        let mut by_row = Candidates::default();
+        for value in &values {
+            by_row.add(*value, 1);
+        }
+        let mut by_run = Candidates::default();
+        let mut runs = Vec::new();
+        let mut folder =
+            Runs { run: None, visit: |ordinal, value, times| runs.push((ordinal, value, times)) };
+        for (ordinal, value) in values.iter().enumerate() {
+            folder.push(ordinal as u64, *value);
+        }
+        folder.finish();
+        for &(_, value, times) in &runs {
+            by_run.add(value, times);
+        }
+
+        assert!(by_row.decrements > 0);
+        assert_eq!(by_run.decrements, by_row.decrements);
+        assert_eq!(by_run.counts, by_row.counts);
+        let mut next = 0;
+        for &(ordinal, value, times) in &runs {
+            assert_eq!(ordinal, next);
+            assert!(
+                values[next as usize..(next + times) as usize].iter().all(|seen| *seen == value)
+            );
+            next += times;
+        }
+        assert_eq!(next as usize, values.len());
     }
 
     #[test]
