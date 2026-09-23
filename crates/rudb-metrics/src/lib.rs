@@ -63,6 +63,12 @@
 //! adds up to a third of the execution. A pipeline's time is its driver's time, and the `driver`
 //! module explains how pipelines that run inside each other avoid counting the same time twice.
 //!
+//! [`LoadProfile`] is the same kind of counting for a statement that writes a table in bulk, which
+//! is not a query plan and has no operators to hang a row on. It has one row per stage of the bulk
+//! path instead, charged by the native writer and the sink in front of it, and
+//! `rudb_write_metrics()` reads it. The `load` module says what each stage covers and why it is
+//! charged once per stripe and once per worker rather than once per chunk.
+//!
 //! [`Report`] is the other end of all those counters. Whoever builds an execution registers each
 //! operator with one as it is made and says which pipeline depends on which, and at the end
 //! [`Report::fill`] puts the rows into the document. That is the piece that makes the ids and the
@@ -82,6 +88,7 @@ mod document;
 mod driver;
 mod histogram;
 mod json;
+mod load;
 mod qerror;
 mod report;
 mod warn;
@@ -94,6 +101,7 @@ pub use document::{
 };
 pub use driver::{Driver, Running};
 pub use histogram::{HIGHEST, Histogram};
+pub use load::{KEPT_LOADS, LoadProfile, Stage, StageSpan, StageTotals, recent_loads};
 pub use qerror::{QErrors, Spread, q_error, tenths, word};
 pub use report::Report;
 

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Instant;
 
 use rudb_bind::{Bound, Parameters};
 use rudb_catalog::{Catalog, Entry, QualifiedName, View};
@@ -10,7 +11,7 @@ use rudb_common::stat::Provenance;
 use rudb_common::{
     Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Rule, Session, Value,
 };
-use rudb_metrics::{Document, Report, Span};
+use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
 use rudb_native::graph::Edge;
 use rudb_parse::ast::Ast;
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
@@ -888,11 +889,32 @@ fn appendable(path: &Path, catalog: &Catalog, target: &QualifiedName) -> Result<
 /// The run is what makes the sink safe to instance. A stripe has to be a contiguous run of the
 /// source in order, and the writer cannot work out which of several interleaved callers a chunk
 /// belongs to, so each instance groups its own and hands over whole stripes.
+///
+/// It is also where one instance's share of the load profile's convert stage is counted. Convert is
+/// everything upstream of the writer, the scan and the operators between it and here, and nothing
+/// times that directly. So the instance times itself from the first thing it is handed to
+/// [`Sink::combine`], takes off the time it spent inside the writer, which the writer charges to
+/// its own stages, and charges what is left once, at the end. Rows and bytes are plain integers
+/// here and go to the profile in the same one call.
 #[derive(Debug, Default)]
 struct NativePlace {
     morsel: u64,
     chunk: u64,
     held: Vec<((u64, u64), Chunk)>,
+    started: Option<Span>,
+    inside_wall: u64,
+    inside_cpu: u64,
+    rows: u64,
+    bytes: u64,
+}
+
+impl NativePlace {
+    /// Starts the instance's clock the first time it is called, on the thread that fills it.
+    fn start(&mut self) {
+        if self.started.is_none() {
+            self.started = Some(Span::start());
+        }
+    }
 }
 
 /// A writer that has been told what order the rows it is about to take are meant to be in.
@@ -925,6 +947,7 @@ struct NativeSink {
     target: PathBuf,
     table: String,
     fields: Vec<Field>,
+    profile: Arc<LoadProfile>,
 }
 
 impl NativeSink {
@@ -938,7 +961,9 @@ impl NativeSink {
         if temporary.exists() {
             std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
         }
-        let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?;
+        let profile = LoadProfile::begin(name.clone());
+        let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?
+            .with_profile(Arc::clone(&profile));
         let writer = declared(writer, clustering)?;
         Ok(Self {
             writer: Mutex::new(Some(writer)),
@@ -946,6 +971,7 @@ impl NativeSink {
             target: target.to_path_buf(),
             table: name,
             fields,
+            profile,
         })
     }
 
@@ -957,7 +983,9 @@ impl NativeSink {
         fields: Vec<Field>,
         clustering: Option<Clustering>,
     ) -> Result<Self> {
-        let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?;
+        let profile = LoadProfile::begin(name.clone());
+        let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?
+            .with_profile(Arc::clone(&profile));
         let writer = declared(writer, clustering)?;
         Ok(Self {
             writer: Mutex::new(Some(writer)),
@@ -965,6 +993,7 @@ impl NativeSink {
             target: target.to_path_buf(),
             table: name,
             fields,
+            profile,
         })
     }
 
@@ -974,12 +1003,27 @@ impl NativeSink {
             return Ok(());
         }
         let parts = std::mem::take(&mut place.held);
+        place.bytes = parts
+            .iter()
+            .fold(place.bytes, |bytes, (_, chunk)| bytes.saturating_add(chunk.footprint() as u64));
+        // Once a stripe, so both clocks. The wait for the lock is a write wait: it is the time one
+        // instance spent while another was encoding and writing its stripe, which is the cost of
+        // the writer being one file behind one lock and the number the parallel writer of W1 has
+        // to make go away.
+        let inside = Span::start();
+        let waiting = Instant::now();
         let mut writer =
             self.writer.lock().map_err(|_| Error::internal("native writer panicked"))?;
-        writer
+        self.profile.waited(Stage::Write, elapsed_ns(waiting));
+        let appended = writer
             .as_mut()
             .ok_or_else(|| Error::internal("native writer was already committed"))?
-            .append_stripe(parts)
+            .append_stripe(parts);
+        drop(writer);
+        let (wall, cpu) = inside.stop();
+        place.inside_wall = place.inside_wall.saturating_add(wall);
+        place.inside_cpu = place.inside_cpu.saturating_add(cpu);
+        appended
     }
 }
 
@@ -1000,6 +1044,7 @@ impl Sink for NativeSink {
     }
 
     fn at(&self, morsel: &Morsel, place: &mut Self::Local) -> Result<()> {
+        place.start();
         // A stripe never spans two morsels, so that its parts are a run of the source with nothing
         // from another instance in the middle of them. The cost is a short stripe at the end of
         // each morsel, and a morsel on ClickBench is a whole row group of about a million rows.
@@ -1023,6 +1068,8 @@ impl Sink for NativeSink {
                 )));
             }
         }
+        place.start();
+        place.rows = place.rows.saturating_add(chunk.len() as u64);
         place.held.push(((place.morsel, place.chunk), chunk.clone()));
         place.chunk = place.chunk.saturating_add(1);
         if place.held.len() == rudb_native::STRIPE_PARTS {
@@ -1032,7 +1079,17 @@ impl Sink for NativeSink {
     }
 
     fn combine(&self, mut local: Self::Local) -> Result<()> {
-        self.hand_over(&mut local)
+        let handed = self.hand_over(&mut local);
+        if let Some(started) = local.started.take() {
+            let (wall, cpu) = started.stop();
+            self.profile.charge(
+                Stage::Convert,
+                wall.saturating_sub(local.inside_wall),
+                cpu.saturating_sub(local.inside_cpu),
+            );
+            self.profile.moved(Stage::Convert, 0, local.bytes, local.rows);
+        }
+        handed
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
@@ -1043,9 +1100,30 @@ impl Sink for NativeSink {
             .take()
             .ok_or_else(|| Error::internal("native writer was already committed"))?;
         writer.finish()?;
-        let Some(temporary) = &self.temporary else { return Ok(()) };
-        std::fs::rename(temporary, &self.target).map_err(|error| Error::io(error.to_string()))
+        let Some(temporary) = &self.temporary else {
+            self.profile.finish();
+            return Ok(());
+        };
+        let renamed = {
+            let _timing = self.profile.span(Stage::Publish);
+            std::fs::rename(temporary, &self.target).map_err(|error| Error::io(error.to_string()))
+        };
+        self.profile.finish();
+        renamed
     }
+}
+
+impl Drop for NativeSink {
+    /// A load that failed or was cancelled still ends, and its profile says how long it ran before
+    /// it did. A profile that was finished already keeps the time it had.
+    fn drop(&mut self) {
+        self.profile.finish();
+    }
+}
+
+/// Nanoseconds since `since`, as the profile counts them.
+fn elapsed_ns(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Shared {

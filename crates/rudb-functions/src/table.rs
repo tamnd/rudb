@@ -95,6 +95,8 @@ pub enum TableFunction {
     RudbLinks,
     /// `rudb_device_card(path)`, what a sync costs on the device a directory is on.
     RudbDeviceCard,
+    /// `rudb_write_metrics()`, what each stage of the recent bulk loads cost.
+    RudbWriteMetrics,
     /// `duckdb_keywords()`, every word the grammar knows and which class each one is in.
     DuckdbKeywords,
     /// `duckdb_types()`, every type name the engine knows and what each one stands for.
@@ -163,6 +165,7 @@ impl TableFunction {
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
             Self::RudbDeviceCard => "rudb_device_card",
+            Self::RudbWriteMetrics => "rudb_write_metrics",
             Self::DuckdbKeywords => "duckdb_keywords",
             Self::DuckdbTypes => "duckdb_types",
             Self::DuckdbFunctions => "duckdb_functions",
@@ -301,6 +304,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("rudb_device_card") {
             return Some(Self::RudbDeviceCard);
+        }
+        if name.eq_ignore_ascii_case("rudb_write_metrics") {
+            return Some(Self::RudbWriteMetrics);
         }
         if name.eq_ignore_ascii_case("duckdb_keywords") {
             return Some(Self::DuckdbKeywords);
@@ -560,6 +566,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::RudbStrategies
         | TableFunction::RudbLinks
         | TableFunction::RudbDeviceCard
+        | TableFunction::RudbWriteMetrics
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions
@@ -592,6 +599,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
     match function {
         TableFunction::RudbStrategies => Some(strategy_fields()),
         TableFunction::RudbLinks => Some(link_fields()),
+        TableFunction::RudbWriteMetrics => Some(write_metric_fields()),
         TableFunction::DuckdbKeywords => Some(keyword_fields()),
         TableFunction::DuckdbTypes => Some(type_fields()),
         TableFunction::DuckdbFunctions => Some(function_fields()),
@@ -841,6 +849,33 @@ pub fn strategy_fields() -> Vec<Field> {
         Field::new("determinism", LogicalType::Varchar),
         Field::new("is_reference", LogicalType::Boolean),
         Field::new("is_default", LogicalType::Boolean),
+    ]
+}
+
+/// The columns `rudb_write_metrics()` produces.
+///
+/// One row per stage that ran in each of the loads the process has kept, and one `total` row per
+/// load, which is section 16.2 of `engine-v4/16-measurement.md`. `load` is the number the process
+/// gave the load, so the rows of one load group together and a later load has a larger number.
+/// Wall time in a stage row is summed over the workers that ran it, which is what makes it
+/// comparable with CPU time, and the `total` row's wall time is how long the statement took.
+///
+/// `waits` and `wait_ms` are the time a stage spent on something other than its own work. For
+/// write it is instances queued on the writer's lock, and for publish it is the syncs.
+#[must_use]
+pub fn write_metric_fields() -> Vec<Field> {
+    vec![
+        Field::new("load", LogicalType::BigInt),
+        Field::new("target", LogicalType::Varchar),
+        Field::new("stage", LogicalType::Varchar),
+        Field::new("wall_ms", LogicalType::Double),
+        Field::new("cpu_ms", LogicalType::Double),
+        Field::new("bytes_in", LogicalType::BigInt),
+        Field::new("bytes_out", LogicalType::BigInt),
+        Field::new("rows", LogicalType::BigInt),
+        Field::new("waits", LogicalType::BigInt),
+        Field::new("wait_ms", LogicalType::Double),
+        Field::new("finished", LogicalType::Boolean),
     ]
 }
 
@@ -1302,6 +1337,15 @@ mod tests {
         // Not run, only counted. The point is that the count is worked out in i128, so this comes
         // out as a huge number rather than as a negative one that becomes a capacity panic.
         assert_eq!(length(TableFunction::Range, i64::MIN, i64::MAX, 1), usize::MAX);
+    }
+
+    #[test]
+    fn rudb_write_metrics_takes_no_arguments() {
+        let resolved = resolve_table("rudb_write_metrics", &[]).unwrap();
+        assert_eq!(resolved.function, TableFunction::RudbWriteMetrics);
+        assert_eq!(resolved.columns, Columns::Fixed(write_metric_fields()));
+        let error = resolve_table("rudb_write_metrics", &[LogicalType::BigInt]).unwrap_err();
+        assert!(error.to_string().contains("\"rudb_write_metrics\"()"), "{error}");
     }
 
     #[test]

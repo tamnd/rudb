@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
 use rudb_encoding::{bitpack, chooser, integer, string};
+use rudb_metrics::{LoadProfile, Stage};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
@@ -1310,6 +1311,12 @@ pub struct Writer {
     /// Carried forward from the committed generation by [`Writer::open`], so a writer that was only
     /// opened to append a table does not have to know about views to avoid dropping them.
     views: Vec<ViewEntry>,
+    /// Where the stages this writer runs are charged, which [`Writer::with_profile`] sets.
+    ///
+    /// The writer runs the page builder, the dictionary blocks, the writes and the publish, and it
+    /// charges them once per stripe and once per worker, never per chunk. See
+    /// `rudb_metrics::LoadProfile` for why that is the grain.
+    profile: Option<Arc<LoadProfile>>,
 }
 
 /// A chunk that has arrived and is waiting for the rest of its stripe.
@@ -1500,6 +1507,7 @@ impl Writer {
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed,
             views,
+            profile: None,
         })
     }
 
@@ -1550,6 +1558,7 @@ impl Writer {
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed: Vec::new(),
             views: Vec::new(),
+            profile: None,
         })
     }
 
@@ -1625,6 +1634,7 @@ impl Writer {
             generation,
             closed,
             views,
+            profile: None,
             dictionaries: fields
                 .iter()
                 .map(|field| (field.ty == LogicalType::Varchar).then(GlobalDictionary::new))
@@ -1662,6 +1672,17 @@ impl Writer {
     #[must_use]
     pub fn with_views(mut self, views: Vec<ViewEntry>) -> Self {
         self.views = views;
+        self
+    }
+
+    /// Charges the stages this writer runs to `profile`.
+    ///
+    /// For the table being written now. [`Writer::next`] starts the next table without one,
+    /// because a second table's stripes charged to the first table's load would be a profile of
+    /// neither.
+    #[must_use]
+    pub fn with_profile(mut self, profile: Arc<LoadProfile>) -> Self {
+        self.profile = Some(profile);
         self
     }
 
@@ -1927,7 +1948,9 @@ impl Writer {
             .map_or(1, usize::from)
             .min(MAX_ENCODE_WORKERS)
             .min(width);
+        let profile = self.profile.clone();
         if workers <= 1 || held.len() <= 1 {
+            let _span = profile.as_deref().map(|profile| profile.span(Stage::Pages));
             return self
                 .dictionaries
                 .iter_mut()
@@ -1956,6 +1979,7 @@ impl Writer {
             (0..workers)
                 .map(|_| {
                     scope.spawn(|| {
+                        let _span = profile.as_deref().map(|profile| profile.span(Stage::Pages));
                         let mut mine = Vec::new();
                         loop {
                             let taken = queue
@@ -2028,10 +2052,26 @@ impl Writer {
         let mut held = std::mem::take(&mut self.pending);
         let parts = held.len();
         let encoded = self.encode_columns(&held)?;
+        let profile = self.profile.clone();
+        if let Some(profile) = &profile {
+            let rows = held.iter().map(|pending| pending.chunk.len() as u64).sum();
+            let raw = held.iter().map(|pending| pending.chunk.footprint() as u64).sum();
+            let pages =
+                encoded.iter().flat_map(|stripe| &stripe.pages).map(|page| page.len() as u64).sum();
+            profile.moved(Stage::Pages, raw, pages, rows);
+        }
         // Before a byte of the stripe is written, because the raw bytes this frees are the bytes the
         // load peaks on and the threads it uses are idle between here and the next chunk arriving.
+        let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
+        let before = self.at;
         encode_ready(&mut self.dictionaries)?;
         self.place_blocks()?;
+        drop(timing);
+        if let Some(profile) = &profile {
+            profile.moved(Stage::Dictionary, 0, self.at - before, 0);
+        }
+        let timing = profile.as_deref().map(|profile| profile.span(Stage::Write));
+        let before = self.at;
         let mut pages = Vec::with_capacity(width);
         let mut memberships = vec![None; width];
         let mut ranges = Vec::with_capacity(width);
@@ -2151,6 +2191,10 @@ impl Writer {
             part_ranges: Pages::from_slots(part_ranges)?,
             zone: Zone::from_ranges(ranges),
         });
+        drop(timing);
+        if let Some(profile) = &profile {
+            profile.moved(Stage::Write, 0, self.at - before, rows as u64);
+        }
         // Back where it came from, empty, so the next stripe buffers into the same allocation.
         self.pending = held;
         Ok(())
@@ -2371,7 +2415,9 @@ impl Writer {
             .map_or(1, usize::from)
             .min(MAX_FREQUENCY_WORKERS)
             .min(columns.len());
+        let profile = self.profile.as_deref();
         if workers <= 1 {
+            let _timing = profile.map(|profile| profile.span(Stage::Publish));
             let mut frequencies = vec![(None, None); self.table.fields.len()];
             for column in columns {
                 frequencies[column] = self.numeric_frequency(column)?;
@@ -2386,6 +2432,7 @@ impl Writer {
             (0..workers)
                 .map(|_| {
                     scope.spawn(|| {
+                        let _timing = profile.map(|profile| profile.span(Stage::Publish));
                         let mut mine = Vec::new();
                         loop {
                             let taken = queue
@@ -2554,6 +2601,12 @@ impl Writer {
     /// If directory encoding or writing fails.
     fn close(&mut self) -> Result<Entry> {
         self.flush_pending()?;
+        // The rest of a table is its statistics, its dictionaries and its directory. The dictionary
+        // work is charged as its own stage, because ranking a global dictionary can be most of what
+        // this costs, and the rest as publish.
+        let profile = self.profile.clone();
+        let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
+        let before = self.at;
         let mut stripes = std::mem::take(&mut self.order)
             .into_iter()
             .zip(std::mem::take(&mut self.table.stripes))
@@ -2567,11 +2620,17 @@ impl Writer {
             previous = Some(*last);
         }
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
+        // The frequencies charge themselves, one span to each thread that counts, because they run
+        // on threads of their own and a span on this one would see their wall time and none of
+        // their CPU.
+        drop(timing);
         let (frequencies, distincts): (Vec<Option<FrequencySummary>>, _) =
             self.numeric_frequencies()?.into_iter().unzip();
         self.table.frequencies =
             frequencies.into_iter().map(|held| held.map(Frequencies::Held)).collect();
         self.table.distincts = distincts;
+        let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
+        let placing = self.at;
         for dictionary in self.dictionaries.iter_mut().flatten() {
             dictionary.finish_blocks()?;
         }
@@ -2614,6 +2673,9 @@ impl Writer {
                 hash: checksum(&encoded.index),
             });
         }
+        drop(timing);
+        let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
+        let placed = self.at - placing;
         self.write_stats()?;
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
@@ -2621,6 +2683,11 @@ impl Writer {
         }
         let offset = self.at;
         self.put(&directory)?;
+        drop(timing);
+        if let Some(profile) = &profile {
+            profile.moved(Stage::Dictionary, 0, placed, 0);
+            profile.moved(Stage::Publish, 0, self.at - before - placed, 0);
+        }
         Ok(Entry {
             name: self.table.name.clone(),
             fields: self.table.fields.clone(),
@@ -2713,6 +2780,8 @@ impl Writer {
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
         let entry = self.close()?;
+        let profile = self.profile.take();
+        let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
         tables.push(entry);
         let catalog = encode_catalog(&tables, &self.views)?;
@@ -2721,10 +2790,13 @@ impl Writer {
         }
         let offset = self.at;
         self.put(&catalog)?;
+        if let Some(profile) = &profile {
+            profile.moved(Stage::Publish, 0, catalog.len() as u64, 0);
+        }
         // Every page and every table directory is on the disk before anything points at them. The
         // slot write below is what makes this generation the one a reader picks, so the order of
         // these two syncs is the whole of the commit.
-        self.file.sync_all().map_err(io)?;
+        synced(&self.file, profile.as_deref())?;
         let slot = Slot {
             offset,
             length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
@@ -2736,7 +2808,7 @@ impl Writer {
         // Which of the two slots it is alternates with the generation, so the one naming the
         // generation before this is still intact and still valid until this write lands.
         write_at(&self.file, slot_offset(self.generation), &slot.bytes())?;
-        self.file.sync_all().map_err(io)?;
+        synced(&self.file, profile.as_deref())?;
         Ok(self.table)
     }
 
@@ -7862,6 +7934,24 @@ fn payload_shapes() -> Vec<chooser::Settled> {
 /// the way [`Writer::close`] used to fan out over one column's. The work and the parallelism are
 /// what they were. It happens sixty times during the load rather than once at the end of it, and the
 /// raw bytes go as it goes.
+/// Syncs the file, and counts the sync and how long it took as a publish wait when a load is being
+/// profiled.
+///
+/// A wait rather than time, because the time is already in the publish span around it. What the
+/// wait columns add is how much of publish was the device, which on the WSL2 disk of the gaming PC
+/// is most of it: a sync there costs about two milliseconds (see `rudb_device_card`).
+fn synced(file: &File, profile: Option<&LoadProfile>) -> Result<()> {
+    let started = profile.map(|_| std::time::Instant::now());
+    file.sync_all().map_err(io)?;
+    if let (Some(profile), Some(started)) = (profile, started) {
+        profile.waited(
+            Stage::Publish,
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+    Ok(())
+}
+
 fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     for dictionary in dictionaries.iter_mut().flatten() {
         dictionary.settle()?;
