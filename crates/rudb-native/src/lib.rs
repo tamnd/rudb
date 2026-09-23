@@ -58,7 +58,7 @@ pub mod stats;
 mod zones;
 
 pub use section::Section;
-pub use zones::{Common, Stripes, distincts};
+pub use zones::{Common, Stripes, ascending, distincts};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
@@ -1668,7 +1668,8 @@ impl Writer {
         gather: &mut Option<stats::Gather>,
     ) -> Result<ColumnStripe> {
         if let Some(gather) = gather {
-            gather.stripe(held.iter().filter_map(|pending| pending.chunk.column(index).ok()));
+            let key = held.first().map_or((0, 0), |pending| pending.order);
+            gather.stripe(key, held.iter().filter_map(|pending| pending.chunk.column(index).ok()));
         }
         Self::encode_column(index, held, dictionary)
     }
