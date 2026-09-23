@@ -137,7 +137,7 @@ fn answer_native_csv_once(options: &Options) -> Option<String> {
         answer_nonzero_csv_once(options)
     } else if expression.eq_ignore_ascii_case("count(distinct") {
         answer_distinct_csv_once(options)
-    } else if expression.eq_ignore_ascii_case("AdvEngineID,") {
+    } else if expression.ends_with(',') {
         answer_frequency_csv_once(options)
     } else {
         None

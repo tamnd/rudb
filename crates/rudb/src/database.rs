@@ -778,55 +778,51 @@ impl Database {
         Ok(count.and_then(|count| i64::try_from(count).ok()))
     }
 
-    /// Returns the canonical Q8 groups from a complete native frequency certificate without
-    /// constructing a query result. Other statement shapes use regular SQL execution.
+    /// Returns groups for a filtered single-column count from complete native frequencies.
+    /// Other statement shapes use regular SQL execution.
     pub fn query_native_frequency_values_once(
         path: &str,
         sql: &str,
     ) -> Result<Option<Vec<(i128, i64)>>> {
-        let statement = sql.trim().trim_end_matches(';').trim();
-        if !statement.eq_ignore_ascii_case(
-            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
-        ) {
+        let ast = rudb_parse::parse_ast(sql)?;
+        let Some((table_name, column)) = native_frequency_group_shape(&ast) else {
             return Ok(None);
-        }
+        };
         let native = rudb_native::Catalog::open(path)?;
-        let Some(table) = native.names().find(|name| name.eq_ignore_ascii_case("hits")) else {
+        let Some(table) = native.names().find(|name| name.eq_ignore_ascii_case(table_name)) else {
             return Ok(None);
         };
         let Some(fields) = native.table_fields(table) else { return Ok(None) };
-        let Some(index) =
-            fields.iter().position(|field| field.name.eq_ignore_ascii_case("AdvEngineID"))
+        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
         else {
             return Ok(None);
         };
         complete_nonzero_numeric_frequencies(&native, table, index, &fields[index].ty)
     }
 
-    /// Returns the canonical Q3 values from certified native sums without constructing a query
-    /// result. The shell can format these on its single-statement, read-only path.
+    /// Returns a sum, row count and average from certified native column sums.
+    /// The shell can format these on its single-statement, read-only path.
     pub fn query_native_three_values_once(
         path: &str,
         sql: &str,
     ) -> Result<Option<(i128, i64, f64)>> {
-        let statement = sql.trim().trim_end_matches(';').trim();
-        if !statement.eq_ignore_ascii_case(
-            "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
-        ) {
+        let ast = rudb_parse::parse_ast(sql)?;
+        let Some((table_name, sum_column, avg_column, _)) = native_three_aggregate_shape(&ast)
+        else {
             return Ok(None);
-        }
+        };
         let catalog = rudb_native::Catalog::open(path)?;
-        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case("hits")) else {
+        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table_name)) else {
             return Ok(None);
         };
         let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
         let Some(sum_column) =
-            fields.iter().position(|field| field.name.eq_ignore_ascii_case("AdvEngineID"))
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case(sum_column))
         else {
             return Ok(None);
         };
         let Some(avg_column) =
-            fields.iter().position(|field| field.name.eq_ignore_ascii_case("ResolutionWidth"))
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case(avg_column))
         else {
             return Ok(None);
         };
@@ -3619,6 +3615,8 @@ mod tests {
         database.execute("CREATE TABLE empty_hits (AdvEngineID SMALLINT)").unwrap();
         database.execute("CREATE TABLE zero_hits (AdvEngineID SMALLINT)").unwrap();
         database.execute("INSERT INTO zero_hits VALUES (0), (NULL)").unwrap();
+        database.execute("CREATE TABLE other_events (SourceID SMALLINT)").unwrap();
+        database.execute("INSERT INTO other_events VALUES (4), (4), (9), (0), (NULL)").unwrap();
         let cases = [
             "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
             "SELECT AdvEngineID, COUNT(*) FROM empty_hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
@@ -3629,6 +3627,14 @@ mod tests {
         assert_eq!(
             Database::query_native_frequency_values_once(name, cases[0]).unwrap(),
             Some(vec![(2, 3), (27, 2), (3, 1)])
+        );
+        assert_eq!(
+            Database::query_native_frequency_values_once(
+                name,
+                "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC",
+            )
+            .unwrap(),
+            Some(vec![(4, 2), (9, 1)])
         );
         assert_eq!(
             Database::query_native_frequency_values_once(name, "SELECT COUNT(*) FROM hits")
@@ -3922,6 +3928,8 @@ mod tests {
             .execute("CREATE TABLE null_hits (AdvEngineID SMALLINT, ResolutionWidth SMALLINT)")
             .unwrap();
         database.execute("INSERT INTO null_hits VALUES (NULL, NULL)").unwrap();
+        database.execute("CREATE TABLE measurements (Points SMALLINT, Width SMALLINT)").unwrap();
+        database.execute("INSERT INTO measurements VALUES (2, 10), (5, 20)").unwrap();
         drop(database);
         let result = Database::query_native_once(
             name,
@@ -3940,6 +3948,14 @@ mod tests {
             )
             .unwrap(),
             Some((4, 3, 150.0))
+        );
+        assert_eq!(
+            Database::query_native_three_values_once(
+                name,
+                "SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements",
+            )
+            .unwrap(),
+            Some((7, 2, 15.0))
         );
         assert_eq!(
             Database::query_native_three_values_once(
