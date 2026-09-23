@@ -1826,7 +1826,9 @@ impl<'a> Building<'a, '_> {
         // Never more room than the cap a pushed down limit already put on the groups. A table that
         // is going to stop at ten groups and took room for a million would be holding it for groups
         // the operator above is about to refuse to open.
-        let aggregate = match self.plan.presized(index) {
+        // Not for an aggregate that closes its groups, whose tables only ever see the first and last
+        // run of each chunk, so room for every group would be room taken per instance for nothing.
+        let aggregate = match self.plan.presized(index).filter(|_| !self.plan.clustered(index)) {
             Some(groups) => aggregate.presize(match bound.max_groups {
                 Some(limit) => groups.min(u64::try_from(limit).unwrap_or(u64::MAX)),
                 None => groups,
@@ -1841,6 +1843,8 @@ impl<'a> Building<'a, '_> {
             Some((low, values)) => aggregate.over_range(low, values),
             None => aggregate,
         };
+        // Whether the key arrives in ascending order, where the planner could say so.
+        let aggregate = if self.plan.clustered(index) { aggregate.clustered() } else { aggregate };
         let aggregate = match bound.top_counts {
             Some((bound, call)) => aggregate.top_counts(bound, call),
             None => aggregate,

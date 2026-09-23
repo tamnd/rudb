@@ -1828,6 +1828,9 @@ impl<'a> Binder<'a> {
         for (column, distinct) in table.distincts() {
             self.plan.measure_distinct(index, &column, distinct);
         }
+        for column in table.ascending() {
+            self.plan.mark_ascending(index, &column);
+        }
         let node = self.add_node(Node::Get {
             catalog: catalog_name,
             schema,

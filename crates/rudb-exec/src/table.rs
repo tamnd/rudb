@@ -608,6 +608,30 @@ impl Table {
         Ok(slot)
     }
 
+    /// Adds the key that `keys` holds at `row` as a group nobody will look up.
+    ///
+    /// For a group the aggregate closed as soon as it opened, because its key is past every row
+    /// that could still arrive. Such a group is only ever read back out, so it takes no bucket and
+    /// no hash, and the buckets stay the size they started. A table filled this way must not be
+    /// probed, merged or scattered, which is why the stored hash is a zero that means nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`rudb_common::ErrorCode::OutOfMemory`] at [`LIMIT`] groups.
+    pub(crate) fn append(&mut self, keys: &[Vector], row: usize) -> Result<usize> {
+        let slot = self.hashes.len();
+        if slot >= LIMIT {
+            return Err(Error::out_of_memory(format!(
+                "a single group by cannot hold more than {LIMIT} groups"
+            )));
+        }
+        for (at, column) in keys.iter().enumerate() {
+            self.owned += self.columns[at].push_from(column, row)?;
+        }
+        self.hashes.push(0);
+        Ok(slot)
+    }
+
     /// Whether the group in `slot` has the key that `keys` holds at `row`.
     ///
     /// The string case is the one worth writing out. [`Vector::value_at`] on a `VARCHAR` allocates a

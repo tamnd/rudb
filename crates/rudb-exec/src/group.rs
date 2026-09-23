@@ -194,6 +194,10 @@ pub(crate) struct Aggregate<'a> {
     /// that one is a grouped count over a stable dictionary, keyed by the storage code, and it
     /// replaces the hash table rather than sitting beside it.
     span: Option<(i128, u64)>,
+    /// Whether the one grouping key arrives in ascending order, so a group whose key the rows have
+    /// moved past is finished and can skip the table. `rudb_opt`'s `cluster` pass is where it comes
+    /// from, and [`interior`] checks every chunk before believing it.
+    clustered: bool,
     /// The groups a pushed down limit keeps, agreed once and used by every instance.
     agreed: Mutex<Option<Agreed>>,
     /// Whether [`Agreed::keys`] is filled in, so the fold can ask without taking the lock.
@@ -804,6 +808,7 @@ impl<'a> Aggregate<'a> {
             max_groups: None,
             presize: None,
             span: None,
+            clustered: false,
             agreed: Mutex::new(None),
             settled: AtomicBool::new(false),
             by_vector,
@@ -855,6 +860,79 @@ impl<'a> Aggregate<'a> {
     pub(crate) fn over_range(mut self, low: i128, values: u64) -> Self {
         self.span = Some((low, values));
         self
+    }
+
+    /// Closes a group as soon as its key is behind the rows, from `rudb_opt`'s `cluster` pass.
+    pub(crate) fn clustered(mut self) -> Self {
+        self.clustered = true;
+        self
+    }
+
+    /// Whether this aggregate closes groups, which is the pass having said so and nothing else
+    /// here needing to see every group.
+    ///
+    /// The exchanges and the dense count each keep their own state and finish from it alone, so a
+    /// closed group would never reach their answer. A `DISTINCT` call keeps a set per group and a
+    /// pushed down limit agrees on groups between instances, and neither is worth teaching about a
+    /// group that skipped the table.
+    fn closes(&self) -> bool {
+        self.clustered
+            && !self.alone
+            && !self.sets
+            && self.keys.len() == 1
+            && self.max_groups.is_none()
+            && !self.count_only
+            && !self.radix_distinct_count
+            && !self.fixed_top_count()
+            && !self.encoded_top_count()
+            && !self.grouped_distinct_top_count()
+            && !self.mixed_top_count()
+    }
+
+    /// Rows into this instance's own table or the partitions, which is every row that is not in a
+    /// closed group.
+    fn open(
+        &self,
+        rows: &Rows,
+        single: &mut Option<Building>,
+        installed: &mut bool,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+        folded: &mut u64,
+    ) -> Result<()> {
+        *folded += rows.rows as u64;
+        if let Some(table) = single {
+            if let Some(error) = table.failure.take() {
+                return Err(error);
+            }
+            if let Some(limit) = self.max_groups {
+                if !self.alone {
+                    self.agree(rows, limit, table, installed)?;
+                }
+            }
+            let timing = stage::Timing::start(Stage::Fold);
+            let done = self.fold(rows, table, None, None);
+            timing.stop(0);
+            done?;
+            if !self.ought_to_partition(table) {
+                return Ok(());
+            }
+            let handing = single.take().expect("the table was there a moment ago");
+            self.begin_partitioning(spreading, own)?;
+            return self.hand(handing, spreading, own);
+        }
+        if self.locally.load(Ordering::Relaxed) && self.still_local(*folded, spreading, own)? {
+            return self.spread_own(rows, spreading, own);
+        }
+        self.spread(rows, spreading)
+    }
+
+    /// The table closed groups go into, which is never probed, so it takes no room in advance.
+    fn shut(&self) -> Building {
+        let mut local = self.starting(Share::Local);
+        let types: Vec<_> = self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+        local.table = Table::new(&types);
+        local
     }
 
     /// Keeps only the groups that can still reach a count-descending TopN above this aggregate.
@@ -1316,7 +1394,7 @@ impl<'a> Aggregate<'a> {
         }
         while let Some(rows) = spilled.next(self)? {
             let timing = stage::Timing::start(Stage::Fold);
-            let folded = self.fold(&rows, &mut local, None);
+            let folded = self.fold(&rows, &mut local, None, None);
             timing.stop(0);
             folded?;
         }
@@ -1455,6 +1533,7 @@ impl<'a> Aggregate<'a> {
         seen_rows: &Rows,
         local: &mut Building,
         prehashed: Option<&[u64]>,
+        closed: Option<(usize, usize)>,
     ) -> Result<()> {
         // Field by field, because the `DISTINCT` path below holds four of them at once and they
         // have to be disjoint borrows.
@@ -1523,7 +1602,7 @@ impl<'a> Aggregate<'a> {
         //
         // Refused while there is a spill file, because a row that does not fit goes out whole and
         // the map has nothing to say about where it went.
-        let direct = if alone || over.is_some() {
+        let direct = if alone || over.is_some() || closed.is_some() {
             coded_on.clear();
             None
         } else {
@@ -1553,7 +1632,11 @@ impl<'a> Aggregate<'a> {
         // because the rows that missed are hashed one at a time below and they are a few dozen.
         let one_at_a_time =
             prehashed.is_none() && direct.as_ref().is_some_and(|codes| codes.by_value());
-        if !alone && !one_at_a_time && direct.as_ref().is_none_or(|_| !missing.is_empty()) {
+        if !alone
+            && closed.is_none()
+            && !one_at_a_time
+            && direct.as_ref().is_none_or(|_| !missing.is_empty())
+        {
             match prehashed {
                 Some(prehashed) => {
                     hashes.clear();
@@ -1618,7 +1701,29 @@ impl<'a> Aggregate<'a> {
         // what it costs is one sequential pass per key column plus the list, so a chunk where every
         // other row repeats is already well ahead and one where fewer do is not worth the risk of
         // being behind. A chunk that cannot reach it is dropped inside the pass.
-        let runs = if direct.is_none() && !alone && over.is_none() && self.max_groups.is_none() {
+        // Closed groups first, which is the same run pass with the table left out. Every run between
+        // `from` and `to` is a whole group, because [`interior`] found the chunk in ascending order
+        // and the table is stored that way, so a key strictly inside the chunk's first and last keys
+        // has no row anywhere else. Each run is a new group in a table nobody probes, and the rows
+        // outside the range stay `NOWHERE` and are folded by the caller through the open table.
+        if let Some((from, to)) = closed {
+            crate::table::repeats(keys, *length, 0, same);
+            let mut slot = NOWHERE;
+            for row in from..to {
+                if row == from || !same[row] {
+                    slot = table.append(keys, row)?;
+                    *groups = table.len();
+                    self.fresh(states, counts, compact)?;
+                }
+                slots[row] = slot;
+            }
+        }
+        let runs = if closed.is_none()
+            && direct.is_none()
+            && !alone
+            && over.is_none()
+            && self.max_groups.is_none()
+        {
             crate::table::repeats(keys, *length, length.div_ceil(2), same)
         } else {
             same.clear();
@@ -1669,7 +1774,7 @@ impl<'a> Aggregate<'a> {
             }
         }
         let mut from = 0;
-        while !by_run && direct.is_none() && !alone && from < *length {
+        while closed.is_none() && !by_run && direct.is_none() && !alone && from < *length {
             let upto = (from + crate::table::BATCH).min(*length);
             table.probe_run(hashes, keys, from, upto, slots, walk);
             from = upto;
@@ -1789,7 +1894,7 @@ impl<'a> Aggregate<'a> {
         // `combine` finish: a pass that could spill from its first row would spill every row and
         // hand back a file the same size as what it was given.
         match over.as_ref() {
-            None if !alone && crowded(&self.memory) => {
+            None if !alone && closed.is_none() && crowded(&self.memory) => {
                 *over = Some(Spill::new("aggregate", self.spilled_types())?);
             }
             Some(file) => hopeless(file, *groups)?,
@@ -2831,7 +2936,7 @@ impl<'a> Aggregate<'a> {
             if let Some(error) = table.failure.take() {
                 return Err(error);
             }
-            self.fold(selected, table, Some(&spreading.keyed[partition]))?;
+            self.fold(selected, table, Some(&spreading.keyed[partition]), None)?;
         }
         Ok(())
     }
@@ -2941,7 +3046,7 @@ impl<'a> Aggregate<'a> {
             match self.merged[partition].try_lock() {
                 Ok(mut held) => {
                     let table = held.table.get_or_insert_with(|| self.partition());
-                    self.fold(selected, table, Some(&keyed[partition]))?;
+                    self.fold(selected, table, Some(&keyed[partition]), None)?;
                 }
                 Err(TryLockError::WouldBlock) => waiting.push(partition),
                 Err(TryLockError::Poisoned(error)) => return Err(poisoned(error)),
@@ -2952,7 +3057,7 @@ impl<'a> Aggregate<'a> {
                 ready[partition].as_ref().expect("only a filled partition was put aside");
             let mut held = self.merged[partition].lock().map_err(poisoned)?;
             let table = held.table.get_or_insert_with(|| self.partition());
-            self.fold(selected, table, Some(&keyed[partition]))?;
+            self.fold(selected, table, Some(&keyed[partition]), None)?;
         }
         Ok(())
     }
@@ -3117,6 +3222,25 @@ struct Rows {
 }
 
 impl Rows {
+    /// The rows from `at` for `len`, every column cut the same way.
+    fn slice(&self, at: usize, len: usize) -> Result<Self> {
+        let cut = |vector: &Vector| vector.slice(at, len);
+        Ok(Self {
+            keys: self.keys.iter().map(cut).collect::<Result<_>>()?,
+            arguments: self
+                .arguments
+                .iter()
+                .map(|call| call.iter().map(cut).collect::<Result<_>>())
+                .collect::<Result<_>>()?,
+            filters: self
+                .filters
+                .iter()
+                .map(|filter| filter.as_ref().map(cut).transpose())
+                .collect::<Result<_>>()?,
+            rows: len,
+        })
+    }
+
     /// How many columns one of these rows is written out as, which is
     /// [`Aggregate::spilled_types`] long.
     fn width(&self) -> usize {
@@ -3188,6 +3312,9 @@ pub(crate) struct Partitioned {
     /// table has grown enough to be worth sharing, and from then on this is `None` and the chunks go
     /// straight into the partitions.
     single: Option<Building>,
+    /// The groups this instance closed, which skip `single` and the partitions and are finished into
+    /// chunks when the instance combines. `None` until the first chunk that closes one.
+    closed: Option<Building>,
     /// Whether the agreed keys of a pushed down limit are already in this instance's table.
     ///
     /// They go in once and they never come out, so after that the table holds as many groups as the
@@ -3300,6 +3427,65 @@ impl Spreading {
             split_rows: 0,
             runs: 0,
         }
+    }
+}
+
+/// Where the closed groups of a chunk start and end, as the first row after the first run of the
+/// key and the first row of its last run.
+///
+/// `None` unless the key is a run of integers in ascending order with no null, in a form where two
+/// rows are compared by what they hold. A chunk that goes down anywhere is refused whole, which is
+/// what makes a stale promise about the table's order cost time rather than a wrong answer: a group
+/// is only closed out of a chunk that is sorted, and a table that is sorted puts every row of a key
+/// strictly inside a sorted chunk inside that chunk. Two runs or fewer have nothing strictly inside.
+///
+/// The forms are the ones [`crate::table::repeats`] compares exactly, in the order it tries them,
+/// because the fold finds the runs with it and a run it split would be one group closed twice.
+fn interior(key: &Vector, rows: usize) -> Option<(usize, usize)> {
+    if rows < 3 || key.validity().has_nulls(rows) {
+        return None;
+    }
+    fn bounds<T: PartialOrd>(rows: usize, at: impl Fn(usize) -> T) -> Option<(usize, usize)> {
+        let (mut from, mut to) = (0, 0);
+        let mut before = at(0);
+        for row in 1..rows {
+            let value = at(row);
+            if value < before {
+                return None;
+            }
+            if value != before {
+                if from == 0 {
+                    from = row;
+                }
+                to = row;
+            }
+            before = value;
+        }
+        (from > 0 && from < to).then_some((from, to))
+    }
+    macro_rules! flat {
+        ($values:expr) => {{
+            let values = $values.as_slice();
+            if values.len() < rows {
+                return None;
+            }
+            bounds(rows, |row| values[row])
+        }};
+    }
+    // A packed code is the value less the frame's base, so codes are in the order the values are.
+    if let Some(packed) = key.packed_parts() {
+        return bounds(rows, |row| packed.code(row));
+    }
+    match key.data()? {
+        Data::Int8(values) => flat!(values),
+        Data::Int16(values) => flat!(values),
+        Data::Int32(values) => flat!(values),
+        Data::Int64(values) => flat!(values),
+        Data::UInt8(values) => flat!(values),
+        Data::UInt16(values) => flat!(values),
+        Data::UInt32(values) => flat!(values),
+        Data::UInt64(values) => flat!(values),
+        _ => None,
     }
 }
 
@@ -3841,6 +4027,7 @@ impl Sink for Aggregate<'_> {
             dense_nulls: 0,
             dense_memory: self.memory.reservation(),
             single: Some(self.start()),
+            closed: None,
             installed: false,
             expressions: self.inputs.scratch(),
             spreading: Spreading::new(),
@@ -3909,6 +4096,7 @@ impl Sink for Aggregate<'_> {
             dense_nulls,
             dense_memory,
             single,
+            closed,
             installed,
             expressions,
             spreading,
@@ -4065,33 +4253,26 @@ impl Sink for Aggregate<'_> {
                 }
             }
         }
-        *folded += rows.rows as u64;
-        if let Some(table) = single {
-            if let Some(error) = table.failure.take() {
-                return Err(error);
-            }
-            if let Some(limit) = self.max_groups {
-                if !self.alone {
-                    self.agree(&rows, limit, table, installed)?;
+        // The groups strictly inside the chunk are closed and skip the table, and only the first
+        // and the last run go the ordinary way, since either of them can carry on into a chunk some
+        // other instance holds. The two ends are cut before anything is folded, so a vector that
+        // cannot be cut leaves the whole chunk to the ordinary path.
+        if self.closes() {
+            if let Some((from, to)) = interior(&rows.keys[0], rows.rows) {
+                if let (Ok(head), Ok(tail)) = (rows.slice(0, from), rows.slice(to, rows.rows - to))
+                {
+                    let building = closed.get_or_insert_with(|| self.shut());
+                    let timing = stage::Timing::start(Stage::Fold);
+                    let done = self.fold(&rows, building, None, Some((from, to)));
+                    timing.stop(0);
+                    done?;
+                    self.open(&head, single, installed, spreading, own, folded)?;
+                    self.open(&tail, single, installed, spreading, own, folded)?;
+                    return Ok(Progress::More);
                 }
             }
-            let timing = stage::Timing::start(Stage::Fold);
-            let folded = self.fold(&rows, table, None);
-            timing.stop(0);
-            folded?;
-            if !self.ought_to_partition(table) {
-                return Ok(Progress::More);
-            }
-            let handing = single.take().expect("the table was there a moment ago");
-            self.begin_partitioning(spreading, own)?;
-            self.hand(handing, spreading, own)?;
-            return Ok(Progress::More);
         }
-        if self.locally.load(Ordering::Relaxed) && self.still_local(*folded, spreading, own)? {
-            self.spread_own(&rows, spreading, own)?;
-            return Ok(Progress::More);
-        }
-        self.spread(&rows, spreading)?;
+        self.open(&rows, single, installed, spreading, own, folded)?;
         Ok(Progress::More)
     }
 
@@ -4148,10 +4329,26 @@ impl Sink for Aggregate<'_> {
             dense_nulls,
             dense_memory,
             single,
+            closed,
             mut spreading,
             mut own,
             ..
         } = local;
+        // Closed groups are finished groups, so they become chunks here on this instance's thread
+        // and wait beside the answer for the partitions to finish.
+        if let Some(closed) = closed {
+            if let Some(error) = closed.failure {
+                return Err(error);
+            }
+            let mut chunks = Vec::new();
+            let mut held = self.memory.reservation();
+            if self.finish(closed, &mut chunks, &mut held)?.is_some() {
+                return Err(Error::internal("a closed group went to a spill file"));
+            }
+            let mut built = self.built.lock().map_err(poisoned)?;
+            built.chunks.append(&mut chunks);
+            built.held.push(held);
+        }
         if mixed.used() {
             let state = self.mixed.get().expect("a mixed exchange exists after its sink");
             state.combine(mixed)?;

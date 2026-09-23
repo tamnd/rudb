@@ -387,6 +387,9 @@ fn sized(plan: &Plan, node: NodeRef) -> String {
     if let Some((low, values)) = plan.dense(index) {
         said.push(format!("addressed directly over {} values from {low}", commas(values)));
     }
+    if plan.clustered(index) {
+        said.push("groups closed in key order".to_owned());
+    }
     if said.is_empty() { String::new() } else { format!(" [{}]", said.join(", ")) }
 }
 

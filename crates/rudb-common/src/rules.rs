@@ -73,11 +73,14 @@ pub enum Rule {
     /// Turning a join's build side into an exact set of driving rows through a stored link, rather
     /// than into a Bloom filter. Under [`Rule::GraphSections`], so it is off whenever the layer is.
     GraphReduction,
+    /// Closing a group of an aggregate as soon as its key moves past it, when the key is a column the
+    /// table is stored in ascending order of.
+    ClosedGroups,
 }
 
 impl Rule {
     /// Every rule, in the order a report lists them.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::StatsAll,
         Self::Presize,
         Self::DirectAddressing,
@@ -89,6 +92,7 @@ impl Rule {
         Self::MemoryReservation,
         Self::GraphSections,
         Self::GraphReduction,
+        Self::ClosedGroups,
     ];
 
     /// The canonical name, which is what a setting reads back as.
@@ -106,6 +110,7 @@ impl Rule {
             Self::MemoryReservation => "stats.memory_reservation",
             Self::GraphSections => "graph.sections",
             Self::GraphReduction => "graph.reduction",
+            Self::ClosedGroups => "stats.closed_groups",
         }
     }
 
