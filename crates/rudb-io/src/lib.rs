@@ -49,6 +49,7 @@ pub mod pool;
 pub mod real;
 pub mod sim;
 pub mod submit;
+pub mod writeback;
 
 #[cfg(test)]
 mod scratch;
@@ -64,6 +65,7 @@ pub use pool::{Config, Pool, Pooled, Stats};
 pub use real::RealFilesystem;
 pub use sim::{Completions, Crash, Op, SimFilesystem};
 pub use submit::{Completion, Filler, Request, Response};
+pub use writeback::start_writeback;
 
 /// How a file is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
