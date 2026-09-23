@@ -513,6 +513,80 @@ enum FrequencyValue {
 /// guarding against an attacker who would have to choose the rows of the file being written.
 type FrequencyMap<V> = HashMap<u64, V, Spread>;
 
+/// The first pass of [`Writer::numeric_frequency`]: a Misra-Gries candidate table keyed by a value's
+/// sixty four bits, with the null counted beside it.
+#[derive(Debug, Default)]
+struct Candidates {
+    counts: FrequencyMap<u32>,
+    nulls: u32,
+    decrements: u64,
+}
+
+impl Candidates {
+    /// Counts `times` rows of `bits` and ends in the state `times` rows counted one at a time would.
+    ///
+    /// A value already held, or one there is room to hold, takes the whole run at once, because
+    /// every row after the first would find it held. A value the full table turns away goes a row
+    /// at a time, because each of its rows decrements every candidate and one of those decrements
+    /// can free the place the next row takes.
+    fn add(&mut self, bits: Option<u64>, mut times: u32) {
+        while times > 0 {
+            let held = match bits {
+                Some(bits) => self.counts.get_mut(&bits),
+                None if self.nulls != 0 => Some(&mut self.nulls),
+                None => None,
+            };
+            if let Some(count) = held {
+                *count = count.saturating_add(times);
+                return;
+            }
+            if self.counts.len() + usize::from(self.nulls != 0) < FREQUENCY_CANDIDATES {
+                match bits {
+                    Some(bits) => {
+                        self.counts.insert(bits, times);
+                    }
+                    None => self.nulls = times,
+                }
+                return;
+            }
+            self.counts.retain(|_, count| {
+                *count -= 1;
+                *count != 0
+            });
+            self.nulls = self.nulls.saturating_sub(1);
+            self.decrements = self.decrements.saturating_add(1);
+            times -= 1;
+        }
+    }
+}
+
+/// Equal rows in a row, gathered so they are counted once.
+#[derive(Debug, Default)]
+struct Run {
+    bits: Option<u64>,
+    times: u32,
+}
+
+impl Run {
+    /// Adds one row, and hands back the run it ended if it was not the same value.
+    fn push(&mut self, bits: Option<u64>) -> Option<(Option<u64>, u32)> {
+        if self.times != 0 && self.bits == bits && self.times < u32::MAX {
+            self.times += 1;
+            return None;
+        }
+        let ended = self.take();
+        self.bits = bits;
+        self.times = 1;
+        ended
+    }
+
+    /// The run being gathered, if there is one, leaving none.
+    fn take(&mut self) -> Option<(Option<u64>, u32)> {
+        let times = std::mem::take(&mut self.times);
+        (times != 0).then_some((self.bits, times))
+    }
+}
+
 /// Builds the hasher for [`FrequencyMap`].
 #[derive(Debug, Default, Clone, Copy)]
 struct Spread;
@@ -2316,37 +2390,25 @@ impl Writer {
             Some(bits) if signed => FrequencyValue::Integer(i128::from(bits as i64)),
             Some(bits) => FrequencyValue::Integer(i128::from(bits)),
         };
-        let mut candidates: FrequencyMap<u32> = FrequencyMap::default();
-        let mut nulls = 0_u32;
-        let mut decrements = 0_u64;
+        // Rows arrive a run of equal values at a time, because a sorted column is runs and a flag
+        // column is mostly one value, so a run is counted and inserted once rather than per row.
+        let mut first = Candidates::default();
         let mut distinct = distinct::ExactDistinct::new();
+        let mut run = Run::default();
         self.visit_numeric(column, signed, |_, bits| {
-            let held = match bits {
-                Some(bits) => {
+            if let Some((bits, times)) = run.push(bits) {
+                first.add(bits, times);
+            }
+            if run.times == 1 {
+                if let Some(bits) = bits {
                     distinct.insert(bits);
-                    candidates.get_mut(&bits)
                 }
-                None if nulls != 0 => Some(&mut nulls),
-                None => None,
-            };
-            if let Some(count) = held {
-                *count = count.saturating_add(1);
-            } else if candidates.len() + usize::from(nulls != 0) < FREQUENCY_CANDIDATES {
-                match bits {
-                    Some(bits) => {
-                        candidates.insert(bits, 1);
-                    }
-                    None => nulls = 1,
-                }
-            } else {
-                candidates.retain(|_, count| {
-                    *count -= 1;
-                    *count != 0
-                });
-                nulls = nulls.saturating_sub(1);
-                decrements = decrements.saturating_add(1);
             }
         })?;
+        if let Some((bits, times)) = run.take() {
+            first.add(bits, times);
+        }
+        let Candidates { counts: candidates, nulls, decrements } = first;
         let (exact, null_count) = if decrements == 0 {
             let exact = candidates
                 .into_iter()
@@ -2367,15 +2429,24 @@ impl Writer {
             let mut exact =
                 candidates.into_keys().map(|bits| (bits, 0_u64)).collect::<FrequencyMap<_>>();
             let mut null_count = (nulls != 0).then_some(0_u64);
-            self.visit_numeric(column, signed, |_, bits| {
+            let mut recount = |bits: Option<u64>, times: u32| {
                 let held = match bits {
                     Some(bits) => exact.get_mut(&bits),
                     None => null_count.as_mut(),
                 };
                 if let Some(count) = held {
-                    *count = count.saturating_add(1);
+                    *count = count.saturating_add(u64::from(times));
+                }
+            };
+            let mut run = Run::default();
+            self.visit_numeric(column, signed, |_, bits| {
+                if let Some((bits, times)) = run.push(bits) {
+                    recount(bits, times);
                 }
             })?;
+            if let Some((bits, times)) = run.take() {
+                recount(bits, times);
+            }
             (exact, null_count)
         };
         let mut entries = exact
@@ -12465,6 +12536,47 @@ mod tests {
             assert_eq!(back.bytes(row), expected.bytes(row), "row {row} of the bit column");
         }
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Counting a run at once has to leave the candidate table exactly where counting its rows one
+    /// at a time would, including once the table is full and a run is turned away row by row.
+    #[test]
+    fn a_run_counted_at_once_leaves_the_candidates_a_row_at_a_time_would() {
+        let mut rows: Vec<Option<u64>> = Vec::new();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for index in 0..400_000_u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let times = 1 + (state % 7) as usize;
+            let bits = match state % 11 {
+                0 => None,
+                1..=3 => Some(state % 16),
+                _ => Some(index.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            };
+            rows.extend(std::iter::repeat_n(bits, times));
+        }
+        let mut by_row = Candidates::default();
+        for &bits in &rows {
+            by_row.add(bits, 1);
+        }
+        let mut by_run = Candidates::default();
+        let mut run = Run::default();
+        let mut runs = 0_usize;
+        for &bits in &rows {
+            if let Some((bits, times)) = run.push(bits) {
+                by_run.add(bits, times);
+                runs += 1;
+            }
+        }
+        if let Some((bits, times)) = run.take() {
+            by_run.add(bits, times);
+        }
+        assert!(runs < rows.len() / 2, "the rows came in runs");
+        assert!(by_row.decrements > 0, "the table filled and turned values away");
+        assert_eq!(by_run.counts, by_row.counts);
+        assert_eq!(by_run.nulls, by_row.nulls);
+        assert_eq!(by_run.decrements, by_row.decrements);
     }
 
     #[test]
