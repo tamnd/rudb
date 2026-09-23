@@ -92,6 +92,17 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Every kind, in tag order.
+    pub const ALL: [Self; 7] = [
+        Self::Constant,
+        Self::Packed,
+        Self::Delta,
+        Self::Rle,
+        Self::Dict,
+        Self::Sparse,
+        Self::Strided,
+    ];
+
     fn tag(self) -> u8 {
         self as u8
     }
@@ -263,6 +274,24 @@ pub fn encode_only(kind: Kind, values: &[i64]) -> Result<Option<Vec<u8>>> {
 /// separate so that the sampler in [`crate::chooser`] is not handing back buffers it will not read.
 pub(crate) fn size_as(kind: Kind, values: &[i64], depth: u8) -> Result<Option<usize>> {
     Ok(encode_as(kind, values, depth, &EXHAUSTIVE)?.map(|bytes| bytes.len()))
+}
+
+/// The kind at every level of an encoded chunk, in the order the encoder chose them.
+///
+/// The order is the one [`encode_with`] asks its chooser in: a level, then everything under its
+/// first inner chunk, then everything under its second. So a chooser that hands these back one per
+/// question gets the same cascade on a chunk that offers the same kinds, without searching any of
+/// it. That is what a writer with many small parts of one column wants, because the search is
+/// most of what the encode costs and neighbouring parts nearly always come out the same shape.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn shape(bytes: &[u8]) -> Result<Vec<Kind>> {
+    let mut reader = Reader::new(bytes);
+    let mut kinds = Vec::new();
+    shape_chunk(&mut reader, &mut kinds)?;
+    Ok(kinds)
 }
 
 /// The cascade a chunk was encoded as, as a line of text like `DICT(PACKED, PACKED)`.
@@ -780,28 +809,7 @@ fn skip_chunk(reader: &mut Reader<'_>) -> Result<usize> {
     let count = reader.u32()? as usize;
     match kind {
         Kind::Constant => reader.skip(8)?,
-        Kind::Packed => {
-            let mut done = 0;
-            while done < count {
-                reader.skip(8)?;
-                let width = reader.u8()? as usize;
-                if width > 64 {
-                    return Err(Error::internal(format!(
-                        "a packed integer width of {width} is past 64"
-                    )));
-                }
-                let wanted = (count - done).min(VALUES);
-                let bytes = if wanted == VALUES {
-                    bitpack::packed_len::<u64>(width)
-                        .checked_mul(8)
-                        .ok_or_else(|| Error::internal("packed integer size overflow"))?
-                } else {
-                    bitpack::tail_len(wanted, width)
-                };
-                reader.skip(bytes)?;
-                done += wanted;
-            }
-        }
+        Kind::Packed => skip_packed(reader, count)?,
         Kind::Delta => {
             reader.skip(8)?;
             skip_chunk(reader)?;
@@ -821,6 +829,58 @@ fn skip_chunk(reader: &mut Reader<'_>) -> Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// Advances over the units of a `Packed` body of `count` values.
+fn skip_packed(reader: &mut Reader<'_>, count: usize) -> Result<()> {
+    let mut done = 0;
+    while done < count {
+        reader.skip(8)?;
+        let width = reader.u8()? as usize;
+        if width > 64 {
+            return Err(Error::internal(format!("a packed integer width of {width} is past 64")));
+        }
+        let wanted = (count - done).min(VALUES);
+        let bytes = if wanted == VALUES {
+            bitpack::packed_len::<u64>(width)
+                .checked_mul(8)
+                .ok_or_else(|| Error::internal("packed integer size overflow"))?
+        } else {
+            bitpack::tail_len(wanted, width)
+        };
+        reader.skip(bytes)?;
+        done += wanted;
+    }
+    Ok(())
+}
+
+/// [`shape`] for one chunk and everything inside it.
+fn shape_chunk(reader: &mut Reader<'_>, kinds: &mut Vec<Kind>) -> Result<()> {
+    let kind = Kind::from_tag(reader.u8()?)?;
+    let count = reader.u32()? as usize;
+    kinds.push(kind);
+    match kind {
+        Kind::Constant => reader.skip(8)?,
+        Kind::Packed => skip_packed(reader, count)?,
+        Kind::Delta => {
+            reader.skip(8)?;
+            shape_chunk(reader, kinds)?;
+        }
+        Kind::Rle | Kind::Dict => {
+            shape_chunk(reader, kinds)?;
+            shape_chunk(reader, kinds)?;
+        }
+        Kind::Sparse => {
+            reader.skip(12)?;
+            shape_chunk(reader, kinds)?;
+            shape_chunk(reader, kinds)?;
+        }
+        Kind::Strided => {
+            reader.skip(16)?;
+            shape_chunk(reader, kinds)?;
+        }
+    }
+    Ok(())
 }
 
 fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {

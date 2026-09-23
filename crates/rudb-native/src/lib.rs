@@ -1996,8 +1996,9 @@ impl Writer {
             sieves: Vec::with_capacity(columns.len()),
             ranges: Vec::with_capacity(columns.len()),
         };
+        let mut settling = Settling::default();
         for &column in columns {
-            let bytes = encode(column)?;
+            let bytes = encode(column, &mut settling)?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
@@ -8200,6 +8201,7 @@ fn cascaded(
     flat: &Vector,
     ty: &LogicalType,
     packed: Option<&Packed<'_>>,
+    settling: &mut Settling,
 ) -> Result<Option<Vec<u8>>> {
     let (Some(width), Some(data)) = (plain_width(ty), flat.data()) else { return Ok(None) };
     let Some(values) = widened(data) else { return Ok(None) };
@@ -8209,8 +8211,74 @@ fn cascaded(
         Some(packed) => plain.min(21 + size_of_val(packed.words())),
         None => plain,
     };
-    let out = integer::encode_with(&values, &Fixed)?;
+    let out = settling.encode(&values)?;
     Ok((out.len() < best).then_some(out))
+}
+
+/// How often the parts of one column in one stripe search the cascade again, in parts.
+///
+/// A stripe is 64 parts, so this is four searches a stripe where there were 64. The search is
+/// what the cascade costs: on ClickBench `hits` the integer cascade was about a tenth of the load's
+/// CPU and nearly all of it under `encode_pages`, trying six trees on every part to keep the one
+/// the part before had kept.
+const SEARCH_EVERY: usize = 16;
+
+/// What the parts of one column in one stripe have settled on in the integer cascade.
+///
+/// One of these per column per stripe, used in part order, so what a part comes out as depends on
+/// the stripe and not on which thread wrote it or on how many there were.
+#[derive(Debug, Default)]
+struct Settling {
+    /// The shape of the last part that was searched, with what its top level offered, its length
+    /// and its row count, which is the size a replay is held to.
+    shape: Option<Shape>,
+    /// Parts replayed since that search.
+    since: usize,
+}
+
+impl Settling {
+    /// A part's integers through the cascade, replaying the settled shape where there is one.
+    ///
+    /// The replay is kept when it held and came out no more than a quarter bigger a row than the
+    /// part the shape was searched on. Past that the column has changed under it and the part is
+    /// searched. A replay that stopped fitting partway has already searched from where it stopped,
+    /// so its shape is taken as the new one rather than searched a second time.
+    fn encode(&mut self, values: &[i64]) -> Result<Vec<u8>> {
+        if let Some(shape) = self.shape.as_ref().filter(|_| self.since < SEARCH_EVERY) {
+            let replay = chooser::Replay::new(&shape.kinds, &Fixed).expecting(&shape.offered);
+            let out = integer::encode_with(values, &replay)?;
+            if !replay.held() {
+                self.settle(&out, values.len(), replay.first_offered())?;
+                return Ok(out);
+            }
+            let grown = (out.len() as u128) * (shape.rows as u128) * 4;
+            if grown <= (shape.len as u128) * (values.len() as u128) * 5 {
+                self.since += 1;
+                return Ok(out);
+            }
+        }
+        // A replay of nothing is the search, and says what the top level offered on the way.
+        let search = chooser::Replay::new(&[], &Fixed);
+        let out = integer::encode_with(values, &search)?;
+        self.settle(&out, values.len(), search.first_offered())?;
+        Ok(out)
+    }
+
+    fn settle(&mut self, out: &[u8], rows: usize, offered: Vec<integer::Kind>) -> Result<()> {
+        let kinds = integer::shape(out)?;
+        self.shape = Some(Shape { kinds, offered, len: out.len().max(1), rows: rows.max(1) });
+        self.since = 0;
+        Ok(())
+    }
+}
+
+/// A searched part's cascade, what its top level was offered, and what it came to.
+#[derive(Debug)]
+struct Shape {
+    kinds: Vec<integer::Kind>,
+    offered: Vec<integer::Kind>,
+    len: usize,
+    rows: usize,
 }
 
 /// A part's dictionary codes through the integer cascade, or `None` when the cascade did not pay.
@@ -8321,7 +8389,7 @@ fn coded_page(codes: &[u32], validity: &[u8]) -> Result<Vec<u8>> {
 
 /// One part of one column as a page, for every column that is not coded against a global
 /// dictionary. Those are built by [`coded_page`] from codes [`prepare`] handed out.
-fn encode(vector: &Vector) -> Result<Vec<u8>> {
+fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
     let ty = vector.logical_type();
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
@@ -8337,7 +8405,8 @@ fn encode(vector: &Vector) -> Result<Vec<u8>> {
     // Only where nothing else has claimed the page, which is the plain integer case. A packed part
     // is still on the table because the cascade has to beat it too: the bit pack takes a part only
     // when it halves it, so a column that shrinks by a third was coming out whole.
-    let cascade = if dictionary.is_none() { cascaded(&flat, ty, packed.as_ref())? } else { None };
+    let cascade =
+        if dictionary.is_none() { cascaded(&flat, ty, packed.as_ref(), settling)? } else { None };
     out.push(if cascade.is_some() {
         5
     } else if dictionary.is_some() {
@@ -10107,6 +10176,54 @@ mod tests {
                     &column[..column.len().min(8)]
                 );
             }
+        }
+    }
+
+    /// Parts of a column that all look alike come out of a settled shape byte for byte as they
+    /// come out of a search, because the search would have kept the same tree on every one.
+    #[test]
+    fn parts_that_look_alike_replay_to_the_bytes_a_search_writes() {
+        let mut settling = Settling::default();
+        for part in 0..STRIPE_PARTS as i64 {
+            let values: Vec<i64> = (0..2048)
+                .map(|row| 1_600_000_000_000_000 + (part * 2048 + row) * 1_000_000 + row % 7)
+                .collect();
+            let searched = integer::encode_with(&values, &Fixed).unwrap();
+            assert_eq!(settling.encode(&values).unwrap(), searched, "part {part}");
+        }
+    }
+
+    /// A column that changes shape partway through a stripe still reads back, and no part comes
+    /// out much bigger than a search would have made it, because a replay that stops fitting or
+    /// grows past a quarter a row is searched.
+    #[test]
+    fn a_column_that_changes_under_the_shape_is_searched_again() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_000) as i64
+        };
+        let mut settling = Settling::default();
+        for part in 0..STRIPE_PARTS as i64 {
+            let values: Vec<i64> = match part / 16 {
+                0 => (0..2048).map(|row| (part * 2048 + row) / 300).collect(),
+                1 => (0..2048).map(|_| noise()).collect(),
+                2 => (0..2048).map(|row| if row % 97 == 0 { row } else { 42 }).collect(),
+                _ => (0..2048).map(|row| 5 + (part * 2048 + row) * 1_000_000).collect(),
+            };
+            let settled = settling.encode(&values).unwrap();
+            assert_eq!(integer::decode(&settled).unwrap(), values, "part {part}");
+            let searched = integer::encode_with(&values, &Fixed).unwrap();
+            assert!(
+                settled.len() * 4 <= searched.len() * 5,
+                "part {part}: {} settled against {} searched, {} against {}",
+                settled.len(),
+                searched.len(),
+                integer::describe(&settled).unwrap(),
+                integer::describe(&searched).unwrap(),
+            );
         }
     }
 
