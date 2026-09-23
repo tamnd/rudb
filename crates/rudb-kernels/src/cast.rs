@@ -307,6 +307,25 @@ fn from_packed<M: Fn(usize) -> usize>(
             }
         }
     }
+    // A run whose two ends fit in an `i64` loosens from there, which is one instruction a value
+    // where the same conversion from an `i128` is a call into the runtime. It is the benchmark
+    // view's `EventTime`, a stored integer cast to a double on its way into `to_seconds` on every
+    // query that reads it. The value is the same integer either way, so the double is the same.
+    if let (Numeric::Approximate { single }, Ok(low), Ok(_)) =
+        (into, i64::try_from(base), i64::try_from(base + i128::from(mask)))
+    {
+        let factor = pow10(was) as f64;
+        let loosened = codes
+            .iter()
+            .map(|&code| {
+                // Every value is inside the two ends, so the add wraps back into range.
+                #[expect(clippy::cast_possible_wrap, reason = "undone by the wrapping add")]
+                let whole = low.wrapping_add(code as i64) as f64;
+                if was == 0 { whole } else { whole / factor }
+            })
+            .collect();
+        return approximate_out(loosened, single);
+    }
     let mut run: Vec<i128> = codes.iter().map(|&code| base + i128::from(code)).collect();
     match into {
         Numeric::Exact { scale: now, width } => {
