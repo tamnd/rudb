@@ -35,6 +35,22 @@
 //! rules here write a number onto a node and move no operator, so before that they were invisible in
 //! the plan and this tool would have reported them as never firing anywhere.
 //!
+//! # Why an answer that changed is not always a wrong answer
+//!
+//! Claim S3 is that no rule changes an answer, and on this suite the naive reading of it fails on
+//! queries where nothing is wrong. Five of the forty three take ten rows out of a group by where far
+//! more than ten rows are tied for the tenth place, and q18 does it with no `ORDER BY` in the
+//! statement at all. Which ten of the tied rows come back is whichever ten the aggregate emitted
+//! first, so a rule that sizes the table differently returns different rows and has answered the
+//! question exactly as well as the run it is being compared against.
+//!
+//! So a difference is put through the four steps of the tie rule in
+//! `spec/bench/tpc-h/04-the-answers.md` section 4.4, which is the same hazard on the same shape over
+//! the other suite. [`settle`] is those steps, and step three, the one that runs the query again
+//! without its limit, is [`boundary`]. The table has a column for each of the two outcomes the rule
+//! allows, because a rule that reorders a result or takes other rows at the cut is worth knowing
+//! about even though it is not a failure, and the run only fails on the fourth outcome.
+//!
 //! # The delta, and the column that says how much of it to believe
 //!
 //! Per query the two times are taken next to each other, fastest of however many repeats were asked
@@ -68,6 +84,7 @@
 //! than a failure of it, and it is worth stating out loud because a row of zeroes looks the same
 //! either way.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -89,6 +106,10 @@ struct Row {
     /// rule says is not a failure. Named anyway, because a rule that reorders a result nobody asked
     /// to be ordered is worth knowing about.
     tied: Vec<String>,
+    /// The queries that came back with different rows, where the answer without the limit is the same
+    /// answer and the difference is which of the rows tied at the cut the limit let through. Step
+    /// three of the tie rule, and also not a failure. Named for the same reason as `tied`.
+    cut: Vec<String>,
     /// The queries that answered differently, which have to be none.
     differ: Vec<String>,
     /// The queries that stopped answering with the rule off, which also have to be none. The same
@@ -132,8 +153,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         baseline.iter().filter(|query| !query.compared).map(|query| query.name.as_str()).collect();
     if !arbitrary.is_empty() {
         println!(
-            "timed    but not compared, because two runs of it with nothing changed already \
-             disagree: {}",
+            "unstable {}, which answer differently from themselves with nothing changed, so they \
+             are compared without their limit rather than row for row",
             arbitrary.join(" ")
         );
     }
@@ -143,10 +164,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     }
 
     println!(
-        "{:<28}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}",
-        "rule", "fired", "quiet", "tied", "wrong", "median", "floor"
+        "{:<28}{:>7}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}",
+        "rule", "fired", "quiet", "tied", "cut", "wrong", "median", "floor"
     );
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(83));
     let mut rows = Vec::new();
     for rule in Rule::ALL {
         // The graph sections start off rather than on, so turning them off ablates nothing, and this
@@ -156,25 +177,27 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         }
         let row = ablate(&database, rule, &baseline, repeats);
         println!(
-            "{:<28}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}",
+            "{:<28}{:>7}{:>7}{:>7}{:>7}{:>7}{:>10}{:>10}",
             rule.name(),
             row.fired.len(),
             row.quiet,
             row.tied.len(),
+            row.cut.len(),
             row.differ.len() + row.broke.len(),
             percent(median(&row.earned)),
             percent(median(&row.floor)),
         );
         rows.push((rule, row));
     }
-    println!("{}", "-".repeat(76));
+    println!("{}", "-".repeat(83));
     println!(
         "median is over the queries the rule fired on and floor is over the ones it left alone, \
          both as the share of the run without the rule that the rule takes off"
     );
     println!(
-        "tied is the same rows in another order, which step two of the tie rule in \
-         spec/bench/tpc-h/04-the-answers.md section 4.4 allows"
+        "tied is the same rows in another order and cut is a different set of the rows tied at the \
+         limit, which steps two and three of the tie rule in \
+         spec/bench/tpc-h/04-the-answers.md section 4.4 both allow"
     );
 
     for (rule, row) in &rows {
@@ -183,6 +206,9 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
         }
         if !row.tied.is_empty() {
             println!("{} reordered {}", rule.name(), row.tied.join(" "));
+        }
+        if !row.cut.is_empty() {
+            println!("{} took other rows at the cut of {}", rule.name(), row.cut.join(" "));
         }
     }
     let nothing: Vec<&str> =
@@ -226,7 +252,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
 ///
 /// Every query runs twice, and the second run is the one kept. The first is what says whether the
 /// answer is the same answer twice, which is the question [`Query::compared`] holds and which decides
-/// whether this query is allowed to speak about a rule at all.
+/// which of the tie rule's steps this query gets compared by.
 fn baseline(
     database: &Database,
     queries: &[(String, String)],
@@ -265,21 +291,21 @@ struct Query {
     sql: String,
     plan: String,
     rows: Vec<String>,
-    /// Whether this query's own answer is the same answer twice, and so whether comparing it against
-    /// itself with a rule off says anything.
+    /// Whether this query's own answer is the same answer twice, and so whether a difference in it
+    /// row for row is attributable to a rule at all.
     ///
-    /// ClickBench q19 and q41 both order by a count and limit to ten, and on any real file thousands
-    /// of groups share the count at the cut. Which ten come back is whichever ten the aggregate
-    /// emitted first, which is a property of how the threads happened to interleave. Two runs with
-    /// identical settings return different rows, so a run with a rule off returning different rows
-    /// says nothing about the rule, and reporting it as a wrong answer would be this tool crying
-    /// wolf on the one claim nobody is allowed to ignore.
+    /// ClickBench q19, q33 and q41 order by a count and limit to ten, and on a real file more groups
+    /// share the count at the cut than there is room for. Which ten come back is whichever ten the
+    /// aggregate emitted first, which is a property of how the threads happened to interleave. Two
+    /// runs with identical settings return different rows, so recording that as the rule having
+    /// reordered or changed a result would be this tool putting noise in a column somebody reads as
+    /// evidence.
     ///
-    /// `spec/bench/tpc-h/04-the-answers.md` section 4.4 is the same hazard on the same shape, and its
-    /// step three is the check that would let these two queries be compared properly: the rows before
-    /// the boundary, plus the cardinality of the result without its limit. That needs the unlimited
-    /// result and so it needs the sort key, which is more than a tool reading rendered rows has. So
-    /// these queries are timed and not compared, and the header says which ones they were.
+    /// It is not a free pass. A query this is false for skips the first two steps of the tie rule and
+    /// is settled by [`boundary`], which is the comparison that is still meaningful for it: the same
+    /// query without its limit answers the same thing every time, and if it stops doing that with a
+    /// rule off then the rule broke something. What is lost is only the ability to say which of the
+    /// two allowed outcomes it was.
     compared: bool,
 }
 
@@ -300,9 +326,10 @@ fn ablate(database: &Database, rule: Rule, baseline: &[Query], repeats: usize) -
             continue;
         }
         let planned = plan(database, &query.sql);
-        match compare(query, &pair.rows) {
+        match settle(database, &switch, query, &pair.rows) {
             Answer::Same => {}
             Answer::Tied => row.tied.push(query.name.clone()),
+            Answer::Cut => row.cut.push(query.name.clone()),
             Answer::Differ => {
                 row.differ.push(query.name.clone());
                 continue;
@@ -378,15 +405,18 @@ fn turn(database: &Database, switch: &str, on: bool) -> Option<()> {
 /// How the run with a rule off compares against the run with it on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
-    /// The same rows in the same order, or a query whose order was never reproducible to begin with.
+    /// The same rows in the same order.
     Same,
     /// The same rows in a different order, which step two of the tie rule says is not a failure.
     Tied,
-    /// Different rows.
+    /// Different rows, where the answer without the limit is the same answer, so what differs is
+    /// which of the rows tied at the cut the limit let through. Step three of the tie rule.
+    Cut,
+    /// Different rows, with the answer without the limit different too, which is claim S3 failing.
     Differ,
 }
 
-/// The two runs of one query, by the first two steps of the tie rule.
+/// The two runs of one query, by all four steps of the tie rule.
 ///
 /// Step one is the ordered comparison and it is the answer almost every time. Step two re-sorts both
 /// and compares them as multisets, and a match there means the two runs agree on the rows and
@@ -395,15 +425,116 @@ enum Answer {
 /// rules over a query with no total order, and treating it as a wrong answer would fail the run on
 /// the rules working.
 ///
-/// A query whose own answer was not reproducible is not compared, per [`Query::compared`].
-fn compare(query: &Query, rows: &[String]) -> Answer {
+/// Step three is [`boundary`] and it is why this function needs the database. It is skipped for a
+/// query where the first two steps settled the question, per the note in section 4.4 that step three
+/// is expensive and belongs where it has already been earned.
+///
+/// The first two steps are skipped for a query that is not reproducible against itself, per
+/// [`Query::compared`], because a reorder or a different set of rows from such a query is a fact
+/// about the threads rather than about the rule, and attributing it to the rule in either column
+/// would be reading noise. Those go straight to step three, which is the only comparison that means
+/// anything for them.
+fn settle(database: &Database, switch: &str, query: &Query, rows: &[String]) -> Answer {
+    if let Some(settled) = compare(query, rows) {
+        return settled;
+    }
+    match boundary(database, switch, &query.sql) {
+        Some(true) => Answer::Cut,
+        _ => Answer::Differ,
+    }
+}
+
+/// The first two steps of the tie rule, or nothing when neither of them settles the question.
+///
+/// Separate from [`settle`] because these two steps are a comparison of two lists of strings and the
+/// third one is two more runs of the query, and the part that is only strings is the part that can be
+/// tested without a file to load.
+fn compare(query: &Query, rows: &[String]) -> Option<Answer> {
     if rows == query.rows.as_slice() {
-        return Answer::Same;
+        return Some(Answer::Same);
     }
-    if !query.compared {
-        return Answer::Same;
+    if query.compared && multiset(rows) == multiset(&query.rows) {
+        return Some(Answer::Tied);
     }
-    if multiset(rows) == multiset(&query.rows) { Answer::Tied } else { Answer::Differ }
+    None
+}
+
+/// Whether the query answers the same thing both ways once the limit is taken off it.
+///
+/// Step three of the tie rule, which exists because the first two steps cannot tell a rule that
+/// broke an answer from a rule that changed which of the rows tied at the cut got under the limit.
+/// ClickBench has both shapes in it. q18 groups by two columns and limits to ten with no `ORDER BY`
+/// at all, so which ten rows it returns is whatever the aggregate emitted first and a presized table
+/// emits them in a different order. q22, q23, q32 and q33 order by a count and limit to ten, and on
+/// a real file the count at the cut is shared by more groups than there is room for. Ablating a
+/// sizing rule over any of those changes the answer and changes nothing that was asked for.
+///
+/// Section 4.4 says to take the key of the last row and count the rows that share it in each
+/// unlimited result. What is done instead is stronger on the half that matters and weaker on the
+/// other half: the whole unlimited result is compared as a multiset, which subsumes both the
+/// deterministic prefix and the total cardinality that step three falls back to. What it does not
+/// check is that the rows the limit admitted were the top ones, because that needs the sort key and
+/// a tool reading rendered rows does not have it. So a `TopN` that returned ten rows from the middle
+/// of a correct answer would be recorded here as a tie at the cut. That gap is the same one
+/// rudb-bench issue 148 is open on, and it is worth stating rather than leaving in the difference
+/// between what this prints and what section 4.4 asked for.
+///
+/// Both sides are run here rather than one side being kept from the baseline, because the unlimited
+/// result of a group by over a hundred million rows is tens of millions of rows and holding one of
+/// those for every query in the suite on the chance it is needed is not worth the memory. It is
+/// needed by almost none of them.
+fn boundary(database: &Database, switch: &str, sql: &str) -> Option<bool> {
+    let whole = unlimited(sql)?;
+    turn(database, switch, true)?;
+    let on = fingerprint(database, whole)?;
+    turn(database, switch, false)?;
+    let off = fingerprint(database, whole)?;
+    Some(on == off)
+}
+
+/// The query without its limit, or nothing if it never had one.
+///
+/// Cut at the last `LIMIT` in the text, which also takes an `OFFSET` after it, since the unlimited
+/// result is the whole answer and not a different window onto it. Text rather than a parse because
+/// this suite is forty three known statements with no subquery and no string literal containing the
+/// word in any of them, and a rewrite that works on the input it has is better than a rewrite that
+/// claims to work on input it will never see.
+fn unlimited(sql: &str) -> Option<&str> {
+    let upper = sql.to_uppercase();
+    let at = upper.rfind(" LIMIT ")?;
+    Some(sql[..at].trim_end())
+}
+
+/// One query's rows as a count and two accumulators over them, which is a multiset without the rows.
+///
+/// A sum and an exclusive or of a hash per row, both of which a reordering leaves alone, so two runs
+/// that produced the same rows in a different order come out equal here and two runs that produced
+/// different rows do not. It is a fingerprint and not a proof: two different multisets can agree on
+/// all three numbers. At sixty four bits twice over that is not a thing worth planning around, and
+/// what it buys is that the unlimited result of a group by over a hundred million rows is read one
+/// row at a time rather than copied into a second list beside the one the engine already made.
+fn fingerprint(database: &Database, sql: &str) -> Option<(u64, u64, u64)> {
+    let result = database.query(sql).ok()?;
+    let mut rows = 0u64;
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    let mut line = String::new();
+    for row in 0..result.len() {
+        line.clear();
+        for column in 0..result.width() {
+            if column > 0 {
+                line.push('|');
+            }
+            line.push_str(&result.text_at(row, column));
+        }
+        let mut hasher = DefaultHasher::new();
+        line.hash(&mut hasher);
+        let one = hasher.finish();
+        rows += 1;
+        sum = sum.wrapping_add(one);
+        xor ^= one;
+    }
+    Some((rows, sum, xor))
 }
 
 /// The rows with the order taken out of them, which is what a multiset comparison is over.
@@ -571,7 +702,9 @@ fn say(error: rudb_common::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answer, Query, Rule, compare, delta, median, percent, switch};
+    use super::{
+        Answer, Query, Rule, compare, delta, fingerprint, median, percent, switch, unlimited,
+    };
 
     /// A baseline query that answered those rows, and that either was or was not reproducible.
     fn asked(rows: &[&str], compared: bool) -> Query {
@@ -591,28 +724,64 @@ mod tests {
     #[test]
     fn the_same_rows_in_the_same_order_agree_and_in_another_order_are_tied() {
         let query = asked(&["a", "b", "c"], true);
-        assert_eq!(compare(&query, &got(&["a", "b", "c"])), Answer::Same);
+        assert_eq!(compare(&query, &got(&["a", "b", "c"])), Some(Answer::Same));
         // Which is what ablating a rule that sized a hash table does to a query with no total order,
         // and failing the run on it would be failing the run on the rule working.
-        assert_eq!(compare(&query, &got(&["c", "a", "b"])), Answer::Tied);
+        assert_eq!(compare(&query, &got(&["c", "a", "b"])), Some(Answer::Tied));
     }
 
     #[test]
-    fn a_row_that_is_not_in_the_other_result_is_the_failure_this_is_looking_for() {
+    fn a_row_that_is_not_in_the_other_result_goes_on_to_the_run_without_the_limit() {
+        // Nothing here is a failure yet. These are the three shapes step three has to look at, and on
+        // this suite two of them turn out to be a tie at the cut rather than a broken answer.
         let query = asked(&["a", "b", "c"], true);
-        assert_eq!(compare(&query, &got(&["a", "b", "d"])), Answer::Differ);
-        assert_eq!(compare(&query, &got(&["a", "b"])), Answer::Differ);
+        assert_eq!(compare(&query, &got(&["a", "b", "d"])), None);
+        assert_eq!(compare(&query, &got(&["a", "b"])), None);
         // A repeated row is a different multiset, which is the count of a group being wrong.
-        assert_eq!(compare(&query, &got(&["a", "b", "b"])), Answer::Differ);
+        assert_eq!(compare(&query, &got(&["a", "b", "b"])), None);
     }
 
     #[test]
-    fn a_query_that_does_not_answer_the_same_thing_twice_by_itself_is_not_evidence() {
-        // q19 and q41 of ClickBench limit ten rows out of thousands that tie at the cut, so the rows
-        // differ between two runs with nothing changed at all. Calling that a wrong answer would be
-        // this tool crying wolf on claim S3, which is the one nobody is allowed to ignore.
+    fn a_query_that_does_not_answer_the_same_thing_twice_by_itself_is_never_tied() {
+        // q19, q33 and q41 of ClickBench limit ten rows out of thousands that tie at the cut, so the
+        // rows differ between two runs with nothing changed at all. A reorder there is a fact about
+        // the threads, so recording it against the rule would be putting noise in a column that is
+        // read as evidence. It goes to step three instead, which still has something to say about it.
         let query = asked(&["a", "b", "c"], false);
-        assert_eq!(compare(&query, &got(&["x", "y", "z"])), Answer::Same);
+        assert_eq!(compare(&query, &got(&["c", "b", "a"])), None);
+        assert_eq!(compare(&query, &got(&["x", "y", "z"])), None);
+        // The same rows in the same order is still the same rows in the same order.
+        assert_eq!(compare(&query, &got(&["a", "b", "c"])), Some(Answer::Same));
+    }
+
+    #[test]
+    fn taking_the_limit_off_takes_the_offset_with_it_and_leaves_a_query_that_had_neither_alone() {
+        assert_eq!(
+            unlimited("SELECT a FROM t GROUP BY a ORDER BY count(*) DESC LIMIT 10"),
+            Some("SELECT a FROM t GROUP BY a ORDER BY count(*) DESC")
+        );
+        // Which is ClickBench q43, where the window under the limit is not the answer either.
+        assert_eq!(unlimited("SELECT a FROM t LIMIT 10 OFFSET 1000"), Some("SELECT a FROM t"));
+        // Lower case, because the file is not required to shout.
+        assert_eq!(unlimited("select a from t limit 10"), Some("select a from t"));
+        // A query with no limit has no boundary to be tied at, so a difference in it is a difference.
+        assert_eq!(unlimited("SELECT count(*) FROM t"), None);
+    }
+
+    #[test]
+    fn the_fingerprint_of_a_result_is_the_same_in_any_order_and_not_the_same_for_other_rows() {
+        let database = rudb::Database::new();
+        let one = fingerprint(&database, "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c'))");
+        let same = fingerprint(&database, "SELECT * FROM (VALUES (3, 'c'), (1, 'a'), (2, 'b'))");
+        let other = fingerprint(&database, "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (4, 'd'))");
+        let fewer = fingerprint(&database, "SELECT * FROM (VALUES (1, 'a'), (2, 'b'))");
+        assert!(one.is_some());
+        assert_eq!(one, same);
+        assert_ne!(one, other);
+        assert_ne!(one, fewer);
+        // A row twice is a different multiset, which is what a count being wrong looks like.
+        let twice = fingerprint(&database, "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (2, 'b'))");
+        assert_ne!(one, twice);
     }
 
     #[test]
