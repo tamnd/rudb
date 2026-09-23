@@ -172,17 +172,13 @@ impl Rows {
         }
     }
 
-    /// Certified host aggregates kept by a native file when its omitted bound is below the
-    /// inclusive `HAVING COUNT(*)` threshold. Other row sources use the ordinary aggregate.
+    /// Query-specific host aggregates are not used, including in older native files.
     pub fn host_groups(
         &self,
-        column: usize,
-        minimum_count: u64,
+        _column: usize,
+        _minimum_count: u64,
     ) -> Result<Option<Vec<rudb_native::host::HostEntry>>> {
-        match self {
-            Self::Native(reader) => reader.host_groups(column, minimum_count),
-            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
-        }
+        Ok(None)
     }
 
     /// Every value of one column with its exact row count, when something has all of them.
@@ -308,17 +304,14 @@ impl Rows {
         }
     }
 
-    /// Exact certified leading counts for a native numeric/string grouping pair.
+    /// Query-specific pair leaders are not used, including in older native files.
     pub fn top_pair_frequencies(
         &self,
-        first: usize,
-        second: usize,
-        top: usize,
+        _first: usize,
+        _second: usize,
+        _top: usize,
     ) -> Result<Option<PairFrequencyCounts>> {
-        match self {
-            Self::Native(reader) => reader.top_pair_frequencies(first, second, top),
-            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
-        }
+        Ok(None)
     }
 
     /// Reads a signed column and a stable-dictionary column at sorted native row ordinals.

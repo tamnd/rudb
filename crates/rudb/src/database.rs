@@ -122,75 +122,6 @@ fn native_simple_extrema_statement(sql: &str) -> Option<(&str, &str)> {
         .then_some((table, column))
 }
 
-/// A narrow grouped-distinct top-ten shape whose exact answer may be certified by native storage.
-fn native_grouped_distinct_statement(sql: &str) -> Option<(&str, &str, &str)> {
-    let statement = sql.trim();
-    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
-    let words = statement.split_ascii_whitespace().collect::<Vec<_>>();
-    if words.len() != 17
-        || !words[0].eq_ignore_ascii_case("select")
-        || !words[2].eq_ignore_ascii_case("count(distinct")
-        || !words[4].eq_ignore_ascii_case("as")
-        || !words[6].eq_ignore_ascii_case("from")
-        || !words[8].eq_ignore_ascii_case("group")
-        || !words[9].eq_ignore_ascii_case("by")
-        || !words[11].eq_ignore_ascii_case("order")
-        || !words[12].eq_ignore_ascii_case("by")
-        || !words[14].eq_ignore_ascii_case("desc")
-        || !words[15].eq_ignore_ascii_case("limit")
-        || words[16] != "10"
-    {
-        return None;
-    }
-    let group = words[1].strip_suffix(',')?;
-    let distinct = words[3].strip_suffix(')')?;
-    (native_simple_identifier(group)
-        && native_simple_identifier(distinct)
-        && native_simple_identifier(words[5])
-        && native_simple_identifier(words[7])
-        && group.eq_ignore_ascii_case(words[10])
-        && words[5].eq_ignore_ascii_case(words[13]))
-    .then_some((words[7], group, distinct))
-}
-
-fn native_grouped_metrics_statement(sql: &str) -> Option<(&str, [&str; 4])> {
-    let statement = sql.trim();
-    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
-    let words = statement.split_ascii_whitespace().collect::<Vec<_>>();
-    if words.len() != 20
-        || !words[0].eq_ignore_ascii_case("select")
-        || !words[3].eq_ignore_ascii_case("count(*)")
-        || !words[4].eq_ignore_ascii_case("as")
-        || !words[7].eq_ignore_ascii_case("count(distinct")
-        || !words[9].eq_ignore_ascii_case("from")
-        || !words[11].eq_ignore_ascii_case("group")
-        || !words[12].eq_ignore_ascii_case("by")
-        || !words[14].eq_ignore_ascii_case("order")
-        || !words[15].eq_ignore_ascii_case("by")
-        || !words[17].eq_ignore_ascii_case("desc")
-        || !words[18].eq_ignore_ascii_case("limit")
-        || words[19] != "10"
-    {
-        return None;
-    }
-    let group = words[1].strip_suffix(',')?;
-    let sum = words[2].strip_suffix("),")?.get(4..)?;
-    let average = words[6].strip_suffix("),")?.get(4..)?;
-    let distinct = words[8].strip_suffix(')')?;
-    let alias = words[5].strip_suffix(',')?;
-    if !words[2].get(..4)?.eq_ignore_ascii_case("sum(")
-        || !words[6].get(..4)?.eq_ignore_ascii_case("avg(")
-        || ![group, sum, average, distinct, alias, words[10]]
-            .into_iter()
-            .all(native_simple_identifier)
-        || !group.eq_ignore_ascii_case(words[13])
-        || !alias.eq_ignore_ascii_case(words[16])
-    {
-        return None;
-    }
-    Some((words[10], [group, sum, average, distinct]))
-}
-
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
 /// Keep this check strict: every clause it does not understand belongs to the regular binder.
 fn native_nonzero_shape(ast: &Ast) -> Option<(&str, &str, &str)> {
@@ -907,52 +838,6 @@ impl Database {
             }
             _ => NativeExtremaValues::Integer { low, high },
         }))
-    }
-
-    /// Reads a certified top-ten grouped distinct result without opening column pages.
-    pub fn query_native_grouped_distinct_once(
-        path: &str,
-        sql: &str,
-    ) -> Result<Option<rudb_native::GroupedDistinctTop>> {
-        let Some((table, group, distinct)) = native_grouped_distinct_statement(sql) else {
-            return Ok(None);
-        };
-        let catalog = rudb_native::Catalog::open(path)?;
-        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table)) else {
-            return Ok(None);
-        };
-        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
-        let Some(group) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(group))
-        else {
-            return Ok(None);
-        };
-        let Some(distinct) =
-            fields.iter().position(|field| field.name.eq_ignore_ascii_case(distinct))
-        else {
-            return Ok(None);
-        };
-        catalog.grouped_distinct_top(name, group, distinct)
-    }
-
-    /// Reads certified count-ranked group measures without scanning native columns.
-    pub fn query_native_grouped_metrics_once(
-        path: &str,
-        sql: &str,
-    ) -> Result<Option<rudb_native::GroupMetricsTop>> {
-        let Some((table, columns)) = native_grouped_metrics_statement(sql) else {
-            return Ok(None);
-        };
-        let catalog = rudb_native::Catalog::open(path)?;
-        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table)) else {
-            return Ok(None);
-        };
-        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
-        let indices = columns
-            .map(|column| fields.iter().position(|field| field.name.eq_ignore_ascii_case(column)));
-        let [Some(group), Some(sum), Some(average), Some(distinct)] = indices else {
-            return Ok(None);
-        };
-        catalog.grouped_metrics_top(name, [group, sum, average, distinct])
     }
 
     /// Answers supported read-only aggregates directly from certified native synopses.
@@ -3495,42 +3380,10 @@ mod tests {
 
     use super::{
         Database, NativeExtremaValues, native_extrema_shape, native_frequency_group_shape,
-        native_grouped_distinct_statement, native_grouped_metrics_statement, native_nonzero_shape,
-        native_simple_average_statement, native_simple_distinct_statement,
+        native_nonzero_shape, native_simple_average_statement, native_simple_distinct_statement,
         native_simple_extrema_statement, native_single_average_shape, native_single_distinct_shape,
         native_three_aggregate_shape, publish,
     };
-
-    #[test]
-    fn grouped_metrics_certificate_shape_rejects_other_sql() {
-        let sql = "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10";
-        assert_eq!(
-            native_grouped_metrics_statement(sql),
-            Some(("hits", ["RegionID", "AdvEngineID", "ResolutionWidth", "UserID"]))
-        );
-        assert_eq!(
-            native_grouped_metrics_statement(&sql.replace("GROUP BY RegionID", "GROUP BY UserID")),
-            None
-        );
-        assert_eq!(
-            native_grouped_metrics_statement(&sql.replace("ORDER BY c", "ORDER BY RegionID")),
-            None
-        );
-        assert_eq!(native_grouped_metrics_statement(&sql.replace("LIMIT 10", "LIMIT 9")), None);
-        assert_eq!(native_grouped_metrics_statement(&format!("{sql} WHERE RegionID > 0")), None);
-    }
-
-    #[test]
-    fn grouped_distinct_certificate_shape_rejects_extra_clauses() {
-        let sql = "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10";
-        assert_eq!(native_grouped_distinct_statement(sql), Some(("hits", "RegionID", "UserID")));
-        assert_eq!(native_grouped_distinct_statement(&format!("{sql} WHERE RegionID > 0")), None);
-        assert_eq!(
-            native_grouped_distinct_statement(&sql.replace("GROUP BY RegionID", "GROUP BY UserID")),
-            None
-        );
-        assert_eq!(native_grouped_distinct_statement(&sql.replace("LIMIT 10", "LIMIT 9")), None);
-    }
 
     #[test]
     fn cold_frequency_group_shape_accepts_only_the_complete_group() {
