@@ -3241,6 +3241,14 @@ struct NativeText {
     /// a little early, which is the harmless direction, and it costs one relaxed add a block rather
     /// than a lock on the path every scan of a string column goes through.
     payload_kept: AtomicUsize,
+    /// Which payload blocks a sweep has decoded before, one flag a block.
+    ///
+    /// A sweep keeps a block the second time it decodes it and not the first. A process that runs
+    /// one statement, which is how a benchmark or a script uses the engine, sweeps each block once
+    /// and so keeps nothing: on ten million rows a `URL LIKE` held 396 MB with every block kept and
+    /// 97 MB with none, for the same processor time. A session that asks again pays the decode one
+    /// more time and reads kept blocks from then on, under the same [`TEXT_KEEP_BUDGET`].
+    swept: Vec<AtomicBool>,
     /// The boundaries this dictionary has already been searched for, by the value searched for.
     ///
     /// A search is the expensive thing this type does. It settles a probe on the stored head where
@@ -3751,8 +3759,8 @@ impl TextSource for NativeText {
     /// the same question decode all of it again, which on the same column at a million rows is a
     /// `LIKE` going from 2.7 ms to 16.2 ms.
     ///
-    /// So a sweep keeps what it decodes while the column is under [`TEXT_KEEP_BUDGET`] and drops it
-    /// after that. A block already in hand is used where it is there and costs nothing either way.
+    /// So a sweep keeps what it decodes for the second time while the column is under
+    /// [`TEXT_KEEP_BUDGET`] and drops it after that. A block already in hand is used where it is there and costs nothing either way.
     fn sweep(
         &self,
         first: usize,
@@ -3766,9 +3774,12 @@ impl TextSource for NativeText {
         let block = first / TEXT_PAYLOAD_VALUES;
         let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
         let decoded;
-        let bytes: &[u8] = match self.blocks.get(block).and_then(OnceLock::get) {
+        let kept = self.blocks.get(block).and_then(OnceLock::get);
+        let again = kept.is_none()
+            && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
+        let bytes: &[u8] = match kept {
             Some(Ok(kept)) => kept,
-            _ if self.payload_kept.load(Atomic::Relaxed) < self.keep_budget => {
+            _ if again && self.payload_kept.load(Atomic::Relaxed) < self.keep_budget => {
                 let kept = self
                     .payload_block(block)?
                     .ok_or_else(|| invalid("global dictionary block is past the payload"))?;
@@ -8602,6 +8613,7 @@ fn open_global_dictionary(
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
             keep_budget,
             payload_kept: AtomicUsize::new(0),
+            swept: (0..blocks).map(|_| AtomicBool::new(false)).collect(),
             searched: Mutex::new(HashMap::new()),
         }),
     )
@@ -11963,12 +11975,14 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A sweep of the dictionary reads every value and keeps what it read, up to the budget.
+    /// A sweep of the dictionary reads every value, and the second sweep keeps what it read, up to
+    /// the budget.
     ///
     /// The point of the sweep is the resident size rather than the answer, so both are checked
-    /// here. A dictionary this small is well under [`TEXT_KEEP_BUDGET`], so it keeps everything and
-    /// a second sweep decodes nothing, which is what makes the second statement of a session asking
-    /// the same question cost what it should. The ceiling is the other half of it and it has its own
+    /// here. The first sweep keeps nothing, because a process that runs one statement never reads
+    /// a block twice. A dictionary this small is well under [`TEXT_KEEP_BUDGET`], so the second
+    /// sweep keeps everything and a third decodes nothing, which is what makes a session asking the
+    /// same question again cost what it should. The ceiling is the other half of it and it has its own
     /// test below, because a ceiling that never binds is not a ceiling anybody checked.
     #[test]
     fn a_dictionary_sweep_reads_every_value_and_keeps_it_under_the_budget() {
@@ -12000,24 +12014,30 @@ mod tests {
         assert_eq!(dictionary.len(), spellings.len(), "every value is distinct");
 
         let resting = dictionary.footprint();
-        let mut swept: Vec<Vec<u8>> = Vec::new();
-        let mut at = 0;
-        let mut calls = 0;
-        while at < dictionary.len() {
-            let stopped = dictionary
-                .sweep_text(at, dictionary.len(), &mut |index: usize, text: &[u8]| {
-                    assert_eq!(index, swept.len(), "a sweep hands its values over in order");
-                    swept.push(text.to_vec());
-                    Ok(())
-                })
-                .expect("a sweep reads");
-            assert!(stopped > at, "a sweep moves");
-            at = stopped;
-            calls += 1;
-        }
-        assert_eq!(calls, 3, "a sweep hands over one block at a time");
+        let sweep = || {
+            let mut swept: Vec<Vec<u8>> = Vec::new();
+            let mut at = 0;
+            let mut calls = 0;
+            while at < dictionary.len() {
+                let stopped = dictionary
+                    .sweep_text(at, dictionary.len(), &mut |index: usize, text: &[u8]| {
+                        assert_eq!(index, swept.len(), "a sweep hands its values over in order");
+                        swept.push(text.to_vec());
+                        Ok(())
+                    })
+                    .expect("a sweep reads");
+                assert!(stopped > at, "a sweep moves");
+                at = stopped;
+                calls += 1;
+            }
+            assert_eq!(calls, 3, "a sweep hands over one block at a time");
+            swept
+        };
+        let swept = sweep();
+        assert_eq!(dictionary.footprint(), resting, "a first sweep keeps nothing it decoded");
+        assert_eq!(sweep(), swept, "a second sweep reads what the first did");
         let after = dictionary.footprint();
-        assert!(after > resting, "a sweep under the budget keeps what it decoded");
+        assert!(after > resting, "a second sweep under the budget keeps what it decoded");
 
         let read = (0..dictionary.len())
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
