@@ -449,7 +449,7 @@ impl<'a> Transform<'a> {
             "DeleteStatement" => self.delete_statement(inner),
             "TruncateStatement" => {
                 let name = self.name_parts(self.find(inner, "BaseTableName"));
-                self.changed_rows(name, NONE, NONE, Vec::new(), None, true)
+                self.changed_rows(inner, name, NONE, Vec::new(), true)
             }
             "SetStatement" => self.set_statement(inner),
             "ResetStatement" => self.reset_statement(inner),
@@ -1076,15 +1076,12 @@ impl<'a> Transform<'a> {
     /// `UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause FromClause?
     /// WhereClause? ReturningClause?`.
     ///
-    /// `WITH`, `FROM` and the `(a, b) = row` form are each a refusal for now, since
-    /// every one of them changes which rows change or what comes back. A qualified name after `SET`
-    /// is the pin's own refusal.
+    /// `WITH` and the `(a, b) = row` form are each a refusal for now, since both change which rows
+    /// change or what comes back. A qualified name after `SET` is the pin's own refusal.
     fn update_statement(&mut self, node: u32) -> Result<Statement> {
-        for name in ["WithClause", "FromClause"] {
-            let clause = self.find(node, name);
-            if clause != NONE {
-                return self.unsupported(clause);
-            }
+        let with = self.find(node, "WithClause");
+        if with != NONE {
+            return self.unsupported(with);
         }
         let target = self.first(self.find(node, "UpdateTarget"));
         let name = self.name_parts(self.find(target, "BaseTableName"));
@@ -1105,40 +1102,49 @@ impl<'a> Transform<'a> {
             let value = self.expr(self.find(element, "Expression"))?;
             sets.push((written, value));
         }
-        let filter = self.find(node, "WhereClause");
-        let returning = self.returning(node, name, alias)?;
-        self.changed_rows(name, alias, filter, sets, returning, false)
+        self.changed_rows(node, name, alias, sets, false)
     }
 
     /// `DeleteStatement <- WithClause? 'DELETE' 'FROM' TargetOptAlias DeleteUsingClause?
-    /// WhereClause? ReturningClause?`, with `WITH` and `USING` refused for now.
+    /// WhereClause? ReturningClause?`, with `WITH` refused for now.
     fn delete_statement(&mut self, node: u32) -> Result<Statement> {
-        for name in ["WithClause", "DeleteUsingClause"] {
-            let clause = self.find(node, name);
-            if clause != NONE {
-                return self.unsupported(clause);
-            }
+        let with = self.find(node, "WithClause");
+        if with != NONE {
+            return self.unsupported(with);
         }
         let target = self.find(node, "TargetOptAlias");
         let name = self.name_parts(self.find(target, "BaseTableName"));
         let alias = self.find(target, "ColId");
         let alias = if alias == NONE { NONE } else { self.identifier(alias) };
-        let filter = self.find(node, "WhereClause");
-        let returning = self.returning(node, name, alias)?;
-        self.changed_rows(name, alias, filter, Vec::new(), returning, true)
+        self.changed_rows(node, name, alias, Vec::new(), true)
     }
 
     /// The source an `UPDATE` or a `DELETE` is held with, which is `SELECT *, condition, values...
     /// FROM table`. With no `WHERE` the condition is `TRUE`, since every row is the one meant.
+    ///
+    /// `UPDATE ... FROM` and `DELETE ... USING` are the same thing with the condition and the values
+    /// read from a lateral join instead, `SELECT t.*, m.hit, m.values... FROM table AS t LEFT JOIN
+    /// (SELECT true AS hit, values... FROM sources WHERE condition LIMIT 1) AS m ON true`. The
+    /// `LIMIT 1` is what makes a table row that several source rows match change once, to the
+    /// values of one of them, which is what the pin does. A row nothing matches has a null for the
+    /// flag and is left alone.
     fn changed_rows(
         &mut self,
+        node: u32,
         name: Slice,
         alias: StrRef,
-        filter: u32,
         sets: Vec<(StrRef, ExprRef)>,
-        returning: Option<QueryRef>,
         delete: bool,
     ) -> Result<Statement> {
+        let returning = self.returning(node, name, alias)?;
+        let filter = self.find(node, "WhereClause");
+        let using = match self.find(node, "FromClause") {
+            NONE => self.find(node, "DeleteUsingClause"),
+            clause => clause,
+        };
+        if using != NONE {
+            return self.changed_rows_using(name, alias, filter, using, sets, returning, delete);
+        }
         let hit = if filter == NONE {
             self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
         } else {
@@ -1158,9 +1164,86 @@ impl<'a> Transform<'a> {
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         let source = self.push_query(Query::bare(QueryBody::Select(select)));
         let columns = self.part_slice(columns);
+        Ok(self.changed_statement(name, columns, source, returning, delete))
+    }
+
+    /// The lateral form of [`Self::changed_rows`], for a statement with a `FROM` or a `USING`.
+    #[allow(clippy::too_many_arguments)]
+    fn changed_rows_using(
+        &mut self,
+        name: Slice,
+        alias: StrRef,
+        filter: u32,
+        using: u32,
+        sets: Vec<(StrRef, ExprRef)>,
+        returning: Option<QueryRef>,
+        delete: bool,
+    ) -> Result<Statement> {
+        let hit = self.intern("__rudb_hit");
+        let matched = self.intern("__rudb_matched");
+        let alias = if alias == NONE {
+            self.ast.parts[(name.start + name.len - 1) as usize]
+        } else {
+            alias
+        };
+        let yes = self.push(Expr::Literal { kind: LiteralKind::True, text: NONE });
+        let mut inner = vec![Target { expr: yes, alias: hit }];
+        let mut outer_names = vec![hit];
+        let mut columns = Vec::with_capacity(sets.len());
+        for (at, (column, value)) in sets.into_iter().enumerate() {
+            columns.push(column);
+            let named = self.intern(&format!("__rudb_value_{at}"));
+            inner.push(Target { expr: value, alias: named });
+            outer_names.push(named);
+        }
+        let inner = self.target_slice(inner);
+        let from = self.sources(using)?;
+        let filter = if filter == NONE { NONE } else { self.expr(self.first(filter))? };
+        let select = self.push_select(Select { targets: inner, from, filter, ..Select::empty() });
+        let one = self.intern("1");
+        let limit = self.push(Expr::Literal { kind: LiteralKind::Number, text: one });
+        let query = self.push_query(Query { limit, ..Query::bare(QueryBody::Select(select)) });
+        let right =
+            self.push_source(Source::Subquery { query, alias: matched, columns: Slice::default() });
+        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let on = self.push(Expr::Literal { kind: LiteralKind::True, text: NONE });
+        let join = self.push_source(Source::Join {
+            left,
+            right,
+            kind: JoinKind::Left,
+            natural: false,
+            on,
+            using: Slice::default(),
+        });
+        let start = self.ast.source_lists.len() as u32;
+        self.ast.source_lists.push(join);
+        let from = Slice { start, len: 1 };
+        let qualifier = self.part_slice(vec![alias]);
+        let star = self.push(Expr::Star { qualifier, replacements: Slice::default() });
+        let mut targets = vec![Target { expr: star, alias: NONE }];
+        for named in outer_names {
+            let name = self.part_slice(vec![matched, named]);
+            let column = self.push(Expr::Column { name });
+            targets.push(Target { expr: column, alias: NONE });
+        }
+        let targets = self.target_slice(targets);
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        let source = self.push_query(Query::bare(QueryBody::Select(select)));
+        let columns = self.part_slice(columns);
+        Ok(self.changed_statement(name, columns, source, returning, delete))
+    }
+
+    fn changed_statement(
+        &mut self,
+        name: Slice,
+        columns: Slice,
+        source: QueryRef,
+        returning: Option<QueryRef>,
+        delete: bool,
+    ) -> Statement {
         let index = self.ast.inserts.len() as u32;
         self.ast.inserts.push(Insert { name, columns, source, returning });
-        Ok(if delete { Statement::Delete(index) } else { Statement::Update(index) })
+        if delete { Statement::Delete(index) } else { Statement::Update(index) }
     }
 
     /// `SelectStatementInternal <- WithClause? SelectSetOpChain ResultModifiers?`.
