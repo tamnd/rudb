@@ -550,3 +550,38 @@ fn the_count_starts_again_at_zero_in_every_file_of_a_glob() {
         .collect();
     assert_eq!(got, [0, 1, 2, 0, 1, 2, 3]);
 }
+
+#[test]
+fn a_dictionary_column_loaded_into_a_native_file_reads_back_as_the_file_has_it() {
+    // `s` arrives as codes into each row group's dictionary, with nulls, and the writer codes those
+    // straight to its own codes without spelling out a row. Every row, every null and every group
+    // has to come back as the file has them, and through a reopen, so from the pages and not from
+    // what the load still held.
+    let path = std::env::temp_dir().join(format!(
+        "rudb-parquet-transcode-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time advances")
+            .as_nanos()
+    ));
+    let name = path.to_str().expect("a UTF-8 temporary path").to_owned();
+    let rows = |database: &Database, sql: &str| -> Vec<Vec<Value>> {
+        database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}")).rows().collect()
+    };
+    let file = Database::new();
+    let wanted = rows(&file, &format!("SELECT a, s FROM {} ORDER BY a, s", fixture()));
+    let groups =
+        rows(&file, &format!("SELECT s, count(*) FROM {} GROUP BY s ORDER BY s", fixture()));
+    {
+        let database = Database::open(&name).expect("a file name starts a native database");
+        database
+            .execute(&format!("CREATE TABLE loaded AS SELECT a, s FROM {}", fixture()))
+            .expect("loads");
+    }
+    let database = Database::open(&name).expect("the file opens again");
+    assert_eq!(rows(&database, "SELECT a, s FROM loaded ORDER BY a, s"), wanted);
+    assert_eq!(rows(&database, "SELECT s, count(*) FROM loaded GROUP BY s ORDER BY s"), groups);
+    drop(database);
+    let _ = std::fs::remove_file(&path);
+}

@@ -201,8 +201,15 @@ impl Local {
     /// validity says the row is null, and giving it one keeps the page one code a row.
     fn code_column(index: usize, held: &[PendingChunk]) -> Result<Self> {
         let mut local = Self::default();
+        let mut mapped = None;
         for pending in held {
             let column = pending.chunk.column(index)?;
+            if let Some(codes) = local.code_dictionary(column, &mut mapped)? {
+                let mut validity = Vec::new();
+                push_validity(&mut validity, column);
+                local.parts.push(LocalPart { codes, validity, range: Range::of(column) });
+                continue;
+            }
             // flatten: the page is one code a row whatever form the rows came in.
             let flat = column.flatten()?;
             let mut codes = Vec::with_capacity(flat.len());
@@ -234,6 +241,57 @@ impl Local {
         local.first = HashMap::default();
         local.next = Vec::new();
         Ok(local)
+    }
+
+    /// Codes a part that came in as codes into a dictionary of its own, which is how a Parquet page
+    /// written with a dictionary arrives, by coding each value of that dictionary once rather than
+    /// each row.
+    ///
+    /// Every row then costs a lookup in `mapped`, which holds the local code of each value of the
+    /// last dictionary seen by its position in it, and a value is coded the first time a row holds
+    /// it. So the codes come out in the order the rows first held each value, the same as coding the
+    /// rows one at a time, and the stripe is the same stripe either way. The parts of one Parquet
+    /// column chunk share their dictionary, so `mapped` carries over from one part to the next
+    /// while it is the same one, found by the pointer and kept alive by holding it.
+    ///
+    /// `None` for anything else, and for a dictionary with a null in it, since a null row there is
+    /// found through the value it points at and not through the part's own validity, which is the
+    /// one [`push_validity`] writes.
+    fn code_dictionary(
+        &mut self,
+        column: &Vector,
+        mapped: &mut Option<(Arc<Vector>, Vec<u32>)>,
+    ) -> Result<Option<Vec<u32>>> {
+        let Some((codes, values)) = column.shared_dictionary_parts() else { return Ok(None) };
+        if !matches!(values.validity(), Validity::AllValid) {
+            return Ok(None);
+        }
+        let Some(codes) = codes.get(..column.len()) else { return Ok(None) };
+        let fresh = !matches!(mapped, Some((held, _)) if Arc::ptr_eq(held, values));
+        if fresh {
+            *mapped = Some((Arc::clone(values), vec![END; values.len()]));
+        }
+        let Some((_, map)) = mapped.as_mut() else { return Ok(None) };
+        let every = matches!(column.validity(), Validity::AllValid);
+        let mut coded = Vec::with_capacity(codes.len());
+        for (row, &code) in codes.iter().enumerate() {
+            if !every && !column.validity().is_valid(row) {
+                // Coded as the empty string and counted as a null, as `code_column` does.
+                let code = self.code(b"")?;
+                self.nulls += 1;
+                coded.push(code);
+                continue;
+            }
+            let slot = map
+                .get_mut(code as usize)
+                .ok_or_else(|| invalid("a dictionary code is out of range"))?;
+            if *slot == END {
+                *slot = self.code(values.bytes_at(code as usize).unwrap_or(b""))?;
+            }
+            self.counts[*slot as usize] += 1;
+            coded.push(*slot);
+        }
+        Ok(Some(coded))
     }
 
     /// The column's parts as the rows they were coded from, for a column that lost its global
@@ -1027,6 +1085,77 @@ mod tests {
     use crate::Reader;
 
     const PART: usize = 1_000;
+
+    /// A stripe that came in as codes into Parquet style dictionaries codes to the same stripe as
+    /// the same rows would flat: the same values in the same order, the same codes, counts, nulls
+    /// and validity. Two of the parts share a dictionary and one has one of its own, and one of the
+    /// shared ones has nulls pointing at a value that is not the empty string. None of them is
+    /// flattened on the way.
+    #[test]
+    fn dictionary_parts_code_as_their_rows_would() {
+        let texts = |values: &[&str]| {
+            Arc::new(
+                Vector::from_values(
+                    LogicalType::Varchar,
+                    &values
+                        .iter()
+                        .map(|text| Value::Varchar((*text).to_string()))
+                        .collect::<Vec<_>>(),
+                )
+                .expect("a dictionary"),
+            )
+        };
+        let shared = texts(&["b", "a", "", "c", "unused"]);
+        let other = texts(&["c", "d", "a"]);
+        let mut nulls = Bitmap::all_valid(6);
+        nulls.set(1, false);
+        nulls.set(4, false);
+        let parts = [
+            Vector::dictionary_over(vec![3, 3, 1, 0, 2, 1], Arc::clone(&shared)).expect("codes"),
+            Vector::dictionary_over(vec![0, 3, 1, 1, 3, 2], Arc::clone(&shared))
+                .expect("codes")
+                .with_validity(Validity::Mask(nulls)),
+            Vector::dictionary_over(vec![1, 2, 0, 1], other).expect("codes"),
+        ];
+        let held = |flat: bool| {
+            parts
+                .iter()
+                .enumerate()
+                .map(|(at, part)| PendingChunk {
+                    order: (at as u64, 0),
+                    chunk: Chunk::new(vec![if flat {
+                        part.flatten().expect("flat")
+                    } else {
+                        part.clone()
+                    }])
+                    .expect("a chunk"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let parquet = held(false);
+        let before = rudb_common::slow::here();
+        let coded = Local::code_column(0, &parquet).expect("coded");
+        assert_eq!(
+            rudb_common::slow::here().since(before).get(rudb_common::slow::Cause::Flatten),
+            0,
+            "a part that came in as codes was flattened",
+        );
+        let flat = Local::code_column(0, &held(true)).expect("coded");
+        assert_eq!(coded.values(), flat.values());
+        for code in 0..flat.values() as u32 {
+            assert_eq!(coded.value(code), flat.value(code), "value {code}");
+        }
+        assert_eq!(coded.counts, flat.counts);
+        assert_eq!(coded.nulls, flat.nulls);
+        assert_eq!(coded.nulls, 2);
+        assert_eq!(coded.hashes, flat.hashes);
+        assert_eq!(coded.checks, flat.checks);
+        assert_eq!(coded.parts.len(), flat.parts.len());
+        for (coded, flat) in coded.parts.iter().zip(&flat.parts) {
+            assert_eq!(coded.codes, flat.codes);
+            assert_eq!(coded.validity, flat.validity);
+        }
+    }
 
     fn path(label: &str) -> PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("time advances").as_nanos();
