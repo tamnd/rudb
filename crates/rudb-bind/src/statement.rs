@@ -448,6 +448,9 @@ fn default_text(
         Ok(_) if binder.plan_mut().node_count() > before => {
             Err(Error::binder("DEFAULT value cannot contain subqueries"))
         }
+        Ok(_) if !binder.windows.is_empty() => {
+            Err(Error::binder("DEFAULT value cannot contain window functions!"))
+        }
         Ok(_) => Ok(deparse::expression(ast, expr)),
     }
 }

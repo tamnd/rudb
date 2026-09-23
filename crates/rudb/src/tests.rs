@@ -9347,6 +9347,10 @@ fn a_column_default_fills_what_an_insert_leaves_out_the_way_the_pin_does() {
         ("CREATE TABLE u (a INT DEFAULT k)", "DEFAULT value cannot contain column names"),
         ("CREATE TABLE u (a INT DEFAULT (SELECT 1))", "DEFAULT value cannot contain subqueries"),
         ("CREATE TABLE u (a INT DEFAULT sum(1))", "DEFAULT value cannot contain aggregates!"),
+        (
+            "CREATE TABLE u (a INT DEFAULT row_number() OVER ())",
+            "DEFAULT value cannot contain window functions!",
+        ),
         ("INSERT INTO t VALUES (DEFAULT + 1, 'a', 1, 'b')", "DEFAULT is not allowed here!"),
         (
             "INSERT INTO t (k) DEFAULT VALUES",
