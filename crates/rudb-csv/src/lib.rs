@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod combine;
+mod convert;
 pub mod dialect;
 pub mod infer;
 pub mod reader;
