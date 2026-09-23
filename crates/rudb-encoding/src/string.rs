@@ -734,21 +734,30 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
                 )));
             }
             // The shared prefix is copied out of the buffer being written into, so a value never
-            // has to exist anywhere but where it belongs.
-            let mut flat = Flat::with_capacity(count, suffixes.bytes.len());
+            // has to exist anywhere but where it belongs. The buffer is sized for the prefixes as
+            // well as the suffixes, since sized for the suffixes alone a sorted block of URLs,
+            // whose values share most of their bytes, doubled its way up and copied itself each
+            // time. Walking the lengths first also checks every prefix against the value before
+            // it, so a corrupt one is refused before anything is allocated for it.
+            let mut room = 0usize;
+            let mut previous = 0usize;
             for (index, prefix) in prefixes.iter().enumerate() {
                 let shared = usize::try_from(*prefix)
                     .map_err(|_| Error::internal("a negative shared prefix length"))?;
-                let (from, previous) = if index == 0 {
-                    (0, 0)
-                } else {
-                    (flat.start(index - 1), flat.ends[index - 1] - flat.start(index - 1))
-                };
                 if shared > previous {
                     return Err(Error::internal(format!(
                         "a value shares {shared} bytes with a value {previous} bytes long"
                     )));
                 }
+                previous = shared + suffixes.get(index).map_or(0, <[u8]>::len);
+                room = room
+                    .checked_add(previous)
+                    .ok_or_else(|| Error::internal("a string chunk longer than memory"))?;
+            }
+            let mut flat = Flat::with_capacity(count, room);
+            for (index, &prefix) in prefixes.iter().enumerate() {
+                let shared = prefix as usize;
+                let from = if index == 0 { 0 } else { flat.start(index - 1) };
                 flat.bytes.extend_from_within(from..from + shared);
                 flat.bytes.extend_from_slice(suffixes.get(index).expect("in range"));
                 flat.ends.push(flat.bytes.len());
@@ -777,7 +786,9 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             }
             // The copies point back into the bytes already replayed, which is the buffer the values
             // are going into, so the replay is the decode and there is nothing to cut up after it.
-            let mut flat = Flat::with_capacity(count, total);
+            // The room past the end is what the replay's wide stores want, and leaving it out had
+            // the replay grow the buffer, which copied every block once more into fresh pages.
+            let mut flat = Flat::with_capacity(count, total.saturating_add(REPLAY_SLACK));
             replay_literals(reader, &lengths, &offsets, total, &mut flat.bytes)?;
             if flat.bytes.len() != total {
                 return Err(Error::internal(format!(
