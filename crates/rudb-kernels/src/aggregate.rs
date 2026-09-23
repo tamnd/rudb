@@ -1220,7 +1220,10 @@ pub fn update_runs(
         return Ok(true);
     }
     let Some(input) = input else { return Ok(false) };
-    if input.form() != Form::Flat || input.len() < rows || !matches!(nulls_of(input), Validity::AllValid) {
+    if input.form() != Form::Flat
+        || input.len() < rows
+        || !matches!(nulls_of(input), Validity::AllValid)
+    {
         return Ok(false);
     }
     let Some(feed) = feed_of(first, input.logical_type()) else {
