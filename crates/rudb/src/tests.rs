@@ -8878,3 +8878,59 @@ fn maps_build_and_read_back_the_way_the_pin_has_them() {
         ["\"map\"(list_value(1), list_value('a'))"]
     );
 }
+
+/// The struct calls that take a struct apart or put two together, with the answers the pin gives.
+#[test]
+fn struct_helpers_answer_what_the_pin_does() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT struct_keys({'a': 1, 'B': 2})"), "[a, B]");
+    assert_eq!(column("SELECT struct_values({'a': 1, 'b': 'x'})"), "(1, x)");
+    assert_eq!(
+        column("SELECT typeof(struct_values({'a': 1, 'b': 'x'}))"),
+        "TUPLE(INTEGER, VARCHAR)"
+    );
+    assert_eq!(column("SELECT struct_keys(NULL::STRUCT(a INT))"), "NULL");
+    assert_eq!(
+        column("SELECT struct_insert({'a': 1}, b := 2, c := 'x')"),
+        "{'a': 1, 'b': 2, 'c': x}"
+    );
+    assert_eq!(column("SELECT struct_insert(NULL::STRUCT(a INT), b := 2)"), "{'a': NULL, 'b': 2}");
+    assert_eq!(column("SELECT struct_update({'a': 1, 'b': 2}, B := 'x')"), "{'a': 1, 'B': x}");
+    assert_eq!(column("SELECT struct_update({'a': 1}, b := 2)"), "{'a': 1, 'b': 2}");
+    assert_eq!(column("SELECT struct_update(NULL::STRUCT(a INT), a := 2)"), "{'a': 2}");
+    assert_eq!(column("SELECT struct_concat({'a': 1}, {'b': 2})"), "{'a': 1, 'b': 2}");
+    assert_eq!(column("SELECT struct_concat(row(1), row(2))"), "(1, 2)");
+    assert_eq!(column("SELECT struct_contains(row(1, 2), 2)"), "true");
+    assert_eq!(column("SELECT struct_contains(row(1, NULL), NULL)"), "NULL");
+    assert_eq!(column("SELECT struct_position(row(1, 2), 2)"), "2");
+    assert_eq!(column("SELECT struct_position(row(1, 2), 3)"), "NULL");
+    assert_eq!(
+        column("SELECT struct_insert({'a': i}, b := i + 1) FROM range(2) t(i)"),
+        "{'a': 0, 'b': 1};{'a': 1, 'b': 2}"
+    );
+    assert_eq!(
+        error("SELECT struct_insert({'a': 1}, a := 2)"),
+        "Binder Error: Duplicate struct entry name \"\"a\"\""
+    );
+    assert_eq!(
+        error("SELECT struct_concat({'a': 1}, {'a': 2})"),
+        "Invalid Input Error: struct_concat: Arguments contain duplicate STRUCT entry \"a\""
+    );
+    assert_eq!(
+        error("SELECT struct_concat({'a': 1}, row(2))"),
+        "Invalid Input Error: struct_concat: Cannot mix named and unnamed STRUCTs"
+    );
+    assert_eq!(
+        error("SELECT struct_keys(row(1, 2))"),
+        "Invalid Input Error: struct_keys() expects a STRUCT argument"
+    );
+    assert_eq!(
+        error("SELECT struct_contains({'a': 1}, 1)"),
+        "Binder Error: \"struct_contains\" can only be used on unnamed structs"
+    );
+}

@@ -116,4 +116,118 @@ impl Binder<'_> {
             ))
         })
     }
+
+    /// `struct_insert`, `struct_update`, `struct_concat`, `struct_keys`, `struct_values`,
+    /// `struct_contains` and `struct_position`, or `None` for any other call.
+    ///
+    /// Each answers a type made out of the fields of its arguments, so the type is worked out here
+    /// and the kernel in `rudb_kernels::structs` puts the values where the type says they go.
+    pub(crate) fn struct_call(
+        &mut self,
+        written: &str,
+        bound: &[ExprRef],
+    ) -> Result<Option<ExprRef>> {
+        let name = written.to_ascii_lowercase();
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        let fields_of = |at: usize| match types.get(at) {
+            Some(LogicalType::Struct(fields)) => Some(fields.clone()),
+            _ => None,
+        };
+        let returns = match name.as_str() {
+            "struct_insert" | "struct_update" => {
+                let Some(mut fields) = fields_of(0) else {
+                    return Ok(None);
+                };
+                let Some(added) = fields_of(1).filter(|_| bound.len() == 2) else {
+                    if bound.len() == 1 && name == "struct_insert" {
+                        return Err(Error::invalid_input("Can't insert nothing into a STRUCT"));
+                    }
+                    return Err(Error::binder(format!(
+                        "Need named argument for struct {}, e.g., a := b",
+                        &name[7..]
+                    )));
+                };
+                for field in added {
+                    let same =
+                        fields.iter().position(|one| one.name.eq_ignore_ascii_case(&field.name));
+                    match same {
+                        Some(_) if name == "struct_insert" => {
+                            return Err(Error::binder(format!(
+                                "Duplicate struct entry name \"\"{}\"\"",
+                                field.name
+                            )));
+                        }
+                        Some(at) => fields[at] = field,
+                        None => fields.push(field),
+                    }
+                }
+                LogicalType::Struct(fields)
+            }
+            "struct_concat" => {
+                let mut fields: Vec<Field> = Vec::new();
+                let mut unnamed = None;
+                for (at, ty) in types.iter().enumerate() {
+                    let LogicalType::Struct(held) = ty else {
+                        return Err(Error::invalid_input(format!(
+                            "struct_concat: Argument at position \"{}\" is not a STRUCT",
+                            at + 1
+                        )));
+                    };
+                    let this = Field::unnamed(held);
+                    if *unnamed.get_or_insert(this) != this {
+                        return Err(Error::invalid_input(
+                            "struct_concat: Cannot mix named and unnamed STRUCTs",
+                        ));
+                    }
+                    for field in held {
+                        if !this
+                            && fields.iter().any(|one| one.name.eq_ignore_ascii_case(&field.name))
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "struct_concat: Arguments contain duplicate STRUCT entry \"{}\"",
+                                field.name
+                            )));
+                        }
+                        fields.push(field.clone());
+                    }
+                }
+                if fields.is_empty() {
+                    return Ok(None);
+                }
+                LogicalType::Struct(fields)
+            }
+            "struct_keys" | "struct_values" => {
+                let Some(fields) = fields_of(0).filter(|_| bound.len() == 1) else {
+                    return Ok(None);
+                };
+                if name == "struct_keys" {
+                    if Field::unnamed(&fields) {
+                        return Err(Error::invalid_input(
+                            "struct_keys() expects a STRUCT argument",
+                        ));
+                    }
+                    LogicalType::list(LogicalType::Varchar)
+                } else {
+                    let unnamed = fields.iter().map(|field| Field::new("", field.ty.clone()));
+                    LogicalType::Struct(unnamed.collect())
+                }
+            }
+            "struct_contains" | "struct_position" => {
+                let Some(fields) = fields_of(0).filter(|_| bound.len() == 2) else {
+                    return Ok(None);
+                };
+                if !Field::unnamed(&fields) {
+                    return Err(Error::binder(format!(
+                        "\"{name}\" can only be used on unnamed structs"
+                    )));
+                }
+                if name == "struct_contains" { LogicalType::Boolean } else { LogicalType::Integer }
+            }
+            _ => return Ok(None),
+        };
+        let args = self.plan_mut().add_expr_list(bound);
+        let recorded = self.plan_mut().intern(&name);
+        Ok(Some(self.add_expr(Expr::Function { name: recorded, args }, returns)))
+    }
 }
