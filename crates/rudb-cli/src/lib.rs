@@ -126,7 +126,7 @@ fn standard_native_csv_statement(options: &Options) -> Option<&str> {
 fn answer_native_csv_once(options: &Options) -> Option<String> {
     let sql = standard_native_csv_statement(options)?;
     let expression = sql.trim_start().split_ascii_whitespace().nth(1)?;
-    let prefix = expression.get(..4)?;
+    let prefix = expression.get(..4).unwrap_or("");
     if prefix.eq_ignore_ascii_case("min(") {
         answer_extrema_csv_once(options)
     } else if prefix.eq_ignore_ascii_case("sum(") {
