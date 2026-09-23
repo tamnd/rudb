@@ -1406,13 +1406,23 @@ impl<'a> Probe<'a> {
                 let undecided = self.kind == JoinKind::Mark
                     && !self.equalities.null_is_a_value.first().copied().unwrap_or(false)
                     && any_null_key(keying, &chunks, &self.cancel)?;
-                let index = lookup(keying, &chunks, &self.cancel, threads, &mut charged)?;
                 // The chunks laid end to end, which is a copy of the side and is charged as one.
                 // The chunks themselves are not charged again here: the keep that made them holds
                 // that reservation for as long as this operator can read them, and charging the
                 // same bytes twice would be a limit half the size it says it is.
                 let rows = Build::new(&self.right_types, &chunks, threads)?;
                 charged.grow(rows.footprint())?;
+                // Laid before the table rather than after it, because a key that is a column of
+                // this side is already laid out in `rows` and the table reads it from there.
+                let index = match laid_keys(keying, &rows) {
+                    Some(keys) => {
+                        let index =
+                            Lookup::build(&keys, rows.rows(), keying.nulls, threads, &self.cancel)?;
+                        charged.grow(index.footprint())?;
+                        index
+                    }
+                    None => lookup(keying, &chunks, &self.cancel, threads, &mut charged)?,
+                };
                 if let Some(counters) = &self.counters {
                     counters.joining(Joined {
                         algorithm: Algorithm::Hash,
@@ -2576,6 +2586,27 @@ fn lookup(
     let lookup = Lookup::build(&keys, rows, nulls, threads, cancel)?;
     scratch.grow(lookup.footprint())?;
     Ok(lookup)
+}
+
+/// The key columns out of the side already laid end to end, when every key is one of its columns.
+///
+/// Every equality in TPC-H is a column against a column, and [`lookup`] evaluated each key over each
+/// chunk on one thread and then laid the answers end to end, which for a bare column is the same
+/// copy [`Build::new`] has just made of it. On q9 that was the 800,000 rows of `partsupp` copied a
+/// second time before the table could start. A key that is anything else, a cast or an expression,
+/// still goes through [`lookup`], and so does a side with no rows, which has no columns to take.
+fn laid_keys(keying: Keying<'_>, rows: &Build) -> Option<Vec<Vector>> {
+    if rows.rows() == 0 {
+        return None;
+    }
+    keying
+        .exprs
+        .iter()
+        .map(|&expr| match *keying.plan.expr(expr) {
+            Expr::Column(binding) => rows.column(keying.schema.position_of(binding)?).cloned(),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether any row of this side has a null anywhere in its key.

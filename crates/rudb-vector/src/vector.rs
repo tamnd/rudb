@@ -1986,6 +1986,19 @@ impl Vector {
         }
     }
 
+    /// The views and the arena they point into, for a vector of string views and nothing else.
+    ///
+    /// [`Self::text_parts`] answers the same question for a flat column too, and gives the arena as
+    /// bytes. This gives the `Arc`, which is what a caller laying several of these end to end needs
+    /// to see that they share one arena and can keep it rather than copying out of it.
+    #[must_use]
+    pub fn shared_views(&self) -> Option<(&[StringView], &Arc<Buffer<u8>>)> {
+        match &self.body {
+            Body::Views { views, arena } => Some((views, arena)),
+            _ => None,
+        }
+    }
+
     /// The codes and the table, for an FSST vector, and `None` for any other form.
     ///
     /// What a kernel needs to stay in code space. An equality filter is the case that pays, and it

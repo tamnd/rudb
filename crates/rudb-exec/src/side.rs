@@ -26,9 +26,11 @@
 //! null for a position past the end of the vector, so [`PAD`] is a position past the end and the
 //! padded rows go through the same loop as the matched ones.
 
+use std::borrow::Cow;
+
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_pipeline::Lease;
-use rudb_vector::{Assembly, Chunk, Vector};
+use rudb_vector::{Assembly, Chunk, Form, Vector};
 
 use crate::pairs::in_parallel;
 
@@ -76,6 +78,11 @@ impl Build {
     /// How many rows are in there.
     pub(crate) fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Column `index` of the side, laid end to end.
+    pub(crate) fn column(&self, index: usize) -> Option<&Vector> {
+        self.columns.get(index)
     }
 
     /// How many bytes the columns are holding.
@@ -160,6 +167,9 @@ pub(crate) fn laid_out(
 ) -> Result<Vec<Vector>> {
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     let one = |index: usize| -> Result<Vector> {
+        if let Some(laid) = end_to_end(&types[index], chunks, index)? {
+            return Ok(laid);
+        }
         let mut assembly = Assembly::new(types[index].clone(), rows)?;
         let mut at: Vec<u32> = Vec::new();
         let mut base: u32 = 0;
@@ -173,6 +183,54 @@ pub(crate) fn laid_out(
         assembly.finish()
     };
     in_parallel(threads, types.len(), threads.degree(), "gathered column", one)
+}
+
+/// One column of the chunks laid end to end in a single copy, or `None` to leave it to an assembly.
+///
+/// An assembly is a scatter. It is built to put rows wherever a caller says, so it flattens each
+/// piece, copies it into its own run, and then walks every row to record where the row went and
+/// whether it is null, only for the finish to find that every row went where it already was. On
+/// TPC-H q9 that was three passes over the 800,000 rows of `partsupp` and the 319,404 joined rows
+/// the last join builds on, and it was a quarter of the time the query spent building its tables.
+/// Laying the chunks end to end is one copy, and none at all when they are windows of one page.
+///
+/// A piece that is not flat is flattened on its own first, which is the copy it would have had in
+/// the assembly anyway. A nested type, and a piece whose flattened run is shorter than the piece
+/// (an untyped null), go to the assembly, which is written for both.
+fn end_to_end(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option<Vector>> {
+    if matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _)) {
+        return Ok(None);
+    }
+    let mut pieces: Vec<Cow<'_, Vector>> = Vec::with_capacity(chunks.len());
+    for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+        let column = chunk.column(index)?;
+        let piece = match column.form() {
+            Form::Flat | Form::StringView => Cow::Borrowed(column),
+            _ => Cow::Owned(column.flatten()?),
+        };
+        if piece.form() == Form::Flat && short(&piece) {
+            return Ok(None);
+        }
+        pieces.push(piece);
+    }
+    // Views over one shared arena lay without a copy, and anything else that lays is flat.
+    if let Some(laid) = rudb_vector::concat(ty, &pieces)? {
+        return Ok(Some(laid));
+    }
+    for piece in &mut pieces {
+        if piece.form() == Form::StringView {
+            *piece = Cow::Owned(piece.flatten()?);
+            if short(piece) {
+                return Ok(None);
+            }
+        }
+    }
+    rudb_vector::concat(ty, &pieces)
+}
+
+/// Whether a flat piece holds fewer values than it has rows, which is what an untyped null is.
+fn short(piece: &Vector) -> bool {
+    piece.data().is_none_or(|data| data.len() != piece.len())
 }
 
 #[cfg(test)]
@@ -251,5 +309,65 @@ mod tests {
         let side =
             Build::new(&types(), &[chunk(&[4, 5], &["p", "q"])], &alone()).expect("one chunk");
         assert_eq!(side.row(1), vec![Value::Integer(5), Value::Varchar("q".to_string())]);
+    }
+
+    /// Every form a piece of the gathered side can arrive in, laid end to end and read back.
+    ///
+    /// The flat pieces and the string views over one arena lay without an assembly, the others are
+    /// flattened on the way, and a null constant with no values in it goes to the assembly. Each
+    /// mix has to read back as the values that went in, in order.
+    #[test]
+    fn a_side_laid_out_of_pieces_of_every_form_reads_back_as_the_values_that_went_in() {
+        let int = LogicalType::Integer;
+        let text = LogicalType::Varchar;
+        let words = |list: &[&str]| {
+            let values: Vec<Value> =
+                list.iter().map(|&word| Value::Varchar(word.to_string())).collect();
+            Vector::from_values(LogicalType::Varchar, &values).expect("strings build")
+        };
+        let page = rudb_vector::concat(
+            &text,
+            &[words(&["one", "a string longer than twelve", "three", "four"])],
+        )
+        .expect("a flat piece lays")
+        .expect("and comes back as views");
+        let numbers = |list: &[Option<i32>]| {
+            let values: Vec<Value> =
+                list.iter().map(|value| value.map_or(Value::Null, Value::Integer)).collect();
+            Vector::from_values(LogicalType::Integer, &values).expect("integers build")
+        };
+        let coded =
+            Vector::dictionary(vec![1, 0], numbers(&[Some(5), Some(6)])).expect("codes in range");
+        let shared = [
+            Chunk::new(vec![numbers(&[Some(1), None]), page.gather(&[0, 1]).expect("in range")]),
+            Chunk::new(vec![coded, page.gather(&[3, 2]).expect("in range")]),
+        ];
+        let mixed = [
+            Chunk::new(vec![
+                Vector::constant(int.clone(), Value::Integer(7), 2),
+                page.gather(&[1, 0]).expect("in range"),
+            ]),
+            Chunk::new(vec![Vector::constant(int.clone(), Value::Null, 2), words(&["x", "y"])]),
+        ];
+        let want_shared = (
+            vec![Value::Integer(1), Value::Null, Value::Integer(6), Value::Integer(5)],
+            ["one", "a string longer than twelve", "four", "three"],
+        );
+        let want_mixed = (
+            vec![Value::Integer(7), Value::Integer(7), Value::Null, Value::Null],
+            ["a string longer than twelve", "one", "x", "y"],
+        );
+        for (chunks, (ints, strings)) in [(shared, want_shared), (mixed, want_mixed)] {
+            let chunks: Vec<Chunk> =
+                chunks.into_iter().map(|chunk| chunk.expect("two columns of two rows")).collect();
+            let side = Build::new(&[int.clone(), text.clone()], &chunks, &alone()).expect("lays");
+            let got = side.gather(&[0, 1, 2, 3]).expect("four positions in range");
+            let read: Vec<Value> = (0..4).map(|at| got[0].value_at(at)).collect();
+            assert_eq!(read, ints);
+            let read: Vec<Value> = (0..4).map(|at| got[1].value_at(at)).collect();
+            let strings: Vec<Value> =
+                strings.iter().map(|&word| Value::Varchar(word.to_string())).collect();
+            assert_eq!(read, strings);
+        }
     }
 }
