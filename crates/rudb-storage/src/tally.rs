@@ -344,6 +344,25 @@ impl Tally {
     /// Asked once a chunk a column rather than once a row, because the answer only ever changes the
     /// one way and a column that gave up in its first chunk is otherwise reading this a hundred
     /// million times to hear the same thing.
+    /// Every value held with its hash and its rows, in the order the values first arrived, or
+    /// `None` once the tally has given up.
+    ///
+    /// What a tally counted over later rows is handed to the one that counted the rows before them
+    /// in this order, so that the list they end with is the list one tally reading every row would
+    /// have ended with.
+    #[must_use]
+    pub fn list_by_arrival(&self) -> Option<Vec<(u64, u64, Value)>> {
+        if self.full {
+            return None;
+        }
+        Some(
+            self.held
+                .iter()
+                .map(|(hash, value)| (*hash, self.rows_of(*hash), value.clone()))
+                .collect(),
+        )
+    }
+
     #[must_use]
     pub fn counting(&self) -> bool {
         !self.full
