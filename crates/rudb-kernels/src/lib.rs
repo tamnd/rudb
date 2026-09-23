@@ -74,6 +74,7 @@ mod regexp;
 pub mod scalar;
 pub mod select;
 mod shape;
+mod structs;
 mod subscript;
 mod text;
 

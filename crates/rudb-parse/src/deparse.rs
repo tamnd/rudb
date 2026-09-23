@@ -389,6 +389,15 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         // And a parenthesised list is a call to `row`, which needs its quotes because it is a
         // keyword.
         Expr::Row { items } => format!("\"row\"({})", exprs(ast, items)),
+        // A braced struct is a call to `struct_pack` with every field passed by name.
+        Expr::Struct { names, values } => {
+            let fields: Vec<String> = ast
+                .name(names)
+                .zip(ast.expr_list(values))
+                .map(|(name, &value)| format!("{} := {}", quoted(name), expr(ast, value)))
+                .collect();
+            format!("struct_pack({})", fields.join(", "))
+        }
         // Upstream brackets a lambda whole, and names the parameters the way it names columns.
         Expr::Lambda { params, body } => {
             let params: Vec<String> = ast.name(params).map(quoted).collect();

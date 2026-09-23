@@ -131,6 +131,15 @@ impl Binder<'_> {
             // function binds it itself. See `crate::lambda`.
             ast::Expr::Lambda { .. } => Err(Error::binder("invalid lambda expression")),
             ast::Expr::List { items } => self.bind_list(ast, items, scope),
+            ast::Expr::Struct { names, values } => {
+                let names: Vec<String> = ast.name(names).map(str::to_string).collect();
+                let written = ast.expr_list(values).to_vec();
+                let mut bound = Vec::with_capacity(written.len());
+                for value in written {
+                    bound.push(self.bind_expr(ast, value, scope)?);
+                }
+                self.pack_struct(&names, &bound)
+            }
             ast::Expr::Parameter { name } => self.bind_parameter(ast, name),
             ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query, scope),
             ast::Expr::Exists { query, negated } => {
@@ -281,9 +290,14 @@ impl Binder<'_> {
 
     fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {
         let parts: Vec<&str> = ast.name(name).collect();
+        self.bind_column_parts(&parts, scope)
+    }
+
+    /// A column named by its written parts, or a field of a struct column when no column is.
+    fn bind_column_parts(&mut self, parts: &[&str], scope: &Scope) -> Result<ExprRef> {
         // A lambda parameter beats a column of the same name, so `lambda l: l + 1` over a table with
         // a column `l` reads the element. The innermost lambda that has the name is the one meant.
-        if let [word] = parts.as_slice() {
+        if let [word] = parts {
             if let Some(parameter) = self.lambda_parameter(word) {
                 return Ok(parameter);
             }
@@ -293,25 +307,28 @@ impl Binder<'_> {
         // rather than the fold happening when resolution fails, so that two tables carrying the name
         // is still the ambiguity error. Both halves were measured against the pin. See
         // `crate::context`.
-        if let [word] = parts.as_slice() {
+        if let [word] = parts {
             if !scope.names(word) && !self.outer_scopes.iter().any(|outer| outer.names(word)) {
                 if let Some(folded) = self.context_keyword(word) {
                     return Ok(folded);
                 }
             }
         }
-        if let Some(found) = scope.resolve_optional(&parts)? {
+        if let Some(found) = scope.resolve_optional(parts)? {
             return Ok(self.add_expr(Expr::Column(found.binding), found.ty.clone()));
         }
         let mut found = None;
         for (at, outer) in self.outer_scopes.iter().enumerate().rev() {
-            if let Some(visible) = outer.resolve_optional(&parts)? {
+            if let Some(visible) = outer.resolve_optional(parts)? {
                 found = Some((at, visible.binding, visible.ty.clone()));
                 break;
             }
         }
         let Some((at, binding, ty)) = found else {
-            return scope.resolve(&parts).map(|_| unreachable!());
+            if let Some(field) = self.struct_path(parts, scope)? {
+                return Ok(field);
+            }
+            return scope.resolve(parts).map(|_| unreachable!());
         };
         // A LATERAL entry may not aggregate over what its left neighbour gave it. There is one row
         // of the left per evaluation of the entry, so `sum(o.k)` would be a sum of one value and
@@ -366,6 +383,32 @@ impl Binder<'_> {
             args.push(self.bind_expr(ast, item, scope)?);
         }
         self.call("list_value", args)
+    }
+
+    /// `s.a` or `t.s.a.b` read as fields of a struct column, once no column answers to the name.
+    ///
+    /// The longest front of the name that is a column wins, which is the pin's order: a table
+    /// called `s` with a column `a` is read as that column before a struct column `s` is looked
+    /// into. `None` when no front of the name is a struct column, so the caller says the name is
+    /// missing in its own words.
+    fn struct_path(&mut self, parts: &[&str], scope: &Scope) -> Result<Option<ExprRef>> {
+        for split in (1..parts.len()).rev() {
+            let Ok(mut expr) = self.bind_column_parts(&parts[..split], scope) else {
+                continue;
+            };
+            if !matches!(self.plan().expr_type(expr), LogicalType::Struct(_)) {
+                continue;
+            }
+            for field in &parts[split..] {
+                let key = self.add_constant(Value::Varchar((*field).to_string()));
+                let Some(picked) = self.struct_field("struct_extract", &[expr, key])? else {
+                    return Ok(None);
+                };
+                expr = picked;
+            }
+            return Ok(Some(expr));
+        }
+        Ok(None)
     }
 
     fn bind_unary(
@@ -580,6 +623,9 @@ impl Binder<'_> {
         }
         if let Some(aggregated) = self.list_aggregate(&written, &bound)? {
             return Ok(aggregated);
+        }
+        if let Some(field) = self.struct_field(&written, &bound)? {
+            return Ok(field);
         }
         // `typeof` is answered here rather than by a kernel, because the type is settled the moment
         // its argument is bound and nothing about it changes per row. The argument still has to be
@@ -1141,7 +1187,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         ast::Expr::Row { items } => {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
-        ast::Expr::List { items } => {
+        ast::Expr::List { items } | ast::Expr::Struct { values: items, .. } => {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
         // A window call is not an aggregate and is evaluated after the grouping rather than by it,
@@ -1401,6 +1447,17 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             let items: Vec<String> =
                 ast.expr_list(items).iter().map(|&item| describe(ast, item, semantics)).collect();
             format!("list_value({})", items.join(", "))
+        }
+        // And a braced struct after `struct_pack`, with every field passed by name.
+        ast::Expr::Struct { names, values } => {
+            let fields: Vec<String> = ast
+                .name(names)
+                .zip(ast.expr_list(values))
+                .map(|(name, &value)| {
+                    format!("{} := {}", quoted(name), describe(ast, value, semantics))
+                })
+                .collect();
+            format!("struct_pack({})", fields.join(", "))
         }
         // DuckDB names the column after the parameter, so `SELECT ?` comes back as `$1` whatever
         // the value turns out to be.

@@ -832,6 +832,13 @@ pub enum Expr {
         /// What the function computes from them.
         body: ExprRef,
     },
+    /// A braced struct, `{'a': 1, b: 2}`, which is a STRUCT value with the field names written.
+    Struct {
+        /// The field names, as a run of [`StrRef`], in the order they were written.
+        names: Slice,
+        /// The values, as a run of [`ExprRef`], one for each name.
+        values: Slice,
+    },
     /// A parenthesised list of more than one expression, which is a row value.
     Row {
         /// The items, as a run of [`ExprRef`].

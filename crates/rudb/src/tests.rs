@@ -8638,3 +8638,71 @@ fn range_and_generate_series_over_moments_are_tables_the_way_the_pin_has_them() 
     );
     assert_eq!(column("SELECT column_name FROM (DESCRIBE SELECT * FROM range(3) t(x))"), "x");
 }
+
+/// A braced struct is `struct_pack` on the pin, and `.a`, `['a']` and `struct_extract` all pick a
+/// field out of one. Every answer and sentence here was read off the pin.
+#[test]
+fn struct_literals_build_and_fields_come_back_out_the_way_the_pin_has_them() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT {'a': 1, 'b': 'x'}"), "{'a': 1, 'b': x}");
+    assert_eq!(column("SELECT typeof({'a': 1, 'b': 'x'})"), "STRUCT(a INTEGER, b VARCHAR)");
+    assert_eq!(column("SELECT {a: 1, \"B\": 2.5}"), "{'a': 1, 'B': 2.5}");
+    assert_eq!(column("SELECT {'a': NULL}"), "{'a': NULL}");
+    assert_eq!(column("SELECT {'a': 1}.a"), "1");
+    assert_eq!(column("SELECT ({'a': 1}).A"), "1");
+    assert_eq!(column("SELECT {'a': 1}['a']"), "1");
+    assert_eq!(column("SELECT {'a': {'b': 1}}.a.b"), "1");
+    assert_eq!(column("SELECT struct_extract({'a': 1, 'b': 2}, 'b')"), "2");
+    assert_eq!(
+        column("SELECT {'a': 'it''s', 'b': [1, 2], 'c': {'d': NULL}}"),
+        "{'a': 'it\\'s', 'b': [1, 2], 'c': {'d': NULL}}"
+    );
+    assert_eq!(column("SELECT {'it''s': 1}"), "{'it\\'s': 1}");
+    assert_eq!(column("SELECT [{'a': 1}, {'a': 2}]"), "[{'a': 1}, {'a': 2}]");
+    assert_eq!(column("SELECT {'a': 1, 'b': 2} IS NULL"), "false");
+    assert_eq!(
+        error("SELECT {'a': 1, 'A': 2}"),
+        "Binder Error: Duplicate named argument \"A\" in function call to '\"struct_pack\"'"
+    );
+    assert_eq!(
+        error("SELECT struct_extract({'a': 1, 'b': 2}, 2)"),
+        "Binder Error: struct_extract with an integer key can only be used on unnamed structs, \
+         use a string key instead"
+    );
+    // Over a column the struct is built from the columns side by side, and a field of a null row
+    // is null even though the field column under it holds a value.
+    let packed = "SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE {'n': i, 's': i::VARCHAR} END AS p \
+                  FROM range(6) t(i)";
+    assert_eq!(
+        column(&format!("SELECT p FROM ({packed})")),
+        "NULL;{'n': 1, 's': 1};{'n': 2, 's': 2};NULL;{'n': 4, 's': 4};{'n': 5, 's': 5}"
+    );
+    assert_eq!(column(&format!("SELECT p.n FROM ({packed})")), "NULL;1;2;NULL;4;5");
+    assert_eq!(column("SELECT {'n': i, 'm': i * 2}.m FROM range(4) t(i)"), "0;2;4;6");
+}
+
+/// Text inside a list, struct or map is quoted only when it would read wrong bare, which is the
+/// pin's rule, checked character by character.
+#[test]
+fn text_inside_a_nested_value_is_quoted_only_when_it_has_to_be() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    assert_eq!(
+        column(
+            "SELECT ['', 'null', 'Null', 'nul', 'a\"b', 'a:b', 'a=b', 'a,b', 'a(b', 'a[b', \
+             'a{b', 'a\\b', 'a''b', 'a b', ' a', 'a/b', 'é']"
+        ),
+        "['', 'null', 'Null', nul, 'a\"b', 'a:b', 'a=b', 'a,b', 'a(b', 'a[b', 'a{b', a\\b, \
+         'a\\'b', a b, ' a', a/b, é]"
+    );
+    assert_eq!(column("SELECT ['a', NULL]"), "[a, NULL]");
+    assert_eq!(column("SELECT [chr(39) || chr(92)]"), "['\\'\\\\']");
+}

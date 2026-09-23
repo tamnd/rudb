@@ -311,7 +311,7 @@ impl fmt::Display for Value {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{value}")?;
+                    write_element(f, value)?;
                 }
                 f.write_str("]")
             }
@@ -321,7 +321,8 @@ impl fmt::Display for Value {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "'{name}': {value}")?;
+                    write!(f, "'{}': ", name.replace('\'', "\\'"))?;
+                    write_element(f, value)?;
                 }
                 f.write_str("}")
             }
@@ -334,7 +335,9 @@ impl fmt::Display for Value {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{key}={value}")?;
+                    write_element(f, key)?;
+                    f.write_str("=")?;
+                    write_element(f, value)?;
                 }
                 f.write_str("}")
             }
@@ -468,6 +471,37 @@ fn write_decimal(f: &mut fmt::Formatter<'_>, unscaled: i128, scale: u8) -> fmt::
         f.write_str("-")?;
     }
     write!(f, "{whole}.{fraction}")
+}
+
+/// A value inside a list, struct or map, where text is quoted only when it would read wrong bare.
+///
+/// The pin prints `['a b', '']` as `[a b, '']`: a string goes in quotes when it is empty, when it
+/// is `null` in any case, when it starts or ends in whitespace, or when it holds a quote or one of
+/// the characters that lay out a nested value, and a quote inside is written `\'` and a backslash
+/// `\\`. Anything else prints bare, backslashes and all, which was checked character by character
+/// against the pin.
+fn write_element(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
+    let Value::Varchar(text) = value else {
+        return write!(f, "{value}");
+    };
+    let edge = |c: Option<char>| c.is_some_and(char::is_whitespace);
+    let quoted = text.is_empty()
+        || text.eq_ignore_ascii_case("null")
+        || edge(text.chars().next())
+        || edge(text.chars().next_back())
+        || text.contains(['\'', '"', ',', ':', '=', '(', ')', '[', ']', '{', '}']);
+    if !quoted {
+        return f.write_str(text);
+    }
+    f.write_str("'")?;
+    for c in text.chars() {
+        match c {
+            '\'' => f.write_str("\\'")?,
+            '\\' => f.write_str("\\\\")?,
+            _ => write!(f, "{c}")?,
+        }
+    }
+    f.write_str("'")
 }
 
 /// A blob prints as printable ASCII with everything else hex escaped, which is DuckDB's rule.
