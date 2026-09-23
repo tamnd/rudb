@@ -16,6 +16,7 @@
 
 pub mod catalog;
 pub mod held;
+pub mod mirror;
 pub mod name;
 pub mod parent;
 pub mod system;
@@ -24,6 +25,7 @@ pub mod view;
 
 pub use catalog::{Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema};
 pub use held::Held;
+pub use mirror::{FileStamp, MIRROR_CATALOG};
 pub use name::{QualifiedName, same_name};
 pub use parent::Parent;
 pub use rudb_native::StoredPart;

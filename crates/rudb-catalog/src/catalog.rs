@@ -12,6 +12,8 @@ use crate::table::Table;
 use crate::view::View;
 use rudb_native::Reader as NativeReader;
 
+use crate::mirror::{FileStamp, MIRROR_CATALOG, Mirror};
+
 /// The default attached database, which is the one an in-memory session gets.
 pub const DEFAULT_CATALOG: &str = "memory";
 /// The default schema inside it.
@@ -177,6 +179,8 @@ pub struct Catalog {
     /// `duckdb_types()` does not reproduce `database_oid`: an allocation counter says what order a
     /// process happened to create things in, so matching it would mean matching an accident.
     next: i64,
+    /// The Parquet files read through a native mirror, apart from every schema. See [`crate::mirror`].
+    mirrors: Vec<Mirror>,
 }
 
 impl Default for Catalog {
@@ -218,6 +222,7 @@ impl Catalog {
             default_schema: DEFAULT_SCHEMA.to_string(),
             next,
             generation: 1,
+            mirrors: Vec::new(),
         }
     }
 
@@ -481,6 +486,14 @@ impl Catalog {
     ///
     /// If the database, the schema or the table is missing.
     pub fn table(&self, name: &QualifiedName) -> Result<&Table> {
+        if name.catalog == MIRROR_CATALOG {
+            return self
+                .mirrors
+                .iter()
+                .map(|mirror| &mirror.table)
+                .find(|held| held.name() == name)
+                .ok_or_else(|| missing_table(&name.table));
+        }
         let schema = self.schema(&name.catalog, &name.schema)?;
         schema
             .tables
@@ -654,6 +667,66 @@ impl Catalog {
             .iter()
             .flat_map(|database| database.schemas.iter())
             .flat_map(|schema| schema.tables.iter())
+    }
+
+    /// The native mirror of the Parquet file at `path`, where there is one made from the file as
+    /// it is now.
+    ///
+    /// `path` is canonical and `stamp` is what the file system says about it now. A mirror of the
+    /// file as it was before somebody wrote it has a different stamp and is not an answer.
+    #[must_use]
+    pub fn mirror(
+        &self,
+        path: &str,
+        binary_as_string: bool,
+        stamp: FileStamp,
+    ) -> Option<&QualifiedName> {
+        self.mirrors
+            .iter()
+            .find(|mirror| {
+                mirror.path == path
+                    && mirror.binary_as_string == binary_as_string
+                    && mirror.stamp == stamp
+            })
+            .map(|mirror| mirror.table.name())
+    }
+
+    /// Reads the Parquet file at `path` through `reader` from here on, while its stamp holds.
+    ///
+    /// A mirror of the same file under the same options that is already here is replaced, since it
+    /// was made from the file before it last changed.
+    ///
+    /// # Errors
+    ///
+    /// When the mirror's columns cannot be a table's, which a mirror written by the load path does
+    /// not produce.
+    pub fn add_mirror(
+        &mut self,
+        path: &str,
+        binary_as_string: bool,
+        stamp: FileStamp,
+        reader: NativeReader,
+    ) -> Result<()> {
+        self.changed();
+        let at = self
+            .mirrors
+            .iter()
+            .position(|mirror| mirror.path == path && mirror.binary_as_string == binary_as_string)
+            .unwrap_or(self.mirrors.len());
+        let table = Table::native(Mirror::name(at), reader)?;
+        let mirror = Mirror { path: path.to_string(), binary_as_string, stamp, table };
+        if at == self.mirrors.len() {
+            self.mirrors.push(mirror);
+        } else {
+            self.mirrors[at] = mirror;
+        }
+        Ok(())
+    }
+
+    /// The tables of every mirror, which the optimizer counts rows and distinct values in the way
+    /// it does for the schemas' own.
+    pub fn mirrored_tables(&self) -> impl Iterator<Item = &Table> {
+        self.mirrors.iter().map(|mirror| &mirror.table)
     }
 
     /// Every row order declaration the catalog holds, in the spelling `SET cluster_by` takes.

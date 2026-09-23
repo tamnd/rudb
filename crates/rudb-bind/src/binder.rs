@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, Entry, QualifiedName, same_name};
+use rudb_catalog::{Catalog, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
     Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, Value,
@@ -1791,10 +1791,22 @@ impl<'a> Binder<'a> {
         if catalog.entry(&resolved)? == Entry::View {
             return self.bind_view(ast, &resolved, alias, columns);
         }
-        let table = catalog.table(&resolved)?;
-        let fields: Vec<Field> = table.columns().to_vec();
         let label =
             if alias == NONE { resolved.table.clone() } else { ast.string(alias).to_string() };
+        self.bind_catalog_table(ast, &resolved, label, columns)
+    }
+
+    /// A table the catalog holds, under the name `label`, which is where [`Self::bind_table`] ends
+    /// and where a Parquet file with a native mirror goes instead of to its reader.
+    fn bind_catalog_table(
+        &mut self,
+        ast: &Ast,
+        resolved: &QualifiedName,
+        label: String,
+        columns: ast::Slice,
+    ) -> Result<(NodeRef, Scope)> {
+        let table = self.catalog.table(resolved)?;
+        let fields: Vec<Field> = table.columns().to_vec();
         let index = self.fresh_index();
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
@@ -1919,6 +1931,9 @@ impl<'a> Binder<'a> {
         columns: ast::Slice,
         pragma: bool,
     ) -> Result<(NodeRef, Scope)> {
+        // The column names written after the alias, kept under a name of their own because the
+        // match on what the function's columns are below binds `columns` to something else.
+        let renamed = columns;
         let parts: Vec<&str> = ast.name(name).collect();
         // A qualified call names a schema, and the two schemas that exist are the ones every
         // built-in lives in. Anything else is a name that has to fail rather than fall through to
@@ -2009,12 +2024,32 @@ impl<'a> Binder<'a> {
                 // directory and the answer cannot change between binding a prepared statement and
                 // running it, which is the same reason the schema is settled here.
                 let paths = self.file_paths(cast[0], resolved.function.name())?;
+                let mut mirrorable = None;
+                if resolved.function == TableFunction::ReadParquet && !options.file_row_number {
+                    if let Some((path, stamp)) = mirror_target(&paths) {
+                        if let Some(name) =
+                            self.catalog.mirror(&path, options.binary_as_string, stamp)
+                        {
+                            let name = name.clone();
+                            let label = if alias == NONE {
+                                resolved.function.name().to_string()
+                            } else {
+                                ast.string(alias).to_string()
+                            };
+                            return self.bind_catalog_table(ast, &name, label, renamed);
+                        }
+                        mirrorable = Some(path);
+                    }
+                }
                 let mut fields = match columns {
                     // Parquet takes the first file's footer as the answer and CSV sniffs all of
                     // them, which is not a choice made here. See `csv_fields`.
                     Columns::Csv => csv_fields(&paths, options.given)?,
                     _ => {
                         let footers = parquet_footers(&paths)?;
+                        if let Some(path) = mirrorable.as_deref() {
+                            self.want_mirror(path, options.binary_as_string, &footers.rows);
+                        }
                         measured = footers.rows;
                         counted = footers.distincts;
                         bounded = footers.zones;
@@ -2301,18 +2336,6 @@ impl<'a> Binder<'a> {
         // DuckDB's order and it is the helpful one: somebody who wrote a file name wants to hear
         // about the file.
         let paths = files(path)?;
-        let read = match function {
-            TableFunction::ReadParquet => {
-                let footers = parquet_footers(&paths)?;
-                Read {
-                    fields: footers.fields,
-                    rows: footers.rows,
-                    distincts: footers.distincts,
-                    zones: footers.zones,
-                }
-            }
-            _ => Read::uncounted(csv_fields(&paths, Given::default())?),
-        };
         // The name the columns answer to is the file's stem, so `SELECT mixed.a FROM
         // 'data/mixed.parquet'` works. That is DuckDB's choice and it is the useful one, since the
         // alternative is a table name with a dot and a slash in it that nothing can write. A pattern
@@ -2328,9 +2351,43 @@ impl<'a> Binder<'a> {
         } else {
             ast.string(alias).to_string()
         };
+        let mut mirrorable = None;
+        if function == TableFunction::ReadParquet {
+            if let Some((canonical, stamp)) = mirror_target(&paths) {
+                if let Some(name) = self.catalog.mirror(&canonical, false, stamp) {
+                    let name = name.clone();
+                    return self.bind_catalog_table(ast, &name, label, columns);
+                }
+                mirrorable = Some(canonical);
+            }
+        }
+        let read = match function {
+            TableFunction::ReadParquet => {
+                let footers = parquet_footers(&paths)?;
+                if let Some(canonical) = mirrorable.as_deref() {
+                    self.want_mirror(canonical, false, &footers.rows);
+                }
+                Read {
+                    fields: footers.fields,
+                    rows: footers.rows,
+                    distincts: footers.distincts,
+                    zones: footers.zones,
+                }
+            }
+            _ => Read::uncounted(csv_fields(&paths, Given::default())?),
+        };
         let arguments: Vec<ExprRef> = paths.iter().map(|path| self.path_constant(path)).collect();
         let names: Vec<&str> = ast.name(columns).collect();
         self.table_function_source(function, &arguments, &[], read, &label, &names)
+    }
+
+    /// Says the Parquet file at `path` could have been read through a native mirror, when its
+    /// footer says how many rows it holds, which is what the database decides whether one would
+    /// repay itself by.
+    fn want_mirror(&mut self, path: &str, binary_as_string: bool, rows: &Stat<u64>) {
+        if let Some(&rows) = rows.value() {
+            self.plan.want_mirror(path, binary_as_string, rows);
+        }
     }
 
     /// One file name, as a constant expression in the plan.
@@ -3373,6 +3430,15 @@ impl Options {
         options.given = csv_given(&named)?;
         Ok(options)
     }
+}
+
+/// The one file a read names, canonical, with what the file system says about it now, or `None`
+/// for a read of several files or of something that is not a regular file with a UTF-8 name.
+fn mirror_target(paths: &[String]) -> Option<(String, FileStamp)> {
+    let [path] = paths else { return None };
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let stamp = FileStamp::of(&canonical)?;
+    Some((canonical.to_str()?.to_string(), stamp))
 }
 
 /// What was written between the two sides of a set operation.
