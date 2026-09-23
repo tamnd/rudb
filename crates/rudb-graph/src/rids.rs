@@ -1,0 +1,664 @@
+//! A set of row ids of one table, and pushing one through a link.
+//!
+//! spec/graph/04-in-memory.md section 4.3. This is the type a semi join reduction produces and
+//! consumes: a predicate on a parent table leaves a set of parent rows, the set is pushed through
+//! the forward link to become a set of child rows, and the child's scan reads only those. Section
+//! 5.4 of the execution document is the argument for why that is worth doing and this module is the
+//! part of it that has to be cheap.
+//!
+//! # Three forms, and why the choice is not the caller's
+//!
+//! Full is every row, which is a flag and nothing allocated. It exists because a reduction that
+//! removed nothing has to cost nothing downstream, and without it that reduction costs a bitmap of
+//! all ones and a test per row to learn nothing.
+//!
+//! Sparse is a sorted list of row ids, used below one member in [`SPARSE_RATIO`] rows. A test is a
+//! binary search, which is fine because the consumer of a set that small walks it rather than
+//! testing into it.
+//!
+//! Dense is one bit per row. On TPC-H SF100 `lineitem` that is 75 MB and `orders` is 18.75 MB, which
+//! fits the last level cache of nothing, and the reason it is still the right form is that a scan
+//! tests it in row id order, so the access is a stream rather than a scatter.
+//!
+//! Every constructor picks the form from the count, so the form is a function of the members and
+//! the table size and nothing else. That is what makes two sets over the same rows with the same
+//! members compare equal, and it means a caller never has to ask which one it got.
+//!
+//! # What is left out
+//!
+//! Section 4.3 gives the dense form a rank index. Nothing here asks a rank of one yet, and an index
+//! nothing reads is an eighth more memory to build on every push, so it arrives with the first
+//! caller that needs it.
+
+use rudb_common::{Error, Result};
+
+use crate::link::Link;
+use crate::rid::{NO_PARENT, PART_ROWS, Rid};
+
+/// Below one member in this many rows, a set is held as a sorted list rather than a bitmap.
+///
+/// Section 4.3's number. At one in a thousand the list is eight bytes a member against a bitmap's
+/// thousand bits, so the list is about a sixteenth of the size, and it stays smaller until one in
+/// sixty four, so the threshold is on the side of the bitmap. That side is the one a scan wants.
+pub const SPARSE_RATIO: u64 = 1000;
+
+/// Which form a set is held in, for a plan output to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    /// Every row, with nothing allocated.
+    Full,
+    /// A sorted list of row ids.
+    Sparse,
+    /// One bit per row.
+    Dense,
+}
+
+/// A set of row ids of one table of a known number of rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rids {
+    rows: u64,
+    body: Body,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Body {
+    Full,
+    Sparse(Vec<Rid>),
+    Dense { words: Vec<u64>, members: u64 },
+}
+
+impl Rids {
+    /// Every row of a table of `rows`.
+    #[must_use]
+    pub fn full(rows: u64) -> Self {
+        if rows == 0 { Self::none(0) } else { Self { rows, body: Body::Full } }
+    }
+
+    /// No row of a table of `rows`.
+    #[must_use]
+    pub fn none(rows: u64) -> Self {
+        Self { rows, body: Body::Sparse(Vec::new()) }
+    }
+
+    /// The set holding exactly `members`, which have to be strictly increasing and below `rows`.
+    ///
+    /// # Errors
+    ///
+    /// If a member is out of order, repeated or past the end. A set that silently dropped one of
+    /// those would be a reduction that removed a row which joins.
+    pub fn from_sorted(rows: u64, members: Vec<Rid>) -> Result<Self> {
+        let mut previous = None;
+        for &member in &members {
+            if member >= rows || previous.is_some_and(|previous| member <= previous) {
+                return Err(Error::internal(format!(
+                    "row {member} is out of order or past the end of a table of {rows} rows"
+                )));
+            }
+            previous = Some(member);
+        }
+        Ok(Self::settle_sparse(rows, members))
+    }
+
+    /// The set whose members are the set bits of `words`, least significant bit of word zero first.
+    ///
+    /// # Errors
+    ///
+    /// If `words` is not the number of words `rows` bits take, or a bit past `rows` is set.
+    pub fn from_words(rows: u64, words: Vec<u64>) -> Result<Self> {
+        if count(words.len()) != rows.div_ceil(64) {
+            return Err(Error::internal(format!(
+                "{} words is not a bitmap over {rows} rows",
+                words.len()
+            )));
+        }
+        let tail = rows % 64;
+        if tail != 0 && words.last().is_some_and(|last| last >> tail != 0) {
+            return Err(Error::internal("a bitmap has rows set past the end of its table"));
+        }
+        Ok(Self::settle_dense(rows, words))
+    }
+
+    /// Rows in the table this is a set over.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Rows in the set.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        match &self.body {
+            Body::Full => self.rows,
+            Body::Sparse(members) => count(members.len()),
+            Body::Dense { members, .. } => *members,
+        }
+    }
+
+    /// Whether no row is in the set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether every row is in the set.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        matches!(self.body, Body::Full)
+    }
+
+    /// Which form the set is held in.
+    #[must_use]
+    pub fn form(&self) -> Form {
+        match self.body {
+            Body::Full => Form::Full,
+            Body::Sparse(_) => Form::Sparse,
+            Body::Dense { .. } => Form::Dense,
+        }
+    }
+
+    /// Bytes the set holds on to.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        match &self.body {
+            Body::Full => 0,
+            Body::Sparse(members) => members.len() * size_of::<Rid>(),
+            Body::Dense { words, .. } => words.len() * size_of::<u64>(),
+        }
+    }
+
+    /// Whether `rid` is in the set.
+    #[must_use]
+    pub fn contains(&self, rid: Rid) -> bool {
+        if rid >= self.rows {
+            return false;
+        }
+        match &self.body {
+            Body::Full => true,
+            Body::Sparse(members) => members.binary_search(&rid).is_ok(),
+            Body::Dense { words, .. } => bit(words, rid),
+        }
+    }
+
+    /// Whether any member is between `low` and `high`, both included.
+    ///
+    /// The question a part skip asks: the link's zone map says the children of this part point at
+    /// parents in that range, and a range holding no member is a part that cannot contribute.
+    #[must_use]
+    pub fn any_between(&self, low: Rid, high: Rid) -> bool {
+        let high = high.min(self.rows.saturating_sub(1));
+        if low > high || self.rows == 0 {
+            return false;
+        }
+        match &self.body {
+            Body::Full => true,
+            Body::Sparse(members) => {
+                let from = members.partition_point(|&member| member < low);
+                members.get(from).is_some_and(|&member| member <= high)
+            }
+            Body::Dense { words, .. } => {
+                let (first, last) = (index(low / 64), index(high / 64));
+                (first..=last).any(|at| {
+                    let mut word = words[at];
+                    if at == first {
+                        word &= u64::MAX << (low % 64);
+                    }
+                    if at == last {
+                        word &= u64::MAX >> (63 - high % 64);
+                    }
+                    word != 0
+                })
+            }
+        }
+    }
+
+    /// The members, in increasing order.
+    pub fn iter(&self) -> impl Iterator<Item = Rid> + '_ {
+        let (full, sparse, dense) = match &self.body {
+            Body::Full => (Some(0..self.rows), None, None),
+            Body::Sparse(members) => (None, Some(members.iter().copied()), None),
+            Body::Dense { words, .. } => (None, None, Some(ones(words))),
+        };
+        full.into_iter()
+            .flatten()
+            .chain(sparse.into_iter().flatten())
+            .chain(dense.into_iter().flatten())
+    }
+
+    /// The rows in both sets.
+    ///
+    /// # Errors
+    ///
+    /// If the two are over tables of different sizes, which is two different tables.
+    pub fn intersect(&self, other: &Self) -> Result<Self> {
+        self.same_table(other)?;
+        Ok(match (&self.body, &other.body) {
+            (Body::Full, _) => other.clone(),
+            (_, Body::Full) => self.clone(),
+            (Body::Dense { words: left, .. }, Body::Dense { words: right, .. }) => {
+                let words = left.iter().zip(right).map(|(left, right)| left & right).collect();
+                Self::settle_dense(self.rows, words)
+            }
+            // A sparse side is small by definition, so the answer is the part of it the other side
+            // holds, which is one test per member of the small one.
+            (Body::Sparse(members), _) => Self::settle_sparse(
+                self.rows,
+                members.iter().copied().filter(|&member| other.contains(member)).collect(),
+            ),
+            (_, Body::Sparse(members)) => Self::settle_sparse(
+                self.rows,
+                members.iter().copied().filter(|&member| self.contains(member)).collect(),
+            ),
+        })
+    }
+
+    /// The rows in either set.
+    ///
+    /// # Errors
+    ///
+    /// If the two are over tables of different sizes.
+    pub fn union(&self, other: &Self) -> Result<Self> {
+        self.same_table(other)?;
+        if self.is_full() || other.is_full() {
+            return Ok(Self::full(self.rows));
+        }
+        let mut words = self.words();
+        for member in other.iter() {
+            words[index(member / 64)] |= 1 << (member % 64);
+        }
+        Ok(Self::settle_dense(self.rows, words))
+    }
+
+    /// Pushes a set of parent rows forward through `link`, to the child rows that point into it.
+    ///
+    /// One pass over the link in child order, which is section 4.3's first push. A part whose zone
+    /// map says its children point only at parents outside the set is never decoded, which is
+    /// section 5.5's part skip and on a child clustered by the parent is most of the table.
+    ///
+    /// # Errors
+    ///
+    /// If this set is not over the link's parent table.
+    pub fn forward(&self, link: &Link) -> Result<Pushed> {
+        if self.rows != link.parents() {
+            return Err(Error::internal(format!(
+                "a set over {} rows pushed through a link whose parent has {}",
+                self.rows,
+                link.parents()
+            )));
+        }
+        let children = link.children();
+        let parts = children.div_ceil(count(PART_ROWS));
+        // Every child that has a parent is a member, which is every child when every child matched.
+        if self.is_full() && link.linked() == children {
+            return Ok(Pushed { rids: Self::full(children), parts, skipped: 0 });
+        }
+        let mut words = vec![0_u64; index(children.div_ceil(64))];
+        let mut parents = vec![NO_PARENT; PART_ROWS];
+        let mut skipped = 0_u64;
+        for part in 0..parts {
+            let first = part * count(PART_ROWS);
+            let reach = match link.part_bounds(index(part)) {
+                Some(Some((low, high))) => self.any_between(low, high),
+                _ => false,
+            };
+            if !reach {
+                skipped += 1;
+                continue;
+            }
+            let run = index((children - first).min(count(PART_ROWS)));
+            link.forward_run(first, &mut parents[..run])?;
+            for (at, &parent) in parents[..run].iter().enumerate() {
+                if parent != NO_PARENT && self.contains(parent) {
+                    let child = first + count(at);
+                    words[index(child / 64)] |= 1 << (child % 64);
+                }
+            }
+        }
+        Ok(Pushed { rids: Self::settle_dense(children, words), parts, skipped })
+    }
+
+    /// Pushes a set of child rows backward through `link`, to the parents they point at.
+    ///
+    /// The second push of section 4.3, a pass over the link setting a bit per surviving child. It
+    /// reads the link in child order just as the forward push does, so it needs no backward
+    /// structure, and a child without a parent contributes nothing.
+    ///
+    /// # Errors
+    ///
+    /// If this set is not over the link's child table.
+    pub fn backward(&self, link: &Link) -> Result<Self> {
+        if self.rows != link.children() {
+            return Err(Error::internal(format!(
+                "a set over {} rows pushed back through a link whose child has {}",
+                self.rows,
+                link.children()
+            )));
+        }
+        let mut words = vec![0_u64; index(link.parents().div_ceil(64))];
+        let mut parents = vec![NO_PARENT; PART_ROWS];
+        let children = link.children();
+        for part in 0..children.div_ceil(count(PART_ROWS)) {
+            let first = part * count(PART_ROWS);
+            let last = (first + count(PART_ROWS)).min(children) - 1;
+            if !self.any_between(first, last) {
+                continue;
+            }
+            let run = index(last - first + 1);
+            link.forward_run(first, &mut parents[..run])?;
+            for (at, &parent) in parents[..run].iter().enumerate() {
+                if parent != NO_PARENT && self.contains(first + count(at)) {
+                    words[index(parent / 64)] |= 1 << (parent % 64);
+                }
+            }
+        }
+        Ok(Self::settle_dense(link.parents(), words))
+    }
+
+    fn same_table(&self, other: &Self) -> Result<()> {
+        if self.rows == other.rows {
+            Ok(())
+        } else {
+            Err(Error::internal(format!(
+                "a set over {} rows combined with one over {}",
+                self.rows, other.rows
+            )))
+        }
+    }
+
+    /// The set as a bitmap, whatever form it is held in.
+    fn words(&self) -> Vec<u64> {
+        let mut words = vec![0_u64; index(self.rows.div_ceil(64))];
+        match &self.body {
+            Body::Dense { words: held, .. } => words.copy_from_slice(held),
+            _ => {
+                for member in self.iter() {
+                    words[index(member / 64)] |= 1 << (member % 64);
+                }
+            }
+        }
+        words
+    }
+
+    /// The form a bitmap's members call for.
+    fn settle_dense(rows: u64, words: Vec<u64>) -> Self {
+        let members = words.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
+        match shape(rows, members) {
+            Form::Full => Self::full(rows),
+            Form::Sparse => Self { rows, body: Body::Sparse(ones(&words).collect()) },
+            Form::Dense => Self { rows, body: Body::Dense { words, members } },
+        }
+    }
+
+    /// The form a sorted list's members call for.
+    fn settle_sparse(rows: u64, members: Vec<Rid>) -> Self {
+        match shape(rows, count(members.len())) {
+            Form::Full => Self::full(rows),
+            Form::Sparse => Self { rows, body: Body::Sparse(members) },
+            Form::Dense => {
+                let mut words = vec![0_u64; index(rows.div_ceil(64))];
+                for member in &members {
+                    words[index(member / 64)] |= 1 << (member % 64);
+                }
+                Self { rows, body: Body::Dense { words, members: count(members.len()) } }
+            }
+        }
+    }
+}
+
+/// What pushing a set through a link produced, and how much of the link it had to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pushed {
+    /// The child rows that point into the set.
+    pub rids: Rids,
+    /// Parts of the child table there are.
+    pub parts: u64,
+    /// Parts the zone map ruled out without their link being decoded.
+    pub skipped: u64,
+}
+
+/// Which form `members` rows out of `rows` belong in.
+fn shape(rows: u64, members: u64) -> Form {
+    if rows > 0 && members == rows {
+        Form::Full
+    } else if members == 0 || members.saturating_mul(SPARSE_RATIO) < rows {
+        Form::Sparse
+    } else {
+        Form::Dense
+    }
+}
+
+/// Whether bit `at` of a bitmap is set.
+fn bit(words: &[u64], at: u64) -> bool {
+    words.get(index(at / 64)).is_some_and(|word| word >> (at % 64) & 1 == 1)
+}
+
+/// The set bits of a bitmap, in order.
+fn ones(words: &[u64]) -> impl Iterator<Item = Rid> + '_ {
+    words.iter().enumerate().flat_map(|(at, &word)| {
+        let base = count(at) * 64;
+        let mut rest = word;
+        std::iter::from_fn(move || {
+            if rest == 0 {
+                return None;
+            }
+            let low = u64::from(rest.trailing_zeros());
+            rest &= rest - 1;
+            Some(base + low)
+        })
+    })
+}
+
+/// A count in the `u64` every interface here uses.
+fn count(rows: usize) -> u64 {
+    u64::try_from(rows).unwrap_or(u64::MAX)
+}
+
+/// A row count as an index. Every set here fits in memory, so one that does not is a bug upstream.
+fn index(rows: u64) -> usize {
+    usize::try_from(rows).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Form, Rids, SPARSE_RATIO};
+    use crate::link::Link;
+    use crate::rid::{NO_PARENT, PART_ROWS, Rid};
+
+    /// The members of a set, the slow way, for comparing against.
+    fn members(rids: &Rids) -> Vec<Rid> {
+        (0..rids.rows()).filter(|&rid| rids.contains(rid)).collect()
+    }
+
+    #[test]
+    fn the_form_follows_the_count_and_not_the_constructor() {
+        let rows = 10 * SPARSE_RATIO;
+        assert_eq!(Rids::from_sorted(rows, vec![1, 2, 3]).expect("sorted").form(), Form::Sparse);
+        let many: Vec<Rid> = (0..rows).step_by(2).collect();
+        assert_eq!(Rids::from_sorted(rows, many).expect("sorted").form(), Form::Dense);
+        let every: Vec<Rid> = (0..rows).collect();
+        assert_eq!(Rids::from_sorted(rows, every).expect("sorted").form(), Form::Full);
+        let mut words = vec![0_u64; usize::try_from(rows.div_ceil(64)).expect("small")];
+        words[0] = 1;
+        assert_eq!(Rids::from_words(rows, words).expect("bitmap").form(), Form::Sparse);
+    }
+
+    /// The reason the form is chosen by the count: the same members over the same table are the
+    /// same set, however they were built.
+    #[test]
+    fn the_same_members_are_the_same_set_whichever_way_they_came_in() {
+        let rows = 5000;
+        let members: Vec<Rid> = (0..rows).filter(|rid| rid % 3 == 0).collect();
+        let mut words = vec![0_u64; usize::try_from(rows.div_ceil(64)).expect("small")];
+        for member in &members {
+            words[usize::try_from(member / 64).expect("small")] |= 1 << (member % 64);
+        }
+        let listed = Rids::from_sorted(rows, members).expect("sorted");
+        let mapped = Rids::from_words(rows, words).expect("bitmap");
+        assert_eq!(listed, mapped);
+    }
+
+    #[test]
+    fn a_member_out_of_order_or_past_the_end_is_refused() {
+        assert!(Rids::from_sorted(10, vec![3, 2]).is_err());
+        assert!(Rids::from_sorted(10, vec![3, 3]).is_err());
+        assert!(Rids::from_sorted(10, vec![10]).is_err());
+        assert!(Rids::from_words(10, vec![1 << 10]).is_err(), "a bit past the end");
+        assert!(Rids::from_words(10, vec![0, 0]).is_err(), "a word too many");
+    }
+
+    #[test]
+    fn a_full_set_holds_nothing_and_answers_everything() {
+        let full = Rids::full(1_000_000);
+        assert_eq!(full.bytes(), 0);
+        assert_eq!(full.len(), 1_000_000);
+        assert!(full.contains(999_999));
+        assert!(!full.contains(1_000_000));
+    }
+
+    #[test]
+    fn any_between_looks_only_inside_the_range_in_every_form() {
+        let rows = 4096;
+        for members in [vec![700], (0..rows).filter(|rid| rid % 2 == 0 && *rid != 700).collect()] {
+            let rids = Rids::from_sorted(rows, members.clone()).expect("sorted");
+            for (low, high) in [(0, 63), (64, 699), (699, 701), (700, 700), (1000, 5000)] {
+                let expected = members.iter().any(|&member| (low..=high).contains(&member));
+                assert_eq!(
+                    rids.any_between(low, high),
+                    expected,
+                    "{low}..={high} over {:?}",
+                    rids.form()
+                );
+            }
+        }
+        assert!(Rids::full(10).any_between(3, 3));
+        assert!(!Rids::full(10).any_between(10, 20), "past the end is outside the table");
+    }
+
+    #[test]
+    fn intersect_and_union_agree_with_the_slow_answer_across_forms() {
+        let rows = 20_000;
+        let sets = [
+            Rids::none(rows),
+            Rids::from_sorted(rows, vec![5, 700, 19_999]).expect("sorted"),
+            Rids::from_sorted(rows, (0..rows).filter(|rid| rid % 3 == 0).collect())
+                .expect("sorted"),
+            Rids::from_sorted(rows, (0..rows).filter(|rid| rid % 5 == 0).collect())
+                .expect("sorted"),
+            Rids::full(rows),
+        ];
+        for left in &sets {
+            for right in &sets {
+                let both = left.intersect(right).expect("same table");
+                let either = left.union(right).expect("same table");
+                let (left_members, right_members) = (members(left), members(right));
+                let expected_both: Vec<Rid> = left_members
+                    .iter()
+                    .copied()
+                    .filter(|rid| right_members.contains(rid))
+                    .collect();
+                let mut expected_either = left_members.clone();
+                expected_either.extend(right_members.iter().copied());
+                expected_either.sort_unstable();
+                expected_either.dedup();
+                assert_eq!(members(&both), expected_both);
+                assert_eq!(members(&either), expected_either);
+                assert_eq!(both.iter().collect::<Vec<_>>(), expected_both, "iteration is in order");
+            }
+        }
+        assert!(Rids::full(3).intersect(&Rids::full(4)).is_err(), "two different tables");
+    }
+
+    /// A child of `children` rows whose parents are `parent_of(child)`, over `parents` parents.
+    fn link(children: u64, parents: u64, parent_of: impl Fn(u64) -> Rid) -> Link {
+        let of: Vec<Rid> = (0..children).map(parent_of).collect();
+        Link::build(&of, parents).expect("a link")
+    }
+
+    /// The forward push against the definition, over both forms of link, including a part of
+    /// children that point at no parent at all.
+    #[test]
+    fn a_forward_push_finds_exactly_the_children_that_point_into_the_set() {
+        let parents = 3000;
+        let children = 10 * count(PART_ROWS) + 17;
+        let clustered = link(children, parents, |child| child * parents / children);
+        let scattered = link(children, parents, |child| {
+            if child / count(PART_ROWS) == 4 { NO_PARENT } else { (child * 7919) % parents }
+        });
+        for link in [&clustered, &scattered] {
+            for set in [
+                Rids::none(parents),
+                Rids::from_sorted(parents, vec![0, 1500, 2999]).expect("sorted"),
+                Rids::from_sorted(parents, (0..parents).filter(|p| p % 4 == 1).collect())
+                    .expect("sorted"),
+                Rids::full(parents),
+            ] {
+                let pushed = set.forward(link).expect("the same table");
+                let expected: Vec<Rid> = (0..children)
+                    .filter(|&child| link.forward(child).is_some_and(|parent| set.contains(parent)))
+                    .collect();
+                assert_eq!(
+                    members(&pushed.rids),
+                    expected,
+                    "{:?} through {:?}",
+                    set.form(),
+                    link.form()
+                );
+            }
+        }
+    }
+
+    fn count(rows: usize) -> u64 {
+        u64::try_from(rows).expect("small")
+    }
+
+    /// Section 5.5's claim, on the shape it is made about: a child clustered by its parent, and a
+    /// set of parents that is one contiguous stretch of them, reads only the parts over that stretch.
+    #[test]
+    fn a_clustered_child_skips_every_part_that_points_outside_the_set() {
+        let parents = 1000;
+        let children = 100 * count(PART_ROWS);
+        let link = link(children, parents, |child| child * parents / children);
+        let set = Rids::from_sorted(parents, (100..200).collect()).expect("sorted");
+        let pushed = set.forward(&link).expect("the same table");
+        assert_eq!(pushed.parts, 100);
+        // A tenth of the parents is a tenth of the parts, give or take the two at the edges.
+        assert!(pushed.skipped >= 88, "only {} of 100 parts were skipped", pushed.skipped);
+        assert_eq!(pushed.rids.len(), children / 10);
+    }
+
+    #[test]
+    fn nothing_in_the_set_skips_every_part_and_everything_skips_the_pass() {
+        let link = link(5000, 100, |child| child % 100);
+        let pushed = Rids::none(100).forward(&link).expect("the same table");
+        assert_eq!((pushed.skipped, pushed.rids.len()), (pushed.parts, 0));
+        let pushed = Rids::full(100).forward(&link).expect("the same table");
+        assert!(pushed.rids.is_full(), "every child matched, so every child is in");
+        assert_eq!(pushed.skipped, 0);
+    }
+
+    #[test]
+    fn a_backward_push_finds_exactly_the_parents_the_set_points_at() {
+        let parents = 500;
+        let children = 7 * count(PART_ROWS) + 3;
+        let clustered = link(children, parents, |child| child * parents / children);
+        let scattered = link(children, parents, |child| {
+            if child % 11 == 0 { NO_PARENT } else { (child * 31) % parents }
+        });
+        for link in [&clustered, &scattered] {
+            let set = Rids::from_sorted(children, (0..children).filter(|c| c % 97 == 3).collect())
+                .expect("sorted");
+            let pushed = set.backward(link).expect("the same table");
+            let mut expected: Vec<Rid> =
+                set.iter().filter_map(|child| link.forward(child)).collect();
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(members(&pushed), expected, "through {:?}", link.form());
+        }
+    }
+
+    #[test]
+    fn a_set_over_the_wrong_table_is_refused_rather_than_pushed() {
+        let link = link(100, 10, |child| child % 10);
+        assert!(Rids::full(11).forward(&link).is_err());
+        assert!(Rids::full(10).backward(&link).is_err());
+    }
+}

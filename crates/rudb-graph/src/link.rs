@@ -233,6 +233,74 @@ impl Link {
         }
     }
 
+    /// The parents of a run of consecutive children, with [`NO_PARENT`] for the ones that have none.
+    ///
+    /// This is [`Link::forward`] over a range, and what it adds is the monotone form. Answering one
+    /// child there is a `select1`, which is a search, and walking a run of them one search at a time
+    /// is paying for random access on a read that is sequential. So the run is found once and then
+    /// read off the bitmap in order: a one bit is a child of the current parent and a zero bit moves
+    /// on to the next parent, which is a load per sixty four bits and a count of zeros per word.
+    ///
+    /// # Errors
+    ///
+    /// If the run goes past the last child.
+    pub fn forward_run(&self, first: Rid, out: &mut [Rid]) -> Result<()> {
+        let end = first.checked_add(count(out.len()));
+        if end.is_none_or(|end| end > self.children) {
+            return Err(Error::internal(format!(
+                "a run of {} children from {first} goes past the {} the link has",
+                out.len(),
+                self.children
+            )));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        match &self.body {
+            Body::Packed { bytes, width, .. } => {
+                let absent = reserved(*width);
+                let start = usize::try_from(first)
+                    .map_err(|_| malformed("a child past what fits in memory"))?;
+                for (at, slot) in out.iter_mut().enumerate() {
+                    let value = bitpack::tail_at(bytes, *width, start + at)?;
+                    *slot = if value == absent { NO_PARENT } else { value };
+                }
+            }
+            Body::Monotone { vector } => {
+                // Every child has a parent in this form, so the first child's parent is the count
+                // of zeros before its bit and every later one follows from the bits in between.
+                let Some(mut at) = vector.select1(first) else {
+                    return Err(malformed("a monotone link has fewer ones than children"));
+                };
+                let mut parent = vector.rank0(at);
+                let words = vector.words();
+                for slot in out.iter_mut() {
+                    // Skip the zeros up to the next one bit, a word at a time, counting each as a
+                    // parent boundary crossed.
+                    loop {
+                        let word = words.get(at / 64).copied().unwrap_or(0) >> (at % 64);
+                        if word == 0 {
+                            let skipped = 64 - at % 64;
+                            parent += count(skipped);
+                            at += skipped;
+                            if at >= vector.len() {
+                                return Err(malformed("a monotone link ran out of ones"));
+                            }
+                            continue;
+                        }
+                        let zeros = word.trailing_zeros() as usize;
+                        parent += count(zeros);
+                        at += zeros;
+                        break;
+                    }
+                    *slot = parent;
+                    at += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The children of a parent row, as a half open range of child `rid`s.
     ///
     /// `None` for the packed form, which does not answer this direction, and for a parent past the
@@ -655,6 +723,39 @@ mod tests {
             link.write(&mut bytes).expect("write");
             let short = &bytes[..bytes.len() - 1];
             assert!(Link::read(short).is_err(), "a truncated {:?} body is refused", link.form());
+        }
+    }
+
+    /// A run decodes to what the per child lookup says, from every starting point and across long
+    /// stretches of parents with no children, which is where the word at a time walk could slip.
+    #[test]
+    fn a_run_agrees_with_the_per_child_lookup_in_both_forms() {
+        let mut clustered = Vec::new();
+        for parent in 0..400_u64 {
+            // Parents with no children in runs of up to a few hundred, so a walk crosses whole
+            // words of zeros.
+            let children = if parent % 50 < 45 { 0 } else { parent % 7 + 1 };
+            clustered.extend(std::iter::repeat_n(parent, children as usize));
+        }
+        let scattered: Vec<Rid> = (0..3000_u64)
+            .map(|child| if child % 13 == 0 { NO_PARENT } else { (child * 37) % 500 })
+            .collect();
+        for (parents_of, parents) in [(clustered, 400), (scattered, 500)] {
+            let link = Link::build(&parents_of, parents).expect("build");
+            let children = link.children();
+            for first in [0, 1, 63, 64, 65, children / 2, children - 1] {
+                for len in [0, 1, 2, 100, children - first] {
+                    let len = len.min(children - first);
+                    let mut out = vec![0; len as usize];
+                    link.forward_run(first, &mut out).expect("in range");
+                    let want: Vec<Rid> = (first..first + len)
+                        .map(|child| link.forward(child).unwrap_or(NO_PARENT))
+                        .collect();
+                    assert_eq!(out, want, "{:?} from {first} for {len}", link.form());
+                }
+            }
+            let mut out = vec![0; 2];
+            assert!(link.forward_run(children - 1, &mut out).is_err(), "past the last child");
         }
     }
 }

@@ -262,6 +262,14 @@ impl BitVector {
         Some(self.select(nth, false))
     }
 
+    /// The bitmap itself, least significant bit of word zero first.
+    ///
+    /// For a caller that walks the bits in order, which is one load per sixty four of them, where
+    /// asking `select` for each would be a search per bit.
+    pub(crate) fn words(&self) -> &[u64] {
+        &self.words
+    }
+
     /// Bytes this costs on disk, which is the bitmap and the rank index and not the samples.
     #[must_use]
     pub fn bytes(&self) -> usize {
