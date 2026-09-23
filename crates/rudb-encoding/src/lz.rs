@@ -60,7 +60,7 @@ const HASH_BITS: u32 = 16;
 ///
 /// A greedy matcher with a bounded chain, which is what deflate calls a compression level. Raising
 /// this buys tenths of a ratio point for a proportional amount of time.
-const MAX_TRIES: usize = 32;
+const MAX_TRIES: usize = 16;
 
 /// A copy this long ends the walk down its chain, since a longer one would save a few bytes of a
 /// copy that already saves this many. Deflate calls this `nice_match` and zlib's default is 128.
