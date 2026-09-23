@@ -2937,6 +2937,16 @@ impl<'a> Binder<'a> {
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
         let resolved = resolve(name, &types)?;
+        // The separator is read once per group and not once per row, so the pin wants it to be the
+        // same on every row and says so in these words.
+        if resolved.name == "string_agg"
+            && bound.len() == 2
+            && !matches!(fold::value_of(&self.plan, bound[1]), Ok(Some(_)))
+        {
+            return Err(Error::binder(
+                "The \"separator\" argument in function \"string_agg\" must be a constant expression",
+            ));
+        }
         let mut cast = Vec::with_capacity(bound.len());
         for (arg, wanted) in bound.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);

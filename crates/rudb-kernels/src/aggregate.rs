@@ -59,6 +59,7 @@ use rudb_vector::{Data, Form, Live, Validity, Vector};
 
 use crate::compare::order;
 use crate::fallback::{self, Kernel};
+use crate::general::General;
 use crate::number::{fit, integral, pow10, rescale};
 use crate::shape::{identity, nulls_of};
 
@@ -145,6 +146,8 @@ enum Kind {
     Avg,
     Min,
     Max,
+    /// Anything in [`State::General`], which no vector path here reads.
+    General,
 }
 
 /// What the aggregate has seen so far.
@@ -185,6 +188,8 @@ enum State {
     // Most ClickBench groups contain count/sum/avg states and should not each pay for a 64-byte
     // Value they never hold. Min and max allocate only after they see their first non-null value.
     Extreme { held: Option<Box<Extremum>>, least: bool },
+    /// Any other aggregate, boxed so that the five above stay as narrow as they are.
+    General(Box<General>),
 }
 
 /// An accumulator's answer as a number, before anything decides what type it is written as.
@@ -329,6 +334,7 @@ impl Accumulator {
                     Kind::Max
                 }
             }
+            State::General(_) => Kind::General,
         }
     }
 
@@ -339,7 +345,7 @@ impl Accumulator {
             | State::Real { returns, .. }
             | State::Mean { returns, .. }
             | State::Scaled { returns, .. } => returns,
-            State::Extreme { .. } => Return::Other,
+            State::Extreme { .. } | State::General(_) => Return::Other,
         }
     }
 
@@ -349,6 +355,9 @@ impl Accumulator {
     ///
     /// If the name is not an aggregate this crate implements.
     pub fn new(name: &str, returns: &LogicalType) -> Result<Self> {
+        if let Some(general) = General::new(name, returns) {
+            return Ok(Self { state: State::General(Box::new(general)) });
+        }
         let kind = match name {
             "count_star" => Kind::CountStar,
             "count" => Kind::Count,
@@ -366,6 +375,8 @@ impl Accumulator {
         };
         let returns = Return::new(returns);
         let state = match kind {
+            // Every name that builds one of these went to [`General::new`] above.
+            Kind::General => return Err(Error::internal(format!("the {name} aggregate"))),
             Kind::CountStar | Kind::Count => {
                 State::Counted { count: 0, star: kind == Kind::CountStar }
             }
@@ -391,6 +402,9 @@ impl Accumulator {
     /// If the argument count is wrong for the aggregate, if the value is not one the aggregate can
     /// accumulate, or if a whole running total overflows.
     pub fn update(&mut self, args: &[Value]) -> Result<()> {
+        if let State::General(general) = &mut self.state {
+            return general.update(args);
+        }
         if self.kind() == Kind::CountStar {
             if let State::Counted { count, .. } = &mut self.state {
                 *count += 1;
@@ -462,6 +476,8 @@ impl Accumulator {
                     *held = Some(Box::new(Extremum::Held(value.clone())));
                 }
             }
+            // Taken at the top, before the null is skipped, and kept here for the match.
+            State::General(general) => general.update(args)?,
         }
         Ok(())
     }
@@ -482,6 +498,17 @@ impl Accumulator {
     ///
     /// The same errors [`Accumulator::update`] raises, for the same reasons.
     pub fn update_run(&mut self, args: &[Vector], rows: usize) -> Result<()> {
+        if let State::General(general) = &mut self.state {
+            let mut row_args = Vec::with_capacity(args.len());
+            for row in 0..rows {
+                row_args.clear();
+                for arg in args {
+                    row_args.push(arg.try_value_at(row)?);
+                }
+                general.update(&row_args)?;
+            }
+            return Ok(());
+        }
         if self.kind() == Kind::CountStar {
             if let State::Counted { count, .. } = &mut self.state {
                 *count += i64::try_from(rows).map_err(|_| overlong())?;
@@ -743,6 +770,7 @@ impl Accumulator {
                     }
                 }
             }
+            (State::General(general), State::General(other)) => general.combine(other)?,
             (here, there) => {
                 return Err(Error::internal(format!(
                     "combining a {here:?} aggregate state with a {there:?} one, which are not the \
@@ -762,6 +790,9 @@ impl Accumulator {
         // The arithmetic is in `answer` so that the run at a time finish below reaches the same
         // number by the same route. What is left here is turning that number into a `Value`, which
         // is the part the run at a time finish exists to skip.
+        if let State::General(general) = &self.state {
+            return general.finish();
+        }
         let Some(answer) = self.answer() else {
             let State::Extreme { held, .. } = &self.state else {
                 return Err(Error::internal(
@@ -846,7 +877,7 @@ impl Accumulator {
             State::Scaled { total, seen, .. } => {
                 Some(if *seen { Answer::Whole(*total) } else { Answer::Null })
             }
-            State::Extreme { .. } => None,
+            State::Extreme { .. } | State::General(_) => None,
         }
     }
 
@@ -878,7 +909,7 @@ impl Accumulator {
                     _ => None,
                 }
             }
-            State::Extreme { .. } => None,
+            State::Extreme { .. } | State::General(_) => None,
         }
     }
 
@@ -1179,6 +1210,47 @@ pub fn update_scattered(
     Ok(())
 }
 
+/// Folds every argument of one call into many accumulators a row at a time, for the aggregates in
+/// [`General`], or says `false` for any other aggregate and touches nothing.
+///
+/// The layout is the one [`update_scattered`] folds into, and the caller asks this first. These
+/// states take every argument of the call rather than the first one, and some of them keep a null
+/// where every aggregate the other paths serve skips it, so none of those paths can stand in.
+///
+/// # Errors
+///
+/// What [`Accumulator::update`] raises, and an internal error if the slots or the vectors are
+/// shorter than the rows.
+pub fn update_general(
+    states: &mut [Accumulator],
+    slots: &[usize],
+    stride: usize,
+    offset: usize,
+    inputs: &[Vector],
+    rows: usize,
+) -> Result<bool> {
+    if !matches!(states.get(offset), Some(Accumulator { state: State::General(_) })) {
+        return Ok(false);
+    }
+    if slots.len() < rows || inputs.iter().any(|input| input.len() < rows) {
+        return Err(Error::internal(format!("an aggregate handed {rows} rows and less to fold")));
+    }
+    let into = Where { slots: &slots[..rows], stride, offset };
+    let mut args = Vec::with_capacity(inputs.len());
+    for row in 0..rows {
+        let Some(index) = into.index(row) else { continue };
+        args.clear();
+        for input in inputs {
+            args.push(input.try_value_at(row)?);
+        }
+        let Some(state) = states.get_mut(index) else {
+            return Err(Error::internal(format!("an aggregate state at {index} is out of range")));
+        };
+        state.update(&args)?;
+    }
+    Ok(true)
+}
+
 /// Folds one vector into many accumulators a run of rows at a time, where every row of a run
 /// belongs to one group.
 ///
@@ -1217,6 +1289,9 @@ pub fn update_runs(
     let Some(first) = states.get(offset) else {
         return Ok(false);
     };
+    if first.kind() == Kind::General {
+        return Ok(false);
+    }
     let group = |slot: usize| (slot != NOWHERE).then(|| slot * stride + offset);
     if first.kind() == Kind::CountStar {
         count_runs(states, runs, group);
@@ -1593,6 +1668,7 @@ enum Feed {
 fn feed_of(first: &Accumulator, ty: &LogicalType) -> Option<Feed> {
     match (&first.state, ty) {
         (State::Counted { .. }, _) => Some(Feed::Counted),
+        (State::General(_), _) => None,
         // A whole total adds the integers of an integer column. The type is asked about rather
         // than taken for granted because a date and a timestamp are stored as integers too, and
         // summing one of those is not a thing you can do: the row at a time path says `summing a

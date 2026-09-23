@@ -30,7 +30,8 @@ use rudb_common::{
     stage,
 };
 use rudb_kernels::{
-    Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_runs, update_scattered,
+    Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_general, update_runs,
+    update_scattered,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -2070,7 +2071,9 @@ impl<'a> Aggregate<'a> {
                     &*kept
                 }
             };
-            update_scattered(states, picked, calls, at, arguments[at].first(), *length)?;
+            if !update_general(states, picked, calls, at, &arguments[at], *length)? {
+                update_scattered(states, picked, calls, at, arguments[at].first(), *length)?;
+            }
         }
         rows::capacity(table.owned(), charged_keys, scratch)?;
         containers.grow(aside)?;
