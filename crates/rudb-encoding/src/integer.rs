@@ -1184,16 +1184,21 @@ fn deltas(values: &[i64]) -> Option<Vec<i64>> {
     Some(deltas)
 }
 
+/// The value and the length of every run of equal neighbours.
+///
+/// Each run is found by walking to its end and pushed once. This used to push the first value of a
+/// run and then add one to the last length for every value after it, which kept both vectors'
+/// lengths in memory across the whole loop and was the hottest loop left in `encode_at` once the
+/// candidate tests became one pass.
 fn runs(values: &[i64]) -> (Vec<i64>, Vec<i64>) {
     let mut run_values: Vec<i64> = Vec::new();
     let mut run_lengths: Vec<i64> = Vec::new();
-    for value in values {
-        if run_values.last() == Some(value) {
-            *run_lengths.last_mut().expect("a run length exists beside every run value") += 1;
-        } else {
-            run_values.push(*value);
-            run_lengths.push(1);
-        }
+    let mut start = 0;
+    while let Some(&value) = values.get(start) {
+        let length = values[start..].iter().take_while(|other| **other == value).count();
+        run_values.push(value);
+        run_lengths.push(length as i64);
+        start += length;
     }
     (run_values, run_lengths)
 }
@@ -1450,6 +1455,13 @@ mod tests {
             }
             assert_eq!(candidates(&chunk, 0, &EXHAUSTIVE), expected, "{chunk:?}");
         }
+    }
+
+    #[test]
+    fn runs_are_every_stretch_of_equal_neighbours_in_order() {
+        assert_eq!(runs(&[]), (vec![], vec![]));
+        assert_eq!(runs(&[4]), (vec![4], vec![1]));
+        assert_eq!(runs(&[1, 1, 2, 1, 1, 1]), (vec![1, 2, 1], vec![2, 1, 3]));
     }
 
     #[test]
