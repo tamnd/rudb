@@ -119,7 +119,7 @@ impl StringView {
     }
 
     /// The same string after the arena it points into was laid `by` bytes further along.
-    fn shifted(self, by: u64) -> Self {
+    pub(crate) fn shifted(self, by: u64) -> Self {
         if self.is_inline() {
             return self;
         }
@@ -557,6 +557,16 @@ impl StringColumn {
         &self.arena
     }
 
+    /// Whether this column's own views read nearly all of its arena.
+    ///
+    /// The question [`Arenas`] asks of every arena it is about to lay, asked of one column on its own.
+    /// It is the difference between a column that was built to hold exactly these strings, where a
+    /// copy of the arena is a copy of the answer, and a cut of somebody else's page, where it drags
+    /// the rest of the page along. See the note on [`Arenas`] for what depends on that.
+    pub(crate) fn mostly_read(&self) -> bool {
+        Arenas::mostly_read(self.arena.len(), live_bytes(self))
+    }
+
     /// The views and the arena, taken out of the column rather than borrowed from it.
     ///
     /// What the string view form of a vector is built from. It takes `self` because the point of
@@ -673,7 +683,7 @@ impl Arenas {
             .sum()
     }
 
-    fn mostly_read(arena: usize, live: usize) -> bool {
+    pub(crate) fn mostly_read(arena: usize, live: usize) -> bool {
         arena <= live.saturating_add(live / 4)
     }
 

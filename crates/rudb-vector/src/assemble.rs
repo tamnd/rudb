@@ -39,14 +39,14 @@
 //! position per row and a flatten per piece to answer something that is a run of `memcpy`s, so it is
 //! its own function. What the two share is the typed append underneath both of them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Spread, Value};
 
 use crate::buffer::Buffer;
-use crate::string::{Arenas, StringView};
+use crate::string::{Arenas, StringColumn, StringView};
 use crate::validity::Validity;
 use crate::vector::{
     Data, Form, NOWHERE, Vector, copy_of, data_for, empty_data_for, layout_of, placed_of,
@@ -232,6 +232,151 @@ impl Assembly {
 pub fn concat<V: AsRef<Vector>>(ty: &LogicalType, pieces: &[V]) -> Result<Option<Vector>> {
     let pieces: Vec<&Vector> = pieces.iter().map(AsRef::as_ref).collect();
     laid(ty, &pieces)
+}
+
+/// The same, copying the pieces of a string column on whatever threads `spread` has.
+///
+/// # Why this exists at all
+///
+/// Because of where one caller lays its pieces. A link join reads the columns of its parent table in
+/// `Stream::prepare`, which runs once before any instance of the pipeline is handed out, so it runs
+/// with the whole thread lease parked and every nanosecond of it is on the pipeline's wall clock.
+/// Reading the parts of the column on the lease was #1575. This is the step after it, and on TPC-H
+/// q12's parent projection at scale factor one it measured as large as the reads: 18 to 73 ms of
+/// laying against 27 to 84 ms of parallel part reads.
+///
+/// # What it parallelises and what it does not
+///
+/// Strings whose pieces each own an arena, which is the one case where laying is a copy of every byte
+/// of the column rather than a copy of a view a row. Everything else goes down the same path
+/// [`concat()`] does, including the two cases that are already nearly free: pieces that share one
+/// arena, where laying is the views alone, and pieces that are adjacent windows of one page, where it
+/// is a handle. Fixed width pieces are also left serial, on the measurement above: the integer column
+/// of the same projection lays in 2 to 12 ms, so the copy is there but it is not what is worth a
+/// second code path yet.
+///
+/// The reason the string case is the expensive one is that a flat varchar piece owns its arena, so the
+/// serial walk has to be in order: each piece's views record offsets into the page being built and
+/// those offsets depend on where the previous piece ended. Every piece's arena length is known before
+/// anything is copied, though, so the offsets can be worked out in one pass over the lengths and then
+/// every piece copies its own bytes into its own slice of the page with nothing to wait for.
+///
+/// # Errors
+///
+/// What [`concat()`] errors on, and whatever `spread` reports. A piece is never the thing that fails
+/// here: by the time the copies start the shape has been checked and a copy into a slice of the right
+/// size cannot fail.
+pub fn concat_on<V: AsRef<Vector>>(
+    ty: &LogicalType,
+    pieces: &[V],
+    spread: &Spread<'_>,
+) -> Result<Option<Vector>> {
+    let pieces: Vec<&Vector> = pieces.iter().map(AsRef::as_ref).collect();
+    if let Some(strung) = strung(ty, &pieces, spread)? {
+        return Ok(Some(strung));
+    }
+    laid(ty, &pieces)
+}
+
+/// String pieces that each own an arena, laid into one page with a piece per task.
+///
+/// `None` is not a refusal to lay. It says these pieces are not the shape this handles and that
+/// [`laid`] should have them, which is every case where laying is not a copy of the bytes.
+fn strung(ty: &LogicalType, pieces: &[&Vector], spread: &Spread<'_>) -> Result<Option<Vector>> {
+    let Some(columns) = apart(ty, pieces) else {
+        return Ok(None);
+    };
+    // One pass over the lengths, which is the pass that makes the copies independent. `base` is where
+    // this piece's bytes land in the page and so is what its views are shifted by, and `from` is
+    // where its views land among the views.
+    let mut bases = Vec::with_capacity(columns.len());
+    let mut bytes = 0usize;
+    let mut rows = 0usize;
+    for column in &columns {
+        bases.push((bytes, rows));
+        bytes += column.arena().len();
+        rows += column.len();
+    }
+
+    // Zeroed rather than grown, so the page is one allocation of the right size and every task has
+    // somewhere to write before any of them starts. The zeroing of the arena costs nothing worth
+    // measuring because it is whole pages the allocator hands over untouched, and the views are
+    // sixteen bytes a row of `memset` that the copy below would be writing over anyway.
+    let mut arena = vec![0u8; bytes];
+    let mut views = vec![StringView::empty(); rows];
+    // Cut into a piece of arena and a piece of views per piece, because a task writing through a
+    // shared closure cannot be handed a `&mut` any other way and these are disjoint by construction.
+    // The lock is a formality: each one is taken exactly once by exactly one task.
+    let mut arena_rest: &mut [u8] = &mut arena;
+    let mut views_rest: &mut [StringView] = &mut views;
+    let mut slots = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let (arena_head, arena_tail) = arena_rest.split_at_mut(column.arena().len());
+        let (views_head, views_tail) = views_rest.split_at_mut(column.len());
+        slots.push(Mutex::new((arena_head, views_head)));
+        arena_rest = arena_tail;
+        views_rest = views_tail;
+    }
+
+    let task = |at: usize| {
+        let column = columns[at];
+        let (base, _) = bases[at];
+        let mut slot = slots[at].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (into_arena, into_views) = &mut *slot;
+        into_arena.copy_from_slice(column.arena());
+        let base = base as u64;
+        for (slot, view) in into_views.iter_mut().zip(column.views()) {
+            *slot = view.shifted(base);
+        }
+    };
+    spread(columns.len(), &task)?;
+    drop(slots);
+
+    let validity = run_of(pieces, rows);
+    let page = Vector::string_views(ty.clone(), views, Arc::new(Buffer::from(arena)))?;
+    Ok(Some(page.with_validity(validity)))
+}
+
+/// The pieces as string columns, when they are strings that each hold an arena of their own.
+///
+/// Four things are being asked, and each of them is a case that belongs to [`laid`] rather than a
+/// case this does worse.
+///
+/// More than one piece, because one piece is laid by handing its own arena back and copying it into a
+/// page of the same size would be a copy for nothing.
+///
+/// Flat pieces of this type, which is what [`laid`] requires of the general path anyway, and which
+/// rules out the stable dictionary and shared view shapes it answers earlier and more cheaply.
+///
+/// An arena the piece's own views read nearly all of. [`laid`] copies an arena whole only when it is
+/// mostly read and otherwise copies a string at a time, because a filtered cut of a Parquet page
+/// would drag the rest of the page along for as long as the result lives. A string at a time still
+/// writes a piece's bytes into a piece sized run, so it could be done here too, but a decoded part of
+/// a stored column is always entirely read and the other shape is not what this is for.
+///
+/// Arenas that are all different. Pieces sharing an arena are what a cut up page is, and [`laid`]
+/// copies a shared one once and shifts the views of every piece that points into it. Copying it once
+/// per piece here would be correct and would use more memory than the serial path, which is not a
+/// trade worth making for threads.
+fn apart<'a>(ty: &LogicalType, pieces: &[&'a Vector]) -> Option<Vec<&'a StringColumn>> {
+    if pieces.len() < 2 {
+        return None;
+    }
+    let mut columns = Vec::with_capacity(pieces.len());
+    let mut seen = HashSet::with_capacity(pieces.len());
+    for piece in pieces {
+        if piece.form() != Form::Flat || piece.logical_type() != ty || piece.is_empty() {
+            return None;
+        }
+        let Some(Data::Varlen(column)) = piece.data() else {
+            return None;
+        };
+        if !column.mostly_read() || !seen.insert(column.arena().as_ptr() as usize) {
+            return None;
+        }
+        columns.push(column);
+    }
+    Some(columns)
 }
 
 /// The body of [`concat()`], over borrowed pieces.
@@ -1324,6 +1469,111 @@ mod tests {
         let other =
             Vector::from_values(LogicalType::Integer, &[Value::Integer(1)]).expect("an int");
         assert!(concat(&ty, &[flat, other]).expect("no error").is_none(), "two types laid");
+    }
+
+    /// A [`Spread`] that runs each piece on a thread of its own, in no particular order.
+    ///
+    /// Not what the engine passes, which shares the pieces out over a fixed lease off a counter. This
+    /// is the harsher version on purpose: a thread per piece and nothing deciding who goes first is
+    /// the widest the interleaving can get, so anything in the copy that depends on piece order
+    /// happening to be arrival order shows up here.
+    fn on_a_thread_each(count: usize, task: &(dyn Fn(usize) + Sync)) -> Result<()> {
+        std::thread::scope(|scope| {
+            let running: Vec<_> =
+                (0..count).rev().map(|at| scope.spawn(move || task(at))).collect();
+            for thread in running {
+                thread.join().expect("a piece copier panicked");
+            }
+        });
+        Ok(())
+    }
+
+    /// A run of string pieces that each own an arena, which is what the parts of a stored column are.
+    ///
+    /// The strings are past the inline limit on purpose. A column of short strings has no arena worth
+    /// copying and would pass the same test without the offsets ever being exercised.
+    fn owned_strings(pieces: usize, each: usize) -> Vec<Vector> {
+        (0..pieces)
+            .map(|piece| {
+                let held: Vec<Value> = (0..each)
+                    .map(|row| match (piece + row) % 4 {
+                        0 => Value::Null,
+                        1 => Value::Varchar(format!("short {row}")),
+                        _ => Value::Varchar(format!(
+                            "a string of piece {piece} row {row} that is well past twelve bytes"
+                        )),
+                    })
+                    .collect();
+                Vector::from_values(LogicalType::Varchar, &held).expect("a run of strings")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn string_pieces_laid_on_many_threads_hold_the_same_strings_as_laid_on_one() {
+        let ty = LogicalType::Varchar;
+        let pieces = owned_strings(9, 7);
+        // Asserted rather than assumed. Every case below agrees with the serial path whichever path
+        // ran, so a test that only compared values would still pass if the shape check quietly
+        // stopped taking anything, and it is the shape check that this whole file turns on.
+        let borrowed: Vec<&Vector> = pieces.iter().collect();
+        assert!(apart(&ty, &borrowed).is_some(), "the parallel lay declined its own case");
+        let serial = concat(&ty, &pieces).expect("no error").expect("owned arenas lay");
+        let parallel = concat_on(&ty, &pieces, &on_a_thread_each)
+            .expect("no error")
+            .expect("owned arenas lay");
+        assert_eq!(parallel.len(), serial.len(), "the row count");
+        assert_eq!(values(&parallel), all_of(&pieces), "the values laid end to end");
+        assert_eq!(values(&parallel), values(&serial), "the two paths disagree");
+        // The form matters as much as the values. A gather off this is a gather off one page of views,
+        // and the serial path ends in the same place, so a caller cannot tell which one ran.
+        assert_eq!(parallel.form(), serial.form(), "a different body came out");
+    }
+
+    /// The shapes the parallel path hands back, each of which is a case the serial one does better.
+    #[test]
+    fn a_run_the_parallel_lay_does_not_own_is_left_to_the_serial_one() {
+        let ty = LogicalType::Varchar;
+        let pieces = owned_strings(3, 5);
+        assert!(apart(&ty, &[&pieces[0]]).is_none(), "one piece was taken");
+        // Cuts of one page share an arena, and the serial path copies it once and shifts the views of
+        // every cut. Copying it per cut here would hold it three times over.
+        let page = concat(&ty, &pieces).expect("no error").expect("a page").into_pages();
+        let cut = |from: usize, len: usize| page.slice(from, len).expect("a window");
+        let cuts = [cut(0, 4), cut(4, 6), cut(10, 5)];
+        let borrowed: Vec<&Vector> = cuts.iter().collect();
+        assert!(apart(&ty, &borrowed).is_none(), "cuts of one page were taken");
+        // And a run that goes down the shared view path answers the same either way, which is the
+        // thing the fall through is there to preserve.
+        let serial = concat(&ty, &cuts).expect("no error").expect("shared views lay");
+        let parallel =
+            concat_on(&ty, &cuts, &on_a_thread_each).expect("no error").expect("shared views");
+        assert_eq!(values(&parallel), values(&serial), "the fall through changed the answer");
+    }
+
+    /// A piece whose arena holds bytes nobody reads is the filtered cut of a Parquet page, and taking
+    /// it would carry the rest of the page along for as long as the result lives.
+    #[test]
+    fn a_piece_holding_more_arena_than_it_reads_is_left_to_the_serial_lay() {
+        let ty = LogicalType::Varchar;
+        let pieces = owned_strings(2, 8);
+        let page = concat(&ty, &pieces).expect("no error").expect("a page");
+        // One row out of sixteen, so the arena is far larger than the one string read out of it. The
+        // slice keeps the whole arena, which is exactly the case being asked about.
+        let thin = page.slice(2, 1).expect("a window").flatten().expect("flattened");
+        let fat = page.slice(3, 1).expect("a window").flatten().expect("flattened");
+        let held = [thin, fat];
+        let borrowed: Vec<&Vector> = held.iter().collect();
+        if borrowed.iter().all(|piece| match piece.data() {
+            Some(Data::Varlen(column)) => !column.mostly_read(),
+            _ => false,
+        }) {
+            assert!(apart(&ty, &borrowed).is_none(), "a mostly unread arena was taken");
+        }
+        let serial = concat(&ty, &held).expect("no error").expect("flat pieces lay");
+        let parallel =
+            concat_on(&ty, &held, &on_a_thread_each).expect("no error").expect("flat pieces");
+        assert_eq!(values(&parallel), values(&serial), "the two paths disagree");
     }
 
     /// Pieces of every form a sort hands over, read back through an order, against the same order

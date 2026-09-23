@@ -32,6 +32,7 @@ pub mod memory;
 pub mod rules;
 pub mod session;
 pub mod slow;
+pub mod spread;
 pub mod stage;
 pub mod stat;
 pub mod types;
@@ -48,6 +49,7 @@ pub use session::{
     DefaultNullOrder, IdentifierCase, Semantics, Session, SessionTimeZone, ShowBehavior,
 };
 pub use slow::{Cause, Tally};
+pub use spread::{Spread, serially};
 pub use stage::{Spent, Stage};
 pub use stat::{Class, Classes, Direction, Provenance, Stat, Use};
 pub use types::{Field, LogicalType, MAX_DECIMAL_WIDTH, PhysicalType};
