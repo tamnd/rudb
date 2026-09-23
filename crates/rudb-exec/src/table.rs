@@ -32,6 +32,7 @@
 
 use rudb_common::bounds::Bound;
 use rudb_common::{Error, Result, Value, interval_micros};
+use rudb_kernels::NOWHERE;
 use rudb_vector::{Data, Packed, Vector};
 use std::sync::Arc;
 
@@ -1068,6 +1069,45 @@ impl<'a> Coded<'a> {
         }
     }
 
+    /// Answers each row's slot straight out of `map`, for a key of one or two dictionary columns
+    /// with no nulls, and says whether any row found nothing there.
+    ///
+    /// That is the key of TPC-H q1, and [`Self::places`] followed by a lookup was two passes and a
+    /// vector of places for it, one pass to write each row's place and one to read it back. Here a
+    /// row's place is worked out in a register and used at once. The rows that found nothing are
+    /// the first of each combination and need their place again, so when there are any the caller
+    /// asks [`Self::places`] for them the long way. `None` is a key this does not answer.
+    pub(crate) fn look_up(&self, map: &[usize], slots: &mut [usize]) -> Option<bool> {
+        let mut plain = self.columns.iter().flatten().map(|column| match column.places {
+            Places::Codes { codes, .. } if !column.nullable => Some((codes, column.stride)),
+            _ => None,
+        });
+        let (first, stride) = plain.next()??;
+        let second = plain.next();
+        if plain.next().is_some() {
+            return None;
+        }
+        let mut missed = false;
+        match second {
+            None => {
+                for (slot, &code) in slots.iter_mut().zip(first) {
+                    let found = map[code as usize * stride];
+                    missed |= found == NOWHERE;
+                    *slot = found;
+                }
+            }
+            Some(second) => {
+                let (other, across) = second?;
+                for ((slot, &code), &next) in slots.iter_mut().zip(first).zip(other) {
+                    let found = map[code as usize * stride + next as usize * across];
+                    missed |= found == NOWHERE;
+                    *slot = found;
+                }
+            }
+        }
+        Some(missed)
+    }
+
     /// Whether these are the same things `held` was filled from, so the map still means what it
     /// meant.
     pub(crate) fn same_as(&self, held: &[Origin]) -> bool {
@@ -1399,10 +1439,10 @@ fn places_of(key: &Vector, rows: usize, room: usize) -> Option<(Places<'_>, usiz
     // sixteen, and the map's identity is the page's, so the chunk after this one reuses it.
     if let Some((at, values)) = key.dictionary_parts() {
         if let Some(packed) = values.packed_parts() {
+            // No code here needs checking against the payload. A dictionary vector is range checked
+            // when it is built and nothing changes its codes after, so the check that used to sit
+            // here was a second pass over every row of a chunk to learn what was already known.
             let at = at.get(..rows)?;
-            if at.iter().any(|&code| code as usize >= values.len()) {
-                return None;
-            }
             let span = 1_usize.checked_shl(packed.width())?.checked_add(1)?;
             if span > room {
                 return None;
@@ -1419,9 +1459,6 @@ fn places_of(key: &Vector, rows: usize, room: usize) -> Option<(Places<'_>, usiz
         let codes = codes.get(..rows)?;
         let span = values.len().checked_add(1)?;
         if span > room {
-            return None;
-        }
-        if codes.iter().any(|&code| code as usize >= values.len()) {
             return None;
         }
         // Whether any row here can be null at all, asked once for the chunk. The cheap answer comes

@@ -9429,22 +9429,17 @@ fn decode(
             if wide.len() != rows {
                 return Err(invalid("encoded code page holds the wrong number of rows"));
             }
-            // Converted in one pass and checked in the same one, rather than a fallible conversion
-            // per code. A `Result` an element is a short circuit the loop cannot be vectorized past,
-            // and it was costing about twelve instructions a row to narrow a number that already
-            // fits. Every code a file holds is inside a `u32` or the file is corrupt, so the check
-            // belongs once at the end: or the codes together and the answer has a bit set above the
-            // low thirty two, or the sign bit, exactly when one of them did.
-            let mut codes = Vec::with_capacity(wide.len());
-            let mut seen = 0_i64;
-            for &code in &wide {
-                seen |= code;
-                codes.push(code as u32);
-            }
+            // Checked once for the page rather than a fallible conversion per code. Every code a
+            // file holds is inside a `u32` or the file is corrupt, so or the codes together and the
+            // answer has a bit set above the low thirty two, or the sign bit, exactly when one of
+            // them did. The or and the narrowing are two passes because each is then a vector
+            // loop. As one loop with a `push` a code, the length check and the store kept it scalar,
+            // and it was sixteen instructions a row on the two flag columns of q1.
+            let seen = wide.iter().fold(0_i64, |seen, &code| seen | code);
             if seen < 0 || seen > i64::from(u32::MAX) {
                 return Err(invalid("code is not a code"));
             }
-            codes
+            wide.iter().map(|&code| code as u32).collect()
         } else {
             let mut codes = Vec::with_capacity(rows);
             for _ in 0..rows {

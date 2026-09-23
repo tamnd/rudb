@@ -1983,11 +1983,15 @@ fn packed_into<M: Fn(usize) -> usize>(
     let wide = input.logical_type().physical() == PhysicalType::UInt128;
     let scale = decimal_scale(input.logical_type());
     let base = packed.base();
+    // Every code the loops below read, unpacked in bulk before any of them runs. See
+    // [`rudb_vector::Packed::unpack`] for what a code at a time was costing.
+    let codes = packed.codes_at(at, rows);
+    let code = |row: usize| codes[row];
     // A base inside 64 bits and a code of at most 64 is a value inside 65, which is small enough for
     // [`few`]'s unchecked local totals. A base past that is a column no packing here has built.
     if !wide
         && i64::try_from(base).is_ok()
-        && few(states, into, rows, nulls, feed, |row| base + i128::from(packed.code(at(row))))?
+        && few(states, into, rows, nulls, feed, |row| base + i128::from(code(row)))?
     {
         return Ok(true);
     }
@@ -2007,7 +2011,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                     return Err(Error::internal("an exact total into another".to_string()));
                 };
                 *total = total
-                    .checked_add(base + i128::from(packed.code(at(row))))
+                    .checked_add(base + i128::from(code(row)))
                     .ok_or_else(overflowed)?;
                 *seen = true;
             });
@@ -2020,7 +2024,7 @@ fn packed_into<M: Fn(usize) -> usize>(
             }
             live_rows!(nulls, rows, |row| {
                 let Some(index) = into.index(row) else { continue };
-                let number = base + i128::from(packed.code(at(row)));
+                let number = base + i128::from(code(row));
                 let State::Mean { total, seen, exact, scale: held, .. } = &mut states[index].state
                 else {
                     return Err(Error::internal("a mean into another".to_string()));
@@ -2039,7 +2043,7 @@ fn packed_into<M: Fn(usize) -> usize>(
             let scaled = scale != 0;
             live_rows!(nulls, rows, |row| {
                 let Some(index) = into.index(row) else { continue };
-                let number = (base + i128::from(packed.code(at(row)))) as f64;
+                let number = (base + i128::from(code(row))) as f64;
                 fold_real(&mut states[index], if scaled { number / factor } else { number });
             });
             Ok(true)
@@ -2050,7 +2054,7 @@ fn packed_into<M: Fn(usize) -> usize>(
             }
             live_rows!(nulls, rows, |row| {
                 let Some(index) = into.index(row) else { continue };
-                let number = base + i128::from(packed.code(at(row)));
+                let number = base + i128::from(code(row));
                 let State::Extreme { held, .. } = &mut states[index].state else {
                     return Err(Error::internal("an extreme into a total".to_string()));
                 };
