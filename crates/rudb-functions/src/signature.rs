@@ -1548,13 +1548,18 @@ fn carrying(common: LogicalType) -> LogicalType {
 /// error to raise at that point, so the accumulator is the widest integer there is and the answer
 /// is right. A float sums into a double for the same reason and a double stays a double, since
 /// there is nothing wider to go to.
+///
+/// A decimal keeps its scale and takes the widest width, for the integer's reason: a column of
+/// `DECIMAL(3,1)` that holds 99.9 a hundred times sums to 9990.0, which does not fit in three
+/// digits, and the pin answers `DECIMAL(38,1)` whatever the column's width was.
 fn accumulator(ty: &LogicalType) -> LogicalType {
-    if ty.is_integer() {
-        LogicalType::HugeInt
-    } else if *ty == LogicalType::Float {
-        LogicalType::Double
-    } else {
-        ty.clone()
+    match ty {
+        _ if ty.is_integer() => LogicalType::HugeInt,
+        LogicalType::Float => LogicalType::Double,
+        LogicalType::Decimal { scale, .. } => {
+            LogicalType::Decimal { width: MAX_DECIMAL_WIDTH, scale: *scale }
+        }
+        _ => ty.clone(),
     }
 }
 
