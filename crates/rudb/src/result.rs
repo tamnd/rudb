@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rudb_arrow::{DataType, Field, RecordBatch, Schema};
 use rudb_common::{LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_metrics::Document;
-use rudb_vector::Chunk;
+use rudb_vector::{Chunk, Vector};
 
 fn unix_micros() -> i64 {
     std::time::SystemTime::now()
@@ -50,6 +50,9 @@ pub struct QueryResult {
     session: Session,
     /// The instant used to choose the offset for a zoned time with no date of its own.
     rendered_at: i64,
+    /// How many rows the statement wrote, when this is the count a writing statement answers with
+    /// rather than rows a query produced.
+    changes: Option<usize>,
 }
 
 impl QueryResult {
@@ -78,6 +81,7 @@ impl QueryResult {
             metrics: None,
             session: Session::new(),
             rendered_at: unix_micros(),
+            changes: None,
         }
     }
 
@@ -127,6 +131,34 @@ impl QueryResult {
     #[must_use]
     pub(crate) fn empty() -> Self {
         Self::new(Vec::new(), Vec::new(), Vec::new(), Memory::unlimited().reservation())
+    }
+
+    /// What an `INSERT`, `UPDATE` or `DELETE` answers, which on the pin is one `Count` column of
+    /// one row holding how many rows it wrote.
+    ///
+    /// A column the caller did not ask for, unlike the empty result above, because the corpus
+    /// checks the count with a query record and a program asks how many rows an update touched.
+    /// [`Self::changes`] is what tells it apart from a query that happened to produce the same
+    /// shape.
+    pub(crate) fn changed(rows: usize) -> Result<Self> {
+        let count = i64::try_from(rows).unwrap_or(i64::MAX);
+        let vector = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(count)])?;
+        let chunk = Chunk::new(vec![vector])?;
+        let mut result = Self::new(
+            vec!["Count".to_owned()],
+            vec![LogicalType::BigInt],
+            vec![chunk],
+            Memory::unlimited().reservation(),
+        );
+        result.changes = Some(rows);
+        Ok(result)
+    }
+
+    /// How many rows the statement wrote, when it was an `INSERT`, `UPDATE` or `DELETE`, and
+    /// `None` when the rows are the answer to a query.
+    #[must_use]
+    pub fn changes(&self) -> Option<usize> {
+        self.changes
     }
 
     /// The column names, in order.

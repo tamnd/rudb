@@ -157,6 +157,9 @@ pub struct Insert {
     /// Whether the rows are the whole table afterwards rather than rows to add to it, which is
     /// what an `UPDATE` and a `DELETE` bind to.
     pub replace: bool,
+    /// Whether the source has one more column after the table's, a flag saying which rows the
+    /// statement changed, which is how an `UPDATE` counts what it changed without keeping it.
+    pub flagged: bool,
 }
 
 /// Binds one parsed statement against a catalog.
@@ -684,7 +687,12 @@ fn insert(
     let names = binder.plan_mut().add_name_list(&names);
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
-    Ok(Bound::Insert(Insert { name, source: finish(binder, root)?, replace: false }))
+    Ok(Bound::Insert(Insert {
+        name,
+        source: finish(binder, root)?,
+        replace: false,
+        flagged: false,
+    }))
 }
 
 /// An `UPDATE` or a `DELETE`, bound to the query that produces every row the table has afterwards.
@@ -768,9 +776,21 @@ fn change(
         let interned = binder.plan_mut().intern(&field.name);
         names.push(interned);
     }
+    // A deleted row is not in the output at all, so the rows a `DELETE` removed are the ones the
+    // table lost, and only an `UPDATE` needs the flag to say which rows it changed.
+    if !delete {
+        let yes = binder.add_constant(Value::Boolean(true));
+        let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then: yes }]);
+        let otherwise = Some(binder.add_constant(Value::Boolean(false)));
+        exprs
+            .push(binder.plan_mut().add_expr(Expr::Case { arms, otherwise }, LogicalType::Boolean));
+        let interned = binder.plan_mut().intern("changed");
+        names.push(interned);
+    }
     let exprs = binder.plan_mut().add_expr_list(&exprs);
     let names = binder.plan_mut().add_name_list(&names);
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
-    Ok(Bound::Insert(Insert { name, source: finish(binder, root)?, replace: true }))
+    let source = finish(binder, root)?;
+    Ok(Bound::Insert(Insert { name, source, replace: true, flagged: !delete }))
 }

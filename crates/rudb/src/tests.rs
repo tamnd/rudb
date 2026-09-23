@@ -9134,3 +9134,25 @@ fn a_file_keeps_what_committed_and_loses_what_rolled_back_or_was_left_open() {
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_write_answers_with_the_count_of_rows_it_wrote_the_way_the_pin_does() {
+    let db = Database::new();
+    let count = |sql: &str| {
+        let result = db.execute(sql).unwrap();
+        assert_eq!(result.names(), ["Count"]);
+        assert_eq!(result.types(), [LogicalType::BigInt]);
+        assert_eq!(result.text_at(0, 0), result.changes().unwrap().to_string());
+        result.changes().unwrap()
+    };
+    assert!(db.execute("CREATE TABLE t (a INTEGER, b VARCHAR)").unwrap().changes().is_none());
+    assert_eq!(count("INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'z')"), 3);
+    assert_eq!(count("INSERT INTO t SELECT * FROM t WHERE a > 5"), 0);
+    assert_eq!(count("UPDATE t SET b = 'q' WHERE a >= 2"), 2);
+    assert_eq!(count("UPDATE t SET b = 'q' WHERE b IS NULL"), 0);
+    assert_eq!(count("UPDATE t SET a = a + 1"), 3);
+    assert_eq!(rows(&db, "SELECT a, b FROM t ORDER BY a").len(), 3);
+    assert_eq!(count("DELETE FROM t WHERE a = 2"), 1);
+    assert_eq!(count("DELETE FROM t"), 2);
+    assert!(db.query("SELECT 1").unwrap().changes().is_none());
+}

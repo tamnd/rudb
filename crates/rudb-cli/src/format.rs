@@ -237,8 +237,11 @@ pub fn escaped(text: &str) -> String {
 }
 
 /// Prints a result.
+///
+/// The count an `INSERT`, `UPDATE` or `DELETE` answers with is not printed, the same as DuckDB's
+/// shell, which renders only what a query returns.
 pub fn render(result: &QueryResult, settings: &Settings) -> String {
-    if result.width() == 0 {
+    if result.width() == 0 || result.changes().is_some() {
         return String::new();
     }
     // `duckbox` is the only mode that leaves rows out, so it is the only mode that needs fewer cells
