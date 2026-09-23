@@ -2134,8 +2134,8 @@ impl<'a> Under<'a> {
     }
 }
 
-/// Direct counts and the three summary-backed Q3 aggregates over one immutable native table can
-/// use the cache. A filter is accepted only when its written form has no changing calls.
+/// Direct counts, one average, and the three Q3 aggregates over an immutable native table can use
+/// the cache. A filter is accepted only when its written form has no changing calls.
 fn is_native_summary_aggregate(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
     let Node::Project { input, exprs, .. } = *plan.node(plan.root()) else { return false };
     let Node::Aggregate { input, index, groups, aggregates } = *plan.node(input) else {
@@ -2178,9 +2178,10 @@ fn is_native_summary_aggregate(ast: &Ast, plan: &Plan, catalog: &Catalog) -> boo
             })
     };
     let supported = match aggregates {
-        [count] => {
-            direct_aggregate(*count, "count_star", 0)
-                && (filtered || plan.field_list(columns).is_empty())
+        [aggregate] => {
+            (direct_aggregate(*aggregate, "count_star", 0)
+                && (filtered || plan.field_list(columns).is_empty()))
+                || (!filtered && direct_aggregate(*aggregate, "avg", 1))
         }
         [sum, count, avg] if !filtered => {
             direct_aggregate(*sum, "sum", 1)

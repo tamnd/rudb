@@ -107,3 +107,47 @@ fn a_native_three_aggregate_summary_reuses_its_plan_until_the_table_changes() {
     database.close().expect("close the file");
     std::fs::remove_file(path).expect("remove the fixture");
 }
+
+#[test]
+fn a_native_average_reuses_its_plan_until_the_table_changes() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-average-plan-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let database = Database::open(name).expect("open the file");
+    database.execute("CREATE TABLE hits (i INTEGER)").expect("create the table");
+    database.execute("INSERT INTO hits VALUES (1), (2), (NULL)").expect("insert rows");
+    database.close().expect("persist the native table");
+
+    let database = Database::open(name).expect("reopen the native table");
+    let sql = "SELECT AVG(i) FROM hits";
+    let first = database.execute(sql).expect("first average");
+    assert_eq!(first.value_at(0, 0), Value::Double(1.5));
+    assert!(first.metrics().expect("metrics").timing.bind_ns > 0);
+    let repeated = database.execute(sql).expect("repeated average");
+    assert_eq!(repeated.value_at(0, 0), first.value_at(0, 0));
+    assert_eq!(repeated.metrics().expect("metrics").timing.bind_ns, 0);
+
+    let derived = "SELECT AVG(i + 1) FROM hits";
+    for _ in 0..2 {
+        let answer = database.execute(derived).expect("derived average");
+        assert!(answer.metrics().expect("metrics").timing.bind_ns > 0);
+    }
+
+    database.execute("SET default_order = 'DESC'").expect("change a setting");
+    let after_setting = database.execute(sql).expect("average after setting");
+    assert_eq!(after_setting.value_at(0, 0), first.value_at(0, 0));
+    assert!(after_setting.metrics().expect("metrics").timing.bind_ns > 0);
+
+    database.execute("INSERT INTO hits VALUES (5)").expect("grow the table");
+    let after_insert = database.execute(sql).expect("average after insert");
+    assert_ne!(after_insert.value_at(0, 0), first.value_at(0, 0));
+    assert!(after_insert.metrics().expect("metrics").timing.bind_ns > 0);
+    database.close().expect("close the file");
+    std::fs::remove_file(path).expect("remove the fixture");
+}
