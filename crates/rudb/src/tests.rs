@@ -1934,6 +1934,164 @@ fn a_lambda_is_refused_the_way_the_pin_refuses_it() {
     );
 }
 
+/// `list_reduce` folds a list left to right, and the accumulator's type is the pin's. Per #467.
+///
+/// The types are the part worth pinning down. The pin binds the body a second time with the
+/// accumulator widened to what the first binding made, so a decimal sum gains a digit per binding,
+/// and every type below is one it printed.
+#[test]
+fn a_reduction_folds_a_list_into_one_value() {
+    let db = database();
+    let one = |sql: &str| rows(&db, sql);
+    assert_eq!(one("SELECT list_reduce([1, 2, 3], lambda x, y: x + y)"), vec![vec![integer(6)]]);
+    assert_eq!(
+        db.query("SELECT list_reduce([1, 2, 3], lambda x, y: x + y)").unwrap().names(),
+        ["list_reduce(list_value(1, 2, 3), (lambda x, y: (x + y)))"]
+    );
+    assert_eq!(
+        one("SELECT list_reduce([1, 2, 3], lambda x, y, i: x + y * i)"),
+        vec![vec![Value::BigInt(14)]]
+    );
+    assert_eq!(
+        one("SELECT list_reduce([1, 2, 3], lambda x, y: x + y, 100)"),
+        vec![vec![integer(106)]]
+    );
+    assert_eq!(
+        one("SELECT list_reduce([1, 2, 3], lambda x, y: x || y::VARCHAR, '')"),
+        vec![vec![text("123")]]
+    );
+    assert_eq!(one("SELECT list_reduce(['a', 'b'], lambda x, y: x || y)"), vec![vec![text("ab")]]);
+    assert_eq!(one("SELECT list_reduce([5], lambda x, y: x + y)"), vec![vec![integer(5)]]);
+    assert_eq!(one("SELECT list_reduce([]::INT[], lambda x, y: x + y, 7)"), vec![vec![integer(7)]]);
+    assert_eq!(
+        one("SELECT list_reduce([1, NULL, 3], lambda x, y: x + y)"),
+        vec![vec![Value::Null]]
+    );
+    assert_eq!(one("SELECT list_reduce(NULL, lambda x, y: x + y)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        one("SELECT typeof(list_reduce(NULL, lambda x, y: x + y))"),
+        vec![vec![text("\"NULL\"")]]
+    );
+    assert_eq!(
+        one("SELECT list_reduce([1, 2], lambda x, y: x + y, NULL)"),
+        vec![vec![Value::Null]]
+    );
+    assert_eq!(
+        one("SELECT typeof(list_reduce([1, 2], lambda x, y: x + y, NULL))"),
+        vec![vec![text("INTEGER")]]
+    );
+    // The position starts at 2 without an initial value, since the first element is the start.
+    assert_eq!(
+        one("SELECT list_reduce([1, 2, 3], lambda x, y, i: i)"),
+        vec![vec![Value::BigInt(3)]]
+    );
+    assert_eq!(
+        one("SELECT list_reduce([1, 2, 3], lambda x, y, i: i, 0)"),
+        vec![vec![Value::BigInt(3)]]
+    );
+    // A comparison is carried as the element's type, because a boolean meets a number there.
+    assert_eq!(one("SELECT list_reduce([1, 2, 3], lambda x, y: x > y)"), vec![vec![integer(0)]]);
+    assert_eq!(
+        one("SELECT typeof(list_reduce([1, 2], lambda x, y: x > y))"),
+        vec![vec![text("INTEGER")]]
+    );
+    for (sql, ty, answer) in [
+        ("list_reduce([1.5, 2, 3], lambda x, y: x + y)", "DECIMAL(13,1)", "6.5"),
+        ("list_reduce([1, 2, 3], lambda x, y: x + y, 1.5)", "DECIMAL(12,1)", "7.5"),
+        ("list_reduce([1000, 2000, 3000], lambda x, y: x + y, 1.5)", "DECIMAL(12,1)", "6001.5"),
+        // The pin prints 225.00 here, one scale digit lost per step, which is tamnd/duckdb#13.
+        ("list_reduce([1, 2, 3], lambda x, y: x * 1.5)", "DECIMAL(14,2)", "2.25"),
+        ("list_reduce([1, 2, 3], lambda x, y: x + y + 0.5)", "DECIMAL(14,1)", "7.0"),
+    ] {
+        assert_eq!(one(&format!("SELECT typeof({sql})")), vec![vec![text(ty)]], "{sql}");
+        assert_eq!(one(&format!("SELECT ({sql})::VARCHAR")), vec![vec![text(answer)]], "{sql}");
+    }
+    assert_eq!(
+        one("SELECT list_reduce([[1], [2, 3]], lambda x, y: list_concat(x, y))"),
+        vec![vec![list(&[1, 2, 3])]]
+    );
+    assert_eq!(
+        one("SELECT array_reduce([1, 2], lambda x, y: x * y), reduce([1, 2], lambda x, y: x * y)"),
+        vec![vec![integer(2), integer(2)]]
+    );
+    // Longer than a chunk, which a reduction runs a position at a time and not in batches.
+    let long: Vec<String> = (1..=3000).map(|n| n.to_string()).collect();
+    assert_eq!(
+        one(&format!("SELECT list_reduce([{}], lambda x, y: x + y)", long.join(", "))),
+        vec![vec![integer(4_501_500)]]
+    );
+}
+
+/// A reduction per row, with lists of different lengths and an initial value from a column.
+#[test]
+fn a_reduction_runs_per_row() {
+    let db = database();
+    db.execute("CREATE TABLE lr (l INTEGER[], k INTEGER)").unwrap();
+    db.execute("INSERT INTO lr VALUES ([1, 2], 10), (NULL, 20), ([], 30), ([3], 40)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT list_reduce(l, lambda x, y: x + y, k) FROM lr"),
+        vec![vec![integer(13)], vec![Value::Null], vec![integer(30)], vec![integer(43)]]
+    );
+    assert_eq!(
+        db.query("SELECT list_reduce(l, lambda x, y: x + y, k) FROM lr").unwrap().names(),
+        ["list_reduce(l, (lambda x, y: (x + y)), k)"]
+    );
+    assert_eq!(
+        rows(&db, "SELECT list_reduce(l, lambda x, y: x + y, NULL::INT) FROM lr"),
+        vec![vec![Value::Null]; 4]
+    );
+    assert_eq!(
+        rows(&db, "SELECT list_reduce(l, lambda x, y: x + y + k) FROM lr WHERE k <> 30"),
+        vec![vec![integer(13)], vec![Value::Null], vec![integer(3)]]
+    );
+    // The empty list is refused when its row is reached, not when the query is bound.
+    let error = db.query("SELECT list_reduce(l, lambda x, y: x + y + k) FROM lr").unwrap_err();
+    assert_eq!(error.code(), rudb_common::ErrorCode::ParameterNotAllowed);
+    assert_eq!(error.message(), "Cannot perform list_reduce on an empty input list");
+}
+
+/// What the pin refuses about a reduction, in its words. Per #467.
+#[test]
+fn a_reduction_is_refused_the_way_the_pin_refuses_it() {
+    let db = database();
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([], lambda x, y: x + y)"),
+        "Cannot perform list_reduce on an empty input list"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([1, 2], lambda x: x)"),
+        "list_reduce expects a function with 2 or 3 arguments"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([1, 2], lambda x, y, z, w: x)"),
+        "This lambda function only supports up to three lambda parameters!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([1, 2])"),
+        "No function matches the given name and argument types 'list_reduce(INTEGER[])'. You \
+         might need to add explicit type casts.\n\tCandidate functions:\n\tlist_reduce(col0 \
+         ANY[], col1 LAMBDA) -> ANY\n\tlist_reduce(col0 ANY[], col1 LAMBDA, col2 ANY) -> ANY\n"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([1, 2], lambda x, y: [x, y])"),
+        "No common super type between list element type INTEGER and lambda return type INTEGER[]"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([1, 2], lambda x, y: [x], [0])"),
+        "No common super type between initial value type INTEGER[] and lambda return type \
+         INTEGER[][]"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([1, 0], lambda x, y: x // y)"),
+        "Division by zero in expression (x // y). Use TRY(...) to return NULL for this \
+         expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero."
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_reduce([100, 100, 100]::TINYINT[], lambda x, y: x + y)"),
+        "Overflow in addition of INT8 (100 + 100)!"
+    );
+}
+
 /// What the struct vector changes that a query can see today. Per #594.
 ///
 /// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put

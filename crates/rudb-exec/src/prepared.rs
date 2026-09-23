@@ -201,6 +201,8 @@ enum Step {
     Lambda {
         /// The list's step.
         list: usize,
+        /// The initial value's step, for a `list_reduce` that has one.
+        initial: Option<usize>,
         /// The layout of what the body runs over and what to do with its answers.
         runner: Box<Lambda>,
         /// The body, prepared against the runner's schema.
@@ -365,7 +367,12 @@ impl Prepared {
             // A case's branches are arrays of their own and read nothing out of this one.
             Step::Column(_) | Step::Constant(_) | Step::Case { .. } => {}
             Step::Cast { input, .. } | Step::InSet { input, .. } => visit(*input),
-            Step::Lambda { list, .. } => visit(*list),
+            Step::Lambda { list, initial, .. } => {
+                visit(*list);
+                if let Some(initial) = initial {
+                    visit(*initial);
+                }
+            }
             Step::Compare { left, right, .. } => {
                 visit(*left);
                 visit(*right);
@@ -819,10 +826,14 @@ impl Prepared {
             Step::Case { arms, otherwise, blend } => {
                 Some(self.case(chunk, arms, otherwise.as_ref(), blend.as_ref(), ty)?)
             }
-            Step::Lambda { list, runner, body } => {
+            Step::Lambda { list, initial, runner, body } => {
                 let list = self.operand(*list, chunk, slots)?;
+                let initial = match initial {
+                    Some(initial) => Some(self.operand(*initial, chunk, slots)?),
+                    None => None,
+                };
                 let mut scratch = body.scratch();
-                Some(runner.run(list, chunk, &mut |inner| {
+                Some(runner.run(list, initial, chunk, &mut |inner| {
                     body.evaluate_one(inner, &mut scratch).cloned()
                 })?)
             }
@@ -1030,7 +1041,7 @@ impl Prepared {
                 }
             }
             Expr::Function { name, args } if lambda_call(plan, args).is_some() => {
-                let Some((list, lambda)) = lambda_call(plan, args) else {
+                let Some((list, lambda, initial)) = lambda_call(plan, args) else {
                     return Err(Error::internal("a lambda call without a lambda"));
                 };
                 let Expr::Lambda { body, .. } = *plan.expr(lambda) else {
@@ -1038,11 +1049,12 @@ impl Prepared {
                 };
                 let runner = Lambda::new(plan, plan.string(name), list, lambda, schema)?;
                 let body = Self::one(plan, body, runner.schema())?;
-                Step::Lambda {
-                    list: self.push(plan, list, schema)?,
-                    runner: Box::new(runner),
-                    body: Box::new(body),
-                }
+                let list = self.push(plan, list, schema)?;
+                let initial = match initial {
+                    Some(initial) => Some(self.push(plan, initial, schema)?),
+                    None => None,
+                };
+                Step::Lambda { list, initial, runner: Box::new(runner), body: Box::new(body) }
             }
             Expr::LambdaParam(binding) => {
                 let position = schema.position_of(binding).ok_or_else(|| {
