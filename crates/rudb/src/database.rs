@@ -1730,7 +1730,7 @@ fn declared(
 /// 19.9 s at 524,288, and the smallest target wrote a 2.31 GiB file against 1.55 GiB for the other
 /// two, because short stripes compress worse. The largest peaked at 6.46 GiB of memory against 3.37
 /// GiB, so this is the middle one: the file size and query speed of a full stripe at half its peak.
-const GATHER_ROWS: usize = 131_072;
+const GATHER_ROWS: usize = 65_536;
 
 /// The root of a file-backed initial insert.
 #[derive(Debug)]
