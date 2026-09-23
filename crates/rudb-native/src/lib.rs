@@ -5653,6 +5653,30 @@ impl Catalog {
     ///
     /// If the directory, selected page index, checksum, or encoded integer is invalid.
     pub fn integer_tally(&self, name: &str, column: usize) -> Result<Option<Vec<(i64, u64)>>> {
+        let mut counts = BTreeMap::<i64, u64>::new();
+        let Some(()) = self.integer_fold(name, column, |value, count| {
+            let held = counts.entry(value).or_default();
+            *held = held.checked_add(count).ok_or_else(|| invalid("integer count overflow"))?;
+            Ok(())
+        })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(counts.into_iter().collect()))
+    }
+
+    /// Visits a signed integer column's row values without building per-part or table-wide count
+    /// maps. The caller combines the emitted counts for its query at runtime.
+    ///
+    /// # Errors
+    ///
+    /// If the selected file data is invalid or the callback rejects a count.
+    pub fn integer_fold(
+        &self,
+        name: &str,
+        column: usize,
+        mut emit: impl FnMut(i64, u64) -> Result<()>,
+    ) -> Result<Option<()>> {
         let entry = self
             .entries
             .iter()
@@ -5667,15 +5691,15 @@ impl Catalog {
         if file_checksum(&self.file, offset, length)? != entry.directory.hash {
             return Err(invalid(&format!("the directory of table {name} does not checksum")));
         }
-        quick_integer_tally(
+        quick_integer_fold(
             &self.file,
             Cursor::over(&self.file, offset, length),
-            &entry.name,
-            &entry.fields,
-            entry.rows,
+            entry,
             self.size,
             column,
-        )
+            &mut emit,
+        )?;
+        Ok(Some(()))
     }
 
     /// Counts non-null, nonzero values from generic column frequencies when complete. For an
@@ -9048,16 +9072,18 @@ fn quick_nonzero(
 
 /// Walks the row-oriented directory while retaining only one column's index and page spans.
 /// The catalog supplies the schema and the caller checks the complete directory checksum first.
-fn quick_integer_tally(
+fn quick_integer_fold(
     file: &File,
     mut cur: Cursor<'_>,
-    name: &str,
-    fields: &[Field],
-    rows: usize,
+    entry: &Entry,
     size: u64,
     wanted: usize,
-) -> Result<Option<Vec<(i64, u64)>>> {
-    if cur.take(8)? != DIRECTORY || cur.text()? != name {
+    emit: &mut impl FnMut(i64, u64) -> Result<()>,
+) -> Result<()> {
+    let name = &entry.name;
+    let fields = &entry.fields;
+    let rows = entry.rows;
+    if cur.take(8)? != DIRECTORY || cur.text()? != name.as_str() {
         return Err(invalid("table directory differs from the catalog"));
     }
     let width = cur.u16()? as usize;
@@ -9094,7 +9120,6 @@ fn quick_integer_tally(
     }
     let stripes = cur.u32()? as usize;
     let mut total = 0_usize;
-    let mut counts = BTreeMap::<i64, u64>::new();
     let mut bytes = Vec::new();
     for _ in 0..stripes {
         let parts = cur.u32()? as usize;
@@ -9162,22 +9187,23 @@ fn quick_integer_tally(
             if checksum(&bytes) != span.hash {
                 return Err(invalid("integer part checksum differs"));
             }
-            let part_counts = if bytes.first() == Some(&5) && bytes.get(1) == Some(&0) {
-                let (decoded_rows, part_counts) = integer::tally(&bytes[2..])?;
+            if bytes.first() == Some(&5) && bytes.get(1) == Some(&0) {
+                let decoded_rows = integer::fold(&bytes[2..], |value, count| {
+                    check_integer_tally_value(value, &fields[wanted].ty)?;
+                    emit(value, count)
+                })?;
                 if decoded_rows != expected_rows {
                     return Err(invalid("encoded integer part holds the wrong number of rows"));
                 }
-                part_counts
             } else {
                 let column =
                     decode(&fields[wanted].ty, expected_rows, &bytes, None)?.into_flat()?;
                 let validity = column.validity();
-                let mut part_counts = BTreeMap::<i64, u64>::new();
                 macro_rules! count_decoded {
                     ($values:expr) => {
                         for (row, &value) in $values.as_slice().iter().enumerate() {
                             if validity.is_valid(row) {
-                                *part_counts.entry(i64::from(value)).or_default() += 1;
+                                emit(i64::from(value), 1)?;
                             }
                         }
                     };
@@ -9189,28 +9215,24 @@ fn quick_integer_tally(
                     Some(Data::Int64(values)) => count_decoded!(values),
                     _ => return Err(invalid("decoded integer part has the wrong type")),
                 }
-                part_counts.into_iter().collect()
-            };
-            for (value, count) in part_counts {
-                let fits = match fields[wanted].ty {
-                    LogicalType::TinyInt => i8::try_from(value).is_ok(),
-                    LogicalType::SmallInt => i16::try_from(value).is_ok(),
-                    LogicalType::Integer => i32::try_from(value).is_ok(),
-                    LogicalType::BigInt => true,
-                    _ => false,
-                };
-                if !fits {
-                    return Err(invalid("encoded integer value is outside its column type"));
-                }
-                let held = counts.entry(value).or_default();
-                *held = held.checked_add(count).ok_or_else(|| invalid("integer count overflow"))?;
             }
         }
     }
     if total != rows {
         return Err(invalid("table row count differs from stripes"));
     }
-    Ok(Some(counts.into_iter().collect()))
+    Ok(())
+}
+
+fn check_integer_tally_value(value: i64, ty: &LogicalType) -> Result<()> {
+    let fits = match ty {
+        LogicalType::TinyInt => i8::try_from(value).is_ok(),
+        LogicalType::SmallInt => i16::try_from(value).is_ok(),
+        LogicalType::Integer => i32::try_from(value).is_ok(),
+        LogicalType::BigInt => true,
+        _ => false,
+    };
+    if fits { Ok(()) } else { Err(invalid("encoded integer value is outside its column type")) }
 }
 
 fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {

@@ -192,15 +192,30 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
 ///
 /// As [`decode`], or if a sparse position or run length is outside the chunk.
 pub fn tally(bytes: &[u8]) -> Result<(usize, Vec<(i64, u64)>)> {
+    let mut counts = BTreeMap::<i64, u64>::new();
+    let rows = fold(bytes, |value, count| {
+        *counts.entry(value).or_default() += count;
+        Ok(())
+    })?;
+    Ok((rows, counts.into_iter().collect()))
+}
+
+/// Visits the values of one encoded chunk with their runtime row counts. Sparse chunks written
+/// with sorted exception positions need no per-chunk count map. An older or malformed chunk with
+/// repeated positions keeps the decoder's last-write-wins behavior.
+///
+/// # Errors
+///
+/// As [`decode`], or if the callback rejects a count.
+pub fn fold(bytes: &[u8], mut emit: impl FnMut(i64, u64) -> Result<()>) -> Result<usize> {
     let mut reader = Reader::new(bytes);
     let kind = Kind::from_tag(reader.u8()?)?;
     let count = reader.u32()? as usize;
-    let mut counts = BTreeMap::<i64, u64>::new();
     match kind {
         Kind::Constant => {
             let value = reader.i64()?;
             if count != 0 {
-                counts.insert(value, count as u64);
+                emit(value, count as u64)?;
             }
         }
         Kind::Sparse => {
@@ -212,22 +227,38 @@ pub fn tally(bytes: &[u8]) -> Result<(usize, Vec<(i64, u64)>)> {
             if positions.len() != exception_count || values.len() != exception_count {
                 return Err(Error::internal("a sparse chunk disagrees about its exception count"));
             }
-            // The ordinary decoder lets a later exception overwrite an earlier one at the same
-            // position. Keep the same rule rather than counting both entries.
-            let mut exceptions = BTreeMap::<usize, i64>::new();
-            for (position, value) in positions.into_iter().zip(values) {
+            let mut ordered = true;
+            let mut previous = None;
+            for &position in &positions {
                 let position = usize::try_from(position)
                     .ok()
                     .filter(|&position| position < count)
                     .ok_or_else(|| Error::internal("a sparse exception is outside the chunk"))?;
-                exceptions.insert(position, value);
+                if previous.is_some_and(|last| position <= last) {
+                    ordered = false;
+                }
+                previous = Some(position);
             }
-            let dominant_count = count - exceptions.len();
-            if dominant_count != 0 {
-                counts.insert(dominant, dominant_count as u64);
-            }
-            for value in exceptions.into_values() {
-                *counts.entry(value).or_default() += 1;
+            if ordered {
+                if count != exception_count {
+                    emit(dominant, (count - exception_count) as u64)?;
+                }
+                for value in values {
+                    emit(value, 1)?;
+                }
+            } else {
+                // The ordinary decoder lets a later exception overwrite an earlier one at the
+                // same position. Keep that rule for chunks the writer would not normally produce.
+                let mut exceptions = BTreeMap::<usize, i64>::new();
+                for (position, value) in positions.into_iter().zip(values) {
+                    exceptions.insert(position as usize, value);
+                }
+                if count != exceptions.len() {
+                    emit(dominant, (count - exceptions.len()) as u64)?;
+                }
+                for value in exceptions.into_values() {
+                    emit(value, 1)?;
+                }
             }
         }
         Kind::Rle => {
@@ -246,7 +277,7 @@ pub fn tally(bytes: &[u8]) -> Result<(usize, Vec<(i64, u64)>)> {
                     .filter(|&rows| rows <= count)
                     .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
                 if length != 0 {
-                    *counts.entry(value).or_default() += length as u64;
+                    emit(value, length as u64)?;
                 }
             }
             check_count(rows, count)?;
@@ -257,7 +288,7 @@ pub fn tally(bytes: &[u8]) -> Result<(usize, Vec<(i64, u64)>)> {
             let values = with_decoding(|scratch| decode_chunk(&mut reader, scratch))?;
             check_count(values.len(), count)?;
             for value in values {
-                *counts.entry(value).or_default() += 1;
+                emit(value, 1)?;
             }
         }
     }
@@ -267,7 +298,7 @@ pub fn tally(bytes: &[u8]) -> Result<(usize, Vec<(i64, u64)>)> {
             reader.remaining()
         )));
     }
-    Ok((count, counts.into_iter().collect()))
+    Ok(count)
 }
 
 /// Decodes selected row positions from a chunk written by [`encode`].
@@ -1558,6 +1589,28 @@ mod tests {
             assert_eq!(rows, values.len());
             assert_eq!(counts, expected.into_iter().collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn folded_sparse_exceptions_keep_the_last_value_at_a_repeated_position() {
+        let mut bytes = vec![Kind::Sparse.tag()];
+        put_u32(&mut bytes, 10);
+        put_i64(&mut bytes, 0);
+        put_u32(&mut bytes, 2);
+        bytes.extend(encode(&[7, 7]).unwrap());
+        bytes.extend(encode(&[3, 5]).unwrap());
+
+        let mut counts = BTreeMap::<i64, u64>::new();
+        assert_eq!(
+            fold(&bytes, |value, count| {
+                *counts.entry(value).or_default() += count;
+                Ok(())
+            })
+            .unwrap(),
+            10
+        );
+        assert_eq!(counts, BTreeMap::from([(0, 9), (5, 1)]));
+        assert_eq!(decode(&bytes).unwrap()[7], 5);
     }
 
     #[test]
