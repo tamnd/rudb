@@ -1553,26 +1553,26 @@ pub(crate) struct FileScan<'a> {
 /// first, because a morsel cannot start inside a page for free.
 const MORSEL_ROWS: usize = 32_768;
 
-/// How many rows a run of small row groups is gathered into one morsel up to.
+/// The rows a run of whole row groups is gathered up to, or zero when groups are being cut instead
+/// or the sink asked for nothing.
 ///
-/// The other side of [`MORSEL_ROWS`]. A file written with small row groups is as common as one
-/// written with large ones: the ClickBench ten million row sample is 1,203 groups of about eight
-/// thousand rows, and anything written by a streaming job or a Spark stage with many small tasks
-/// looks the same. Handed out one group at a time, every morsel pays a split of the reader, a
-/// registration and a hand over at the sink, and a load into a native file pays far more, because
-/// the sink never lets a stripe span two morsels and so writes a stripe of eight thousand rows, one
-/// at a time behind the writer's lock. Loading that sample took 73.6 s against 22.2 s for the same
-/// ten million rows in 81 groups, and the profile showed 1,203 writes waiting a summed 961 s.
+/// A file written with small row groups is as common as one written with large ones: the ClickBench
+/// ten million row sample is 1,203 groups of about eight thousand rows, and anything written by a
+/// streaming job or a Spark stage with many small tasks looks the same. Handed out one group at a
+/// time, every morsel pays a split of the reader, a registration and a hand over at the sink, and a
+/// load into a native file pays far more, because that sink never lets a stripe span two morsels.
+/// It writes eight thousand row stripes one at a time behind the writer's lock, and loading the
+/// sample took 73.6 s against 22.2 s for the same rows in 81 groups, with 1,203 writes waiting a
+/// summed 961 s. So a sink that pays for a boundary asks through [`Source::gather`] and the groups
+/// are gathered until the next would take the run past what it asked for, and never so far that
+/// there are fewer morsels than threads. A group that large or larger is handed out alone.
 ///
-/// Consecutive groups are gathered until the next one would take the run past this many rows, and
-/// never so far that there are fewer morsels than threads. A group this large or larger is handed out
-/// alone as before, so a file DuckDB wrote with its default of 122,880 rows is cut exactly as it was.
-const GATHER_ROWS: usize = 131_072;
-
-/// The rows a run of whole row groups is gathered up to, or zero when groups are being cut instead.
-fn gather_rows(reader: &FileReader, cut: usize, threads: usize) -> usize {
+/// A query over the file asks for nothing and is cut as it always was. Gathering the same sample
+/// for queries made the ClickBench set 6 to 14% slower on 32 threads, measured and not explained
+/// yet, though fewer and larger morsels leaving threads idle at the end of a scan is the suspect.
+fn gather_rows(reader: &FileReader, cut: usize, threads: usize, asked: usize) -> usize {
     let FileReader::Parquet(parquet) = reader else { return 0 };
-    if cut != 0 {
+    if cut != 0 || asked == 0 {
         return 0;
     }
     let total = parquet
@@ -1581,13 +1581,13 @@ fn gather_rows(reader: &FileReader, cut: usize, threads: usize) -> usize {
         .iter()
         .map(|group| usize::try_from(group.rows).unwrap_or(usize::MAX))
         .fold(0_usize, usize::saturating_add);
-    gather_target(total, threads)
+    gather_target(total, threads, asked)
 }
 
-/// The arithmetic of [`gather_rows`]: a share of the file for every thread, and no more than
-/// [`GATHER_ROWS`].
-fn gather_target(total: usize, threads: usize) -> usize {
-    (total / threads.max(1)).min(GATHER_ROWS)
+/// The arithmetic of [`gather_rows`]: a share of the file for every thread, and no more than the
+/// sink asked for.
+fn gather_target(total: usize, threads: usize, asked: usize) -> usize {
+    (total / threads.max(1)).min(asked)
 }
 
 /// How many row groups the run starting with a group of `first` rows takes, `later` being the rows
@@ -1705,7 +1705,7 @@ fn group_rows(reader: &Reader, at: usize) -> usize {
 fn aim(cutting: &mut Cutting) {
     let Some(reader) = cutting.reader.as_ref() else { return };
     cutting.cut = morsel_rows(reader, cutting.groups, cutting.threads);
-    cutting.gather = gather_rows(reader, cutting.cut, cutting.threads);
+    cutting.gather = gather_rows(reader, cutting.cut, cutting.threads, cutting.asked);
     cutting.pieces = pieces(reader, cutting.cut, cutting.gather);
 }
 
@@ -1761,8 +1761,11 @@ struct Cutting {
     /// being a thread with nothing else to do.
     cut: usize,
     /// How many rows a run of small whole row groups is gathered up to, or zero when groups are
-    /// being cut rather than gathered. See [`GATHER_ROWS`].
+    /// being cut rather than gathered. See [`gather_rows`].
     gather: usize,
+    /// How many rows the sink asked a morsel to hold, or zero when it asked for nothing, which is
+    /// every sink but a load. Kept across files, since it is asked once and every file is aimed.
+    asked: usize,
     /// How many threads the scheduler said it would lend, which is one until it says otherwise.
     ///
     /// [`Source::morsels`] is asked before any instance starts and is given the ceiling, so this is
@@ -1855,6 +1858,7 @@ impl<'a> FileScan<'a> {
                 part: 0,
                 cut: 0,
                 gather: 0,
+                asked: 0,
                 threads: 1,
                 pieces: 1,
                 skipping: Vec::new(),
@@ -2169,6 +2173,13 @@ impl Source for FileScan<'_> {
         Some(cutting.pieces.max(1).saturating_mul(self.paths.len().max(1)))
     }
 
+    /// Remembered for [`aim`], which [`Source::morsels`] calls next.
+    fn gather(&self, rows: usize) {
+        if let Ok(mut cutting) = self.cutting.lock() {
+            cutting.asked = rows;
+        }
+    }
+
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let piece = self.piece(morsel.index())?;
         let mut piece = piece.lock().map_err(poisoned)?;
@@ -2427,10 +2438,10 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Across, Bound, Cutoff, FileScan, Filters, GATHER_ROWS, Handout, Live, OnceLock, Op, Paying,
-        Probe, Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE,
-        WARMUP, cut_rows, gather_target, gathered, hash, instances_for, morsels_of, next_piece,
-        parts, runs_of, worth_sifting,
+        Across, Bound, Cutoff, FileScan, Filters, Handout, Live, OnceLock, Op, Paying, Probe,
+        Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP,
+        cut_rows, gather_target, gathered, hash, instances_for, morsels_of, next_piece, parts,
+        runs_of, worth_sifting,
     };
     use crate::sideways::Found;
 
@@ -3340,23 +3351,36 @@ mod tests {
         assert_eq!(cutting(0, 0), Vec::new());
     }
 
-    /// A file whose pages are as long as its row groups, which is every file DuckDB writes. The cut
-    /// is turned off rather than made small, because a morsel that starts inside a page decodes that
-    /// page whole and then throws most of it away.
-    /// A scan with one thread gathers the fixture's two groups into one morsel. The rows are the
-    /// same rows in the same order, and the row numbers carry on across the join between the groups.
+    /// What a load asks a scan to gather up to. See `NativeSink` in the `rudb` crate.
+    const LOAD: usize = 131_072;
+
+    /// A scan with one thread that a load asked to gather takes the fixture's two groups as one
+    /// morsel. The rows are the same rows in the same order, and the row numbers carry on across the
+    /// join between the groups.
     #[test]
-    fn a_scan_with_one_thread_gathers_small_row_groups_into_one_morsel() {
+    fn a_scan_a_load_asked_to_gather_takes_small_row_groups_as_one_morsel() {
         let scan = untold(Vec::new());
+        scan.gather(LOAD);
         assert_eq!(scan.morsels(1, 0), Some(1));
         assert_eq!(morsels(&scan), [4096], "both groups in one morsel");
         assert_eq!(morsels(&fixture()), [2048, 2048], "and apart when there are two threads");
+    }
+
+    /// A query asks for nothing and gets a morsel a group, however few threads it has.
+    #[test]
+    fn a_scan_nobody_asked_to_gather_hands_out_a_group_at_a_time() {
+        let scan = untold(Vec::new());
+        scan.gather(0);
+        assert_eq!(scan.morsels(1, 0), Some(2));
+        assert_eq!(morsels(&scan), [2048, 2048]);
     }
 
     /// A run stops at a group the filter rules out, and the next morsel starts past it.
     #[test]
     fn a_gathered_run_stops_at_a_group_the_filter_rules_out() {
         let scan = untold(vec![(0, Op::Greater, Bound::Int(1_000))]);
+        scan.gather(LOAD);
+        assert_eq!(scan.morsels(1, 0), Some(1));
         assert_eq!(morsels(&scan), Vec::<usize>::new());
         assert_eq!(scan.cutting.lock().expect("the lock holds").skipped, 2);
     }
@@ -3366,10 +3390,10 @@ mod tests {
     #[test]
     fn small_row_groups_are_gathered_up_to_the_target_and_large_ones_are_left_alone() {
         assert_eq!(gathered(8_000, [8_000, 8_000, 8_000].into_iter(), 20_000), 2);
-        assert_eq!(gathered(8_000, [8_000; 40].into_iter(), GATHER_ROWS), 16);
-        assert_eq!(gathered(122_880, [122_880].into_iter(), GATHER_ROWS), 1, "a DuckDB file");
-        assert_eq!(gathered(8_000, [200_000, 8_000].into_iter(), GATHER_ROWS), 1);
-        assert_eq!(gathered(8_000, std::iter::empty(), GATHER_ROWS), 1);
+        assert_eq!(gathered(8_000, [8_000; 40].into_iter(), LOAD), 16);
+        assert_eq!(gathered(122_880, [122_880].into_iter(), LOAD), 1, "a DuckDB file");
+        assert_eq!(gathered(8_000, [200_000, 8_000].into_iter(), LOAD), 1);
+        assert_eq!(gathered(8_000, std::iter::empty(), LOAD), 1);
         assert_eq!(gathered(0, [0, 0].into_iter(), 0), 3, "empty groups cost nothing to join");
     }
 
@@ -3381,15 +3405,19 @@ mod tests {
         let rows = vec![8_312; 1_203];
         let total: usize = rows.iter().sum();
         assert_eq!(morsels_of(&rows, 0, 0), 1_203, "one a group without gathering");
-        let gather = gather_target(total, 32);
-        assert_eq!(gather, GATHER_ROWS);
+        assert_eq!(gather_target(total, 32, 0), 0, "a query asks for nothing");
+        let gather = gather_target(total, 32, LOAD);
+        assert_eq!(gather, LOAD);
         assert_eq!(morsels_of(&rows, 0, gather), 1_203_usize.div_ceil(15));
-        let many = gather_target(total, 1_000);
+        let many = gather_target(total, 1_000, LOAD);
         assert!(morsels_of(&rows, 0, many) >= 1_000.min(rows.len()) / 2, "threads are kept busy");
-        assert_eq!(gather_target(total, 2_000), 4_999, "a share each, below a group");
-        assert_eq!(morsels_of(&rows, 0, gather_target(total, 2_000)), 1_203);
+        assert_eq!(gather_target(total, 2_000, LOAD), 4_999, "a share each, below a group");
+        assert_eq!(morsels_of(&rows, 0, gather_target(total, 2_000, LOAD)), 1_203);
     }
 
+    /// A file whose pages are as long as its row groups, which is every file DuckDB writes. The cut
+    /// is turned off rather than made small, because a morsel that starts inside a page decodes that
+    /// page whole and then throws most of it away.
     #[test]
     fn a_row_group_that_is_not_worth_cutting_is_one_morsel() {
         assert_eq!(cutting(123_554, 0), vec![0..123_554]);
