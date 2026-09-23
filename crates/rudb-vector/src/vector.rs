@@ -2906,7 +2906,76 @@ impl Vector {
     /// If the type is one there is no vector for yet, which today means `ARRAY` and `UNION`. A `LIST`
     /// and a `MAP` gather by permuting their entries and a `STRUCT` by gathering every field.
     pub fn gather(&self, indices: &[u32]) -> Result<Self> {
+        // Straight off the positions a filter handed over, since a gather of a stable dictionary is
+        // its codes gathered and nothing else, and widening every position first was a pass and an
+        // allocation per filtered chunk of `URL` on ClickBench 28.
+        if let Body::Dictionary { codes, values, stable: true } = &self.body {
+            return self.stable_gathered(codes, values, indices, |index| index as usize);
+        }
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
+    }
+
+    /// A gather off a stable dictionary, which is its codes gathered over the same values.
+    ///
+    /// Generic over the position type because a filter hands over `u32` positions and a nested
+    /// gather hands over `usize` ones, and each is read where it lies rather than widened first.
+    fn stable_gathered<T: Copy>(
+        &self,
+        codes: &Buffer<u32>,
+        values: &Arc<Vector>,
+        at: &[T],
+        index: impl Fn(T) -> usize,
+    ) -> Result<Self> {
+        let rows = at.len();
+        // The range is the largest position, because a maximum is a loop the compiler vectorizes
+        // and a search that can stop early is not.
+        let inside = at.iter().map(|&at| index(at)).max().is_none_or(|top| top < codes.len());
+        // The ordinary case, a column with no nulls and a filter's rows all inside it, in one pass
+        // for the range and one for the gather. Every code taken is one of this vector's codes,
+        // which were range checked when it was built, so the result is not checked again the way
+        // a dictionary from outside is. On q1 the two passes this replaces and the check after
+        // them were a tenth of the instructions of the scan.
+        if inside && self.never_null() {
+            return Ok(Self {
+                ty: values.ty.clone(),
+                len: rows,
+                validity: Validity::AllValid,
+                body: Body::Dictionary {
+                    codes: at.iter().map(|&at| codes[index(at)]).collect(),
+                    values: Arc::clone(values),
+                    stable: true,
+                },
+            });
+        }
+        // Otherwise the rows past the end and the nulls are found one row at a time. The per row
+        // question reads through the dictionary to the value it stands for, which is why the case
+        // above answers it for the whole column at once.
+        let validity = if self.never_null() && at.iter().all(|&at| index(at) < self.len) {
+            Validity::AllValid
+        } else {
+            Validity::from_iter(rows, |row| {
+                at.get(row)
+                    .map(|&at| index(at))
+                    .is_some_and(|index| index < self.len && !self.is_null_at(index))
+            })
+        };
+        let gathered: Vec<u32> =
+            at.iter().map(|&at| codes.get(index(at)).copied().unwrap_or(0)).collect();
+        // Every code here is one this vector already held, which was checked against the same
+        // values on the way in, or the zero a row past the end is written as. So the only code that
+        // can be out of range is that zero over no values at all, and the pass that looks for the
+        // largest code is not needed to find it. On ClickBench 28 that pass was four percent of the
+        // query, because every filtered chunk of `URL` came through here.
+        // Values that are themselves a dictionary are composed through by the constructor, and this
+        // skips the constructor, so that shape still goes the checked way.
+        if matches!(values.body, Body::Dictionary { .. }) {
+            return Ok(
+                Self::stable_dictionary(gathered, Arc::clone(values))?.with_validity(validity)
+            );
+        }
+        let highest = (values.is_empty() && !gathered.is_empty()).then_some(0);
+        Ok(Self::stable_dictionary_validated(gathered, Arc::clone(values), highest)?
+            .with_validity(validity))
     }
 
     /// The copy both [`Self::gather`] and [`Self::flatten`] are.
@@ -2920,61 +2989,7 @@ impl Vector {
         let rows = at.len();
         if forms_stay {
             if let Body::Dictionary { codes, values, stable: true } = &self.body {
-                // The ordinary case, a column with no nulls and a filter's rows all inside it, in
-                // one pass for the range and one for the gather. Every code taken is one of this
-                // vector's codes, which were range checked when it was built, so the result is not
-                // checked again the way a dictionary from outside is. The highest index rather than
-                // a test that stops at the first bad one, because a running maximum is vectorized
-                // and an early exit is not. On q1 the two passes this replaces and the check after
-                // them were a tenth of the instructions of the scan.
-                let highest = at.iter().copied().fold(0, usize::max);
-                if self.never_null() && (at.is_empty() || highest < codes.len()) {
-                    let gathered = at.iter().map(|&index| codes[index]).collect();
-                    return Ok(Self {
-                        ty: values.ty.clone(),
-                        len: rows,
-                        validity: Validity::AllValid,
-                        body: Body::Dictionary {
-                            codes: gathered,
-                            values: Arc::clone(values),
-                            stable: true,
-                        },
-                    });
-                }
-                // A gather off a column with no nulls in it is all valid as long as every index it
-                // was handed is in range, and both of those are answered by a word at a time rather
-                // than by asking each row whether it is null. That per row question reads through
-                // the dictionary to the value it stands for, which made it the single line a
-                // filtered scan of a dictionary column spent most of its copy in.
-                let validity = if self.never_null() && at.iter().all(|&index| index < self.len) {
-                    Validity::AllValid
-                } else {
-                    Validity::from_iter(rows, |row| {
-                        at.get(row)
-                            .is_some_and(|&index| index < self.len && !self.is_null_at(index))
-                    })
-                };
-                let gathered: Vec<u32> =
-                    at.iter().map(|&index| codes.get(index).copied().unwrap_or(0)).collect();
-                // Every code here is one this vector already held, which was checked against the
-                // same values on the way in, or the zero a row past the end is written as. So the
-                // only code that can be out of range is that zero over no values at all, and the
-                // pass that looks for the largest code is not needed to find it. On ClickBench 28
-                // that pass was four percent of the query, because every filtered chunk of `URL`
-                // came through here.
-                // Values that are themselves a dictionary are composed through by the constructor,
-                // and this skips the constructor, so that shape still goes the checked way.
-                if matches!(values.body, Body::Dictionary { .. }) {
-                    return Ok(Self::stable_dictionary(gathered, Arc::clone(values))?
-                        .with_validity(validity));
-                }
-                let highest = (values.is_empty() && !gathered.is_empty()).then_some(0);
-                return Ok(Self::stable_dictionary_validated(
-                    gathered,
-                    Arc::clone(values),
-                    highest,
-                )?
-                .with_validity(validity));
+                return self.stable_gathered(codes, values, &at, |index| index);
             }
         }
         let (at, leaf) = self.resolve(at);
