@@ -19,6 +19,7 @@
 //! which is one of the orders the pin could have given.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Buffer, Data, Live, Validity, Vector, interleave};
@@ -379,6 +380,9 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     match (name, args) {
         ("list_value", [_, ..]) => built(args, returns, rows),
         ("list_reverse", [list]) => reversed(list.as_ref()),
+        ("length" | "array_length", [list]) => counted(list.as_ref()),
+        ("list_distinct", [list]) => deduplicated(false, list.as_ref()),
+        ("list_unique", [list]) => deduplicated(true, list.as_ref()),
         ("list_contains" | "list_position", [list, needle]) => {
             searched(name == "list_position", list.as_ref(), needle.as_ref())
         }
@@ -419,6 +423,19 @@ fn built<V: AsRef<Vector>>(
     let count = entry(width)?;
     let entries = (0..rows).map(|row| Ok((entry(row * width)?, count))).collect::<Result<_>>()?;
     Vector::list(entries, child).map(Some)
+}
+
+/// `length` of a list column, which is every entry's length with the column's nulls.
+fn counted(list: &Vector) -> Result<Option<Vector>> {
+    let Some((entries, _)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !matches!(list.logical_type(), LogicalType::List(_)) {
+        return Ok(None);
+    }
+    let lengths: Vec<i64> = entries.iter().map(|&(_, len)| i64::from(len)).collect();
+    let answer = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(lengths)))?;
+    Ok(Some(answer.with_validity(list.validity().clone())))
 }
 
 /// `list_reverse` over a column: one gather of the child with every row's run turned round.
@@ -536,6 +553,86 @@ fn ordered(
     let (placed, indices) = permute!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
     let child = child.gather(&indices)?;
     Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
+}
+
+/// `list_distinct` and `list_unique` over an integer column, as one pass over each row's run that
+/// keeps the first appearance of every value that is not null.
+fn deduplicated(unique: bool, list: &Vector) -> Result<Option<Vector>> {
+    let Some((entries, child)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !plain(child.logical_type()) {
+        return Ok(None);
+    }
+    let rows = list.validity().live();
+    let elements = child.validity().live();
+    macro_rules! keep {
+        ($($variant:ident),+) => {
+            match child.data() {
+                $(Some(Data::$variant(values)) => {
+                    let values = values.as_slice();
+                    firsts(entries, rows, elements, |at| i128::from(values[at as usize]))?
+                })+
+                _ => return Ok(None),
+            }
+        };
+    }
+    let (placed, indices) = keep!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
+    if unique {
+        let counts: Vec<u64> = placed.iter().map(|&(_, len)| u64::from(len)).collect();
+        let answer = Vector::flat(LogicalType::UBigInt, Data::UInt64(Buffer::from(counts)))?;
+        return Ok(Some(answer.with_validity(list.validity().clone())));
+    }
+    let child = child.gather(&indices)?;
+    Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
+}
+
+/// The new entries and the child indices that keep the first element of every `key` in each row's
+/// run and drop the nulls, which is what [`distinct`] does with values.
+///
+/// A short run is checked against what it has kept so far, which for the lists people write is a
+/// handful of comparisons and no allocation. A long one goes through a set.
+fn firsts(
+    entries: &[(u32, u32)],
+    rows: Live<'_>,
+    elements: Live<'_>,
+    key: impl Fn(u32) -> i128,
+) -> Result<Permuted> {
+    const SHORT: u32 = 32;
+    let mut indices = Vec::new();
+    let mut placed = Vec::with_capacity(entries.len());
+    let mut kept: Vec<i128> = Vec::new();
+    let mut seen: HashSet<i128> = HashSet::new();
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        let at = entry(indices.len())?;
+        if !rows.at(row) {
+            placed.push((at, 0));
+            continue;
+        }
+        let from = indices.len();
+        kept.clear();
+        seen.clear();
+        for index in start..start + len {
+            if !elements.at(index as usize) {
+                continue;
+            }
+            let value = key(index);
+            let fresh = if len <= SHORT {
+                let fresh = !kept.contains(&value);
+                if fresh {
+                    kept.push(value);
+                }
+                fresh
+            } else {
+                seen.insert(value)
+            };
+            if fresh {
+                indices.push(index);
+            }
+        }
+        placed.push((at, entry(indices.len() - from)?));
+    }
+    Ok((placed, indices))
 }
 
 /// A list column rearranged but not yet gathered: its new entries, and the child index each new

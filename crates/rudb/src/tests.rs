@@ -8292,6 +8292,16 @@ fn the_list_calls_with_a_vector_loop_answer_over_a_column_the_way_they_do_a_row_
         column("SELECT list_reverse(l) FROM held ORDER BY id"),
         "[NULL, 2, 1];[6, 5, NULL];NULL;[2, 2, 2]"
     );
+    assert_eq!(column("SELECT len(l) FROM held ORDER BY id"), "3;3;NULL;3");
+    assert_eq!(column("SELECT list_distinct(l) FROM held ORDER BY id"), "[1, 2];[5, 6];NULL;[2]");
+    assert_eq!(column("SELECT list_unique(l) FROM held ORDER BY id"), "2;2;NULL;1");
+    // Past the length where a run is checked against what it kept, so the set is what answers.
+    let long = vec!["a, b, c, id"; 9].join(", ");
+    assert_eq!(
+        column(&format!("SELECT list_unique(list_value({long})) FROM shaped ORDER BY id")),
+        "2;3;4;2"
+    );
+    assert_eq!(column("SELECT array_length(list_value(a)) FROM shaped ORDER BY id"), "1;1;1;1");
     assert_eq!(column("SELECT list_contains(l, 2) FROM held ORDER BY id"), "true;false;NULL;true");
     assert_eq!(column("SELECT list_position(l, 2) FROM held ORDER BY id"), "2;NULL;NULL;1");
     assert_eq!(column("SELECT list_position(l, NULL) FROM held ORDER BY id"), "3;1;NULL;NULL");
