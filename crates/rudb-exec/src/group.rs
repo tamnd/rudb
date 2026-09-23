@@ -456,7 +456,20 @@ struct EncodedCountPartition {
     rows: Vec<EncodedCountRecord>,
     /// Empty while all three keys are valid. It is allocated when this partition sees a null.
     validity: Vec<u8>,
+    /// How many rows each record stands for. Empty while every record is one row, which it is until
+    /// the run is first compacted.
+    weights: Vec<u32>,
 }
+
+/// How long a scattered run gets before it is compacted rather than grown.
+///
+/// A run holds a record a row, so a grouped count over ten million rows scattered 240 MB of
+/// records before the fold ever saw them, and the doubling behind it held up to twice that. When a
+/// run fills, the records it already holds are folded in place into one per group with a weight,
+/// and the run grows only if that did not free a quarter of it. On ClickBench `GROUP BY UserID,
+/// SearchPhrase` a group is four rows on average and they arrive close together, so most of a run
+/// folds away. The floor keeps small runs, which fit in cache and cost nothing to hold, out of it.
+const COMPACT_FROM: usize = 4_096;
 
 impl EncodedCountRecord {
     const FIRST: u8 = 1;
@@ -481,11 +494,87 @@ impl EncodedCountPartition {
         if keeping {
             self.validity.push(valid);
         }
+        if !self.weights.is_empty() {
+            self.weights.push(1);
+        }
+    }
+
+    /// Takes one scattered record, compacting the run first when it is full.
+    #[inline]
+    fn scatter(&mut self, row: EncodedCountRecord, valid: u8) {
+        if self.rows.len() == self.rows.capacity() && self.rows.len() >= COMPACT_FROM {
+            self.compact();
+        }
+        self.push(row, valid);
+    }
+
+    /// How many rows the record at `at` stands for.
+    #[inline]
+    fn weight(&self, at: usize) -> i64 {
+        self.weights.get(at).map_or(1, |&weight| i64::from(weight))
+    }
+
+    /// Folds the records of the same group into the first of them, adding up their weights.
+    ///
+    /// A weight that would pass `u32::MAX` is left as a record of its own, which the fold at the end
+    /// adds up like any other.
+    #[cold]
+    fn compact(&mut self) {
+        let len = self.rows.len();
+        let capacity = len.saturating_mul(2).next_power_of_two();
+        let mask = capacity - 1;
+        let mut buckets = vec![u32::MAX; capacity];
+        let all_valid = self.validity.is_empty();
+        if self.weights.is_empty() {
+            self.weights = vec![1; len];
+        }
+        let mut kept = 0;
+        for at in 0..len {
+            let row = self.rows[at];
+            let valid = if all_valid { EncodedCountRecord::ALL } else { self.validity[at] };
+            let weight = self.weights[at];
+            let mut slot = row.hash as usize & mask;
+            loop {
+                let held = buckets[slot];
+                if held == u32::MAX {
+                    // `kept` is at most `at`, so the record lands on a slot this loop has already read.
+                    buckets[slot] = kept as u32;
+                    self.rows[kept] = row;
+                    if !all_valid {
+                        self.validity[kept] = valid;
+                    }
+                    self.weights[kept] = weight;
+                    kept += 1;
+                    break;
+                }
+                let held = held as usize;
+                let other = self.rows[held];
+                if other.hash == row.hash
+                    && other.first == row.first
+                    && other.second == row.second
+                    && other.third == row.third
+                    && (all_valid || self.validity[held] == valid)
+                {
+                    if let Some(sum) = self.weights[held].checked_add(weight) {
+                        self.weights[held] = sum;
+                        break;
+                    }
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+        self.rows.truncate(kept);
+        self.validity.truncate(kept);
+        self.weights.truncate(kept);
+        if kept * 4 > len * 3 {
+            self.rows.reserve(len);
+        }
     }
 
     fn footprint(&self) -> usize {
         self.rows.capacity() * size_of::<EncodedCountRecord>()
             + self.validity.capacity() * size_of::<u8>()
+            + self.weights.capacity() * size_of::<u32>()
     }
 }
 
@@ -1281,7 +1370,7 @@ impl<'a> Aggregate<'a> {
                     u64::from(third_code),
                 ));
                 let hash = (wide ^ (wide >> 32)) as u32;
-                partitions[(hash >> shift) as usize].push(
+                partitions[(hash >> shift) as usize].scatter(
                     EncodedCountRecord {
                         first: first_value,
                         second: second_value,
@@ -1339,7 +1428,7 @@ impl<'a> Aggregate<'a> {
             };
             let wide = spread(mix(mix(mix(0, first_word), second_word), third_word));
             let hash = (wide ^ (wide >> 32)) as u32;
-            partitions[(hash >> shift) as usize].push(
+            partitions[(hash >> shift) as usize].scatter(
                 EncodedCountRecord {
                     first: first_value,
                     second: second_value,
@@ -4889,6 +4978,7 @@ fn encoded_count_partition(
     for source in 0..seeded {
         let row = partition.rows[source];
         let valid = if all_valid { EncodedCountRecord::ALL } else { partition.validity[source] };
+        let weight = partition.weight(source);
         let slot = match encoded_slot(&buckets, &partition, row, valid) {
             Ok(slot) => slot,
             Err(bucket) => {
@@ -4907,13 +4997,16 @@ fn encoded_count_partition(
             }
         };
         counts[slot] = counts[slot]
-            .checked_add(1)
+            .checked_add(weight)
             .ok_or_else(|| Error::out_of_range("a grouped COUNT overflowed BIGINT"))?;
     }
     partition.rows.truncate(counts.len());
     if !all_valid {
         partition.validity.truncate(counts.len());
     }
+    // The table's records are groups from here on, counted in `counts`, and what they weighed as
+    // records is already in there.
+    partition.weights = Vec::new();
     timing.stop(0);
     // Every other instance's run, folded into that table and given back one run at a time rather
     // than all at the end, so the records this has finished with stop costing anything.
@@ -4922,6 +5015,7 @@ fn encoded_count_partition(
         let all_valid = run.validity.is_empty();
         for (source, &row) in run.rows.iter().enumerate() {
             let valid = if all_valid { EncodedCountRecord::ALL } else { run.validity[source] };
+            let weight = run.weight(source);
             let slot = match encoded_slot(&buckets, &partition, row, valid) {
                 Ok(slot) => slot,
                 Err(bucket) => {
@@ -4937,7 +5031,7 @@ fn encoded_count_partition(
                 }
             };
             counts[slot] = counts[slot]
-                .checked_add(1)
+                .checked_add(weight)
                 .ok_or_else(|| Error::out_of_range("a grouped COUNT overflowed BIGINT"))?;
         }
     }
@@ -6013,10 +6107,11 @@ mod tests {
     use rudb_vector::{Chunk, Data, Vector};
 
     use super::{
-        Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
-        EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition, FixedRecord,
-        FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, encoded_count_partition, fixed_partition, slot_runs_of,
+        Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
+        Distinct, EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition,
+        FixedRecord, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, WINDOW_RATE,
+        WINDOW_SLACK, bigint_distinct_partition, encoded_count_partition, fixed_partition,
+        slot_runs_of,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -6711,6 +6806,63 @@ mod tests {
         ];
         expected.sort_by_key(|row| format!("{row:?}"));
         assert_eq!(rows, expected, "a group is one group however many runs it arrived in");
+    }
+
+    #[test]
+    fn a_full_encoded_run_folds_its_repeats_and_the_counts_come_out_the_same() {
+        let dictionary = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+        )
+        .expect("a string dictionary");
+        // Five groups, one of them with a null key, sharing a hash so every probe walks past the
+        // others, scattered round after round until the run has filled and folded several times.
+        let row = |first, third| EncodedCountRecord { first, second: 0, hash: 7, third };
+        let mut folded = EncodedCountPartition::default();
+        let rounds = COMPACT_FROM * 3;
+        for round in 0..rounds {
+            folded.scatter(row(round as i64 % 4, (round % 2) as u32), EncodedCountRecord::ALL);
+            if round % 3 == 0 {
+                folded.scatter(row(0, 1), EncodedCountRecord::SECOND | EncodedCountRecord::THIRD);
+            }
+        }
+        assert!(
+            folded.rows.capacity() <= COMPACT_FROM * 2,
+            "a run of five groups grew to {}",
+            folded.rows.capacity()
+        );
+        let mut other = EncodedCountPartition::default();
+        other.scatter(row(1, 1), EncodedCountRecord::ALL);
+        let leading = [LogicalType::BigInt];
+        let part = encoded_count_partition(
+            &mut EncodedCountRuns { runs: vec![other, folded] },
+            &dictionary,
+            &leading,
+            10,
+            &Memory::unlimited(),
+        )
+        .expect("the encoded partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in part.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        rows.sort_by_key(|row| format!("{row:?}"));
+        let quarter = (rounds / 4) as i64;
+        let mut expected = vec![
+            vec![Value::BigInt(0), Value::Varchar("one".into()), Value::BigInt(quarter)],
+            vec![Value::BigInt(1), Value::Varchar("two".into()), Value::BigInt(quarter + 1)],
+            vec![Value::BigInt(2), Value::Varchar("one".into()), Value::BigInt(quarter)],
+            vec![Value::BigInt(3), Value::Varchar("two".into()), Value::BigInt(quarter)],
+            vec![
+                Value::Null,
+                Value::Varchar("two".into()),
+                Value::BigInt(rounds.div_ceil(3) as i64),
+            ],
+        ];
+        expected.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(rows, expected, "a folded run counts every row it was given");
     }
 
     #[test]
