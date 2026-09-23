@@ -2898,84 +2898,109 @@ impl Writer {
             Some(bits) if signed => FrequencyValue::Integer(i128::from(bits as i64)),
             Some(bits) => FrequencyValue::Integer(i128::from(bits)),
         };
-        // Rows arrive a run of equal values at a time, because a sorted column is runs and a flag
-        // column is mostly one value, so a run is counted and inserted once rather than per row.
-        //
-        // The exact distinct count is left alone until the candidate table is full. Until then no
-        // candidate has been decremented, so the table holds every value the column has had and
-        // its size is the count. Most columns never fill it and so never build the set. The one
-        // that fills it hands the set everything it holds at that moment, plus the run it is about
-        // to add, and the set carries on from there as it always did.
-        let mut first = Candidates::default();
-        let mut distinct: Option<distinct::ExactDistinct> = None;
-        let mut run = Run::default();
-        self.visit_numeric(column, signed, |_, bits| {
-            if let Some((ended, times)) = run.push(bits) {
-                count_from_full(&first, &mut distinct, ended, counted);
-                first.add(ended, times);
-            }
-            if run.times == 1 {
-                if let (Some(distinct), Some(bits)) = (distinct.as_mut(), bits) {
-                    distinct.insert(bits);
+        // A column the writer's tally held whole has its exact counts already, gathered as the rows
+        // went past, so the pages are not read back to count them again. On `hits` that is most of
+        // the flag and enum columns. The tally only speaks for the whole column when it saw every
+        // row, which is the same check the statistics make before they are written.
+        let tallied = self
+            .gathers
+            .get(column)
+            .and_then(Option::as_ref)
+            .filter(|gather| gather.rows() == self.table.rows as u64)
+            .and_then(stats::Gather::frequencies)
+            .and_then(|(values, nulls)| {
+                let exact = values
+                    .iter()
+                    .map(|(value, count)| Some((frequency_bits(value)?, *count)))
+                    .collect::<Option<FrequencyMap<_>>>()?;
+                Some((exact, (nulls != 0).then_some(nulls), values.len() as u64))
+            });
+        let (exact, null_count, decrements, distinct_count) = match tallied {
+            Some((exact, null_count, distinct)) => (exact, null_count, 0, Some(distinct)),
+            None => {
+                // Rows arrive a run of equal values at a time, because a sorted column is runs and
+                // a flag column is mostly one value, so a run is counted and inserted once rather
+                // than per row.
+                //
+                // The exact distinct count is left alone until the candidate table is full. Until
+                // then no candidate has been decremented, so the table holds every value the column
+                // has had and its size is the count. Most columns never fill it and so never build
+                // the set. The one that fills it hands the set everything it holds at that moment,
+                // plus the run it is about to add, and the set carries on from there as it always
+                // did.
+                let mut first = Candidates::default();
+                let mut distinct: Option<distinct::ExactDistinct> = None;
+                let mut run = Run::default();
+                self.visit_numeric(column, signed, |_, bits| {
+                    if let Some((ended, times)) = run.push(bits) {
+                        count_from_full(&first, &mut distinct, ended, counted);
+                        first.add(ended, times);
+                    }
+                    if run.times == 1 {
+                        if let (Some(distinct), Some(bits)) = (distinct.as_mut(), bits) {
+                            distinct.insert(bits);
+                        }
+                    }
+                })?;
+                if let Some((bits, times)) = run.take() {
+                    count_from_full(&first, &mut distinct, bits, counted);
+                    first.add(bits, times);
                 }
-            }
-        })?;
-        if let Some((bits, times)) = run.take() {
-            count_from_full(&first, &mut distinct, bits, counted);
-            first.add(bits, times);
-        }
-        let distinct_count = match distinct.as_mut() {
-            Some(distinct) => distinct.count(),
-            None => Some(first.held as u64),
-        };
-        let (nulls, decrements) = (first.nulls, first.decrements);
-        let (exact, null_count) = if decrements == 0 {
-            let exact = first
-                .pairs()
-                .map(|(bits, count)| (bits, u64::from(count)))
-                .collect::<FrequencyMap<_>>();
-            (exact, (nulls != 0).then_some(u64::from(nulls)))
-        } else {
-            let mut lower = first.pairs().map(|(_, count)| count).collect::<Vec<_>>();
-            if nulls != 0 {
-                lower.push(nulls);
-            }
-            lower.sort_unstable_by(|left, right| right.cmp(left));
-            if lower.len() < FREQUENCY_BUILD_RANK
-                || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
-            {
-                return Ok((None, distinct_count));
-            }
-            // Counted beside the slot each candidate sits in, since the table is not changed again
-            // and a lookup in it is the one probe the first pass made.
-            let mut recounts = vec![0_u64; first.slots.len()];
-            let mut null_count = (nulls != 0).then_some(0_u64);
-            let mut recount = |bits: Option<u64>, times: u32| {
-                let held = match bits {
-                    Some(bits) => first.position(bits).map(|at| &mut recounts[at]),
-                    None => null_count.as_mut(),
+                let distinct_count = match distinct.as_mut() {
+                    Some(distinct) => distinct.count(),
+                    None => Some(first.held as u64),
                 };
-                if let Some(count) = held {
-                    *count = count.saturating_add(u64::from(times));
-                }
-            };
-            let mut run = Run::default();
-            self.visit_numeric(column, signed, |_, bits| {
-                if let Some((bits, times)) = run.push(bits) {
-                    recount(bits, times);
-                }
-            })?;
-            if let Some((bits, times)) = run.take() {
-                recount(bits, times);
+                let (nulls, decrements) = (first.nulls, first.decrements);
+                let (exact, null_count) = if decrements == 0 {
+                    let exact = first
+                        .pairs()
+                        .map(|(bits, count)| (bits, u64::from(count)))
+                        .collect::<FrequencyMap<_>>();
+                    (exact, (nulls != 0).then_some(u64::from(nulls)))
+                } else {
+                    let mut lower = first.pairs().map(|(_, count)| count).collect::<Vec<_>>();
+                    if nulls != 0 {
+                        lower.push(nulls);
+                    }
+                    lower.sort_unstable_by(|left, right| right.cmp(left));
+                    if lower.len() < FREQUENCY_BUILD_RANK
+                        || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
+                    {
+                        return Ok((None, distinct_count));
+                    }
+                    // Counted beside the slot each candidate sits in, since the table is not
+                    // changed again and a lookup in it is the one probe the first pass made.
+                    let mut recounts = vec![0_u64; first.slots.len()];
+                    let mut null_count = (nulls != 0).then_some(0_u64);
+                    let mut recount = |bits: Option<u64>, times: u32| {
+                        let held = match bits {
+                            Some(bits) => first.position(bits).map(|at| &mut recounts[at]),
+                            None => null_count.as_mut(),
+                        };
+                        if let Some(count) = held {
+                            *count = count.saturating_add(u64::from(times));
+                        }
+                    };
+                    let mut run = Run::default();
+                    self.visit_numeric(column, signed, |_, bits| {
+                        if let Some((bits, times)) = run.push(bits) {
+                            recount(bits, times);
+                        }
+                    })?;
+                    if let Some((bits, times)) = run.take() {
+                        recount(bits, times);
+                    }
+                    let exact = first
+                        .slots
+                        .iter()
+                        .zip(&recounts)
+                        .filter(|(slot, _)| slot.count != 0)
+                        .map(|(slot, &count)| (slot.bits, count))
+                        .collect::<FrequencyMap<_>>();
+                    (exact, null_count)
+                };
+                (exact, null_count, decrements, distinct_count)
             }
-            let exact = first
-                .slots
-                .iter()
-                .zip(&recounts)
-                .filter(|(slot, _)| slot.count != 0)
-                .map(|(slot, &count)| (slot.bits, count))
-                .collect::<FrequencyMap<_>>();
-            (exact, null_count)
         };
         let mut entries = exact
             .into_iter()
@@ -7906,6 +7931,25 @@ fn table_complete_numeric_frequencies(table: &Table) -> Vec<StoredNumericFrequen
             (rows == table.rows as u64).then_some(entries)
         })
         .collect()
+}
+
+/// The sixty four bits the close keys a numeric column's frequencies by, for a value the writer's
+/// tally held.
+///
+/// The same bits [`Writer::visit_numeric`] hands over: a signed value sign extended to `i64`, and an
+/// unsigned one as it is.
+fn frequency_bits(value: &Value) -> Option<u64> {
+    Some(match value {
+        Value::TinyInt(value) => i64::from(*value) as u64,
+        Value::SmallInt(value) => i64::from(*value) as u64,
+        Value::Integer(value) | Value::Date(value) => i64::from(*value) as u64,
+        Value::BigInt(value) | Value::Timestamp(value) => *value as u64,
+        Value::UTinyInt(value) => u64::from(*value),
+        Value::USmallInt(value) => u64::from(*value),
+        Value::UInteger(value) => u64::from(*value),
+        Value::UBigInt(value) => *value,
+        _ => return None,
+    })
 }
 
 fn numeric_frequency_value(value: &Value) -> Option<Option<i128>> {
@@ -14384,6 +14428,82 @@ mod tests {
             assert_eq!(
                 reader.distinct_values(column).expect("valid metadata"),
                 Some(9 + 40_000),
+                "column {column}"
+            );
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_narrow_column_takes_its_frequencies_from_the_tally_and_they_match_the_rows() {
+        // Every column here has fewer distinct values than the tally holds, so the close takes its
+        // counts from the gather rather than reading the pages back. The types are the ones whose
+        // bits could come out wrong on that road: a negative tiny integer that has to be sign
+        // extended, an unsigned one past the top of `INTEGER`, a date and a timestamp. A null every
+        // thirteenth row checks that the nulls come from the pass and not from the list.
+        let path = path("frequency-tally");
+        let types = [
+            LogicalType::TinyInt,
+            LogicalType::UInteger,
+            LogicalType::Date,
+            LogicalType::Timestamp,
+        ];
+        let value = |ty: &LogicalType, at: i64| match ty {
+            LogicalType::TinyInt => Value::TinyInt((at % 250 - 125) as i8),
+            LogicalType::UInteger => Value::UInteger(u32::MAX - at as u32),
+            LogicalType::Date => Value::Date(19_000 - at as i32),
+            _ => Value::Timestamp(1_700_000_000_000_000 - at * 1_000_003),
+        };
+        let fields = types
+            .iter()
+            .enumerate()
+            .map(|(at, ty)| Field::new(format!("c{at}"), ty.clone()))
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(&path, "items", fields).expect("new file");
+        let mut rows = Vec::new();
+        for at in 0..250_i64 {
+            for _ in 0..=(at % 37) {
+                rows.push(if rows.len() % 13 == 0 { None } else { Some(at) });
+            }
+        }
+        for part in rows.chunks(1_000) {
+            let columns = types
+                .iter()
+                .map(|ty| {
+                    let values = part
+                        .iter()
+                        .map(|row| row.map_or(Value::Null, |at| value(ty, at)))
+                        .collect::<Vec<_>>();
+                    Vector::from_values(ty.clone(), &values).expect("a column")
+                })
+                .collect();
+            writer.append(&Chunk::new(columns).expect("matching columns")).expect("rows");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        for (column, ty) in types.iter().enumerate() {
+            let mut counts = HashMap::<Option<i64>, u64>::new();
+            for row in &rows {
+                *counts.entry(*row).or_default() += 1;
+            }
+            let wanted = counts
+                .into_iter()
+                .map(|(row, count)| (row.map_or(Value::Null, |at| value(ty, at)), count))
+                .collect::<Vec<_>>();
+            let prefix =
+                reader.frequency_prefix(column).expect("valid metadata").expect("a synopsis");
+            assert_eq!(prefix.entries.len(), wanted.len(), "column {column}");
+            assert_eq!(prefix.omitted_max, 0, "column {column}");
+            for (value, count) in &prefix.entries {
+                let held =
+                    wanted.iter().find(|(wanted, _)| wanted == value).map(|(_, count)| count);
+                assert_eq!(held, Some(count), "column {column} value {value:?}");
+            }
+            assert!(prefix.entries.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+            assert_eq!(
+                reader.distinct_values(column).expect("valid metadata"),
+                Some(wanted.len() as u64 - 1),
                 "column {column}"
             );
         }
