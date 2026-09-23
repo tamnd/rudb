@@ -218,6 +218,67 @@ pub fn compare_prepared(
     Vector::from_values(LogicalType::Boolean, &values)
 }
 
+/// The rows the comparison is true on, which is [`compare_prepared`] and then
+/// [`crate::select::selection`] without the flag vector in between.
+///
+/// The first conjunct of a filter asks exactly this, and going the long way round built a
+/// `BOOLEAN` vector, wrote false into every null of it, and then had `selection` take the vector
+/// apart again to find the booleans it had just been handed. Here the answers go straight to the
+/// loop that picks the rows, and a null is dropped by the validity the way `selection` drops a
+/// null flag, so the rows are the same ones. A pair of forms with no loop of its own goes the long
+/// way, which is where it is counted.
+///
+/// # Errors
+///
+/// The same ones [`compare`] gives.
+pub fn select_prepared(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    held: Option<&Held>,
+) -> Result<Selection> {
+    if left.len() != right.len() {
+        return Err(Error::internal(format!(
+            "a comparison of a {} row vector with a {} row one",
+            left.len(),
+            right.len()
+        )));
+    }
+    let len = left.len();
+    if len == 0 {
+        return Ok(Selection::empty());
+    }
+    if left.form() == Form::Constant && right.form() == Form::Constant {
+        let single = compare_values(op, &left.try_value_at(0)?, &right.try_value_at(0)?)?;
+        return Ok(if is_true(&single) { Selection::identity(len) } else { Selection::empty() });
+    }
+    let (left_valid, right_valid) = (nulls_of(left), nulls_of(right));
+    if !op.is_total() && (left_valid == Validity::AllInvalid || right_valid == Validity::AllInvalid)
+    {
+        return Ok(Selection::empty());
+    }
+    // A selection holds `u32` rows, and a chunk is nowhere near that, but the long way checks it
+    // and so this does too rather than casting past it.
+    if u32::try_from(len).is_ok() {
+        if let Some(answers) = external_text_literal(op, left, right, len, identity, held)? {
+            return Ok(crate::select::picked(
+                &answers,
+                identity,
+                len,
+                &left_valid.and(&right_valid, len),
+            ));
+        }
+        if let Some(answers) =
+            specialized(op, left, right, &left_valid, &right_valid, len, identity, held)
+        {
+            let validity =
+                if op.is_total() { Validity::AllValid } else { left_valid.and(&right_valid, len) };
+            return Ok(crate::select::picked(&answers, identity, len, &validity));
+        }
+    }
+    Ok(crate::select::selection(&compare_prepared(op, left, right, held)?, len))
+}
+
 /// The rows of `kept` the comparison also keeps.
 ///
 /// This is [`compare`] for a conjunct that is not the first one. A filter with four conjuncts
@@ -612,15 +673,15 @@ where
     let (codes, _) = column
         .shared_dictionary_parts()
         .ok_or_else(|| Error::internal("a resolved literal lost the codes it was resolved for"))?;
-    let mut answers = Vec::with_capacity(len);
-    // row at a time: the comparison is the loop. Nothing here reads a value or allocates.
-    for slot in 0..len {
-        let code = *codes
-            .get(map(slot))
-            .ok_or_else(|| Error::internal("a compared row is past the end of its codes"))?;
-        answers.push((code == wanted) == same);
+    // Every row the map can name is a row of the column, which both callers check before they get
+    // here, so codes as long as the column settle the bound for the whole chunk at once. Asking per
+    // row put an error path and a push in a loop that is otherwise one compare, and that loop was
+    // fifteen instructions a row on ClickBench 28 rather than one.
+    if codes.len() < column.len() {
+        return Err(Error::internal("a compared column is longer than its codes"));
     }
-    Ok(answers)
+    // row at a time: the comparison is the loop. Nothing here reads a value or allocates.
+    Ok((0..len).map(|slot| (codes[map(slot)] == wanted) == same).collect())
 }
 
 /// The positions of `rows` whose answer is true and whose row is live, without a branch per row.
@@ -1732,6 +1793,22 @@ mod tests {
         assert_eq!(fast, slow, "{op:?} on a {:?} against a {:?}", left.form(), right.form());
     }
 
+    /// [`agrees`], and the rows picked straight from the answers are the rows the flag vector
+    /// gives. Kept apart from `agrees` because a pair of forms with no loop goes the long way here
+    /// too, and the tests that count the long way would count it twice.
+    fn agrees_and_selects(op: Comparison, left: &Vector, right: &Vector) {
+        agrees(op, left, right);
+        let slow = oracle(op, left, right);
+        let picked = select_prepared(op, left, right, None).expect("selects");
+        assert_eq!(
+            picked.indices(),
+            crate::select::selection(&slow, slow.len()).indices(),
+            "{op:?} selected on a {:?} against a {:?}",
+            left.form(),
+            right.form()
+        );
+    }
+
     /// A small deterministic generator, because a property test with no seed is a test that fails
     /// on somebody else's machine and passes on yours.
     struct Rng(u64);
@@ -1948,34 +2025,34 @@ mod tests {
                 let other_runs = Vector::runs(ends, right.clone()).expect("one value for each run");
 
                 for op in EVERY {
-                    agrees(op, &left, &right);
-                    agrees(op, &left, &constant);
-                    agrees(op, &constant, &left);
-                    agrees(op, &left, &null_constant);
-                    agrees(op, &null_constant, &left);
-                    agrees(op, &dictionary, &constant);
-                    agrees(op, &constant, &dictionary);
+                    agrees_and_selects(op, &left, &right);
+                    agrees_and_selects(op, &left, &constant);
+                    agrees_and_selects(op, &constant, &left);
+                    agrees_and_selects(op, &left, &null_constant);
+                    agrees_and_selects(op, &null_constant, &left);
+                    agrees_and_selects(op, &dictionary, &constant);
+                    agrees_and_selects(op, &constant, &dictionary);
                     // The dictionary against a flat column, which reads a null from either side and
                     // from the dictionary's values as well, so it is the pair with the most ways to
                     // disagree with the oracle and the one that got a loop last.
-                    agrees(op, &dictionary, &right);
-                    agrees(op, &right, &dictionary);
+                    agrees_and_selects(op, &dictionary, &right);
+                    agrees_and_selects(op, &right, &dictionary);
                     // The same four pairings for run length, which reaches the same loops through
                     // the same accessor, so what is being checked is that the positions it works
                     // out are the positions the row at a time path reads.
-                    agrees(op, &runs, &constant);
-                    agrees(op, &constant, &runs);
-                    agrees(op, &runs, &right);
-                    agrees(op, &right, &runs);
+                    agrees_and_selects(op, &runs, &constant);
+                    agrees_and_selects(op, &constant, &runs);
+                    agrees_and_selects(op, &runs, &right);
+                    agrees_and_selects(op, &right, &runs);
                     // Both sides reached through codes, which is the pair TPC-H actually hits:
                     // `l_commitdate < l_receiptdate` is two dictionary encoded columns of one
                     // table. A null here can be in four places at once, the two dictionaries' own
                     // masks and the two value vectors, and the answer has to be null if it is in
                     // any of them.
-                    agrees(op, &dictionary, &other_dictionary);
-                    agrees(op, &runs, &other_runs);
-                    agrees(op, &dictionary, &other_runs);
-                    agrees(op, &runs, &other_dictionary);
+                    agrees_and_selects(op, &dictionary, &other_dictionary);
+                    agrees_and_selects(op, &runs, &other_runs);
+                    agrees_and_selects(op, &dictionary, &other_runs);
+                    agrees_and_selects(op, &runs, &other_dictionary);
                 }
             }
         }
@@ -3029,6 +3106,14 @@ mod tests {
                 let got = compare_prepared(op, column, &right, Some(&held))
                     .expect("the peeled path answers");
                 assert_eq!(got, wanted, "{literal:?} under {op:?}");
+                let held = Held::of(&LogicalType::Varchar, &value).expect("text has a column");
+                let picked = select_prepared(op, column, &right, Some(&held))
+                    .expect("the peeled path selects");
+                assert_eq!(
+                    picked.indices(),
+                    crate::select::selection(&wanted, column.len()).indices(),
+                    "{literal:?} under {op:?}, selected"
+                );
                 // A fresh memo for the selection, since the one above belongs to that call's node.
                 let held = Held::of(&LogicalType::Varchar, &value).expect("text has a column");
                 let kept = Selection::from_predicate(column.len(), |row| row % 3 != 1);

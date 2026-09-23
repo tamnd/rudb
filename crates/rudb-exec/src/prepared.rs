@@ -38,7 +38,7 @@ use rudb_common::{
 };
 use rudb_kernels::{
     Comparison, Connective, Found, Held, Lookup, Members, Recipe, cast_in_time_zone, combine,
-    compare_prepared, in_set, is_true, refine_flags, refine_prepared, selection,
+    compare_prepared, in_set, is_true, refine_flags, refine_prepared, select_prepared, selection,
 };
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 use rudb_vector::{Assembly, Chunk, Selection, Vector};
@@ -742,7 +742,7 @@ impl Prepared {
             return match live {
                 // The first operand has every row in play, and asking the threaded kernel for that
                 // would be a pass over an identity selection the unthreaded one does not need.
-                None => Ok(selection(&compare_prepared(*op, one, other, held)?, chunk.len())),
+                None => select_prepared(*op, one, other, held),
                 Some(live) => refine_prepared(*op, one, other, live, held),
             };
         }

@@ -2886,11 +2886,27 @@ impl Vector {
                             .is_some_and(|&index| index < self.len && !self.is_null_at(index))
                     })
                 };
-                let gathered =
+                let gathered: Vec<u32> =
                     at.iter().map(|&index| codes.get(index).copied().unwrap_or(0)).collect();
-                return Ok(
-                    Self::stable_dictionary(gathered, Arc::clone(values))?.with_validity(validity)
-                );
+                // Every code here is one this vector already held, which was checked against the
+                // same values on the way in, or the zero a row past the end is written as. So the
+                // only code that can be out of range is that zero over no values at all, and the
+                // pass that looks for the largest code is not needed to find it. On ClickBench 28
+                // that pass was four percent of the query, because every filtered chunk of `URL`
+                // came through here.
+                // Values that are themselves a dictionary are composed through by the constructor,
+                // and this skips the constructor, so that shape still goes the checked way.
+                if matches!(values.body, Body::Dictionary { .. }) {
+                    return Ok(Self::stable_dictionary(gathered, Arc::clone(values))?
+                        .with_validity(validity));
+                }
+                let highest = (values.is_empty() && !gathered.is_empty()).then_some(0);
+                return Ok(Self::stable_dictionary_validated(
+                    gathered,
+                    Arc::clone(values),
+                    highest,
+                )?
+                .with_validity(validity));
             }
         }
         let (at, leaf) = self.resolve(at);

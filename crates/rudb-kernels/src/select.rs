@@ -205,7 +205,7 @@ fn swept(flags: &Vector, rows: usize) -> Option<Selection> {
     clippy::cast_possible_truncation,
     reason = "the caller checked that the row count fits in a u32 before getting here"
 )]
-fn picked<M: Fn(usize) -> usize>(
+pub(crate) fn picked<M: Fn(usize) -> usize>(
     values: &[bool],
     at: M,
     rows: usize,
