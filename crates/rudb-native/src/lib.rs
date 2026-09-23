@@ -6527,6 +6527,77 @@ impl Reader {
         self.read_impl(part, columns, false, None)
     }
 
+    /// Counts one signed integer part from its encoded row values when it uses an all-valid
+    /// cascade. Sparse and run-length cascades are folded without expanding their rows. Other
+    /// page forms return `None` so the caller can use the ordinary reader.
+    ///
+    /// # Errors
+    ///
+    /// If a part, column, page checksum, or encoded integer is invalid.
+    pub fn integer_tally(&self, part: usize, column: usize) -> Result<Option<Vec<(i64, u64)>>> {
+        let place = *self.places.get(part).ok_or_else(|| invalid("part index out of range"))?;
+        let field =
+            self.table.fields.get(column).ok_or_else(|| invalid("column index out of range"))?;
+        if !matches!(
+            field.ty,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+        ) {
+            return Ok(None);
+        }
+        let stripe_index = place.stripe as usize;
+        let stripe = self
+            .table
+            .stripes
+            .get(stripe_index)
+            .ok_or_else(|| invalid("stripe index out of range"))?;
+        let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
+        let held = self.held(stripe_index, stripe, column, true)?;
+        let span = *held
+            .index
+            .get(place.part as usize)
+            .ok_or_else(|| invalid("part index out of range"))?;
+        let owned;
+        let bytes = match &held.page {
+            Some(page) => part_bytes(page, span)?,
+            None => {
+                let offset = page
+                    .offset
+                    .checked_add(span.start as u64)
+                    .ok_or_else(|| invalid("part range overflow"))?;
+                let mut bytes = vec![0; span.length];
+                read_at(&self.file, offset, &mut bytes)?;
+                owned = bytes;
+                &owned
+            }
+        };
+        if checksum(bytes) != span.hash {
+            return Err(invalid("integer part checksum differs"));
+        }
+        if bytes.first() != Some(&5) || bytes.get(1) != Some(&0) {
+            return Ok(None);
+        }
+        let (rows, counts) = integer::tally(&bytes[2..])?;
+        if rows != place.rows as usize {
+            return Err(invalid("encoded integer part holds the wrong number of rows"));
+        }
+        for &(value, _) in &counts {
+            let fits = match field.ty {
+                LogicalType::TinyInt => i8::try_from(value).is_ok(),
+                LogicalType::SmallInt => i16::try_from(value).is_ok(),
+                LogicalType::Integer => i32::try_from(value).is_ok(),
+                LogicalType::BigInt => true,
+                _ => false,
+            };
+            if !fits {
+                return Err(invalid("encoded integer value is outside its column type"));
+            }
+        }
+        Ok(Some(counts))
+    }
+
     /// Reads named columns from one part, only at the rows `positions` names.
     ///
     /// For a scan that already knows which rows of the part it keeps, from the columns it read
@@ -15995,6 +16066,32 @@ mod tests {
             .next("t", vec![Field::new("a", LogicalType::BigInt)])
             .expect_err("the same name twice");
         assert!(error.message().contains("same name"), "{}", error.message());
+        fs::remove_file(file).expect("remove scratch file");
+    }
+
+    #[test]
+    fn integer_tally_counts_encoded_rows_and_declines_null_parts() {
+        let file = path("integer-tally");
+        let mut writer =
+            Writer::create(&file, "events", vec![Field::new("source", LogicalType::SmallInt)])
+                .expect("new file");
+        let mut values = vec![Value::SmallInt(0); 1024];
+        values[7] = Value::SmallInt(3);
+        values[99] = Value::SmallInt(-2);
+        values[1001] = Value::SmallInt(3);
+        let column = Vector::from_values(LogicalType::SmallInt, &values).expect("integer values");
+        writer.append(&Chunk::new(vec![column]).expect("one column")).expect("first part");
+        values[0] = Value::Null;
+        let column = Vector::from_values(LogicalType::SmallInt, &values).expect("nullable values");
+        writer.append(&Chunk::new(vec![column]).expect("one column")).expect("second part");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&file).expect("read file");
+        assert_eq!(
+            reader.integer_tally(0, 0).expect("valid part"),
+            Some(vec![(-2, 1), (0, 1021), (3, 2)])
+        );
+        assert!(reader.integer_tally(1, 0).expect("valid null part").is_none());
         fs::remove_file(file).expect("remove scratch file");
     }
 

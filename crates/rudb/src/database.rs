@@ -794,6 +794,23 @@ impl Database {
         let mut sparse = BTreeMap::<i128, u64>::new();
         let reader = catalog.table(name)?;
         for part in 0..reader.parts() {
+            if let Some(counts) = reader.integer_tally(part, index)? {
+                for (value, count) in counts {
+                    if value == 0 {
+                        continue;
+                    }
+                    let value = i128::from(value);
+                    if let Some((low, dense_counts)) = &mut dense {
+                        let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
+                        if let Some(held) = dense_counts.get_mut(at) {
+                            *held += count;
+                            continue;
+                        }
+                    }
+                    *sparse.entry(value).or_default() += count;
+                }
+                continue;
+            }
             let chunk = reader.read(part, &[index])?;
             let column = chunk
                 .into_columns()
