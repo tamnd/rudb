@@ -70,6 +70,7 @@ const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
 const NONZERO_COUNTS: &[u8; 8] = b"RUDBNZ10";
 const AGGREGATE_SUMS: &[u8; 8] = b"RUDBAG10";
+const DISTINCT_COUNTS: &[u8; 8] = b"RUDBDC10";
 const FORMAT: u32 = 28;
 
 /// Formats this build can open.
@@ -919,6 +920,8 @@ struct Entry {
     nonzero: Vec<Option<u64>>,
     /// Exact sum and non-null count for signed integer columns.
     aggregates: Vec<Option<(i128, u64)>>,
+    /// Exact non-null distinct values when the writer finished counting the column.
+    distincts: Vec<Option<u64>>,
 }
 
 /// One view's line in the catalog directory.
@@ -2819,6 +2822,7 @@ impl Writer {
             rows: self.table.rows,
             nonzero: table_nonzero_counts(&self.table),
             aggregates: table_aggregate_sums(&self.table),
+            distincts: self.table.distincts.clone(),
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -2981,8 +2985,8 @@ impl Writer {
         Ok(())
     }
 
-    /// Adds exact integer aggregate certificates to an older file's catalog without rewriting
-    /// table pages. The old committed slot remains readable until the new catalog is fully synced.
+    /// Adds exact count, sum, and distinct certificates to an older file's catalog without
+    /// rewriting table pages. The old slot remains readable until the new catalog is synced.
     pub fn certify_summaries(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
@@ -2992,6 +2996,9 @@ impl Writer {
             let reader = native.table(&entry.name)?;
             entry.nonzero = reader_nonzero_counts(&reader)?;
             entry.aggregates = reader_aggregate_sums(&reader)?;
+            entry.distincts = (0..entry.fields.len())
+                .map(|column| reader.distinct_values(column))
+                .collect::<Result<Vec<_>>>()?;
         }
         let generation = slot
             .generation
@@ -4671,6 +4678,24 @@ impl Catalog {
             return Err(invalid(&format!("the directory of table {name} does not checksum")));
         }
         Ok(Some(CertifiedSums { columns: sums, rows: entry.rows as u64 }))
+    }
+
+    /// Exact non-null distinct count from the small catalog, after checking the table directory.
+    pub fn distinct_count(&self, name: &str, column: usize) -> Result<Option<u64>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(count) = entry.distincts.get(column).copied() else {
+            return Err(invalid("distinct column index out of range"));
+        };
+        let Some(count) = count else { return Ok(None) };
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
+        }
+        Ok(Some(count))
     }
 
     /// The schema copied into the small file catalog, available without opening the table directory.
@@ -6829,6 +6854,24 @@ fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
             }
         }
     }
+    out.extend_from_slice(DISTINCT_COUNTS);
+    for entry in entries {
+        if entry.distincts.len() != entry.fields.len() {
+            return Err(invalid("distinct count width differs from schema"));
+        }
+        for count in &entry.distincts {
+            match count {
+                None => out.push(0),
+                Some(count) => {
+                    if *count > entry.rows as u64 {
+                        return Err(invalid("distinct count exceeds table rows"));
+                    }
+                    out.push(1);
+                    put_u64(&mut out, *count);
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -6881,7 +6924,8 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
         }
         let nonzero = vec![None; fields.len()];
         let aggregates = vec![None; fields.len()];
-        entries.push(Entry { name, fields, rows, directory, nonzero, aggregates });
+        let distincts = vec![None; fields.len()];
+        entries.push(Entry { name, fields, rows, directory, nonzero, aggregates, distincts });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
     // file written before format 25. That is why the count is allowed to be missing rather than
@@ -6973,6 +7017,26 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
                         Some((sum, count))
                     }
                     _ => return Err(invalid("aggregate sum tag or column type differs")),
+                };
+            }
+        }
+    }
+    if !cur.done() {
+        if cur.take(8)? != DISTINCT_COUNTS {
+            return Err(invalid("distinct catalog extension magic differs"));
+        }
+        for entry in &mut entries {
+            for count in &mut entry.distincts {
+                *count = match cur.u8()? {
+                    0 => None,
+                    1 => {
+                        let value = cur.u64()?;
+                        if value > entry.rows as u64 {
+                            return Err(invalid("distinct count exceeds table rows"));
+                        }
+                        Some(value)
+                    }
+                    _ => return Err(invalid("distinct count tag differs")),
                 };
             }
         }
@@ -11368,6 +11432,7 @@ mod tests {
                 directory: Page { offset: HEADER, length: 8, hash: 0 },
                 nonzero: vec![None],
                 aggregates: vec![None],
+                distincts: vec![None],
             }],
             &[sample_view("items")],
         )
@@ -12592,6 +12657,8 @@ mod tests {
         let catalog = Catalog::open(&path).expect("catalog");
         assert_eq!(catalog.entries[0].nonzero, vec![None, Some(2)]);
         assert_eq!(catalog.entries[0].aggregates, vec![None, Some((10, 4))]);
+        assert_eq!(catalog.entries[0].distincts, vec![Some(1), Some(3)]);
+        assert_eq!(catalog.distinct_count("items", 1).expect("distinct count"), Some(3));
         assert_eq!(
             catalog.aggregate_sums("items", &[1]).expect("catalog sums"),
             Some(CertifiedSums { columns: vec![(10, 4)], rows: 6 })
@@ -12609,6 +12676,10 @@ mod tests {
         assert_eq!(
             Catalog::open(&path).expect("reopen").aggregate_sums("items", &[1]).expect("sums"),
             Some(CertifiedSums { columns: vec![(10, 4)], rows: 6 })
+        );
+        assert_eq!(
+            Catalog::open(&path).expect("reopen").distinct_count("items", 1).expect("distinct"),
+            Some(3)
         );
         assert_eq!(catalog.table("items").expect("reader").null_count(1).expect("nulls"), 2);
         fs::remove_file(path).expect("remove scratch file");
