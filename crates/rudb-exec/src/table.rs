@@ -446,10 +446,10 @@ impl Table {
             return;
         }
         if self.buckets.len() <= HOT {
-            if let [column] = keys
-                && self.hot_one(hashes, column, rows, slots, walk)
-            {
-                return;
+            if let [column] = keys {
+                if self.hot_one(hashes, column, rows, slots, walk) {
+                    return;
+                }
             }
             for (out, found) in slots.iter_mut().enumerate().take(rows.len()) {
                 let row = rows.at(out);
