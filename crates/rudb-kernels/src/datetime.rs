@@ -853,6 +853,15 @@ fn shifted_months(day: i32, months: i64) -> Result<i32> {
 }
 
 /// The day, the time inside it and the interval's own microseconds, as one timestamp.
+/// A timestamp moved by a count of microseconds, which is [`shifted_stamp`] with no months and no
+/// days. Every timestamp's day is a date, so the only thing that can fail is the sum.
+pub(crate) fn nudged_stamp(stamp: i64, micros: i64) -> Result<i64> {
+    match stamp.checked_add(micros) {
+        Some(stamp) if (OLDEST_TIMESTAMP..=NEWEST_TIMESTAMP).contains(&stamp) => Ok(stamp),
+        _ => Err(not_in_range()),
+    }
+}
+
 fn moved(day: i32, within: i64, micros: i128) -> Result<i64> {
     let stamp = i128::from(day) * i128::from(MICROS_PER_DAY) + i128::from(within) + micros;
     match i64::try_from(stamp) {
