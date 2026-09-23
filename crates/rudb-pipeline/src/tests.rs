@@ -1091,6 +1091,24 @@ fn a_source_is_told_how_many_workers_are_coming_even_when_the_answer_is_one() {
 }
 
 #[test]
+fn the_two_widths_a_run_needs_come_from_one_question_to_the_source() {
+    // A query wants both numbers, the borrow and the instance count, and it used to get them from
+    // `lease_degree` and then `degree`. Asking is how a source cuts its work, so that was two passes
+    // over the zone maps and two sets of morsels, of which the second was thrown away because they
+    // are set once. On TPC-H 12 it tested every one of lineitem's 733 parts against the filter twice
+    // before a row was read, and it made the ruled out parts count double, so a scan that could
+    // reach nothing said 1466 of 1466 parts skipped on a table that has 733.
+    let source = Arc::new(Asked::default());
+    let built = pipeline(Arc::clone(&source) as Arc<dyn Source>, Arc::new(WideFinish::default()));
+
+    let (degree, lease) = built.widths(8);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1, "asked once and not once per number");
+    assert_eq!(degree, 8, "sixty four morsels are more than the eight on offer");
+    assert_eq!(lease, 8, "and the sink finishes on everything");
+    assert_eq!(built.lease_degree(8), lease, "the old name still answers the same");
+}
+
+#[test]
 fn a_source_under_an_operator_that_refuses_instances_is_told_one_rather_than_the_ceiling() {
     // The pipeline is going to run on one thread whatever the pool would lend, so telling the
     // source the ceiling would have it cut for workers that are never coming.
