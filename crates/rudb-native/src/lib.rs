@@ -2915,6 +2915,36 @@ impl TextSource for NativeText {
         Ok(Some((end - start) as usize))
     }
 
+    /// Every length out of the unpacked ends in one loop, which is the point of having them.
+    ///
+    /// The whole run of positions counts towards [`Self::ends_worth_unpacking`] at once, because a
+    /// caller asking for a vector of lengths has said how many it wants, and a vector of them is
+    /// usually enough on its own. Until the table is worth building this is the row at a time read,
+    /// the same as the default.
+    fn bytes_lens_at(&self, indices: &[u32], into: &mut [i64]) -> Result<()> {
+        self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed);
+        let Some(ends) = self.value_ends() else {
+            for (slot, &index) in into.iter_mut().zip(indices) {
+                *slot = self.bytes_len_at(index as usize)?.map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX));
+            }
+            return Ok(());
+        };
+        for (slot, &index) in into.iter_mut().zip(indices) {
+            let index = index as usize;
+            // Past the end is no value and so no length, which is what a row at a time read says.
+            let Some(&end) = ends.get(index) else {
+                *slot = 0;
+                continue;
+            };
+            let start = if index % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[index - 1] };
+            if start > end {
+                return Err(invalid("global dictionary value ends before it starts"));
+            }
+            *slot = i64::from(end - start);
+        }
+        Ok(())
+    }
+
     /// The rest of the block holding `first`, decoded into a buffer that may die with the call.
     ///
     /// A block is the unit this format decodes, so a walk that wants every value is going to decode
@@ -10028,6 +10058,35 @@ mod tests {
         };
         pass("the first pass");
         pass("the second pass");
+
+        // The whole vector in one call, over the text and through codes into it, which is how a
+        // scan of a stored column hands it out. The codes run backwards and repeat so that they are
+        // neither the positions nor in order.
+        let lens = wanted.iter().map(|value| value.len() as i64).collect::<Vec<_>>();
+        let mut whole = vec![0i64; wanted.len()];
+        assert!(dictionary.try_bytes_lens(&mut whole).expect("read"), "the text answers whole");
+        assert_eq!(whole, lens, "a vector of lengths answers what a length at a time answers");
+        let codes = (0..4_000_u32).map(|row| (7 * (4_000 - row)) % 2_800).collect::<Vec<_>>();
+        let coded =
+            Vector::dictionary_over(codes.clone(), Arc::new(dictionary)).expect("codes in range");
+        let mut through = vec![0i64; codes.len()];
+        assert!(coded.try_bytes_lens(&mut through).expect("read"), "the codes answer whole");
+        for (row, &code) in codes.iter().enumerate() {
+            assert_eq!(through[row], lens[code as usize], "row {row} reads code {code}");
+            let one = coded.try_bytes_len_at(row).expect("read").expect("a value");
+            assert_eq!(through[row], one as i64, "row {row} a row at a time");
+        }
+
+        // A handful of codes over a column nobody has read yet is short of the table, so the same
+        // call answers out of the packed ends instead, and has to answer the same.
+        let fresh = Reader::open(&path).expect("valid directory");
+        let untouched = fresh.dictionary(0).expect("read").expect("a string column has one");
+        let few = vec![2_799_u32, 0, 1_024, 1_023, 511, 512];
+        let coded = Vector::dictionary_over(few.clone(), Arc::new(untouched)).expect("in range");
+        let mut short = vec![0i64; few.len()];
+        assert!(coded.try_bytes_lens(&mut short).expect("read"), "the codes answer whole");
+        let expected = few.iter().map(|&code| lens[code as usize]).collect::<Vec<_>>();
+        assert_eq!(short, expected, "the packed ends answer what the table answers");
         fs::remove_file(path).expect("remove scratch file");
     }
 
