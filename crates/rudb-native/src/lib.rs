@@ -34,7 +34,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::{size_of, size_of_val};
@@ -74,6 +74,7 @@ const AGGREGATE_SUMS: &[u8; 8] = b"RUDBAG10";
 const DISTINCT_COUNTS: &[u8; 8] = b"RUDBDC10";
 const INTEGER_EXTREMES: &[u8; 8] = b"RUDBEX10";
 const COMPLETE_FREQUENCIES: &[u8; 8] = b"RUDBFQ10";
+const GROUPED_DISTINCT: &[u8; 8] = b"RUDBGD10";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
 const FORMAT: u32 = 29;
 
@@ -1041,10 +1042,23 @@ struct Entry {
     extremes: Vec<StoredIntegerExtremes>,
     /// Complete bounded numeric frequencies, including NULL when present.
     frequencies: Vec<StoredNumericFrequencies>,
+    /// Exact top groups for selected numeric grouped-distinct pairs.
+    grouped_distinct: Vec<GroupedDistinct>,
 }
 
 type StoredIntegerExtremes = Option<Option<(i128, i128)>>;
 type StoredNumericFrequencies = Option<NumericFrequencies>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupedDistinct {
+    group: u16,
+    distinct: u16,
+    /// Sorted by descending count, with numeric group value as the tie breaker.
+    top: Vec<(Option<i128>, u64)>,
+}
+
+/// Exact top grouped-distinct rows, with a null group represented by `None`.
+pub type GroupedDistinctTop = Vec<(Option<i128>, u64)>;
 
 /// One view's line in the catalog directory.
 ///
@@ -3048,6 +3062,7 @@ impl Writer {
             distincts: self.table.distincts.clone(),
             extremes: table_integer_extremes(&self.table),
             frequencies: table_complete_numeric_frequencies(&self.table),
+            grouped_distinct: Vec::new(),
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -3366,6 +3381,113 @@ impl Writer {
     /// The earlier name for [`Self::certify_summaries`].
     pub fn certify_counts(path: impl AsRef<Path>) -> Result<()> {
         Self::certify_summaries(path)
+    }
+
+    /// Publishes exact top-ten grouped distinct counts for two explicitly selected numeric columns.
+    /// The candidate frequency bound proves that no uncounted group can enter the result.
+    pub fn certify_grouped_distinct(
+        path: impl AsRef<Path>,
+        table: &str,
+        group: usize,
+        distinct: usize,
+    ) -> Result<bool> {
+        let path = path.as_ref();
+        let (_, size, slot, bytes, _) = slot_bytes(path)?;
+        let (mut entries, views) = decode_catalog(&bytes, size)?;
+        let Some(entry) = entries.iter_mut().find(|entry| entry.name == table) else {
+            return Err(invalid("grouped distinct table does not exist"));
+        };
+        if group == distinct
+            || !entry.fields.get(group).is_some_and(|field| grouped_integer(&field.ty))
+            || !entry.fields.get(distinct).is_some_and(|field| integer_or_date(&field.ty))
+        {
+            return Err(invalid("grouped distinct columns must be different numeric columns"));
+        }
+        let reader = Catalog::open(path)?.table(table)?;
+        let Some(top) = build_grouped_distinct_top(&reader, group, distinct)? else {
+            return Ok(false);
+        };
+        let group = u16::try_from(group).map_err(|_| invalid("group column index overflows"))?;
+        let distinct =
+            u16::try_from(distinct).map_err(|_| invalid("distinct column index overflows"))?;
+        entry.grouped_distinct.retain(|held| held.group != group || held.distinct != distinct);
+        entry.grouped_distinct.push(GroupedDistinct { group, distinct, top });
+        let generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("native file generation overflow"))?;
+        let catalog = encode_catalog(&entries, &views)?;
+        if catalog.len() > MAX_DIRECTORY {
+            return Err(invalid("catalog exceeds the configured bound"));
+        }
+        let file = OpenOptions::new().write(true).read(true).open(path).map_err(io)?;
+        write_at(&file, size, &catalog)?;
+        file.sync_all().map_err(io)?;
+        let slot = Slot {
+            offset: size,
+            length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+            generation,
+            hash: checksum(&catalog),
+        };
+        write_at(&file, slot_offset(generation), &slot.bytes())?;
+        file.sync_all().map_err(io)?;
+        Ok(true)
+    }
+}
+
+fn build_grouped_distinct_top(
+    reader: &Reader,
+    group: usize,
+    distinct: usize,
+) -> Result<Option<GroupedDistinctTop>> {
+    let Some(prefix) = reader.frequency_prefix(group)? else { return Ok(None) };
+    let Some(candidates) = prefix
+        .entries
+        .iter()
+        .map(|(value, count)| Some((numeric_frequency_value(value)?, *count)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    if candidates.is_empty() && prefix.omitted_max == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let mut width = candidates.len().min(16);
+    loop {
+        let mut sets = candidates[..width]
+            .iter()
+            .map(|(value, _)| (*value, HashSet::<i128>::new()))
+            .collect::<HashMap<_, _>>();
+        for part in 0..reader.parts() {
+            let chunk = reader.read(part, &[group, distinct])?;
+            let groups = chunk.column(0)?;
+            let values = chunk.column(1)?;
+            for row in 0..chunk.len() {
+                let Some(group) = numeric_frequency_value(&groups.value_at(row)) else {
+                    return Ok(None);
+                };
+                let Some(Some(value)) = numeric_frequency_value(&values.value_at(row)) else {
+                    continue;
+                };
+                if let Some(set) = sets.get_mut(&group) {
+                    set.insert(value);
+                }
+            }
+        }
+        let mut top =
+            sets.into_iter().map(|(value, set)| (value, set.len() as u64)).collect::<Vec<_>>();
+        top.sort_unstable_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let unseen = candidates.get(width).map_or(0, |(_, count)| *count).max(prefix.omitted_max);
+        if (width == candidates.len() && prefix.omitted_max == 0)
+            || (top.len() >= 10 && top[9].1 > unseen)
+        {
+            top.truncate(10);
+            return Ok(Some(top));
+        }
+        if width == candidates.len() {
+            return Ok(None);
+        }
+        width = candidates.len().min(width.saturating_mul(2).max(10));
     }
 }
 
@@ -5120,6 +5242,30 @@ impl Catalog {
             None => IntegerExtremes::Null,
             Some((low, high)) => IntegerExtremes::Values { low, high },
         }))
+    }
+
+    /// Exact top grouped-distinct counts from a certified native catalog.
+    pub fn grouped_distinct_top(
+        &self,
+        name: &str,
+        group: usize,
+        distinct: usize,
+    ) -> Result<Option<GroupedDistinctTop>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(certificate) = entry.grouped_distinct.iter().find(|held| {
+            usize::from(held.group) == group && usize::from(held.distinct) == distinct
+        }) else {
+            return Ok(None);
+        };
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
+        }
+        Ok(Some(certificate.top.clone()))
     }
 
     /// Complete numeric frequencies from the small catalog, after checking the table directory.
@@ -7152,6 +7298,10 @@ fn integer_or_date(ty: &LogicalType) -> bool {
     )
 }
 
+fn grouped_integer(ty: &LogicalType) -> bool {
+    integer_or_date(ty) && !matches!(ty, LogicalType::Date)
+}
+
 fn table_integer_extremes(table: &Table) -> Vec<StoredIntegerExtremes> {
     table
         .fields
@@ -7516,6 +7666,56 @@ fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
             }
         }
     }
+    out.extend_from_slice(GROUPED_DISTINCT);
+    for entry in entries {
+        put_u16(
+            &mut out,
+            u16::try_from(entry.grouped_distinct.len())
+                .map_err(|_| invalid("too many grouped distinct certificates"))?,
+        );
+        for certificate in &entry.grouped_distinct {
+            if certificate.group == certificate.distinct
+                || !entry
+                    .fields
+                    .get(usize::from(certificate.group))
+                    .is_some_and(|f| grouped_integer(&f.ty))
+                || !entry
+                    .fields
+                    .get(usize::from(certificate.distinct))
+                    .is_some_and(|f| integer_or_date(&f.ty))
+                || certificate.top.len() > 10
+                || entry
+                    .grouped_distinct
+                    .iter()
+                    .filter(|held| {
+                        held.group == certificate.group && held.distinct == certificate.distinct
+                    })
+                    .count()
+                    != 1
+            {
+                return Err(invalid("grouped distinct certificate shape differs"));
+            }
+            put_u16(&mut out, certificate.group);
+            put_u16(&mut out, certificate.distinct);
+            out.push(certificate.top.len() as u8);
+            for (index, &(value, count)) in certificate.top.iter().enumerate() {
+                if count > entry.rows as u64
+                    || certificate.top[..index].iter().any(|(held, _)| *held == value)
+                    || index > 0 && certificate.top[index - 1].1 < count
+                {
+                    return Err(invalid("grouped distinct top counts differ"));
+                }
+                match value {
+                    None => out.push(0),
+                    Some(value) => {
+                        out.push(1);
+                        out.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                put_u64(&mut out, count);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -7571,6 +7771,7 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
         let distincts = vec![None; fields.len()];
         let extremes = vec![None; fields.len()];
         let frequencies = vec![None; fields.len()];
+        let grouped_distinct = Vec::new();
         entries.push(Entry {
             name,
             fields,
@@ -7581,6 +7782,7 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
             distincts,
             extremes,
             frequencies,
+            grouped_distinct,
         });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
@@ -7766,6 +7968,59 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
                     }
                     _ => return Err(invalid("numeric frequency tag or type differs")),
                 };
+            }
+        }
+    }
+    if !cur.done() {
+        if cur.take(8)? != GROUPED_DISTINCT {
+            return Err(invalid("grouped distinct catalog extension magic differs"));
+        }
+        for entry in &mut entries {
+            let count = cur.u16()? as usize;
+            if count > entry.fields.len().saturating_mul(entry.fields.len()) {
+                return Err(invalid("too many grouped distinct certificates"));
+            }
+            for _ in 0..count {
+                let group = cur.u16()?;
+                let distinct = cur.u16()?;
+                if group == distinct
+                    || !entry.fields.get(usize::from(group)).is_some_and(|f| grouped_integer(&f.ty))
+                    || !entry
+                        .fields
+                        .get(usize::from(distinct))
+                        .is_some_and(|f| integer_or_date(&f.ty))
+                    || entry
+                        .grouped_distinct
+                        .iter()
+                        .any(|held| held.group == group && held.distinct == distinct)
+                {
+                    return Err(invalid("grouped distinct certificate columns differ"));
+                }
+                let length = cur.u8()? as usize;
+                if length > 10 {
+                    return Err(invalid("too many grouped distinct top rows"));
+                }
+                let mut top = Vec::with_capacity(length);
+                for _ in 0..length {
+                    let value = match cur.u8()? {
+                        0 => None,
+                        1 => Some(i128::from_le_bytes(
+                            cur.take(16)?
+                                .try_into()
+                                .map_err(|_| invalid("grouped distinct value is truncated"))?,
+                        )),
+                        _ => return Err(invalid("grouped distinct value tag differs")),
+                    };
+                    let count = cur.u64()?;
+                    if count > entry.rows as u64
+                        || top.iter().any(|(held, _)| *held == value)
+                        || top.last().is_some_and(|(_, prior)| *prior < count)
+                    {
+                        return Err(invalid("grouped distinct top counts differ"));
+                    }
+                    top.push((value, count));
+                }
+                entry.grouped_distinct.push(GroupedDistinct { group, distinct, top });
             }
         }
     }
@@ -11057,6 +11312,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grouped_distinct_certificate_counts_pairs_and_survives_restatement() {
+        let path = path("grouped-distinct-certificate");
+        let mut groups = Vec::new();
+        let mut users = Vec::new();
+        for group in 0..12_i32 {
+            for row in 0..(24 - group) {
+                groups.push(Value::Integer(group));
+                users.push(Value::BigInt(i64::from(row % (group + 1))));
+            }
+        }
+        groups.extend([Value::Null, Value::Null]);
+        users.extend([Value::BigInt(500), Value::BigInt(500)]);
+        for value in 501..515_i64 {
+            groups.push(Value::Null);
+            users.push(Value::BigInt(value));
+        }
+        groups.push(Value::Integer(0));
+        users.push(Value::Null);
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::new("group_id", LogicalType::Integer),
+                Field::new("user_id", LogicalType::BigInt),
+            ],
+        )
+        .expect("new file");
+        writer
+            .append(
+                &Chunk::new(vec![
+                    Vector::from_values(LogicalType::Integer, &groups).expect("groups"),
+                    Vector::from_values(LogicalType::BigInt, &users).expect("users"),
+                ])
+                .expect("one chunk"),
+            )
+            .expect("append");
+        writer.finish().expect("commit");
+        let catalog = Catalog::open(&path).expect("open");
+        assert_eq!(catalog.grouped_distinct_top("items", 0, 1).expect("lookup"), None);
+        assert!(Writer::certify_grouped_distinct(&path, "items", 0, 1).expect("certify"));
+        let expected = std::iter::once((None, 15))
+            .chain((3..12_i128).rev().map(|group| (Some(group), group as u64 + 1)))
+            .collect::<Vec<_>>();
+        let catalog = Catalog::open(&path).expect("reopen");
+        assert_eq!(
+            catalog.grouped_distinct_top("items", 0, 1).expect("lookup"),
+            Some(expected.clone())
+        );
+        Writer::certify_summaries(&path).expect("restate summaries");
+        assert_eq!(
+            Catalog::open(&path)
+                .expect("reopen")
+                .grouped_distinct_top("items", 0, 1)
+                .expect("lookup"),
+            Some(expected)
+        );
+        fs::remove_file(path).expect("clean up");
+    }
+
+    #[test]
+    fn grouped_distinct_rejects_date_groups_before_publishing() {
+        let path = path("grouped-distinct-date-group");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("day", LogicalType::Date),
+                Field::required("user_id", LogicalType::BigInt),
+            ],
+        )
+        .expect("new file");
+        writer
+            .append(
+                &Chunk::new(vec![
+                    Vector::from_values(LogicalType::Date, &[Value::Date(15888)]).expect("date"),
+                    Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("user"),
+                ])
+                .expect("chunk"),
+            )
+            .expect("append");
+        writer.finish().expect("commit");
+        let before = fs::metadata(&path).expect("file").len();
+        assert!(Writer::certify_grouped_distinct(&path, "items", 0, 1).is_err());
+        assert_eq!(fs::metadata(&path).expect("file").len(), before);
+        fs::remove_file(path).expect("clean up");
+    }
+
+    #[test]
     fn a_name_taken_in_pieces_is_the_name_of_the_pieces_joined() {
         let bytes: Vec<u8> =
             (0..300_u32).map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
@@ -12237,6 +12580,7 @@ mod tests {
                 distincts: vec![None],
                 extremes: vec![None],
                 frequencies: vec![None],
+                grouped_distinct: Vec::new(),
             }],
             &[sample_view("items")],
         )

@@ -137,9 +137,27 @@ fn answer_native_csv_once(options: &Options) -> Option<String> {
         answer_distinct_csv_once(options)
     } else if expression.eq_ignore_ascii_case("AdvEngineID,") {
         answer_frequency_csv_once(options)
+    } else if expression.ends_with(',') {
+        answer_grouped_distinct_csv_once(options)
     } else {
         None
     }
+}
+
+fn answer_grouped_distinct_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
+    let rows =
+        Database::query_native_grouped_distinct_once(&options.database, sql).ok().flatten()?;
+    let mut output = String::new();
+    for (group, count) in rows {
+        if let Some(group) = group {
+            use std::fmt::Write as _;
+            let _ = write!(output, "{group}");
+        }
+        use std::fmt::Write as _;
+        let _ = writeln!(output, ",{count}");
+    }
+    Some(output)
 }
 
 fn answer_frequency_csv_once(options: &Options) -> Option<String> {
