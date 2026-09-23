@@ -80,6 +80,10 @@ struct Inner {
     /// catalog has not moved. The pair that is stored is the generation and the setting text the
     /// list was read at, and either one changing rereads it.
     relationships: Mutex<(u64, String, Arc<Vec<rudb_opt::link::Linked>>)>,
+    /// The Parquet files this database tried to mirror and could not, with the options they were
+    /// read under, so that a file whose load fails pays for the failure once and not on every
+    /// query. See [`crate::mirror`].
+    declined: Mutex<BTreeSet<(String, bool)>>,
 }
 
 /// The file is written when the last handle on the database goes away.
@@ -143,6 +147,7 @@ impl Database {
             pool,
             facts: Mutex::default(),
             relationships: Mutex::default(),
+            declined: Mutex::default(),
         };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
@@ -273,6 +278,7 @@ impl Database {
             pool,
             facts: Mutex::default(),
             relationships: Mutex::default(),
+            declined: Mutex::default(),
         };
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
@@ -1087,6 +1093,15 @@ impl Shared {
     /// since printing a plan changes nothing. A statement that writes is refused here rather than
     /// run under a read lock.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
+        self.query_mirrored(sql, cancel, true)
+    }
+
+    /// [`Shared::query`], asking for the Parquet mirrors the statement wants when `mirror` is set.
+    ///
+    /// A statement that wanted one is bound again once the mirrors are in, and not a third time,
+    /// so a mirror that cannot be had costs one extra bind and leaves the statement reading the
+    /// file.
+    fn query_mirrored(&self, sql: &str, cancel: &Cancel, mirror: bool) -> Result<QueryResult> {
         let catalog = self.read();
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
@@ -1095,6 +1110,14 @@ impl Shared {
             timed(|| rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case()))?;
         let (bound, bind_ns) =
             timed(|| rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session))?;
+        if mirror {
+            let wanted = self.wanted_mirrors(&bound);
+            if !wanted.is_empty() {
+                drop(catalog);
+                self.mirror(&wanted);
+                return self.query_mirrored(sql, cancel, false);
+            }
+        }
         match bound {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
@@ -1120,6 +1143,51 @@ impl Shared {
                 )
             }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
+        }
+    }
+
+    /// The Parquet files a bound query read directly and would rather have read through a native
+    /// mirror, less the ones this database already failed to mirror.
+    ///
+    /// Only a query asks. A load reads the file once into a table of its own, which is the one
+    /// thing a mirror would duplicate, and an `EXPLAIN` should not start one.
+    fn wanted_mirrors(&self, bound: &Bound) -> Vec<(String, bool)> {
+        let Bound::Query(plan) = bound else { return Vec::new() };
+        if plan.wanted_mirrors().is_empty() {
+            return Vec::new();
+        }
+        let config = self.inner.settings.config();
+        if !config.parquet_mirror() {
+            return Vec::new();
+        }
+        let declined = self.inner.declined.lock().unwrap_or_else(PoisonError::into_inner);
+        plan.wanted_mirrors()
+            .iter()
+            .filter(|(_, _, rows)| *rows >= config.mirror_rows())
+            .map(|(path, binary_as_string, _)| (path.clone(), *binary_as_string))
+            .filter(|wanted| !declined.contains(wanted))
+            .collect()
+    }
+
+    /// Finds or builds a mirror of each file and puts it in the catalog.
+    ///
+    /// Nothing here fails the statement. A file that cannot be mirrored is read as it always was,
+    /// and it is remembered so that the next statement does not try again.
+    fn mirror(&self, wanted: &[(String, bool)]) {
+        let config = self.inner.settings.config();
+        for (path, binary_as_string) in wanted {
+            let added = crate::mirror::ensure(path, *binary_as_string, config).and_then(|found| {
+                let Some((stamp, reader)) = found else { return Ok(false) };
+                self.write().add_mirror(path, *binary_as_string, stamp, reader)?;
+                Ok(true)
+            });
+            if !matches!(added, Ok(true)) {
+                self.inner
+                    .declined
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert((path.clone(), *binary_as_string));
+            }
         }
     }
 
@@ -1280,7 +1348,7 @@ impl Shared {
 
     fn measured(catalog: &Catalog, generation: u64) -> rudb_opt::estimate::Facts {
         let mut facts = rudb_opt::estimate::Facts::at(generation);
-        for table in catalog.tables() {
+        for table in catalog.tables().chain(catalog.mirrored_tables()) {
             let name = table.name();
             let rows = u64::try_from(table.rows().len()).unwrap_or(u64::MAX);
             facts.record(&name.catalog, &name.schema, &name.table, rows);
@@ -1378,12 +1446,33 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
     ) -> Result<QueryResult> {
+        self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true)
+    }
+
+    /// [`Shared::execute_ast`], asking for mirrors the way [`Shared::query_mirrored`] does.
+    fn execute_mirrored(
+        &self,
+        ast: &Ast,
+        sql: &str,
+        parameters: &Parameters,
+        cancel: &Cancel,
+        parse_ns: u64,
+        mirror: bool,
+    ) -> Result<QueryResult> {
         let seams = self.seams(sql)?;
         let mut catalog = self.write();
         let context = self.optimizer(&catalog)?;
         let session = self.session();
         let (bound, bind_ns) =
             timed(|| rudb_bind::bind_statement_with(ast, &catalog, parameters, &session))?;
+        if mirror {
+            let wanted = self.wanted_mirrors(&bound);
+            if !wanted.is_empty() {
+                drop(catalog);
+                self.mirror(&wanted);
+                return self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, false);
+            }
+        }
         match bound {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;

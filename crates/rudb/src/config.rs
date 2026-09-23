@@ -4,6 +4,12 @@ use std::time::Duration;
 
 use rudb_common::{Error, Result};
 
+/// The fewest rows a Parquet file has to hold before a mirror of it is made, by default.
+///
+/// Document 32 put a native query's floor at about nine and a half megabytes, and below a million
+/// rows decoding the file is cheaper than anything a mirror saves. Document 33 is the rest.
+pub(crate) const MIRROR_ROWS: u64 = 1 << 20;
+
 /// The settings a database is opened with.
 ///
 /// Three of them today: how much memory the engine may use, how many threads it may run a query on,
@@ -31,6 +37,8 @@ pub struct Config {
     threads: usize,
     query_timeout: Option<Duration>,
     read_only: bool,
+    parquet_mirror: bool,
+    mirror_rows: u64,
 }
 
 impl Default for Config {
@@ -41,6 +49,13 @@ impl Default for Config {
             threads,
             query_timeout: None,
             read_only: false,
+            // On unless the process was told otherwise. See `spec/storage-v3` document 33.
+            parquet_mirror: std::env::var_os("RUDB_PARQUET_MIRROR")
+                .is_none_or(|value| value != "0"),
+            mirror_rows: std::env::var("RUDB_MIRROR_ROWS")
+                .ok()
+                .and_then(|rows| rows.parse().ok())
+                .unwrap_or(MIRROR_ROWS),
         }
     }
 }
@@ -124,6 +139,36 @@ impl Config {
         self
     }
 
+    /// Whether a Parquet file read directly is decoded once into a native mirror and read from that
+    /// afterwards, which is document 33 in `spec/storage-v3`.
+    ///
+    /// On by default and off in a process started with `RUDB_PARQUET_MIRROR=0`.
+    #[must_use]
+    pub fn parquet_mirror(&self) -> bool {
+        self.parquet_mirror
+    }
+
+    /// The fewest rows a Parquet file has to hold before it is mirrored, which is `RUDB_MIRROR_ROWS`
+    /// where that is set and [`MIRROR_ROWS`] otherwise.
+    #[must_use]
+    pub fn mirror_rows(&self) -> u64 {
+        self.mirror_rows
+    }
+
+    /// The same settings, mirroring Parquet files of at least this many rows.
+    #[must_use]
+    pub fn with_mirror_rows(mut self, rows: u64) -> Self {
+        self.mirror_rows = rows;
+        self
+    }
+
+    /// The same settings, mirroring Parquet files or not.
+    #[must_use]
+    pub fn with_parquet_mirror(mut self, on: bool) -> Self {
+        self.parquet_mirror = on;
+        self
+    }
+
     /// The same settings with this memory limit.
     #[must_use]
     pub fn with_memory_limit(mut self, bytes: u64) -> Self {
@@ -199,6 +244,7 @@ impl Config {
                 ),
             ),
             ("read-only", self.read_only.to_string()),
+            ("parquet-mirror", self.parquet_mirror.to_string()),
         ]
     }
 }
