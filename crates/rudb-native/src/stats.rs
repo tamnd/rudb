@@ -1070,7 +1070,7 @@ pub(crate) fn column_bytes(table: &crate::Table) -> u64 {
                 .saturating_add(crate::sum(
                     table.stripes.iter().map(|stripe| crate::page_bytes(&stripe.part_ranges, at)),
                 ))
-                .saturating_add(crate::page_bytes(&table.dictionaries, at))
+                .saturating_add(crate::dictionary_bytes(table, at))
         })
         .fold(0, u64::saturating_add)
 }
