@@ -1829,10 +1829,36 @@ impl NativeSink {
         // and neither the encode before the first nor the pages between the two need it. That is
         // what lets thirty two instances encode at once rather than one at a time.
         let inside = Span::start();
+        static PROBE_T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let t0 = *PROBE_T0.get_or_init(Instant::now);
+        let ms = || t0.elapsed().as_secs_f64() * 1000.0;
+        let rows: usize = parts.iter().map(|(_, chunk)| chunk.len()).sum();
+        let a = ms();
         let appended = self.preparer.prepare(parts).and_then(|prepared| {
-            let merged = self.locked(|writer| writer.merge(prepared))?;
+            let b = ms();
+            let merged = self.locked(|writer| {
+                let c = ms();
+                let out = writer.merge(prepared);
+                let d = ms();
+                eprintln!("PROBE merge {c:.1} {d:.1}");
+                out
+            })?;
+            let e = ms();
             let paged = merged.pages()?;
-            self.locked(|writer| writer.write(paged))
+            let f = ms();
+            let out = self.locked(|writer| {
+                let g = ms();
+                let out = writer.write(paged);
+                let h = ms();
+                eprintln!("PROBE write {g:.1} {h:.1}");
+                out
+            });
+            eprintln!(
+                "PROBE stripe {:?} rows {rows} prep {a:.1} {b:.1} mergewait {b:.1} merged {e:.1} pages {e:.1} {f:.1} done {:.1}",
+                std::thread::current().id(),
+                ms()
+            );
+            out
         });
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
