@@ -2618,6 +2618,24 @@ fn date_of(
     }
 }
 
+/// The hour, minute or second of every timestamp, as `micros.rem_euclid(PERIOD) / UNIT`.
+///
+/// The same answer [`Part::of_micros`] gives, with the part settled before the loop rather than
+/// matched on every row and both divisors constants, so each row is a few multiplies rather than a
+/// match, a check for an error it cannot have and two divisions by a number read from memory.
+/// `extract(minute FROM EventTime)` over ten million rows was seven percent of ClickBench 19.
+fn clock<const PERIOD: i64, const UNIT: i64>(
+    micros: &[i64],
+    at: &impl Fn(usize) -> usize,
+    base: Validity,
+    out: &mut [i64],
+) -> Result<Validity> {
+    over_valid(out.len(), base, |index| {
+        out[index] = micros[at(index)].rem_euclid(PERIOD) / UNIT;
+        Ok(())
+    })
+}
+
 /// The four `date_part` and `date_trunc` loops, once the form has been turned into a mapping.
 #[expect(
     clippy::too_many_arguments,
@@ -2683,10 +2701,23 @@ fn date_runs<A: Fn(usize) -> usize>(
         }
         (LogicalType::Timestamp, Data::Int64(micros), false) => {
             let mut out = vec![0i64; rows];
-            let validity = over_valid(rows, base, |index| {
-                out[index] = part.of_micros(micros[at(index)])?;
-                Ok(())
-            })?;
+            let validity = match part {
+                Part::Hour => clock::<{ datetime::MICROS_PER_DAY }, { datetime::MICROS_PER_HOUR }>(
+                    micros, &at, base, &mut out,
+                )?,
+                Part::Minute => clock::<
+                    { datetime::MICROS_PER_HOUR },
+                    { datetime::MICROS_PER_MINUTE },
+                >(micros, &at, base, &mut out)?,
+                Part::Second => clock::<
+                    { datetime::MICROS_PER_MINUTE },
+                    { datetime::MICROS_PER_SECOND },
+                >(micros, &at, base, &mut out)?,
+                _ => over_valid(rows, base, |index| {
+                    out[index] = part.of_micros(micros[at(index)])?;
+                    Ok(())
+                })?,
+            };
             finish(returns, Data::Int64(out.into()), validity)
         }
         (LogicalType::Timestamp, Data::Int64(micros), true) => {
