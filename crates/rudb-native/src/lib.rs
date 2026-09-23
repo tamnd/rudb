@@ -34,7 +34,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::{size_of, size_of_val};
@@ -1163,9 +1163,10 @@ const DICTIONARY_CHECK_SEED: u64 = 11_400_714_819_323_198_485;
 /// million ClickBench rows has about eighteen million distinct values and 1.3 GB of bytes in them,
 /// and five columns like it are twelve of the seventeen gigabytes a load of `hits` peaks at. So the
 /// bytes are not kept. A value's bytes go into [`GlobalDictionary::filling`], and when that reaches
-/// [`TEXT_PAYLOAD_VALUES`] values the block is sealed, handed to [`encode_ready`] at the end of the
-/// stripe and never seen in that form again. What is left is the encoded block, which is two to
-/// three times smaller, and that is the same bytes the file is going to hold anyway.
+/// [`TEXT_PAYLOAD_VALUES`] values the block is sealed, handed out at the end of the merge that
+/// sealed it to be encoded with the stripe's pages, and never seen in that form again. What is left
+/// is the encoded block, which is two to three times smaller, and that is the same bytes the file
+/// is going to hold anyway.
 ///
 /// Two things needed the raw bytes and neither needs them now. Deciding whether a value has been
 /// seen before was a hash lookup and then a comparison of the bytes, and is now a hash lookup and a
@@ -1192,12 +1193,16 @@ struct GlobalDictionary {
     nulls: u64,
     /// The values of the block being filled, back to back.
     filling: Vec<u8>,
-    /// One conservative four-byte substring signature per sealed payload block.
-    grams: Vec<[u8; TEXT_GRAM_BYTES]>,
-    /// Blocks that have filled and not been encoded yet, each with its block number.
+    /// One conservative four-byte substring signature per encoded payload block, in block order.
     ///
-    /// Empty except between a block filling and the end of the stripe that filled it, and while the
-    /// column is still too small to settle a shape on.
+    /// Made where the block is encoded rather than where it is sealed, because sealing is under the
+    /// writer's lock and every byte of every value going through [`gram_bits`] was 2.9 of the 14
+    /// seconds the 10m ClickBench load spent on the 32 core box.
+    grams: Vec<[u8; TEXT_GRAM_BYTES]>,
+    /// Blocks that have filled and not been handed out to be encoded yet, each with its block number.
+    ///
+    /// Empty except inside the merge that filled them, and while the column is still too small to
+    /// settle a shape on.
     waiting: Vec<(usize, Vec<u8>)>,
     /// Blocks kept raw to settle a shape on, spread across the column, each with its number.
     ///
@@ -1213,10 +1218,15 @@ struct GlobalDictionary {
     settled: usize,
     /// The blocks that are encoded and not yet in the file, in block order, following `placed`.
     ///
-    /// Empty between stripes, because [`Writer::place_blocks`] writes them the moment
-    /// [`encode_ready`] hands them back. Only a dictionary that never meets a writer, which is a
-    /// test's, keeps them here.
+    /// Empty between stripes, because [`Writer::place_blocks`] writes them the moment they come
+    /// back. Only a dictionary that never meets a writer, which is a test's, keeps them here.
     blocks: Vec<Vec<u8>>,
+    /// Blocks that came back encoded ahead of a block before them, by block number.
+    ///
+    /// Two stripes merged one after the other can have their pages built in the other order, and a
+    /// block cannot go into `blocks` until every block before it is there. They wait here until the
+    /// gap closes, which is at most until the stripe merged just before this one is written.
+    early: BTreeMap<usize, EncodedBlock>,
     /// Where every block already written to the file is, in block order.
     placed: Vec<Placed>,
 }
@@ -1249,6 +1259,7 @@ impl GlobalDictionary {
             shape: None,
             settled: 0,
             blocks: Vec::new(),
+            early: BTreeMap::new(),
             placed: Vec::new(),
         }
     }
@@ -1319,15 +1330,6 @@ impl GlobalDictionary {
     fn seal(&mut self) {
         let at = self.ends.len().div_ceil(TEXT_PAYLOAD_VALUES) - 1;
         let bytes = std::mem::take(&mut self.filling);
-        let mut grams = [0_u8; TEXT_GRAM_BYTES];
-        for value in self.slices(at, &bytes) {
-            for gram in value.windows(4) {
-                for bit in gram_bits(gram) {
-                    grams[bit / 8] |= 1 << (bit % 8);
-                }
-            }
-        }
-        self.grams.push(grams);
         if at % self.stride == 0 {
             self.sample.push((at, bytes.clone()));
             if self.sample.len() > PAYLOAD_SAMPLE_BLOCKS {
@@ -1341,16 +1343,53 @@ impl GlobalDictionary {
 
     /// The values of one block, as slices into the bytes the block was filled with.
     fn slices<'a>(&self, at: usize, bytes: &'a [u8]) -> Vec<&'a [u8]> {
-        let first = at * TEXT_PAYLOAD_VALUES;
+        block_values(self.block_ends(at), bytes)
+    }
+
+    /// Where every value of one block ends, relative to the block.
+    fn block_ends(&self, at: usize) -> &[u32] {
+        let first = (at * TEXT_PAYLOAD_VALUES).min(self.ends.len());
         let last = (first + TEXT_PAYLOAD_VALUES).min(self.ends.len());
-        let mut out = Vec::with_capacity(last.saturating_sub(first));
-        let mut from = 0;
-        for value in first..last {
-            let to = self.ends[value] as usize;
-            out.push(&bytes[from..to]);
-            from = to;
+        &self.ends[first..last]
+    }
+
+    /// Takes every waiting block out to be encoded somewhere else, if the column has a shape to
+    /// encode them with.
+    ///
+    /// This is what keeps the encoding out of the writer's lock. A block needs its bytes, where its
+    /// values end and the shape, and nothing else of the dictionary, so it goes out with a copy of
+    /// the four kilobytes of ends it has and comes back through [`GlobalDictionary::take_back`].
+    fn hand_out(&mut self, column: usize) -> Vec<Unencoded> {
+        let Some(shape) = &self.shape else { return Vec::new() };
+        let waiting = std::mem::take(&mut self.waiting);
+        waiting
+            .into_iter()
+            .map(|(at, bytes)| Unencoded {
+                column,
+                at,
+                ends: self.block_ends(at).to_vec(),
+                bytes,
+                shape: shape.clone(),
+            })
+            .collect()
+    }
+
+    /// Takes back one block that was handed out, and moves every block that is now next in line
+    /// into `blocks`.
+    fn take_back(&mut self, at: usize, block: EncodedBlock) -> Result<()> {
+        if at < self.encoded() || self.early.insert(at, block).is_some() {
+            return Err(Error::internal("a dictionary block came back twice"));
         }
-        out
+        while let Some(block) = self.early.remove(&self.encoded()) {
+            self.push_block(block);
+        }
+        Ok(())
+    }
+
+    /// Appends the next encoded block and its signature.
+    fn push_block(&mut self, (bytes, grams): EncodedBlock) {
+        self.blocks.push(bytes);
+        self.grams.push(*grams);
     }
 
     /// Settles the shape the waiting blocks are about to be encoded with, if there is enough column
@@ -1386,13 +1425,14 @@ impl GlobalDictionary {
 
     /// Encodes the waiting block at `at`, with the settled shape when there is one and by trying
     /// everything when the column was too small to settle one.
-    fn encode_waiting(&self, at: usize) -> Result<Vec<u8>> {
+    fn encode_waiting(&self, at: usize) -> Result<EncodedBlock> {
         let (block, bytes) = &self.waiting[at];
         let values = self.slices(*block, bytes);
-        match &self.shape {
-            Some(shape) => string::encode_with(&values, shape),
-            None => string::encode(&values),
-        }
+        let encoded = match &self.shape {
+            Some(shape) => string::encode_with(&values, shape)?,
+            None => string::encode(&values)?,
+        };
+        Ok((encoded, block_grams(&values)))
     }
 
     /// [`finish_dictionaries`] for one dictionary on this thread, for the tests that hold one.
@@ -1402,11 +1442,11 @@ impl GlobalDictionary {
         let made = (0..self.waiting.len())
             .map(|at| self.encode_waiting(at))
             .collect::<Result<Vec<_>>>()?;
-        for ((at, _), bytes) in std::mem::take(&mut self.waiting).into_iter().zip(made) {
+        for ((at, _), block) in std::mem::take(&mut self.waiting).into_iter().zip(made) {
             if self.encoded() != at {
                 return Err(Error::internal("a dictionary block was encoded out of order"));
             }
-            self.blocks.push(bytes);
+            self.push_block(block);
         }
         Ok(())
     }
@@ -2229,11 +2269,10 @@ impl Writer {
                 encoded.iter().flat_map(|stripe| &stripe.pages).map(|page| page.len() as u64).sum();
             profile.moved(Stage::Pages, raw, pages, rows);
         }
-        // Before a byte of the stripe is written, because the raw bytes this frees are the bytes the
-        // load peaks on and the threads it uses are idle between here and the next chunk arriving.
+        // Before a byte of the stripe is written, so that the blocks the stripe's pages were built
+        // with, and any that were waiting on them, are let go of now rather than a stripe later.
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
         let before = self.at;
-        encode_ready(&mut self.dictionaries)?;
         self.place_blocks()?;
         drop(timing);
         if let Some(profile) = &profile {
@@ -9650,15 +9689,59 @@ fn synced(file: &File, profile: Option<&LoadProfile>) -> Result<()> {
     Ok(())
 }
 
-fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
-    for dictionary in dictionaries.iter_mut().flatten() {
-        dictionary.settle()?;
+/// One sealed dictionary block on its way to being encoded outside the writer's lock.
+///
+/// Handed out by the merge that sealed it and encoded with the pages of the same stripe. See
+/// [`GlobalDictionary::hand_out`].
+#[derive(Debug)]
+pub(crate) struct Unencoded {
+    column: usize,
+    at: usize,
+    ends: Vec<u32>,
+    bytes: Vec<u8>,
+    shape: chooser::Settled,
+}
+
+impl Unencoded {
+    /// The encoded block and its signature.
+    pub(crate) fn encode(&self) -> Result<EncodedBlock> {
+        let values = block_values(&self.ends, &self.bytes);
+        Ok((string::encode_with(&values, &self.shape)?, block_grams(&values)))
     }
-    // A column with no shape yet is a column with fewer blocks than the sample wants, so its blocks
-    // wait. There are at most `PAYLOAD_SAMPLE_BLOCKS` of them and they are about to be encoded one
-    // way or the other, and encoding them now would be encoding them without having looked at the
-    // column.
-    encode_waiting(dictionaries, false)
+
+    /// The column and the block number the encoded block goes back to.
+    pub(crate) fn place(&self) -> (usize, usize) {
+        (self.column, self.at)
+    }
+}
+
+/// One encoded dictionary block and the signature of the values in it.
+///
+/// Boxed because it is carried around in things that are otherwise small.
+pub(crate) type EncodedBlock = (Vec<u8>, Box<[u8; TEXT_GRAM_BYTES]>);
+
+/// The conservative four-byte substring signature of one block's values.
+fn block_grams(values: &[&[u8]]) -> Box<[u8; TEXT_GRAM_BYTES]> {
+    let mut grams = Box::new([0_u8; TEXT_GRAM_BYTES]);
+    for value in values {
+        for gram in value.windows(4) {
+            for bit in gram_bits(gram) {
+                grams[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+    }
+    grams
+}
+
+/// The values of one block, given where each of them ends relative to the block.
+fn block_values<'a>(ends: &[u32], bytes: &'a [u8]) -> Vec<&'a [u8]> {
+    let mut out = Vec::with_capacity(ends.len());
+    let mut from = 0;
+    for &to in ends {
+        out.push(&bytes[from..to as usize]);
+        from = to as usize;
+    }
+    out
 }
 
 /// Encodes every block still raw at the end of a load: the part block each column ends on and,
@@ -9669,18 +9752,30 @@ fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
 /// candidate, so on a million rows of `hits` it was most of the load's CPU on one core.
 fn finish_dictionaries(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     for dictionary in dictionaries.iter_mut().flatten() {
+        if !dictionary.early.is_empty() {
+            return Err(Error::internal("a dictionary block handed out never came back"));
+        }
         dictionary.seal_rest();
     }
-    encode_waiting(dictionaries, true)
+    encode_waiting(dictionaries)?;
+    // A block handed out and never given back leaves a gap nothing above would notice when it was
+    // the last one, so the count is checked against the values as well.
+    if dictionaries
+        .iter()
+        .flatten()
+        .any(|dictionary| dictionary.encoded() != dictionary.values().div_ceil(TEXT_PAYLOAD_VALUES))
+    {
+        return Err(Error::internal("a dictionary block handed out never came back"));
+    }
+    Ok(())
 }
 
-/// Encodes the waiting blocks of every dictionary with a shape, or of every dictionary when
-/// `closing`, across threads, and appends them to their columns in order.
-fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>], closing: bool) -> Result<()> {
+/// Encodes the waiting blocks of every dictionary across threads, and appends them to their columns
+/// in order.
+fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     let jobs = dictionaries
         .iter()
         .enumerate()
-        .filter(|(_, held)| held.as_ref().is_some_and(|held| closing || held.shape.is_some()))
         .flat_map(|(column, held)| {
             (0..held.as_ref().map_or(0, |held| held.waiting.len())).map(move |at| (column, at))
         })
@@ -9688,7 +9783,7 @@ fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>], closing: bool) 
     if jobs.is_empty() {
         return Ok(());
     }
-    let one = |column: usize, at: usize| -> Result<(usize, usize, Vec<u8>)> {
+    let one = |column: usize, at: usize| -> Result<(usize, usize, EncodedBlock)> {
         let held = dictionaries[column].as_ref().ok_or_else(|| Error::internal("no dictionary"))?;
         Ok((column, at, held.encode_waiting(at)?))
     };
@@ -9725,7 +9820,7 @@ fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>], closing: bool) 
         })?;
         pieces.into_iter().flatten().collect()
     };
-    let mut done: Vec<Vec<(usize, Vec<u8>)>> =
+    let mut done: Vec<Vec<(usize, EncodedBlock)>> =
         (0..dictionaries.len()).map(|_| Vec::new()).collect();
     for (column, at, bytes) in made {
         done[column].push((at, bytes));
@@ -9737,11 +9832,11 @@ fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>], closing: bool) 
         let Some(held) = dictionaries[column].as_mut() else { continue };
         made.sort_by_key(|(at, _)| *at);
         let waiting = std::mem::take(&mut held.waiting);
-        for ((block, _), (_, bytes)) in waiting.into_iter().zip(made) {
-            if held.encoded() != block {
+        for ((at, _), (_, block)) in waiting.into_iter().zip(made) {
+            if held.encoded() != at {
                 return Err(Error::internal("a dictionary block was encoded out of order"));
             }
-            held.blocks.push(bytes);
+            held.push_block(block);
         }
     }
     Ok(())
@@ -14698,6 +14793,55 @@ mod tests {
 
     /// The sorted order is the byte order, whatever the values do before they differ.
     ///
+    /// A block handed out of the writer's lock to be encoded, and given back in whatever order the
+    /// stripes happen to finish in, is the same block with the same signature as one encoded in
+    /// place, and lands in the same position.
+    #[test]
+    fn blocks_handed_out_and_given_back_out_of_order_are_the_blocks_encoded_in_place() {
+        let values = (0..PAYLOAD_SAMPLE_BLOCKS * TEXT_PAYLOAD_VALUES * 2 + 100)
+            .map(|at| format!("http://example{}.test/page/{at:06}", at % 7))
+            .collect::<Vec<_>>();
+        let filled = || {
+            let mut dictionary = GlobalDictionary::new();
+            for value in &values {
+                dictionary.code(value).expect("a code for every value");
+            }
+            dictionary.settle().expect("a shape");
+            dictionary
+        };
+        let mut in_place = filled();
+        in_place.finish_blocks().expect("every block encodes");
+
+        let mut handed = filled();
+        let out = handed.hand_out(3);
+        assert_eq!(out.len(), PAYLOAD_SAMPLE_BLOCKS * 2, "every sealed block goes out");
+        assert!(handed.waiting.is_empty(), "and none is left to be encoded under the lock");
+        for job in out.iter().rev() {
+            assert_eq!(job.place().0, 3, "a block goes back to the column it came from");
+            handed.take_back(job.place().1, job.encode().expect("encodes")).expect("taken back");
+        }
+        assert!(handed.early.is_empty(), "nothing is waiting on a gap");
+        handed.finish_blocks().expect("the last block encodes");
+
+        assert_eq!(handed.blocks, in_place.blocks, "the same blocks in the same order");
+        assert_eq!(handed.grams, in_place.grams, "with the same signatures");
+    }
+
+    /// A block given back twice is a bug in whoever gave it, and is said rather than written twice.
+    #[test]
+    fn a_block_given_back_twice_is_refused() {
+        let mut dictionary = GlobalDictionary::new();
+        for at in 0..PAYLOAD_SAMPLE_BLOCKS * TEXT_PAYLOAD_VALUES {
+            dictionary.code(&format!("value {at}")).expect("a code");
+        }
+        dictionary.settle().expect("a shape");
+        let out = dictionary.hand_out(0);
+        let last = out.last().expect("blocks went out");
+        let at = last.place().1;
+        dictionary.take_back(at, last.encode().expect("encodes")).expect("taken back once");
+        assert!(dictionary.take_back(at, last.encode().expect("encodes")).is_err());
+    }
+
     /// The values here are the shape the sort is built for and the shape a comparison sort is worst
     /// at: a common scheme, a handful of hosts, and a path that only decides the pair thirty bytes
     /// in. They also cover what the bucketing has to get right at the edges, which is a value that
