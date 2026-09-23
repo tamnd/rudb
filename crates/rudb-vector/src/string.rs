@@ -15,6 +15,8 @@
 //! the kind of decision that gets remeasured rather than argued about, and it is tracked as an
 //! issue so that M3 measures it instead of inheriting it.
 
+use std::collections::HashMap;
+
 use rudb_common::{Error, Result};
 
 use crate::buffer::Buffer;
@@ -114,6 +116,16 @@ impl StringView {
     #[must_use]
     pub fn is_inline(&self) -> bool {
         self.len() <= INLINE_LIMIT
+    }
+
+    /// The same string after the arena it points into was laid `by` bytes further along.
+    fn shifted(self, by: u64) -> Self {
+        if self.is_inline() {
+            return self;
+        }
+        let mut shifted = self;
+        shifted.payload[4..].copy_from_slice(&(self.offset() as u64 + by).to_le_bytes());
+        shifted
     }
 
     /// The first four bytes, zero padded.
@@ -369,6 +381,42 @@ impl StringColumn {
         self.push_bytes(source.bytes(index).unwrap_or(b""))
     }
 
+    /// Appends every string of `source`, in order, copying its arena whole when `arenas` says
+    /// that pays.
+    ///
+    /// A scan cuts a page of strings into chunk sized columns that all hold the page as their
+    /// arena, so one cut of SF1 `lineitem`'s comments points at 210KB of a 3.75MB arena. Copying
+    /// that arena for each cut would copy it eighteen times, and copying a string at a time is what
+    /// laying the 6 million comments end to end spent 300ms on. So the arena is copied once, the
+    /// first time a cut of it arrives, and every cut of it moves its views along by where it
+    /// landed. A Parquet page also holds a four byte length before each string and the short strings
+    /// the views carry themselves, which on the comments is one byte in six that no view points
+    /// at. An arena with more than one byte in five like that is copied a string at a time instead,
+    /// so that a filtered cut of a page does not carry the rest of the page along for as long as
+    /// the result lives.
+    pub(crate) fn push_column(&mut self, source: &Self, arenas: &mut Arenas) {
+        self.views.reserve(source.views.len());
+        let key = Arenas::key(source);
+        let base = match arenas.placed.get(&key) {
+            Some(&base) => Some(base),
+            None if Arenas::mostly_read(source.arena.len(), arenas.live(source)) => {
+                let base = self.arena.len() as u64;
+                self.arena.extend_from_slice(source.arena());
+                arenas.placed.insert(key, base);
+                Some(base)
+            }
+            None => None,
+        };
+        if let Some(base) = base {
+            self.views.extend(source.views.iter().map(|view| view.shifted(base)));
+            return;
+        }
+        self.arena.reserve(live_bytes(source));
+        for index in 0..source.len() {
+            self.push_from(source, index);
+        }
+    }
+
     /// Appends bytes that are not required to be text, and returns their index.
     ///
     /// What a `BLOB` is stored through. The column is the same column either way, because a string
@@ -534,6 +582,44 @@ impl StringColumn {
     }
 }
 
+/// The arenas a run of string columns share, for laying the columns end to end.
+///
+/// Counted over every column before any of them is laid, because whether an arena is worth
+/// copying whole depends on how much of it all the columns cut from it read, and the first cut
+/// alone reads a sliver. An arena is known by where its bytes are and how many there are, which
+/// tells two arenas apart for as long as the columns holding them are alive, and they are alive for
+/// the whole of a lay.
+#[derive(Debug, Default)]
+pub(crate) struct Arenas {
+    live: HashMap<(usize, usize), usize>,
+    placed: HashMap<(usize, usize), u64>,
+}
+
+impl Arenas {
+    /// Records the bytes `column` reads out of its arena.
+    pub(crate) fn count(&mut self, column: &StringColumn) {
+        *self.live.entry(Self::key(column)).or_default() += live_bytes(column);
+    }
+
+    fn mostly_read(arena: usize, live: usize) -> bool {
+        arena <= live.saturating_add(live / 4)
+    }
+
+    fn key(column: &StringColumn) -> (usize, usize) {
+        (column.arena.as_ptr() as usize, column.arena.len())
+    }
+
+    /// The bytes of `column`'s arena read by every column counted, or by `column` if it was not.
+    fn live(&self, column: &StringColumn) -> usize {
+        self.live.get(&Self::key(column)).copied().unwrap_or_else(|| live_bytes(column))
+    }
+}
+
+/// The bytes of a column's arena its views point at, counting a byte twice if two views do.
+fn live_bytes(column: &StringColumn) -> usize {
+    column.views.iter().filter(|view| !view.is_inline()).map(StringView::len).sum()
+}
+
 /// Two columns are equal when they hold the same strings in the same order, whatever their arenas
 /// look like.
 ///
@@ -577,13 +663,52 @@ impl<'a> FromIterator<&'a str> for StringColumn {
 
 #[cfg(test)]
 mod tests {
-    use super::{INLINE_LIMIT, StringColumn, StringView};
+    use std::sync::Arc;
+
+    use super::{Arenas, INLINE_LIMIT, StringColumn, StringView};
     use crate::buffer::Buffer;
 
     /// The seam, used the way layer three will use it. The page arrives whole, each string is
     /// recorded where it already is, and the arena at the end is the page byte for byte, including
     /// the header this page has in front of the strings and the bytes between them that belong to
     /// nothing. A column that had copied would have an arena the size of the strings instead.
+    #[test]
+    fn cuts_of_one_page_lay_the_page_once_and_a_sparse_cut_lays_its_strings() {
+        let strings =
+            ["the first string past the inline limit", "short", "a second string past the limit"];
+        let mut bytes = Vec::new();
+        let mut at = Vec::new();
+        for text in strings {
+            at.push((bytes.len(), text.len()));
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        let page = Arc::new(bytes);
+        let cut = |rows: &[usize]| {
+            let mut column = StringColumn::over(Buffer::from_arc(Arc::clone(&page)));
+            for &row in rows {
+                column.push_in_place(at[row].0, at[row].1).expect("inside the page");
+            }
+            column
+        };
+        let (first, second) = (cut(&[0, 1]), cut(&[2]));
+        let mut arenas = Arenas::default();
+        arenas.count(&first);
+        arenas.count(&second);
+        let mut laid = StringColumn::from_iter(["a string already there, past the limit"]);
+        let before = laid.arena().len();
+        laid.push_column(&first, &mut arenas);
+        laid.push_column(&second, &mut arenas);
+        assert_eq!(laid.arena().len(), before + page.len(), "the page is laid once");
+        let expected =
+            ["a string already there, past the limit", strings[0], strings[1], strings[2]];
+        assert_eq!(laid.iter().collect::<Vec<_>>(), expected);
+
+        let mut sparse = StringColumn::new();
+        sparse.push_column(&second, &mut Arenas::default());
+        assert_eq!(sparse.arena(), strings[2].as_bytes(), "a sliver of a page is copied alone");
+        assert_eq!(sparse.get(0), Some(strings[2]));
+    }
+
     #[test]
     fn a_column_over_a_page_records_the_strings_without_moving_them() {
         let page =
