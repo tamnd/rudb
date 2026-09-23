@@ -103,13 +103,16 @@
 //! another three gigabytes that is not held while the assembly runs.
 
 use std::cmp::Ordering;
-use std::sync::Mutex;
+use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
+use std::sync::{Mutex, RwLock};
 
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
-use rudb_vector::{Chunk, VECTOR_SIZE, Vector, interleave_placed};
+use rudb_vector::{
+    Chunk, VECTOR_SIZE, Vector, interleave_placed, placed_string_rows, strings_placeable,
+};
 
 use crate::merged::{ORDER, Sorted, order_of, ordering};
 use crate::normal::{self, Normal};
@@ -979,6 +982,60 @@ fn column(ty: &LogicalType, pieces: Vec<Vector>, order: Placing<'_>) -> Result<(
     Ok((whole, u64::try_from(given).unwrap_or(u64::MAX)))
 }
 
+/// The columns to lay as tasks for the threads, longest first, each a column and the rows of it
+/// the task lays, or `None` for all of them.
+///
+/// A string column written through the inverse is split into ranges of rows, a range a thread.
+/// Laid whole it is the one column the others wait on: on SF1 `lineitem` sorted by ship month
+/// `l_comment` took 170 to 385 ms on its own while no other column took more than 55 ms, and the
+/// gather took as long as it did. The ranges start on a chunk boundary so every chunk of the answer
+/// is cut from one of them.
+fn split(
+    types: &[LogicalType],
+    pieces: &[Vec<Vector>],
+    longest: &[usize],
+    order: Placing<'_>,
+    rows: usize,
+    degree: usize,
+) -> Vec<(usize, Option<Range<usize>>)> {
+    let mut tasks = Vec::with_capacity(longest.len() + degree);
+    for &position in longest {
+        let placeable = order.inverse.is_some()
+            && types
+                .get(position)
+                .zip(pieces.get(position))
+                .is_some_and(|(ty, pieces)| strings_placeable(ty, pieces));
+        let ranges = if placeable {
+            PLACED_RANGES.min(degree).min(rows / MIN_PLACED_RANGE).max(1)
+        } else {
+            1
+        };
+        if ranges == 1 {
+            tasks.push((position, None));
+            continue;
+        }
+        let per = rows.div_ceil(ranges).div_ceil(VECTOR_SIZE) * VECTOR_SIZE;
+        let mut start = 0;
+        while start < rows {
+            let end = (start + per).min(rows);
+            tasks.push((position, Some(start..end)));
+            start = end;
+        }
+    }
+    tasks
+}
+
+/// How many ranges a string column written through the inverse is split into, see [`split`].
+///
+/// Each range reads every piece and the whole inverse to find its own rows, so the reading grows
+/// with the number of ranges while the copying stays the same, whatever the size of the table. On
+/// the sorted SF1 `lineitem` under load the gather took 100 to 140 ms with the comment in three
+/// ranges and no less with more, where each range took at least 60 ms however few rows it had.
+const PLACED_RANGES: usize = 3;
+
+/// The fewest rows a range of a split string column has, so a small sort lays its strings whole.
+const MIN_PLACED_RANGE: usize = 32 * VECTOR_SIZE;
+
 /// The sorted rows as chunks, for a sort that is going to hand them back rather than write them.
 ///
 /// The columns are laid on the lease's threads, a column each, rather than one after another the
@@ -986,7 +1043,8 @@ fn column(ty: &LogicalType, pieces: Vec<Vector>, order: Placing<'_>) -> Result<(
 /// a sort that fitted spent after its input ran out: 1.2s of 1.55s on SF1 `lineitem`, with the
 /// other threads idle (#1210). The headroom it costs is a column a thread rather than one column,
 /// which a sort that fitted can afford and a sort that is spilling cannot, and that is why the
-/// spilling path still goes through [`lay`].
+/// spilling path still goes through [`lay`]. A long string column is laid in ranges of rows on
+/// several threads, see [`split`], and its input is dropped when the last of its ranges is done.
 ///
 /// # Errors
 ///
@@ -1016,33 +1074,61 @@ fn gathered(
         let bytes = pieces.get(position).map_or(0, |run| run.iter().map(Vector::footprint).sum());
         std::cmp::Reverse((stringy, bytes))
     });
-    let pieces: Vec<Mutex<Vec<Vector>>> = pieces.into_iter().map(Mutex::new).collect();
+    let tasks = split(types, &pieces, &longest, order, rows, threads.degree());
+    let mut left = vec![0usize; types.len()];
+    for &(position, _) in &tasks {
+        if let Some(count) = left.get_mut(position) {
+            *count += 1;
+        }
+    }
+    let left: Vec<AtomicUsize> = left.into_iter().map(AtomicUsize::new).collect();
+    let pieces: Vec<RwLock<Vec<Vector>>> = pieces.into_iter().map(RwLock::new).collect();
     let charged = Mutex::new(charged);
-    let laid = in_parallel(threads, types.len(), threads.degree(), "laid sorted column", |rank| {
-        let position = longest.get(rank).copied().unwrap_or(rank);
-        let (Some(ty), Some(pieces)) = (types.get(position), pieces.get(position)) else {
+    let laid = in_parallel(threads, tasks.len(), threads.degree(), "laid sorted column", |task| {
+        let Some((position, range)) = tasks.get(task).cloned() else {
+            return Err(Error::internal("a sorted column task past the end"));
+        };
+        let (Some(ty), Some(held), Some(left)) =
+            (types.get(position), pieces.get(position), left.get(position))
+        else {
             return Err(Error::internal("a sorted column past the end of the schema"));
         };
-        let pieces = std::mem::take(&mut *pieces.lock().map_err(poisoned)?);
-        let (whole, given) = column(ty, pieces, order)?;
-        give(*charged.lock().map_err(poisoned)?, given);
-        Ok((position, whole))
+        let Some(range) = range else {
+            let pieces = std::mem::take(&mut *held.write().map_err(poisoned)?);
+            let (whole, given) = column(ty, pieces, order)?;
+            give(*charged.lock().map_err(poisoned)?, given);
+            return Ok((position, 0, whole));
+        };
+        let start = range.start;
+        let part = {
+            let pieces = held.read().map_err(poisoned)?;
+            let inverse = order.inverse.unwrap_or_default();
+            placed_string_rows(ty, &pieces, inverse, range)?.into_pages()
+        };
+        if left.fetch_sub(1, Atomic::AcqRel) == 1 {
+            let pieces = std::mem::take(&mut *held.write().map_err(poisoned)?);
+            let given = pieces.iter().map(Vector::footprint).sum::<usize>();
+            drop(pieces);
+            give(*charged.lock().map_err(poisoned)?, u64::try_from(given).unwrap_or(u64::MAX));
+        }
+        Ok((position, start, part))
     })?;
-    let mut wholes: Vec<Option<Vector>> = vec![None; types.len()];
-    for (position, whole) in laid {
-        if let Some(slot) = wholes.get_mut(position) {
-            *slot = Some(whole);
+    let mut wholes: Vec<Vec<(usize, Vector)>> = vec![Vec::new(); types.len()];
+    for (position, start, part) in laid {
+        if let Some(parts) = wholes.get_mut(position) {
+            parts.push((start, part));
         }
     }
     let blocks = rows.div_ceil(VECTOR_SIZE);
     let mut columns: Vec<Vec<Vector>> = vec![Vec::with_capacity(types.len()); blocks];
-    for whole in &wholes {
-        let Some(whole) = whole else {
-            return Err(Error::internal("a sorted column nobody laid"));
-        };
+    for parts in &mut wholes {
+        parts.sort_unstable_by_key(|&(start, _)| start);
         for (block, into) in columns.iter_mut().enumerate() {
             let start = block * VECTOR_SIZE;
-            into.push(whole.slice(start, (rows - start).min(VECTOR_SIZE))?);
+            let Some((from, part)) = parts.iter().rev().find(|&&(from, _)| from <= start) else {
+                return Err(Error::internal("a sorted column nobody laid"));
+            };
+            into.push(part.slice(start - from, (rows - start).min(VECTOR_SIZE))?);
         }
     }
     drop(wholes);

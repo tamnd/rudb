@@ -40,6 +40,7 @@
 //! its own function. What the two share is the typed append underneath both of them.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value};
@@ -360,7 +361,7 @@ pub fn interleave_placed(
         return Ok(merged);
     }
     if let Some(inverse) = inverse {
-        if let Some(placed) = placed_strings(ty, pieces, inverse)? {
+        if let Some(placed) = placed_strings(ty, pieces, inverse, 0..rows)? {
             return Ok(placed);
         }
     }
@@ -465,13 +466,19 @@ pub fn interleave_placed(
 ///
 /// `None` when the column is not a string, or when a piece is not flat views and has to be
 /// flattened on the general path first.
-fn placed_strings(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Result<Option<Vector>> {
-    if !matches!(ty, LogicalType::Varchar | LogicalType::Blob)
-        || pieces.iter().any(|piece| piece.text_parts().is_none())
-    {
+fn placed_strings(
+    ty: &LogicalType,
+    pieces: &[Vector],
+    inverse: &[u32],
+    range: Range<usize>,
+) -> Result<Option<Vector>> {
+    if !strings_placeable(ty, pieces) {
         return Ok(None);
     }
-    let rows = inverse.len();
+    let first = range.start;
+    let rows = range.len();
+    // The place of a row in this range, or `None` for a row another range lays.
+    let local = |to: u32| (to as usize).checked_sub(first).filter(|&at| at < rows);
     let mut offsets = vec![0u64; rows + 1];
     let mut places = inverse.iter();
     for piece in pieces {
@@ -480,7 +487,7 @@ fn placed_strings(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Resul
             if view.is_inline() {
                 continue;
             }
-            if let Some(slot) = offsets.get_mut(to as usize + 1) {
+            if let Some(slot) = local(to).and_then(|at| offsets.get_mut(at + 1)) {
                 *slot = view.len() as u64;
             }
         }
@@ -499,7 +506,9 @@ fn placed_strings(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Resul
         let (views, from) = piece.text_parts().unwrap_or_default();
         let validity = piece.validity();
         for (row, (view, &to)) in views.iter().zip(places.by_ref()).enumerate() {
-            let to = to as usize;
+            let Some(to) = local(to) else {
+                continue;
+            };
             if !validity.is_valid(row) {
                 if let Some(slot) = live.get_mut(to) {
                     *slot = false;
@@ -528,6 +537,42 @@ fn placed_strings(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Resul
     };
     let vector = Vector::string_views(ty.clone(), placed, Arc::new(Buffer::from_vec(arena)))?;
     Ok(Some(vector.with_validity(validity)))
+}
+
+/// Whether [`interleave_placed`] lays this string column through [`placed_string_rows`], which is
+/// when it is a string and every piece is flat views.
+#[must_use]
+pub fn strings_placeable(ty: &LogicalType, pieces: &[Vector]) -> bool {
+    matches!(ty, LogicalType::Varchar | LogicalType::Blob)
+        && pieces.iter().all(|piece| piece.text_parts().is_some())
+}
+
+/// The rows in `range` of the string column [`interleave_placed`] would lay through `inverse`,
+/// with an arena of their own.
+///
+/// This is how a sort builds one long string column on several threads. Each range reads every
+/// piece and all of `inverse` and copies only its own strings, so each has a few forward streams
+/// to write the way the whole column does, and the ranges share nothing they write.
+///
+/// # Errors
+///
+/// If `inverse` is not as long as the pieces or `range` runs past it, or if a piece is not flat
+/// views, which [`strings_placeable`] says beforehand.
+pub fn placed_string_rows(
+    ty: &LogicalType,
+    pieces: &[Vector],
+    inverse: &[u32],
+    range: Range<usize>,
+) -> Result<Vector> {
+    let rows: usize = pieces.iter().map(Vector::len).sum();
+    if inverse.len() != rows || range.end > rows || range.start > range.end {
+        return Err(Error::internal(format!(
+            "rows {range:?} of {} places for {rows} rows",
+            inverse.len()
+        )));
+    }
+    placed_strings(ty, pieces, inverse, range)?
+        .ok_or_else(|| Error::internal("a string column placed that is not flat views"))
 }
 
 /// How many rows a merged dictionary entry has to stand for on average before a string column is
@@ -1170,6 +1215,23 @@ mod tests {
             arena, b"a second string past twelve bytesthe first string past twelve bytes",
             "the long strings in the order they come out, and nothing else"
         );
+        assert!(strings_placeable(&LogicalType::Varchar, &pieces));
+        for split in 0..=order.len() {
+            let mut joined = Vec::new();
+            for range in [0..split, split..order.len()] {
+                let part = placed_string_rows(&LogicalType::Varchar, &pieces, &inverse, range)
+                    .expect("a range of rows");
+                joined.extend(values(&part));
+            }
+            assert_eq!(joined, expected, "split at {split}");
+        }
+        let (_, arena) = placed_string_rows(&LogicalType::Varchar, &pieces, &inverse, 1..3)
+            .expect("the middle rows")
+            .text_parts()
+            .map(|(views, arena)| (views.len(), arena.to_vec()))
+            .expect("views");
+        assert_eq!(arena, b"the first string past twelve bytes", "only the range's own strings");
+        assert!(placed_string_rows(&LogicalType::Varchar, &pieces, &inverse, 4..6).is_err());
     }
 
     #[test]
