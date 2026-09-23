@@ -67,6 +67,11 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             ExitCode::FAILURE
         }
         Action::Run(options) => {
+            if let Some(rows) = answer_frequency_csv_once(&options) {
+                let mut out = out;
+                let _ = write!(out, "{rows}");
+                return ExitCode::SUCCESS;
+            }
             if let Some(row) = answer_three_csv_once(&options) {
                 let mut out = out;
                 let _ = write!(out, "{row}");
@@ -104,7 +109,7 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
     }
 }
 
-fn answer_three_csv_once(options: &Options) -> Option<String> {
+fn standard_native_csv_statement(options: &Options) -> Option<&str> {
     if !options.readonly
         || !options.stop_after_commands
         || !options.sets.is_empty()
@@ -119,6 +124,22 @@ fn answer_three_csv_once(options: &Options) -> Option<String> {
         return None;
     }
     let [Command::Sql(sql)] = options.commands.as_slice() else { return None };
+    Some(sql)
+}
+
+fn answer_frequency_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
+    let rows =
+        Database::query_native_frequency_values_once(&options.database, sql).ok().flatten()?;
+    let mut csv = String::with_capacity(rows.len() * 24);
+    for (value, count) in rows {
+        csv.push_str(&format!("{value},{count}\n"));
+    }
+    Some(csv)
+}
+
+fn answer_three_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
     let (sum, rows, average) =
         Database::query_native_three_values_once(&options.database, sql).ok().flatten()?;
     Some(format!("{sum},{rows},{average}\n"))

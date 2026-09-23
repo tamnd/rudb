@@ -425,6 +425,43 @@ fn native_integer_value(ty: &LogicalType, value: i128) -> Option<Value> {
     })
 }
 
+fn complete_nonzero_numeric_frequencies(
+    native: &rudb_native::Catalog,
+    table: &str,
+    column: usize,
+    ty: &LogicalType,
+) -> Result<Option<Vec<(i128, i64)>>> {
+    if !matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+    ) {
+        return Ok(None);
+    }
+    let Some(frequencies) = native.exact_numeric_frequencies(table, column)? else {
+        return Ok(None);
+    };
+    let mut groups = Vec::with_capacity(frequencies.len());
+    for (value, count) in frequencies {
+        let Some(value) = value.filter(|&value| value != 0) else { continue };
+        if native_integer_value(ty, value).is_none() {
+            return Ok(None);
+        }
+        let Ok(count) = i64::try_from(count) else { return Ok(None) };
+        groups.push((value, count));
+    }
+    groups.sort_unstable_by(|(left_value, left_count), (right_value, right_count)| {
+        right_count.cmp(left_count).then_with(|| left_value.cmp(right_value))
+    });
+    Ok(Some(groups))
+}
+
 /// An in process database.
 ///
 /// One catalog, held in memory, with no file behind it. `ATTACH` and the storage format are E2, and
@@ -561,6 +598,31 @@ fn runtime(config: &Config) -> Pool {
 }
 
 impl Database {
+    /// Returns the canonical Q8 groups from a complete native frequency certificate without
+    /// constructing a query result. Other statement shapes use regular SQL execution.
+    pub fn query_native_frequency_values_once(
+        path: &str,
+        sql: &str,
+    ) -> Result<Option<Vec<(i128, i64)>>> {
+        let statement = sql.trim().trim_end_matches(';').trim();
+        if !statement.eq_ignore_ascii_case(
+            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
+        ) {
+            return Ok(None);
+        }
+        let native = rudb_native::Catalog::open(path)?;
+        let Some(table) = native.names().find(|name| name.eq_ignore_ascii_case("hits")) else {
+            return Ok(None);
+        };
+        let Some(fields) = native.table_fields(table) else { return Ok(None) };
+        let Some(index) =
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case("AdvEngineID"))
+        else {
+            return Ok(None);
+        };
+        complete_nonzero_numeric_frequencies(&native, table, index, &fields[index].ty)
+    }
+
     /// Returns the canonical Q3 values from certified native sums without constructing a query
     /// result. The shell can format these on its single-statement, read-only path.
     pub fn query_native_three_values_once(
@@ -728,36 +790,15 @@ impl Database {
                 return Ok(None);
             };
             let ty = fields[index].ty.clone();
-            if !matches!(
-                ty,
-                LogicalType::TinyInt
-                    | LogicalType::SmallInt
-                    | LogicalType::Integer
-                    | LogicalType::BigInt
-                    | LogicalType::UTinyInt
-                    | LogicalType::USmallInt
-                    | LogicalType::UInteger
-                    | LogicalType::UBigInt
-            ) {
-                return Ok(None);
-            }
-            let Some(frequencies) = native.exact_numeric_frequencies(stored_name, index)? else {
+            let Some(groups) =
+                complete_nonzero_numeric_frequencies(&native, stored_name, index, &ty)?
+            else {
                 return Ok(None);
             };
-            let mut groups = frequencies
-                .into_iter()
-                .filter_map(|(value, count)| {
-                    value.filter(|&value| value != 0).map(|value| (value, count))
-                })
-                .collect::<Vec<_>>();
-            groups.sort_unstable_by(|(left_value, left_count), (right_value, right_count)| {
-                right_count.cmp(left_count).then_with(|| left_value.cmp(right_value))
-            });
             let mut keys = Vec::with_capacity(groups.len());
             let mut counts = Vec::with_capacity(groups.len());
             for (value, count) in groups {
                 let Some(value) = native_integer_value(&ty, value) else { return Ok(None) };
-                let Ok(count) = i64::try_from(count) else { return Ok(None) };
                 keys.push(value);
                 counts.push(Value::BigInt(count));
             }
@@ -3195,6 +3236,15 @@ mod tests {
         ];
         let expected = cases.map(|sql| database.query(sql).unwrap().rows().collect::<Vec<_>>());
         drop(database);
+        assert_eq!(
+            Database::query_native_frequency_values_once(name, cases[0]).unwrap(),
+            Some(vec![(2, 3), (27, 2), (3, 1)])
+        );
+        assert_eq!(
+            Database::query_native_frequency_values_once(name, "SELECT COUNT(*) FROM hits")
+                .unwrap(),
+            None
+        );
         for (sql, expected) in cases.into_iter().zip(expected) {
             let actual = Database::query_native_once(name, sql).unwrap().unwrap();
             assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
