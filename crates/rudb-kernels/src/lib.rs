@@ -81,7 +81,7 @@ pub use aggregate::{
 pub use cast::{cast, cast_in_time_zone, cast_value, percentage, row_count};
 pub use compare::{
     Comparison, compare, compare_prepared, compare_values, order, order_with_nulls, rank_at,
-    rank_within, refine, refine_prepared, select_against_rank,
+    rank_within, refine, refine_prepared, select_against_rank, select_prepared,
 };
 pub use datetime::came_round;
 pub use fallback::Kernel;
