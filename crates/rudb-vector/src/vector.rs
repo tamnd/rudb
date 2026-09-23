@@ -5649,6 +5649,32 @@ mod tests {
         }
     }
 
+    /// The gathered form reads what the row at a time accessor reads at the rows it is given, and
+    /// refuses a row past the end and a vector that is not flat, leaving nothing behind.
+    #[test]
+    fn a_gather_of_signed_integers_holds_what_the_row_at_a_time_accessor_hands_back() {
+        let mut out = Vec::new();
+        let at = [0, 2, 2, 3];
+        let shapes = [
+            integers(&[7, -3, 0, 2]),
+            Vector::flat(LogicalType::Integer, Data::Int32(vec![5, -6, 7, -8].into())).unwrap(),
+            Vector::flat(LogicalType::TinyInt, Data::Int8(vec![-128, 127, 1, 0].into())).unwrap(),
+        ];
+        for column in &shapes {
+            assert!(column.signed_gather(&at, &mut out), "{:?} is gathered", column.logical_type());
+            let wanted: Vec<i64> = at
+                .iter()
+                .map(|&row| i64::try_from(column.signed_at(row as usize).unwrap()).unwrap())
+                .collect();
+            assert_eq!(out, wanted);
+        }
+        let short = integers(&[1, 2, 3]);
+        assert!(!short.signed_gather(&at, &mut out), "row 3 is past the end");
+        assert!(out.is_empty());
+        assert!(!Vector::sequence(100, 5, 4).signed_gather(&at, &mut out));
+        assert!(integers(&[1]).signed_gather(&[], &mut out) && out.is_empty());
+    }
+
     /// What the block form will not answer for, where the caller reads the vector a row at a time
     /// instead. A null is not one of them: it writes whatever sits under it and the caller reads the
     /// null from the column.
