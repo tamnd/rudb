@@ -196,6 +196,9 @@ fn specialized<V: AsRef<Vector>>(
     if matches!(name, "substring" | "substr") {
         return substring_of(args, returns, rows);
     }
+    if let Some(vector) = lists::vectorized(name, args, returns, rows)? {
+        return Ok(Some(vector));
+    }
     match args {
         [only] => unary(name, only.as_ref(), returns, rows),
         [left, right] => {

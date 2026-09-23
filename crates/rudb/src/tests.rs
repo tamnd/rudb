@@ -8260,6 +8260,43 @@ fn the_list_functions_that_look_inside_a_list_answer_the_way_the_pin_does() {
     );
 }
 
+/// Over a column rather than literals, so the calls that have a loop over the whole vector take
+/// it, and the answers are the same ones the pin gives row for row.
+#[test]
+fn the_list_calls_with_a_vector_loop_answer_over_a_column_the_way_they_do_a_row_at_a_time() {
+    let db = database();
+    db.execute(
+        "CREATE TABLE shaped AS SELECT * FROM (VALUES (1, 1, 2, NULL, 'a'), (2, NULL, 5, 6, NULL), \
+         (3, 7, 8, 9, 'a string long enough to leave the view'), (4, 2, 2, 2, 'd')) \
+         v(id, a, b, c, s)",
+    )
+    .expect("created");
+    db.execute(
+        "CREATE TABLE held AS SELECT id, CASE WHEN id = 3 THEN NULL ELSE list_value(a, b, c) END \
+         AS l FROM shaped",
+    )
+    .expect("created");
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    assert_eq!(
+        column("SELECT list_value(a, b, c) FROM shaped ORDER BY id"),
+        "[1, 2, NULL];[NULL, 5, 6];[7, 8, 9];[2, 2, 2]"
+    );
+    assert_eq!(
+        column("SELECT list_value(s, 'k') FROM shaped ORDER BY id"),
+        "[a, k];[NULL, k];[a string long enough to leave the view, k];[d, k]"
+    );
+    assert_eq!(
+        column("SELECT list_reverse(l) FROM held ORDER BY id"),
+        "[NULL, 2, 1];[6, 5, NULL];NULL;[2, 2, 2]"
+    );
+    assert_eq!(column("SELECT list_contains(l, 2) FROM held ORDER BY id"), "true;false;NULL;true");
+    assert_eq!(column("SELECT list_position(l, 2) FROM held ORDER BY id"), "2;NULL;NULL;1");
+    assert_eq!(column("SELECT list_position(l, NULL) FROM held ORDER BY id"), "3;1;NULL;NULL");
+}
+
 #[test]
 fn the_list_functions_that_look_inside_a_list_refuse_the_way_the_pin_does() {
     let db = database();

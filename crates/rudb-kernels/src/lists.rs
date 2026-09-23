@@ -21,8 +21,10 @@
 use std::cmp::Ordering;
 
 use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_vector::{Buffer, Data, Validity, Vector, interleave};
 
 use crate::compare::order;
+use crate::number::integral;
 
 /// What the pin says when the mask of `list_where` or the indexes of `list_select` hold a null.
 const NULL_PICK: &str = "NULLs are not allowed as list elements in the second input parameter.";
@@ -359,4 +361,160 @@ fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Val
         sorted.resize(values.len(), Value::Null);
     }
     Ok(sorted)
+}
+
+/// A loop over whole vectors for the list calls that have one, or `None` for a call that goes
+/// through the row at a time path.
+///
+/// A list vector is entries over one child, so building a list, reversing one or searching one for
+/// a constant can be a gather or a scan of the child with no `Value` made for any row. These are
+/// the calls that were furthest behind the pin when measured, and each one here gives the same
+/// answer as its arm in [`value`], which the tests in the facade check row for row.
+pub(crate) fn vectorized<V: AsRef<Vector>>(
+    name: &str,
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    match (name, args) {
+        ("list_value", [_, ..]) => built(args, returns, rows),
+        ("list_reverse", [list]) => reversed(list.as_ref()),
+        ("list_contains" | "list_position", [list, needle]) => {
+            searched(name == "list_position", list.as_ref(), needle.as_ref())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `list_value` over columns: every argument laid end to end and read back a row at a time.
+///
+/// Left to the row path when the element is nested, because laying a nested column is a row at a
+/// time there too, or when an argument is not already of the element type.
+fn built<V: AsRef<Vector>>(
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let LogicalType::List(element) = returns else {
+        return Ok(None);
+    };
+    if nested_or_null(element) || args.iter().any(|arg| arg.as_ref().logical_type() != &**element) {
+        return Ok(None);
+    }
+    let pieces: Vec<Vector> =
+        args.iter().map(|arg| arg.as_ref().flatten()).collect::<Result<_>>()?;
+    let width = args.len();
+    let order: Vec<usize> =
+        (0..rows).flat_map(|row| (0..width).map(move |at| at * rows + row)).collect();
+    let child = interleave(element, &pieces, &order)?;
+    let count = entry(width)?;
+    let entries = (0..rows).map(|row| Ok((entry(row * width)?, count))).collect::<Result<_>>()?;
+    Vector::list(entries, child).map(Some)
+}
+
+/// `list_reverse` over a column: one gather of the child with every row's run turned round.
+fn reversed(list: &Vector) -> Result<Option<Vector>> {
+    let Some((entries, child)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !matches!(list.logical_type(), LogicalType::List(_)) {
+        return Ok(None);
+    }
+    let live = list.validity().live();
+    let mut indices = Vec::with_capacity(child.len());
+    let mut placed = Vec::with_capacity(entries.len());
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        let at = entry(indices.len())?;
+        if live.at(row) {
+            indices.extend((start..start + len).rev());
+            placed.push((at, len));
+        } else {
+            placed.push((at, 0));
+        }
+    }
+    let child = child.gather(&indices)?;
+    Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
+}
+
+/// `list_contains` and `list_position` over an integer column with a constant needle, as one scan
+/// of the child.
+///
+/// A null needle is left to the row path, since `list_position` finds a null element with it and
+/// `list_contains` is null, and so is anything that is not a plain integer, where equality is not
+/// the same thing as equal bits.
+fn searched(position: bool, list: &Vector, needle: &Vector) -> Result<Option<Vector>> {
+    let (Some((entries, child)), Some(wanted)) = (list.list_parts(), needle.constant_value())
+    else {
+        return Ok(None);
+    };
+    let plain = matches!(
+        child.logical_type(),
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+    );
+    let Some(wanted) =
+        integral(wanted).filter(|_| plain && needle.logical_type() == child.logical_type())
+    else {
+        return Ok(None);
+    };
+    let elements = child.validity().live();
+    macro_rules! scan {
+        ($($variant:ident),+) => {
+            match child.data() {
+                $(Some(Data::$variant(values)) => {
+                    let values = values.as_slice();
+                    first_places(entries, |at| elements.at(at) && i128::from(values[at]) == wanted)
+                })+
+                _ => return Ok(None),
+            }
+        };
+    }
+    let found = scan!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
+    let rows = list.validity().live();
+    if position {
+        let validity = Validity::from_iter(entries.len(), |row| rows.at(row) && found[row] != 0);
+        let data =
+            Data::Int32(Buffer::from(found.iter().map(|&place| place as i32).collect::<Vec<_>>()));
+        let answer = Vector::flat(LogicalType::Integer, data)?;
+        return Ok(Some(answer.with_validity(validity.normalize(entries.len()))));
+    }
+    let data = Data::Bool(Buffer::from(found.iter().map(|&place| place != 0).collect::<Vec<_>>()));
+    let answer = Vector::flat(LogicalType::Boolean, data)?;
+    Ok(Some(answer.with_validity(list.validity().clone())))
+}
+
+/// The one based place in each row's run of the first element `hit` accepts, or 0 for none.
+fn first_places(entries: &[(u32, u32)], hit: impl Fn(usize) -> bool) -> Vec<u32> {
+    entries
+        .iter()
+        .map(|&(start, len)| {
+            let start = start as usize;
+            (start..start + len as usize).position(&hit).map_or(0, |at| at as u32 + 1)
+        })
+        .collect()
+}
+
+/// Whether a list of `element` has to be laid a row at a time.
+fn nested_or_null(element: &LogicalType) -> bool {
+    matches!(
+        element,
+        LogicalType::Null
+            | LogicalType::List(_)
+            | LogicalType::Array(..)
+            | LogicalType::Struct(_)
+            | LogicalType::Map(..)
+            | LogicalType::Union(_)
+    )
+}
+
+/// A child offset as a list entry holds it.
+fn entry(offset: usize) -> Result<u32> {
+    u32::try_from(offset)
+        .map_err(|_| Error::out_of_range(format!("a list child of {offset} elements")))
 }
