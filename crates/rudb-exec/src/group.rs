@@ -396,28 +396,39 @@ const fn slot_tag(hash: u64) -> u32 {
 /// Cuts a chunk's slots into runs of one slot, each given as its slot and the row it ends before,
 /// when they come in runs at least [`RUN_ROWS`] long on average.
 ///
-/// The count of places the slot changes comes first and a block at a time, so that a chunk of
-/// keys in no order is given up on after a block of a few hundred rows, which is a compare and an
-/// add a row. `false`, with `into` empty, for a chunk that is not worth it.
+/// One pass, and most of it sixteen slots at a time: a block that holds nothing but the slot of
+/// the run it is in is an or of sixteen differences the compiler does as a few vector
+/// instructions, and only a block where the slot changes is walked a row at a time. The first
+/// version counted the changes before cutting and did both a row at a time, and at twenty
+/// instructions a row it cost more than the counting loop it was there to replace. A chunk of keys
+/// in no order is given up on as soon as it has more runs than it is allowed. `false`, with `into`
+/// empty, for a chunk that is not worth it.
 fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>) -> bool {
     into.clear();
+    let Some(&first) = slots.first() else {
+        return false;
+    };
     let most = slots.len() / RUN_ROWS;
-    let mut changes = 0;
-    for (block, run) in slots.chunks(256).enumerate() {
-        let before = if block == 0 { run[0] } else { slots[block * 256 - 1] };
-        changes += usize::from(run[0] != before)
-            + run.windows(2).map(|pair| usize::from(pair[0] != pair[1])).sum::<usize>();
-        if changes >= most {
-            return false;
+    let mut current = first;
+    let mut row = 0;
+    while row < slots.len() {
+        let end = (row + 16).min(slots.len());
+        let block = &slots[row..end];
+        if block.iter().fold(0, |differ, &slot| differ | (slot ^ current)) != 0 {
+            for (at, &slot) in block.iter().enumerate() {
+                if slot != current {
+                    if into.len() >= most {
+                        into.clear();
+                        return false;
+                    }
+                    into.push((current, row + at));
+                    current = slot;
+                }
+            }
         }
+        row = end;
     }
-    let mut start = 0;
-    for row in 1..=slots.len() {
-        if row == slots.len() || slots[row] != slots[start] {
-            into.push((slots[start], row));
-            start = row;
-        }
-    }
+    into.push((current, slots.len()));
     true
 }
 
@@ -5999,12 +6010,13 @@ mod tests {
     use rudb_pipeline::Sink;
     use rudb_plan::{Plan, Slice};
     use rudb_vector::{Chunk, Data, Vector};
+    use rudb_kernels::NOWHERE;
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
         EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition, FixedRecord,
         FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, encoded_count_partition, fixed_partition,
+        bigint_distinct_partition, encoded_count_partition, fixed_partition, slot_runs_of,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -6025,6 +6037,35 @@ mod tests {
     fn column(out: &Buffered) -> Vec<Value> {
         let chunk = out.at(0).expect("readable").expect("one chunk");
         (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect()
+    }
+
+    /// Slots cut into runs come back as the runs they are, across the blocks the cut reads them in,
+    /// and slots in no order come back as nothing.
+    #[test]
+    fn slots_in_runs_are_cut_into_them_and_slots_in_no_order_are_not() {
+        let lengths = [(4, 40), (NOWHERE, 17), (1, 1), (4, 30), (0, 16)];
+        let slots: Vec<usize> = lengths
+            .iter()
+            .flat_map(|&(slot, length)| std::iter::repeat_n(slot, length))
+            .collect();
+        let mut runs = Vec::new();
+        assert!(slot_runs_of(&slots, &mut runs));
+        let mut end = 0;
+        let expected: Vec<(usize, usize)> = lengths
+            .iter()
+            .map(|&(slot, length)| {
+                end += length;
+                (slot, end)
+            })
+            .collect();
+        assert_eq!(runs, expected);
+        let one = vec![7; 1_000];
+        assert!(slot_runs_of(&one, &mut runs));
+        assert_eq!(runs, [(7, 1_000)]);
+        let scattered: Vec<usize> = (0..1_000).map(|row| row * 7 % 13).collect();
+        assert!(!slot_runs_of(&scattered, &mut runs));
+        assert!(runs.is_empty());
+        assert!(!slot_runs_of(&[], &mut runs));
     }
 
     #[test]
