@@ -116,10 +116,8 @@ impl Lookup {
     /// agreeing on the low bits of its bucket, which is one bucket in `parts` used and the rest
     /// empty.
     ///
-    /// A partition finds its rows by reading the whole run of hashes and keeping the ones that are
-    /// its own. That is a pass per partition over eight bytes a row, which sounds like the wrong
-    /// shape and is not: it is sequential, it prefetches, and it is nothing next to the probe and
-    /// the insert it saves, which walk a table too large for any cache.
+    /// The rows are dealt into their partitions once, in two passes over the hashes, before any
+    /// partition starts. See `deal_rows` for why that is not a pass per partition.
     ///
     /// # Errors
     ///
@@ -148,8 +146,10 @@ impl Lookup {
         let count = 1usize << bits;
         let next: Vec<AtomicU32> = (0..rows).map(|_| AtomicU32::new(NONE)).collect();
         let types: Vec<LogicalType> = keys.iter().map(|key| key.logical_type().clone()).collect();
+        let (starts, dealt) = deal_rows(&hashes, &keyed, bits, count);
         let one = |part: usize| -> Result<(Table, Vec<u32>, usize)> {
-            fill(part, bits, &types, keys, &hashes, &keyed, &next, cancel)
+            let mine = &dealt[starts[part]..starts[part + 1]];
+            fill(mine, &types, keys, &hashes, &next, cancel)
         };
         let filled = in_parallel(threads, count, threads.degree(), "join table partition", one)?;
 
@@ -335,21 +335,13 @@ impl Lookup {
 /// are the rows it owns, so nothing it touches is touched by another thread.
 #[allow(clippy::too_many_arguments)]
 fn fill(
-    part: usize,
-    bits: u32,
+    mine: &[usize],
     types: &[LogicalType],
     keys: &[Vector],
     hashes: &[u64],
-    keyed: &[bool],
     next: &[AtomicU32],
     cancel: &Cancel,
 ) -> Result<(Table, Vec<u32>, usize)> {
-    let mut mine: Vec<usize> = Vec::new();
-    for (row, &hash) in hashes.iter().enumerate() {
-        if keyed[row] && part_of(hash, bits) == part {
-            mine.push(row);
-        }
-    }
     let mut table = Table::new(types);
     let mut head: Vec<u32> = Vec::new();
     let mut tail: Vec<u32> = Vec::new();
@@ -399,6 +391,35 @@ fn fill(
         from = upto;
     }
     Ok((table, head, kept))
+}
+
+/// The keyed rows of the side sorted into their partitions, in row order inside each one.
+///
+/// What comes back is one run of rows and where each partition's rows start in it, with one more
+/// start at the end. Two passes over the hashes whatever the number of partitions: one counts the
+/// rows each partition gets and one puts every row where its partition starts plus the rows of it
+/// seen so far. Before this every partition read the whole run of hashes to find its own, which on
+/// sixteen threads is sixteen passes, and on q09 at SF1 that was a tenth of the query's CPU.
+fn deal_rows(hashes: &[u64], keyed: &[bool], bits: u32, count: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut starts = vec![0; count + 1];
+    for (row, &hash) in hashes.iter().enumerate() {
+        if keyed[row] {
+            starts[part_of(hash, bits) + 1] += 1;
+        }
+    }
+    for part in 0..count {
+        starts[part + 1] += starts[part];
+    }
+    let mut at = starts.clone();
+    let mut dealt = vec![0; starts[count]];
+    for (row, &hash) in hashes.iter().enumerate() {
+        if keyed[row] {
+            let part = part_of(hash, bits);
+            dealt[at[part]] = row;
+            at[part] += 1;
+        }
+    }
+    (starts, dealt)
 }
 
 /// How many of a hash's top bits name a partition, which is none below [`SPLIT`] rows.
@@ -486,7 +507,25 @@ mod tests {
     use rudb_common::Cancel;
     use rudb_pipeline::{Lease, Pool};
 
-    use super::{Lookup, MISS, SPLIT, Scratch, column, part_of, split_into};
+    use super::{Lookup, MISS, SPLIT, Scratch, column, deal_rows, part_of, split_into};
+
+    /// Every keyed row lands in the partition its hash names, once, in row order, and a row that
+    /// is not keyed lands nowhere.
+    #[test]
+    fn rows_are_dealt_to_the_partition_their_hash_names_in_row_order() {
+        let hashes: Vec<u64> =
+            (0..40_u64).map(|row| row.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let keyed: Vec<bool> = (0..40).map(|row| row % 5 != 0).collect();
+        let (starts, dealt) = deal_rows(&hashes, &keyed, 2, 4);
+        assert_eq!(starts.len(), 5);
+        assert_eq!(dealt.len(), 32, "the eight rows that are not keyed are left out");
+        for part in 0..4 {
+            let mine = &dealt[starts[part]..starts[part + 1]];
+            let expected: Vec<usize> =
+                (0..40).filter(|&row| keyed[row] && part_of(hashes[row], 2) == part).collect();
+            assert_eq!(mine, expected);
+        }
+    }
 
     /// Builds a lookup over one integer key column on one thread, nulls rejected.
     fn built(values: &[Option<i32>]) -> Lookup {
