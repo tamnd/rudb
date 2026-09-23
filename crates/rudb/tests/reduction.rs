@@ -138,6 +138,38 @@ fn a_reduction_that_removes_nothing_early_stops_and_says_so() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A child with no link to `customer`, because no relationship names it, still gets an exact test
+/// of its key against the keys the join holds, since `customer` has a key map for being the parent
+/// of `orders`. It is exact, so the answer is the same and the scan hands the join only the rows
+/// that match.
+#[test]
+fn a_child_with_no_link_is_reduced_through_the_parents_key_map() {
+    let (database, path) = database("keymap");
+    database.execute("CREATE TABLE visits (v_custkey INTEGER, v_day INTEGER)").expect("creates");
+    database
+        .execute("INSERT INTO visits SELECT 1 + i % 30000, i FROM range(0, 200000) AS r(i)")
+        .expect("loads");
+    database.execute("INSERT INTO visits VALUES (NULL, 0), (40000, 0)").expect("loads");
+    database.execute("CHECKPOINT").expect("commits");
+    let sql = "SELECT count(*), sum(v_day), max(c_name) FROM visits JOIN customer ON v_custkey = \
+               c_custkey WHERE c_custkey % 1000 = 7";
+    let reduced = rows(&database, sql);
+    assert_eq!(reduced[0][0], Value::BigInt(200));
+    let result = database.query(&format!("EXPLAIN ANALYZE {sql}")).expect("the explain ran");
+    let Value::Varchar(text) = result.value_at(0, 1) else { panic!("no plan text") };
+    let line = text
+        .lines()
+        .find(|line| line.contains("Get ") && line.contains("visits"))
+        .unwrap_or_else(|| panic!("no scan of visits:\n{text}"));
+    assert!(line.contains("key map kept 30 of 30000 parent keys"), "{line}");
+    assert!(line.contains("[200 rows"), "the scan should hand on only the matches: {line}");
+
+    database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
+    assert_eq!(rows(&database, sql), reduced, "the key map test changed an answer");
+    drop(database);
+    std::fs::remove_file(&path).ok();
+}
+
 /// Every kind of join the runtime filter is armed for, and a few it is not, against the same
 /// queries with the layer off.
 #[test]

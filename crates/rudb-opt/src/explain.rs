@@ -469,6 +469,9 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
         Some(reduced) if reduced.stopped => {
             ", link reduction stopped after a third of the rows removed nothing".to_owned()
         }
+        Some(reduced) if reduced.by_key => {
+            format!(", key map kept {} of {} parent keys", reduced.kept, reduced.rows)
+        }
         Some(reduced) => format!(", link kept {} of {} rows", reduced.kept, reduced.rows),
     };
     // Both clocks, named, because one number here was read as the other three times. The wall

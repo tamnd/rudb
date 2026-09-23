@@ -274,6 +274,22 @@ impl KeyMap {
         }
     }
 
+    /// The smallest key and how many key values from it the map spans, when the keys are compact.
+    ///
+    /// The identity and dense forms are the two that exist because the keys fill most of a range,
+    /// at most one hole in [`DENSE_THRESHOLD`] values, so a bitmap over that range is at most that
+    /// many bits a parent row. That is what lets a join test a child's key against a set of parents
+    /// with one subtraction and one bit, and with no link at all. The sorted form is the one for
+    /// keys spread over a range too wide for that, and answers `None`.
+    #[must_use]
+    pub fn span(&self) -> Option<(i128, u64)> {
+        match self.body {
+            Body::Identity { base, count } => Some((base, count)),
+            Body::Dense { base, range, .. } => Some((base, range)),
+            Body::Sorted { .. } => None,
+        }
+    }
+
     /// What the build saw, which is the cardinality verification.
     #[must_use]
     pub fn observed(&self) -> &Observed {
@@ -825,6 +841,7 @@ mod tests {
         resolves(&column, &map);
         assert_eq!(map.lookup(0).expect("lookup"), None, "below the base");
         assert_eq!(map.lookup(1001).expect("lookup"), None, "past the end");
+        assert_eq!(map.span(), Some((1, 1000)));
     }
 
     #[test]
@@ -849,6 +866,7 @@ mod tests {
             "a value in the range and not in the column"
         );
         assert_eq!(map.lookup(2001).expect("lookup"), None, "past the range");
+        assert_eq!(map.span(), Some((0, 1999)), "from the smallest key to the largest");
     }
 
     #[test]
@@ -860,6 +878,7 @@ mod tests {
         assert_eq!(map.form(), Form::Sorted);
         resolves(&column, &map);
         assert_eq!(map.lookup(500).expect("lookup"), None);
+        assert_eq!(map.span(), None, "too sparse for a bitmap over the range");
     }
 
     #[test]
