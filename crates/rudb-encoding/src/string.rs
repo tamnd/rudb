@@ -63,7 +63,7 @@
 
 use rudb_common::{Error, Result};
 
-use crate::chooser::{Chooser, EXHAUSTIVE};
+use crate::chooser::{Chooser, EXHAUSTIVE, Settled};
 use crate::fsst::SymbolTable;
 use crate::integer;
 use crate::lz;
@@ -379,6 +379,54 @@ pub fn describe(bytes: &[u8]) -> Result<String> {
     describe_chunk(&mut reader)
 }
 
+/// `shape` with one symbol table for the whole column, trained on what reaches FSST in `blocks`.
+///
+/// A settled shape is used for thousands of blocks of one column, and every block that tries FSST
+/// trains its own table. On ClickBench `hits` that was 35 seconds of a 150 second load, most of it
+/// on the literals `FRONT` then `LZ` leaves behind in `URL` and `Referer`, where the table comes
+/// out much the same block after block. So the blocks the shape was settled on are taken down the
+/// shape's levels here, the values that arrive at the FSST level are sampled together, and the
+/// table trained on them is handed to every block through [`Chooser::symbols`].
+///
+/// A shape that ends in `PLAIN` before any FSST level comes back as it was. So does one whose
+/// table comes out empty, which leaves each block to train its own as before.
+#[must_use]
+pub fn with_symbols(shape: Settled, blocks: &[Vec<&[u8]>]) -> Settled {
+    let kinds = shape.strings();
+    let Some(depth) =
+        (0..=kinds.len()).find(|&at| matches!(kinds.get(at), Some(Kind::Fsst) | None))
+    else {
+        return shape;
+    };
+    let leads =
+        kinds[..depth].iter().all(|kind| matches!(kind, Kind::Front | Kind::Lz | Kind::Dict));
+    if !leads || depth > usize::from(MAX_DEPTH) {
+        return shape;
+    }
+    let mut reached: Vec<Vec<u8>> = Vec::new();
+    for block in blocks {
+        let mut values: Vec<Vec<u8>> = block.iter().map(|value| value.to_vec()).collect();
+        for kind in &kinds[..depth] {
+            let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+            values = match kind {
+                Kind::Front => front_code(&refs).1.into_iter().map(<[u8]>::to_vec).collect(),
+                Kind::Dict => dictionary_of(&refs).0.into_iter().map(<[u8]>::to_vec).collect(),
+                _ => {
+                    let joined = refs.concat();
+                    lz::tokens_of(&joined).literals.into_iter().map(<[u8]>::to_vec).collect()
+                }
+            };
+        }
+        reached.extend(values);
+    }
+    let refs: Vec<&[u8]> = reached.iter().map(Vec::as_slice).collect();
+    let table = SymbolTable::train(&sample_of(&refs));
+    if table.is_empty() {
+        return shape;
+    }
+    shape.with_symbols(depth as u8, table)
+}
+
 fn encode_at(values: &[&[u8]], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
     let offered = candidates(values, depth);
     let mut best: Option<Vec<u8>> = None;
@@ -512,8 +560,14 @@ fn encode_as(
             }
         }
         Kind::Fsst => {
-            let sample = sample_of(values);
-            let table = SymbolTable::train(&sample);
+            let trained;
+            let table = match chooser.symbols(depth) {
+                Some(table) => table,
+                None => {
+                    trained = SymbolTable::train(&sample_of(values));
+                    &trained
+                }
+            };
             if table.is_empty() {
                 return Ok(None);
             }
@@ -1029,6 +1083,39 @@ mod tests {
                 format!("http://{host}{path}?session={}&ref=google", index * 7).into_bytes()
             })
             .collect()
+    }
+
+    fn front_lz() -> Settled {
+        Settled::new(vec![Kind::Front, Kind::Lz], vec![integer::Kind::Packed])
+    }
+
+    /// The point of the table: every block of a column compresses against one table trained once,
+    /// and what it writes still reads back as the values, including a block the table was not
+    /// trained on.
+    #[test]
+    fn a_block_compressed_against_the_column_table_reads_back() {
+        let values = urls(4096);
+        let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let blocks: Vec<Vec<&[u8]>> = refs.chunks(1024).take(2).map(<[&[u8]]>::to_vec).collect();
+        let shape = with_symbols(front_lz(), &blocks);
+        assert!(shape.symbols(2).is_some(), "FRONT then LZ leaves FSST the third level");
+        assert!(shape.symbols(1).is_none(), "and only that one");
+        for block in refs.chunks(1024) {
+            let encoded = encode_with(block, &shape).expect("encoded");
+            assert_eq!(decode(&encoded).expect("decoded"), block.to_vec());
+        }
+    }
+
+    /// A shape that settles on `PLAIN` never tries FSST, so there is nothing to train.
+    #[test]
+    fn a_shape_ending_in_plain_gets_no_table() {
+        let values = urls(1024);
+        let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let plain = Settled::new(vec![Kind::Lz, Kind::Plain], vec![integer::Kind::Packed]);
+        let shape = with_symbols(plain, std::slice::from_ref(&refs));
+        assert!((0..=MAX_DEPTH).all(|depth| shape.symbols(depth).is_none()));
+        let fsst = Settled::new(vec![Kind::Fsst], vec![integer::Kind::Packed]);
+        assert!(with_symbols(fsst, &[refs]).symbols(0).is_some());
     }
 
     /// The same values with a scrambled identifier stuck on the front of each, for the tests that
