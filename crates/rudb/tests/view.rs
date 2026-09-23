@@ -212,20 +212,23 @@ fn a_query_through_a_view_reads_the_columns_it_names_and_not_the_ones_the_body_l
     // The reason a view expands inline instead of becoming a node. What the binder hands over is a
     // hundred columns wide when the view says `SELECT *`, and what runs has to be as narrow as the
     // query. On the real ClickBench partition this is the difference between 3.39 seconds and 0.009
-    // seconds for the count, because a scan of no columns is a read of the Parquet footer.
+    // seconds for the count, because a scan of no columns is a read of the Parquet footer. The
+    // view's projection, which carries nothing by then, is gone too, so the aggregate sits right on
+    // the scan where the rules that answer from what a table stores look for it.
     let database = ran(&[
         "CREATE TABLE t (a INTEGER, b VARCHAR, c INTEGER)",
         "CREATE VIEW v AS SELECT * FROM t",
     ]);
     assert_eq!(
         database.plan("SELECT COUNT(*) FROM v").expect("a plan"),
-        "Project #3 [#2.0::BIGINT AS \"count_star()\"]\n  Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n    Project #1 []\n      Get memory.main.t AS t #0 []\n"
+        "Project #3 [#2.0::BIGINT AS \"count_star()\"]\n  Aggregate #2 groups=[] aggregates=[count_star()::BIGINT]\n    Get memory.main.t AS t #0 []\n"
     );
     // The filter is under the view's own projection rather than over it, which is filter pushdown,
-    // and that is what lets the projection be one column wide instead of two.
+    // and that is what lets the projection be one column wide instead of two. It only renames by
+    // then, so it goes as well and the outer projection reads the scan.
     assert_eq!(
         database.plan("SELECT b FROM v WHERE c > 1").expect("a plan"),
-        "Project #2 [#1.0::VARCHAR AS b]\n  Project #1 [#0.0::VARCHAR AS b]\n    Filter (#0.1::INTEGER > 1::INTEGER)::BOOLEAN\n      Get memory.main.t AS t #0 [b::VARCHAR, c::INTEGER]\n"
+        "Project #2 [#0.0::VARCHAR AS b]\n  Filter (#0.1::INTEGER > 1::INTEGER)::BOOLEAN\n    Get memory.main.t AS t #0 [b::VARCHAR, c::INTEGER]\n"
     );
 }
 

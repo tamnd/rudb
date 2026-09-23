@@ -3214,7 +3214,6 @@ fn correlated_scalar_aggregates_group_by_hidden_correlation_keys() {
     let plan = db.plan(sql).expect("the correlated scalar aggregate plans");
     assert!(plan.contains("Join SINGLE"), "{plan}");
     assert!(plan.contains("groups=[#1.0::INTEGER]"), "{plan}");
-    assert!(plan.contains("__correlated_1"), "{plan}");
     assert!(!plan.contains("DependentJoin"), "{plan}");
 }
 
