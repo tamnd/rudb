@@ -405,8 +405,10 @@ mod tests {
     #[test]
     fn a_table_function_has_no_return_type_and_no_stability() {
         let entries = function_entries();
-        let range: Vec<&super::FunctionEntry> =
-            entries.iter().filter(|entry| entry.name == "range").collect();
+        let range: Vec<&super::FunctionEntry> = entries
+            .iter()
+            .filter(|entry| entry.name == "range" && entry.function_type == "table")
+            .collect();
         // One, two or three arguments, which is what the function takes and what the pin reports.
         assert_eq!(range.len(), 3);
         for entry in &range {

@@ -8331,6 +8331,23 @@ fn the_list_calls_with_a_vector_loop_answer_over_a_column_the_way_they_do_a_row_
     );
     assert_eq!(column("SELECT contains(l, 2) FROM held ORDER BY id"), "true;false;NULL;true");
     assert_eq!(column("SELECT contains(s, 'a') FROM shaped ORDER BY id"), "true;NULL;true;false");
+    let aggregated = |call: &str, answer: &str| {
+        assert_eq!(column(&format!("SELECT {call} FROM held ORDER BY id")), answer, "{call}");
+    };
+    aggregated("list_sum(l)", "3;11;NULL;6");
+    aggregated("list_count(l)", "2;2;NULL;3");
+    aggregated("list_min(l)", "1;5;NULL;2");
+    aggregated("list_max(l)", "2;6;NULL;2");
+    aggregated("list_avg(l)", "1.5;5.5;NULL;2.0");
+    aggregated("list_first(l)", "1;NULL;NULL;2");
+    aggregated("list_last(l)", "NULL;6;NULL;2");
+    let ranged = |call: &str, answer: &str| {
+        assert_eq!(column(&format!("SELECT {call} FROM shaped ORDER BY id")), answer, "{call}");
+    };
+    ranged("list_sum(range(a - 1))", "NULL;NULL;15;0");
+    ranged("list_count(range(a - 1))", "0;NULL;6;1");
+    ranged("list_bit_or(range(a))", "0;NULL;7;1");
+    ranged("list_stddev_samp(range(a))", "NULL;NULL;2.160246899469287;0.7071067811865476");
 }
 
 #[test]
@@ -8345,6 +8362,106 @@ fn a_boolean_column_casts_to_a_number_as_a_zero_or_a_one() {
     );
     let answer: Vec<String> = answer[0].iter().map(ToString::to_string).collect();
     assert_eq!(answer, ["2", "2", "2.0", "2.0", "2", "1.00", "3"]);
+}
+
+#[test]
+fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
+    let db = database();
+    let row = |sql: &str| rows(&db, sql)[0][0].to_string();
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    let answers = [
+        ("SELECT range(5)", "[0, 1, 2, 3, 4]"),
+        (
+            "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-03', INTERVAL '1 day 12 hours')",
+            "[2020-01-01 00:00:00, 2020-01-02 12:00:00]",
+        ),
+        (
+            "SELECT range(TIMESTAMP '2020-01-03', TIMESTAMP '2020-01-01', INTERVAL '-1 day -12 hours')",
+            "[2020-01-03 00:00:00, 2020-01-01 12:00:00]",
+        ),
+        ("SELECT range(2, 5)", "[2, 3, 4]"),
+        ("SELECT range(10, 2, -3)", "[10, 7, 4]"),
+        ("SELECT range(0, 0)", "[]"),
+        ("SELECT range(5, 1)", "[]"),
+        ("SELECT range(5, 1, -1)", "[5, 4, 3, 2]"),
+        ("SELECT range(1, 5, 0)", "[]"),
+        ("SELECT range(-3)", "[]"),
+        ("SELECT range(1, 6, 2)", "[1, 3, 5]"),
+        ("SELECT typeof(range(5))", "BIGINT[]"),
+        ("SELECT range(NULL)", "NULL"),
+        ("SELECT range(1, NULL)", "NULL"),
+        ("SELECT generate_series(5)", "[0, 1, 2, 3, 4, 5]"),
+        ("SELECT generate_series(2, 5)", "[2, 3, 4, 5]"),
+        ("SELECT generate_series(10, 2, -3)", "[10, 7, 4]"),
+        ("SELECT generate_series(5, 1, -1)", "[5, 4, 3, 2, 1]"),
+        ("SELECT generate_series(1, 5, 0)", "[]"),
+        ("SELECT generate_series(1, 6, 2)", "[1, 3, 5]"),
+        ("SELECT range(9223372036854775807 - 1, 9223372036854775807)", "[9223372036854775806]"),
+        (
+            "SELECT generate_series(9223372036854775806, 9223372036854775807)",
+            "[9223372036854775806, 9223372036854775807]",
+        ),
+        ("SELECT range(-9223372036854775807, -9223372036854775808, -1)", "[-9223372036854775807]"),
+        (
+            "SELECT range(DATE '2020-01-01', DATE '2020-01-04', INTERVAL 1 DAY)",
+            "[2020-01-01 00:00:00, 2020-01-02 00:00:00, 2020-01-03 00:00:00]",
+        ),
+        (
+            "SELECT generate_series(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 6 HOUR)",
+            "[2020-01-01 00:00:00, 2020-01-01 06:00:00, 2020-01-01 12:00:00, \
+             2020-01-01 18:00:00, 2020-01-02 00:00:00]",
+        ),
+        (
+            "SELECT typeof(range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 6 HOUR))",
+            "TIMESTAMP[]",
+        ),
+        ("SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 0 HOUR)", "[]"),
+        (
+            "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-03-01', INTERVAL '1 month 1 day')",
+            "[2020-01-01 00:00:00, 2020-02-02 00:00:00]",
+        ),
+    ];
+    for (sql, answer) in answers {
+        assert_eq!(row(sql), answer, "{sql}");
+    }
+    assert_eq!(
+        error("SELECT range(0, 100000000000)"),
+        "Invalid Input Error: Lists larger than 2^32 elements are not supported"
+    );
+    assert_eq!(
+        error(
+            "SELECT range(TIMESTAMP '2020-01-01', TIMESTAMP '2020-03-01', INTERVAL '1 month -1 day')"
+        ),
+        "Invalid Input Error: Interval with mix of negative/positive entries not supported"
+    );
+    let refused = error("SELECT range(1.5)");
+    assert!(refused.contains("\"range\"(col0 BIGINT) -> BIGINT[]"), "{refused}");
+    // Over a column the series is built for each row, and the table function of the same name is
+    // still what a FROM clause gets.
+    db.execute("CREATE TABLE ends AS SELECT * FROM (VALUES (1, 3), (2, NULL), (3, 0)) v(id, e)")
+        .expect("created");
+    let column: Vec<String> = rows(&db, "SELECT generate_series(e) FROM ends ORDER BY id")
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert_eq!(column, ["[0, 1, 2, 3]", "NULL", "[0]"]);
+    db.execute(
+        "CREATE TABLE stops AS SELECT * FROM (VALUES (1, TIMESTAMP '2020-01-02'), (2, NULL), \
+         (3, TIMESTAMP '2019-12-31')) v(id, s)",
+    )
+    .expect("created");
+    let column: Vec<String> = rows(
+        &db,
+        "SELECT generate_series(TIMESTAMP '2020-01-01', s, INTERVAL 12 HOUR) FROM stops ORDER BY id",
+    )
+    .iter()
+    .map(|r| r[0].to_string())
+    .collect();
+    assert_eq!(
+        column,
+        ["[2020-01-01 00:00:00, 2020-01-01 12:00:00, 2020-01-02 00:00:00]", "NULL", "[]"]
+    );
+    assert_eq!(row("SELECT count(*) FROM range(4)"), "4");
 }
 
 #[test]

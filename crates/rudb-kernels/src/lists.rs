@@ -24,7 +24,9 @@ use std::collections::HashSet;
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Buffer, Data, Live, Validity, Vector, interleave};
 
+use crate::aggregate::{Accumulator, NOWHERE, finish_run, update_runs, update_scattered};
 use crate::compare::order;
+use crate::datetime;
 use crate::number::integral;
 
 /// What the pin says when the mask of `list_where` or the indexes of `list_select` hold a null.
@@ -84,6 +86,7 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
+        ("range" | "generate_series", _) => ranged(name == "generate_series", args).and_then(list),
         ("list_grade_up", [Value::List { values, .. }, spelled @ ..]) => {
             let order = spelled.first().map(spelled_order).transpose();
             let nulls = spelled.get(1).map(spelled_nulls).transpose();
@@ -122,6 +125,133 @@ fn listed(values: Vec<Value>, returns: &LogicalType) -> Result<Value> {
         return Err(Error::internal(format!("a list function returning {returns}")));
     };
     Ok(Value::List { element: (**element).clone(), values })
+}
+
+/// `range` and `generate_series` as scalars: the series from the start toward the stop as a list.
+///
+/// `generate_series` takes the stop when a step lands on it and `range` stops short of it. One
+/// argument is the stop, with a start of zero and a step of one. A step of zero, or one that points
+/// away from the stop, is an empty list rather than an error, which is the pin's answer.
+fn ranged(inclusive: bool, args: &[Value]) -> Result<Vec<Value>> {
+    if let [start, stop, Value::Interval { months, days, micros }] = args {
+        return stepped(inclusive, start, stop, (*months, *days, *micros));
+    }
+    let whole = |value: &Value| {
+        integral(value)
+            .and_then(|held| i64::try_from(held).ok())
+            .ok_or_else(|| Error::internal(format!("a range over a {}", value.logical_type())))
+    };
+    let (start, stop, step) = match args {
+        [stop] => (0, whole(stop)?, 1),
+        [start, stop] => (whole(start)?, whole(stop)?, 1),
+        [start, stop, step] => (whole(start)?, whole(stop)?, whole(step)?),
+        _ => return Err(Error::internal(format!("a range over {} arguments", args.len()))),
+    };
+    let count = series_length(start, stop, step, inclusive)?;
+    // Every value is between the start and the stop, both of which are BIGINTs, so none of these
+    // can leave the type.
+    let mut at = start;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(Value::BigInt(at));
+        at = at.wrapping_add(step);
+    }
+    Ok(values)
+}
+
+/// How many values an integer series has, counted wide so the gap between the two ends of BIGINT
+/// does not overflow.
+fn series_length(start: i64, stop: i64, step: i64, inclusive: bool) -> Result<usize> {
+    if step == 0 || (start > stop && step > 0) || (start < stop && step < 0) {
+        return Ok(0);
+    }
+    let apart = stop.abs_diff(start);
+    let by = step.unsigned_abs();
+    // A step of one is nearly every series written, and it needs no division at all.
+    let (whole, over) = if by == 1 { (apart, false) } else { (apart / by, apart % by != 0) };
+    let count = u128::from(whole) + u128::from(inclusive || over);
+    usize::try_from(count).ok().filter(|&count| count <= MAX_SERIES).ok_or_else(too_long)
+}
+
+/// A series of moments, each one the last with the interval added, which is how the pin steps and
+/// why a step of a month from the thirty first lands where adding a month would.
+fn stepped(
+    inclusive: bool,
+    start: &Value,
+    stop: &Value,
+    interval: (i32, i32, i64),
+) -> Result<Vec<Value>> {
+    let moment = |value: &Value| match value {
+        Value::Timestamp(stamp) | Value::TimestampTz(stamp) => Ok(*stamp),
+        other => Err(Error::internal(format!("a range from a {}", other.logical_type()))),
+    };
+    let mut stamps = Vec::new();
+    step_stamps(inclusive, moment(start)?, moment(stop)?, interval, &mut stamps)?;
+    let zoned = matches!(start, Value::TimestampTz(_));
+    Ok(stamps
+        .into_iter()
+        .map(|stamp| if zoned { Value::TimestampTz(stamp) } else { Value::Timestamp(stamp) })
+        .collect())
+}
+
+/// Appends the series of moments from `start` toward `end` to `out` and says how many it added.
+///
+/// An interval that is neither forward nor backward is an empty series, and one that is both is
+/// refused, which are the pin's two answers.
+fn step_stamps(
+    inclusive: bool,
+    start: i64,
+    end: i64,
+    (months, days, micros): (i32, i32, i64),
+    out: &mut Vec<i64>,
+) -> Result<usize> {
+    let forward = months > 0 || days > 0 || micros > 0;
+    let backward = months < 0 || days < 0 || micros < 0;
+    if forward && backward {
+        return Err(Error::invalid_input(
+            "Interval with mix of negative/positive entries not supported",
+        ));
+    }
+    // The two infinities are the two ends of the `i64`, less one at the bottom as upstream has it.
+    if [start, end].iter().any(|&stamp| stamp == i64::MAX || stamp == -i64::MAX) {
+        return Err(Error::invalid_input("Interval infinite bounds not supported"));
+    }
+    let from = out.len();
+    if !forward && !backward {
+        return Ok(0);
+    }
+    // Without months every step is the same number of microseconds, so the series is counted and
+    // written the way an integer one is, and every moment in it is between the start and the end.
+    let whole = i128::from(days) * i128::from(datetime::MICROS_PER_DAY) + i128::from(micros);
+    if let (0, Ok(step)) = (months, i64::try_from(whole)) {
+        let count = series_length(start, end, step, inclusive)?;
+        let steps = i64::try_from(count).map_err(|_| too_long())?;
+        out.reserve(count);
+        out.extend((0..steps).map(|at| start.wrapping_add(at.wrapping_mul(step))));
+        return Ok(count);
+    }
+    let (months, days, micros) = (i64::from(months), i64::from(days), i128::from(micros));
+    let mut at = start;
+    loop {
+        let past = if forward { at > end } else { at < end };
+        if past || (at == end && !inclusive) {
+            return Ok(out.len() - from);
+        }
+        if out.len() - from == MAX_SERIES {
+            return Err(too_long());
+        }
+        let next = datetime::shifted_stamp(at, months, days, micros)?;
+        out.push(at);
+        at = next;
+    }
+}
+
+/// The longest list the pin builds for a series, which is the most entries a list can hold.
+const MAX_SERIES: usize = u32::MAX as usize;
+
+/// The pin's refusal of a series longer than [`MAX_SERIES`].
+fn too_long() -> Error {
+    Error::invalid_input("Lists larger than 2^32 elements are not supported")
 }
 
 /// Whether two values are the same value, with a null the same as another null.
@@ -399,6 +529,10 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
 ) -> Result<Option<Vector>> {
     match (name, args) {
         ("list_value", [_, ..]) => built(args, returns, rows),
+        ("range" | "generate_series", [_, ..]) => {
+            series(name == "generate_series", args, returns, rows)
+        }
+        ("list_aggr", [list, aggregate]) => aggregated(list.as_ref(), aggregate.as_ref(), returns),
         ("list_reverse", [list]) => reversed(list.as_ref()),
         ("length" | "array_length", [list]) => counted(list.as_ref()),
         ("list_distinct", [list]) => deduplicated(false, list.as_ref()),
@@ -446,6 +580,111 @@ fn built<V: AsRef<Vector>>(
     Vector::list(entries, child).map(Some)
 }
 
+/// `range` and `generate_series` over integer columns, with every row's series written straight
+/// into one child and no `Value` made for any element. A row with a null argument is a null list.
+fn series<V: AsRef<Vector>>(
+    inclusive: bool,
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    if let [start, stop, step] = args {
+        if step.as_ref().logical_type() == &LogicalType::Interval {
+            return timed(inclusive, [start.as_ref(), stop.as_ref(), step.as_ref()], returns, rows);
+        }
+    }
+    if args.iter().any(|arg| arg.as_ref().logical_type() != &LogicalType::BigInt) {
+        return Ok(None);
+    }
+    let flat: Vec<Vector> = args.iter().map(|arg| arg.as_ref().flatten()).collect::<Result<_>>()?;
+    let mut columns = Vec::with_capacity(flat.len());
+    for vector in &flat {
+        let Some(Data::Int64(values)) = vector.data() else {
+            return Ok(None);
+        };
+        columns.push((values.as_slice(), vector.validity().live()));
+    }
+    // Every row is counted before anything is written, so the child is allocated once at its full
+    // length and never moved while it grows.
+    let mut runs = Vec::with_capacity(rows);
+    let mut live = vec![true; rows];
+    let mut total = 0_usize;
+    for (row, live) in live.iter_mut().enumerate() {
+        let mut held = [0_i64; 3];
+        for (at, (values, valid)) in columns.iter().enumerate() {
+            match values.get(row) {
+                Some(&value) if valid.at(row) => held[at] = value,
+                _ => *live = false,
+            }
+        }
+        let (start, stop, step) = match columns.len() {
+            1 => (0, held[0], 1),
+            2 => (held[0], held[1], 1),
+            _ => (held[0], held[1], held[2]),
+        };
+        let count = if *live { series_length(start, stop, step, inclusive)? } else { 0 };
+        runs.push((start, step, count));
+        total += count;
+    }
+    let mut entries = Vec::with_capacity(rows);
+    let mut child = Vec::with_capacity(total);
+    for &(start, step, count) in &runs {
+        entries.push((entry(child.len())?, entry(count)?));
+        // Every value taken is between the start and the stop, both BIGINTs, so neither the product
+        // nor the sum can leave the type for any of them.
+        let steps = i64::try_from(count).map_err(|_| too_long())?;
+        child.extend((0..steps).map(|at| start.wrapping_add(at.wrapping_mul(step))));
+    }
+    let child = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(child)))?;
+    let validity = Validity::from_iter(rows, |row| live[row]).normalize(rows);
+    Ok(Some(Vector::list(entries, child)?.with_validity(validity)))
+}
+
+/// `range` and `generate_series` over moments and an interval, the same way as [`series`] and
+/// with each step taken on the raw microseconds.
+fn timed(
+    inclusive: bool,
+    args: [&Vector; 3],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let LogicalType::List(element) = returns else {
+        return Ok(None);
+    };
+    if args[..2].iter().any(|arg| arg.logical_type() != &**element) {
+        return Ok(None);
+    }
+    let [start, stop, step] = args.map(Vector::flatten);
+    let (start, stop, step) = (start?, stop?, step?);
+    let (Some(Data::Int64(starts)), Some(Data::Int64(stops)), Some(Data::Interval(steps))) =
+        (start.data(), stop.data(), step.data())
+    else {
+        return Ok(None);
+    };
+    let (starts, stops, steps) = (starts.as_slice(), stops.as_slice(), steps.as_slice());
+    let lives = [start.validity().live(), stop.validity().live(), step.validity().live()];
+    let mut entries = Vec::with_capacity(rows);
+    let mut child = Vec::new();
+    let mut live = vec![true; rows];
+    for row in 0..rows {
+        let at = entry(child.len())?;
+        let held = (starts.get(row), stops.get(row), steps.get(row));
+        let (Some(&from), Some(&to), Some(&interval)) = held else {
+            return Ok(None);
+        };
+        if lives.iter().any(|live| !live.at(row)) {
+            entries.push((at, 0));
+            live[row] = false;
+            continue;
+        }
+        let count = step_stamps(inclusive, from, to, interval, &mut child)?;
+        entries.push((at, entry(count)?));
+    }
+    let child = Vector::flat((**element).clone(), Data::Int64(Buffer::from(child)))?;
+    let validity = Validity::from_iter(rows, |row| live[row]).normalize(rows);
+    Ok(Some(Vector::list(entries, child)?.with_validity(validity)))
+}
+
 /// `length` of a list column, which is every entry's length with the column's nulls.
 fn counted(list: &Vector) -> Result<Option<Vector>> {
     let Some((entries, _)) = list.list_parts() else {
@@ -457,6 +696,59 @@ fn counted(list: &Vector) -> Result<Option<Vector>> {
     let lengths: Vec<i64> = entries.iter().map(|&(_, len)| i64::from(len)).collect();
     let answer = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(lengths)))?;
     Ok(Some(answer.with_validity(list.validity().clone())))
+}
+
+/// `list_aggr` over a column, as a grouped aggregate whose groups are the lists.
+///
+/// Every element of the child belongs to the row whose list holds it, so the child is the input and
+/// the rows are the slots, and the same one pass folds a `GROUP BY` uses do the rest. The elements
+/// of one list are walked in order, which keeps a floating point total adding the way the row path
+/// adds it. A null list folds nothing and is null. Left to the row path when two lists share an
+/// element of the child, since a row of the input can only go to one slot, and when the call has
+/// arguments after the aggregate's name.
+fn aggregated(list: &Vector, aggregate: &Vector, returns: &LogicalType) -> Result<Option<Vector>> {
+    let (Some((entries, child)), Some(Value::Varchar(aggregate))) =
+        (list.list_parts(), aggregate.constant_value())
+    else {
+        return Ok(None);
+    };
+    let live = list.validity().live();
+    let mut slots = vec![NOWHERE; child.len()];
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        if !live.at(row) {
+            continue;
+        }
+        let (start, len) = (start as usize, len as usize);
+        let Some(held) = slots.get_mut(start..start + len) else {
+            return Err(Error::internal("a list entry past the end of its child"));
+        };
+        if held.iter().any(|&slot| slot != NOWHERE) {
+            return Ok(None);
+        }
+        held.fill(row);
+    }
+    let rows = entries.len();
+    let mut states = vec![Accumulator::new(aggregate, returns)?; rows];
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (at, &slot) in slots.iter().enumerate() {
+        match runs.last_mut() {
+            Some((held, end)) if *held == slot => *end = at + 1,
+            _ => runs.push((slot, at + 1)),
+        }
+    }
+    if !update_runs(&mut states, &runs, 1, 0, Some(child), child.len())? {
+        update_scattered(&mut states, &slots, 1, 0, Some(child), child.len())?;
+    }
+    let every: Vec<usize> = (0..rows).collect();
+    let answer = match finish_run(&states, &every, 1, 0, returns)? {
+        Some(answer) => answer,
+        None => {
+            let values = states.iter().map(Accumulator::finish).collect::<Result<Vec<_>>>()?;
+            Vector::from_values(returns.clone(), &values)?
+        }
+    };
+    let validity = answer.validity().and(list.validity(), rows);
+    Ok(Some(answer.with_validity(validity)))
 }
 
 /// `list_reverse` over a column: one gather of the child with every row's run turned round.

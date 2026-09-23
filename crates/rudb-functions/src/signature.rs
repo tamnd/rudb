@@ -285,6 +285,13 @@ enum Shape {
     /// The strings are not cast, so `list_sort([1], 1)` is refused as it is on the pin, and the
     /// binder holds them to constants.
     Sorted,
+    /// A start, a stop and a step, all BIGINT, or two moments and an INTERVAL, answering with the
+    /// list of values from the start toward the stop. `range` and `generate_series`.
+    ///
+    /// Only the integer types that widen to BIGINT without loss are taken, so a HUGEINT or a
+    /// decimal is refused as it is on the pin. A date goes in as a timestamp, and a zoned moment on
+    /// either side makes the list zoned.
+    Ranged,
     /// A list and the same two strings, answering with the places `list_sort` would put each
     /// element at rather than the elements. `list_grade_up`.
     Graded,
@@ -768,6 +775,22 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::between(1, 3),
         shape: Shape::Graded,
+        numeric_only: false,
+    },
+    // `range` and `generate_series` as scalars, which answer with the whole series as one list.
+    // The table functions of the same names are a different table and are not affected.
+    Entry {
+        name: "range",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 3),
+        shape: Shape::Ranged,
+        numeric_only: false,
+    },
+    Entry {
+        name: "generate_series",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 3),
+        shape: Shape::Ranged,
         numeric_only: false,
     },
     Entry {
@@ -1405,6 +1428,46 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             };
             listed_or_null(&arguments[0], element, arguments[1..].to_vec())
         }
+        Shape::Ranged => {
+            let moment = |ty: &LogicalType| {
+                matches!(
+                    ty,
+                    LogicalType::Date
+                        | LogicalType::Timestamp
+                        | LogicalType::TimestampTz
+                        | LogicalType::Null
+                )
+            };
+            let whole = |ty: &LogicalType| {
+                matches!(
+                    ty,
+                    LogicalType::TinyInt
+                        | LogicalType::SmallInt
+                        | LogicalType::Integer
+                        | LogicalType::BigInt
+                        | LogicalType::UTinyInt
+                        | LogicalType::USmallInt
+                        | LogicalType::UInteger
+                        | LogicalType::Null
+                )
+            };
+            match arguments {
+                [start, stop, LogicalType::Interval] if moment(start) && moment(stop) => {
+                    let zoned = [start, stop].contains(&&LogicalType::TimestampTz);
+                    let when =
+                        if zoned { LogicalType::TimestampTz } else { LogicalType::Timestamp };
+                    (
+                        vec![when.clone(), when.clone(), LogicalType::Interval],
+                        LogicalType::list(when),
+                    )
+                }
+                _ if arguments.iter().all(whole) => (
+                    vec![LogicalType::BigInt; arguments.len()],
+                    LogicalType::list(LogicalType::BigInt),
+                ),
+                _ => return Err(no_match(entry.name, arguments)),
+            }
+        }
         Shape::Graded => {
             let spelled = arguments[1..]
                 .iter()
@@ -1612,6 +1675,28 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         &[
             "list_reverse_sort(list ANY[]) -> ANY[]",
             "list_reverse_sort(list ANY[], null_order VARCHAR) -> ANY[]",
+        ],
+    ),
+    (
+        "range",
+        &[
+            "\"range\"(col0 BIGINT) -> BIGINT[]",
+            "\"range\"(col0 BIGINT, col1 BIGINT) -> BIGINT[]",
+            "\"range\"(col0 BIGINT, col1 BIGINT, col2 BIGINT) -> BIGINT[]",
+            "\"range\"(col0 TIMESTAMP, col1 TIMESTAMP, col2 INTERVAL) -> TIMESTAMP[]",
+            "\"range\"(col0 TIMESTAMP WITH TIME ZONE, col1 TIMESTAMP WITH TIME ZONE, col2 \
+             INTERVAL) -> TIMESTAMP WITH TIME ZONE[]",
+        ],
+    ),
+    (
+        "generate_series",
+        &[
+            "generate_series(col0 BIGINT) -> BIGINT[]",
+            "generate_series(col0 BIGINT, col1 BIGINT) -> BIGINT[]",
+            "generate_series(col0 BIGINT, col1 BIGINT, col2 BIGINT) -> BIGINT[]",
+            "generate_series(col0 TIMESTAMP, col1 TIMESTAMP, col2 INTERVAL) -> TIMESTAMP[]",
+            "generate_series(col0 TIMESTAMP WITH TIME ZONE, col1 TIMESTAMP WITH TIME ZONE, \
+             col2 INTERVAL) -> TIMESTAMP WITH TIME ZONE[]",
         ],
     ),
     (
@@ -2192,6 +2277,7 @@ impl Shape {
             Self::Resized => (leading(1, ANY_LIST, ANY), ANY_LIST),
             Self::Sorted => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
             Self::Graded => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
+            Self::Ranged => (all("BIGINT"), "BIGINT[]"),
         }
     }
 }
@@ -2721,6 +2807,7 @@ mod tests {
                     }
                     Shape::Flattened => arguments = vec![LogicalType::list(strings())],
                     Shape::Resized => arguments[0] = strings(),
+                    Shape::Ranged => arguments = vec![LogicalType::BigInt; count],
                     Shape::Sorted | Shape::Graded => {
                         arguments = vec![LogicalType::Varchar; count];
                         arguments[0] = strings();
