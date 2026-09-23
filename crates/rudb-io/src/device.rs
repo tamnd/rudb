@@ -286,14 +286,11 @@ pub fn measure(dir: &Path, options: &Options) -> Result<Card> {
 pub fn card(dir: &Path, iterations: Option<u32>) -> Result<Card> {
     static KEPT: Mutex<Vec<(String, Card)>> = Mutex::new(Vec::new());
     let key = device_key(dir)?;
-    if iterations.is_none()
-        && let Some((_, card)) = KEPT
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .find(|(have, _)| *have == key)
-    {
-        return Ok(Card { path: dir.to_path_buf(), ..card.clone() });
+    if iterations.is_none() {
+        let kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, card)) = kept.iter().find(|(have, _)| *have == key) {
+            return Ok(Card { path: dir.to_path_buf(), ..card.clone() });
+        }
     }
     let mut options = Options::default();
     if let Some(iterations) = iterations {
