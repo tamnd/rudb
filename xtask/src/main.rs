@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+mod ablate;
 mod bench;
 mod codegen;
 mod compare;
@@ -111,6 +112,13 @@ fn main() -> ExitCode {
         // with a setting flipped, and the reference is the run that reads nothing the graph layer
         // wrote.
         Some("sections") => sections::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // The forty three ClickBench queries once per statistics rule with that rule off, which is
+        // the per rule table `spec/stats/09-measurement.md` section 9.4 asks every milestone for.
+        // The same idea as `sections` above with the other set of switches, and separate from it
+        // because the suite and the evidence are both different: that one asks whether the graph
+        // layer changed an answer over TPC-H, and this one asks which statistics rule earned
+        // anything over a workload with no joins in it.
+        Some("ablate") => ablate::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("stats") => stats::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("topcount") => topcount::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("conform") => conform::run(&root()),
@@ -197,6 +205,14 @@ fn usage() {
     println!("           a green over a run where the layer never fired is a green that says");
     println!("           nothing, and the cache bytes is how a scale factor small enough to");
     println!("           generate quickly is pushed off the crossover of section 6.4");
+    println!("  ablate <hits.parquet> [repeats]  the forty three ClickBench queries once with");
+    println!("           every statistics rule on and once per rule with that rule off, which is");
+    println!("           the per rule table of spec/stats/09-measurement.md section 9.4. the file");
+    println!("           is loaded into a table and checkpointed first, because the rules read");
+    println!("           statistics a store wrote and a table in memory has none. a rule counts");
+    println!("           as having fired on a query only where the plan text changed, and the");
+    println!("           second delta column is over the queries where it did not, which is the");
+    println!("           noise floor a fired delta has to beat to mean anything");
     println!(
         "  stats <file.db> <table>...  builds a summary and a sketch for every column of each"
     );
