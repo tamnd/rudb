@@ -768,10 +768,12 @@ fn binary(
     rows: usize,
     written: Written<'_>,
 ) -> Result<Option<Vector>> {
-    if matches!(name, "+" | "-")
-        && let Some(moved) = shift_of(name == "-", left, right, returns)?
-    {
-        return Ok(Some(moved));
+    // Nested rather than a let chain, because the minimum supported Rust version is 1.85 and let
+    // chains landed in 1.88.
+    if matches!(name, "+" | "-") {
+        if let Some(moved) = shift_of(name == "-", left, right, returns)? {
+            return Ok(Some(moved));
+        }
     }
     if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
         return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
@@ -4225,7 +4227,7 @@ mod tests {
         )
         .expect("three counts");
         for arg in forms(&days) {
-            agrees("to_days", &[arg.clone()], &LogicalType::Interval);
+            agrees("to_days", std::slice::from_ref(&arg), &LogicalType::Interval);
             agrees("to_months", &[arg], &LogicalType::Interval);
         }
         let huge = Vector::from_values(LogicalType::Double, &[Value::Double(1e300)]).expect("one");
