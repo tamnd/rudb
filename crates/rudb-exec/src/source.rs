@@ -350,6 +350,8 @@ pub(crate) struct Scan<'a> {
     skipped: AtomicUsize,
     /// Whether the runtime filter has been earning the hash it costs.
     paying: Paying,
+    /// What the pushed filter keeps, which decides whether a Bloom filter runs ahead of it.
+    passed: Paying,
     /// The operator row this scan reports its part counts to, when it is being measured.
     ///
     /// The scan has counted its own skips since the walk was written and nobody outside could see
@@ -386,6 +388,12 @@ impl Paying {
         // Under the warmup there is nothing to go on, and a filter is given the benefit of it.
         seen < WARMUP
             || self.kept.load(Ordering::Relaxed).saturating_mul(4) < seen.saturating_mul(3)
+    }
+
+    /// Whether the filter has been measured keeping more than half of what it saw.
+    fn loose(&self) -> bool {
+        let seen = self.seen.load(Ordering::Relaxed);
+        seen >= WARMUP && self.kept.load(Ordering::Relaxed).saturating_mul(2) > seen
     }
 
     /// Records what one chunk put through the filter and what came out.
@@ -770,6 +778,7 @@ impl<'a> Scan<'a> {
             skipped: AtomicUsize::new(0),
             counters: None,
             paying: Paying::default(),
+            passed: Paying::default(),
         })
     }
 
@@ -805,6 +814,7 @@ impl<'a> Scan<'a> {
         let slot = reader();
         let mut working = pushed.take(slot);
         let mut kept = pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?;
+        self.passed.saw(chunk.len(), kept.len());
         // After the filter and on its answer rather than on the chunk, so that the filter's kernels
         // read the columns flat as they came off the disk and the chunk is narrowed once. Narrowing
         // it for the reduction first left the filter a selected chunk, and the comparison on a
@@ -822,6 +832,41 @@ impl<'a> Scan<'a> {
         }
         pushed.give(slot, working);
         Ok(())
+    }
+
+    /// Runs the filter this scan took off the operator above it and the joins' runtime filters over
+    /// one chunk it has just read, the exact bitmaps first where it can.
+    ///
+    /// A bitmap costs a subtraction and a bit test a row and is exact, while the pushed filter
+    /// evaluates a predicate and then narrows every column, which unpacks the packed ones. In q03 at
+    /// SF1 the date filter keeps half of lineitem and the join to orders keeps about one row in a
+    /// hundred of those, so narrowing on the date first unpacked fifty times more rows than the join
+    /// ever read. A Bloom filter costs a hash a row, so it goes ahead of the pushed filter only once
+    /// that filter has been measured keeping more than half the rows. In q04 the date filter keeps
+    /// about two thirds of lineitem and hashing first saved a third of the scan, while in q10 it keeps
+    /// a quarter and hashing the whole chunk cost more than the narrowing it saved.
+    ///
+    /// The graph reduction inside [`Self::apply`] names rows by their place in the part, so a part it
+    /// narrows keeps the old order, which lets the reduction see the rows where they were read.
+    fn narrow_read(&self, at: usize, out: &mut Chunk) -> Result<()> {
+        let placed = self.reduced(at).is_some_and(|(rows, _)| !rows.is_full());
+        if placed {
+            self.apply(at, out)?;
+            return self.sift(out);
+        }
+        self.sift_exact(out)?;
+        if out.is_empty() {
+            return Ok(());
+        }
+        if self.passed.loose() {
+            self.sift_hashed(out)?;
+            if out.is_empty() {
+                return Ok(());
+            }
+            return self.apply(at, out);
+        }
+        self.apply(at, out)?;
+        self.sift_hashed(out)
     }
 
     /// Reads the first LIKE column before the other projected column when it can reject most rows.
@@ -895,6 +940,13 @@ impl<'a> Scan<'a> {
     /// bit a row and a filter costs a hash and a cache line, and a row a bitmap has dropped is a row
     /// no filter has to hash.
     fn sift(&self, chunk: &mut Chunk) -> Result<()> {
+        self.sift_exact(chunk)?;
+        self.sift_hashed(chunk)
+    }
+
+    /// The bitmaps half of [`Self::sift`], which is cheap enough to go in front of the pushed
+    /// filter. See [`Self::narrow_read`].
+    fn sift_exact(&self, chunk: &mut Chunk) -> Result<()> {
         let handoffs = || {
             let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
             own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)))
@@ -918,6 +970,16 @@ impl<'a> Scan<'a> {
                 *chunk = whole.select(&Selection::from_indices(kept))?;
             }
         }
+        Ok(())
+    }
+
+    /// The filters half of [`Self::sift`], a hash a row, run after the bitmaps so that a row a
+    /// bitmap has dropped is a row no filter has to hash.
+    fn sift_hashed(&self, chunk: &mut Chunk) -> Result<()> {
+        let handoffs = || {
+            let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
+            own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)))
+        };
         for (sideways, paying) in handoffs() {
             if chunk.is_empty() {
                 return Ok(());
@@ -1305,8 +1367,7 @@ impl Source for Scan<'_> {
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
             *out = read;
-            self.apply(at, out)?;
-            self.sift(out)?;
+            self.narrow_read(at, out)?;
             return Ok(more(morsel));
         }
         let mut held = Vec::with_capacity(self.columns.len());
@@ -1320,8 +1381,7 @@ impl Source for Scan<'_> {
             }
         }
         *out = Chunk::with_rows(held, read.len())?;
-        self.apply(at, out)?;
-        self.sift(out)?;
+        self.narrow_read(at, out)?;
         Ok(more(morsel))
     }
 
@@ -3237,6 +3297,7 @@ mod tests {
             skipped: AtomicUsize::new(0),
             counters: None,
             paying: Paying::default(),
+            passed: Paying::default(),
         }
     }
 
@@ -3632,6 +3693,20 @@ mod tests {
                 paying.saw(1_000, kept);
             }
             assert_eq!(paying.worth(), worth, "{kept} of every thousand rows kept");
+        }
+    }
+
+    /// The pushed filter counts as loose only after the warmup and only when it keeps more than
+    /// half, which is when a Bloom filter goes ahead of it.
+    #[test]
+    fn a_pushed_filter_is_loose_once_it_keeps_more_than_half() {
+        for (kept, loose) in [(0, false), (250, false), (500, false), (501, true), (1_000, true)] {
+            let passed = Paying::default();
+            assert!(!passed.loose(), "nothing is decided under the warmup");
+            for _ in 0..(WARMUP / 1_000 + 1) {
+                passed.saw(1_000, kept);
+            }
+            assert_eq!(passed.loose(), loose, "{kept} of every thousand rows kept");
         }
     }
 
