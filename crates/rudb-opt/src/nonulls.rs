@@ -41,7 +41,7 @@
 //!
 //! What this pass leaves behind is work for two passes that do not run after it. A `count(x)` that
 //! becomes a `count(*)` stops reading a column, and can be the last reader of a whole joined table.
-//! So [`crate::columns::prune`] and [`crate::eliminate::sweep`] are called from `run` once anything
+//! So [`crate::columns::prune`] and `crate::eliminate::sweep` are called from `run` once anything
 //! was rewritten, rather than left for the next run of the sequence to notice.
 //!
 //! # What is not rewritten

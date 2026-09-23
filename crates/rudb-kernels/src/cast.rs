@@ -652,7 +652,7 @@ fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
 /// Null casts to null of the target type, which is not a special case so much as the only sensible
 /// reading: there is no value to convert and no conversion can fail.
 ///
-/// A list going to a list is handled here rather than in [`convert`] because `try_cast` has to
+/// A list going to a list is handled here rather than in `convert` because `try_cast` has to
 /// reach the elements. `TRY_CAST(['x', '2'] AS INTEGER[])` is `[NULL, 2]` upstream and not `NULL`,
 /// so the element that will not go is the one that becomes null and the list around it survives.
 ///

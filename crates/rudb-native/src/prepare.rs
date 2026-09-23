@@ -551,7 +551,7 @@ fn code_pages(parts: &[LocalPart], global: &[u32]) -> Result<ColumnStripe> {
 }
 
 impl Writer {
-    /// Something that encodes stripes for this writer without holding it. See [`prepare`].
+    /// Something that encodes stripes for this writer without holding it. See [`Preparer::prepare`].
     ///
     /// It carries the profile the writer has when it is asked for, so a writer that is going to be
     /// given one with [`Writer::with_profile`] should be given it first.
