@@ -185,6 +185,18 @@ pub(crate) struct Aggregate<'a> {
     /// Groups for the whole aggregate, so a table built for a radix partition takes its [`Share`]
     /// of this rather than all of it.
     presize: Option<u64>,
+    /// Whether a table taking room for [`Aggregate::presize`] reserves it against the budget before
+    /// it asks the allocator, and starts at the ordinary size when the budget cannot hold it.
+    ///
+    /// `spec/stats/05-every-query.md` section 5.1 is the reason it can fall back rather than fail.
+    /// Room taken for groups that may never come is the one charge in the operator that is a choice,
+    /// and a choice that does not fit is made the other way: a table that starts small grows the
+    /// way it always did, which costs time, where one charged on its first chunk for room it never
+    /// fills turns a query that fits into one that is out of memory. [`Rule::MemoryReservation`] is
+    /// the switch.
+    ///
+    /// [`Rule::MemoryReservation`]: rudb_common::rules::Rule::MemoryReservation
+    reserve: bool,
     /// The range the one integer grouping key lies in, where the planner said it has one.
     ///
     /// A shortcut and never a rule. The table it reaches holds the same groups in the same slots
@@ -759,6 +771,20 @@ impl Share {
     }
 }
 
+/// Whether room taken ahead of the groups can come out of the budget, which is while it leaves the
+/// query using no more than half of it.
+///
+/// Room reserved because it fits can still be room the rest of the query needed. An aggregate that
+/// partitions takes a table for each of its sixty four partitions, and when the ceiling is well over
+/// the groups that arrive, each one reserving what fits leaves the budget full of empty buckets and
+/// the next small allocation anywhere in the query out of memory. The half is the part of the budget
+/// a guess may spend. What the rows really need is charged as it arrives and may take the rest, and
+/// a table declined here starts at the ordinary size and grows, which is the failure section 5.1
+/// says to prefer.
+fn spare(memory: &Memory, room: u64) -> bool {
+    memory.limit().is_none_or(|limit| memory.used().saturating_add(room) <= limit / 2)
+}
+
 /// How many groups an instance holds before it stops keeping them to itself.
 ///
 /// Partitioning is not free. Every chunk is hashed, split, and gathered into one set of vectors per
@@ -952,6 +978,7 @@ impl<'a> Aggregate<'a> {
             having_count: None,
             max_groups: None,
             presize: None,
+            reserve: false,
             span: None,
             clustered: false,
             agreed: Mutex::new(None),
@@ -998,6 +1025,12 @@ impl<'a> Aggregate<'a> {
     /// has a ceiling at all.
     pub(crate) fn presize(mut self, groups: u64) -> Self {
         self.presize = Some(groups);
+        self
+    }
+
+    /// Reserves the room [`Aggregate::presize`] takes before taking it, per [`Aggregate::reserve`].
+    pub(crate) fn reserved(mut self) -> Self {
+        self.reserve = true;
         self
     }
 
@@ -1590,6 +1623,23 @@ impl<'a> Aggregate<'a> {
 
     fn starting(&self, share: Share) -> Building {
         let calls = self.calls.len();
+        let types: Vec<_> = self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
+        let mut containers = self.memory.reservation();
+        let mut charged = 0;
+        let groups = self.presize.and_then(|groups| share.of(groups));
+        // The room is reserved before the bucket array exists, so a budget that cannot hold it is
+        // found out before any page of it is cleared, and the charge the first chunk makes for the
+        // table is only what the table grew past it. `charged` is what the containers already hold.
+        let groups = match groups {
+            Some(groups) if self.reserve => {
+                let room = Table::room(groups);
+                (spare(&self.memory, room) && containers.grow(room).is_ok()).then(|| {
+                    charged = room;
+                    groups
+                })
+            }
+            groups => groups,
+        };
         let mut local = Building {
             // The keys and the rows made out of them, given back when this pass ends, because by
             // then they are in the chunks.
@@ -1598,17 +1648,15 @@ impl<'a> Aggregate<'a> {
             // chunks are built rather than after. Their own reservation so that their charge can go
             // when they do, which is what leaves room for the chunks. A key is not in here, because
             // a key is moved into the rows and outlives all of it. Per #272.
-            containers: self.memory.reservation(),
-            charged: 0,
+            containers,
+            charged,
             // What the keys the table has taken a copy of own away from themselves, charged against
             // the scratch rather than against the containers because those strings move into the
             // rows and outlive the table. `charged` and this one are the same arrangement over two
             // reservations.
             charged_keys: 0,
             table: {
-                let types: Vec<_> =
-                    self.keys.iter().map(|&key| self.plan.expr_type(key).clone()).collect();
-                let table = match self.presize.and_then(|groups| share.of(groups)) {
+                let table = match groups {
                     Some(groups) => Table::with_groups(&types, groups),
                     None => Table::new(&types),
                 };

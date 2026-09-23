@@ -1952,6 +1952,11 @@ impl<'a> Building<'a, '_> {
             }),
             None => aggregate,
         };
+        let aggregate = if self.session.rules().enabled(Rule::MemoryReservation) {
+            aggregate.reserved()
+        } else {
+            aggregate
+        };
         // The range of the one integer grouping key, where the planner found one. Not capped by the
         // group limit the way the presize above is, because this is the range the key lies in and
         // not a number of groups to take room for: narrowing it would leave values with no cell,
