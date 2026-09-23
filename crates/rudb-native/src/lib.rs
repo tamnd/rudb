@@ -193,16 +193,21 @@ fn close_workers() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from).min(MAX_FREQUENCY_WORKERS)
 }
 
-/// How many decoded bytes the global dictionaries closing at the same time may hold between them.
+/// How many bytes the columns closing at the same time may hold between them.
 ///
-/// Closing a dictionary decodes every value it holds, sorts them and drops them, and #1356 took the
-/// columns one at a time so that five of them decoded at once were not the peak of a load. On the
-/// ClickBench `hits` 10M load that made the dictionaries 1.9 s of a 6.3 s load on the 32 core box,
-/// with `Referer`, `Title` and `URL` each most of a second on their own. A column is taken while the
-/// ones already closing leave room for it under this, and always when nothing else is closing, so
-/// every column of `hits` at 10M rows closes at once and `URL` at 100M, which is past this alone,
-/// still closes on its own.
-const CLOSE_DICTIONARY_BYTES: usize = 1 << 30;
+/// Closing a global dictionary decodes every value it holds, sorts them and drops them, and #1356
+/// took the columns one at a time so that five of them decoded at once were not the peak of a load.
+/// A numeric column's frequencies hold a candidate table and, past it, an exact set of its distinct
+/// values that reaches 512 MiB. The two used to run side by side with only the dictionaries under a
+/// bound, and on the ClickBench `hits` 10M load the close took a load that had held 3.1 GB to 4.8
+/// GB. A column is taken while the ones already closing leave room for it under this, and always
+/// when nothing else is closing, so every dictionary of `hits` at 10M rows closes at once and `URL`
+/// at 100M, which is past this alone, still closes on its own.
+const CLOSE_BYTES: usize = 1 << 30;
+
+/// What a numeric column's frequencies hold before its exact distinct set, which is the candidate
+/// table, its recount and the page being read, with room to spare.
+const NUMERIC_CLOSE_BYTES: usize = 4 << 20;
 
 /// The most threads one stripe's encode is spread over.
 ///
@@ -606,13 +611,18 @@ impl Default for Candidates {
 ///
 /// Until then nothing was decremented and the table holds every value seen, so the set starts as
 /// those values and `ended`, the run about to be added. It is the caller's to insert every value
-/// after that.
+/// after that. A column the close decided not to count gets a set that has already given up.
 fn count_from_full(
     first: &Candidates,
     distinct: &mut Option<distinct::ExactDistinct>,
     ended: Option<u64>,
+    counted: bool,
 ) {
     if distinct.is_some() || !first.full() {
+        return;
+    }
+    if !counted {
+        *distinct = Some(distinct::ExactDistinct::declined());
         return;
     }
     let mut set = distinct::ExactDistinct::new();
@@ -1471,6 +1481,20 @@ impl GlobalDictionary {
             .map(|block| self.ends[((block + 1) * TEXT_PAYLOAD_VALUES).min(values) - 1] as usize)
             .sum::<usize>();
         decoded.saturating_add(values.saturating_mul(size_of::<(u64, u32)>() + size_of::<u32>()))
+    }
+
+    /// Frees what the dictionary keeps for coding new values, once none are coming.
+    ///
+    /// The hash tables, the check hash of every value and the blocks kept to settle a shape on are
+    /// what a merge looks values up in. The close reads the counts, the ends and the written blocks
+    /// and none of these, which are most of what the dictionary holds per value, so they go before
+    /// the close takes memory of its own rather than after.
+    fn release_lookup(&mut self) {
+        self.primary = HashMap::default();
+        self.collisions = HashMap::default();
+        self.checks = Vec::new();
+        self.sample = Vec::new();
+        self.filling = Vec::new();
     }
 
     /// How many blocks are encoded, written or not, which is the number the next one has to have.
@@ -2706,7 +2730,15 @@ impl Writer {
     /// entry keeps the whole candidate table in the second level cache where the forty eight byte
     /// one did not. The null takes part in the candidate table exactly as a key would: it holds a
     /// place while its count is above zero, and it is decremented with the rest.
-    fn numeric_frequency(&self, column: usize) -> Result<(Option<FrequencySummary>, Option<u64>)> {
+    ///
+    /// `counted` is false for a column whose sketch says its distinct values are far past what the
+    /// exact set holds. It still gets its frequencies, and a count only if it turns out to have
+    /// fewer values than the candidate table, which is the count that costs nothing.
+    fn numeric_frequency(
+        &self,
+        column: usize,
+        counted: bool,
+    ) -> Result<(Option<FrequencySummary>, Option<u64>)> {
         let signed = match self.table.fields[column].ty {
             LogicalType::TinyInt
             | LogicalType::SmallInt
@@ -2738,7 +2770,7 @@ impl Writer {
         let mut run = Run::default();
         self.visit_numeric(column, signed, |_, bits| {
             if let Some((ended, times)) = run.push(bits) {
-                count_from_full(&first, &mut distinct, ended);
+                count_from_full(&first, &mut distinct, ended, counted);
                 first.add(ended, times);
             }
             if run.times == 1 {
@@ -2748,7 +2780,7 @@ impl Writer {
             }
         })?;
         if let Some((bits, times)) = run.take() {
-            count_from_full(&first, &mut distinct, bits);
+            count_from_full(&first, &mut distinct, bits, counted);
             first.add(bits, times);
         }
         let distinct_count = match distinct.as_mut() {
@@ -2922,16 +2954,9 @@ impl Writer {
         Ok(())
     }
 
-    /// Builds independent numeric synopses concurrently after all column pages are committed.
-    ///
-    /// The columns go through a queue rather than being cut into equal runs, because they are not
-    /// equally expensive and they are not shuffled. A `BIGINT` column carries eight times the bytes
-    /// of a `TINYINT` through the decode, and a run of them sits together in a schema the way it
-    /// sits together in `hits`, so a worker that was handed the wrong six columns finishes long
-    /// after one that was handed the right six and the whole phase waits for it.
-    fn numeric_frequencies(&self) -> Result<Vec<(Option<FrequencySummary>, Option<u64>)>> {
-        let mut columns = self
-            .table
+    /// The columns that get numeric frequencies, which are the integer, date and timestamp ones.
+    fn numeric_columns(&self) -> Vec<usize> {
+        self.table
             .fields
             .iter()
             .enumerate()
@@ -2951,57 +2976,7 @@ impl Writer {
                 )
                 .then_some(column)
             })
-            .collect::<Vec<_>>();
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(MAX_FREQUENCY_WORKERS)
-            .min(columns.len());
-        let profile = self.profile.as_deref();
-        if workers <= 1 {
-            let _timing = profile.map(|profile| profile.span(Stage::Publish));
-            let mut frequencies = vec![(None, None); self.table.fields.len()];
-            for column in columns {
-                frequencies[column] = self.numeric_frequency(column)?;
-            }
-            return Ok(frequencies);
-        }
-        // Popped from the back, so the expensive columns are the ones taken first and the cheap ones
-        // are what is left to fill in behind them.
-        columns.sort_by_key(|&column| weight(&self.table.fields[column].ty));
-        let queue = Mutex::new(columns);
-        let pieces = std::thread::scope(|scope| {
-            (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let _timing = profile.map(|profile| profile.span(Stage::Publish));
-                        let mut mine = Vec::new();
-                        loop {
-                            let taken = queue
-                                .lock()
-                                .map_err(|_| Error::internal("a native frequency worker panicked"))?
-                                .pop();
-                            let Some(column) = taken else { break };
-                            mine.push((column, self.numeric_frequency(column)?));
-                        }
-                        Ok(mine)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| Error::internal("a native frequency worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        let mut frequencies = vec![(None, None); self.table.fields.len()];
-        for piece in pieces {
-            for (column, summary) in piece {
-                frequencies[column] = summary;
-            }
-        }
-        Ok(frequencies)
+            .collect()
     }
 
     /// Reads one stable dictionary code column only at sorted table-wide row ordinals.
@@ -3171,32 +3146,16 @@ impl Writer {
         let placing = self.at;
         finish_dictionaries(&mut self.dictionaries)?;
         self.place_blocks()?;
-        // The numeric frequencies and the global dictionaries read what is already written and
-        // write nothing, so they run at the same time. Each was most of a second on `hits` with the
-        // other waiting for it, and neither keeps every core busy on its own: each is as long as
-        // its longest column. Both charge themselves, one span to each thread that works, because
-        // they run on threads of their own and a span on this one would see their wall time and
-        // none of their CPU.
-        let this = &*self;
-        let (numeric, closed) = std::thread::scope(|scope| {
-            let numeric = scope.spawn(|| {
-                let (frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
-                    this.numeric_frequencies()?.into_iter().unzip();
-                let frequencies = frequencies
-                    .into_iter()
-                    .map(|held| held.map(Frequencies::Held))
-                    .collect::<Vec<_>>();
-                // Pair leaders are query results, not reusable column statistics.
-                let pairs = Vec::new();
-                Ok::<_, Error>((frequencies, distincts, pairs))
-            });
-            let closed = this.close_dictionaries();
-            let numeric =
-                numeric.join().map_err(|_| Error::internal("the native frequency thread panicked"));
-            (numeric, closed)
-        });
-        let (frequencies, distincts, pairs) = numeric??;
-        let closed = closed?;
+        for dictionary in self.dictionaries.iter_mut().flatten() {
+            dictionary.release_lookup();
+        }
+        let (numeric, closed) = self.close_columns()?;
+        let (frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
+            numeric.into_iter().unzip();
+        let frequencies =
+            frequencies.into_iter().map(|held| held.map(Frequencies::Held)).collect::<Vec<_>>();
+        // Pair leaders are query results, not reusable column statistics.
+        let pairs = Vec::new();
         self.table.frequencies = frequencies;
         self.table.distincts = distincts;
         self.table.pair_frequencies = pairs;
@@ -3264,85 +3223,120 @@ impl Writer {
         })
     }
 
-    /// Every global dictionary's page and statistics, by column, as many columns at a time as
-    /// [`CLOSE_DICTIONARY_BYTES`] allows.
+    /// Every numeric column's frequencies and every global dictionary's page and statistics, by
+    /// column, as many columns at a time as [`CLOSE_BYTES`] allows.
     ///
-    /// The largest column that fits is the one taken next, so the long ones start first and the
-    /// short ones fill in behind them. A column that does not fit waits for one that is closing to
-    /// finish, unless nothing is closing, in which case it goes alone.
-    fn close_dictionaries(&self) -> Result<Vec<Option<ClosedDictionary>>> {
-        let mut jobs = self
-            .dictionaries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, dictionary)| {
-                dictionary
-                    .as_ref()
-                    .map(|dictionary| (index, dictionary, dictionary.closing_bytes()))
-            })
-            .collect::<Vec<_>>();
-        jobs.sort_by_key(|&(_, _, bytes)| bytes);
-        let mut closed = (0..self.dictionaries.len()).map(|_| None).collect::<Vec<_>>();
-        let workers = close_workers().min(jobs.len());
-        if workers <= 1 {
-            for (index, dictionary, _) in jobs {
-                closed[index] = Some(self.close_dictionary(index, dictionary)?);
-            }
-            return Ok(closed);
-        }
-        // The columns not taken yet, smallest first, and the bytes the ones closing now hold.
-        let state = Mutex::new((jobs, 0_usize));
-        let finished = Condvar::new();
+    /// The two kinds read what is already written and write nothing, so they share one set of
+    /// threads. Each was most of a second on `hits` with the other waiting for it, and neither keeps
+    /// every core busy on its own. The most expensive column that fits is the one taken next, so
+    /// the long ones start first and the short ones fill in behind them. A column that does not fit
+    /// waits for one that is closing to finish, unless nothing is closing, in which case it goes
+    /// alone.
+    ///
+    /// A numeric column is charged the exact distinct set its sketch says it will need, and one the
+    /// sketch puts far past what that set can hold does not build it, because the set would fill,
+    /// give up and have held 512 MiB for nothing. A column with no sketch is charged the whole set.
+    /// Each job charges itself as its own span, publish for the numeric ones and dictionary for the
+    /// rest, because it runs on a thread of its own and a span on this one would see the wall time
+    /// and none of the CPU.
+    #[allow(clippy::type_complexity)]
+    fn close_columns(
+        &self,
+    ) -> Result<(Vec<(Option<FrequencySummary>, Option<u64>)>, Vec<Option<ClosedDictionary>>)> {
+        let numeric = self.numeric_columns().into_iter().map(|column| {
+            let estimate =
+                self.gathers.get(column).and_then(Option::as_ref).and_then(stats::Gather::distinct);
+            let counted = !estimate.is_some_and(distinct::beyond);
+            let set =
+                if counted { distinct::bytes_for(estimate.unwrap_or(f64::INFINITY)) } else { 0 };
+            let cost = self.table.rows.saturating_mul(weight(&self.table.fields[column].ty));
+            (Closing::Numeric { column, counted }, NUMERIC_CLOSE_BYTES + set, cost)
+        });
+        let dictionaries =
+            self.dictionaries.iter().enumerate().filter_map(|(index, dictionary)| {
+                let dictionary = dictionary.as_ref()?;
+                let bytes = dictionary.closing_bytes();
+                Some((Closing::Dictionary { index, dictionary }, bytes, bytes))
+            });
+        let mut jobs = numeric.chain(dictionaries).collect::<Vec<_>>();
+        jobs.sort_by_key(|&(_, _, cost)| cost);
+        let columns = self.table.fields.len();
+        let mut frequencies = vec![(None, None); columns];
+        let mut closed = (0..columns).map(|_| None).collect::<Vec<_>>();
         let profile = self.profile.as_deref();
-        let pieces = std::thread::scope(|scope| {
-            (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let _timing = profile.map(|profile| profile.span(Stage::Dictionary));
-                        let mut mine = Vec::new();
-                        loop {
-                            let mut held = state.lock().map_err(|_| {
-                                Error::internal("a native dictionary worker panicked")
-                            })?;
-                            let (index, dictionary, bytes) = loop {
-                                let (jobs, busy) = &mut *held;
-                                if jobs.is_empty() {
-                                    return Ok(mine);
-                                }
-                                let fits = jobs.iter().rposition(|&(_, _, bytes)| {
-                                    *busy == 0
-                                        || busy.saturating_add(bytes) <= CLOSE_DICTIONARY_BYTES
-                                });
-                                if let Some(at) = fits {
-                                    let job = jobs.remove(at);
-                                    *busy += job.2;
-                                    break job;
-                                }
-                                held = finished.wait(held).map_err(|_| {
-                                    Error::internal("a native dictionary worker panicked")
+        let run = |job: Closing<'_>| -> Result<Closed> {
+            match job {
+                Closing::Numeric { column, counted } => {
+                    let _timing = profile.map(|profile| profile.span(Stage::Publish));
+                    Ok(Closed::Numeric(column, self.numeric_frequency(column, counted)?))
+                }
+                Closing::Dictionary { index, dictionary } => {
+                    let _timing = profile.map(|profile| profile.span(Stage::Dictionary));
+                    Ok(Closed::Dictionary(index, self.close_dictionary(index, dictionary)?))
+                }
+            }
+        };
+        let workers = close_workers().min(jobs.len());
+        let pieces = if workers <= 1 {
+            jobs.into_iter().map(|(job, _, _)| run(job)).collect::<Result<Vec<_>>>()?
+        } else {
+            // The columns not taken yet, cheapest first, and the bytes the ones closing now hold.
+            let state = Mutex::new((jobs, 0_usize));
+            let finished = Condvar::new();
+            std::thread::scope(|scope| {
+                (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut mine = Vec::new();
+                            loop {
+                                let mut held = state.lock().map_err(|_| {
+                                    Error::internal("a native close worker panicked")
                                 })?;
-                            };
-                            drop(held);
-                            // Given back on the way out whether the close worked, failed or
-                            // panicked, so that a worker waiting for room is never left waiting.
-                            let _room = Room { state: &state, finished: &finished, bytes };
-                            mine.push((index, self.close_dictionary(index, dictionary)?));
-                        }
+                                let (job, bytes) = loop {
+                                    let (jobs, busy) = &mut *held;
+                                    if jobs.is_empty() {
+                                        return Ok(mine);
+                                    }
+                                    let fits = jobs.iter().rposition(|&(_, bytes, _)| {
+                                        *busy == 0 || busy.saturating_add(bytes) <= CLOSE_BYTES
+                                    });
+                                    if let Some(at) = fits {
+                                        let (job, bytes, _) = jobs.remove(at);
+                                        *busy += bytes;
+                                        break (job, bytes);
+                                    }
+                                    held = finished.wait(held).map_err(|_| {
+                                        Error::internal("a native close worker panicked")
+                                    })?;
+                                };
+                                drop(held);
+                                // Given back on the way out whether the close worked, failed or
+                                // panicked, so that a worker waiting for room is never left waiting.
+                                let _room = Room { state: &state, finished: &finished, bytes };
+                                mine.push(run(job)?);
+                            }
+                        })
                     })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| Error::internal("a native dictionary worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-        for (index, one) in pieces.into_iter().flatten() {
-            closed[index] = Some(one);
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| Error::internal("a native close worker panicked"))?
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?
+            .into_iter()
+            .flatten()
+            .collect()
+        };
+        for piece in pieces {
+            match piece {
+                Closed::Numeric(column, summary) => frequencies[column] = summary,
+                Closed::Dictionary(index, one) => closed[index] = Some(one),
+            }
         }
-        Ok(closed)
+        Ok((frequencies, closed))
     }
 
     /// One global dictionary's page and statistics, built from what is already in the file.
@@ -3350,7 +3344,7 @@ impl Writer {
     /// Nothing is written here, so that [`Self::close`] can run this beside the numeric frequencies
     /// and put the pages down afterwards in column order, which is where they always went. The
     /// column's values are decoded in here and dropped before it returns, and
-    /// [`Self::close_dictionaries`] decides how many columns are in here at once.
+    /// [`Self::close_columns`] decides how many columns are in here at once.
     fn close_dictionary(
         &self,
         _index: usize,
@@ -10003,7 +9997,7 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
     Ok(Some(out))
 }
 
-/// The room one closing dictionary takes under [`CLOSE_DICTIONARY_BYTES`], given back when dropped.
+/// The room one closing column takes under [`CLOSE_BYTES`], given back when dropped.
 struct Room<'a, T> {
     state: &'a Mutex<(T, usize)>,
     finished: &'a Condvar,
@@ -10017,6 +10011,25 @@ impl<T> Drop for Room<'_, T> {
         drop(held);
         self.finished.notify_all();
     }
+}
+
+/// One column's work at the end of a load, as [`Writer::close_columns`] schedules it.
+enum Closing<'a> {
+    /// A numeric column's frequencies, and whether to count its distinct values exactly.
+    Numeric {
+        column: usize,
+        counted: bool,
+    },
+    Dictionary {
+        index: usize,
+        dictionary: &'a GlobalDictionary,
+    },
+}
+
+/// What one [`Closing`] came back with, by column.
+enum Closed {
+    Numeric(usize, (Option<FrequencySummary>, Option<u64>)),
+    Dictionary(usize, ClosedDictionary),
 }
 
 /// What [`Writer::close_dictionary`] builds for one column and [`Writer::close`] writes.
