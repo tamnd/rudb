@@ -2858,16 +2858,22 @@ impl Writer {
         // on threads of their own and a span on this one would see their wall time and none of
         // their CPU.
         drop(timing);
+        let t = std::time::Instant::now();
         let (frequencies, distincts): (Vec<Option<FrequencySummary>>, _) =
             self.numeric_frequencies()?.into_iter().unzip();
+        probe_add(0, t);
         self.table.frequencies =
             frequencies.into_iter().map(|held| held.map(Frequencies::Held)).collect();
         self.table.distincts = distincts;
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
         let placing = self.at;
+        let t = std::time::Instant::now();
         finish_dictionaries(&mut self.dictionaries)?;
         self.place_blocks()?;
+        probe_add(1, t);
+        let t = std::time::Instant::now();
         self.table.pair_frequencies = self.pair_frequencies()?;
+        probe_add(2, t);
         let dictionaries = std::mem::take(&mut self.dictionaries);
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         self.table.frequency_texts = vec![Vec::new(); self.table.fields.len()];
@@ -2878,7 +2884,10 @@ impl Writer {
         // is the peak this change is about.
         for (index, dictionary) in dictionaries.into_iter().enumerate() {
             let Some(dictionary) = dictionary else { continue };
+            let t = std::time::Instant::now();
             let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
+            probe_add(3, t);
+            let t = std::time::Instant::now();
             // A code nothing counted is a code no non-null row of this column holds, which is the
             // empty string a null was written as and nothing else, because a code is only ever made
             // by a row asking for one.
@@ -2887,12 +2896,17 @@ impl Writer {
             let (frequencies, texts) = code_frequency(&dictionary, &flat, &bases)?;
             self.table.frequencies[index] = Some(Frequencies::Held(frequencies));
             self.table.frequency_texts[index] = texts;
+            probe_add(4, t);
+            let t = std::time::Instant::now();
             if self.table.fields[index].name.eq_ignore_ascii_case("Referer") {
                 self.table.host_groups = host::build(index, &dictionary, &flat, &bases)?;
             }
+            probe_add(5, t);
+            let t = std::time::Instant::now();
             drop(flat);
             drop(bases);
             let encoded = encode_global_dictionary(&dictionary, &order, &dictionary.placed, true)?;
+            probe_add(6, t);
             drop(order);
             let offset = self.at;
             self.put(&encoded.index)?;
@@ -2919,7 +2933,9 @@ impl Writer {
         drop(timing);
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let placed = self.at - placing;
+        let t = std::time::Instant::now();
         self.write_stats()?;
+        probe_add(7, t);
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
@@ -3026,7 +3042,11 @@ impl Writer {
     ///
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
+        let t = std::time::Instant::now();
         let entry = self.close()?;
+        probe_add(8, t);
+        eprintln!("PROBE numfreq finishdict pairfreq ranked codefreq host encdict stats close = {:?}",
+            PROBE.iter().map(|p| std::time::Duration::from_nanos(p.load(std::sync::atomic::Ordering::Relaxed))).collect::<Vec<_>>());
         let profile = self.profile.take();
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
@@ -9750,6 +9770,10 @@ fn block_values<'a>(ends: &[u32], bytes: &'a [u8]) -> Vec<&'a [u8]> {
 /// Across threads, the way [`encode_ready`] does it. This ran one column at a time on the thread
 /// closing the table, and a column that never settled a shape encodes each block by trying every
 /// candidate, so on a million rows of `hits` it was most of the load's CPU on one core.
+pub static PROBE: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+pub fn probe_add(slot: usize, since: std::time::Instant) {
+    PROBE[slot].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
 fn finish_dictionaries(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     for dictionary in dictionaries.iter_mut().flatten() {
         if !dictionary.early.is_empty() {
