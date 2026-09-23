@@ -8295,6 +8295,18 @@ fn the_list_calls_with_a_vector_loop_answer_over_a_column_the_way_they_do_a_row_
     assert_eq!(column("SELECT list_contains(l, 2) FROM held ORDER BY id"), "true;false;NULL;true");
     assert_eq!(column("SELECT list_position(l, 2) FROM held ORDER BY id"), "2;NULL;NULL;1");
     assert_eq!(column("SELECT list_position(l, NULL) FROM held ORDER BY id"), "3;1;NULL;NULL");
+    assert_eq!(
+        column("SELECT list_sort(l) FROM held ORDER BY id"),
+        "[1, 2, NULL];[5, 6, NULL];NULL;[2, 2, 2]"
+    );
+    assert_eq!(
+        column("SELECT list_sort(l, 'DESC', 'NULLS FIRST') FROM held ORDER BY id"),
+        "[NULL, 2, 1];[NULL, 6, 5];NULL;[2, 2, 2]"
+    );
+    assert_eq!(
+        column("SELECT list_reverse_sort(l) FROM held ORDER BY id"),
+        "[2, 1, NULL];[6, 5, NULL];NULL;[2, 2, 2]"
+    );
 }
 
 #[test]

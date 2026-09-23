@@ -21,7 +21,7 @@
 use std::cmp::Ordering;
 
 use rudb_common::{Error, LogicalType, Result, Value};
-use rudb_vector::{Buffer, Data, Validity, Vector, interleave};
+use rudb_vector::{Buffer, Data, Live, Validity, Vector, interleave};
 
 use crate::compare::order;
 use crate::number::integral;
@@ -382,6 +382,15 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
         ("list_contains" | "list_position", [list, needle]) => {
             searched(name == "list_position", list.as_ref(), needle.as_ref())
         }
+        ("list_sort", [list, spelled @ ..]) => ordered(
+            list.as_ref(),
+            spelled.first().map(AsRef::as_ref),
+            spelled.get(1).map(AsRef::as_ref),
+            false,
+        ),
+        ("list_reverse_sort", [list, spelled @ ..]) => {
+            ordered(list.as_ref(), None, spelled.first().map(AsRef::as_ref), true)
+        }
         _ => Ok(None),
     }
 }
@@ -447,17 +456,7 @@ fn searched(position: bool, list: &Vector, needle: &Vector) -> Result<Option<Vec
     else {
         return Ok(None);
     };
-    let plain = matches!(
-        child.logical_type(),
-        LogicalType::TinyInt
-            | LogicalType::SmallInt
-            | LogicalType::Integer
-            | LogicalType::BigInt
-            | LogicalType::UTinyInt
-            | LogicalType::USmallInt
-            | LogicalType::UInteger
-            | LogicalType::UBigInt
-    );
+    let plain = plain(child.logical_type());
     let Some(wanted) =
         integral(wanted).filter(|_| plain && needle.logical_type() == child.logical_type())
     else {
@@ -487,6 +486,116 @@ fn searched(position: bool, list: &Vector, needle: &Vector) -> Result<Option<Vec
     let data = Data::Bool(Buffer::from(found.iter().map(|&place| place != 0).collect::<Vec<_>>()));
     let answer = Vector::flat(LogicalType::Boolean, data)?;
     Ok(Some(answer.with_validity(list.validity().clone())))
+}
+
+/// `list_sort` and `list_reverse_sort` over an integer column: each row's run of the child sorted
+/// as indices, and the child gathered once in that order.
+///
+/// The order and null order are constants, which the binder insists on, so they are read once for
+/// the whole vector. A null one is left to the row path, where it makes every row null. So is a
+/// vector with no row that is not null, because the row path never reads the order for those and
+/// so never refuses a bad one.
+fn ordered(
+    list: &Vector,
+    order: Option<&Vector>,
+    nulls: Option<&Vector>,
+    reverse: bool,
+) -> Result<Option<Vector>> {
+    let Some((entries, child)) = list.list_parts() else {
+        return Ok(None);
+    };
+    if !plain(child.logical_type()) || list.validity().count_valid(list.len()) == 0 {
+        return Ok(None);
+    }
+    let spelled = |arg: Option<&Vector>| match arg.map(Vector::constant_value) {
+        None => Some(None),
+        Some(Some(value @ Value::Varchar(_))) => Some(Some(value.clone())),
+        Some(_) => None,
+    };
+    let (Some(order), Some(nulls)) = (spelled(order), spelled(nulls)) else {
+        return Ok(None);
+    };
+    let descending = reverse || order.as_ref().map(spelled_order).transpose()?.unwrap_or(false);
+    let nulls_first = nulls.as_ref().map(spelled_nulls).transpose()?.unwrap_or(false);
+    let rows = list.validity().live();
+    let elements = child.validity().live();
+    macro_rules! permute {
+        ($($variant:ident),+) => {
+            match child.data() {
+                $(Some(Data::$variant(values)) => {
+                    let values = values.as_slice();
+                    permutation(entries, rows, elements, nulls_first, |left, right| {
+                        let ordering = values[left as usize].cmp(&values[right as usize]);
+                        if descending { ordering.reverse() } else { ordering }
+                    })?
+                })+
+                _ => return Ok(None),
+            }
+        };
+    }
+    let (placed, indices) = permute!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
+    let child = child.gather(&indices)?;
+    Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
+}
+
+/// A list column rearranged but not yet gathered: its new entries, and the child index each new
+/// element is read from.
+type Permuted = (Vec<(u32, u32)>, Vec<u32>);
+
+/// The new entries and the child indices in order, for sorting every row's run with `compare`.
+///
+/// The nulls in a run are set aside, the rest are sorted stably, and the nulls go back in at the
+/// front or the back, which is what [`sort`] does with values.
+fn permutation(
+    entries: &[(u32, u32)],
+    rows: Live<'_>,
+    elements: Live<'_>,
+    nulls_first: bool,
+    compare: impl Fn(u32, u32) -> Ordering,
+) -> Result<Permuted> {
+    let mut indices = Vec::new();
+    let mut placed = Vec::with_capacity(entries.len());
+    let mut nulls = Vec::new();
+    for (row, &(start, len)) in entries.iter().enumerate() {
+        let at = entry(indices.len())?;
+        if !rows.at(row) {
+            placed.push((at, 0));
+            continue;
+        }
+        nulls.clear();
+        let from = indices.len();
+        for index in start..start + len {
+            if elements.at(index as usize) {
+                indices.push(index);
+            } else {
+                nulls.push(index);
+            }
+        }
+        indices[from..].sort_by(|&left, &right| compare(left, right));
+        if nulls_first {
+            indices.splice(from..from, nulls.iter().copied());
+        } else {
+            indices.extend_from_slice(&nulls);
+        }
+        placed.push((at, len));
+    }
+    Ok((placed, indices))
+}
+
+/// Whether equal values of `ty` are equal bits, which is what lets a search or a sort compare the
+/// child's native values instead of going through [`order`].
+fn plain(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+    )
 }
 
 /// The one based place in each row's run of the first element `hit` accepts, or 0 for none.
