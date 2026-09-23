@@ -601,6 +601,15 @@ impl Arenas {
         *self.live.entry(Self::key(column)).or_default() += live_bytes(column);
     }
 
+    /// The bytes laying every counted column takes: an arena that is mostly read is copied whole
+    /// and any other one a string at a time.
+    pub(crate) fn bytes(&self) -> usize {
+        self.live
+            .iter()
+            .map(|(&(_, len), &live)| if Self::mostly_read(len, live) { len } else { live })
+            .sum()
+    }
+
     fn mostly_read(arena: usize, live: usize) -> bool {
         arena <= live.saturating_add(live / 4)
     }
@@ -694,6 +703,7 @@ mod tests {
         let mut arenas = Arenas::default();
         arenas.count(&first);
         arenas.count(&second);
+        assert_eq!(arenas.bytes(), page.len(), "what the lay below takes, reserved up front");
         let mut laid = StringColumn::from_iter(["a string already there, past the limit"]);
         let before = laid.arena().len();
         laid.push_column(&first, &mut arenas);
@@ -704,7 +714,10 @@ mod tests {
         assert_eq!(laid.iter().collect::<Vec<_>>(), expected);
 
         let mut sparse = StringColumn::new();
-        sparse.push_column(&second, &mut Arenas::default());
+        let mut alone = Arenas::default();
+        alone.count(&second);
+        assert_eq!(alone.bytes(), strings[2].len(), "a sliver reserves only its own bytes");
+        sparse.push_column(&second, &mut alone);
         assert_eq!(sparse.arena(), strings[2].as_bytes(), "a sliver of a page is copied alone");
         assert_eq!(sparse.get(0), Some(strings[2]));
     }
