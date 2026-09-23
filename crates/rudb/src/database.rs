@@ -239,6 +239,9 @@ struct Inner {
     settings: Settings,
     memory: Memory,
     pool: Pool,
+    /// The pages every table of the file keeps between queries. One per database, and handed to
+    /// the catalog each checkpoint opens, so a checkpoint does not start a second budget.
+    pages: rudb_native::PagePool,
     /// The counts the last statement planned from, kept for the next one.
     ///
     /// What is stored carries the catalog generation it was read at, so the next statement can tell
@@ -289,7 +292,7 @@ impl Drop for Inner {
             return;
         };
         let catalog = self.catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let _ = persist(path, catalog);
+        let _ = persist(path, catalog, &self.pages);
     }
 }
 
@@ -306,6 +309,15 @@ impl Default for Database {
 /// in again on the next one, and which is asked here to stop. Both of them are process wide or
 /// database wide rather than query wide, both of them are cheap to set and expensive to find out
 /// about later, and opening a database is the one place that knows a query is coming.
+/// How many bytes of pages a database keeps between queries, which is half of its memory limit.
+///
+/// Half, because the other half is what a query's hash tables and sorts get, and those have to
+/// spill when they run out while a page that is let go can always be read again. No limit keeps
+/// every page, which is what DuckDB does too.
+fn page_budget(limit: Option<u64>) -> usize {
+    limit.map_or(usize::MAX, |limit| usize::try_from(limit / 2).unwrap_or(usize::MAX))
+}
+
 fn runtime(config: &Config) -> Pool {
     keep_pages();
     Pool::new(config.threads())
@@ -421,6 +433,7 @@ impl Database {
             settings,
             memory,
             pool,
+            pages: rudb_native::PagePool::default(),
             facts: Mutex::default(),
             relationships: Mutex::default(),
             declined: Mutex::default(),
@@ -524,13 +537,14 @@ impl Database {
         }
         let path = PathBuf::from(path);
         let mut catalog = Catalog::new();
+        let pages = rudb_native::PagePool::new(page_budget(config.memory_limit()));
         if path.exists() {
             // The catalog directory names the tables and the loop below decodes each one's own
             // directory. That is one decode per table rather than one decode of everything, but it
             // still happens at open, because the catalog this builds holds a reader per table and a
             // reader is built from a decoded directory. Deferring the decode to the first query
             // that touches a table is what the two levels are for and is not done here yet.
-            let native = rudb_native::Catalog::open(&path)?;
+            let native = rudb_native::Catalog::open_in(&path, &pages)?;
             let names = native.names().map(str::to_string).collect::<Vec<_>>();
             for name in names {
                 catalog.create_native_table(native.table(&name)?)?;
@@ -557,6 +571,7 @@ impl Database {
             settings,
             memory,
             pool,
+            pages,
             facts: Mutex::default(),
             relationships: Mutex::default(),
             declined: Mutex::default(),
@@ -594,7 +609,7 @@ impl Database {
         };
         let path = path.clone();
         let _writing = self.shared.writing();
-        persist(&path, &mut self.shared.write())
+        persist(&path, &mut self.shared.write(), &self.shared.inner.pages)
     }
 
     /// Parses a statement so it can be run more than once, with values for its parameters.
@@ -804,7 +819,7 @@ impl Database {
 /// The tables are rebound afterwards. Without that the catalog would go on reading the generation
 /// before this one, which still answers correctly because its bytes are unchanged, but which would
 /// be kept alive by every checkpoint for as long as the database is open.
-fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
+fn persist(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) -> Result<()> {
     let names = catalog.stored_tables().map(|table| table.name().clone()).collect::<Vec<_>>();
     let views = views(catalog);
     // Nothing to write is every table already in the file and the file holding no other. The second
@@ -843,10 +858,10 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     // the right bytes in the right place and the commit is a new catalog naming the same pages.
     if clean && held.is_some_and(|held| held.tables == wanted(&names)) {
         rudb_native::Writer::restate(path, &views)?;
-        return rebind(path, catalog, &names);
+        return rebind(path, catalog, &names, pages);
     }
     if appended(path, catalog, &names, &views)? {
-        return rebind(path, catalog, &names);
+        return rebind(path, catalog, &names, pages);
     }
     let temporary = scratch(path)?;
     let mut writer: Option<rudb_native::Writer> = None;
@@ -869,7 +884,7 @@ fn persist(path: &Path, catalog: &mut Catalog) -> Result<()> {
     let writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
     writer.with_views(views).finish()?;
     rename(&temporary, path)?;
-    rebind(path, catalog, &names)
+    rebind(path, catalog, &names, pages)
 }
 
 /// A path beside the database for the file being built, with anything left there removed first.
@@ -994,7 +1009,12 @@ fn same_views(held: &[rudb_native::ViewEntry], wanted: &[rudb_native::ViewEntry]
 /// which cuts both ways: a relationship naming a table that is not here, or a column no form can
 /// map, is passed over rather than made into an error, because the query it was declared for will
 /// run either way and only the time is different. What did and did not get built is `rudb_links()`.
-fn index(path: &Path, catalog: &mut Catalog, links: &str) -> Result<()> {
+fn index(
+    path: &Path,
+    catalog: &mut Catalog,
+    links: &str,
+    pages: &rudb_native::PagePool,
+) -> Result<()> {
     let declared = rudb_graph::parse_links(links).unwrap_or_default();
     if declared.is_empty() {
         return Ok(());
@@ -1047,7 +1067,7 @@ fn index(path: &Path, catalog: &mut Catalog, links: &str) -> Result<()> {
             }
         }
     }
-    rebind(path, catalog, &names)
+    rebind(path, catalog, &names, pages)
 }
 
 /// The declared relationships whose four names all resolve, as the link builder wants them.
@@ -1086,8 +1106,13 @@ fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edg
 }
 
 /// Points every table at the generation the file now holds.
-fn rebind(path: &Path, catalog: &mut Catalog, names: &[QualifiedName]) -> Result<()> {
-    let native = rudb_native::Catalog::open(path)?;
+fn rebind(
+    path: &Path,
+    catalog: &mut Catalog,
+    names: &[QualifiedName],
+    pages: &rudb_native::PagePool,
+) -> Result<()> {
+    let native = rudb_native::Catalog::open_in(path, pages)?;
     for name in names {
         let reader = native.table(&name.table)?;
         catalog.table_mut(name)?.rebind_native(reader)?;
@@ -2013,8 +2038,8 @@ impl Shared {
                 // A read only database answers this the way the pinned DuckDB does, which is by
                 // succeeding and writing nothing. It is not an error there and it is not one here.
                 if let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) {
-                    persist(path, &mut catalog)?;
-                    index(path, &mut catalog, &self.inner.settings.links())?;
+                    persist(path, &mut catalog, &self.inner.pages)?;
+                    index(path, &mut catalog, &self.inner.settings.links(), &self.inner.pages)?;
                 }
                 Ok(QueryResult::empty())
             }
