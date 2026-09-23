@@ -395,6 +395,72 @@ enum FrequencyValue {
     Code(u32),
 }
 
+/// A table keyed by the values the frequency pass counts.
+///
+/// Every integer of every numeric column goes through one of these at least once when a table
+/// closes, and with the standard hasher that was a fifth of the close on its own, all of it SipHash
+/// guarding against an attacker who would have to choose the rows of the file being written.
+type FrequencyMap<V> = HashMap<FrequencyValue, V, Spread>;
+
+/// Builds the hasher for [`FrequencyMap`].
+#[derive(Debug, Default, Clone, Copy)]
+struct Spread;
+
+impl std::hash::BuildHasher for Spread {
+    type Hasher = SpreadHasher;
+
+    fn build_hasher(&self) -> SpreadHasher {
+        SpreadHasher(0)
+    }
+}
+
+/// Folds each word in with a full width multiply whose two halves are xored together.
+///
+/// A plain multiply leaves the low bits of the hash as poor as the low bits of the key, and the
+/// table picks its bucket from the low bits, so a timestamp column, whose values are all multiples
+/// of a million microseconds, would pile into a sixty fourth of the buckets. Folding the high half
+/// of the product back in is what gives the low bits the whole word.
+#[derive(Debug)]
+struct SpreadHasher(u64);
+
+impl SpreadHasher {
+    fn mix(&mut self, word: u64) {
+        let product = u128::from(self.0 ^ word) * 0x9E37_79B9_7F4A_7C15_u128;
+        self.0 = (product as u64) ^ ((product >> 64) as u64);
+    }
+}
+
+impl std::hash::Hasher for SpreadHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for part in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..part.len()].copy_from_slice(part);
+            self.mix(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.mix(value as u64);
+        self.mix((value >> 64) as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.mix(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FrequencyEntry {
     value: FrequencyValue,
@@ -2103,7 +2169,7 @@ impl Writer {
         ) {
             return Ok((None, None));
         }
-        let mut candidates: HashMap<FrequencyValue, u32> = HashMap::new();
+        let mut candidates: FrequencyMap<u32> = FrequencyMap::default();
         let mut decrements = 0_u64;
         let mut distinct = distinct::ExactDistinct::new();
         self.visit_numeric(column, |_, value| {
@@ -2127,7 +2193,7 @@ impl Writer {
             candidates
                 .into_iter()
                 .map(|(value, count)| (value, u64::from(count)))
-                .collect::<HashMap<_, _>>()
+                .collect::<FrequencyMap<_>>()
         } else {
             let mut lower = candidates.values().copied().collect::<Vec<_>>();
             lower.sort_unstable_by(|left, right| right.cmp(left));
@@ -2137,7 +2203,7 @@ impl Writer {
                 return Ok((None, distinct.count()));
             }
             let mut exact =
-                candidates.into_keys().map(|value| (value, 0_u64)).collect::<HashMap<_, _>>();
+                candidates.into_keys().map(|value| (value, 0_u64)).collect::<FrequencyMap<_>>();
             self.visit_numeric(column, |_, value| {
                 if let Some(count) = exact.get_mut(&value) {
                     *count = count.saturating_add(1);
@@ -2166,7 +2232,7 @@ impl Writer {
                             .map_err(|_| invalid("too many retained frequency entries"))?,
                     ))
                 })
-                .collect::<Result<HashMap<_, _>>>()?;
+                .collect::<Result<FrequencyMap<_>>>()?;
             ordinals.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
             ordinal_entries.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
             self.visit_numeric(column, |ordinal, value| {
@@ -2189,6 +2255,18 @@ impl Writer {
     ) -> Result<()> {
         let ty = &self.table.fields[column].ty;
         let mut start = 0_u64;
+        let mut block = Vec::new();
+        // Signed types only. A packed unsigned column would come back from `signed_block` as a base
+        // plus a code in `i64`, which wraps for a value past the top of `BIGINT`.
+        let signed = matches!(
+            ty,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::Date
+                | LogicalType::Timestamp
+        );
         for stripe in &self.table.stripes {
             let spans = read_index(&self.file, stripe, column)?;
             let page = stripe.pages[column];
@@ -2201,6 +2279,22 @@ impl Writer {
                 }
                 let rows = rows as usize;
                 let vector = decode(ty, rows, part, None)?;
+                // Every signed layout a numeric column decodes to, which is every column of `hits`,
+                // comes out as one run of `i64` and is walked as a slice. The row path below is for
+                // the unsigned types and anything else that cannot be handed over that way.
+                if signed && vector.signed_block(&mut block) && block.len() == rows {
+                    let none_null = vector.none_null();
+                    for (row, &value) in block.iter().enumerate() {
+                        let value = if none_null || !vector.is_null_at(row) {
+                            FrequencyValue::Integer(i128::from(value))
+                        } else {
+                            FrequencyValue::Null
+                        };
+                        visit(start.saturating_add(row as u64), value);
+                    }
+                    start = start.saturating_add(rows as u64);
+                    continue;
+                }
                 // row at a time: frequency construction visits decoded values to update bounded candidates.
                 for row in 0..rows {
                     let value = if vector.is_null_at(row) {
