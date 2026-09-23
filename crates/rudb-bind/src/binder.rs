@@ -1210,6 +1210,14 @@ impl<'a> Binder<'a> {
         if let ast::Expr::Column { name } = ast.expr(target) {
             let parts: Vec<&str> = ast.name(name).collect();
             if let Ok(found) = input.resolve(&parts) {
+                // A column found by its second name is headed by that name, so `t.range` over
+                // `range(2) t` is a column called `range` on the pin while `SELECT *` calls it `t`.
+                let written = parts.last().copied().unwrap_or_default();
+                if let Some(also) = &found.also {
+                    if !same_name(&found.name, written) && same_name(also, written) {
+                        return also.clone();
+                    }
+                }
                 return found.name.clone();
             }
         }
