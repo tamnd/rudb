@@ -1169,6 +1169,11 @@ impl Gather {
         self.pass.rows
     }
 
+    /// The sketch's estimate of the column's distinct values so far, or nothing for a blind one.
+    pub(crate) fn distinct(&self) -> Option<f64> {
+        self.counts.sketch(0).map(|sketch| sketch.distinct())
+    }
+
     /// The summary and the merged sketch, or nothing if the column turned out to be blind.
     ///
     /// Blind means a form `rudb_storage::count` has no arm for turned up, so the sketch is missing

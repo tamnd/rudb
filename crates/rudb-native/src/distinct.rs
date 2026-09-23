@@ -63,6 +63,33 @@ fn hash(value: u64) -> u64 {
     value.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+/// Whether a column the sketch puts at `estimate` distinct values is so far past the cap that
+/// building its set would only fill 256 MiB and give up.
+///
+/// Twice the cap, where the sketch's error of a percent or two cannot reach, so a column this
+/// turns away is one the set would have turned away too. The sketch is a function of the column's
+/// values alone, so the answer, and the file, does not depend on the machine or the order the
+/// close ran in.
+pub(crate) fn beyond(estimate: f64) -> bool {
+    estimate > (2 * MAX_DISTINCT) as f64
+}
+
+/// About the most memory a set holds while it counts a column of `estimate` distinct values.
+///
+/// Each of the [`SETS`] sets takes its share of the values, an eighth over to cover a share that
+/// came out uneven and the sketch's error, at the power of two its growth rule reaches. Past the
+/// cap it is the size the sets reach as the last of them grow and the column gives up. This is
+/// what the close charges a column before it starts, so it errs large.
+pub(crate) fn bytes_for(estimate: f64) -> usize {
+    let values = estimate.clamp(0.0, MAX_DISTINCT as f64) as usize;
+    let share = (values / SETS).saturating_mul(9) / 8 + 1;
+    let mut slots = FIRST_SLOTS;
+    while full(share, slots) {
+        slots *= 2;
+    }
+    (slots + BUFFERED) * SETS * size_of::<u64>()
+}
+
 /// An exact set of one column's distinct non-null values, or the record that there were too many.
 #[derive(Debug)]
 pub(crate) struct ExactDistinct {
@@ -90,6 +117,20 @@ impl ExactDistinct {
             zero: false,
             len: 0,
             gave_up: false,
+        }
+    }
+
+    /// A set that has already given up, for a column [`beyond`] turned away. It holds nothing and
+    /// counts nothing.
+    pub(crate) fn declined() -> Self {
+        Self {
+            sets: Vec::new(),
+            held: Vec::new(),
+            buffered: Vec::new(),
+            waiting: Vec::new(),
+            zero: false,
+            len: 0,
+            gave_up: true,
         }
     }
 
@@ -214,6 +255,38 @@ mod tests {
             }
             assert_eq!(set.count(), Some(oracle.len() as u64), "round {round} counted wrong");
         }
+    }
+
+    #[test]
+    fn the_estimate_covers_what_a_set_holds_and_not_much_more() {
+        for distinct in [0_usize, 1, 1_000, 40_000, 300_000, 1_000_000] {
+            let mut set = ExactDistinct::new();
+            for value in 1..=distinct as u64 {
+                set.insert(value.wrapping_mul(0x0123_4567_89AB_CDEF));
+            }
+            assert_eq!(set.count(), Some(distinct as u64));
+            let held = (set.sets.iter().map(Vec::len).sum::<usize>() + set.buffered.len()) * 8;
+            let estimate = bytes_for(distinct as f64);
+            assert!(held <= estimate, "{distinct} values held {held} bytes over {estimate}");
+            assert!(
+                estimate <= 2 * held,
+                "{distinct} values held {held} bytes, far under {estimate}"
+            );
+        }
+        assert!(
+            bytes_for(1e12) <= (512 << 20) + (1 << 20),
+            "past the cap is not the most a set holds"
+        );
+    }
+
+    #[test]
+    fn a_declined_set_counts_nothing() {
+        let mut set = ExactDistinct::declined();
+        set.insert(7);
+        set.insert(0);
+        assert_eq!(set.count(), None);
+        assert!(beyond(3.0 * MAX_DISTINCT as f64));
+        assert!(!beyond(MAX_DISTINCT as f64));
     }
 
     #[test]
