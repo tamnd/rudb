@@ -41,7 +41,7 @@ use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as Atomic};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
@@ -3139,16 +3139,15 @@ pub struct Reader {
     part_ranges: Arc<Vec<Vec<RangeSlot>>>,
     /// Which stripe and which part of it every part of the table is, by table wide part number.
     places: Arc<Vec<Place>>,
-    cache: Arc<Vec<Mutex<Cached>>>,
+    cache: Arc<Shelf>,
+    /// Where the pages above are counted against the database's budget. See [`PagePool`].
+    pool: PagePool,
     /// How many whole stripe pages have been read, which is what the sharing above is judged on. A
     /// scan of a column should read each of its stripes once however many workers it has.
     pages: Arc<AtomicUsize>,
     /// How many index sections have been read. A scan of a column should read each of its stripes
     /// once here too, and the test that says so is the only thing keeping it that way.
     indexes: Arc<AtomicUsize>,
-    /// How many stripes of one column the page cache keeps. See [`CACHED_STRIPES_PER_COLUMN`] for
-    /// what sets it and [`Reader::keep_stripes`] for who raises it.
-    kept: Arc<AtomicUsize>,
     /// The file's size when it was opened, for [`Reader::layout`].
     size: u64,
     /// The committed directory's size, for [`Reader::layout`].
@@ -3240,10 +3239,145 @@ struct CachedColumn {
 /// ClickBench file was about thirteen hundred reads out of a hundred and fourteen thousand.
 #[derive(Debug, Default)]
 struct Cached {
-    pages: Vec<Option<Arc<Vec<u8>>>>,
-    order: VecDeque<usize>,
+    pages: Vec<Option<Resident>>,
     loading: Vec<usize>,
     index: Vec<Option<Arc<Vec<PartSpan>>>>,
+}
+
+/// One page a reader holds, and whether anyone has read it since the pool last looked.
+#[derive(Debug, Clone)]
+struct Resident {
+    page: Arc<Vec<u8>>,
+    used: Arc<AtomicBool>,
+}
+
+/// Every column's pages of one reader, with how many each column holds and the floor under that.
+#[derive(Debug)]
+struct Shelf {
+    columns: Vec<Mutex<Cached>>,
+    /// How many pages each column holds right now. Counted outside the column locks so that the
+    /// pool can tell whether a column is at its floor without taking a lock it might be under.
+    held: Vec<AtomicUsize>,
+    /// How many stripes of one column are kept whatever the budget says. See
+    /// [`CACHED_STRIPES_PER_COLUMN`] for what sets it and [`Reader::keep_stripes`] for who raises it.
+    kept: AtomicUsize,
+}
+
+/// The pages every reader of one database keeps, under one budget in bytes.
+///
+/// A reader lives as long as the database does, so the pages it holds are what the next query finds
+/// already in memory. They used to be four stripes a column, oldest out first, which on TPC-H SF1
+/// meant every query read every page of lineitem off the file again and paid the system call for
+/// it. Keeping every page there costs 38 MB and took a third of the system time off the suite.
+///
+/// So the question is no longer how many stripes a column keeps but how many bytes the database
+/// does, and one budget answers it for every reader at once. A table nobody queries gives its pages
+/// up to one that is being queried, which a count per column cannot do.
+///
+/// Pages leave by the clock. Each has a bit a read sets, and when the pool is over budget it walks
+/// from the oldest: a page with the bit set loses the bit and goes round again, and a page without
+/// it goes. That keeps what is read over and over and lets a page one scan read once go first.
+///
+/// The old count is still a floor. A column never gives up a page while it holds four or fewer,
+/// because a scan whose workers evict each other's pages reads a quarter of a megabyte for every
+/// part it takes, and a budget of zero is the cache as it was before the pool existed.
+#[derive(Debug, Clone, Default)]
+pub struct PagePool {
+    ring: Arc<Mutex<Ring>>,
+    budget: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Default)]
+struct Ring {
+    held: VecDeque<Held>,
+    bytes: usize,
+}
+
+/// One page in the pool, pointing back at the reader that holds it.
+///
+/// Weak, because a reader that has gone, which every reader does at a checkpoint, should take its
+/// pages with it and not have them kept alive by the pool.
+#[derive(Debug)]
+struct Held {
+    shelf: Weak<Shelf>,
+    column: usize,
+    stripe: usize,
+    bytes: usize,
+    used: Arc<AtomicBool>,
+}
+
+impl PagePool {
+    /// A pool that keeps up to `budget` bytes of pages beyond each column's floor.
+    #[must_use]
+    pub fn new(budget: usize) -> Self {
+        let pool = Self::default();
+        pool.budget.store(budget, Atomic::Relaxed);
+        pool
+    }
+
+    /// The bytes of pages the pool is counting now.
+    ///
+    /// # Panics
+    ///
+    /// If the pool's lock is poisoned, which takes a panic while it was held.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.ring.lock().map_or(0, |ring| ring.bytes)
+    }
+
+    /// Counts a page a reader has just taken in, and lets pages go until the pool is back under its
+    /// budget or it has looked at every page once.
+    ///
+    /// Called with no column lock held. The pages that go are chosen under the pool's lock and
+    /// dropped under their column's lock afterwards, so no thread ever holds both.
+    fn admit(&self, held: Held) {
+        let budget = self.budget.load(Atomic::Relaxed);
+        let mut gone = Vec::new();
+        {
+            let Ok(mut ring) = self.ring.lock() else { return };
+            ring.bytes += held.bytes;
+            ring.held.push_back(held);
+            // One lap and no more. A page read since the last pass loses its bit on this one and
+            // can only go on a later one, which is the second chance the clock is named for.
+            let mut looked = 0;
+            let limit = ring.held.len();
+            while ring.bytes > budget && looked < limit {
+                looked += 1;
+                let Some(entry) = ring.held.pop_front() else { break };
+                let Some(shelf) = entry.shelf.upgrade() else {
+                    ring.bytes -= entry.bytes;
+                    continue;
+                };
+                if entry.used.swap(false, Atomic::Relaxed) {
+                    ring.held.push_back(entry);
+                    continue;
+                }
+                let count = &shelf.held[entry.column];
+                if count.load(Atomic::Relaxed) <= shelf.kept.load(Atomic::Relaxed).max(1) {
+                    ring.held.push_back(entry);
+                    continue;
+                }
+                count.fetch_sub(1, Atomic::Relaxed);
+                ring.bytes -= entry.bytes;
+                gone.push((shelf, entry));
+            }
+            // A reader that has gone leaves its entries behind, and with a budget nobody reaches
+            // they would pile up one checkpoint after another. The front is where the oldest are.
+            while ring.held.front().is_some_and(|entry| entry.shelf.strong_count() == 0) {
+                if let Some(entry) = ring.held.pop_front() {
+                    ring.bytes -= entry.bytes;
+                }
+            }
+        }
+        for (shelf, entry) in gone {
+            let Ok(mut cached) = shelf.columns[entry.column].lock() else { continue };
+            if let Some(slot) = cached.pages.get_mut(entry.stripe) {
+                if slot.as_ref().is_some_and(|slot| Arc::ptr_eq(&slot.used, &entry.used)) {
+                    *slot = None;
+                }
+            }
+        }
+    }
 }
 
 /// Stripes of one column a reader keeps the bytes of, when nobody has asked for more.
@@ -4242,28 +4376,28 @@ fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
     page.get(span.start..end).ok_or_else(|| invalid("part exceeds its column page"))
 }
 
-/// Puts one stripe of one column in the cache, dropping the stripe that has been there longest.
+/// Puts one stripe of one column in the cache, and hands back the page for the pool to count when
+/// it is a page the column did not already hold.
 ///
-/// The index goes in its own slot and stays. Only the page is under the budget, and `kept` is how
-/// many pages that budget is.
-fn remember(cached: &mut Cached, held: &CachedColumn, kept: usize) {
+/// The index goes in its own slot and stays. Only the page is under the budget, and the pool is
+/// what enforces it, once the caller has let go of the column's lock.
+fn remember(cached: &mut Cached, held: &CachedColumn) -> Option<(usize, Arc<AtomicBool>)> {
     if let Some(slot) = cached.index.get_mut(held.stripe) {
         if slot.is_none() {
             *slot = Some(Arc::clone(&held.index));
         }
     }
-    let Some(page) = held.page.clone() else { return };
-    let Some(slot) = cached.pages.get_mut(held.stripe) else { return };
-    if slot.is_none() {
-        cached.order.push_back(held.stripe);
+    let page = held.page.clone()?;
+    let slot = cached.pages.get_mut(held.stripe)?;
+    if slot.is_some() {
+        return None;
     }
-    *slot = Some(page);
-    while cached.order.len() > kept.max(1) {
-        let Some(oldest) = cached.order.pop_front() else { break };
-        if let Some(slot) = cached.pages.get_mut(oldest) {
-            *slot = None;
-        }
-    }
+    let bytes = page.len();
+    // Set, so that the page a worker has just paid to read is not the one the pass it pays for
+    // lets go of before the worker has read a part out of it.
+    let used = Arc::new(AtomicBool::new(true));
+    *slot = Some(Resident { page, used: Arc::clone(&used) });
+    Some((bytes, used))
 }
 
 /// Every table a native file holds, without the directory of any of them.
@@ -4282,15 +4416,29 @@ pub struct Catalog {
     /// The views the file holds, whole, since a view has no second level to read later.
     views: Arc<Vec<ViewEntry>>,
     opening: Opening,
+    /// Where every reader this hands out counts its pages.
+    pool: PagePool,
 }
 
 impl Catalog {
     /// Reads the highest valid catalog slot and nothing under it.
     ///
+    /// The readers it hands out keep pages in a pool of their own with no budget, so each column
+    /// holds its floor of four stripes and no more. A database opens with [`Catalog::open_in`].
+    ///
     /// # Errors
     ///
     /// If the file has no valid committed catalog or a catalog pointer is out of bounds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in(path, &PagePool::default())
+    }
+
+    /// The same, with every reader it hands out keeping its pages in `pool`.
+    ///
+    /// # Errors
+    ///
+    /// If the file has no valid committed catalog or a catalog pointer is out of bounds.
+    pub fn open_in(path: impl AsRef<Path>, pool: &PagePool) -> Result<Self> {
         let (file, size, _, bytes, opening) = slot_bytes(path)?;
         let (entries, views) = decode_catalog(&bytes, size)?;
         Ok(Self {
@@ -4299,6 +4447,7 @@ impl Catalog {
             entries: Arc::new(entries),
             views: Arc::new(views),
             opening,
+            pool: pool.clone(),
         })
     }
 
@@ -4366,6 +4515,7 @@ impl Catalog {
             read_directory(Cursor::over(&self.file, offset, length), self.size, Some(offset))?,
             u64::from(entry.directory.length),
             opening,
+            self.pool.clone(),
         )
     }
 
@@ -4504,12 +4654,13 @@ impl Reader {
         table: Table,
         directory: u64,
         opening: Opening,
+        pool: PagePool,
     ) -> Result<Self> {
         let places = places(&table)?;
         let dictionaries = (0..table.fields.len()).map(|_| OnceLock::new()).collect();
         let table_fields = table.fields.len();
         let stripes = table.stripes.len();
-        let cache = (0..table.fields.len())
+        let columns = (0..table.fields.len())
             .map(|_| {
                 Mutex::new(Cached {
                     pages: (0..stripes).map(|_| None).collect(),
@@ -4518,6 +4669,11 @@ impl Reader {
                 })
             })
             .collect::<Vec<_>>();
+        let cache = Shelf {
+            columns,
+            held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
+            kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
+        };
         let sieves: Vec<Vec<SieveSlot>> = (0..table.fields.len())
             .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
             .collect();
@@ -4536,9 +4692,9 @@ impl Reader {
             part_ranges: Arc::new(part_ranges),
             places: Arc::new(places),
             cache: Arc::new(cache),
+            pool,
             pages: Arc::new(AtomicUsize::new(0)),
             indexes: Arc::new(AtomicUsize::new(0)),
-            kept: Arc::new(AtomicUsize::new(CACHED_STRIPES_PER_COLUMN)),
             size,
             directory,
             opening,
@@ -4692,7 +4848,7 @@ impl Reader {
     /// all: every worker's page is evicted by the others before it has finished its stripe, so it
     /// reads a quarter of a megabyte for every part it takes out of it.
     pub fn keep_stripes(&self, stripes: usize) {
-        self.kept.fetch_max(stripes, Atomic::Relaxed);
+        self.cache.kept.fetch_max(stripes, Atomic::Relaxed);
     }
 
     /// Rows in one part, or zero when the part number is past the table.
@@ -5430,10 +5586,14 @@ impl Reader {
     ///
     /// The file is never read under the lock.
     fn held(&self, at: usize, stripe: &Stripe, column: usize, whole: bool) -> Result<CachedColumn> {
-        let cache = self.cache.get(column).ok_or_else(|| invalid("column index out of range"))?;
+        let cache =
+            self.cache.columns.get(column).ok_or_else(|| invalid("column index out of range"))?;
         let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
         let known = cached.index.get(at).and_then(Clone::clone);
-        let page = cached.pages.get(at).and_then(Clone::clone);
+        let page = cached.pages.get(at).and_then(Option::as_ref).map(|slot| {
+            slot.used.store(true, Atomic::Relaxed);
+            Arc::clone(&slot.page)
+        });
         if let Some(index) = known.clone() {
             if !whole || page.is_some() {
                 return Ok(CachedColumn { stripe: at, index, page });
@@ -5449,7 +5609,7 @@ impl Reader {
             }
             let held = self.page_of(stripe, column, at, false, None)?;
             let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
-            remember(&mut cached, &held, self.kept.load(Atomic::Relaxed));
+            remember(&mut cached, &held);
             return Ok(held);
         }
         cached.loading.push(at);
@@ -5465,7 +5625,18 @@ impl Reader {
             cached.loading.remove(position);
         }
         let held = read?;
-        remember(&mut cached, &held, self.kept.load(Atomic::Relaxed));
+        let taken = remember(&mut cached, &held);
+        drop(cached);
+        if let Some((bytes, used)) = taken {
+            self.cache.held[column].fetch_add(1, Atomic::Relaxed);
+            self.pool.admit(Held {
+                shelf: Arc::downgrade(&self.cache),
+                column,
+                stripe: at,
+                bytes,
+                used,
+            });
+        }
         Ok(held)
     }
 
@@ -11657,6 +11828,66 @@ mod tests {
             "the pages are the ones that get read again, which is what makes the index count mean \
              something"
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A page stays in memory from one scan to the next while the pool has room for it, and a
+    /// table that is being read takes room from one that is not, down to the floor and no further.
+    ///
+    /// This is what the pool is for. Each reader lives as long as its database, so a second query
+    /// over the same table should find every page it read the first time, and before the pool it
+    /// found four stripes a column and read the rest off the file again.
+    #[test]
+    fn a_pool_keeps_pages_between_scans_and_gives_them_to_the_table_being_read() {
+        let path = path("page-pool");
+        let parts = STRIPE_PARTS * (CACHED_STRIPES_PER_COLUMN + 2);
+        let fields = || vec![Field::required("id", LogicalType::Integer)];
+        let mut writer = Writer::create(&path, "a", fields()).expect("new file");
+        for table in ["a", "b"] {
+            if table == "b" {
+                writer = writer.next("b".to_string(), fields()).expect("a second table");
+            }
+            for part in 0..parts {
+                let chunk = Chunk::new(vec![
+                    Vector::from_values(LogicalType::Integer, &[Value::Integer(part as i32)])
+                        .expect("integers"),
+                ])
+                .expect("matching rows");
+                writer.append(&chunk).expect("one part");
+            }
+        }
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let (a, b) = (catalog.table("a").expect("a"), catalog.table("b").expect("b"));
+        let stripes = a.table().stripes().len();
+        assert!(stripes > CACHED_STRIPES_PER_COLUMN, "the floor has to be smaller than a table");
+        let scan = |reader: &Reader| {
+            for part in 0..parts {
+                let chunk = reader.read(part, &[0]).expect("a part");
+                assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
+            }
+        };
+        scan(&a);
+        scan(&a);
+        assert_eq!(a.pages.load(Atomic::Relaxed), stripes, "the second scan reads nothing");
+        let one = pool.bytes();
+        assert!(one > 0, "the pool counts what the reader holds");
+
+        // Room for one table. Reading the other takes the first one's pages down to its floor.
+        pool.budget.store(one, Atomic::Relaxed);
+        scan(&b);
+        assert_eq!(b.pages.load(Atomic::Relaxed), stripes, "a page is never let go while in use");
+        assert_eq!(a.cache.held[0].load(Atomic::Relaxed), CACHED_STRIPES_PER_COLUMN);
+        let held = a.cache.columns[0].lock().expect("the column").pages.iter().flatten().count();
+        assert_eq!(held, CACHED_STRIPES_PER_COLUMN, "the count and the slots agree");
+
+        // A reader that goes takes its pages out of the count with it.
+        drop((a, b, catalog));
+        let c = Catalog::open_in(&path, &pool).expect("again").table("a").expect("a");
+        scan(&c);
+        assert!(pool.bytes() <= one, "only what the live reader holds is counted");
         fs::remove_file(path).expect("remove scratch file");
     }
 
