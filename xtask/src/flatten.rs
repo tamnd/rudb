@@ -50,8 +50,19 @@ const MARKER: &str = "flatten:";
 /// the list is short and grows a line at a time when somebody writes a shape it does not cover. A
 /// long speculative list would defeat the point, since the value of this rule is entirely in it
 /// failing on something it has not seen before.
-const ADAPTERS: [&str; 9] =
-    ["iter", "iter_mut", "into_iter", "values", "copied", "cloned", "map", "filter_map", "ok"];
+const ADAPTERS: [&str; 11] = [
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "values",
+    "copied",
+    "cloned",
+    "map",
+    "filter_map",
+    "ok",
+    "transpose",
+    "then",
+];
 
 pub(crate) fn check(root: &Path) -> Result<(), String> {
     let mut files = Vec::new();
@@ -110,7 +121,11 @@ fn check_one(name: &str, text: &str) -> (Vec<String>, Vec<String>) {
             let at = format!("{name}:{}", index + 1);
             match kind {
                 Kind::Standard => {}
-                Kind::Column if raw.contains(MARKER) || declares(&lines, index, MARKER) => {
+                // A chain this cannot read is taken at its word when somebody has said why, which
+                // is the second of the two ways out the module comment gives.
+                Kind::Column | Kind::Unknown
+                    if raw.contains(MARKER) || declares(&lines, index, MARKER) =>
+                {
                     reviewed.push(at);
                 }
                 Kind::Column => {
@@ -144,6 +159,9 @@ fn kinds(code: &str) -> Vec<Kind> {
 /// What the text in front of the dot says about which `flatten` this is.
 fn classify(before: &str) -> Kind {
     let trimmed = before.trim_end();
+    // `x.transpose()?.flatten()` is the option one on whatever the `?` unwrapped, so the call to
+    // look at is the one in front of the `?`.
+    let trimmed = trimmed.strip_suffix('?').map_or(trimmed, str::trim_end);
     if !trimmed.ends_with(')') {
         // A name, a field or an index, which is what a column is reached through. An empty receiver
         // is the definition of the method itself rather than a call of it.
@@ -200,6 +218,23 @@ mod tests {
         // The mutable half of the pair, which is how a loop walks the `Some` entries of a slice of
         // options in place. It is the one this list was missing.
         assert_eq!(classify("        for held in slots.iter_mut()"), Kind::Standard);
+    }
+
+    #[test]
+    fn a_chain_through_a_question_mark_is_judged_by_the_call_before_it() {
+        assert_eq!(classify("    let pushed = exact.map(f).transpose()?"), Kind::Standard);
+        assert_eq!(classify("    (words.next()? == name).then(|| words.next())"), Kind::Standard);
+        assert_eq!(classify("        let flat = decode(page)?"), Kind::Unknown);
+        assert_eq!(classify("        let flat = column?"), Kind::Column);
+    }
+
+    #[test]
+    fn a_marked_chain_it_cannot_read_is_taken_at_its_word() {
+        let text =
+            "fn f() {\n    // flatten: the reason.\n    let flat = decode(page)?.flatten()?;\n}\n";
+        let (problems, reviewed) = check_one("t.rs", text);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(reviewed, ["t.rs:3"]);
     }
 
     /// The case the rule is worth having. A chain ending in something nobody listed is not waved

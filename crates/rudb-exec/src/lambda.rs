@@ -178,6 +178,8 @@ impl Lambda {
         let (Some(list), initial) = (inputs.first(), inputs.get(1).copied()) else {
             return Err(Error::internal("a lambda over a list without the list"));
         };
+        // flatten: `list_parts` reads the entries and the child of a flat list, and a list argument
+        // can arrive as a constant or through a dictionary.
         let flat = list.flatten()?;
         let Some((entries, child)) = flat.list_parts() else {
             return Err(Error::internal(format!("a lambda over a {} vector", list.logical_type())));
@@ -270,6 +272,8 @@ impl Lambda {
                 return Err(Error::internal("a lambda without elements run a batch at a time"));
             }
             Kind::Filter => {
+                // row at a time: one boolean answer per element of the batch, which is at most one
+                // vector's worth, and each one decides whether that element is kept.
                 for (at, (&row, &element)) in batch.rows.iter().zip(&batch.elements).enumerate() {
                     if is_true(&answers.value_at(at)) {
                         counts[row as usize] += 1;
@@ -422,10 +426,13 @@ impl Batch {
 fn joined(ty: &LogicalType, pieces: Vec<Vector>) -> Result<Vector> {
     match pieces.len() {
         0 => Vector::from_values(ty.clone(), &[]),
-        1 => pieces
-            .into_iter()
-            .next()
-            .map_or_else(|| Vector::from_values(ty.clone(), &[]), |one| one.flatten()),
+        1 => match pieces.into_iter().next() {
+            // flatten: the answers become the child of the list being built, and one batch gives
+            // back the same flat form the concatenation below gives several, so the child does not
+            // depend on how many batches the elements took.
+            Some(one) => one.flatten(),
+            None => Vector::from_values(ty.clone(), &[]),
+        },
         _ => {
             if let Some(joined) = rudb_vector::concat(ty, &pieces)? {
                 return Ok(joined);
