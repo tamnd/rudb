@@ -349,6 +349,14 @@ pub(crate) struct Scan<'a> {
     spread: OnceLock<Spread>,
     skipped: AtomicUsize,
     /// Whether the runtime filter has been earning the hash it costs.
+    /// The projected string columns the pushed filter does not read, by their place in the
+    /// projection, which are read after the filters have run and only for the rows they kept. See
+    /// [`Self::read_deferring`].
+    deferred: Vec<usize>,
+    /// What the filters kept of the parts read that way, which stops the deferring once they are
+    /// measured keeping most rows, since then the string columns are read nearly whole anyway and
+    /// the second read is a cost with nothing to show for it.
+    deferring: Paying,
     paying: Paying,
     /// What the pushed filter keeps, which decides whether a Bloom filter runs ahead of it.
     passed: Paying,
@@ -756,6 +764,18 @@ impl<'a> Scan<'a> {
                 next.saturating_add(i64::try_from(table.rows().chunk_len(at)?).unwrap_or(i64::MAX));
         }
         let stripes = table.rows().stripe_parts();
+        let mut read = vec![false; columns.len()];
+        if let Some(pushdown) = &pushdown {
+            crate::join::columns(plan, pushdown.predicate, &mut |binding| {
+                if let Some(at) = schema.position_of(binding) {
+                    read[at] = true;
+                }
+            });
+        }
+        let types = schema.types();
+        let deferred = (0..columns.len())
+            .filter(|&at| columns[at].is_some() && !read[at] && types[at] == LogicalType::Varchar)
+            .collect();
         let pushed = pushdown
             .map(|pushdown| Pushed::new(plan, &schema, &columns, pushdown, seams, session))
             .transpose()?;
@@ -777,6 +797,8 @@ impl<'a> Scan<'a> {
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
             counters: None,
+            deferred,
+            deferring: Paying::default(),
             paying: Paying::default(),
             passed: Paying::default(),
         })
@@ -916,6 +938,95 @@ impl<'a> Scan<'a> {
         let columns = if late.input == 0 { vec![first, second] } else { vec![second, first] };
         *out = Chunk::with_rows(columns, selected.len())?;
         self.apply(at, out)?;
+        Ok(true)
+    }
+
+    /// Reads the string columns nothing filters on only for the rows the filters keep.
+    ///
+    /// The other columns are read first, with a null in place of each string column the pushed
+    /// filter and the joins' filters do not read and a row number on the end, and the filters run
+    /// over that as they would over the whole part. The row numbers that come through are the rows
+    /// kept, and the string columns are then read at those rows alone, which for a compressed page
+    /// decompresses nothing else. In TPC-H q10 the join to orders keeps a quarter of the customer
+    /// scan, and decompressing the name, address, phone and comment of the other three quarters
+    /// was a fifth of the query.
+    ///
+    /// Only for a scan that has a filter of some kind, since without one every row is kept, and only
+    /// while the filters are measured dropping a quarter of the rows or more. In q01 the date filter
+    /// keeps nearly all of lineitem and reading the two flags a second time cost 7 percent. A graph
+    /// reduction names rows by where they were read and a late LIKE has its own path, so those do
+    /// not come here.
+    fn read_deferring(&self, at: usize, out: &mut Chunk) -> Result<bool> {
+        if self.deferred.is_empty() || !self.deferring.worth() || self.reduced(at).is_some() {
+            return Ok(false);
+        }
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        let mut keys = Vec::new();
+        for sideways in joins {
+            keys.extend(sideways.domain(self.index).map(|(key, _)| key));
+            keys.extend(sideways.sifting(self.index).map(|(key, _)| key));
+        }
+        if self.pushed.is_none() && keys.is_empty() {
+            return Ok(false);
+        }
+        let deferred: Vec<usize> =
+            self.deferred.iter().copied().filter(|at| !keys.contains(at)).collect();
+        let first: Vec<usize> = (0..self.columns.len())
+            .filter(|at| !deferred.contains(at))
+            .filter_map(|at| self.columns[at])
+            .collect();
+        if deferred.is_empty() || first.is_empty() {
+            return Ok(false);
+        }
+        let read = self.table.rows().read(at, &first)?;
+        let len = read.len();
+        let types = self.schema.types();
+        let mut held = Vec::with_capacity(self.columns.len() + 1);
+        let mut real = 0;
+        for (place, column) in self.columns.iter().enumerate() {
+            if deferred.contains(&place) {
+                held.push(Vector::constant(types[place].clone(), Value::Null, len));
+            } else if column.is_some() {
+                held.push(read.column(real)?.clone());
+                real += 1;
+            } else {
+                held.push(Vector::sequence(self.offsets[at], 1, len));
+            }
+        }
+        held.push(Vector::sequence(0, 1, len));
+        *out = Chunk::with_rows(held, len)?;
+        self.narrow_read(at, out)?;
+        let kept = out.len();
+        self.deferring.saw(len, kept);
+        let mut columns = std::mem::replace(out, Chunk::empty(&[])).into_columns();
+        let numbers =
+            columns.pop().ok_or_else(|| Error::internal("the row numbers went missing"))?;
+        if kept > 0 {
+            // A part every row of which was kept is read whole, which is the plain read with nothing
+            // to gather afterwards.
+            let wanted: Vec<usize> = deferred.iter().filter_map(|&at| self.columns[at]).collect();
+            let fetched = if kept == len {
+                self.table.rows().read(at, &wanted)?
+            } else {
+                let mut block = Vec::new();
+                if !numbers.signed_block(&mut block) || block.len() < kept {
+                    block = (0..kept)
+                        .map(|row| numbers.signed_at(row).and_then(|at| i64::try_from(at).ok()))
+                        .collect::<Option<Vec<i64>>>()
+                        .ok_or_else(|| Error::internal("a row number is not a row"))?;
+                }
+                let positions = block[..kept]
+                    .iter()
+                    .map(|&number| u32::try_from(number))
+                    .collect::<std::result::Result<Vec<u32>, _>>()
+                    .map_err(|_| Error::internal("a row number is not a row"))?;
+                self.table.rows().read_rows(at, &wanted, &positions)?
+            };
+            for (from, &place) in deferred.iter().enumerate() {
+                columns[place] = fetched.column(from)?.clone();
+            }
+        }
+        *out = Chunk::with_rows(columns, kept)?;
         Ok(true)
     }
 
@@ -1360,7 +1471,7 @@ impl Source for Scan<'_> {
         if let Some(counters) = &self.counters {
             counters.part_read();
         }
-        if self.read_late(at, out)? {
+        if self.read_late(at, out)? || self.read_deferring(at, out)? {
             return Ok(more(morsel));
         }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();
@@ -3296,6 +3407,8 @@ mod tests {
             spread: OnceLock::new(),
             skipped: AtomicUsize::new(0),
             counters: None,
+            deferred: Vec::new(),
+            deferring: Paying::default(),
             paying: Paying::default(),
             passed: Paying::default(),
         }

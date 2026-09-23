@@ -6094,7 +6094,7 @@ impl Reader {
     ///
     /// If a part, column, page, or checksum is invalid.
     pub fn read(&self, part: usize, columns: &[usize]) -> Result<Chunk> {
-        self.read_impl(part, columns, true)
+        self.read_impl(part, columns, true, None)
     }
 
     /// Reads named columns from one part without keeping the stripe page it came out of.
@@ -6107,7 +6107,29 @@ impl Reader {
     ///
     /// If a part, column, page, or checksum is invalid.
     pub fn read_sparse(&self, part: usize, columns: &[usize]) -> Result<Chunk> {
-        self.read_impl(part, columns, false)
+        self.read_impl(part, columns, false, None)
+    }
+
+    /// Reads named columns from one part, only at the rows `positions` names.
+    ///
+    /// For a scan that already knows which rows of the part it keeps, from the columns it read
+    /// first. A compressed string page decompresses only those rows, and every other page is
+    /// decoded whole and gathered, which is what reading it and narrowing it costs anyway. With
+    /// `whole` the stripe's pages are kept the way [`Self::read`] keeps them, and without it they
+    /// are not, the way [`Self::read_sparse`] does.
+    ///
+    /// # Errors
+    ///
+    /// If a part, column, page, or checksum is invalid, or the positions do not rise or run past
+    /// the end of the part.
+    pub fn read_rows(
+        &self,
+        part: usize,
+        columns: &[usize],
+        positions: &[u32],
+        whole: bool,
+    ) -> Result<Chunk> {
+        self.read_impl(part, columns, whole, Some(positions))
     }
 
     /// Whether an exact global-code membership index proves that the stripe holding a part cannot
@@ -6256,7 +6278,13 @@ impl Reader {
         Ok(CachedColumn { stripe: at, index, page })
     }
 
-    fn read_impl(&self, at: usize, columns: &[usize], whole: bool) -> Result<Chunk> {
+    fn read_impl(
+        &self,
+        at: usize,
+        columns: &[usize],
+        whole: bool,
+        positions: Option<&[u32]>,
+    ) -> Result<Chunk> {
         let place = *self.places.get(at).ok_or_else(|| invalid("part index out of range"))?;
         let index = place.stripe as usize;
         let stripe =
@@ -6307,9 +6335,13 @@ impl Reader {
             // projection of a bare column name does the same, and a cut of a flat run copies unless
             // the run is a page. One `Arc` per column per part buys all of those, and it moves the
             // run into the `Arc` without touching a value.
-            picked.push(decode(&field.ty, rows, bytes, dictionary)?.into_pages());
+            let vector = match positions {
+                None => decode(&field.ty, rows, bytes, dictionary)?,
+                Some(positions) => decode_at(&field.ty, rows, bytes, dictionary, positions)?,
+            };
+            picked.push(vector.into_pages());
         }
-        Chunk::with_rows(picked, rows)
+        Chunk::with_rows(picked, positions.map_or(rows, <[u32]>::len))
     }
 
     /// Whether persisted statistics prove that a part cannot match the predicates.
@@ -10662,6 +10694,54 @@ fn decode_selected_stable_codes(
     Ok(true)
 }
 
+/// [`decode`] of only the rows at `positions`, which rise.
+///
+/// A compressed text page decompresses only those rows, see [`string::decode_flat_at`], and checks
+/// only those rows are text. Every other page is decoded whole and gathered, since its values are
+/// fixed width or its strings are shared through a dictionary, and there picking comes after.
+fn decode_at(
+    ty: &LogicalType,
+    rows: usize,
+    bytes: &[u8],
+    global: Option<Arc<Vector>>,
+    positions: &[u32],
+) -> Result<Vector> {
+    if positions.last().is_some_and(|&last| last as usize >= rows) {
+        return Err(invalid("a position is past the end of the part"));
+    }
+    if bytes.first() != Some(&6) {
+        return decode(ty, rows, bytes, global)?.gather(positions);
+    }
+    if ty != &LogicalType::Varchar {
+        return Err(invalid("compressed text codec belongs to a non-string page"));
+    }
+    let mut cur = Cursor::new(bytes);
+    cur.u8()?;
+    let validity = match cur.u8()? {
+        0 => Validity::AllValid,
+        1 => Validity::AllInvalid,
+        2 => {
+            let mask = cur.take(rows.div_ceil(8))?;
+            Validity::from_iter(positions.len(), |at| {
+                let row = positions[at] as usize;
+                mask[row / 8] >> (row % 8) & 1 == 1
+            })
+        }
+        _ => return Err(invalid("page validity tag differs")),
+    };
+    let (payload, ends) = string::decode_flat_at(&bytes[cur.at..], positions)?.into_parts();
+    let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
+    let mut start = 0;
+    for end in ends {
+        let len = end
+            .checked_sub(start)
+            .ok_or_else(|| invalid("compressed text value ends before it starts"))?;
+        values.push_in_place(start, len)?;
+        start = end;
+    }
+    Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity))
+}
+
 fn decode(
     ty: &LogicalType,
     rows: usize,
@@ -12235,6 +12315,88 @@ mod tests {
         .expect("it encodes, because encoding does not look");
         let error = decode_catalog(&bytes, HEADER + 8).expect_err("and decoding does");
         assert!(error.to_string().contains("same name"), "{error}");
+    }
+
+    /// A compressed text page read at some rows is those rows of the page read whole, nulls and
+    /// all, and a row past the end or rows out of order are refused rather than guessed at.
+    #[test]
+    fn a_compressed_text_page_read_at_some_rows_is_those_rows_of_the_whole() {
+        let rows: usize = 300;
+        let text: Vec<String> =
+            (0..rows).map(|row| format!("a street named after number {}", row * 7)).collect();
+        let values: Vec<&[u8]> = text.iter().map(String::as_bytes).collect();
+        let mut page = vec![6, 2];
+        page.extend((0..rows.div_ceil(8)).map(|byte| {
+            (0..8).filter(|bit| (byte * 8 + bit) % 5 != 3).fold(0_u8, |mask, bit| mask | 1 << bit)
+        }));
+        let compressed = string::encode_only(string::Kind::Fsst, &values)
+            .expect("encoded")
+            .expect("text this repetitive compresses");
+        page.extend_from_slice(&compressed);
+        let whole = decode(&LogicalType::Varchar, rows, &page, None).expect("the whole page");
+        let positions = [0_u32, 3, 8, 13, 200, 299];
+        let some =
+            decode_at(&LogicalType::Varchar, rows, &page, None, &positions).expect("some rows");
+        assert_eq!(some.len(), positions.len());
+        for (at, &row) in positions.iter().enumerate() {
+            assert_eq!(some.value_at(at), whole.value_at(row as usize), "row {row}");
+        }
+        assert_eq!(some.value_at(1), Value::Null, "row 3 is null");
+        assert!(decode_at(&LogicalType::Varchar, rows, &page, None, &[300]).is_err());
+        assert!(decode_at(&LogicalType::Varchar, rows, &page, None, &[8, 3]).is_err());
+    }
+
+    /// Every column of a part read at some rows is the part read whole and gathered, whatever the
+    /// page holds.
+    #[test]
+    fn a_part_read_at_some_rows_is_the_part_read_whole_and_gathered() {
+        let path = path("rows");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        let rows = 2_000;
+        let chunk = Chunk::new(vec![
+            Vector::from_values(
+                LogicalType::Integer,
+                &(0..rows).map(Value::Integer).collect::<Vec<_>>(),
+            )
+            .expect("integers"),
+            Vector::from_values(
+                LogicalType::Varchar,
+                &(0..rows)
+                    .map(|row| {
+                        if row % 7 == 2 {
+                            Value::Null
+                        } else {
+                            Value::Varchar(format!("a comment about order {}", row * 13))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("strings"),
+        ])
+        .expect("matching rows");
+        writer.append(&chunk).expect("one part");
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let positions = [1_u32, 2, 9, 1_000, 1_999];
+        for whole in [true, false] {
+            let some = reader.read_rows(0, &[0, 1], &positions, whole).expect("some rows");
+            let all = reader.read(0, &[0, 1]).expect("the whole part");
+            assert_eq!(some.len(), positions.len());
+            for column in 0..2 {
+                for (at, &row) in positions.iter().enumerate() {
+                    assert_eq!(some.value_at(at, column), all.value_at(row as usize, column));
+                }
+            }
+        }
+        assert!(reader.read_rows(0, &[1], &[2_000], true).is_err());
     }
 
     #[test]

@@ -285,6 +285,60 @@ pub fn decode_flat(bytes: &[u8]) -> Result<Flat> {
     Ok(flat)
 }
 
+/// Decodes only the values at `positions` of a chunk written by [`encode`], in that order.
+///
+/// A compressed chunk keeps every run's length, so the runs that are not wanted are stepped over
+/// by adding their lengths and never decompressed. That is what a scan wants when a join has
+/// already said which rows it keeps: in TPC-H q10 the customer scan keeps a quarter of its rows,
+/// and decompressing the other three quarters of four string columns was most of what it did. The
+/// other shapes are decoded whole and picked from, which costs what reading them always did.
+///
+/// # Errors
+///
+/// As [`decode`], and if the positions do not rise or one is past the end of the chunk.
+pub fn decode_flat_at(bytes: &[u8], positions: &[u32]) -> Result<Flat> {
+    if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::internal("the positions to decode do not rise"));
+    }
+    let mut reader = Reader::new(bytes);
+    let flat = if bytes.first() == Some(&Kind::Fsst.tag()) {
+        reader.u8()?;
+        let count = reader.u32()? as usize;
+        let runs = read_compressed(&mut reader, count)?;
+        let mut flat = Flat::with_capacity(positions.len(), runs.payload.len());
+        let mut at = 0;
+        let mut next = 0;
+        for &position in positions {
+            let position = position as usize;
+            if position >= count {
+                return Err(Error::internal(format!("value {position} is not in the chunk")));
+            }
+            at += runs.lengths[next..position].iter().sum::<usize>();
+            runs.run_into(position, &mut at, &mut flat.bytes)?;
+            flat.ends.push(flat.bytes.len());
+            next = position + 1;
+        }
+        flat
+    } else {
+        let whole = decode_chunk(&mut reader)?;
+        let mut flat = Flat::with_capacity(positions.len(), 0);
+        for &position in positions {
+            let value = whole
+                .get(position as usize)
+                .ok_or_else(|| Error::internal(format!("value {position} is not in the chunk")))?;
+            flat.push(value);
+        }
+        flat
+    };
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a string chunk",
+            reader.remaining()
+        )));
+    }
+    Ok(flat)
+}
+
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
 ///
 /// A column group holds one of these per column, and the decoder on that side cannot know where
@@ -1190,6 +1244,28 @@ mod tests {
                 format!("http://{host}{path}?session={}&ref=google", index * 7).into_bytes()
             })
             .collect()
+    }
+
+    /// Only the values asked for come back, in order, from a compressed chunk that steps over the
+    /// rest and from every other shape, which is decoded whole and picked from.
+    #[test]
+    fn the_values_at_some_positions_are_the_ones_a_whole_decode_has_there() {
+        let values = urls(1000);
+        let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let positions = [0_u32, 3, 4, 500, 998, 999];
+        let wanted: Vec<Vec<u8>> =
+            positions.iter().map(|&at| values[at as usize].clone()).collect();
+        for kind in offered(&refs) {
+            let Some(encoded) = encode_only(kind, &refs).expect("encoded") else { continue };
+            let flat = decode_flat_at(&encoded, &positions).expect("decoded");
+            assert_eq!(flat.into_values(), wanted, "{kind:?}");
+            let none = decode_flat_at(&encoded, &[]).expect("decoded");
+            assert!(none.is_empty(), "{kind:?}");
+            assert!(decode_flat_at(&encoded, &[4, 3]).is_err(), "{kind:?}");
+            assert!(decode_flat_at(&encoded, &[1000]).is_err(), "{kind:?}");
+        }
+        let fsst = encode_only(Kind::Fsst, &refs).expect("encoded").expect("compressible");
+        assert_eq!(decode_flat_at(&fsst, &positions).expect("decoded").into_values(), wanted);
     }
 
     fn front_lz() -> Settled {
