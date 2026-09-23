@@ -1791,6 +1791,149 @@ fn appending_to_a_list_is_concatenating_a_list_of_one() {
     );
 }
 
+/// `list_transform` and `list_filter` run a lambda over every element. Per #467.
+///
+/// Every answer here is the pin's, headings included, since a heading is where the lambda is
+/// written back out and the parameter keeps the case it was written in.
+#[test]
+fn a_lambda_runs_over_every_element() {
+    let db = database();
+    let one = |sql: &str| rows(&db, sql);
+    let bigints = |values: &[i64]| Value::List {
+        element: LogicalType::BigInt,
+        values: values.iter().map(|&v| Value::BigInt(v)).collect(),
+    };
+    assert_eq!(
+        one("SELECT list_transform([1, 2, 3], lambda x: x + 1)"),
+        vec![vec![list(&[2, 3, 4])]]
+    );
+    assert_eq!(
+        db.query("SELECT list_transform([1, 2, 3], lambda x: x + 1)").unwrap().names(),
+        ["list_transform(list_value(1, 2, 3), (lambda x: (x + 1)))"]
+    );
+    assert_eq!(
+        db.query("SELECT list_transform([1, 2], lambda X: x + 1)").unwrap().names(),
+        ["list_transform(list_value(1, 2), (lambda X: (x + 1)))"]
+    );
+    // The second parameter is the position, counting from one, and it is a `BIGINT`.
+    assert_eq!(
+        one("SELECT list_transform([1, 2, 3], lambda x, i: x * i)"),
+        vec![vec![bigints(&[1, 4, 9])]]
+    );
+    assert_eq!(one("SELECT list_filter([1, 2, 3, 4], lambda x: x % 2)"), vec![vec![list(&[1, 3])]]);
+    assert_eq!(one("SELECT list_filter([1, 2, NULL], lambda x: NULL)"), vec![vec![list(&[])]]);
+    assert_eq!(
+        one("SELECT apply([1, 2], lambda x: x::VARCHAR)"),
+        vec![vec![Value::List {
+            element: LogicalType::Varchar,
+            values: vec![text("1"), text("2")]
+        }]]
+    );
+    assert_eq!(
+        one("SELECT typeof(list_transform([1, 2], lambda x: x::DOUBLE))"),
+        vec![vec![text("DOUBLE[]")]]
+    );
+    assert_eq!(one("SELECT list_transform(NULL, lambda x: x)"), vec![vec![Value::Null]]);
+    assert_eq!(
+        one("SELECT typeof(list_transform(NULL, lambda x: x))"),
+        vec![vec![text("\"NULL\"")]]
+    );
+    assert_eq!(one("SELECT list_transform([], lambda x: x + 1)"), vec![vec![list(&[])]]);
+    // A lambda inside a lambda, over the inner list and over the outer parameter.
+    assert_eq!(
+        one("SELECT list_transform([[1, 2], [3]], lambda x: list_transform(x, lambda y: y * 10))"),
+        vec![vec![Value::List {
+            element: LogicalType::list(LogicalType::Integer),
+            values: vec![list(&[10, 20]), list(&[30])],
+        }]]
+    );
+    assert_eq!(
+        one("SELECT list_transform([1, 2], lambda x: list_transform([10, 20], lambda y: x + y))"),
+        vec![vec![Value::List {
+            element: LogicalType::list(LogicalType::Integer),
+            values: vec![list(&[11, 21]), list(&[12, 22])],
+        }]]
+    );
+    // A list longer than a chunk goes through the body in pieces, and the position carries on
+    // counting across the break.
+    let long: Vec<String> = (1..=3000).map(|n| n.to_string()).collect();
+    assert_eq!(
+        one(&format!("SELECT list_transform([{}], lambda x, i: i)[2999:3000]", long.join(", "))),
+        vec![vec![bigints(&[2999, 3000])]]
+    );
+    assert_eq!(
+        one(&format!("SELECT list_filter([{}], lambda x: x > 2998)", long.join(", "))),
+        vec![vec![list(&[2999, 3000])]]
+    );
+}
+
+/// A lambda's body sees the row it is in, and an aggregate in it is over the rows. Per #467.
+#[test]
+fn a_lambda_reads_the_columns_of_its_row() {
+    let db = database();
+    db.execute("CREATE TABLE lt (l INTEGER[], k INTEGER)").unwrap();
+    db.execute("INSERT INTO lt VALUES ([1, 2], 10), (NULL, 20), ([], 30), ([3], 40)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT list_transform(l, lambda x: x + k) FROM lt"),
+        vec![vec![list(&[11, 12])], vec![Value::Null], vec![list(&[])], vec![list(&[43])]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT list_filter(l, lambda x, i: i > 1) FROM lt"),
+        vec![vec![list(&[2])], vec![Value::Null], vec![list(&[])], vec![list(&[])]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT list_transform([1, 2], lambda x: x + sum(k)) FROM lt"),
+        vec![vec![Value::List {
+            element: LogicalType::HugeInt,
+            values: vec![Value::HugeInt(101), Value::HugeInt(102)],
+        }]]
+    );
+}
+
+/// What the pin refuses about a lambda, in its words. Per #467.
+#[test]
+fn a_lambda_is_refused_the_way_the_pin_refuses_it() {
+    let db = database();
+    assert_eq!(
+        failure(&db, "SELECT list_transform([1, 0], lambda x: 10 // (x - 1))"),
+        "Division by zero in expression (10 // (x - 1)). Use TRY(...) to return NULL for this \
+         expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero."
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_transform([1], lambda x, y, z: x)"),
+        "This lambda function only supports up to two lambda parameters!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_transform([1], lambda x, x: x)"),
+        "table \"0_macro_parameters(x, x)\" has duplicate column name \"x\""
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_transform(1, lambda x: x)"),
+        "Invalid LIST argument during lambda function binding!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_transform([1])"),
+        "No function matches the given name and argument types 'list_transform(INTEGER[])'. You \
+         might need to add explicit type casts.\n\tCandidate functions:\n\tlist_transform(col0 \
+         ANY[], col1 LAMBDA) -> ANY[]\n"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_transform([1], x -> x)"),
+        "Deprecated lambda arrow (->) detected. Please transition to the new lambda syntax, i.e.., \
+         lambda x, i: x + i, before DuckDB's next release.\nUse SET \
+         lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.\nFor more \
+         information, see https://duckdb.org/docs/current/sql/functions/lambda.html."
+    );
+    assert_eq!(
+        failure(&db, "SELECT abs(lambda x: x)"),
+        "This scalar function does not support lambdas!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT list_transform([1], lambda x: (SELECT 1))"),
+        "subqueries in lambda expressions are not supported"
+    );
+}
+
 /// What the struct vector changes that a query can see today. Per #594.
 ///
 /// One line, and that is the honest size of it. A struct vector exists now, so a query that has to put

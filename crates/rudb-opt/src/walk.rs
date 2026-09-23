@@ -279,7 +279,15 @@ pub(crate) fn rebuild(
     let ty = plan.expr_type(expr).clone();
     let span = plan.expr_span(expr);
     match *plan.expr(expr) {
-        Expr::Column(_) | Expr::Constant(_) => expr,
+        Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => expr,
+        Expr::Lambda { table, params, body } => {
+            let rewritten = child(plan, body);
+            if rewritten == body {
+                expr
+            } else {
+                plan.add_expr_at(Expr::Lambda { table, params, body: rewritten }, ty, span)
+            }
+        }
         Expr::Cast { input, try_cast } => {
             let rewritten = child(plan, input);
             if rewritten == input {
@@ -439,8 +447,8 @@ pub(crate) fn node_columns(
 /// and a pass that writes it down twice has turned one call into two.
 pub(crate) fn volatile(plan: &Plan, expr: ExprRef) -> bool {
     match *plan.expr(expr) {
-        Expr::Column(_) | Expr::Constant(_) => false,
-        Expr::Cast { input, .. } => volatile(plan, input),
+        Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => false,
+        Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => volatile(plan, input),
         Expr::Compare { left, right, .. } => volatile(plan, left) || volatile(plan, right),
         Expr::Conjunction { children, .. } => any_volatile(plan, children),
         Expr::Function { name, args } => {
@@ -488,9 +496,9 @@ fn any_volatile(plan: &Plan, slice: Slice) -> bool {
 /// [`Node::Aggregate`]: rudb_plan::Node::Aggregate
 pub(crate) fn elementwise(plan: &Plan, expr: ExprRef) -> bool {
     match *plan.expr(expr) {
-        Expr::Column(_) | Expr::Constant(_) => true,
+        Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => true,
         Expr::Aggregate { .. } | Expr::Window { .. } => false,
-        Expr::Cast { input, .. } => elementwise(plan, input),
+        Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => elementwise(plan, input),
         Expr::Compare { left, right, .. } => elementwise(plan, left) && elementwise(plan, right),
         Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
             all_elementwise(plan, children)
@@ -523,6 +531,9 @@ pub(crate) fn constant(plan: &Plan, expr: ExprRef) -> bool {
     match *plan.expr(expr) {
         Expr::Constant(_) => true,
         Expr::Column(_) | Expr::Aggregate { .. } | Expr::Window { .. } => false,
+        // A parameter is a value per element, and a lambda is not a value at all. Saying neither is
+        // constant keeps a pass from folding one out of the call that gives it a meaning.
+        Expr::Lambda { .. } | Expr::LambdaParam(_) => false,
         Expr::Cast { input, .. } => constant(plan, input),
         Expr::Compare { left, right, .. } => constant(plan, left) && constant(plan, right),
         Expr::Conjunction { children, .. } => all_constant(plan, children),

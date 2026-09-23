@@ -64,7 +64,21 @@ impl Binder<'_> {
     }
 
     fn bind_expr_inner(&mut self, ast: &Ast, expr: ast::ExprRef, scope: &Scope) -> Result<ExprRef> {
-        match ast.expr(expr) {
+        let written = ast.expr(expr);
+        // A lambda's body runs once per element and not once per row, and a query inside it would
+        // have to be joined in per element, which the pin does not do either. Its sentence.
+        if self.in_lambda()
+            && matches!(
+                written,
+                ast::Expr::Subquery { .. }
+                    | ast::Expr::Exists { .. }
+                    | ast::Expr::InSubquery { .. }
+                    | ast::Expr::QuantifiedSubquery { .. }
+            )
+        {
+            return Err(Error::binder("subqueries in lambda expressions are not supported"));
+        }
+        match written {
             ast::Expr::Star { .. } => {
                 Err(Error::binder(format!("* is not allowed in the {}", self.clause)))
             }
@@ -112,6 +126,9 @@ impl Binder<'_> {
             ast::Expr::Row { .. } => {
                 Err(Error::not_implemented("a row value outside of a VALUES clause".to_string()))
             }
+            // A lambda that got here is not the argument of a function that takes one, since that
+            // function binds it itself. See `crate::lambda`.
+            ast::Expr::Lambda { .. } => Err(Error::binder("invalid lambda expression")),
             ast::Expr::List { items } => self.bind_list(ast, items, scope),
             ast::Expr::Parameter { name } => self.bind_parameter(ast, name),
             ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query, scope),
@@ -263,6 +280,13 @@ impl Binder<'_> {
 
     fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {
         let parts: Vec<&str> = ast.name(name).collect();
+        // A lambda parameter beats a column of the same name, so `lambda l: l + 1` over a table with
+        // a column `l` reads the element. The innermost lambda that has the name is the one meant.
+        if let [word] = parts.as_slice() {
+            if let Some(parameter) = self.lambda_parameter(word) {
+                return Ok(parameter);
+            }
+        }
         // A bare `current_date` is one of the ten session context keywords, and a column of that
         // name beats it. The scope is asked whether anything answers to the word before the fold
         // rather than the fold happening when resolution fails, so that two tables carrying the name
@@ -534,6 +558,17 @@ impl Binder<'_> {
                 "Function \"{written}\" is a Scalar Function. \"DISTINCT\", \"FILTER\", and \
                  \"ORDER BY\" are only applicable to window and aggregate functions."
             )));
+        }
+        if let Some(recorded) = crate::lambda::lambda_function(&written) {
+            return self.bind_lambda_call(ast, recorded, &arguments, scope);
+        }
+        if arguments.iter().any(|&arg| matches!(ast.expr(arg), ast::Expr::Lambda { .. })) {
+            // A name nobody has gets the catalog's answer, which is about the name and not about
+            // what was passed to it.
+            if kind_of(&written).is_none() {
+                self.call(&written, Vec::new())?;
+            }
+            return Err(Error::binder("This scalar function does not support lambdas!"));
         }
         let mut bound = Vec::with_capacity(arguments.len());
         for arg in arguments {
@@ -1083,6 +1118,7 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
         }
         ast::Expr::InSubquery { operand, .. } => has_aggregate(ast, operand),
         ast::Expr::QuantifiedSubquery { operand, .. } => has_aggregate(ast, operand),
+        ast::Expr::Lambda { body, .. } => has_aggregate(ast, body),
         ast::Expr::Row { items } => {
             ast.expr_list(items).iter().any(|&item| has_aggregate(ast, item))
         }
@@ -1324,6 +1360,12 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 rudb_parse::deparse::query(ast, query)
             );
             if all { format!("(NOT {any})") } else { any }
+        }
+        // The parameters keep the case they were written in, which is what the pin prints even though
+        // the body finds them without it.
+        ast::Expr::Lambda { params, body } => {
+            let params: Vec<String> = ast.name(params).map(quoted).collect();
+            format!("(lambda {}: {})", params.join(", "), describe(ast, body, semantics))
         }
         // `row` is a keyword and a function of that name, so DuckDB quotes it in the name to say
         // which of the two it means.

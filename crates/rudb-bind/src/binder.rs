@@ -277,6 +277,8 @@ pub(crate) struct Binder<'a> {
     /// `outer_scopes`.
     pub(crate) lateral_scopes: Vec<usize>,
     pub(crate) correlations: Vec<Vec<ColumnBinding>>,
+    /// The lambdas whose bodies are being bound, innermost last. See `crate::lambda`.
+    pub(crate) lambda_frames: Vec<crate::lambda::Frame>,
     /// Where we are, for an error message that says which clause the writer should look at.
     pub(crate) clause: &'static str,
     /// The views whose bodies are open on the stack, which is what catches a cycle.
@@ -317,6 +319,7 @@ impl<'a> Binder<'a> {
             outer_scopes: Vec::new(),
             lateral_scopes: Vec::new(),
             correlations: Vec::new(),
+            lambda_frames: Vec::new(),
             clause: "SELECT clause",
             expanding: Vec::new(),
             materialized: Vec::new(),
@@ -2795,7 +2798,25 @@ impl<'a> Binder<'a> {
     }
 
     /// Binds an aggregate call, records it, and hands back a reference to where its result lands.
+    ///
+    /// An aggregate inside a lambda's body is computed over the rows and not over the elements,
+    /// so its arguments cannot see the lambda's parameters. See `crate::lambda`.
     pub(crate) fn bind_aggregate(
+        &mut self,
+        ast: &Ast,
+        name: &str,
+        args: &[ast::ExprRef],
+        distinct: bool,
+        filter: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let frames = std::mem::take(&mut self.lambda_frames);
+        let bound = self.bind_aggregate_over_rows(ast, name, args, distinct, filter, scope);
+        self.lambda_frames = frames;
+        bound
+    }
+
+    fn bind_aggregate_over_rows(
         &mut self,
         ast: &Ast,
         name: &str,
@@ -2882,7 +2903,22 @@ impl<'a> Binder<'a> {
     /// The result is a column of a [`Node::Window`] rather than the call itself, for the reason the
     /// aggregate path returns a column too: the operator produces the value and everything above it
     /// reads the value, so a target that wraps a window in arithmetic is arithmetic over a column.
+    ///
+    /// A window inside a lambda's body is computed over the rows for the reason an aggregate is,
+    /// so it cannot see the lambda's parameters either.
     pub(crate) fn bind_window(
+        &mut self,
+        ast: &Ast,
+        written: &WindowCall<'_>,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let frames = std::mem::take(&mut self.lambda_frames);
+        let bound = self.bind_window_over_rows(ast, written, scope);
+        self.lambda_frames = frames;
+        bound
+    }
+
+    fn bind_window_over_rows(
         &mut self,
         ast: &Ast,
         written: &WindowCall<'_>,
@@ -3225,7 +3261,17 @@ impl<'a> Binder<'a> {
                     "column {name} must appear in the GROUP BY clause or must be part of an aggregate function"
                 )))
             }
-            Expr::Constant(_) | Expr::Aggregate { .. } | Expr::Window { .. } => Ok(expr),
+            Expr::Constant(_)
+            | Expr::Aggregate { .. }
+            | Expr::Window { .. }
+            | Expr::LambdaParam(_) => Ok(expr),
+            // The body is over the elements and the columns it captures, and a captured column is
+            // held to the grouping rule like any other, which is the pin's error for
+            // `list_transform(l, lambda x: x * k) ... GROUP BY l`.
+            Expr::Lambda { table, params, body } => {
+                let body = self.over_aggregate(body, scope)?;
+                Ok(self.plan.add_expr(Expr::Lambda { table, params, body }, ty))
+            }
             Expr::Cast { input, try_cast } => {
                 let input = self.over_aggregate(input, scope)?;
                 Ok(self.plan.add_expr(Expr::Cast { input, try_cast }, ty))

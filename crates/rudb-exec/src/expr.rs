@@ -60,6 +60,18 @@ pub(crate) fn evaluate_in_time_zone(
             })?;
             Ok(chunk.column(position)?.clone())
         }
+        Expr::LambdaParam(binding) => {
+            let position = schema.position_of(binding).ok_or_else(|| {
+                Error::internal(format!(
+                    "lambda parameter @{}.{} is not in the schema its body was given",
+                    binding.table, binding.column
+                ))
+            })?;
+            Ok(chunk.column(position)?.clone())
+        }
+        Expr::Lambda { .. } => {
+            Err(Error::internal("a lambda was evaluated outside the function that takes it"))
+        }
         Expr::Constant(reference) => {
             Ok(Vector::constant(ty, plan.value(reference).clone(), chunk.len()))
         }
@@ -83,6 +95,19 @@ pub(crate) fn evaluate_in_time_zone(
             combine(connective(op), &children)
         }
         Expr::Function { name, args } => {
+            if let Some((list, lambda)) = crate::lambda::lambda_call(plan, args) {
+                let runner =
+                    crate::lambda::Lambda::new(plan, plan.string(name), list, lambda, schema)?;
+                let Expr::Lambda { body, .. } = *plan.expr(lambda) else {
+                    return Err(Error::internal("a lambda call without a lambda"));
+                };
+                let list = evaluate_in_time_zone(plan, list, schema, chunk, time_zone)?;
+                return runner
+                    .run(&list, chunk, &mut |inner| {
+                        evaluate_in_time_zone(plan, body, runner.schema(), inner, time_zone)
+                    })
+                    .map_err(|error| error.with_fallback_span(plan.expr_span(expr)));
+            }
             let args =
                 evaluate_all_in_time_zone(plan, plan.expr_list(args), schema, chunk, time_zone)?;
             // The renderer runs only if a kernel asks for it, which is only on the row that divides

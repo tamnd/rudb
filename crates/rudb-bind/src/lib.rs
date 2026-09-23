@@ -22,6 +22,7 @@ mod binder;
 mod context;
 mod expr;
 pub mod fold;
+mod lambda;
 mod parameters;
 mod scope;
 mod statement;
