@@ -184,47 +184,6 @@ fn native_simple_three_statement(sql: &str) -> Option<(&str, &str, &str)> {
     .then_some((table, sum_column, average_column))
 }
 
-/// Recognizes one unquoted numeric key grouped and ordered by its nonzero frequency.
-fn native_simple_frequency_statement(sql: &str) -> Option<(&str, &str)> {
-    let statement = sql.trim();
-    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
-    let mut words = statement.split_ascii_whitespace();
-    let select = words.next()?;
-    let key = words.next()?.strip_suffix(',')?;
-    let count = words.next()?;
-    let from = words.next()?;
-    let table = words.next()?;
-    let where_keyword = words.next()?;
-    let filtered = words.next()?;
-    let comparison = words.next()?;
-    let zero = words.next()?;
-    let group = words.next()?;
-    let group_by = words.next()?;
-    let grouped = words.next()?;
-    let order = words.next()?;
-    let order_by = words.next()?;
-    let order_count = words.next()?;
-    let descending = words.next()?;
-    (words.next().is_none()
-        && select.eq_ignore_ascii_case("select")
-        && count.eq_ignore_ascii_case("count(*)")
-        && from.eq_ignore_ascii_case("from")
-        && where_keyword.eq_ignore_ascii_case("where")
-        && comparison == "<>"
-        && zero == "0"
-        && group.eq_ignore_ascii_case("group")
-        && group_by.eq_ignore_ascii_case("by")
-        && order.eq_ignore_ascii_case("order")
-        && order_by.eq_ignore_ascii_case("by")
-        && order_count.eq_ignore_ascii_case("count(*)")
-        && descending.eq_ignore_ascii_case("desc")
-        && native_simple_unquoted_identifier(table)
-        && native_simple_unquoted_identifier(key)
-        && filtered.eq_ignore_ascii_case(key)
-        && grouped.eq_ignore_ascii_case(key))
-    .then_some((table, key))
-}
-
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
 /// Keep this check strict: every clause it does not understand belongs to the regular binder.
 fn native_nonzero_shape(ast: &Ast) -> Option<(&str, &str, &str)> {
@@ -325,83 +284,6 @@ fn native_column_aggregate<'a>(
     let [argument] = ast.expr_list(args) else { return None };
     let ast::Expr::Column { name } = ast.expr(*argument) else { return None };
     (name.len == 1).then(|| ast.name(name).next()).flatten()
-}
-
-fn native_count_star(ast: &Ast, expr: ast::ExprRef) -> bool {
-    use ast::Expr;
-    use rudb_parse::NONE;
-    let Expr::Function { name, args, distinct: false, filter: NONE } = ast.expr(expr) else {
-        return false;
-    };
-    if name.len != 1
-        || !ast.name(name).next().is_some_and(|name| name.eq_ignore_ascii_case("count"))
-    {
-        return false;
-    }
-    let [argument] = ast.expr_list(args) else { return false };
-    matches!(ast.expr(*argument), Expr::Star { qualifier, replacements } if qualifier.len == 0 && replacements.len == 0)
-}
-
-fn native_frequency_group_shape(ast: &Ast) -> Option<(&str, &str)> {
-    use ast::{BinaryOp, Distinct, Expr, LiteralKind, Nulls, Order, QueryBody, Source, Statement};
-    use rudb_parse::NONE;
-
-    let [Statement::Query(query_ref)] = ast.statements.as_slice() else { return None };
-    let query = ast.query(*query_ref);
-    if query.ctes.len != 0
-        || query.order_by_all
-        || query.limit != NONE
-        || query.offset != NONE
-        || query.limit_percent
-    {
-        return None;
-    }
-    let [order] = ast.order_list(query.order_by) else { return None };
-    if order.order != Order::Descending
-        || order.nulls != Nulls::Unstated
-        || !native_count_star(ast, order.expr)
-    {
-        return None;
-    }
-    let QueryBody::Select(select_ref) = query.body else { return None };
-    let select = ast.select(select_ref);
-    if select.distinct != Distinct::No || select.group_by_all || select.having != NONE {
-        return None;
-    }
-    let [key, count] = ast.target_list(select.targets) else { return None };
-    if key.alias != NONE || count.alias != NONE || !native_count_star(ast, count.expr) {
-        return None;
-    }
-    let Expr::Column { name } = ast.expr(key.expr) else { return None };
-    if name.len != 1 {
-        return None;
-    }
-    let column = ast.name(name).next()?;
-    let [group] = ast.expr_list(select.group_by) else { return None };
-    let Expr::Column { name } = ast.expr(*group) else { return None };
-    if name.len != 1 || !ast.name(name).next()?.eq_ignore_ascii_case(column) {
-        return None;
-    }
-    let Expr::Binary { op: BinaryOp::NotEq, left, right } = ast.expr(select.filter) else {
-        return None;
-    };
-    let (filter_column, zero) = match (ast.expr(left), ast.expr(right)) {
-        (Expr::Column { name }, Expr::Literal { kind: LiteralKind::Number, text }) => (name, text),
-        (Expr::Literal { kind: LiteralKind::Number, text }, Expr::Column { name }) => (name, text),
-        _ => return None,
-    };
-    if filter_column.len != 1
-        || !ast.name(filter_column).next()?.eq_ignore_ascii_case(column)
-        || ast.string(zero) != "0"
-    {
-        return None;
-    }
-    let [source] = ast.source_list(select.from) else { return None };
-    let Source::Table { name, alias: NONE, columns } = ast.source(*source) else { return None };
-    if name.len != 1 || columns.len != 0 {
-        return None;
-    }
-    Some((ast.name(name).next()?, column))
 }
 
 fn native_three_aggregate_shape(ast: &Ast) -> Option<(&str, &str, &str, [String; 3])> {
@@ -621,43 +503,6 @@ fn native_integer_value(ty: &LogicalType, value: i128) -> Option<Value> {
     })
 }
 
-fn complete_nonzero_numeric_frequencies(
-    native: &rudb_native::Catalog,
-    table: &str,
-    column: usize,
-    ty: &LogicalType,
-) -> Result<Option<Vec<(i128, i64)>>> {
-    if !matches!(
-        ty,
-        LogicalType::TinyInt
-            | LogicalType::SmallInt
-            | LogicalType::Integer
-            | LogicalType::BigInt
-            | LogicalType::UTinyInt
-            | LogicalType::USmallInt
-            | LogicalType::UInteger
-            | LogicalType::UBigInt
-    ) {
-        return Ok(None);
-    }
-    let Some(frequencies) = native.exact_numeric_frequencies(table, column)? else {
-        return Ok(None);
-    };
-    let mut groups = Vec::with_capacity(frequencies.len());
-    for (value, count) in frequencies {
-        let Some(value) = value.filter(|&value| value != 0) else { continue };
-        if native_integer_value(ty, value).is_none() {
-            return Ok(None);
-        }
-        let Ok(count) = i64::try_from(count) else { return Ok(None) };
-        groups.push((value, count));
-    }
-    groups.sort_unstable_by(|(left_value, left_count), (right_value, right_count)| {
-        right_count.cmp(left_count).then_with(|| left_value.cmp(right_value))
-    });
-    Ok(Some(groups))
-}
-
 /// An in process database.
 ///
 /// One catalog, held in memory, with no file behind it. `ATTACH` and the storage format are E2, and
@@ -855,27 +700,6 @@ impl Database {
         Ok(count.and_then(|count| i64::try_from(count).ok()))
     }
 
-    /// Returns groups for a filtered single-column count from complete native frequencies.
-    /// Other statement shapes use regular SQL execution.
-    pub fn query_native_frequency_values_once(
-        path: &str,
-        sql: &str,
-    ) -> Result<Option<Vec<(i128, i64)>>> {
-        let Some((table_name, column)) = native_simple_frequency_statement(sql) else {
-            return Ok(None);
-        };
-        let native = rudb_native::Catalog::open(path)?;
-        let Some(table) = native.names().find(|name| name.eq_ignore_ascii_case(table_name)) else {
-            return Ok(None);
-        };
-        let Some(fields) = native.table_fields(table) else { return Ok(None) };
-        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
-        else {
-            return Ok(None);
-        };
-        complete_nonzero_numeric_frequencies(&native, table, index, &fields[index].ty)
-    }
-
     /// Returns a sum, row count and average from certified native column sums.
     /// The shell can format these on its single-statement, read-only path.
     pub fn query_native_three_values_once(
@@ -1006,14 +830,12 @@ impl Database {
         let average = native_single_average_shape(&ast);
         let distinct = native_single_distinct_shape(&ast);
         let extrema = native_extrema_shape(&ast);
-        let frequencies = native_frequency_group_shape(&ast);
         let Some(table) = nonzero
             .map(|(table, _, _)| table)
             .or_else(|| three.as_ref().map(|(table, _, _, _)| *table))
             .or_else(|| average.as_ref().map(|(table, _, _)| *table))
             .or_else(|| distinct.as_ref().map(|(table, _, _)| *table))
             .or_else(|| extrema.as_ref().map(|(table, _, _)| *table))
-            .or_else(|| frequencies.as_ref().map(|(table, _)| *table))
         else {
             return Ok(None);
         };
@@ -1114,40 +936,6 @@ impl Database {
                 names.into(),
                 vec![ty.clone(), ty],
                 vec![chunk],
-                Memory::unlimited().reservation(),
-            )));
-        }
-        if let Some((_, column)) = frequencies {
-            let Some(index) =
-                fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
-            else {
-                return Ok(None);
-            };
-            let ty = fields[index].ty.clone();
-            let Some(groups) =
-                complete_nonzero_numeric_frequencies(&native, stored_name, index, &ty)?
-            else {
-                return Ok(None);
-            };
-            let mut keys = Vec::with_capacity(groups.len());
-            let mut counts = Vec::with_capacity(groups.len());
-            for (value, count) in groups {
-                let Some(value) = native_integer_value(&ty, value) else { return Ok(None) };
-                keys.push(value);
-                counts.push(Value::BigInt(count));
-            }
-            let chunks = if keys.is_empty() {
-                Vec::new()
-            } else {
-                vec![Chunk::new(vec![
-                    Vector::from_values(ty.clone(), &keys)?,
-                    Vector::from_values(LogicalType::BigInt, &counts)?,
-                ])?]
-            };
-            return Ok(Some(QueryResult::new(
-                vec![fields[index].name.clone(), "count_star()".into()],
-                vec![ty, LogicalType::BigInt],
-                chunks,
                 Memory::unlimited().reservation(),
             )));
         }
@@ -3709,94 +3497,35 @@ mod tests {
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
     use super::{
-        Database, NativeExtremaValues, native_extrema_shape, native_frequency_group_shape,
-        native_nonzero_shape, native_simple_average_statement, native_simple_distinct_statement,
-        native_simple_extrema_statement, native_simple_frequency_statement,
-        native_simple_three_statement, native_single_average_shape, native_single_distinct_shape,
-        native_three_aggregate_shape, publish,
+        Database, NativeExtremaValues, native_extrema_shape, native_nonzero_shape,
+        native_simple_average_statement, native_simple_distinct_statement,
+        native_simple_extrema_statement, native_simple_three_statement,
+        native_single_average_shape, native_single_distinct_shape, native_three_aggregate_shape,
+        publish,
     };
 
     #[test]
-    fn cold_frequency_group_shape_accepts_only_the_complete_group() {
-        let sql = "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC";
-        let parsed = rudb_parse::parse_ast(sql).unwrap();
-        assert_eq!(native_frequency_group_shape(&parsed), Some(("hits", "AdvEngineID")));
-        for sql in [
-            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 1 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
-            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY AdvEngineID DESC",
-            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC LIMIT 1",
-            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID, RegionID ORDER BY COUNT(*) DESC",
-            "SELECT AdvEngineID, COUNT(DISTINCT UserID) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
-        ] {
-            let parsed = rudb_parse::parse_ast(sql).unwrap();
-            assert_eq!(native_frequency_group_shape(&parsed), None, "{sql}");
-        }
-    }
-
-    #[test]
-    fn simple_frequency_statement_keeps_the_filter_and_group_on_the_same_column() {
-        assert_eq!(
-            native_simple_frequency_statement(
-                " SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC; "
-            ),
-            Some(("other_events", "SourceID"))
-        );
-        for sql in [
-            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 1 GROUP BY SourceID ORDER BY COUNT(*) DESC",
-            "SELECT SourceID, COUNT(*) FROM other_events WHERE OtherID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC",
-            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY OtherID ORDER BY COUNT(*) DESC",
-            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY SourceID DESC",
-            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC LIMIT 1",
-            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC; SELECT 1",
-            "SELECT select, COUNT(*) FROM other_events WHERE select <> 0 GROUP BY select ORDER BY COUNT(*) DESC",
-            "SELECT SourceID, COUNT(*) FROM from WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC",
-        ] {
-            assert_eq!(native_simple_frequency_statement(sql), None, "{sql}");
-        }
-    }
-
-    #[test]
-    fn cold_frequency_group_matches_regular_execution() {
-        let path = std::env::temp_dir().join(format!("rudb-q8-{}.rdb", std::process::id()));
+    fn grouped_counts_read_rows_instead_of_returning_a_saved_frequency_list() {
+        let path =
+            std::env::temp_dir().join(format!("rudb-grouped-rows-{}.rdb", std::process::id()));
         let name = path.to_str().unwrap();
         let database = Database::open(name).unwrap();
-        database.execute("CREATE TABLE hits (AdvEngineID SMALLINT)").unwrap();
-        database
-            .execute("INSERT INTO hits VALUES (2), (2), (2), (27), (27), (3), (0), (NULL)")
-            .unwrap();
-        database.execute("CREATE TABLE empty_hits (AdvEngineID SMALLINT)").unwrap();
-        database.execute("CREATE TABLE zero_hits (AdvEngineID SMALLINT)").unwrap();
-        database.execute("INSERT INTO zero_hits VALUES (0), (NULL)").unwrap();
-        database.execute("CREATE TABLE other_events (SourceID SMALLINT)").unwrap();
-        database.execute("INSERT INTO other_events VALUES (4), (4), (9), (0), (NULL)").unwrap();
-        let cases = [
-            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
-            "SELECT AdvEngineID, COUNT(*) FROM empty_hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
-            "SELECT AdvEngineID, COUNT(*) FROM zero_hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC",
-        ];
-        let expected = cases.map(|sql| database.query(sql).unwrap().rows().collect::<Vec<_>>());
+        database.execute("CREATE TABLE events (source_id SMALLINT)").unwrap();
+        database.execute("INSERT INTO events VALUES (2), (2), (3), (0), (NULL)").unwrap();
         drop(database);
+
+        let sql = "SELECT source_id, COUNT(*) FROM events WHERE source_id <> 0 GROUP BY source_id ORDER BY COUNT(*) DESC";
+        assert!(Database::query_native_once(name, sql).unwrap().is_none());
+        let database = Database::open(name).unwrap();
+        let rows = database.query(sql).unwrap().rows().collect::<Vec<_>>();
         assert_eq!(
-            Database::query_native_frequency_values_once(name, cases[0]).unwrap(),
-            Some(vec![(2, 3), (27, 2), (3, 1)])
+            rows,
+            vec![
+                vec![Value::SmallInt(2), Value::BigInt(2)],
+                vec![Value::SmallInt(3), Value::BigInt(1)]
+            ]
         );
-        assert_eq!(
-            Database::query_native_frequency_values_once(
-                name,
-                "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC",
-            )
-            .unwrap(),
-            Some(vec![(4, 2), (9, 1)])
-        );
-        assert_eq!(
-            Database::query_native_frequency_values_once(name, "SELECT COUNT(*) FROM hits")
-                .unwrap(),
-            None
-        );
-        for (sql, expected) in cases.into_iter().zip(expected) {
-            let actual = Database::query_native_once(name, sql).unwrap().unwrap();
-            assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
-        }
+        drop(database);
         std::fs::remove_file(path).unwrap();
     }
 

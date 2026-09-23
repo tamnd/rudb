@@ -82,7 +82,7 @@ pub(crate) fn position(morsel: &Morsel) -> usize {
     usize::try_from(morsel.cursor()).unwrap_or(usize::MAX)
 }
 
-/// A grouped count answered from a native file's certified frequency synopsis.
+/// Rows for a bounded grouped source derived while a query runs.
 #[derive(Debug)]
 pub(crate) struct Frequencies {
     chunks: Vec<Chunk>,
@@ -144,58 +144,6 @@ impl Frequencies {
                 .collect::<Result<Vec<_>>>()?;
             output.push(Vector::flat(LogicalType::BigInt, Data::Int64(counts.into()))?);
             chunks.push(Chunk::with_rows(output, entries.len())?);
-        }
-        let handout = Handout::new(chunks.len());
-        Ok(Self { chunks, handout })
-    }
-
-    /// Builds the aggregate rows which the ordinary TopN above this source will order and limit.
-    pub(crate) fn new(
-        plan: &Plan,
-        input: &Schema,
-        schema: Schema,
-        groups: Slice,
-        column: usize,
-        entries: Vec<(Value, u64)>,
-        session: &Session,
-    ) -> Result<Self> {
-        let output_types = schema.types();
-        let group_exprs = plan.expr_list(groups);
-        if output_types.len() != group_exprs.len() + 1
-            || output_types.last() != Some(&LogicalType::BigInt)
-        {
-            return Err(Error::internal("a frequency source count is not BIGINT"));
-        }
-        let input_types = input.types();
-        let key_type = input_types
-            .get(column)
-            .ok_or_else(|| Error::internal("a frequency column is outside its scan"))?;
-        let mut chunks = Vec::with_capacity(entries.len().div_ceil(VECTOR_SIZE));
-        for entries in entries.chunks(VECTOR_SIZE) {
-            let mut keys = Vec::with_capacity(entries.len());
-            let mut counts = Vec::with_capacity(entries.len());
-            for (key, count) in entries {
-                keys.push(key.clone());
-                counts.push(
-                    i64::try_from(*count)
-                        .map_err(|_| Error::internal("a stored frequency exceeds BIGINT"))?,
-                );
-            }
-            let mut columns = input_types
-                .iter()
-                .map(|ty| Vector::constant(ty.clone(), Value::Null, keys.len()))
-                .collect::<Vec<_>>();
-            columns[column] = Vector::from_values(key_type.clone(), &keys)?;
-            let input_chunk = Chunk::with_rows(columns, keys.len())?;
-            let mut output = evaluate_all_in_time_zone(
-                plan,
-                group_exprs,
-                input,
-                &input_chunk,
-                session.session_time_zone(),
-            )?;
-            output.push(Vector::flat(LogicalType::BigInt, Data::Int64(counts.into()))?);
-            chunks.push(Chunk::with_rows(output, keys.len())?);
         }
         let handout = Handout::new(chunks.len());
         Ok(Self { chunks, handout })

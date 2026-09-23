@@ -212,11 +212,7 @@ fn an_ungrouped_aggregate_over_an_empty_table_still_produces_a_row() {
     assert_eq!(rows[0], vec![Value::BigInt(0), Value::Null]);
 }
 
-/// `count(x)` and not `count(*)`, because `x` is never null here so the two count the same rows and
-/// only one of them makes the aggregate do the work. A lone `count(*)` over a grouping column is read
-/// out of the table's frequency synopsis and never reaches the hash table this is about. The test
-/// below that does read it out of the synopsis is
-/// [`a_grouping_over_a_table_in_memory_is_answered_from_its_own_counts`].
+/// Count a value that is never null, so the result also checks the ordinary grouped count path.
 #[test]
 fn a_grouped_aggregate_counts_and_sums_within_each_group() {
     let rows = run(&format!(
@@ -228,23 +224,16 @@ fn a_grouped_aggregate_counts_and_sums_within_each_group() {
     assert_eq!(rows[2], vec![integer(2), Value::BigInt(1)]);
 }
 
-/// A grouping a table can answer from what it counted as the rows arrived does not read the rows.
-///
-/// The counts are the table's own and they are exact, the null is a group of its own with the rows
-/// the zone maps counted for it, and the groups come back most common first because that is the order
-/// the synopsis holds them in. Every column of `t` is narrow enough for this, which is what makes the
-/// two tests above have to ask for something else.
+/// A grouped count reads rows, including the row whose grouping key is null.
 #[test]
-fn a_grouping_over_a_table_in_memory_is_answered_from_its_own_counts() {
+fn a_grouping_over_a_table_in_memory_counts_each_row() {
     let rows = run(&format!(
         "Aggregate #1 groups=[#0.1::VARCHAR] aggregates=[count_star()::BIGINT]\n  {SCAN}"
     ));
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], vec![text("a"), Value::BigInt(2)]);
-    assert_eq!(rows[1], vec![text("c"), Value::BigInt(1)]);
-    assert_eq!(rows[2], vec![Value::Null, Value::BigInt(1)]);
-    // And the whole table is accounted for, which is the property that makes a complete list an
-    // answer rather than an estimate.
+    assert!(rows.contains(&vec![text("a"), Value::BigInt(2)]));
+    assert!(rows.contains(&vec![text("c"), Value::BigInt(1)]));
+    assert!(rows.contains(&vec![Value::Null, Value::BigInt(1)]));
     let counted: i64 = rows
         .iter()
         .map(|row| match row[1] {
