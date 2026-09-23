@@ -57,6 +57,7 @@ mod distinct;
 pub mod graph;
 pub mod host;
 mod prepare;
+mod workers;
 use prepare::Lent;
 pub mod section;
 pub mod stats;
@@ -1698,16 +1699,13 @@ impl GlobalDictionary {
             one(&mut outs)?;
         } else {
             let per = count.div_ceil(workers);
-            std::thread::scope(|scope| {
-                outs.chunks_mut(per)
-                    .map(|run| scope.spawn(|| one(run)))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .try_for_each(|handle| {
-                        handle.join().map_err(|_| {
-                            Error::internal("a global dictionary decode worker panicked")
-                        })?
-                    })
+            let runs = Mutex::new(outs.chunks_mut(per).collect::<Vec<_>>());
+            workers::each(workers, "global dictionary decode", || {
+                loop {
+                    let taken = runs.lock().unwrap_or_else(PoisonError::into_inner).pop();
+                    let Some(run) = taken else { return Ok(()) };
+                    one(run)?;
+                }
             })?;
         }
         drop(outs);
@@ -1752,7 +1750,7 @@ impl GlobalDictionary {
             flat.get(from..to).unwrap_or_default()
         };
         let mut codes = (0..self.values() as u32).collect::<Vec<_>>();
-        sort_by_value_across(&mut codes, value, close_workers());
+        sort_by_value_across(&mut codes, value, close_workers())?;
         let order = codes.into_iter().map(|code| (head(value(code)), code)).collect();
         Ok((order, flat, bases))
     }
@@ -2888,31 +2886,18 @@ impl Writer {
         // are what is left to fill in behind them.
         columns.sort_by_key(|&column| weight(&self.table.fields[column].ty));
         let queue = Mutex::new(columns);
-        let pieces = std::thread::scope(|scope| {
-            (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let _timing = profile.map(|profile| profile.span(Stage::Publish));
-                        let mut mine = Vec::new();
-                        loop {
-                            let taken = queue
-                                .lock()
-                                .map_err(|_| Error::internal("a native frequency worker panicked"))?
-                                .pop();
-                            let Some(column) = taken else { break };
-                            mine.push((column, self.numeric_frequency(column)?));
-                        }
-                        Ok(mine)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| Error::internal("a native frequency worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
+        let pieces = workers::each(workers, "native frequency", || {
+            let _timing = profile.map(|profile| profile.span(Stage::Publish));
+            let mut mine = Vec::new();
+            loop {
+                let taken = queue
+                    .lock()
+                    .map_err(|_| Error::internal("a native frequency worker panicked"))?
+                    .pop();
+                let Some(column) = taken else { break };
+                mine.push((column, self.numeric_frequency(column)?));
+            }
+            Ok(mine)
         })?;
         let mut frequencies = vec![(None, None); self.table.fields.len()];
         for piece in pieces {
@@ -3213,50 +3198,36 @@ impl Writer {
         let state = Mutex::new((jobs, 0_usize));
         let finished = Condvar::new();
         let profile = self.profile.as_deref();
-        let pieces = std::thread::scope(|scope| {
-            (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let _timing = profile.map(|profile| profile.span(Stage::Dictionary));
-                        let mut mine = Vec::new();
-                        loop {
-                            let mut held = state.lock().map_err(|_| {
-                                Error::internal("a native dictionary worker panicked")
-                            })?;
-                            let (index, dictionary, bytes) = loop {
-                                let (jobs, busy) = &mut *held;
-                                if jobs.is_empty() {
-                                    return Ok(mine);
-                                }
-                                let fits = jobs.iter().rposition(|&(_, _, bytes)| {
-                                    *busy == 0
-                                        || busy.saturating_add(bytes) <= CLOSE_DICTIONARY_BYTES
-                                });
-                                if let Some(at) = fits {
-                                    let job = jobs.remove(at);
-                                    *busy += job.2;
-                                    break job;
-                                }
-                                held = finished.wait(held).map_err(|_| {
-                                    Error::internal("a native dictionary worker panicked")
-                                })?;
-                            };
-                            drop(held);
-                            // Given back on the way out whether the close worked, failed or
-                            // panicked, so that a worker waiting for room is never left waiting.
-                            let _room = Room { state: &state, finished: &finished, bytes };
-                            mine.push((index, self.close_dictionary(index, dictionary)?));
-                        }
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| Error::internal("a native dictionary worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
+        let pieces = workers::each(workers, "native dictionary", || {
+            let _timing = profile.map(|profile| profile.span(Stage::Dictionary));
+            let mut mine = Vec::new();
+            loop {
+                let mut held = state
+                    .lock()
+                    .map_err(|_| Error::internal("a native dictionary worker panicked"))?;
+                let (index, dictionary, bytes) = loop {
+                    let (jobs, busy) = &mut *held;
+                    if jobs.is_empty() {
+                        return Ok(mine);
+                    }
+                    let fits = jobs.iter().rposition(|&(_, _, bytes)| {
+                        *busy == 0 || busy.saturating_add(bytes) <= CLOSE_DICTIONARY_BYTES
+                    });
+                    if let Some(at) = fits {
+                        let job = jobs.remove(at);
+                        *busy += job.2;
+                        break job;
+                    }
+                    held = finished
+                        .wait(held)
+                        .map_err(|_| Error::internal("a native dictionary worker panicked"))?;
+                };
+                drop(held);
+                // Given back on the way out whether the close worked, failed or panicked, so that a
+                // worker waiting for room is never left waiting.
+                let _room = Room { state: &state, finished: &finished, bytes };
+                mine.push((index, self.close_dictionary(index, dictionary)?));
+            }
         })?;
         for (index, one) in pieces.into_iter().flatten() {
             closed[index] = Some(one);
@@ -10015,10 +9986,10 @@ fn sort_by_value_across<'a>(
     codes: &mut [u32],
     values: impl Fn(u32) -> &'a [u8] + Sync,
     workers: usize,
-) {
+) -> Result<()> {
     if workers <= 1 || codes.len() < PARALLEL_SORT_MIN {
         sort_by_value(codes, values);
-        return;
+        return Ok(());
     }
     let buckets = workers * BUCKETS_PER_WORKER;
     let wanted = buckets * SAMPLES_PER_BUCKET;
@@ -10030,26 +10001,27 @@ fn sort_by_value_across<'a>(
     let splitters = &splitters;
     let per = codes.len().div_ceil(workers);
     // Which bucket each code goes to, a run of the codes per thread.
-    let places = std::thread::scope(|scope| {
-        codes
-            .chunks(per)
-            .map(|run| {
-                scope.spawn(move || {
-                    run.iter()
-                        .map(|&code| {
-                            let value = values(code);
-                            splitters.partition_point(|splitter| *splitter <= value) as u32
-                        })
-                        .collect::<Vec<_>>()
+    let runs = Mutex::new(codes.chunks(per).enumerate().collect::<Vec<_>>());
+    let mut pieces = workers::each(workers, "dictionary sort", || {
+        let mut mine = Vec::new();
+        loop {
+            let taken = runs.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let Some((at, run)) = taken else { return Ok(mine) };
+            let placed = run
+                .iter()
+                .map(|&code| {
+                    let value = values(code);
+                    splitters.partition_point(|splitter| *splitter <= value) as u32
                 })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|handle| {
-                handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect::<Vec<_>>()
-    });
+                .collect::<Vec<_>>();
+            mine.push((at, placed));
+        }
+    })?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    pieces.sort_unstable_by_key(|&(at, _)| at);
+    let places = pieces.into_iter().flat_map(|(_, placed)| placed).collect::<Vec<_>>();
     let mut starts = vec![0_usize; buckets + 1];
     for &place in &places {
         starts[place as usize + 1] += 1;
@@ -10074,18 +10046,15 @@ fn sort_by_value_across<'a>(
     // The largest buckets first, since they are taken from the back.
     runs.sort_by_key(|run| run.len());
     let queue = Mutex::new(runs);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let taken = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
-                    let Some(run) = taken else { break };
-                    sort_by_value(run, values);
-                }
-            });
+    workers::each(workers, "dictionary sort", || {
+        loop {
+            let taken = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let Some(run) = taken else { return Ok(()) };
+            sort_by_value(run, values);
         }
-    });
+    })?;
     codes.copy_from_slice(&laid);
+    Ok(())
 }
 
 /// The first eight bytes of a value as an integer that sorts the way the bytes sort.
@@ -10367,27 +10336,14 @@ fn encode_waiting(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
     } else {
         let next = AtomicUsize::new(0);
         let jobs = &jobs;
-        let pieces = std::thread::scope(|scope| {
-            (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut mine = Vec::new();
-                        loop {
-                            let job = next.fetch_add(1, Atomic::Relaxed);
-                            let Some(&(column, at)) = jobs.get(job) else { break };
-                            mine.push(one(column, at)?);
-                        }
-                        Ok(mine)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| Error::internal("a dictionary encode worker panicked"))?
-                })
-                .collect::<Result<Vec<_>>>()
+        let pieces = workers::each(workers, "dictionary encode", || {
+            let mut mine = Vec::new();
+            loop {
+                let job = next.fetch_add(1, Atomic::Relaxed);
+                let Some(&(column, at)) = jobs.get(job) else { break };
+                mine.push(one(column, at)?);
+            }
+            Ok(mine)
         })?;
         pieces.into_iter().flatten().collect()
     };
@@ -11357,11 +11313,11 @@ mod tests {
             let mut one = (0..values.len() as u32).rev().collect::<Vec<_>>();
             let mut across = one.clone();
             sort_by_value(&mut one, value);
-            sort_by_value_across(&mut across, value, workers);
+            sort_by_value_across(&mut across, value, workers).expect("sorted");
             assert_eq!(one, across, "{workers} workers");
         }
         let mut sorted = (0..values.len() as u32).collect::<Vec<_>>();
-        sort_by_value_across(&mut sorted, value, 8);
+        sort_by_value_across(&mut sorted, value, 8).expect("sorted");
         assert!(sorted.windows(2).all(|pair| value(pair[0]) <= value(pair[1])));
     }
 

@@ -54,7 +54,7 @@ use super::{
     ColumnStripe, DICTIONARY_CHECK_SEED, DICTIONARY_DECIDE_ROWS, DICTIONARY_DISTINCT_IN_TEN,
     EncodedBlock, GlobalDictionary, MAX_ENCODE_WORKERS, MAX_PAGE, Part, PendingChunk, STRIPE_PARTS,
     Spread, Unencoded, Writer, checksum, coded_page, invalid, push_validity, seeded_checksum,
-    stats, unique_codes, weight,
+    stats, unique_codes, weight, workers,
 };
 
 /// How many stripes are being prepared or paged right now, across every writer in the process.
@@ -382,29 +382,16 @@ fn fan_out<T: Send>(
     }
     let workers = workers.min(jobs.len());
     let queue = Mutex::new(jobs);
-    let pieces = std::thread::scope(|scope| {
-        (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let _span = profile.map(|profile| profile.span(Stage::Pages));
-                    let mut mine = Vec::new();
-                    loop {
-                        let taken = queue
-                            .lock()
-                            .map_err(|_| Error::internal("a native encode worker panicked"))?
-                            .pop();
-                        let Some(index) = taken else { break };
-                        mine.push((index, work(index)?));
-                    }
-                    Ok(mine)
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| {
-                handle.join().map_err(|_| Error::internal("a native encode worker panicked"))?
-            })
-            .collect::<Result<Vec<Vec<_>>>>()
+    let pieces = workers::each(workers, "native encode", || {
+        let _span = profile.map(|profile| profile.span(Stage::Pages));
+        let mut mine = Vec::new();
+        loop {
+            let taken =
+                queue.lock().map_err(|_| Error::internal("a native encode worker panicked"))?.pop();
+            let Some(index) = taken else { break };
+            mine.push((index, work(index)?));
+        }
+        Ok(mine)
     })?;
     Ok(pieces.into_iter().flatten().collect())
 }
@@ -637,28 +624,15 @@ fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &[AtomicBool])
         steps.into_iter().map(|step| step.run(rows, coded)).collect::<Result<Vec<_>>>()?
     } else {
         let queue = Mutex::new(steps);
-        let pieces = std::thread::scope(|scope| {
-            (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut mine = Vec::new();
-                        loop {
-                            let taken = queue
-                                .lock()
-                                .map_err(|_| Error::internal("a merge worker panicked"))?
-                                .pop();
-                            let Some(step) = taken else { break };
-                            mine.push(step.run(rows, coded)?);
-                        }
-                        Ok(mine)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| {
-                    handle.join().map_err(|_| Error::internal("a merge worker panicked"))?
-                })
-                .collect::<Result<Vec<Vec<_>>>>()
+        let pieces = workers::each(workers, "merge", || {
+            let mut mine = Vec::new();
+            loop {
+                let taken =
+                    queue.lock().map_err(|_| Error::internal("a merge worker panicked"))?.pop();
+                let Some(step) = taken else { break };
+                mine.push(step.run(rows, coded)?);
+            }
+            Ok(mine)
         })?;
         pieces.into_iter().flatten().collect()
     };

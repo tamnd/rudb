@@ -475,6 +475,7 @@ dependencies = [
  "rudb-graph",
  "rudb-io",
  "rudb-metrics",
+ "rudb-pipeline",
  "rudb-stats",
  "rudb-storage",
  "rudb-vector",
