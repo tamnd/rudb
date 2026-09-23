@@ -66,6 +66,8 @@ TPC-H SF1 from the native file. Instructions are the best of three fresh process
 
 19 of the 22 queries go down and none goes up by more than the noise on server3. The filters gain as well as the sums: q19 goes from 1.773 G to 1.698 G, q03 from 1.557 G to 1.507 G and q06 from 0.713 G to 0.682 G. All 22 answers are the same as main's.
 
+Main moved while this was in review. Its fold now handles a row the map misses inline, in the same loop that reads each row's place, which took q01 on that main to 3.984 G because every row reads its place back out of a vector again. This change puts the one pass lookup in front of that loop, so a chunk the map answers whole never reaches it. Against that main, at 1ec637ef, q01 goes from 3.984 G to 3.500 G, the suite from 45.148 G to 44.170 G with 20 of 22 queries down, and ten q01 runs on one thread from 17.15 G cycles to 14.84 G. All 22 answers are the same.
+
 On gamingpc the ten q01 runs took 1.45 s on main and 1.48 s with this change, best of nine each. The spread between runs is larger than that difference. The cycles on server3 fell by 4 percent, about half as much as the instructions, and the L1 misses rose from 0.69 G to 0.96 G because the unpacked codes are a vector the old loop never built. So this change is a real cut in the work a row costs, and not yet a cut in the time q01 takes on one core.
 
 ## What this says about the goal
