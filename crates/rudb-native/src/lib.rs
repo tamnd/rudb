@@ -2994,6 +2994,8 @@ impl Writer {
                                 .map_err(|_| Error::internal("a native frequency worker panicked"))?
                                 .pop();
                             let Some(work) = taken else { break };
+                            let t0 = std::time::Instant::now();
+                            let what = match &work { Work::Column { column, .. } => format!("col {}", self.table.fields[*column].name), Work::Distinct { column, part, .. } => format!("distinct {} {part}", self.table.fields[*column].name) };
                             mine.push(match work {
                                 Work::Column { column, distinct } => {
                                     Done::Column(column, self.numeric_frequency(column, distinct)?)
@@ -3003,6 +3005,8 @@ impl Writer {
                                     self.numeric_distinct(column, part, parts, total)?,
                                 ),
                             });
+                            let took = t0.elapsed();
+                            if took.as_millis() > 150 { eprintln!("PROBE numeric {what} {took:?}"); }
                         }
                         Ok(mine)
                     })
@@ -3403,17 +3407,21 @@ impl Writer {
         _index: usize,
         dictionary: &GlobalDictionary,
     ) -> Result<ClosedDictionary> {
+        let t0 = std::time::Instant::now();
         let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
+        let t1 = t0.elapsed();
         // A code nothing counted is a code no non-null row of this column holds, which is the
         // empty string a null was written as and nothing else, because a code is only ever made by
         // a row asking for one.
         let distinct = dictionary.counts.iter().filter(|count| **count != 0).count() as u64;
         let (frequencies, texts) = code_frequency(dictionary, &flat, &bases)?;
+        let t2 = t0.elapsed();
         // Deriving a fixed SQL host expression at load time materializes its answer.
         let hosts = None;
         drop(flat);
         drop(bases);
         let encoded = encode_global_dictionary(dictionary, &order, &dictionary.placed, true)?;
+        eprintln!("PROBE dict {} codes={} bytes={} ranked={:?} freq={:?} encoded={:?}", self.table.fields[_index].name, order.len(), dictionary.closing_bytes(), t1, t2, t0.elapsed());
         let payload = dictionary
             .placed
             .iter()
