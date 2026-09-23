@@ -1,6 +1,6 @@
 //! The arena a plan lives in, and the invariant that keeps its indices honest.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rudb_common::bounds::{Frequencies, Zones};
@@ -100,6 +100,13 @@ pub struct Plan {
     /// to be is narrower than the column, which is why the pass that writes it takes nothing but an
     /// exact pair of ends.
     dense: BTreeMap<u32, (i128, u64)>,
+    /// The columns a table is stored in ascending order of, by table index and name, as the binder
+    /// read them off the store's own summaries. A fact about the file, like `distincts`.
+    ascending: BTreeSet<(u32, String)>,
+    /// The aggregates whose one grouping key arrives in ascending order, by output index, so that a
+    /// group can be closed as soon as the key moves past it. A decision, like `dense`, written by
+    /// one pass, `rudb_opt`'s `cluster`.
+    clustered: BTreeSet<u32>,
 }
 
 impl Default for Plan {
@@ -144,6 +151,8 @@ impl Plan {
             frequencies: BTreeMap::new(),
             presized: BTreeMap::new(),
             dense: BTreeMap::new(),
+            ascending: BTreeSet::new(),
+            clustered: BTreeSet::new(),
         }
     }
 
@@ -282,6 +291,7 @@ impl Plan {
         self.zones.clear();
         self.frequencies.clear();
         self.distincts.clear();
+        self.ascending.clear();
     }
 
     /// Records how many groups the aggregate binding its output to `index` is expected to produce.
@@ -326,6 +336,29 @@ impl Plan {
     #[must_use]
     pub fn dense_count(&self) -> usize {
         self.dense.len()
+    }
+
+    /// Records that the table bound to `index` stores its rows in ascending order of `column`,
+    /// with no null in it.
+    pub fn mark_ascending(&mut self, index: u32, column: &str) {
+        self.ascending.insert((index, column.to_owned()));
+    }
+
+    /// Whether the table bound to `index` stores its rows in ascending order of `column`.
+    #[must_use]
+    pub fn ascending(&self, index: u32, column: &str) -> bool {
+        self.ascending.contains(&(index, column.to_owned()))
+    }
+
+    /// Records that the aggregate binding its output to `index` sees its one key in ascending order.
+    pub fn cluster(&mut self, index: u32) {
+        self.clustered.insert(index);
+    }
+
+    /// Whether the aggregate binding its output to `index` sees its one key in ascending order.
+    #[must_use]
+    pub fn clustered(&self, index: u32) -> bool {
+        self.clustered.contains(&index)
     }
 
     /// How many nodes are in the arena, reachable or not.

@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bounds;
+pub mod cluster;
 pub mod columns;
 pub mod cte;
 pub mod delim;
@@ -177,7 +178,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 25] = [
+pub static PASSES: [&(dyn Pass + Sync); 26] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -202,6 +203,7 @@ pub static PASSES: [&(dyn Pass + Sync); 25] = [
     &sides::BuildSideProbeSide,
     &presize::AggregatePresize,
     &dense::AggregateDense,
+    &cluster::AggregateCluster,
     &link::LinkJoinRewrite,
 ];
 
