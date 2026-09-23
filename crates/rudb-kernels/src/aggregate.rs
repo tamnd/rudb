@@ -1079,6 +1079,45 @@ pub fn update_scattered(
     input: Option<&Vector>,
     rows: usize,
 ) -> Result<()> {
+    update_tallied(states, slots, None, stride, offset, input, rows)
+}
+
+/// How many of a chunk's rows land in each group, or none if there are too many groups for the
+/// locals of [`few`] to be the way the chunk is folded.
+///
+/// Every sum, mean and count over a few groups used to count its rows again as it added them, which
+/// on q01 is eight counts a row that all come out the same whenever the argument has no nulls. This
+/// is the count taken once for the chunk, for [`update_tallied`] to hand to each of them.
+#[must_use]
+pub fn group_tally(slots: &[usize], groups: usize) -> Option<Vec<i64>> {
+    if groups > FEW || groups.saturating_mul(4) > slots.len() {
+        return None;
+    }
+    let mut counts = vec![0_i64; groups * LANES];
+    for (row, &slot) in slots.iter().enumerate() {
+        if slot == NOWHERE {
+            continue;
+        }
+        *counts.get_mut(slot.wrapping_mul(LANES) | (row % LANES))? += 1;
+    }
+    Some(counts.chunks_exact(LANES).map(|lanes| lanes.iter().sum()).collect())
+}
+
+/// [`update_scattered`] with the chunk's [`group_tally`], which it takes as the count of every group
+/// whenever the argument has no nulls rather than counting the rows again.
+///
+/// # Errors
+///
+/// The errors [`update_scattered`] raises.
+pub fn update_tallied(
+    states: &mut [Accumulator],
+    slots: &[usize],
+    tally: Option<&[i64]>,
+    stride: usize,
+    offset: usize,
+    input: Option<&Vector>,
+    rows: usize,
+) -> Result<()> {
     if states.is_empty() {
         return Ok(());
     }
@@ -1102,7 +1141,7 @@ pub fn update_scattered(
     };
     // Cut to the rows there are, so that the loops below index it without a check of their own.
     // The length was compared against `rows` just above, which is the one place it has to be.
-    let into = Where { slots: &slots[..rows], stride, offset };
+    let into = Where { slots: &slots[..rows], stride, offset, tally };
     // `count(*)` reads nothing, so it never asks for the argument it does not have.
     if kind == Kind::CountStar {
         if few(states, into, rows, Live::All, Feed::Counted, |_| 0)? {
@@ -1235,7 +1274,7 @@ pub fn update_general(
     if slots.len() < rows || inputs.iter().any(|input| input.len() < rows) {
         return Err(Error::internal(format!("an aggregate handed {rows} rows and less to fold")));
     }
-    let into = Where { slots: &slots[..rows], stride, offset };
+    let into = Where { slots: &slots[..rows], stride, offset, tally: None };
     let mut args = Vec::with_capacity(inputs.len());
     for row in 0..rows {
         let Some(index) = into.index(row) else { continue };
@@ -1626,6 +1665,8 @@ struct Where<'w> {
     slots: &'w [usize],
     stride: usize,
     offset: usize,
+    /// How many of the rows land in each group, when the caller took that once for the chunk.
+    tally: Option<&'w [i64]>,
 }
 
 impl Where<'_> {
@@ -1763,6 +1804,14 @@ macro_rules! live_rows {
 /// same reason.
 const FEW: usize = 256;
 
+/// How many locals [`few`] keeps per group.
+///
+/// With one local per group, a row's add reads the total the row before it wrote whenever the two
+/// rows are in the same group, which on a handful of groups is most rows, and the row then waits on
+/// the store of the one before it. On q01 that wait was nearly all of the time in the row loop. With
+/// four, rows next to each other add into different locals and the adds overlap.
+const LANES: usize = 4;
+
 /// One pass that adds each row into a local total for its group, then folds each group's total into
 /// its accumulator once, or false if there are too many groups for that to pay.
 ///
@@ -1796,20 +1845,51 @@ fn few<V: Fn(usize) -> i128>(
     {
         return Ok(false);
     }
-    let mut totals = [0_i128; FEW];
-    let mut counts = [0_i64; FEW];
-    live_rows!(nulls, rows, |row| {
-        let slot = into.slots[row];
-        if slot == NOWHERE {
-            continue;
+    // With no nulls every row counts, so the chunk's tally is each group's count and the loop is
+    // left with the add alone, or with nothing at all for a count.
+    let tallied = match (nulls, into.tally) {
+        (Live::All, Some(tally)) if tally.len() == groups => Some(tally),
+        _ => None,
+    };
+    // Each group has LANES locals and a row adds into the one its position picks, so rows next to
+    // each other never wait on each other's add. See [`LANES`].
+    let mut totals = vec![0_i128; groups * LANES];
+    let mut counts = vec![0_i64; if tallied.is_some() { 0 } else { groups * LANES }];
+    if tallied.is_none() {
+        live_rows!(nulls, rows, |row| {
+            let slot = into.slots[row];
+            if slot == NOWHERE {
+                continue;
+            }
+            let local = slot.wrapping_mul(LANES) | (row % LANES);
+            // A slot past the groups is a bug elsewhere, and nothing has been folded yet, so the
+            // loops that index the accumulators directly get to say so.
+            let (Some(total), Some(count)) = (totals.get_mut(local), counts.get_mut(local)) else {
+                return Ok(false);
+            };
+            *total = total.wrapping_add(value(row));
+            *count += 1;
+        });
+    } else if !matches!(feed, Feed::Counted) {
+        for (row, &slot) in into.slots.iter().enumerate().take(rows) {
+            if slot == NOWHERE {
+                continue;
+            }
+            let Some(total) = totals.get_mut(slot.wrapping_mul(LANES) | (row % LANES)) else {
+                return Ok(false);
+            };
+            *total = total.wrapping_add(value(row));
         }
-        totals[slot] = totals[slot].wrapping_add(value(row));
-        counts[slot] += 1;
-    });
-    for (slot, (&count, &number)) in counts.iter().zip(&totals).take(groups).enumerate() {
+    }
+    for (slot, number) in totals.chunks_exact(LANES).enumerate() {
+        let count: i64 = match tallied {
+            Some(tally) => tally[slot],
+            None => counts[slot * LANES..(slot + 1) * LANES].iter().sum(),
+        };
         if count == 0 {
             continue;
         }
+        let number = number.iter().fold(0_i128, |sum, &lane| sum.wrapping_add(lane));
         let index = slot * into.stride + into.offset;
         match (&mut states[index].state, feed) {
             (State::Counted { count: held, .. }, Feed::Counted) => *held += count,
@@ -2575,7 +2655,7 @@ fn extreme_ranked(
     Some(winner.map(|(row, _)| row))
 }
 
-/// The widest dictionary [`tally`] copies, and a power of two.
+/// The widest dictionary [`group_tally`] copies, and a power of two.
 ///
 /// The copy is per vector and the gather it speeds up is per row, so a dictionary wide enough that
 /// copying it costs more than the fifteen hundred or so rows of a vector is one to leave alone.
@@ -2628,7 +2708,7 @@ fn tally(data: &Data, codes: &[u32]) -> Option<i128> {
     }
 }
 
-/// [`tally`] with the rung it decided on, `SLOTS` entries wide.
+/// [`group_tally`] with the rung it decided on, `SLOTS` entries wide.
 fn tally_into<const SLOTS: usize>(data: &Data, codes: &[u32]) -> Option<i128> {
     macro_rules! padded {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
@@ -3609,6 +3689,41 @@ mod tests {
         update_scattered(&mut states, &slots, 1, 0, Some(&column), 4).expect("folds them in");
         assert_eq!(states[0].finish().expect("finishes"), Value::HugeInt(1));
         assert_eq!(states[1].finish().expect("finishes"), Value::HugeInt(3));
+    }
+
+    /// A chunk's tally stands in for the counts a sum, a mean and a count take as they go, and
+    /// gives the same answers, with nulls in the argument or not and with rows in no group.
+    #[test]
+    fn a_tally_taken_once_answers_what_counting_every_call_answers() {
+        let rows = 64;
+        let slots: Vec<usize> =
+            (0..rows).map(|row| if row % 7 == 3 { NOWHERE } else { row * 5 % 3 }).collect();
+        let full: Vec<Value> = (0..rows).map(|row| Value::Integer(row as i32 - 20)).collect();
+        let holed: Vec<Value> = full
+            .iter()
+            .enumerate()
+            .map(|(row, value)| if row % 5 == 0 { Value::Null } else { value.clone() })
+            .collect();
+        let tally = group_tally(&slots, 3).expect("three groups is few");
+        assert_eq!(
+            tally.iter().sum::<i64>(),
+            slots.iter().filter(|&&s| s != NOWHERE).count() as i64
+        );
+        for values in [&full, &holed] {
+            let column = Vector::from_values(LogicalType::Integer, values).expect("integers");
+            for name in ["sum", "avg", "count", "count_star"] {
+                let fresh =
+                    || vec![Accumulator::new(name, &LogicalType::Integer).expect("known"); 3];
+                let (mut counting, mut tallied) = (fresh(), fresh());
+                let input = (name != "count_star").then_some(&column);
+                update_scattered(&mut counting, &slots, 1, 0, input, rows).expect("folds");
+                update_tallied(&mut tallied, &slots, Some(&tally), 1, 0, input, rows)
+                    .expect("folds");
+                for (one, other) in counting.iter().zip(&tallied) {
+                    assert_eq!(one.finish().expect("finishes"), other.finish().expect("finishes"));
+                }
+            }
+        }
     }
 
     /// The shapes a grouped ClickBench query is made of stay off the row at a time path, and a
