@@ -2009,6 +2009,7 @@ impl<'a> Transform<'a> {
                 "ParensExpression" if count == 1 => node = self.first(node),
                 "BoundedListExpression" => return self.list(node),
                 "StructExpression" => return self.structure(node),
+                "MapExpression" => return self.map(node),
                 "QuestionMarkNumberedParameter"
                 | "AnonymousParameter"
                 | "NumberedParameter"
@@ -2549,21 +2550,28 @@ impl<'a> Transform<'a> {
             }
         }
         // `struct_pack(a := 1)` is the one call whose names are part of its value, and it is the
-        // same struct `{'a': 1}` is, so it becomes that. A name on any other call is a parameter
-        // the binder does not have yet. `struct_pack()` is the empty struct and a call with any
-        // positional argument stays a call, for the binder to turn down in the pin's words.
-        let packs = name.len == 1
-            && self
-                .ast
-                .name(name)
-                .last()
-                .is_some_and(|part| part.eq_ignore_ascii_case("struct_pack"));
+        // same struct `{'a': 1}` is, so it becomes that. `struct_pack()` is the empty struct and a
+        // call with any positional argument stays a call, for the binder to turn down in the pin's
+        // words. `struct_insert(s, b := 2)` and `struct_update` take the named arguments as the
+        // fields to add or replace, so those are gathered into one struct handed over as the last
+        // argument. A name on any other call is a parameter the binder does not have yet.
+        let called = if name.len == 1 {
+            self.ast.name(name).last().map(str::to_ascii_lowercase).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let packs = called == "struct_pack";
         if packs && over == NONE && names.len() == args.len() {
             let names = self.part_slice(names);
             let values = self.expr_slice(args);
             return Ok(self.push(Expr::Struct { names, values }));
         }
-        if !names.is_empty() && (!packs || names.len() == args.len()) {
+        let merges = matches!(called.as_str(), "struct_insert" | "struct_update");
+        if merges && over == NONE && !names.is_empty() && names.len() + 1 == args.len() {
+            let names = self.part_slice(names);
+            let values = self.expr_slice(args.split_off(1));
+            args.push(self.push(Expr::Struct { names, values }));
+        } else if !names.is_empty() && (!packs || names.len() == args.len()) {
             return self.unsupported(first_named);
         }
         // A call with an `OVER` on it is a window call and none of the rewrites below apply to it.
@@ -3259,6 +3267,34 @@ impl<'a> Transform<'a> {
         }
         let items = self.expr_slice(items);
         Ok(self.push(Expr::List { items }))
+    }
+
+    /// `MapExpression <- 'MAP' MapStructExpression`, `MapStructExpression <- '{'
+    /// List(MapStructField)? '}'` and `MapStructField <- Expression ':' Expression`.
+    ///
+    /// `MAP {1: 'a'}` is `map([1], ['a'])` on the pin, down to the column heading, so it becomes that
+    /// call with the keys in one list and the values in the other.
+    fn map(&mut self, node: u32) -> Result<ExprRef> {
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        let fields = self.find(node, "MapStructExpression");
+        if fields != NONE {
+            for field in self.kids(fields).collect::<Vec<_>>() {
+                let kids: Vec<u32> = self.kids(field).collect();
+                let [key, value] = kids[..] else {
+                    return self.unsupported(field);
+                };
+                keys.push(self.expr(key)?);
+                values.push(self.expr(value)?);
+            }
+        }
+        let keys = self.expr_slice(keys);
+        let keys = self.push(Expr::List { items: keys });
+        let values = self.expr_slice(values);
+        let values = self.push(Expr::List { items: values });
+        let args = self.expr_slice(vec![keys, values]);
+        let name = self.function_name("map");
+        Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
     }
 
     /// `StructExpression <- '{' List(StructField)? '}'` and

@@ -1681,6 +1681,21 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
             }
             Ok(a.len().cmp(&b.len()))
         }
+        // A map is a list of key and value structs underneath on the pin and orders as one, entry
+        // by entry and key before value, with the shorter one first when one runs out.
+        (Value::Map { entries: a, .. }, Value::Map { entries: b, .. }) => {
+            for ((key, value), (other_key, other_value)) in a.iter().zip(b) {
+                let ordering = order_with_nulls(key, other_key, false)?.then(order_with_nulls(
+                    value,
+                    other_value,
+                    false,
+                )?);
+                if ordering != Ordering::Equal {
+                    return Ok(ordering);
+                }
+            }
+            Ok(a.len().cmp(&b.len()))
+        }
         _ => numeric_order(left, right),
     }
 }

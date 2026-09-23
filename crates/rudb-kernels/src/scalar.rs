@@ -60,6 +60,7 @@ use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
 use crate::lists;
+use crate::maps;
 use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
@@ -2746,10 +2747,16 @@ pub fn call_values(
     if let Some(answer) = lists::before_nulls(name, args, returns) {
         return answer;
     }
+    if let Some(answer) = maps::before_nulls(name, args, returns) {
+        return answer;
+    }
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
     if let Some(answer) = lists::value(name, args, returns) {
+        return answer;
+    }
+    if let Some(answer) = maps::value(name, args, returns) {
         return answer;
     }
     // `list_aggr` over one list. The binder resolved the aggregate and put its name second, and

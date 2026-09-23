@@ -66,6 +66,7 @@ pub mod fallback;
 mod general;
 mod lists;
 pub mod logic;
+mod maps;
 pub mod membership;
 mod number;
 mod peel;

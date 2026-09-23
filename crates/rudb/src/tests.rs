@@ -8814,3 +8814,131 @@ fn rows_are_unnamed_structs_and_struct_pack_takes_names_the_way_the_pin_does() {
         ["\"row\"(1, 2)", "struct_pack(a := 1)"]
     );
 }
+
+/// `MAP {k: v}` is `map([k], [v])`, and the calls that read a map answer what the pin does,
+/// including the ones that step around a null argument.
+#[test]
+fn maps_build_and_read_back_the_way_the_pin_has_them() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT MAP {1: 'a', 2: 'b'}"), "{1=a, 2=b}");
+    assert_eq!(column("SELECT MAP([1, 2], ['a', NULL])"), "{1=a, 2=NULL}");
+    assert_eq!(column("SELECT typeof(MAP {'x': 1.5})"), "MAP(VARCHAR, DECIMAL(2,1))");
+    assert_eq!(column("SELECT MAP()"), "{}");
+    assert_eq!(column("SELECT MAP([1, 2], NULL)"), "NULL");
+    assert_eq!(column("SELECT MAP {'a': NULL, 'it''s': 'x y'}"), "{a=NULL, 'it\\'s'=x y}");
+    assert_eq!(column("SELECT MAP {1: 'a'}[1]"), "a");
+    assert_eq!(column("SELECT MAP {1: 'a'}[3]"), "NULL");
+    assert_eq!(column("SELECT MAP {1: 'a'}['1']"), "a");
+    assert_eq!(column("SELECT map_extract(MAP {1: 'a'}, 1)"), "[a]");
+    assert_eq!(column("SELECT element_at(MAP {1: 'a'}, 5)"), "[]");
+    assert_eq!(column("SELECT map_extract(MAP {1: 'a'}, NULL)"), "[]");
+    assert_eq!(column("SELECT map_extract_value(MAP {1: 'a'}, 1)"), "a");
+    assert_eq!(column("SELECT map_keys(MAP {1: 'a', 2: 'b'})"), "[1, 2]");
+    assert_eq!(column("SELECT map_values(MAP {1: 'a', 2: 'b'})"), "[a, b]");
+    assert_eq!(
+        column("SELECT map_entries(MAP {1: 'a', 2: 'b'})"),
+        "[{'key': 1, 'value': a}, {'key': 2, 'value': b}]"
+    );
+    assert_eq!(column("SELECT map_from_entries([(1, 'a'), (2, 'b')])"), "{1=a, 2=b}");
+    assert_eq!(column("SELECT map_from_entries([{'k': 1, 'v': 'a'}])"), "{1=a}");
+    assert_eq!(column("SELECT cardinality(MAP {1: 'a', 2: 'b'})"), "2");
+    assert_eq!(column("SELECT typeof(cardinality(MAP {1: 'a'}))"), "UBIGINT");
+    assert_eq!(column("SELECT map_concat(MAP {1: 'a'}, MAP {1: 'b', 2: 'c'})"), "{1=b, 2=c}");
+    assert_eq!(column("SELECT map_concat(MAP {1: 'a'}, NULL)"), "{1=a}");
+    assert_eq!(column("SELECT map_contains(MAP {1: 'a'}, 1)"), "true");
+    assert_eq!(column("SELECT map_contains_value(MAP {1: 'a'}, 'a')"), "true");
+    assert_eq!(column("SELECT map_contains_entry(MAP {1: 'a'}, 1, 'b')"), "false");
+    assert_eq!(column("SELECT MAP {1: 'a', 2: 'x'} < MAP {2: 'a'}"), "true");
+    assert_eq!(column("SELECT MAP {'a': 1} = MAP {'a': 1}"), "true");
+    assert_eq!(
+        column(
+            "SELECT m::VARCHAR || ':' || count(*) FROM (VALUES (MAP {1: 'a'}), (MAP {1: 'a'}), \
+             (MAP {2: 'b'})) t(m) GROUP BY m ORDER BY m"
+        ),
+        "{1=a}:2;{2=b}:1"
+    );
+    assert_eq!(column("SELECT MAP([i], [i * 2]) FROM range(2) t(i)"), "{0=0};{1=2}");
+    assert_eq!(
+        error("SELECT MAP([1, 1], ['a', 'b'])"),
+        "Invalid Input Error: Map keys must be unique."
+    );
+    assert_eq!(error("SELECT MAP {NULL: 1}"), "Invalid Input Error: Map keys can not be NULL.");
+    assert_eq!(
+        error("SELECT MAP([1], ['a', 'b'])"),
+        "Invalid Input Error: The map key list does not align with the map value list."
+    );
+    assert!(error("SELECT MAP(1, 2)").starts_with("Binder Error: No function matches"));
+    assert_eq!(
+        db.query("SELECT MAP {1: 'a'}").unwrap().names(),
+        ["\"map\"(list_value(1), list_value('a'))"]
+    );
+    let inner = "(SELECT MAP {'a': 1} m, {'n': MAP {'b': MAP {'x': 5}}} s)";
+    assert_eq!(column(&format!("SELECT m.a, m.b FROM {inner}")), "1");
+    assert_eq!(column(&format!("SELECT m.b FROM {inner}")), "NULL");
+    assert_eq!(column(&format!("SELECT s.n.b.x FROM {inner}")), "5");
+    assert_eq!(column("SELECT (MAP {'a': 1}).a"), "1");
+    assert_eq!(column("SELECT m.\"1\" FROM (SELECT MAP {1: 1} m)"), "1");
+    assert!(error("SELECT m.a FROM (SELECT MAP {1: 1} m)").starts_with("Conversion Error"));
+    assert_eq!(db.query(&format!("SELECT m.a FROM {inner}")).unwrap().names(), ["a"]);
+}
+
+/// The struct calls that take a struct apart or put two together, with the answers the pin gives.
+#[test]
+fn struct_helpers_answer_what_the_pin_does() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT struct_keys({'a': 1, 'B': 2})"), "[a, B]");
+    assert_eq!(column("SELECT struct_values({'a': 1, 'b': 'x'})"), "(1, x)");
+    assert_eq!(
+        column("SELECT typeof(struct_values({'a': 1, 'b': 'x'}))"),
+        "TUPLE(INTEGER, VARCHAR)"
+    );
+    assert_eq!(column("SELECT struct_keys(NULL::STRUCT(a INT))"), "NULL");
+    assert_eq!(
+        column("SELECT struct_insert({'a': 1}, b := 2, c := 'x')"),
+        "{'a': 1, 'b': 2, 'c': x}"
+    );
+    assert_eq!(column("SELECT struct_insert(NULL::STRUCT(a INT), b := 2)"), "{'a': NULL, 'b': 2}");
+    assert_eq!(column("SELECT struct_update({'a': 1, 'b': 2}, B := 'x')"), "{'a': 1, 'B': x}");
+    assert_eq!(column("SELECT struct_update({'a': 1}, b := 2)"), "{'a': 1, 'b': 2}");
+    assert_eq!(column("SELECT struct_update(NULL::STRUCT(a INT), a := 2)"), "{'a': 2}");
+    assert_eq!(column("SELECT struct_concat({'a': 1}, {'b': 2})"), "{'a': 1, 'b': 2}");
+    assert_eq!(column("SELECT struct_concat(row(1), row(2))"), "(1, 2)");
+    assert_eq!(column("SELECT struct_contains(row(1, 2), 2)"), "true");
+    assert_eq!(column("SELECT struct_contains(row(1, NULL), NULL)"), "NULL");
+    assert_eq!(column("SELECT struct_position(row(1, 2), 2)"), "2");
+    assert_eq!(column("SELECT struct_position(row(1, 2), 3)"), "NULL");
+    assert_eq!(
+        column("SELECT struct_insert({'a': i}, b := i + 1) FROM range(2) t(i)"),
+        "{'a': 0, 'b': 1};{'a': 1, 'b': 2}"
+    );
+    assert_eq!(
+        error("SELECT struct_insert({'a': 1}, a := 2)"),
+        "Binder Error: Duplicate struct entry name \"\"a\"\""
+    );
+    assert_eq!(
+        error("SELECT struct_concat({'a': 1}, {'a': 2})"),
+        "Invalid Input Error: struct_concat: Arguments contain duplicate STRUCT entry \"a\""
+    );
+    assert_eq!(
+        error("SELECT struct_concat({'a': 1}, row(2))"),
+        "Invalid Input Error: struct_concat: Cannot mix named and unnamed STRUCTs"
+    );
+    assert_eq!(
+        error("SELECT struct_keys(row(1, 2))"),
+        "Invalid Input Error: struct_keys() expects a STRUCT argument"
+    );
+    assert_eq!(
+        error("SELECT struct_contains({'a': 1}, 1)"),
+        "Binder Error: \"struct_contains\" can only be used on unnamed structs"
+    );
+}
