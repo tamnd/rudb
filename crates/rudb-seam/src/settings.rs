@@ -142,6 +142,49 @@ impl Settings {
         Some(self.pins.get(&seam).cloned().unwrap_or_else(|| "default".to_string()))
     }
 
+    /// These settings written as a hint body, which [`Settings::hint`] reads back.
+    ///
+    /// How a pin gets from the session that holds it to a rank that is below `rudb-seam` and cannot
+    /// name a [`SeamId`]. `rudb_common::Session::set_seams` carries the text and
+    /// [`Settings::written_get`] answers out of it, which is what makes
+    /// `current_setting('seam.chunk.compaction')` read back what `SET` just wrote.
+    ///
+    /// The policy goes in it too, under the name it is set by, so the round trip is the whole of
+    /// what a session was told rather than the pins alone.
+    #[must_use]
+    pub fn written(&self) -> String {
+        let mut body = String::new();
+        if self.mode != PolicyMode::Default {
+            body.push_str(&format!("policy({})", self.mode));
+        }
+        for (seam, name) in self.pins() {
+            if !body.is_empty() {
+                body.push(' ');
+            }
+            body.push_str(&format!("{}({name})", seam.name()));
+        }
+        body
+    }
+
+    /// What one seam reads back as, out of a hint body rather than out of a `Settings`.
+    ///
+    /// For the reader that has the text [`Settings::written`] produced and not the settings
+    /// themselves. `None` for a name no seam has, which is the caller's signal to report it as an
+    /// unknown setting rather than as a seam at its default.
+    ///
+    /// # Errors
+    ///
+    /// For a body that is not a hint body, which is a bug in whoever wrote it rather than anything a
+    /// user can cause, since the only writer is [`Settings::written`].
+    pub fn written_get(body: &str, key: &str) -> Result<Option<String>> {
+        if seam_named(key).is_none() {
+            return Ok(None);
+        }
+        let mut settings = Self::new();
+        settings.hint(body)?;
+        Ok(settings.get(key))
+    }
+
     /// The session mode.
     #[must_use]
     pub fn mode(&self) -> PolicyMode {

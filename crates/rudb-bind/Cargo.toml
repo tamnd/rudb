@@ -20,6 +20,7 @@ rudb-kernels.workspace = true
 rudb-plan.workspace = true
 rudb-catalog.workspace = true
 rudb-functions.workspace = true
+rudb-seam.workspace = true
 
 [lints]
 workspace = true
