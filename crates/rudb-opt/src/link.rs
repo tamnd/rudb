@@ -383,12 +383,14 @@ impl Pass for LinkJoinRewrite {
         }
         // One walk before anything is rewritten, and it stays true across the rewrites: what a node
         // carries is a question about the operators under it, and nothing below a join changes
-        // here. A node the walk never reached carries nothing, so an orphan left behind by an
-        // earlier pass answers no to the check below and is never rewritten.
+        // here.
         let carried = rids_of(plan);
         let consumers = consumers(plan);
+        let reachable = reachable(plan);
         for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
-            rewrite(plan, node, &carried, &consumers, context);
+            if reachable.get(node as usize).copied().unwrap_or(false) {
+                rewrite(plan, node, &carried, &consumers, context);
+            }
         }
         Ok(())
     }
@@ -473,6 +475,31 @@ fn decided(
         }
     }
     (worst, None)
+}
+
+/// Which nodes the answer is built out of, reached from the root.
+///
+/// A plan's node list is everything anybody built, and a pass that replaces a subtree leaves the
+/// old one in it. What makes that matter here rather than being a walk over some dead nodes is that
+/// a dead join and a live one share their scans, so rewriting a dead join widens a scan the answer
+/// still reads. The dead join then goes to the executor as nothing at all and the live plan carries
+/// a column nobody asked for, which is exactly what TPC-H q05 did: one run of the passes widened
+/// `orders`, the next run pruned it again, and the fixpoint check in [`crate::optimize_with`] failed
+/// the query outright.
+fn reachable(plan: &Plan) -> Vec<bool> {
+    let mut seen = vec![false; plan.node_count()];
+    let mut stack = vec![plan.root()];
+    while let Some(at) = stack.pop() {
+        let Some(slot) = seen.get_mut(at as usize) else {
+            continue;
+        };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        stack.extend(plan.node(at).children().into_iter().flatten());
+    }
+    seen
 }
 
 /// Which node reads each node's output, or nothing for the root and for anything orphaned.
@@ -827,6 +854,31 @@ mod tests {
             let text = rewritten(&mut plan, &context(1_500_000));
             assert!(!text.contains("LinkJoin"), "a {kind} join was rewritten:\n{text}");
         }
+    }
+
+    /// A dead join reads the same scans a live one does, so rewriting it is a column added to a
+    /// plan that is going to run. TPC-H q05 is the query that has one, and what it reported was not
+    /// a wrong answer but `the passes did not settle`, because the widening happened on one run of
+    /// the sequence and the pruning that undid it happened on the next.
+    #[test]
+    fn a_join_no_longer_in_the_plan_does_not_widen_a_scan_that_still_is() {
+        let mut plan = joined("INNER");
+        let Node::Project { index, exprs, names, .. } = *plan.node(plan.root()) else {
+            panic!("the plan is a projection over a join");
+        };
+        let scan = (0..u32::try_from(plan.node_count()).expect("a small plan"))
+            .find(|&node| matches!(*plan.node(node), Node::Get { index: 0, .. }))
+            .expect("the child scan is in the plan");
+        // The shape a pass leaves behind when it decides the join was not needed: the old
+        // projection and the join under it are still in the node list and nothing reads them.
+        let kept = plan.add_node(Node::Project { input: scan, index, exprs, names });
+        plan.set_root(kept);
+        let text = rewritten(&mut plan, &context(1_500_000));
+        assert!(!text.contains("LinkJoin"), "a join nobody reads was rewritten:\n{text}");
+        assert!(
+            !text.contains("file_row_number"),
+            "a dead join widened a scan the answer reads:\n{text}"
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod rids;
 mod rowloop;
 mod ruletable;
 mod seams;
+mod sections;
 mod sha256;
 mod smoke;
 mod source;
@@ -104,6 +105,12 @@ fn main() -> ExitCode {
         // What a key map costs to build and to keep, which is G1's exit measurement. Not under
         // `native` above, because that one reads a directory and this one writes to the file.
         Some("graph") => graph::run(&std::env::args().skip(2).collect::<Vec<_>>()),
+        // The twenty two TPC-H queries with the graph sections off and then on, which is the exit
+        // criterion of `spec/graph/09-measurement.md` section 9.2. Not under `differential` above,
+        // which compares this engine against duckdb. This one compares the engine against itself
+        // with a setting flipped, and the reference is the run that reads nothing the graph layer
+        // wrote.
+        Some("sections") => sections::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         Some("stats") => stats::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("topcount") => topcount::run(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("conform") => conform::run(&root()),
@@ -181,6 +188,15 @@ fn usage() {
     println!("           a trailing child.column->parent.column builds that relationship's");
     println!("           forward link after the maps, and prints its form, its bytes and its");
     println!("           share of the child table, which is the size claim of section 9.1");
+    println!("  sections <dir> [cache bytes]  the twenty two TPC-H queries out of a directory of");
+    println!("           parquet files, run with graph_sections off and then on and compared byte");
+    println!("           for byte, which is the exit criterion of spec/graph/09-measurement.md");
+    println!(
+        "           section 9.2. the table says per query how many joins read a link, because"
+    );
+    println!("           a green over a run where the layer never fired is a green that says");
+    println!("           nothing, and the cache bytes is how a scale factor small enough to");
+    println!("           generate quickly is pushed off the crossover of section 6.4");
     println!(
         "  stats <file.db> <table>...  builds a summary and a sketch for every column of each"
     );
