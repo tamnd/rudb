@@ -1739,6 +1739,9 @@ struct NativeSink {
     /// Encodes a stripe as far as it can be without the writer, so that the lock is held for the
     /// dictionary merge and the write rather than the whole encode.
     preparer: rudb_native::Preparer,
+    /// Merges a prepared stripe into the table's dictionaries one column lock at a time, so the
+    /// writer's own lock is held only for the write.
+    merger: rudb_native::Merger,
     /// The file being written, when it is not the database itself, and what gets renamed over the
     /// database at the end. `None` for an append, which writes the database in place and has
     /// nothing to rename: the bytes go past the catalog the committed generation points at, and
@@ -1764,9 +1767,10 @@ impl NativeSink {
         let profile = LoadProfile::begin(name.clone());
         let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?
             .with_profile(Arc::clone(&profile));
-        let writer = declared(writer, clustering)?;
+        let mut writer = declared(writer, clustering)?;
         Ok(Self {
             preparer: writer.preparer(),
+            merger: writer.merger()?,
             writer: Mutex::new(Some(writer)),
             temporary: Some(temporary),
             target: target.to_path_buf(),
@@ -1787,9 +1791,10 @@ impl NativeSink {
         let profile = LoadProfile::begin(name.clone());
         let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?
             .with_profile(Arc::clone(&profile));
-        let writer = declared(writer, clustering)?;
+        let mut writer = declared(writer, clustering)?;
         Ok(Self {
             preparer: writer.preparer(),
+            merger: writer.merger()?,
             writer: Mutex::new(Some(writer)),
             temporary: None,
             target: target.to_path_buf(),
@@ -1822,16 +1827,18 @@ impl NativeSink {
             .iter()
             .fold(place.bytes, |bytes, (_, chunk)| bytes.saturating_add(chunk.footprint() as u64));
         // Once a stripe, so both clocks. The waits for the lock are write waits: they are the time
-        // one instance spent while another was merging or writing its stripe, which is the cost of
-        // the writer being one file behind one lock.
+        // one instance spent while another was writing its stripe, which is the cost of the writer
+        // being one file behind one lock.
         //
-        // The lock is taken twice, once to merge the stripe's dictionaries and once to write it,
-        // and neither the encode before the first nor the pages between the two need it. That is
-        // what lets thirty two instances encode at once rather than one at a time.
+        // The lock is taken once, to write. The encode before it needs nothing of the writer, and
+        // the merge takes the lock of each column it merges into instead, so two stripes merge at
+        // once unless they want the same column at the same moment. That is what lets thirty two
+        // instances keep going when one of them is merging `URL`.
         let inside = Span::start();
         let appended = self.preparer.prepare(parts).and_then(|prepared| {
-            let merged = self.locked(|writer| writer.merge(prepared))?;
-            let paged = merged.pages()?;
+            let merged = self.merger.merge(prepared)?;
+            let mut paged = merged.pages()?;
+            self.merger.give_back(&mut paged)?;
             self.locked(|writer| writer.write(paged))
         });
         let (wall, cpu) = inside.stop();
