@@ -97,6 +97,27 @@ fn a_filtered_parent_skips_the_child_parts_it_has_no_rows_in_and_answers_the_sam
     std::fs::remove_file(&path).ok();
 }
 
+/// The shape of Q3: the parent's keys come up through a join of their own before the child is
+/// joined to them, so the build side is not a scan of `customer` and is still `customer`'s keys.
+#[test]
+fn a_parent_key_that_comes_up_through_a_join_still_reduces_the_child() {
+    let (database, path) = database("through");
+    database.execute("CREATE TABLE picked (p_key INTEGER, p_note VARCHAR)").expect("creates");
+    database.execute("INSERT INTO picked VALUES (1, 'a'), (2, 'b'), (30000, 'c')").expect("loads");
+    let sql = "SELECT count(*), sum(o_orderkey), min(p_note) FROM orders JOIN (SELECT c_custkey, \
+               p_note FROM customer JOIN picked ON c_name = 'c' || p_key) AS t ON o_custkey = \
+               c_custkey";
+    let reduced = rows(&database, sql);
+    assert_eq!(reduced[0][0], Value::BigInt(30));
+    let line = orders_scan(&database, sql);
+    assert!(line.contains("link kept 30 of 300000 rows"), "the reduction should fire: {line}");
+
+    database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
+    assert_eq!(rows(&database, sql), reduced, "the reduction changed an answer");
+    drop(database);
+    std::fs::remove_file(&path).ok();
+}
+
 /// A filter that drops only the last customer removes orders only in the last part, so the push
 /// has removed nothing by the time it is a third of the way through `orders` and stops there.
 #[test]

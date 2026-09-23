@@ -603,7 +603,11 @@ fn scanned<'a>(
 ///
 /// spec/graph/05-execution.md section 5.4, and the conditions that make it exact rather than
 /// approximately right. The build side's key has to be the parent's stored key column, read as it
-/// is, so that every key on that side is a key the parent's key map holds. The driving column has
+/// is, so that every key on that side is a key the parent's key map holds. It can come up through
+/// joins as well as filters and projections, which is the shape of Q3 and Q5 where `orders` is
+/// joined to a filtered `customer` before `lineitem` is joined to it, because a key the map does not
+/// hold sends the join back to the filter and so the walk only has to find which table the values
+/// were read from, not prove that every one of them is still a row of it. The driving column has
 /// to be the child's stored column the link was built over, so that the link says which parent
 /// every driving row's value names. And both tables have to be one committed file each, so that a
 /// row's position in the scan is its `rid`. The join kind and the null rule were settled by the
@@ -620,7 +624,7 @@ fn exact(
     binding: ColumnBinding,
 ) -> Option<Exact> {
     let Expr::Column(key) = *plan.expr(key) else { return None };
-    let key = sideways::beneath(plan, parent, key)?;
+    let key = traced(plan, parent, key)?;
     let (parent_table, parent_columns) = scanned(plan, catalog, parent, key.table).ok()??;
     let (child_table, child_columns) = scanned(plan, catalog, driving, binding.table).ok()??;
     let (child_rows, parent_rows) = (child_table.rows().stored()?, parent_table.rows().stored()?);
@@ -634,6 +638,35 @@ fn exact(
     let link = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)?;
     let keys = rudb_native::graph::key_map(parent_rows, parent_column)?;
     Some(Exact::new(keys, link))
+}
+
+/// The stored column under `node` that `binding` reads, through anything that passes it along.
+///
+/// A projection renames, so the binding becomes the column in its position, and an expression there
+/// ends the walk because the values it makes are not a column's. Every other node either passes its
+/// children's bindings through unchanged or makes a table of its own, and a binding into a table a
+/// node made is found under none of its children, since a table index names one node in a plan. So
+/// the walk goes into whichever child the binding turns up in and stops at the scan that made it.
+fn traced(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Option<ColumnBinding> {
+    match *plan.node(node) {
+        Node::Get { index, .. } => (binding.table == index).then_some(binding),
+        Node::Project { input, index, exprs, .. } => {
+            let binding = if binding.table == index {
+                let at = *plan.expr_list(exprs).get(binding.column as usize)?;
+                let Expr::Column(inner) = *plan.expr(at) else { return None };
+                inner
+            } else {
+                binding
+            };
+            traced(plan, input, binding)
+        }
+        _ => plan
+            .node(node)
+            .children()
+            .into_iter()
+            .flatten()
+            .find_map(|child| traced(plan, child, binding)),
+    }
 }
 
 /// The two columns one equality holds equal, when that is what the conditions are.
