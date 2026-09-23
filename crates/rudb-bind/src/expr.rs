@@ -1006,14 +1006,17 @@ impl Binder<'_> {
     /// of the same decision. Without it a session driving the engine through SQL can write one of
     /// these and then has no way to ask what it says.
     ///
-    /// Three of the four are here and each is read off something the binder is already holding: the
-    /// row order declarations are on the catalog, the relationship declarations and the rule
-    /// switches are on the session. The seam settings are the fourth and they are not here, because
-    /// the seam names live in a crate below this one that the binder does not depend on and adding
-    /// the dependency to read a string is a bigger decision than this one.
+    /// All four are here and each is read off something the binder is already holding: the row order
+    /// declarations are on the catalog, and the relationship declarations, the rule switches and the
+    /// seam pins are on the session. The seams were left out of this on the grounds that their names
+    /// live in a crate the binder does not depend on, and the cost of that was that
+    /// `SET seam.chunk.compaction = 'learned-gain'` was accepted and then
+    /// `current_setting('seam.chunk.compaction')` said there is no such parameter, so a sweep had no
+    /// way to confirm it was measuring what it asked for. `rudb-plan` already depends on `rudb-seam`
+    /// and the binder already depends on `rudb-plan`, so naming it here adds no rank edge.
     ///
-    /// A rule reads back as a boolean and the other two as the text they were written as, which is
-    /// what `Database::setting` answers for all three. A declaration nobody made reads back
+    /// A rule reads back as a boolean and the other three as the text they were written as, which is
+    /// what `Database::setting` answers for all of them. A declaration nobody made reads back
     /// as the empty string rather than as null, because the empty string is what `SET cluster_by =
     /// ''` leaves behind and a setting that does not round trip is one somebody reports as a bug.
     ///
@@ -1034,6 +1037,11 @@ impl Binder<'_> {
         }
         if let Some(enabled) = self.session.rules().named(name) {
             return Ok(Some(Value::Boolean(enabled)));
+        }
+        // After the rules, so that a name a rule answers for keeps answering as a rule, and out of
+        // the text the session carries rather than out of a `Settings` this rank could hold.
+        if let Some(pinned) = rudb_seam::Settings::written_get(self.session.seams(), name)? {
+            return Ok(Some(Value::Varchar(pinned)));
         }
         if looks_like_rule(name) {
             return Err(Error::catalog(format!(

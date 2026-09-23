@@ -827,6 +827,7 @@ impl Settings {
         session.set_warnings_as_errors(warnings_as_errors);
         session.set_rules(self.rules());
         session.set_links(self.links());
+        session.set_seams(self.seams().written());
         for entry in SETTINGS {
             if entry.behaviour != Behaviour::Honoured {
                 session.set(entry.name, self.carried(entry));

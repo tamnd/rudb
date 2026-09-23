@@ -31,6 +31,7 @@ pub struct Session {
     semantics: Semantics,
     rules: Rules,
     links: String,
+    seams: String,
 }
 
 /// The meaning-changing session choices consumed while a query is bound.
@@ -221,6 +222,7 @@ impl Default for Session {
             semantics: Semantics::default(),
             rules: Rules::new(),
             links: String::new(),
+            seams: String::new(),
         }
     }
 }
@@ -353,6 +355,26 @@ impl Session {
     #[must_use]
     pub fn links(&self) -> &str {
         &self.links
+    }
+
+    /// Records which seams the session has pinned, as a hint body.
+    ///
+    /// The text and not the parsed form, for the reason [`Session::links`] carries text: the pins
+    /// live in `rudb-seam`, which is above this crate, and a session is read from below it. A hint
+    /// body rather than a format of its own because `rudb_seam::Settings` already writes one and
+    /// already parses one, so the spelling of a pin cannot come to mean two things.
+    pub fn set_seams(&mut self, seams: impl Into<String>) {
+        self.seams = seams.into();
+    }
+
+    /// The seams this session has pinned, as a hint body, empty for none.
+    ///
+    /// Empty is not the same as unknown. A session with nothing pinned has every seam at its
+    /// default, which is what an unpinned seam reads back as, so a reader of this parses it and asks
+    /// it rather than treating empty as an absence of an answer.
+    #[must_use]
+    pub fn seams(&self) -> &str {
+        &self.seams
     }
 
     /// Whether this name is the one the relationship declarations are written under.

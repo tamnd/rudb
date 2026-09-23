@@ -6908,6 +6908,43 @@ fn a_seam_is_set_and_read_back_through_the_statement_everything_else_goes_throug
 }
 
 #[test]
+fn a_pinned_seam_reads_back_through_current_setting_and_not_only_through_the_api() {
+    // `SET` took the pin and `Database::setting` answered for it, and `current_setting` in a query
+    // said there is no such parameter, because the binder's fallback knew about the row order
+    // declarations, the relationship declarations and the rules and not about the seams. What that
+    // cost was a sweep that pinned a seam and had no way to check it was measuring what it asked
+    // for, which is the one thing a sweep has to be able to check.
+    let db = Database::new();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('seam.chunk.compaction')"),
+        vec![vec![text("default")]],
+        "an unpinned seam reads back as the word that would leave it there"
+    );
+
+    db.execute("SET seam_chunk_compaction = 'learned-gain'").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('seam.chunk.compaction')"),
+        vec![vec![text("learned-gain")]]
+    );
+    // The same seam under the two other spellings of it, since one pin is one seam.
+    assert_eq!(
+        rows(&db, "SELECT current_setting('chunk.compaction')"),
+        vec![vec![text("learned-gain")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT current_setting('seam_chunk_compaction')"),
+        vec![vec![text("learned-gain")]]
+    );
+    // And the policy, which is the seam that chooses at the others.
+    db.execute("SET seam_policy = 'reference'").unwrap();
+    assert_eq!(rows(&db, "SELECT current_setting('seam.policy')"), vec![vec![text("reference")]]);
+
+    // A name no seam has is still an unknown setting rather than a seam at its default.
+    let error = db.query("SELECT current_setting('seam.chunk.compactoin')").unwrap_err();
+    assert_eq!(error.code().duckdb_name(), "Catalog Error");
+}
+
+#[test]
 fn the_policy_is_a_seam_like_the_rest_and_a_mistyped_one_names_the_seams() {
     let db = Database::new();
     db.execute("SET seam_policy = 'reference'").unwrap();
