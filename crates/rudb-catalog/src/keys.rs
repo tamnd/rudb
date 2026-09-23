@@ -13,6 +13,8 @@ use std::sync::Arc;
 use rudb_common::{Error, Field, Result, Value};
 use rudb_vector::Chunk;
 
+use crate::QualifiedName;
+
 /// A `PRIMARY KEY` or a `UNIQUE` constraint over one or more columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
@@ -20,6 +22,19 @@ pub struct Key {
     pub columns: Vec<usize>,
     /// Whether this is the table's primary key rather than a unique constraint.
     pub primary: bool,
+}
+
+/// A `FOREIGN KEY`: columns of this table whose values, when none is null, have to be a key the
+/// referenced table holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    /// The columns of this table, by place, in the order the constraint named them.
+    pub columns: Vec<usize>,
+    /// The table the key is held by, which can be this one.
+    pub table: QualifiedName,
+    /// The columns of that table, by place, paired with `columns` one for one. They are the
+    /// columns of one of its keys, though not necessarily in that key's order.
+    pub referenced: Vec<usize>,
 }
 
 impl Key {

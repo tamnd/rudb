@@ -98,6 +98,15 @@ fn is_statement(name: &str) -> bool {
         || folded == "verify_parallelism"
 }
 
+/// One `FOREIGN KEY` as the transform collects it: the columns, the referenced table's name parts
+/// and the referenced columns.
+type Foreign = (Slice, Slice, Slice);
+
+/// Where the constraints of a `CREATE TABLE` are collected: the keys, which of them is primary,
+/// the checks and the foreign keys.
+type Constraints<'c> =
+    (&'c mut Vec<Slice>, &'c mut u32, &'c mut Vec<ExprRef>, &'c mut Vec<Foreign>);
+
 struct Transform<'a> {
     query: &'a str,
     tokens: &'a [Token],
@@ -810,15 +819,21 @@ impl<'a> Transform<'a> {
         let mut keys = Vec::new();
         let mut primary = NONE;
         let mut checks = Vec::new();
+        let mut foreign = Vec::new();
         let (columns, query) = match self.name(body) {
             "CreateColumnList" => {
-                (self.column_list(body, name, &mut keys, &mut primary, &mut checks)?, NONE)
+                let constraints = (&mut keys, &mut primary, &mut checks, &mut foreign);
+                (self.column_list(body, name, constraints)?, NONE)
             }
             "CreateTableAs" => self.create_table_as(body)?,
             _ => return self.unsupported(body),
         };
         let keys = self.name_list_slice(keys);
         let checks = self.expr_slice(checks);
+        let foreign_tables = self.name_list_slice(foreign.iter().map(|f: &Foreign| f.1).collect());
+        let foreign_referenced =
+            self.name_list_slice(foreign.iter().map(|f: &Foreign| f.2).collect());
+        let foreign = self.name_list_slice(foreign.iter().map(|f: &Foreign| f.0).collect());
         let index = self.ast.create_tables.len() as u32;
         self.ast.create_tables.push(CreateTable {
             name,
@@ -830,6 +845,9 @@ impl<'a> Transform<'a> {
             keys,
             primary,
             checks,
+            foreign,
+            foreign_tables,
+            foreign_referenced,
         });
         Ok(Statement::CreateTable(index))
     }
@@ -888,9 +906,7 @@ impl<'a> Transform<'a> {
         &mut self,
         node: u32,
         table: Slice,
-        keys: &mut Vec<Slice>,
-        primary: &mut u32,
-        checks: &mut Vec<ExprRef>,
+        (keys, primary, checks, foreign): Constraints<'_>,
     ) -> Result<Slice> {
         for kid in self.kids(node) {
             if matches!(self.name(kid), "PartitionOptions" | "SortedOptions" | "WithList") {
@@ -907,7 +923,7 @@ impl<'a> Transform<'a> {
         for element in self.kids(list) {
             let inner = self.first(element);
             if self.name(inner) == "CreateTableColumnDefinition" {
-                let (def, marks) = self.column_definition(self.first(inner), checks)?;
+                let (def, marks) = self.column_definition(self.first(inner), checks, foreign)?;
                 for is_primary in marks {
                     let names = self.part_slice(vec![def.name]);
                     self.add_key(table, names, is_primary, keys, primary)?;
@@ -921,6 +937,23 @@ impl<'a> Transform<'a> {
             self.named_nodes(inner, "TopCheckConstraint", &mut found);
             if let Some(&check) = found.first() {
                 checks.push(self.check(check)?);
+                continue;
+            }
+            self.named_nodes(inner, "TopForeignKeyConstraint", &mut found);
+            if let Some(&constraint) = found.first() {
+                let mut ids = Vec::new();
+                self.named_nodes(self.find(constraint, "ColumnIdList"), "ColId", &mut ids);
+                let names: Vec<StrRef> = ids
+                    .into_iter()
+                    .map(|id| {
+                        let text = self.fold_identifier(self.text(id));
+                        self.intern(&text)
+                    })
+                    .collect();
+                let count = names.len();
+                let names = self.part_slice(names);
+                let references = self.find(constraint, "ForeignKeyConstraint");
+                foreign.push(self.foreign_key(references, names, count)?);
                 continue;
             }
             self.named_nodes(inner, "TopPrimaryKeyConstraint", &mut found);
@@ -963,6 +996,42 @@ impl<'a> Transform<'a> {
             return self.unsupported(node);
         };
         self.expr(expr)
+    }
+
+    /// `ForeignKeyConstraint <- 'REFERENCES' BaseTableName Parens(ColumnList)? KeyActions`, for a
+    /// key over these columns of the table being made, refused the way the pin refuses an action
+    /// other than the default or a column count that does not match.
+    fn foreign_key(&mut self, node: u32, columns: Slice, count: usize) -> Result<Foreign> {
+        let mut found = Vec::new();
+        for action in ["CascadeKeyAction", "SetNullKeyAction", "SetDefaultKeyAction"] {
+            self.named_nodes(self.find(node, "KeyActions"), action, &mut found);
+        }
+        if !found.is_empty() {
+            return Err(Error::parser(
+                "FOREIGN KEY constraints cannot use CASCADE, SET NULL or SET DEFAULT",
+            ));
+        }
+        let table = self.name_parts(self.find(node, "BaseTableName"));
+        let mut lists = Vec::new();
+        self.named_nodes(node, "ColumnList", &mut lists);
+        let mut ids = Vec::new();
+        if let Some(&list) = lists.first() {
+            self.named_nodes(list, "ColId", &mut ids);
+        }
+        if !ids.is_empty() && ids.len() != count {
+            return Err(Error::parser(
+                "The number of referencing and referenced columns for foreign keys must be the same",
+            ));
+        }
+        let names: Vec<StrRef> = ids
+            .into_iter()
+            .map(|id| {
+                let text = self.fold_identifier(self.text(id));
+                self.intern(&text)
+            })
+            .collect();
+        let referenced = self.part_slice(names);
+        Ok((columns, table, referenced))
     }
 
     /// Every node under this one, itself included, with this rule name, in the order written.
@@ -1008,6 +1077,7 @@ impl<'a> Transform<'a> {
         &mut self,
         node: u32,
         checks: &mut Vec<ExprRef>,
+        foreign: &mut Vec<Foreign>,
     ) -> Result<(ColumnDef, Vec<bool>)> {
         let name = self.identifier(self.find(node, "DottedIdentifier"));
         let type_node = self.find(node, "Type");
@@ -1038,6 +1108,10 @@ impl<'a> Transform<'a> {
                     default = self.expr(self.find(constraint, "ColumnDefaultExpr"))?;
                 }
                 "CheckConstraint" => checks.push(self.check(constraint)?),
+                "ForeignKeyConstraint" => {
+                    let names = self.part_slice(vec![name]);
+                    foreign.push(self.foreign_key(constraint, names, 1)?);
+                }
                 _ => return self.unsupported(constraint),
             }
         }
@@ -4949,16 +5023,35 @@ mod tests {
     }
 
     #[test]
-    fn a_constraint_nothing_enforces_yet_is_refused() {
-        // Accepting a constraint and not enforcing it is the wrong answer, so only the ones the
-        // table checks are kept and the rest are refused until there is somewhere to put them.
-        for query in [
-            "CREATE TABLE t (a INT REFERENCES u (b))",
-            "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES u (b))",
+    fn a_foreign_key_the_pin_refuses_is_refused_with_its_sentence() {
+        for (query, message) in [
+            (
+                "CREATE TABLE t (a INT REFERENCES u (b) ON DELETE CASCADE)",
+                "FOREIGN KEY constraints cannot use CASCADE, SET NULL or SET DEFAULT",
+            ),
+            (
+                "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES u (b, c))",
+                "The number of referencing and referenced columns for foreign keys must be the same",
+            ),
         ] {
             let error = parse_ast(query).unwrap_err().to_string();
-            assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
+            assert!(error.ends_with(message), "{query} gave {error}");
         }
+        let ast = parse_ast(
+            "CREATE TABLE t (a INT REFERENCES u, b INT, FOREIGN KEY (b) REFERENCES s.v (c))",
+        )
+        .unwrap();
+        let Statement::CreateTable(index) = ast.statements[0] else { panic!("not a create") };
+        let create = ast.create_table(index);
+        let lists = |slice| {
+            ast.name_list(slice)
+                .iter()
+                .map(|&names| ast.name(names).collect::<Vec<_>>().join("."))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lists(create.foreign), ["a", "b"]);
+        assert_eq!(lists(create.foreign_tables), ["u", "s.v"]);
+        assert_eq!(lists(create.foreign_referenced), ["", "c"]);
     }
 
     #[test]

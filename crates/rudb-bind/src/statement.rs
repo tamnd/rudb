@@ -107,6 +107,8 @@ pub struct CreateTable {
     pub defaults: Vec<Option<String>>,
     /// The SQL of each `CHECK`, in the order written.
     pub checks: Vec<String>,
+    /// The foreign keys, in the order written.
+    pub foreign: Vec<rudb_catalog::ForeignKey>,
 }
 
 /// A bound `CREATE VIEW`.
@@ -434,6 +436,17 @@ fn create_table(
         }
         keys.push(rudb_catalog::Key { columns: places, primary });
     }
+    let mut foreign = Vec::new();
+    let lists = ast.name_list(written.foreign).iter();
+    let tables = ast.name_list(written.foreign_tables).iter();
+    let referenced = ast.name_list(written.foreign_referenced).iter();
+    for ((&names, &table), &wanted) in lists.zip(tables).zip(referenced) {
+        let names: Vec<&str> = ast.name(names).collect();
+        let parts: Vec<&str> = ast.name(table).collect();
+        let wanted: Vec<&str> = ast.name(wanted).collect();
+        let key = (names.as_slice(), parts.as_slice(), wanted.as_slice());
+        foreign.push(foreign_key(catalog, &name, (&columns, &keys), key)?);
+    }
     Ok(Bound::CreateTable(CreateTable {
         name,
         columns,
@@ -443,7 +456,98 @@ fn create_table(
         keys,
         defaults,
         checks,
+        foreign,
     }))
+}
+
+/// One `FOREIGN KEY` of a table being made, refused the way the pin refuses one that names no key
+/// of the referenced table or pairs columns of different types.
+///
+/// The referenced table is the one being made when the name is its own, and then its columns and
+/// keys are the ones this statement declares.
+fn foreign_key(
+    catalog: &Catalog,
+    made: &QualifiedName,
+    (columns, keys): (&[Field], &[rudb_catalog::Key]),
+    (names, parts, wanted): (&[&str], &[&str], &[&str]),
+) -> Result<rudb_catalog::ForeignKey> {
+    let mut places = Vec::with_capacity(names.len());
+    for &wanted in names {
+        let Some(place) = columns.iter().position(|field| same_name(&field.name, wanted)) else {
+            return Err(Error::binder(format!(
+                "Failed to create foreign key: referencing column \"{wanted}\" does not exist"
+            )));
+        };
+        places.push(place);
+    }
+    let own = parts.last().is_some_and(|last| same_name(last, &made.table))
+        && catalog.resolve(parts).map_or(true, |resolved| resolved == *made);
+    let (table, fields, held): (QualifiedName, Vec<Field>, Vec<rudb_catalog::Key>) = if own {
+        (made.clone(), columns.to_vec(), keys.to_vec())
+    } else {
+        let resolved = catalog.resolve(parts)?;
+        let table = catalog.table(&resolved)?;
+        (resolved, table.columns().to_vec(), table.keys().to_vec())
+    };
+    let referenced = if wanted.is_empty() {
+        let Some(primary) = held.iter().find(|key| key.primary) else {
+            return Err(Error::binder(format!(
+                "Failed to create foreign key: there is no primary key for referenced table \"{}\"",
+                table.table
+            )));
+        };
+        if primary.columns.len() != places.len() {
+            return Err(Error::parser(
+                "The number of referencing and referenced columns for foreign keys must be the same",
+            ));
+        }
+        primary.columns.clone()
+    } else {
+        let mut referenced = Vec::with_capacity(wanted.len());
+        for &column in wanted {
+            let Some(place) = fields.iter().position(|field| same_name(&field.name, column)) else {
+                return Err(Error::binder(format!(
+                    "Failed to create foreign key: referenced table \"{}\" does not have a column \
+                     named \"{column}\"",
+                    table.table
+                )));
+            };
+            referenced.push(place);
+        }
+        let mut sorted = referenced.clone();
+        sorted.sort_unstable();
+        let matched = held.iter().any(|key| {
+            let mut columns = key.columns.clone();
+            columns.sort_unstable();
+            columns == sorted
+        });
+        if !matched && held.is_empty() {
+            return Err(Error::binder(format!(
+                "Failed to create foreign key: there is no primary key or unique constraint for \
+                 referenced table \"{}\"",
+                table.table
+            )));
+        }
+        if !matched {
+            return Err(Error::binder(format!(
+                "Failed to create foreign key: referenced table \"{}\" does not have a primary key \
+                 or unique constraint on the columns {}",
+                table.table,
+                wanted.join(", ")
+            )));
+        }
+        referenced
+    };
+    for (&from, &to) in places.iter().zip(&referenced) {
+        if columns[from].ty != fields[to].ty {
+            return Err(Error::binder(format!(
+                "Failed to create foreign key: incompatible types between column \"{}\" (\"{}\") \
+                 and column \"{}\" (\"{}\")",
+                fields[to].name, fields[to].ty, columns[from].name, columns[from].ty
+            )));
+        }
+    }
+    Ok(rudb_catalog::ForeignKey { columns: places, table, referenced })
 }
 
 /// The SQL a `CHECK` is kept as, refused the way the pin refuses one when the table is made.

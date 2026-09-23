@@ -25,7 +25,7 @@ use crate::connection::{Connection, single};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
 use crate::settings::Settings;
-use crate::upsert;
+use crate::{foreign, upsert};
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
 const MEMORY: &str = ":memory:";
@@ -3067,7 +3067,9 @@ impl Shared {
                         && insert.write == Write::Append
                         && insert.returning.is_none()
                         && insert.checks.is_none()
-                        && catalog.table(&insert.name).is_ok_and(|table| table.keys().is_empty())
+                        && catalog.table(&insert.name).is_ok_and(|table| {
+                            table.keys().is_empty() && table.foreign().is_empty()
+                        })
                 }) {
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
@@ -3135,6 +3137,7 @@ impl Shared {
                         if let Some(checks) = checks.as_mut() {
                             self.check(sql, &mut catalog, place, &insert.name, checks, &chunks)?;
                         }
+                        foreign::missing(&catalog, &insert.name, &chunks)?;
                         let added = chunks.iter().map(Chunk::len).sum();
                         let written = if wanted { chunks.clone() } else { Vec::new() };
                         catalog.table_mut(&insert.name)?.append_all(chunks, workers)?;
@@ -3142,11 +3145,16 @@ impl Shared {
                     }
                     Write::Update | Write::Delete => {
                         let delete = insert.write == Write::Delete;
+                        let plain = catalog.table(&insert.name)?.foreign().is_empty();
                         let (kept, changed, count) =
-                            split(chunks, delete, wanted || checks.is_some())?;
+                            split(chunks, delete, wanted || checks.is_some() || !plain)?;
                         if let Some(checks) = checks.as_mut() {
                             self.check(sql, &mut catalog, place, &insert.name, checks, &changed)?;
                         }
+                        if !delete {
+                            foreign::missing(&catalog, &insert.name, &changed)?;
+                        }
+                        foreign::lost(&catalog, &insert.name, &kept)?;
                         catalog.table_mut(&insert.name)?.replace_all(kept, workers)?;
                         (count, changed)
                     }
@@ -3313,10 +3321,11 @@ impl Shared {
         let count = updated.len() + added.len();
         let mut written: Vec<Vec<Value>> = updated.iter().map(|&at| held[at].clone()).collect();
         written.extend(added.iter().cloned());
+        let rows = upsert::chunks_of(&types, &written)?;
         if let Some(checks) = checks {
-            let rows = upsert::chunks_of(&types, &written)?;
             self.check(sql, catalog, (cancel, seams, session), name, checks, &rows)?;
         }
+        foreign::missing(catalog, name, &rows)?;
         let table = catalog.table_mut(name)?;
         if updated.is_empty() {
             table.append_all(upsert::chunks_of(&types, &added)?, workers)?;
@@ -3866,6 +3875,9 @@ fn create_table(
     }
     if !create.checks.is_empty() {
         catalog.table_mut(&create.name)?.set_checks(create.checks);
+    }
+    if !create.foreign.is_empty() {
+        catalog.table_mut(&create.name)?.set_foreign(create.foreign);
     }
     if let Some(rows) = rows {
         catalog.table_mut(&create.name)?.append_all(rows.into_chunks(), budget.pool.threads())?;
