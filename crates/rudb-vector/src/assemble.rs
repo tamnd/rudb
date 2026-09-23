@@ -233,15 +233,16 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
         return Ok(None);
     }
     let rows = pieces.iter().map(Vector::len).sum();
-    if let Some((_, values)) = pieces[0].stable_dictionary_parts()
-        && pieces.iter().all(|piece| {
+    let shared = pieces[0].stable_dictionary_parts().map(|(_, values)| values).filter(|values| {
+        pieces.iter().all(|piece| {
             piece.logical_type() == ty
                 && !piece.is_empty()
                 && piece
                     .stable_dictionary_parts()
                     .is_some_and(|(_, held)| Arc::ptr_eq(held, values))
         })
-    {
+    });
+    if let Some(values) = shared {
         let mut codes = Vec::with_capacity(rows);
         for piece in pieces {
             if let Some((held, _)) = piece.stable_dictionary_parts() {
@@ -334,9 +335,7 @@ pub fn interleave_placed(
     inverse: Option<&[u32]>,
 ) -> Result<Vector> {
     let rows: usize = pieces.iter().map(Vector::len).sum();
-    if let Some(inverse) = inverse
-        && (inverse.len() != rows || order.len() != rows)
-    {
+    if let Some(inverse) = inverse.filter(|inverse| inverse.len() != rows || order.len() != rows) {
         return Err(Error::internal(format!(
             "{} places and {} positions for a permutation of {rows} rows",
             inverse.len(),
@@ -360,10 +359,10 @@ pub fn interleave_placed(
     if let Some(merged) = merged_dictionary(ty, pieces, order, inverse)? {
         return Ok(merged);
     }
-    if let Some(inverse) = inverse
-        && let Some(placed) = placed_strings(ty, pieces, inverse)?
-    {
-        return Ok(placed);
+    if let Some(inverse) = inverse {
+        if let Some(placed) = placed_strings(ty, pieces, inverse)? {
+            return Ok(placed);
+        }
     }
     let mut data = data_for(ty, rows)?;
     // The untyped null, which has no run of data to lay or to gather out of, and is null whatever
@@ -478,9 +477,10 @@ fn placed_strings(ty: &LogicalType, pieces: &[Vector], inverse: &[u32]) -> Resul
     for piece in pieces {
         let (views, _) = piece.text_parts().unwrap_or_default();
         for (view, &to) in views.iter().zip(places.by_ref()) {
-            if !view.is_inline()
-                && let Some(slot) = offsets.get_mut(to as usize + 1)
-            {
+            if view.is_inline() {
+                continue;
+            }
+            if let Some(slot) = offsets.get_mut(to as usize + 1) {
                 *slot = view.len() as u64;
             }
         }
