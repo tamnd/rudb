@@ -3126,7 +3126,12 @@ impl Packed<'_> {
     ///
     /// Out of range rows read as zero rather than panicking, the way every other accessor in this
     /// file answers for a row that is not there.
+    ///
+    /// Marked inline because every caller that matters is a kernel in another crate reading one code
+    /// per row, and thin LTO was leaving it as a call there. On TPC-H SF1 that call was 1.5 percent of
+    /// the suite and a tenth of q12.
     #[must_use]
+    #[inline]
     pub fn code(&self, row: usize) -> u64 {
         code_at(self.words, (self.offset + row) * self.width as usize, self.width)
     }
@@ -3354,6 +3359,7 @@ fn unpack(
 ///
 /// Zero for bits past the end of the words, which keeps a read of a row that is not there from
 /// panicking and matches what every other accessor here does with one.
+#[inline]
 fn code_at(words: &[u64], bit: usize, width: u32) -> u64 {
     let word = bit / u64::BITS as usize;
     let shift = (bit % u64::BITS as usize) as u32;
