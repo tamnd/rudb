@@ -484,8 +484,7 @@ fn searched(position: bool, list: &Vector, needle: &Vector) -> Result<Option<Vec
         ($($variant:ident),+) => {
             match child.data() {
                 $(Some(Data::$variant(values)) => {
-                    let values = values.as_slice();
-                    first_places(entries, |at| elements.at(at) && i128::from(values[at]) == wanted)
+                    first_places(entries, values.as_slice(), elements, wanted)
                 })+
                 _ => return Ok(None),
             }
@@ -695,13 +694,35 @@ fn plain(ty: &LogicalType) -> bool {
     )
 }
 
-/// The one based place in each row's run of the first element `hit` accepts, or 0 for none.
-fn first_places(entries: &[(u32, u32)], hit: impl Fn(usize) -> bool) -> Vec<u32> {
+/// The one based place in each row's run of the first element equal to `wanted` that is not null,
+/// or 0 for none.
+///
+/// The needle is narrowed to the child's own type once, so the scan compares native values and a
+/// child with no nulls is a plain search of each run. A needle that does not fit the type is in no
+/// run at all.
+fn first_places<T: Copy + PartialEq + TryFrom<i128>>(
+    entries: &[(u32, u32)],
+    values: &[T],
+    elements: Live<'_>,
+    wanted: i128,
+) -> Vec<u32> {
+    let Ok(wanted) = T::try_from(wanted) else {
+        return vec![0; entries.len()];
+    };
+    let place = |at: Option<usize>| at.map_or(0, |at| at as u32 + 1);
     entries
         .iter()
         .map(|&(start, len)| {
             let start = start as usize;
-            (start..start + len as usize).position(&hit).map_or(0, |at| at as u32 + 1)
+            let run = &values[start..start + len as usize];
+            match elements {
+                Live::All => place(run.iter().position(|&value| value == wanted)),
+                _ => place(
+                    run.iter()
+                        .enumerate()
+                        .position(|(at, &value)| value == wanted && elements.at(start + at)),
+                ),
+            }
         })
         .collect()
 }
