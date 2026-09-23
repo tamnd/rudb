@@ -1829,9 +1829,7 @@ impl NativeSink {
         // and neither the encode before the first nor the pages between the two need it. That is
         // what lets thirty two instances encode at once rather than one at a time.
         let inside = Span::start();
-        static PROBE_T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let t0 = *PROBE_T0.get_or_init(Instant::now);
-        let ms = || t0.elapsed().as_secs_f64() * 1000.0;
+        let ms = probe_ms;
         let rows: usize = parts.iter().map(|(_, chunk)| chunk.len()).sum();
         let a = ms();
         let appended = self.preparer.prepare(parts).and_then(|prepared| {
@@ -1938,6 +1936,7 @@ impl Sink for NativeSink {
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
+        eprintln!("PROBE finalize {:.1}", probe_ms());
         let writer = self
             .writer
             .lock()
@@ -1945,6 +1944,7 @@ impl Sink for NativeSink {
             .take()
             .ok_or_else(|| Error::internal("native writer was already committed"))?;
         writer.finish()?;
+        eprintln!("PROBE finished {:.1}", probe_ms());
         let Some(temporary) = &self.temporary else {
             self.profile.finish();
             return Ok(());
@@ -1954,8 +1954,13 @@ impl Sink for NativeSink {
             publish(&RealFilesystem::new(), temporary, &self.target)
         };
         self.profile.finish();
+        eprintln!("PROBE published {:.1}", probe_ms());
         renamed
     }
+}
+
+fn probe_ms() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
 impl Drop for NativeSink {

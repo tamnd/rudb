@@ -3079,6 +3079,7 @@ impl Writer {
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
         let entry = self.close()?;
+        eprintln!("PROBE closed {:.1}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0));
         let profile = self.profile.take();
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
