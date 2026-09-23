@@ -517,38 +517,66 @@ impl Part {
 /// after it. That is also why their message prints six digits after the point: it is the count that
 /// was passed and not the integer it ends up as.
 pub(crate) fn interval(name: &str, count: Count) -> Result<(i32, i32, i64)> {
-    let unit = name.strip_prefix("to_").unwrap_or(name);
-    let (field, scale) = match unit {
-        "years" => (Field::Months, 12),
-        "months" => (Field::Months, 1),
-        "quarters" => (Field::Months, 3),
-        "decades" => (Field::Months, 120),
-        "centuries" => (Field::Months, 1_200),
-        "millennia" => (Field::Months, 12_000),
-        "days" => (Field::Days, 1),
-        "weeks" => (Field::Days, 7),
-        "hours" => (Field::Micros, i128::from(MICROS_PER_HOUR)),
-        "minutes" => (Field::Micros, i128::from(MICROS_PER_MINUTE)),
-        "seconds" => (Field::Micros, i128::from(MICROS_PER_SECOND)),
-        "milliseconds" => (Field::Micros, 1_000),
-        "microseconds" => (Field::Micros, 1),
-        _ => return Err(Error::internal(format!("{name} is not an interval constructor"))),
-    };
-    let written = match count {
-        Count::Whole(whole) => whole.to_string(),
-        Count::Real(real) => format!("{real:.6}"),
-    };
-    let refuse = || Error::out_of_range(format!("Interval value {written} {unit} out of range"));
-    let total = match count {
-        Count::Whole(whole) => whole.checked_mul(scale).ok_or_else(refuse)?,
-        // A double that has gone past `i128` comes back as the saturated bound, which is out of
-        // every field's range as well, so the check below catches it without a case of its own.
-        Count::Real(real) => (real * scale as f64).trunc() as i128,
-    };
-    match field {
-        Field::Months => Ok((i32::try_from(total).map_err(|_| refuse())?, 0, 0)),
-        Field::Days => Ok((0, i32::try_from(total).map_err(|_| refuse())?, 0)),
-        Field::Micros => Ok((0, 0, i64::try_from(total).map_err(|_| refuse())?)),
+    Unit::of(name)?.count(count)
+}
+
+/// Which constructor was called, worked out once so a vector of counts does not match the name on
+/// every row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Unit<'a> {
+    unit: &'a str,
+    field: Field,
+    scale: i128,
+}
+
+impl<'a> Unit<'a> {
+    /// The constructor `name` stands for, and an internal error for a name that is not one.
+    pub(crate) fn of(name: &'a str) -> Result<Self> {
+        let unit = name.strip_prefix("to_").unwrap_or(name);
+        let (field, scale) = match unit {
+            "years" => (Field::Months, 12),
+            "months" => (Field::Months, 1),
+            "quarters" => (Field::Months, 3),
+            "decades" => (Field::Months, 120),
+            "centuries" => (Field::Months, 1_200),
+            "millennia" => (Field::Months, 12_000),
+            "days" => (Field::Days, 1),
+            "weeks" => (Field::Days, 7),
+            "hours" => (Field::Micros, i128::from(MICROS_PER_HOUR)),
+            "minutes" => (Field::Micros, i128::from(MICROS_PER_MINUTE)),
+            "seconds" => (Field::Micros, i128::from(MICROS_PER_SECOND)),
+            "milliseconds" => (Field::Micros, 1_000),
+            "microseconds" => (Field::Micros, 1),
+            _ => return Err(Error::internal(format!("{name} is not an interval constructor"))),
+        };
+        Ok(Unit { unit, field, scale })
+    }
+
+    /// The interval `count` of this unit makes.
+    ///
+    /// The message is only written when it is raised. It used to be written on every call, which
+    /// made formatting a number the most expensive part of turning a column of seconds into
+    /// intervals.
+    pub(crate) fn count(self, count: Count) -> Result<(i32, i32, i64)> {
+        let unit = self.unit;
+        let refuse = || {
+            let written = match count {
+                Count::Whole(whole) => whole.to_string(),
+                Count::Real(real) => format!("{real:.6}"),
+            };
+            Error::out_of_range(format!("Interval value {written} {unit} out of range"))
+        };
+        let total = match count {
+            Count::Whole(whole) => whole.checked_mul(self.scale).ok_or_else(refuse)?,
+            // A double that has gone past `i128` comes back as the saturated bound, which is out of
+            // every field's range as well, so the check below catches it without a case of its own.
+            Count::Real(real) => (real * self.scale as f64).trunc() as i128,
+        };
+        match self.field {
+            Field::Months => Ok((i32::try_from(total).map_err(|_| refuse())?, 0, 0)),
+            Field::Days => Ok((0, i32::try_from(total).map_err(|_| refuse())?, 0)),
+            Field::Micros => Ok((0, 0, i64::try_from(total).map_err(|_| refuse())?)),
+        }
     }
 }
 
@@ -560,6 +588,7 @@ pub(crate) enum Count {
 }
 
 /// Which of an interval's three fields a constructor lands in.
+#[derive(Debug, Clone, Copy)]
 enum Field {
     Months,
     Days,
@@ -706,10 +735,7 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
         // calendar fields and a calendar is a local thing, so this is the one place where a session
         // time zone will change the answer rather than only the printing, and that is that box.
         Value::Timestamp(stamp) | Value::TimestampTz(stamp) => {
-            let day =
-                i32::try_from(stamp.div_euclid(MICROS_PER_DAY)).map_err(|_| not_in_range())?;
-            let within = stamp.rem_euclid(MICROS_PER_DAY);
-            let moved = moved(shifted_days(day, months, days)?, within, micros)?;
+            let moved = shifted_stamp(*stamp, months, days, micros)?;
             Ok(match when {
                 Value::TimestampTz(_) => Value::TimestampTz(moved),
                 _ => Value::Timestamp(moved),
@@ -728,6 +754,14 @@ pub(crate) fn shift(left: &Value, right: &Value, subtract: bool) -> Result<Value
         }
         other => Err(Error::internal(format!("{other} takes no interval"))),
     }
+}
+
+/// A timestamp moved by an interval's three fields, already signed, which is the arm of [`shift`]
+/// a vector of timestamps takes without making a `Value` of each one.
+pub(crate) fn shifted_stamp(stamp: i64, months: i64, days: i64, micros: i128) -> Result<i64> {
+    let day = i32::try_from(stamp.div_euclid(MICROS_PER_DAY)).map_err(|_| not_in_range())?;
+    let within = stamp.rem_euclid(MICROS_PER_DAY);
+    moved(shifted_days(day, months, days)?, within, micros)
 }
 
 /// Whether shifting a clock by an interval takes it out of the day it started in.

@@ -338,6 +338,7 @@ fn one_of<A: Fn(usize) -> usize>(
         },
         "make_date" => made_date(data, at, base, rows, returns),
         "epoch_ms" => made_timestamp(data, at, base, rows, returns),
+        name if datetime::is_interval(name) => made_interval(name, data, at, base, rows, returns),
         _ => Ok(None),
     }
 }
@@ -488,6 +489,53 @@ fn made_timestamp<A: Fn(usize) -> usize>(
         Ok(())
     })?;
     finish(returns, Data::Int64(out.into()), validity)
+}
+
+/// `to_seconds(count)` and the other twelve interval constructors, over a run of counts.
+///
+/// The benchmark view turns every stored `EventTime` into a timestamp through `to_seconds`, and on
+/// the row at a time path that cost six times what DuckDB spends on it, most of it in making a
+/// `Value` of each count and each interval. The arithmetic is [`datetime::Unit::count`], the same
+/// one that path calls, so the answers and the errors are the ones it gives.
+fn made_interval<A: Fn(usize) -> usize>(
+    name: &str,
+    data: &Data,
+    at: A,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    if returns != &LogicalType::Interval {
+        return Ok(None);
+    }
+    let unit = datetime::Unit::of(name)?;
+    match data {
+        Data::Float64(counts) => {
+            counted(rows, base, returns, |index| unit.count(Count::Real(counts[at(index)])))
+        }
+        Data::Int64(counts) => counted(rows, base, returns, |index| {
+            unit.count(Count::Whole(i128::from(counts[at(index)])))
+        }),
+        Data::Int32(counts) => counted(rows, base, returns, |index| {
+            unit.count(Count::Whole(i128::from(counts[at(index)])))
+        }),
+        _ => Ok(None),
+    }
+}
+
+/// The intervals `make` gives for every row that is not null.
+fn counted(
+    rows: usize,
+    base: Validity,
+    returns: &LogicalType,
+    make: impl Fn(usize) -> Result<(i32, i32, i64)>,
+) -> Result<Option<Vector>> {
+    let mut out = vec![(0, 0, 0); rows];
+    let validity = over_valid(rows, base, |index| {
+        out[index] = make(index)?;
+        Ok(())
+    })?;
+    finish(returns, Data::Interval(out.into()), validity)
 }
 
 /// Milliseconds since the epoch as microseconds since the epoch.
@@ -720,6 +768,11 @@ fn binary(
     rows: usize,
     written: Written<'_>,
 ) -> Result<Option<Vector>> {
+    if matches!(name, "+" | "-")
+        && let Some(moved) = shift_of(name == "-", left, right, returns)?
+    {
+        return Ok(Some(moved));
+    }
     if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
         return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
     }
@@ -816,6 +869,99 @@ macro_rules! by_form {
         }
         Ok(None)
     }};
+}
+
+/// A timestamp with an interval added to it or taken off it, over runs of both.
+///
+/// This is the other half of the benchmark view's `EventTime`, the epoch plus the interval
+/// `to_seconds` made, and it is [`datetime::shifted_stamp`] on each row, which is what the row at a
+/// time path reaches through `datetime::shift`. A date or a time on the moving side is left to that
+/// path, since neither comes back as the type it went in as.
+fn shift_of(
+    subtract: bool,
+    left: &Vector,
+    right: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let stamped = |ty: &LogicalType| {
+        matches!(ty, LogicalType::Timestamp | LogicalType::TimestampTz) && ty == returns
+    };
+    let interval = |ty: &LogicalType| matches!(ty, LogicalType::Interval);
+    let (one, other) = (left.logical_type(), right.logical_type());
+    let stamp_first = if stamped(one) && interval(other) {
+        true
+    } else if !subtract && interval(one) && stamped(other) {
+        false
+    } else {
+        return Ok(None);
+    };
+    by_form!(left, right, shift_runs, subtract, stamp_first, left, right, returns)
+}
+
+/// The loop under [`shift_of`], once each side's form has been turned into a mapping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "two sides with an index each, the direction, which side is the timestamp, and the \
+              vectors and type the answer is built from"
+)]
+fn shift_runs<L, R>(
+    one: &Data,
+    at_left: L,
+    other: &Data,
+    at_right: R,
+    subtract: bool,
+    stamp_first: bool,
+    left: &Vector,
+    right: &Vector,
+    returns: &LogicalType,
+) -> Result<Option<Vector>>
+where
+    L: Fn(usize) -> usize,
+    R: Fn(usize) -> usize,
+{
+    let rows = left.len();
+    let base = nulls_of(left).and(&nulls_of(right), rows);
+    let out = match (stamp_first, one, other) {
+        (true, Data::Int64(stamps), Data::Interval(intervals)) => {
+            shifted(stamps, at_left, intervals, at_right, subtract, base, rows)?
+        }
+        (false, Data::Interval(intervals), Data::Int64(stamps)) => {
+            shifted(stamps, at_right, intervals, at_left, subtract, base, rows)?
+        }
+        _ => return Ok(None),
+    };
+    let (out, validity) = out;
+    finish(returns, Data::Int64(out.into()), validity)
+}
+
+/// Each timestamp moved by the interval beside it, with the timestamps and the intervals each
+/// read through their own mapping.
+fn shifted<S, I>(
+    stamps: &[i64],
+    at_stamp: S,
+    intervals: &[(i32, i32, i64)],
+    at_interval: I,
+    subtract: bool,
+    base: Validity,
+    rows: usize,
+) -> Result<(Vec<i64>, Validity)>
+where
+    S: Fn(usize) -> usize,
+    I: Fn(usize) -> usize,
+{
+    let sign = if subtract { -1 } else { 1 };
+    let mut out = vec![0i64; rows];
+    let validity = over_valid(rows, base, |index| {
+        let (months, days, micros) = intervals[at_interval(index)];
+        out[index] = datetime::shifted_stamp(
+            stamps[at_stamp(index)],
+            i64::from(months) * sign,
+            i64::from(days) * sign,
+            i128::from(micros) * i128::from(sign),
+        )?;
+        Ok(())
+    })?;
+    Ok((out, validity))
 }
 
 /// `+`, `-`, `*`, `//` and `%`, on the types the binder has already made match.
@@ -4057,6 +4203,63 @@ mod tests {
             Vector::from_values(LogicalType::BigInt, &[Value::BigInt(i64::MAX)]).expect("one row");
         for arg in forms(&overflowing) {
             agrees("epoch_ms", &[arg], &LogicalType::Timestamp);
+        }
+    }
+
+    /// The interval constructors and a timestamp moved by an interval, which is how the benchmark
+    /// view turns a stored count of seconds into `EventTime`, on both paths and in every form,
+    /// with a count too large to be an interval and a move past the last timestamp among them.
+    #[test]
+    fn the_loops_for_counted_intervals_and_moved_timestamps_agree_with_the_row_at_a_time_path() {
+        let seconds = Vector::from_values(
+            LogicalType::Double,
+            &[Value::Double(1_373_000_000.0), Value::Null, Value::Double(2.7), Value::Double(-0.5)],
+        )
+        .expect("four counts");
+        for arg in forms(&seconds) {
+            agrees("to_seconds", &[arg], &LogicalType::Interval);
+        }
+        let days = Vector::from_values(
+            LogicalType::BigInt,
+            &[Value::BigInt(3), Value::Null, Value::BigInt(-40)],
+        )
+        .expect("three counts");
+        for arg in forms(&days) {
+            agrees("to_days", &[arg.clone()], &LogicalType::Interval);
+            agrees("to_months", &[arg], &LogicalType::Interval);
+        }
+        let huge = Vector::from_values(LogicalType::Double, &[Value::Double(1e300)]).expect("one");
+        for arg in forms(&huge) {
+            agrees("to_seconds", &[arg], &LogicalType::Interval);
+        }
+        let intervals = Vector::from_values(
+            LogicalType::Interval,
+            &[
+                Value::Interval { months: 0, days: 0, micros: 1_373_000_000_000_000 },
+                Value::Null,
+                Value::Interval { months: 1, days: 1, micros: -5 },
+                Value::Interval { months: 0, days: 0, micros: i64::MAX },
+            ],
+        )
+        .expect("four intervals");
+        let stamps = Vector::from_values(
+            LogicalType::Timestamp,
+            &[
+                Value::Timestamp(0),
+                Value::Timestamp(86_400_000_000),
+                Value::Null,
+                Value::Timestamp(-1),
+            ],
+        )
+        .expect("four stamps");
+        let epoch = Vector::constant(LogicalType::Timestamp, Value::Timestamp(0), 4);
+        for interval in forms(&intervals) {
+            for stamp in forms(&stamps).into_iter().chain([epoch.clone()]) {
+                let pair = [stamp.clone(), interval.clone()];
+                agrees("+", &pair, &LogicalType::Timestamp);
+                agrees("-", &pair, &LogicalType::Timestamp);
+                agrees("+", &[interval.clone(), stamp], &LogicalType::Timestamp);
+            }
         }
     }
 
