@@ -82,6 +82,11 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
                 let _ = write!(out, "{row}");
                 return ExitCode::SUCCESS;
             }
+            if let Some(row) = answer_distinct_csv_once(&options) {
+                let mut out = out;
+                let _ = write!(out, "{row}");
+                return ExitCode::SUCCESS;
+            }
             if let Some(result) = answer_once(&options) {
                 let mut out = out;
                 let _ = write!(out, "{}", format::render(&result, &options.settings));
@@ -155,6 +160,13 @@ fn answer_average_csv_once(options: &Options) -> Option<String> {
     let average =
         Database::query_native_average_value_once(&options.database, sql).ok().flatten()?;
     Some(format!("{}\n", rudb::format_double(average)))
+}
+
+fn answer_distinct_csv_once(options: &Options) -> Option<String> {
+    let sql = standard_native_csv_statement(options)?;
+    let count =
+        Database::query_native_distinct_value_once(&options.database, sql).ok().flatten()?;
+    Some(format!("{count}\n"))
 }
 
 /// The `SET` statement each `--set name=value` runs.

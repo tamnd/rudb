@@ -29,15 +29,15 @@ use crate::settings::Settings;
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
 const MEMORY: &str = ":memory:";
 
+fn native_simple_identifier(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 /// A deliberately small recognizer for a single unquoted AVG(column) statement. Anything with
 /// another clause, expression, or quoting rule goes through the SQL parser instead.
 fn native_simple_average_statement(sql: &str) -> Option<(&str, &str)> {
-    fn identifier(text: &str) -> bool {
-        let mut bytes = text.bytes();
-        matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
-            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    }
-
     let statement = sql.trim();
     let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
     let mut words = statement.split_ascii_whitespace();
@@ -56,7 +56,29 @@ fn native_simple_average_statement(sql: &str) -> Option<(&str, &str)> {
         return None;
     }
     let column = &aggregate[4..aggregate.len() - 1];
-    (identifier(column) && identifier(table)).then_some((table, column))
+    (native_simple_identifier(column) && native_simple_identifier(table)).then_some((table, column))
+}
+
+/// Recognizes a single unquoted COUNT(DISTINCT column) without parsing a general SQL result.
+fn native_simple_distinct_statement(sql: &str) -> Option<(&str, &str)> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let aggregate = words.next()?;
+    let column = words.next()?.strip_suffix(')')?;
+    let from = words.next()?;
+    let table = words.next()?;
+    if words.next().is_some()
+        || !select.eq_ignore_ascii_case("select")
+        || !aggregate.eq_ignore_ascii_case("count(distinct")
+        || !from.eq_ignore_ascii_case("from")
+        || !native_simple_identifier(column)
+        || !native_simple_identifier(table)
+    {
+        return None;
+    }
+    Some((table, column))
 }
 
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
@@ -716,6 +738,27 @@ impl Database {
             return Ok(None);
         }
         Ok(Some(sum as f64 / count as f64))
+    }
+
+    /// Reads a certified distinct count for a simple read-only CSV invocation without building
+    /// a parsed query or result vectors. Missing certificates use regular execution.
+    pub fn query_native_distinct_value_once(path: &str, sql: &str) -> Result<Option<i64>> {
+        let Some((table, column)) = native_simple_distinct_statement(sql) else {
+            return Ok(None);
+        };
+        let catalog = rudb_native::Catalog::open(path)?;
+        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table)) else {
+            return Ok(None);
+        };
+        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
+        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(None);
+        };
+        let Some(count) = catalog.distinct_count(name, index)? else {
+            return Ok(None);
+        };
+        Ok(i64::try_from(count).ok())
     }
 
     /// Answers supported read-only aggregates directly from certified native synopses.
@@ -3258,8 +3301,9 @@ mod tests {
 
     use super::{
         Database, native_extrema_shape, native_frequency_group_shape, native_nonzero_shape,
-        native_simple_average_statement, native_single_average_shape, native_single_distinct_shape,
-        native_three_aggregate_shape, publish,
+        native_simple_average_statement, native_simple_distinct_statement,
+        native_single_average_shape, native_single_distinct_shape, native_three_aggregate_shape,
+        publish,
     };
 
     #[test]
@@ -3383,6 +3427,24 @@ mod tests {
     }
 
     #[test]
+    fn simple_distinct_statement_rejects_other_sql() {
+        assert_eq!(
+            native_simple_distinct_statement(" SELECT COUNT(DISTINCT UserID) FROM hits; "),
+            Some(("hits", "UserID"))
+        );
+        for sql in [
+            "SELECT COUNT(DISTINCT UserID) FROM hits WHERE UserID > 0",
+            "SELECT COUNT(DISTINCT UserID + 1) FROM hits",
+            "SELECT COUNT(UserID) FROM hits",
+            "SELECT COUNT(DISTINCT UserID) FROM hits; SELECT 1",
+            "SELECT COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID",
+            "SELECT COUNT(DISTINCT UserID) FROM hits; ;",
+        ] {
+            assert_eq!(native_simple_distinct_statement(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
     fn cold_distinct_matches_regular_execution_with_nulls() {
         let path = std::env::temp_dir().join(format!("rudb-q5-{}.rdb", std::process::id()));
         let name = path.to_str().unwrap();
@@ -3402,6 +3464,20 @@ mod tests {
         for (sql, expected) in cases.into_iter().zip(expected) {
             let actual = Database::query_native_once(name, sql).unwrap().unwrap();
             assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
+        }
+        assert_eq!(
+            Database::query_native_distinct_value_once(
+                name,
+                "SELECT COUNT(DISTINCT UserID) FROM hits"
+            )
+            .unwrap(),
+            Some(2)
+        );
+        for sql in [
+            "SELECT COUNT(DISTINCT UserID) FROM empty_hits",
+            "SELECT COUNT(DISTINCT UserID) FROM null_hits",
+        ] {
+            assert_eq!(Database::query_native_distinct_value_once(name, sql).unwrap(), Some(0));
         }
         std::fs::remove_file(path).unwrap();
     }
