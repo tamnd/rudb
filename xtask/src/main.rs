@@ -209,15 +209,14 @@ fn usage() {
     println!("           a green over a run where the layer never fired is a green that says");
     println!("           nothing, and the cache bytes is how a scale factor small enough to");
     println!("           generate quickly is pushed off the crossover of section 6.4");
-    println!("  linkjoin <dir> [repeats]  the same twenty two queries with the link join and then");
-    println!(
-        "           with `disabled_optimizers = 'link_join'` forcing the hash join, per query,"
-    );
-    println!("           which is claim C3 of spec/graph/09-measurement.md. only the queries that");
-    println!(
-        "           planned a link join are evidence, and the ones that did not are timed too"
-    );
-    println!("           because between them they say what the machine was doing meanwhile");
+    println!("  linkjoin <dir> [repeats] [cache bytes]  the same twenty two queries with the link");
+    println!("           join and then with `disabled_optimizers = 'link_join'` forcing the hash");
+    println!("           join, per query, which is claim C3 of spec/graph/09-measurement.md. only");
+    println!("           the queries that planned a link join are evidence, and the ones that did");
+    println!("           not are timed too because between them they say what the machine was");
+    println!("           doing meanwhile. the cache bytes is the same knob sections takes, and at");
+    println!("           scale factor one it is the difference between evidence and no evidence,");
+    println!("           because every parent side of TPC-H fits in the default cache");
     println!("  ablate <hits.parquet> [repeats]  the forty three ClickBench queries once with");
     println!("           every statistics rule on and once per rule with that rule off, which is");
     println!("           the per rule table of spec/stats/09-measurement.md section 9.4. the file");

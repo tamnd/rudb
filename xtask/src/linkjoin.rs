@@ -22,6 +22,17 @@
 //! claim names. Rebuilding the file without links would have measured a different file as well as a
 //! different plan.
 //!
+//! # Why there is a cache argument
+//!
+//! Section 6.7 is that the rule builds a hash table when the parent side fits in cache, and at scale
+//! factor one every TPC-H parent side does. Run with nothing said about the cache, all twenty two
+//! queries plan zero link joins and the table is twenty two floor rows and no evidence at all, which
+//! is what the first run of this printed. The third argument is `graph_cache_bytes`, the same knob
+//! `cargo xtask sections` takes for the same reason, and it moves the crossover rather than the rule:
+//! the planner still decides, it decides against a smaller cache. A run that uses it says so at the
+//! top, because a table of timings taken with the cache lied about is not a table of a default
+//! configuration and should not be read as one.
+//!
 //! # Which queries are evidence
 //!
 //! Only the ones that plan a link join. A query the planner never chose the rule for says nothing
@@ -72,7 +83,9 @@ impl Outcome {
 /// Loads the directory, runs the suite both ways and prints the per query table.
 pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let Some(data) = args.first() else {
-        return Err("cargo xtask linkjoin <directory of tpch parquet files> [repeats]".into());
+        return Err(
+            "cargo xtask linkjoin <directory of tpch parquet files> [repeats] [cache bytes]".into(),
+        );
     };
     let repeats = match args.get(1) {
         Some(text) => text.parse::<usize>().map_err(|_| format!("`{text}` is not a count"))?,
@@ -81,10 +94,14 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     if repeats == 0 {
         return Err("a run of nothing measures nothing, ask for at least one repeat".into());
     }
+    let cache = match args.get(2) {
+        Some(text) => Some(text.parse::<u64>().map_err(|_| format!("`{text}` is not a size"))?),
+        None => None,
+    };
     let data = PathBuf::from(data);
     let queries = queries(root)?;
     let path = scratch();
-    let database = load(&data, &path, None)?;
+    let database = load(&data, &path, cache)?;
 
     println!();
     println!("corpus   {}", data.display());
@@ -227,6 +244,9 @@ fn one(database: &Database, sql: &str, repeats: usize) -> Outcome {
 
 /// One run of one query, with the rule taken away or left alone, as its rows and its milliseconds.
 fn once(database: &Database, sql: &str, forced: bool) -> Result<(Vec<String>, f64), String> {
+    // Both sides read the sections. The control takes one rewrite away and leaves the layer in
+    // place, which is the comparison claim C3 names: two plans over one file, not two files.
+    database.execute("SET graph_sections = 'on'").map_err(say)?;
     let setting = if forced {
         "SET disabled_optimizers = 'link_join'"
     } else {
