@@ -23,6 +23,7 @@ mod context;
 mod expr;
 pub mod fold;
 mod lambda;
+mod listaggr;
 mod parameters;
 mod scope;
 mod statement;

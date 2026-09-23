@@ -577,6 +577,9 @@ impl Binder<'_> {
         if let Some(expanded) = self.list_macro(&written, &bound)? {
             return Ok(expanded);
         }
+        if let Some(aggregated) = self.list_aggregate(&written, &bound)? {
+            return Ok(aggregated);
+        }
         // `typeof` is answered here rather than by a kernel, because the type is settled the moment
         // its argument is bound and nothing about it changes per row. The argument still has to be
         // a legal expression where it was written, so it goes through the aggregate rules first and
