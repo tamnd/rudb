@@ -200,15 +200,20 @@ fn usage() {
     println!("           a trailing child.column->parent.column builds that relationship's");
     println!("           forward link after the maps, and prints its form, its bytes and its");
     println!("           share of the child table, which is the size claim of section 9.1");
-    println!("  sections <dir> [cache bytes]  the twenty two TPC-H queries out of a directory of");
-    println!("           parquet files, run with graph_sections off and then on and compared byte");
-    println!("           for byte, which is the exit criterion of spec/graph/09-measurement.md");
+    println!("  sections <dir> [cache bytes] [query]  the twenty two TPC-H queries out of a");
+    println!("           directory of parquet files, run with graph_sections off and then on and");
+    println!("           compared byte for byte, which is the exit criterion of");
     println!(
-        "           section 9.2. the table says per query how many joins read a link, because"
+        "           spec/graph/09-measurement.md section 9.2. the table says per query how many"
     );
-    println!("           a green over a run where the layer never fired is a green that says");
-    println!("           nothing, and the cache bytes is how a scale factor small enough to");
-    println!("           generate quickly is pushed off the crossover of section 6.4");
+    println!(
+        "           joins read a link, because a green over a run where the layer never fired"
+    );
+    println!("           is a green that says nothing, and the cache bytes is how a scale factor");
+    println!("           small enough to generate quickly is pushed off the crossover of section");
+    println!("           6.4. name one query and it prints that query's plan with the link join");
+    println!("           rule on and then off instead of the table, which is how you find out why");
+    println!("           the rule chose what it chose");
     println!("  linkjoin <dir> [repeats] [cache bytes]  the same twenty two queries with the link");
     println!("           join and then with `disabled_optimizers = 'link_join'` forcing the hash");
     println!("           join, per query, which is claim C3 of spec/graph/09-measurement.md. only");

@@ -145,6 +145,17 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let path = scratch();
     let database = load(&data, &path, cache)?;
 
+    // One query named, so print its two plans and stop. The table below says which queries read a
+    // link and `cargo xtask linkjoin` says what that cost them, and the question both of them leave
+    // is why, which is a question only the plan answers. Section 6.7 makes the rule explain itself
+    // on the join line, so the two plans side by side are the whole of the reasoning.
+    if let Some(wanted) = args.get(2) {
+        let outcome = explain(&database, &queries, wanted);
+        drop(database);
+        std::fs::remove_file(&path).ok();
+        return outcome;
+    }
+
     println!("{:<6}{:>8}{:>10}{:>16}  ms off / ms on", "query", "links", "rows", "verdict");
     println!("{}", "-".repeat(64));
     let mut same = 0;
@@ -328,6 +339,42 @@ pub(crate) fn plan(database: &Database, sql: &str) -> String {
         return String::new();
     }
     result.text_at(0, 1)
+}
+
+/// Prints one query's plan with the link join rule on and then with it forced off.
+///
+/// The control is the same one `cargo xtask linkjoin` uses, `disabled_optimizers = 'link_join'`, so
+/// what appears between the two is the rewrite and nothing else. Both are explained with
+/// `graph_sections` on, because the question is which join algorithm the rule picked and not whether
+/// the layer is there at all.
+fn explain(database: &Database, queries: &[(String, String)], wanted: &str) -> Result<(), String> {
+    let Some((name, sql)) = queries.iter().find(|(name, _)| name == wanted) else {
+        let names = queries.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" ");
+        return Err(format!("there is no {wanted} in the suite, which holds {names}"));
+    };
+    for forced in [false, true] {
+        let setting = if forced {
+            "SET disabled_optimizers = 'link_join'"
+        } else {
+            "SET disabled_optimizers = ''"
+        };
+        database.execute(setting).map_err(say)?;
+        let heading =
+            if forced { "with the link join rule off" } else { "as the planner chose it" };
+        println!("\n{name} {heading}\n");
+        let text = plan(database, sql);
+        if text.is_empty() {
+            println!("  the query did not plan");
+        } else {
+            for line in text.lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    // Left off, because `disabled_optimizers` is a session setting and anything reusing this
+    // database afterwards would plan through the control without having asked to.
+    database.execute("SET disabled_optimizers = ''").map_err(say)?;
+    Ok(())
 }
 
 /// The eight tables out of the directory, the relationships declared, and the whole thing written.
