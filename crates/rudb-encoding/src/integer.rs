@@ -41,6 +41,8 @@
 //! this milestone produces are the sampler's numbers rather than the format's, and there would be
 //! no way to tell how much the sampler is leaving behind.
 
+use std::collections::BTreeMap;
+
 use rudb_common::{Error, Result};
 
 use crate::chooser::{Chooser, EXHAUSTIVE};
@@ -179,6 +181,93 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
         )));
     }
     Ok(values)
+}
+
+/// Counts values in one encoded chunk without expanding sparse or run-length chunks into rows.
+///
+/// The result is computed from the encoded row values when called. It is not a stored histogram.
+/// Other encodings use the ordinary decoder until they have a useful count form of their own.
+///
+/// # Errors
+///
+/// As [`decode`], or if a sparse position or run length is outside the chunk.
+pub fn tally(bytes: &[u8]) -> Result<(usize, Vec<(i64, u64)>)> {
+    let mut reader = Reader::new(bytes);
+    let kind = Kind::from_tag(reader.u8()?)?;
+    let count = reader.u32()? as usize;
+    let mut counts = BTreeMap::<i64, u64>::new();
+    match kind {
+        Kind::Constant => {
+            let value = reader.i64()?;
+            if count != 0 {
+                counts.insert(value, count as u64);
+            }
+        }
+        Kind::Sparse => {
+            let dominant = reader.i64()?;
+            let exception_count = reader.u32()? as usize;
+            let (positions, values) = with_decoding(|scratch| -> Result<_> {
+                Ok((decode_chunk(&mut reader, scratch)?, decode_chunk(&mut reader, scratch)?))
+            })?;
+            if positions.len() != exception_count || values.len() != exception_count {
+                return Err(Error::internal("a sparse chunk disagrees about its exception count"));
+            }
+            // The ordinary decoder lets a later exception overwrite an earlier one at the same
+            // position. Keep the same rule rather than counting both entries.
+            let mut exceptions = BTreeMap::<usize, i64>::new();
+            for (position, value) in positions.into_iter().zip(values) {
+                let position = usize::try_from(position)
+                    .ok()
+                    .filter(|&position| position < count)
+                    .ok_or_else(|| Error::internal("a sparse exception is outside the chunk"))?;
+                exceptions.insert(position, value);
+            }
+            let dominant_count = count - exceptions.len();
+            if dominant_count != 0 {
+                counts.insert(dominant, dominant_count as u64);
+            }
+            for value in exceptions.into_values() {
+                *counts.entry(value).or_default() += 1;
+            }
+        }
+        Kind::Rle => {
+            let (values, lengths) = with_decoding(|scratch| -> Result<_> {
+                Ok((decode_chunk(&mut reader, scratch)?, decode_chunk(&mut reader, scratch)?))
+            })?;
+            if values.len() != lengths.len() {
+                return Err(Error::internal("an RLE chunk has more runs than run lengths"));
+            }
+            let mut rows = 0_usize;
+            for (value, length) in values.into_iter().zip(lengths) {
+                let length = usize::try_from(length)
+                    .map_err(|_| Error::internal("a negative RLE run length"))?;
+                rows = rows
+                    .checked_add(length)
+                    .filter(|&rows| rows <= count)
+                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
+                if length != 0 {
+                    *counts.entry(value).or_default() += length as u64;
+                }
+            }
+            check_count(rows, count)?;
+        }
+        _ => {
+            // Re-read the header through the existing decoder for the other cascade shapes.
+            reader = Reader::new(bytes);
+            let values = with_decoding(|scratch| decode_chunk(&mut reader, scratch))?;
+            check_count(values.len(), count)?;
+            for value in values {
+                *counts.entry(value).or_default() += 1;
+            }
+        }
+    }
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after counting a chunk",
+            reader.remaining()
+        )));
+    }
+    Ok((count, counts.into_iter().collect()))
 }
 
 /// Decodes selected row positions from a chunk written by [`encode`].
@@ -1445,6 +1534,30 @@ mod tests {
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Sparse);
         assert!(bytes.len() < 3000, "{} bytes for 300 exceptions", bytes.len());
+    }
+
+    #[test]
+    fn encoded_counts_match_decoded_rows_across_integer_shapes() {
+        let mut sparse = vec![0_i64; 4096];
+        for (index, value) in [(7, -3), (91, 12), (1001, -3), (3000, 12)] {
+            sparse[index] = value;
+        }
+        let mut runs = Vec::new();
+        for value in [0, 7, 0, -5] {
+            runs.extend(std::iter::repeat_n(value, 500));
+        }
+        let mut random = Random::new();
+        let packed = (0..2000).map(|_| (random.next() % 251) as i64).collect::<Vec<_>>();
+        for values in [vec![0_i64; 1024], sparse, runs, packed] {
+            let bytes = encode(&values).unwrap();
+            let (rows, counts) = tally(&bytes).unwrap();
+            let mut expected = BTreeMap::<i64, u64>::new();
+            for value in decode(&bytes).unwrap() {
+                *expected.entry(value).or_default() += 1;
+            }
+            assert_eq!(rows, values.len());
+            assert_eq!(counts, expected.into_iter().collect::<Vec<_>>());
+        }
     }
 
     #[test]
