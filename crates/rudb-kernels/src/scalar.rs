@@ -1791,6 +1791,28 @@ impl StableLike {
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
         let first = code / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
+        if !like.fold_case {
+            if let Pattern::Contains(finder) = &like.compiled {
+                if finder.needle().len() >= 4
+                    && !self.dictionary.text_block_might_contain(first, finder.needle())
+                {
+                    // A stored signature can only prove absence. Mark the whole group as decided,
+                    // with the negated answer when this is NOT LIKE, without decoding its payload.
+                    let word = if like.negated { u64::MAX } else { 0x5555_5555_5555_5555 };
+                    for step in 0..(last - first).div_ceil(MEMO_VALUES) {
+                        let remaining = (last - first - step * MEMO_VALUES).min(MEMO_VALUES);
+                        let mask = if remaining == MEMO_VALUES {
+                            u64::MAX
+                        } else {
+                            (1_u64 << (remaining * 2)) - 1
+                        };
+                        self.word(first / MEMO_VALUES + step)?
+                            .fetch_or(word & mask, Ordering::Release);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let mut bits = [0_u64; LIKE_GROUP / MEMO_VALUES];
         let mut at = first;
         while at < last {
