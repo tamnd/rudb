@@ -106,6 +106,7 @@ use rudb_vector::{Assembly, Chunk, VECTOR_SIZE, Vector};
 
 use crate::merged::{ORDER, Sorted, order_of, ordering};
 use crate::normal::{self, Normal};
+use crate::pairs::in_parallel;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::runs::Runs;
@@ -259,6 +260,19 @@ impl Keyed {
                 rows.sort_by(|left, right| settled(keys, left, right, &mut failure));
                 failure.map_or(Ok(()), Err)
             }
+        }
+    }
+
+    /// The same order as [`Keyed::sort`], put in place on the lease's threads.
+    ///
+    /// Only the normalized arm is spread. The valued arm compares through a function that can fail
+    /// and is left on this thread, which is also where it would be for the types it covers anyway.
+    fn sort_across(&mut self, keys: &[SortKey], threads: &Lease<'_>) -> Result<()> {
+        match self {
+            Self::Normal(rows) => spread(rows, threads, |left, right| {
+                left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+            }),
+            Self::Valued(_) => self.sort(keys),
         }
     }
 
@@ -581,7 +595,7 @@ impl Sink for Sort {
         Ok(())
     }
 
-    fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
+    fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
         let Combined { chunks, mut rows } = {
             let mut gathered = self.gathered.lock().map_err(poisoned)?;
             let empty = Combined { chunks: Vec::new(), rows: gathered.rows.empty() };
@@ -601,7 +615,7 @@ impl Sink for Sort {
             }
             return self.out.merge(files, self.types.clone());
         }
-        rows.sort(&self.keys)?;
+        rows.sort_across(&self.keys, threads)?;
         let total = rows.len();
         if u32::try_from(total).is_err() {
             return Err(too_many());
@@ -613,10 +627,45 @@ impl Sink for Sort {
         drop(rows);
         give(&mut charged, taken);
         let mut held = self.held.lock().map_err(poisoned)?;
-        let out = gathered(&self.types, chunks, &at, total, &mut held, &mut charged)?;
+        let out = gathered(&self.types, chunks, &at, total, &mut held, &mut charged, threads)?;
         self.out.hold(out)?;
         Ok(())
     }
+}
+
+/// Sorts `rows` on the lease's threads, in place and without a second copy of them.
+///
+/// Cut at the median until there is a piece a thread, which leaves every row of a piece ordered
+/// before every row of the piece after it, and then each piece is sorted on its own. Finding a
+/// median is one pass over the piece, so the only step that reads every row on one thread is the
+/// first cut. `order` has to be total with no two rows equal, which the arrival makes it, or the
+/// halves would not be where the rows belong.
+fn spread<T: Send>(
+    rows: &mut [T],
+    threads: &Lease<'_>,
+    order: impl Fn(&T, &T) -> Ordering + Sync,
+) -> Result<()> {
+    let degree = threads.degree();
+    let mut pieces: Vec<&mut [T]> = vec![rows];
+    while pieces.len() < degree && pieces.iter().all(|piece| piece.len() > VECTOR_SIZE) {
+        let held: Vec<Mutex<&mut [T]>> = pieces.into_iter().map(Mutex::new).collect();
+        let halves = in_parallel(threads, held.len(), degree, "halved sorted piece", |at| {
+            let slot =
+                held.get(at).ok_or_else(|| Error::internal("a sorted piece past the end"))?;
+            let piece = std::mem::take(&mut *slot.lock().map_err(poisoned)?);
+            let middle = piece.len() / 2;
+            piece.select_nth_unstable_by(middle, &order);
+            Ok(piece.split_at_mut(middle))
+        })?;
+        pieces = halves.into_iter().flat_map(|(left, right)| [left, right]).collect();
+    }
+    let held: Vec<Mutex<&mut [T]>> = pieces.into_iter().map(Mutex::new).collect();
+    in_parallel(threads, held.len(), degree, "sorted piece", |at| {
+        let slot = held.get(at).ok_or_else(|| Error::internal("a sorted piece past the end"))?;
+        slot.lock().map_err(poisoned)?.sort_unstable_by(&order);
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Where each row that arrived lands, kept the way an [`Assembly`] wants to be handed it.
@@ -691,7 +740,16 @@ fn lay(
     if rows == 0 {
         return Ok(());
     }
-    // Transposed: the pieces of one column of every chunk, so that a column is one thing to drop.
+    for (ty, pieces) in types.iter().zip(transposed(types, chunks)?) {
+        let (whole, given) = column(ty, pieces, at, rows)?;
+        give(charged, given);
+        each(&whole)?;
+    }
+    Ok(())
+}
+
+/// The pieces of one column of every chunk, a list a column, so that a column is one thing to drop.
+fn transposed(types: &[LogicalType], chunks: Vec<Chunk>) -> Result<Vec<Vec<Vector>>> {
     let mut pieces: Vec<Vec<Vector>> = vec![Vec::with_capacity(chunks.len()); types.len()];
     for chunk in chunks {
         for (position, column) in chunk.into_columns().into_iter().enumerate() {
@@ -701,21 +759,33 @@ fn lay(
             into.push(column);
         }
     }
-    for (position, ty) in types.iter().enumerate() {
-        let mut assembly = Assembly::new(ty.clone(), rows)?;
-        let laid = pieces.get_mut(position).map(std::mem::take).unwrap_or_default();
-        for (piece, places) in laid.iter().zip(at) {
-            assembly.place(places, piece)?;
-        }
-        let given = laid.iter().map(Vector::footprint).sum::<usize>();
-        drop(laid);
-        give(charged, u64::try_from(given).unwrap_or(u64::MAX));
-        each(&assembly.finish()?.into_pages())?;
+    Ok(pieces)
+}
+
+/// One column laid in sorted order, and how many bytes of input dropping its pieces gave back.
+fn column(
+    ty: &LogicalType,
+    pieces: Vec<Vector>,
+    at: &[Vec<u32>],
+    rows: usize,
+) -> Result<(Vector, u64)> {
+    let mut assembly = Assembly::new(ty.clone(), rows)?;
+    for (piece, places) in pieces.iter().zip(at) {
+        assembly.place(places, piece)?;
     }
-    Ok(())
+    let given = pieces.iter().map(Vector::footprint).sum::<usize>();
+    drop(pieces);
+    Ok((assembly.finish()?.into_pages(), u64::try_from(given).unwrap_or(u64::MAX)))
 }
 
 /// The sorted rows as chunks, for a sort that is going to hand them back rather than write them.
+///
+/// The columns are laid on the lease's threads, a column each, rather than one after another the
+/// way [`lay`] does it. The columns do not share anything, and on one thread this was most of what
+/// a sort that fitted spent after its input ran out: 1.2s of 1.55s on SF1 `lineitem`, with the
+/// other threads idle (#1210). The headroom it costs is a column a thread rather than one column,
+/// which a sort that fitted can afford and a sort that is spilling cannot, and that is why the
+/// spilling path still goes through [`lay`].
 ///
 /// # Errors
 ///
@@ -727,19 +797,33 @@ fn gathered(
     rows: usize,
     held: &mut Reservation,
     charged: &mut Vec<Reservation>,
+    threads: &Lease<'_>,
 ) -> Result<Vec<Chunk>> {
     if rows == 0 {
         return Ok(Vec::new());
     }
+    let pieces: Vec<Mutex<Vec<Vector>>> =
+        transposed(types, chunks)?.into_iter().map(Mutex::new).collect();
+    let charged = Mutex::new(charged);
+    let wholes =
+        in_parallel(threads, types.len(), threads.degree(), "laid sorted column", |position| {
+            let (Some(ty), Some(pieces)) = (types.get(position), pieces.get(position)) else {
+                return Err(Error::internal("a sorted column past the end of the schema"));
+            };
+            let pieces = std::mem::take(&mut *pieces.lock().map_err(poisoned)?);
+            let (whole, given) = column(ty, pieces, at, rows)?;
+            give(*charged.lock().map_err(poisoned)?, given);
+            Ok(whole)
+        })?;
     let blocks = rows.div_ceil(VECTOR_SIZE);
     let mut columns: Vec<Vec<Vector>> = vec![Vec::with_capacity(types.len()); blocks];
-    lay(types, chunks, at, rows, charged, |whole| {
+    for whole in &wholes {
         for (block, into) in columns.iter_mut().enumerate() {
             let start = block * VECTOR_SIZE;
             into.push(whole.slice(start, (rows - start).min(VECTOR_SIZE))?);
         }
-        Ok(())
-    })?;
+    }
+    drop(wholes);
     let mut built = Vec::with_capacity(blocks);
     for (block, columns) in columns.into_iter().enumerate() {
         let start = block * VECTOR_SIZE;
@@ -837,4 +921,40 @@ pub(crate) fn rank(left: &Value, right: &Value, key: SortKey) -> Result<Ordering
 
 fn poisoned<T>(_: T) -> Error {
     Error::internal("a thread panicked while holding the rows a sort is gathering")
+}
+
+#[cfg(test)]
+mod tests {
+    use rudb_pipeline::{Lease, Pool};
+    use rudb_vector::VECTOR_SIZE;
+
+    use super::spread;
+
+    /// Rows with keys that repeat a lot and an arrival that settles every tie, shuffled.
+    fn shuffled(count: usize) -> Vec<(u64, u64)> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..count as u64)
+            .map(|arrival| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 97, arrival)
+            })
+            .collect()
+    }
+
+    /// Spread over threads, the order is the one a single sort gives, for sizes around the cuts.
+    #[test]
+    fn a_spread_sort_puts_the_rows_where_one_sort_would() {
+        let pool = Pool::new(4);
+        for threads in [Lease::alone(), pool.lease(4)] {
+            for count in [0, 1, VECTOR_SIZE, VECTOR_SIZE + 1, VECTOR_SIZE * 9 + 7] {
+                let mut spread_out = shuffled(count);
+                let mut expected = spread_out.clone();
+                expected.sort_unstable();
+                spread(&mut spread_out, &threads, Ord::cmp).expect("sorted");
+                assert_eq!(spread_out, expected, "{count} rows on {} threads", threads.degree());
+            }
+        }
+    }
 }
