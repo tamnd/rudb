@@ -18,15 +18,32 @@
 //! column rather than shared across the frequency workers, so the file a load writes does not depend
 //! on which worker reached which column first.
 
-/// The most slots one column's set may hold, which is 256 MiB of keys.
+/// The most slots one column's sets may hold between them, which is 256 MiB of keys.
 ///
 /// At the load factor below that is a little over twenty nine million distinct values, which covers
 /// `UserID` at the full hundred million row `hits` table, seventeen and a half million, and gives up
 /// on `WatchID`, which is near unique there and whose count the row path already gets right.
 const MAX_SLOTS: usize = 1 << 25;
 
-/// The first table's size, small enough that a column of flags does not pay for a large one.
-const FIRST_SLOTS: usize = 1 << 10;
+/// How many distinct values a column may have and still be counted, the seven eighths of
+/// [`MAX_SLOTS`] one table of that size would have held before it had to grow past the cap.
+const MAX_DISTINCT: usize = MAX_SLOTS / 8 * 7;
+
+/// How many sets a column's values are spread over, by the top bits of their hash.
+///
+/// One set of twenty nine million keys is 256 MiB, and a value landing anywhere in it is a miss in
+/// every cache and in the page table as well, which is what the first pass over `WatchID` spent a
+/// third of its time on. A value goes to a buffer for its set instead, and a set is only touched
+/// when its buffer is full, so each touch is a run of inserts into one part of a 256th the size.
+const SETS: usize = 1 << SET_BITS;
+const SET_BITS: u32 = 8;
+
+/// How many values wait for their set, which is 128 KiB of buffers across [`SETS`] and fits in the
+/// second level cache beside the set being filled.
+const BUFFERED: usize = 64;
+
+/// One set's first size, small enough that a column of flags does not pay for a large one.
+const FIRST_SLOTS: usize = 1 << 4;
 
 /// Values stay under seven eighths of the slots.
 ///
@@ -37,25 +54,43 @@ fn full(len: usize, slots: usize) -> bool {
     len * 8 >= slots * 7
 }
 
-/// Fibonacci hashing, the top bits of the value times the golden ratio in sixty four bits.
-fn slot(value: u64, shift: u32) -> usize {
-    (value.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+/// Fibonacci hashing, the value times the golden ratio in sixty four bits.
+///
+/// The multiplier is odd, so this is a bijection of the sixty four bit values and the sets hold the
+/// hashes rather than the values: two hashes are equal exactly when the values are, and zero is
+/// still only ever the hash of zero.
+fn hash(value: u64) -> u64 {
+    value.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// An exact set of one column's distinct non-null values, or the record that there were too many.
 #[derive(Debug)]
 pub(crate) struct ExactDistinct {
-    /// Zero marks an empty slot, so a zero value is held in [`Self::zero`] instead.
-    slots: Vec<u64>,
+    /// One open addressed set per top eight bits of the hash. Zero marks an empty slot, so a zero
+    /// value is held in [`Self::zero`] instead.
+    sets: Vec<Vec<u64>>,
+    /// How many hashes each set holds.
+    held: Vec<usize>,
+    /// [`BUFFERED`] hashes per set waiting to go in, and how many of each are there.
+    buffered: Vec<u64>,
+    waiting: Vec<u8>,
     zero: bool,
     len: usize,
-    /// Set when the cap was passed. The slots are released at that point rather than at the end.
+    /// Set when the cap was passed. The sets are released at that point rather than at the end.
     gave_up: bool,
 }
 
 impl ExactDistinct {
     pub(crate) fn new() -> Self {
-        Self { slots: vec![0; FIRST_SLOTS], zero: false, len: 0, gave_up: false }
+        Self {
+            sets: vec![vec![0; FIRST_SLOTS]; SETS],
+            held: vec![0; SETS],
+            buffered: vec![0; SETS * BUFFERED],
+            waiting: vec![0; SETS],
+            zero: false,
+            len: 0,
+            gave_up: false,
+        }
     }
 
     /// Adds one value's bits.
@@ -67,46 +102,73 @@ impl ExactDistinct {
             self.zero = true;
             return;
         }
-        if !self.place(value) {
-            return;
-        }
-        self.len += 1;
-        if full(self.len, self.slots.len()) {
-            self.grow();
+        let hash = hash(value);
+        let set = (hash >> (64 - SET_BITS)) as usize;
+        let waiting = usize::from(self.waiting[set]);
+        self.buffered[set * BUFFERED + waiting] = hash;
+        if waiting + 1 == BUFFERED {
+            self.drain(set);
+        } else {
+            self.waiting[set] = (waiting + 1) as u8;
         }
     }
 
     /// The count, or `None` for a column that went past the cap.
-    pub(crate) fn count(&self) -> Option<u64> {
+    pub(crate) fn count(&mut self) -> Option<u64> {
+        for set in 0..SETS {
+            if self.gave_up {
+                break;
+            }
+            self.drain(set);
+        }
         (!self.gave_up).then(|| self.len as u64 + u64::from(self.zero))
     }
 
-    /// Puts a nonzero value in its slot and says whether it was new.
-    fn place(&mut self, value: u64) -> bool {
-        let mask = self.slots.len() - 1;
-        let mut at = slot(value, 64 - self.slots.len().trailing_zeros());
-        loop {
-            match self.slots[at] {
-                0 => {
-                    self.slots[at] = value;
-                    return true;
+    /// Moves one set's waiting hashes into it.
+    ///
+    /// Whether a column gives up depends only on how many distinct values it has, never on the
+    /// order they were drained in, because the count only goes up and the cap is on the total.
+    fn drain(&mut self, set: usize) {
+        let waiting = usize::from(std::mem::take(&mut self.waiting[set]));
+        let from = set * BUFFERED;
+        for at in from..from + waiting {
+            let hash = self.buffered[at];
+            if !place(&mut self.sets[set], hash) {
+                continue;
+            }
+            self.held[set] += 1;
+            self.len += 1;
+            if full(self.held[set], self.sets[set].len()) {
+                let wanted = self.sets[set].len() * 2;
+                let old = std::mem::replace(&mut self.sets[set], vec![0; wanted]);
+                for hash in old.into_iter().filter(|&hash| hash != 0) {
+                    place(&mut self.sets[set], hash);
                 }
-                held if held == value => return false,
-                _ => at = (at + 1) & mask,
             }
         }
-    }
-
-    fn grow(&mut self) {
-        let wanted = self.slots.len() * 2;
-        if wanted > MAX_SLOTS {
+        if self.len >= MAX_DISTINCT {
             self.gave_up = true;
-            self.slots = Vec::new();
-            return;
+            self.sets = Vec::new();
+            self.buffered = Vec::new();
         }
-        let old = std::mem::replace(&mut self.slots, vec![0; wanted]);
-        for value in old.into_iter().filter(|&value| value != 0) {
-            self.place(value);
+    }
+}
+
+/// Puts a nonzero hash in its slot and says whether it was new.
+///
+/// The slot comes from the bits under the ones that chose the set, which every hash in the set
+/// shares.
+fn place(slots: &mut [u64], hash: u64) -> bool {
+    let mask = slots.len() - 1;
+    let mut at = ((hash << SET_BITS) >> (64 - slots.len().trailing_zeros())) as usize;
+    loop {
+        match slots[at] {
+            0 => {
+                slots[at] = hash;
+                return true;
+            }
+            held if held == hash => return false,
+            _ => at = (at + 1) & mask,
         }
     }
 }
@@ -135,13 +197,16 @@ mod tests {
 
     #[test]
     fn a_column_past_the_cap_records_nothing() {
+        // One short of the cap is counted, and the value that reaches it is not, whichever order
+        // the buffers happened to drain in.
         let mut set = ExactDistinct::new();
-        let mut value = 1_u64;
-        while set.count().is_some() {
+        for value in 1..MAX_DISTINCT as u64 {
             set.insert(value);
-            value += 1;
         }
-        assert!(value as usize > MAX_SLOTS / 8 * 7, "gave up before the cap");
-        assert!(set.slots.is_empty(), "a column that gave up still holds its table");
+        set.insert(0);
+        assert_eq!(set.count(), Some(MAX_DISTINCT as u64), "gave up before the cap");
+        set.insert(MAX_DISTINCT as u64);
+        assert_eq!(set.count(), None, "counted past the cap");
+        assert!(set.sets.is_empty(), "a column that gave up still holds its table");
     }
 }

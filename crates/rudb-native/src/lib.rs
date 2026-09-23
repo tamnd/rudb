@@ -434,12 +434,12 @@ enum FrequencyValue {
     Code(u32),
 }
 
-/// A table keyed by the values the frequency pass counts.
+/// A table keyed by the sixty four bits of the values the numeric frequency pass counts.
 ///
 /// Every integer of every numeric column goes through one of these at least once when a table
 /// closes, and with the standard hasher that was a fifth of the close on its own, all of it SipHash
 /// guarding against an attacker who would have to choose the rows of the file being written.
-type FrequencyMap<V> = HashMap<FrequencyValue, V, Spread>;
+type FrequencyMap<V> = HashMap<u64, V, Spread>;
 
 /// Builds the hasher for [`FrequencyMap`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -2198,50 +2198,74 @@ impl Writer {
     /// [`distinct`], which is the number a string column gets from its dictionary. It comes back
     /// beside the summary because a column whose heavy hitters cannot be proved can still have been
     /// counted.
+    ///
+    /// The tables are keyed by a value's sixty four bits rather than by [`FrequencyValue`], and a
+    /// null is counted beside them. Every integer type the format stores fits in those bits, so
+    /// within one column two values share bits only if they are the same value, and a sixteen byte
+    /// entry keeps the whole candidate table in the second level cache where the forty eight byte
+    /// one did not. The null takes part in the candidate table exactly as a key would: it holds a
+    /// place while its count is above zero, and it is decremented with the rest.
     fn numeric_frequency(&self, column: usize) -> Result<(Option<FrequencySummary>, Option<u64>)> {
-        let ty = &self.table.fields[column].ty;
-        if !matches!(
-            ty,
+        let signed = match self.table.fields[column].ty {
             LogicalType::TinyInt
-                | LogicalType::SmallInt
-                | LogicalType::Integer
-                | LogicalType::BigInt
-                | LogicalType::UTinyInt
-                | LogicalType::USmallInt
-                | LogicalType::UInteger
-                | LogicalType::UBigInt
-                | LogicalType::Date
-                | LogicalType::Timestamp
-        ) {
-            return Ok((None, None));
-        }
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::Date
+            | LogicalType::Timestamp => true,
+            LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt => false,
+            _ => return Ok((None, None)),
+        };
+        let value_of = |bits: Option<u64>| match bits {
+            None => FrequencyValue::Null,
+            Some(bits) if signed => FrequencyValue::Integer(i128::from(bits as i64)),
+            Some(bits) => FrequencyValue::Integer(i128::from(bits)),
+        };
         let mut candidates: FrequencyMap<u32> = FrequencyMap::default();
+        let mut nulls = 0_u32;
         let mut decrements = 0_u64;
         let mut distinct = distinct::ExactDistinct::new();
-        self.visit_numeric(column, |_, value| {
-            // The low sixty four bits, which is every bit any integer column stores.
-            if let FrequencyValue::Integer(value) = value {
-                distinct.insert(value as u64);
-            }
-            if let Some(count) = candidates.get_mut(&value) {
+        self.visit_numeric(column, signed, |_, bits| {
+            let held = match bits {
+                Some(bits) => {
+                    distinct.insert(bits);
+                    candidates.get_mut(&bits)
+                }
+                None if nulls != 0 => Some(&mut nulls),
+                None => None,
+            };
+            if let Some(count) = held {
                 *count = count.saturating_add(1);
-            } else if candidates.len() < FREQUENCY_CANDIDATES {
-                candidates.insert(value, 1);
+            } else if candidates.len() + usize::from(nulls != 0) < FREQUENCY_CANDIDATES {
+                match bits {
+                    Some(bits) => {
+                        candidates.insert(bits, 1);
+                    }
+                    None => nulls = 1,
+                }
             } else {
                 candidates.retain(|_, count| {
                     *count -= 1;
                     *count != 0
                 });
+                nulls = nulls.saturating_sub(1);
                 decrements = decrements.saturating_add(1);
             }
         })?;
-        let exact = if decrements == 0 {
-            candidates
+        let (exact, null_count) = if decrements == 0 {
+            let exact = candidates
                 .into_iter()
-                .map(|(value, count)| (value, u64::from(count)))
-                .collect::<FrequencyMap<_>>()
+                .map(|(bits, count)| (bits, u64::from(count)))
+                .collect::<FrequencyMap<_>>();
+            (exact, (nulls != 0).then_some(u64::from(nulls)))
         } else {
             let mut lower = candidates.values().copied().collect::<Vec<_>>();
+            if nulls != 0 {
+                lower.push(nulls);
+            }
             lower.sort_unstable_by(|left, right| right.cmp(left));
             if lower.len() < FREQUENCY_BUILD_RANK
                 || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
@@ -2249,17 +2273,23 @@ impl Writer {
                 return Ok((None, distinct.count()));
             }
             let mut exact =
-                candidates.into_keys().map(|value| (value, 0_u64)).collect::<FrequencyMap<_>>();
-            self.visit_numeric(column, |_, value| {
-                if let Some(count) = exact.get_mut(&value) {
+                candidates.into_keys().map(|bits| (bits, 0_u64)).collect::<FrequencyMap<_>>();
+            let mut null_count = (nulls != 0).then_some(0_u64);
+            self.visit_numeric(column, signed, |_, bits| {
+                let held = match bits {
+                    Some(bits) => exact.get_mut(&bits),
+                    None => null_count.as_mut(),
+                };
+                if let Some(count) = held {
                     *count = count.saturating_add(1);
                 }
             })?;
-            exact
+            (exact, null_count)
         };
         let mut entries = exact
             .into_iter()
-            .map(|(value, count)| FrequencyEntry { value, count })
+            .map(|(bits, count)| FrequencyEntry { value: value_of(Some(bits)), count })
+            .chain(null_count.map(|count| FrequencyEntry { value: FrequencyValue::Null, count }))
             .collect::<Vec<_>>();
         let omitted_max = keep_most_frequent(&mut entries).max(decrements);
         let kept_rows = entries.iter().try_fold(0_u64, |total, entry| {
@@ -2268,21 +2298,27 @@ impl Writer {
         let mut ordinals = Vec::new();
         let mut ordinal_entries = Vec::new();
         if let Some(kept_rows) = kept_rows {
-            let kept = entries
-                .iter()
-                .enumerate()
-                .map(|(at, entry)| {
-                    Ok((
-                        entry.value,
-                        u16::try_from(at)
-                            .map_err(|_| invalid("too many retained frequency entries"))?,
-                    ))
-                })
-                .collect::<Result<FrequencyMap<_>>>()?;
+            let mut kept = FrequencyMap::default();
+            let mut null_kept = None;
+            for (at, entry) in entries.iter().enumerate() {
+                let at = u16::try_from(at)
+                    .map_err(|_| invalid("too many retained frequency entries"))?;
+                match entry.value {
+                    FrequencyValue::Integer(value) => {
+                        kept.insert(value as u64, at);
+                    }
+                    FrequencyValue::Null => null_kept = Some(at),
+                    FrequencyValue::Code(_) => {}
+                }
+            }
             ordinals.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
             ordinal_entries.reserve(usize::try_from(kept_rows).unwrap_or(FREQUENCY_ORDINALS));
-            self.visit_numeric(column, |ordinal, value| {
-                if let Some(&entry) = kept.get(&value) {
+            self.visit_numeric(column, signed, |ordinal, bits| {
+                let held = match bits {
+                    Some(bits) => kept.get(&bits).copied(),
+                    None => null_kept,
+                };
+                if let Some(entry) = held {
                     ordinals.push(ordinal);
                     ordinal_entries.push(entry);
                 }
@@ -2294,25 +2330,21 @@ impl Writer {
         ))
     }
 
+    /// Hands every row of an integer column to `visit` as its ordinal and its sixty four bits, or
+    /// `None` for a null.
+    ///
+    /// `signed` says which of the two readings the column has. A packed unsigned column would come
+    /// back from `signed_block` as a base plus a code in `i64`, which wraps for a value past the top
+    /// of `BIGINT`, so only a signed column takes the block path.
     fn visit_numeric(
         &self,
         column: usize,
-        mut visit: impl FnMut(u64, FrequencyValue),
+        signed: bool,
+        mut visit: impl FnMut(u64, Option<u64>),
     ) -> Result<()> {
         let ty = &self.table.fields[column].ty;
         let mut start = 0_u64;
         let mut block = Vec::new();
-        // Signed types only. A packed unsigned column would come back from `signed_block` as a base
-        // plus a code in `i64`, which wraps for a value past the top of `BIGINT`.
-        let signed = matches!(
-            ty,
-            LogicalType::TinyInt
-                | LogicalType::SmallInt
-                | LogicalType::Integer
-                | LogicalType::BigInt
-                | LogicalType::Date
-                | LogicalType::Timestamp
-        );
         for stripe in &self.table.stripes {
             let spans = read_index(&self.file, stripe, column)?;
             let page = stripe.pages[column];
@@ -2329,41 +2361,42 @@ impl Writer {
                 // comes out as one run of `i64` and is walked as a slice. The row path below is for
                 // the unsigned types and anything else that cannot be handed over that way.
                 if signed && vector.signed_block(&mut block) && block.len() == rows {
-                    let none_null = vector.none_null();
-                    for (row, &value) in block.iter().enumerate() {
-                        let value = if none_null || !vector.is_null_at(row) {
-                            FrequencyValue::Integer(i128::from(value))
-                        } else {
-                            FrequencyValue::Null
-                        };
-                        visit(start.saturating_add(row as u64), value);
+                    if vector.none_null() {
+                        for (row, &value) in block.iter().enumerate() {
+                            visit(start.saturating_add(row as u64), Some(value as u64));
+                        }
+                    } else {
+                        for (row, &value) in block.iter().enumerate() {
+                            let bits = (!vector.is_null_at(row)).then_some(value as u64);
+                            visit(start.saturating_add(row as u64), bits);
+                        }
                     }
                     start = start.saturating_add(rows as u64);
                     continue;
                 }
                 // row at a time: frequency construction visits decoded values to update bounded candidates.
                 for row in 0..rows {
-                    let value = if vector.is_null_at(row) {
-                        FrequencyValue::Null
+                    let bits = if vector.is_null_at(row) {
+                        None
                     } else {
                         // An unsigned column has no signed reading, and the documented fallback is
-                        // the value itself. Every unsigned width the format stores fits in the
-                        // `i128` a candidate is keyed by, so nothing is lost on the way through.
+                        // the value itself. Every width the format stores fits in sixty four bits,
+                        // so nothing is lost on the way through.
                         let widened = match vector.signed_at(row) {
-                            Some(value) => Some(value),
+                            Some(value) => Some(value as u64),
                             None => match vector.value_at(row) {
-                                Value::UTinyInt(value) => Some(i128::from(value)),
-                                Value::USmallInt(value) => Some(i128::from(value)),
-                                Value::UInteger(value) => Some(i128::from(value)),
-                                Value::UBigInt(value) => Some(i128::from(value)),
+                                Value::UTinyInt(value) => Some(u64::from(value)),
+                                Value::USmallInt(value) => Some(u64::from(value)),
+                                Value::UInteger(value) => Some(u64::from(value)),
+                                Value::UBigInt(value) => Some(value),
                                 _ => None,
                             },
                         };
-                        FrequencyValue::Integer(widened.ok_or_else(|| {
+                        Some(widened.ok_or_else(|| {
                             invalid("numeric frequency page did not contain an integer value")
                         })?)
                     };
-                    visit(start.saturating_add(row as u64), value);
+                    visit(start.saturating_add(row as u64), bits);
                 }
                 start = start.saturating_add(rows as u64);
             }
@@ -11368,6 +11401,64 @@ mod tests {
                 .flat_map(|leader| std::iter::repeat_n(Value::BigInt(leader), 100))
                 .collect::<Vec<_>>()
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn numeric_frequencies_count_nulls_and_values_past_the_top_of_bigint() {
+        // Ten leaders, then more unique values than the candidate table holds, so the first pass
+        // has to decrement and the counts come from the recount. The unsigned leaders sit above
+        // `i64::MAX`, where reading the bits as signed would give a different value, and the signed
+        // ones are negative, where reading them as unsigned would.
+        let path = path("frequency-bits");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![Field::new("u", LogicalType::UBigInt), Field::new("s", LogicalType::BigInt)],
+        )
+        .expect("new file");
+        let mut rows = Vec::new();
+        let mut leaders = Vec::new();
+        for leader in 0..10_u64 {
+            let count = 300 - leader * 10;
+            let (unsigned, signed) = if leader == 0 {
+                (Value::Null, Value::Null)
+            } else {
+                (Value::UBigInt(u64::MAX - leader), Value::BigInt(-(leader as i64)))
+            };
+            rows.extend(std::iter::repeat_n((unsigned.clone(), signed.clone()), count as usize));
+            leaders.push(((unsigned, count), (signed, count)));
+        }
+        rows.extend((1_000..41_000_u64).map(|id| (Value::UBigInt(id), Value::BigInt(id as i64))));
+        for part in rows.chunks(1_024) {
+            let unsigned = part.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
+            let signed = part.iter().map(|(_, value)| value.clone()).collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::UBigInt, &unsigned).expect("unsigned"),
+                Vector::from_values(LogicalType::BigInt, &signed).expect("signed"),
+            ])
+            .expect("matching columns");
+            writer.append(&chunk).expect("rows");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        for column in 0..2 {
+            let prefix =
+                reader.frequency_prefix(column).expect("valid metadata").expect("a synopsis");
+            let wanted = leaders
+                .iter()
+                .map(|(unsigned, signed)| if column == 0 { unsigned } else { signed })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(&prefix.entries[..10], &wanted[..], "column {column}");
+            assert!(prefix.omitted_max < 210, "column {column}");
+            assert_eq!(
+                reader.distinct_values(column).expect("valid metadata"),
+                Some(9 + 40_000),
+                "column {column}"
+            );
+        }
         fs::remove_file(path).expect("remove scratch file");
     }
 
