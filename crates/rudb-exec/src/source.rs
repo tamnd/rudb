@@ -305,6 +305,11 @@ pub(crate) struct Scan<'a> {
     probes: Vec<Probe>,
     /// The runtime filter of the join this scan drives, empty for a scan that drives no join.
     sideways: Option<Arc<Sideways<'a>>>,
+    /// The runtime filters of joins further up that reached this scan through the joins between,
+    /// each with its own count of whether it is paying. Only their ranges, bitmaps and filters are
+    /// read. The exact rows a join can hand down are positions counted from this join's own side,
+    /// and those stay with `sideways`.
+    also: Vec<(Arc<Sideways<'a>>, Paying)>,
     /// The cutoff of the top N above this scan, empty for a scan with no top N that could use one.
     cutoff: Option<Arc<Cutoff>>,
     /// Which table index this scan's columns bind against, which is how the runtime filter knows
@@ -448,6 +453,8 @@ pub(crate) struct Filters<'a> {
     pub(crate) pushed: Option<Pushdown>,
     /// What a join built and handed back down after the plan was already running.
     pub(crate) sideways: Option<Arc<Sideways<'a>>>,
+    /// The same from joins further up, which reached this scan through the joins in between.
+    pub(crate) also: Vec<Arc<Sideways<'a>>>,
     /// How good a row has to be to still interest the top N above, which moves while the scan runs.
     pub(crate) cutoff: Option<Arc<Cutoff>>,
 }
@@ -713,7 +720,7 @@ impl<'a> Scan<'a> {
         seams: &Settings,
         session: &Session,
     ) -> Result<Self> {
-        let Filters { pruning, pushed: pushdown, sideways, cutoff } = filters;
+        let Filters { pruning, pushed: pushdown, sideways, also, cutoff } = filters;
         let fields = plan.field_list(projection).to_vec();
         let mut columns = Vec::with_capacity(fields.len());
         for field in &fields {
@@ -750,6 +757,7 @@ impl<'a> Scan<'a> {
             offsets,
             probes,
             sideways,
+            also: also.into_iter().map(|sideways| (sideways, Paying::default())).collect(),
             cutoff,
             index,
             testing: OnceLock::new(),
@@ -824,7 +832,7 @@ impl<'a> Scan<'a> {
     fn read_late(&self, at: usize, out: &mut Chunk) -> Result<bool> {
         let Some(pushed) = &self.pushed else { return Ok(false) };
         let Some(late) = &pushed.late else { return Ok(false) };
-        if self.sideways.is_some() || !late.worth() {
+        if self.sideways.is_some() || !self.also.is_empty() || !late.worth() {
             return Ok(false);
         }
         let Some(primary) = self.columns[late.input] else { return Ok(false) };
@@ -882,42 +890,62 @@ impl<'a> Scan<'a> {
     /// # Errors
     ///
     /// Whatever narrowing the chunk to the rows that survived raises.
+    ///
+    /// With more than one join above, every bitmap goes before any filter, because a bitmap costs a
+    /// bit a row and a filter costs a hash and a cache line, and a row a bitmap has dropped is a row
+    /// no filter has to hash.
     fn sift(&self, chunk: &mut Chunk) -> Result<()> {
-        // The bitmap a join over a relationship with no link in the file leaves, which is exact and
-        // costs a subtraction and a bit a row, so it is not asked whether it is paying its way. It
-        // takes the place of the filter rather than going in front of it, see `Found::domain`.
-        if let Some((at, domain)) = self.sideways.as_ref().and_then(|s| s.domain(self.index)) {
-            let Ok(column) = chunk.column(at) else { return Ok(()) };
+        let handoffs = || {
+            let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
+            own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)))
+        };
+        // The bitmap a join over a relationship with no link in the file leaves, or one over integer
+        // keys that sit close together. It is exact and costs a subtraction and a bit a row, which
+        // is cheap but not free, so it answers to the same count as the filter and a bitmap that
+        // keeps nearly every row stops being asked. It takes the place of the filter rather than
+        // going in front of it, see `Found::domain`.
+        for (sideways, paying) in handoffs() {
+            let Some((at, domain)) = sideways.domain(self.index) else { continue };
+            if !paying.worth() {
+                continue;
+            }
+            let Ok(column) = chunk.column(at) else { continue };
             let rows = chunk.len();
             let kept = domain.keep(column, rows, &mut Vec::new());
+            paying.saw(rows, kept.len());
             if kept.len() < rows {
                 let whole = std::mem::replace(chunk, Chunk::empty(&[]));
                 *chunk = whole.select(&Selection::from_indices(kept))?;
             }
-            return Ok(());
         }
-        let Some((at, filter)) = self.sideways.as_ref().and_then(|s| s.sifting(self.index)) else {
-            return Ok(());
-        };
-        if !self.paying.worth() {
-            return Ok(());
+        for (sideways, paying) in handoffs() {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            if sideways.domain(self.index).is_some() {
+                continue;
+            }
+            let Some((at, filter)) = sideways.sifting(self.index) else { continue };
+            if !paying.worth() {
+                continue;
+            }
+            let Ok(column) = chunk.column(at) else { continue };
+            let rows = chunk.len();
+            let mut hashes = Vec::new();
+            hash(std::slice::from_ref(column), rows, &mut hashes, Across::TwoInputs);
+            // The whole chunk asked at once rather than a row at a time inside the selection,
+            // because the filter is larger than the cache and a row of it is a trip to memory the
+            // core can only overlap with the next row's if nothing in between branches on the
+            // answer.
+            let mut held = Vec::new();
+            filter.holds_run(&hashes, &mut held);
+            let kept = Selection::from_predicate(rows, |row| held[row]);
+            paying.saw(rows, kept.len());
+            if kept.len() < rows {
+                let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+                *chunk = whole.select(&kept)?;
+            }
         }
-        let Ok(column) = chunk.column(at) else { return Ok(()) };
-        let rows = chunk.len();
-        let mut hashes = Vec::new();
-        hash(std::slice::from_ref(column), rows, &mut hashes, Across::TwoInputs);
-        // The whole chunk asked at once rather than a row at a time inside the selection, because
-        // the filter is larger than the cache and a row of it is a trip to memory the core can only
-        // overlap with the next row's if nothing in between branches on the answer.
-        let mut held = Vec::new();
-        filter.holds_run(&hashes, &mut held);
-        let kept = Selection::from_predicate(rows, |row| held[row]);
-        self.paying.saw(rows, kept.len());
-        if kept.len() == rows {
-            return Ok(());
-        }
-        let whole = std::mem::replace(chunk, Chunk::empty(&[]));
-        *chunk = whole.select(&kept)?;
         Ok(())
     }
 
@@ -928,16 +956,20 @@ impl<'a> Scan<'a> {
     /// divided by one set of rows and done over a different one.
     fn testing(&self) -> &[Probe] {
         self.testing.get_or_init(|| {
-            let Some(sideways) = self.sideways.as_ref() else { return self.probes.clone() };
-            // Here because this is the one moment every instance of the scan passes through after
-            // the build side has finished and before a row is read.
-            if let (Some(counters), Some(reduced)) =
-                (&self.counters, sideways.reduction(self.index))
-            {
-                counters.reducing(reduced);
-            }
             let mut probes = self.probes.clone();
-            probes.extend(onto(&self.columns, sideways.tests(self.index)));
+            if let Some(sideways) = self.sideways.as_ref() {
+                // Here because this is the one moment every instance of the scan passes through
+                // after the build side has finished and before a row is read.
+                if let (Some(counters), Some(reduced)) =
+                    (&self.counters, sideways.reduction(self.index))
+                {
+                    counters.reducing(reduced);
+                }
+                probes.extend(onto(&self.columns, sideways.tests(self.index)));
+            }
+            for (sideways, _) in &self.also {
+                probes.extend(onto(&self.columns, sideways.tests(self.index)));
+            }
             probes
         })
     }
@@ -2066,12 +2098,23 @@ impl<'a> FileScan<'a> {
     ///
     /// Whatever narrowing the chunk to the rows that survived raises.
     fn sift(&self, chunk: &mut Chunk) -> Result<()> {
-        let Some((at, filter)) = self.sideways.as_ref().and_then(|s| s.sifting(self.index)) else {
-            return Ok(());
-        };
+        let Some(sideways) = self.sideways.as_ref() else { return Ok(()) };
         if !self.paying.worth() {
             return Ok(());
         }
+        // Keys close together come as a bitmap in place of the filter, see `Found::domain`.
+        if let Some((at, domain)) = sideways.domain(self.index) {
+            let Ok(column) = chunk.column(at) else { return Ok(()) };
+            let rows = chunk.len();
+            let kept = domain.keep(column, rows, &mut Vec::new());
+            self.paying.saw(rows, kept.len());
+            if kept.len() < rows {
+                let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+                *chunk = whole.select(&Selection::from_indices(kept))?;
+            }
+            return Ok(());
+        }
+        let Some((at, filter)) = sideways.sifting(self.index) else { return Ok(()) };
         let Ok(column) = chunk.column(at) else { return Ok(()) };
         let rows = chunk.len();
         let mut hashes = Vec::new();
@@ -3102,6 +3145,7 @@ mod tests {
                 .map(|at| i64::try_from(at * VECTOR_SIZE).expect("a small table"))
                 .collect(),
             probes,
+            also: Vec::new(),
             sideways: None,
             cutoff: None,
             index: 0,

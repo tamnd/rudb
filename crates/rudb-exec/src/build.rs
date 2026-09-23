@@ -256,6 +256,7 @@ fn build_measured_with_sink<'a>(
         pruning: Vec::new(),
         pushing: None,
         sideways: None,
+        above: Vec::new(),
         cutoff: None,
         top_counts: Vec::new(),
         held: Vec::new(),
@@ -1398,6 +1399,13 @@ struct Building<'a, 'b> {
     /// that drops rows under a `LIMIT` changes which rows reach the limit. [`Builder::node`] clears
     /// it for every node that is not a scan, a filter or a projection.
     sideways: Option<Arc<Sideways<'a>>>,
+    /// The runtime filters of joins further up, for the same scan.
+    ///
+    /// A join's own filter stops at the next join down, and these are the ones that went on through
+    /// it because that join lets a driving row's columns through unchanged. See
+    /// [`sideways::through`] for which joins do. Cleared by every node that `sideways` is cleared
+    /// by and that is not such a join.
+    above: Vec<Arc<Sideways<'a>>>,
     /// The cutoff of the TopN whose input is being walked into, for the scan at the bottom of it.
     ///
     /// The same walk `sideways` survives, minus the table function: a file scan prunes by row group
@@ -1601,6 +1609,7 @@ impl<'a> Building<'a, '_> {
         // Taken here rather than inside the file scan arm so that a table function that is
         // not one leaves nothing behind for whatever is built next.
         let runtime = self.sideways.take();
+        self.above.clear();
         Ok(match TableFunction::lookup(name) {
             Some(function @ (TableFunction::ReadParquet | TableFunction::ReadCsv)) => {
                 let counters = self.watch(reference, id, pipeline, "FileScan", Some(name));
@@ -1778,7 +1787,11 @@ impl<'a> Building<'a, '_> {
         let gather_id = self.gathered(reference);
         let gathering = self.shape.pipeline(held);
         let parent = held;
+        // Not for the gathered side, which is read once per match and whose rows say nothing about
+        // which driving rows the joins above will drop.
+        let above = std::mem::take(&mut self.above);
         let held = self.node(held)?;
+        self.above = above;
         let held_schema = held.schema.clone();
         // The edge this join's runtime filter crosses, made before either side is built
         // because the sink on one side fills it and the scan on the other reads it. It stays
@@ -1802,6 +1815,7 @@ impl<'a> Building<'a, '_> {
         self.sideways = Some(Arc::clone(&sideways));
         let mut left = self.node(driving)?;
         self.sideways = None;
+        self.above.clear();
         let side = Gathered { schema: &held_schema, chunks: gathered, marker, swapped };
         // A lookup answers this join and the kind decides about a driving row from that
         // row's own matches, so nothing has to be held and the driving side streams
@@ -1828,11 +1842,10 @@ impl<'a> Building<'a, '_> {
         let zone = self.session.session_time_zone();
         let (catalog, reducing) =
             (self.catalog, self.session.rules().enabled(Rule::GraphReduction));
-        let arm = |keyed: Option<(ExprRef, ColumnBinding)>| {
-            let Some((key, binding)) = keyed else {
-                return;
-            };
-            let Some(binding) = sideways::beneath(plan, driving, binding) else {
+        let arm = |keyed: Vec<(ExprRef, ColumnBinding)>| {
+            let Some((key, binding)) = keyed.into_iter().find_map(|(key, binding)| {
+                sideways::beneath(plan, driving, binding).map(|binding| (key, binding))
+            }) else {
                 return;
             };
             if reducing {
@@ -2159,7 +2172,14 @@ impl<'a> Building<'a, '_> {
                 | Node::Project { .. }
                 | Node::TableFunction { .. }
         ) {
-            self.sideways = None;
+            // A join that passes a driving row through unchanged passes the filters about it on
+            // too, and they go into `above` so that its own can take the place of the one it got.
+            let inherited = self.sideways.take();
+            if sideways::through(plan.node(reference)).is_some() {
+                self.above.extend(inherited);
+            } else {
+                self.above.clear();
+            }
         }
         // A cutoff travels the same way and stops one node short of it, for the reason on the field.
         if !matches!(
@@ -2179,6 +2199,7 @@ impl<'a> Building<'a, '_> {
                     pruning: std::mem::take(&mut self.pruning),
                     pushed: self.pushing.take(),
                     sideways: self.sideways.take(),
+                    also: std::mem::take(&mut self.above),
                     cutoff: self.cutoff.take(),
                 };
                 // Read before the filters are handed over, because it is the one thing the scan's

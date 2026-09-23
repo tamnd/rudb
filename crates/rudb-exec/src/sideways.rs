@@ -70,10 +70,10 @@
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
-use rudb_common::{Result, SessionTimeZone};
+use rudb_common::{LogicalType, Result, SessionTimeZone};
 use rudb_graph::{KeyMap, Link, Pushed, Rids};
 use rudb_metrics::Reduced;
-use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan};
+use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
 use rudb_vector::{Chunk, Vector};
 
@@ -173,6 +173,24 @@ impl Domain {
         let mut kept = Vec::with_capacity(rows);
         if keys.signed_block(block) && block.len() >= rows {
             let none_null = keys.none_null();
+            if let (Ok(base), true, true) =
+                (i64::try_from(self.base), none_null, self.range < 1 << 62)
+            {
+                // A key under the base wraps round to an offset far past the range, so one compare
+                // covers both ends, and the row is written whether it is kept or not so that the loop
+                // has no branch to mispredict on a bitmap that keeps about half.
+                kept.resize(rows, 0);
+                let mut at = 0;
+                for (row, &key) in block[..rows].iter().enumerate() {
+                    let offset = key.wrapping_sub(base) as u64;
+                    let hit = offset < self.range
+                        && self.words[(offset / 64) as usize] >> (offset % 64) & 1 == 1;
+                    kept[at] = row as u32;
+                    at += usize::from(hit);
+                }
+                kept.truncate(at);
+                return kept;
+            }
             for (row, &key) in block[..rows].iter().enumerate() {
                 if self.holds(key) && (none_null || !keys.is_null_at(row)) {
                     kept.push(row as u32);
@@ -389,8 +407,35 @@ pub(crate) fn beneath(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Opt
                 }
                 at = input;
             }
+            ref node @ Node::Join { .. } => at = through(node)?,
             _ => return None,
         }
+    }
+}
+
+/// The input of a join that a filter on one of its driving columns may go down into.
+///
+/// A join above this one drops a row whose key it has no match for. When this join is an inner
+/// join or a semi join, every row it produces carries its driving row's columns unchanged, so a
+/// driving row the join above would drop can be dropped before this join instead, and the answer
+/// is the same with less work in between. That is the whole of the argument, and it is why the
+/// driving side and not the gathered one: a gathered row is read once per match and dropping it
+/// early says nothing about the rows it would have paired with.
+///
+/// Anything else lets nothing through. An outer join answers for a driving row with no match, a
+/// mark join answers for every driving row, and a semi join turned around gathers its subject and
+/// streams the other side past, so its driving rows are not the ones it produces.
+///
+/// On TPC-H q05 this is what lets the supplier side reach the lineitem scan. The join on the
+/// order key is the one nearest the scan, and without this the filter from the supplier join
+/// above it stopped there, so nine hundred thousand rows paid for the probe of orders to find
+/// out that all but seven thousand had the wrong supplier.
+pub(crate) fn through(node: &Node) -> Option<NodeRef> {
+    let Node::Join { left, right, kind, build, .. } = *node else { return None };
+    match (kind, build) {
+        (JoinKind::Inner, BuildSide::Left) => Some(right),
+        (JoinKind::Inner | JoinKind::Semi, BuildSide::Right) => Some(left),
+        _ => None,
     }
 }
 
@@ -438,18 +483,26 @@ pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) 
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     let mut extremes = Extremes::default();
     let settled = exact.is_some() || stopped || reduced.is_some_and(|reduced| reduced.by_key);
-    let mut filter = if settled { None } else { Blocked::sized(rows, BUDGET) };
-    let mut hashes = Vec::new();
+    let mut keyed = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
-        let Some(keys) = keys.first() else { continue };
+        keyed.push((keys.into_iter().next(), chunk.len()));
+    }
+    if !settled && domain.is_none() {
+        domain = dense(&keyed, rows);
+    }
+    let settled = settled || domain.is_some();
+    let mut filter = if settled { None } else { Blocked::sized(rows, BUDGET) };
+    let mut hashes = Vec::new();
+    for (keys, len) in &keyed {
+        let (Some(keys), len) = (keys, *len) else { continue };
         extremes.widen(keys);
         let Some(filter) = filter.as_mut() else { continue };
-        hash(std::slice::from_ref(keys), chunk.len(), &mut hashes, Across::TwoInputs);
+        hash(std::slice::from_ref(keys), len, &mut hashes, Across::TwoInputs);
         // A null key matches nothing under the rule this is armed for, so it is left out here and a
         // driving row holding one is dropped by the filter it is missing from. That is the same
         // answer the hash table gives and it is arrived at a scan earlier.
-        let nullable = has_nulls(keys, chunk.len());
+        let nullable = has_nulls(keys, len);
         for (row, &word) in hashes.iter().enumerate() {
             if nullable && keys.is_null_at(row) {
                 continue;
@@ -458,6 +511,73 @@ pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) 
         }
     }
     Ok(Found { range: extremes.into_range(), filter, rows: exact, domain, reduced })
+}
+
+/// The build side's keys as a [`Domain`] over their own range, when that range is small enough.
+///
+/// The filter hashes every driving row and still keeps about one in a hundred that the join will
+/// drop. When the key is an integer and the keys the build side holds sit close together, one bit
+/// per value between the smallest and the largest is exact, costs no hash, and is often smaller
+/// than the filter. TPC-H is made of such keys: the orders of one year are two hundred and
+/// twenty seven thousand keys spread over six million values, which is twenty six bits a key
+/// against the filter's ten, and the suppliers of one region are two thousand over ten thousand.
+///
+/// Sixty four bits a key is the most this takes, and never more than the filter's own budget, past
+/// which the filter is the smaller of the two and a bit test that misses the cache is no cheaper
+/// than a filter lookup that does too. Only the four signed integer types of sixty four bits or
+/// fewer, because the scan reads the driving column through the same widening and the join has
+/// already made the two sides one type. `None` for anything else, and the filter is built instead.
+fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
+    let narrow = |ty: &LogicalType| {
+        matches!(
+            ty,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+        )
+    };
+    let mut block = Vec::new();
+    let mut low = i64::MAX;
+    let mut high = i64::MIN;
+    for (keys, len) in keyed {
+        let Some(keys) = keys else { continue };
+        if !narrow(keys.logical_type()) || !keys.signed_block(&mut block) || block.len() < *len {
+            return None;
+        }
+        let nullable = has_nulls(keys, *len);
+        for (row, &key) in block[..*len].iter().enumerate() {
+            if nullable && keys.is_null_at(row) {
+                continue;
+            }
+            low = low.min(key);
+            high = high.max(key);
+        }
+    }
+    if low > high {
+        return None;
+    }
+    let range = u64::try_from(i128::from(high) - i128::from(low) + 1).ok()?;
+    let bytes = usize::try_from(range.div_ceil(8)).ok()?;
+    if range > (rows as u64).saturating_mul(64) || bytes > BUDGET {
+        return None;
+    }
+    let mut words = vec![0_u64; usize::try_from(range.div_ceil(64)).ok()?];
+    for (keys, len) in keyed {
+        let Some(keys) = keys else { continue };
+        if !keys.signed_block(&mut block) {
+            return None;
+        }
+        let nullable = has_nulls(keys, *len);
+        for (row, &key) in block[..*len].iter().enumerate() {
+            if nullable && keys.is_null_at(row) {
+                continue;
+            }
+            let offset = key.wrapping_sub(low) as u64;
+            words[(offset / 64) as usize] |= 1 << (offset % 64);
+        }
+    }
+    Some(Domain { base: i128::from(low), range, words })
 }
 
 /// The driving rows whose link points at a parent row the build side holds.
@@ -692,12 +812,12 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
-        let found = found(&keyed, None, &[chunk(&[Some(5), Some(9)]), chunk(&[Some(2)])])
+        let found = found(&keyed, None, &[chunk(&[Some(5), Some(90_000)]), chunk(&[Some(2)])])
             .expect("a column of integers");
 
-        assert_eq!(found.range, Some((Bound::Int(2), Bound::Int(9))));
+        assert_eq!(found.range, Some((Bound::Int(2), Bound::Int(90_000))));
         let filter = found.filter.expect("a filter over three keys");
-        assert_eq!(through(&filter, &[Some(5), Some(9), Some(2)]), [true, true, true]);
+        assert_eq!(through(&filter, &[Some(5), Some(90_000), Some(2)]), [true, true, true]);
     }
 
     /// The property the whole thing rests on: a filter says no about a key that is in it never, at
@@ -708,7 +828,7 @@ mod tests {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
-        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 7 + 11)).collect();
+        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 1_000 + 11)).collect();
 
         let found = found(&keyed, None, &chunks(&keys)).expect("a column of integers");
 
@@ -724,9 +844,9 @@ mod tests {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
-        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 7 + 11)).collect();
+        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 1_000 + 11)).collect();
         let absent: Vec<Option<i32>> =
-            (0..4_000).map(|value| Some(value * 7 + 1_000_000)).collect();
+            (0..4_000).map(|value| Some(value * 7 + 10_000_000)).collect();
 
         let found = found(&keyed, None, &chunks(&keys)).expect("a column of integers");
 
@@ -743,10 +863,45 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
-        let found = found(&keyed, None, &[chunk(&[Some(3), None, Some(4)])]).expect("integers");
+        let found =
+            found(&keyed, None, &[chunk(&[Some(3), None, Some(400_000)])]).expect("integers");
 
-        assert_eq!(found.range, Some((Bound::Int(3), Bound::Int(4))));
+        assert_eq!(found.range, Some((Bound::Int(3), Bound::Int(400_000))));
         assert_eq!(through(&found.filter.expect("a filter"), &[None]), [false]);
+    }
+
+    /// Keys that sit close together become a bitmap over their own range in place of the filter.
+    /// It keeps exactly the driving rows whose key the side holds and drops a null, a key under the
+    /// smallest, one over the largest and one between them that the side does not hold.
+    #[test]
+    fn keys_close_together_are_kept_as_a_bitmap_instead_of_a_filter() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+
+        let found = found(&keyed, None, &[chunk(&[Some(-4), None, Some(60)]), chunk(&[Some(7)])])
+            .expect("integers");
+
+        assert!(found.filter.is_none(), "the bitmap is exact, so no filter is built beside it");
+        assert_eq!(found.range, Some((Bound::Int(-4), Bound::Int(60))));
+        let domain = found.domain.expect("a bitmap over sixty five values");
+        let driving = column(&[Some(7), Some(8), None, Some(-4), Some(-5), Some(61), Some(60)]);
+        let kept = domain.keep(&driving, driving.len(), &mut Vec::new());
+        assert_eq!(kept, [0, 3, 6]);
+        let whole = column(&[Some(60), Some(1), Some(7), Some(i32::MIN), Some(i32::MAX)]);
+        assert_eq!(domain.keep(&whole, whole.len(), &mut Vec::new()), [0, 2]);
+    }
+
+    /// Past sixty four bits a key the bitmap is bigger than the filter it would replace.
+    #[test]
+    fn keys_spread_wide_still_get_a_filter() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+
+        let found = found(&keyed, None, &[chunk(&[Some(0), Some(64 * 2)])]).expect("integers");
+
+        assert!(found.domain.is_none() && found.filter.is_some());
     }
 
     /// A side that gathered nothing leaves a filter that holds nothing, which is a scan that drops
@@ -801,7 +956,8 @@ mod tests {
             Some(Link::build(&[0, 1, 1], 2).expect("both parents exist")),
         );
 
-        let found = found(&keyed, Some(&exact), &[chunk(&[Some(1), Some(9)])]).expect("integers");
+        let found =
+            found(&keyed, Some(&exact), &[chunk(&[Some(1), Some(9_000_000)])]).expect("integers");
 
         assert!(found.rows.is_none());
         assert!(found.filter.is_some(), "the filter is what the join gets instead");
