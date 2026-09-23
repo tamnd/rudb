@@ -8,6 +8,12 @@
 //! one, so a file larger than memory reads the same as a small one. The sample the sniffer looks at
 //! is the first block, which is also the first block the reader then goes on to use, so opening a
 //! file reads its front once.
+//!
+//! A reader can also cover a stretch of a file rather than all of it, which is what [`crate::split`]
+//! hands each thread. It starts where it is told a record starts and takes the records that start
+//! before its end, reading past the end only to finish the last of them.
+
+use std::sync::Arc;
 
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_io::File;
@@ -25,10 +31,17 @@ use crate::scan::Records;
 /// getting a wider type rather than by failing.
 const BLOCK: usize = 1 << 20;
 
+/// How much is read at a time once a reader of a stretch is past its end.
+///
+/// All it is finishing there is the one record that crosses the end, which is usually a line, so a
+/// whole block would be read to be thrown away. Each read after the first is as large as what is
+/// held, so a record that turns out to be long still arrives in a handful of reads.
+const TAIL: usize = 64 << 10;
+
 /// A CSV file, positioned at a record boundary.
 #[derive(Debug)]
 pub struct Reader {
-    file: Box<dyn File>,
+    file: Arc<dyn File>,
     path: String,
     given: Given,
     dialect: Dialect,
@@ -42,6 +55,13 @@ pub struct Reader {
     scratch: Vec<String>,
     records: Records,
     block: usize,
+    /// Where the reading started, so that what it has read is the offset less this.
+    origin: u64,
+    /// The first byte a record may not start at, which is the end of the file for a whole one.
+    end: u64,
+    /// Where a reader gives up rather than reading on to finish a record, which only a guess
+    /// sets. See [`crate::split`].
+    cap: u64,
 }
 
 impl Reader {
@@ -72,9 +92,14 @@ impl Reader {
 
     /// The same, reading `block` bytes at a time, which the tests make small so that a record
     /// crosses a refill every few lines rather than once a megabyte.
-    fn open_sized(file: Box<dyn File>, path: &str, given: Given, block: usize) -> Result<Self> {
+    pub(crate) fn open_sized(
+        file: Box<dyn File>,
+        path: &str,
+        given: Given,
+        block: usize,
+    ) -> Result<Self> {
         let mut reader = Self {
-            file,
+            file: Arc::from(file),
             path: path.to_string(),
             given,
             dialect: Dialect::comma_separated(),
@@ -88,6 +113,9 @@ impl Reader {
             scratch: Vec::new(),
             records: Records::default(),
             block,
+            origin: 0,
+            end: u64::MAX,
+            cap: u64::MAX,
         };
         reader.fill(0)?;
         let sample = reader.buffer.clone();
@@ -182,27 +210,7 @@ impl Reader {
     /// A read error, a malformed record, or a value that does not fit the type the sample chose
     /// for its column.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-        self.records.clear();
-        let mut start = self.at;
-        loop {
-            self.at = crate::scan::records(
-                &self.buffer,
-                self.at,
-                self.dialect,
-                self.drained,
-                VECTOR_SIZE,
-                &mut self.records,
-            )?;
-            if self.records.len() == VECTOR_SIZE || self.drained {
-                break;
-            }
-            // The records already read point into the buffer, so the refill keeps everything from
-            // the start of the chunk and moves their ranges down by whatever it dropped in front.
-            self.fill(start)?;
-            self.records.shift(start);
-            start = 0;
-        }
-        let rows = self.records.len();
+        let rows = self.next_records()?;
         if rows == 0 {
             return Ok(None);
         }
@@ -218,6 +226,137 @@ impl Reader {
             columns.push(convert::column(&cells, at, &field.ty, &refuse)?);
         }
         Ok(Some(Chunk::with_rows(columns, rows)?))
+    }
+
+    /// Splits the next chunk's worth of records into [`Self::records`] and answers how many there
+    /// are, which is none at the end.
+    ///
+    /// The end of the file is the end for a whole file. A reader of a stretch stops at the first
+    /// record that starts at or after its end, and it cannot see where a record starts until it has
+    /// split it, so a chunk that went past the end is split again a record at a time. That happens
+    /// once per stretch, on its last chunk.
+    fn next_records(&mut self) -> Result<usize> {
+        self.records.clear();
+        let mut start = self.at;
+        let mut careful = false;
+        loop {
+            if self.here() >= self.end {
+                break;
+            }
+            let limit = if careful { self.records.len() + 1 } else { VECTOR_SIZE };
+            self.at = crate::scan::records(
+                &self.buffer,
+                self.at,
+                self.dialect,
+                self.drained,
+                limit,
+                &mut self.records,
+            )?;
+            if !careful && self.here() > self.end {
+                self.records.clear();
+                self.at = start;
+                careful = true;
+                continue;
+            }
+            if self.records.len() == VECTOR_SIZE {
+                break;
+            }
+            if careful && self.records.len() == limit {
+                continue;
+            }
+            if self.drained {
+                break;
+            }
+            // The records already read point into the buffer, so the refill keeps everything from
+            // the start of the chunk and moves their ranges down by whatever it dropped in front.
+            self.fill(start)?;
+            self.records.shift(start);
+            start = 0;
+        }
+        Ok(self.records.len())
+    }
+
+    /// Where in the file the next record starts.
+    pub(crate) fn here(&self) -> u64 {
+        self.offset - self.buffer.len() as u64 + self.at as u64
+    }
+
+    /// How many bytes of the file this reader has read, sniffing included.
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.offset - self.origin
+    }
+
+    /// A reader over the same file with the same answers, that starts at `from`, which has to be
+    /// where a record starts, and takes the records that start before `end`.
+    ///
+    /// `line` is what the line of the record at `from` is called in an error, which is right only
+    /// for a caller that knows it. [`crate::split`] does not, and so never shows the error such a
+    /// reader makes.
+    pub(crate) fn stretch(&self, from: u64, end: u64, line: u64) -> Self {
+        Self {
+            file: Arc::clone(&self.file),
+            path: self.path.clone(),
+            given: self.given,
+            dialect: self.dialect,
+            fields: self.fields.clone(),
+            projection: self.projection.clone(),
+            buffer: Vec::new(),
+            at: 0,
+            offset: from,
+            drained: false,
+            line,
+            scratch: Vec::new(),
+            records: Records::default(),
+            block: self.block,
+            origin: from,
+            end,
+            cap: u64::MAX,
+        }
+    }
+
+    /// Makes the reader give up once it has read up to `cap`, with an error nobody is shown.
+    pub(crate) fn give_up_at(&mut self, cap: u64) {
+        self.cap = cap;
+    }
+
+    /// Splits records to the end without converting any of them, and answers where the first
+    /// record not taken starts.
+    pub(crate) fn skim(&mut self) -> Result<u64> {
+        while self.next_records()? > 0 {}
+        Ok(self.here())
+    }
+
+    /// Steps over the chunks that end at or before `target` without converting them, counting their
+    /// lines, so that the chunks after are the ones and the lines a whole read would give.
+    ///
+    /// The chunk that runs past `target` is left to be read, since it is the same chunk a whole read
+    /// would convert and a value in it may be the one that fails.
+    pub(crate) fn skip_to(&mut self, target: u64) -> Result<()> {
+        loop {
+            let from = self.here();
+            let rows = self.next_records()?;
+            if rows == 0 {
+                return Ok(());
+            }
+            if self.here() > target {
+                let front = self.offset - self.buffer.len() as u64;
+                self.at = usize::try_from(from - front)
+                    .map_err(|_| Error::internal("a chunk start outside the buffer"))?;
+                return Ok(());
+            }
+            self.line += rows as u64;
+        }
+    }
+
+    /// The line the next record is on, as a conversion error counts them.
+    pub(crate) const fn line(&self) -> u64 {
+        self.line
+    }
+
+    /// The file this reads, for a caller that wants to look at bytes the reader has not.
+    pub(crate) fn file(&self) -> &dyn File {
+        self.file.as_ref()
     }
 
     /// DuckDB's message for a value that does not fit the type its column was sniffed as.
@@ -352,10 +491,17 @@ impl Reader {
     /// `keep` is where the first record anything still points at starts, which is the record being
     /// read for one record at a time and the start of the chunk for a chunk.
     fn fill(&mut self, keep: usize) -> Result<()> {
+        if self.offset >= self.cap {
+            return Err(Error::io("a record runs further than a guessed start is followed"));
+        }
         self.buffer.drain(..keep);
         self.at -= keep;
         let held = self.buffer.len();
-        self.buffer.resize(held + self.block, 0);
+        let want = match self.end.checked_sub(self.offset) {
+            Some(left) if left > 0 => self.block.min(usize::try_from(left).unwrap_or(usize::MAX)),
+            _ => self.block.min(TAIL.max(held)),
+        };
+        self.buffer.resize(held + want, 0);
         let read = self.file.read_at(self.offset, &mut self.buffer[held..])?;
         self.buffer.truncate(held + read);
         self.offset += read as u64;

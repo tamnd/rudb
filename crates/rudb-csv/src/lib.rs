@@ -20,6 +20,10 @@
 //! file that says nothing about itself cannot be the one file whose word is taken the way a Parquet
 //! footer is.
 //!
+//! [`split`] is the fifth, and it is there because a file can be large. It cuts one file into
+//! ranges that are read on separate threads, and has each range guess where its first record
+//! starts so that the threads do not have to wait for each other to find out.
+//!
 //! There is no writer yet. `COPY t TO 'out.csv'` is the statement that wants one and it is not
 //! bound, so a writer here would be a writer nothing calls.
 
@@ -31,10 +35,12 @@ pub mod dialect;
 pub mod infer;
 pub mod reader;
 pub mod scan;
+pub mod split;
 
 pub use combine::{across, mismatch, widen};
 pub use dialect::{Dialect, Given};
 pub use reader::Reader;
+pub use split::{Part, Split};
 
 /// The crate this rank belongs to, so that the layer check has something to read.
 pub const RANK: u8 = 5;

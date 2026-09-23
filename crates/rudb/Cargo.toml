@@ -34,5 +34,8 @@ rudb-arrow.workspace = true
 rudb-io.workspace = true
 iana-time-zone.workspace = true
 
+[dev-dependencies]
+rudb-csv.workspace = true
+
 [lints]
 workspace = true

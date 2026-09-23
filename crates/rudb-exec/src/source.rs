@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
-use rudb_csv::Reader as CsvReader;
+use rudb_csv::{Part, Reader as CsvReader, Split};
 use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
 };
@@ -1921,13 +1921,15 @@ pub(crate) fn moments(
 /// as it is opened rather than being allowed to use its own sample, which is what keeps a file that
 /// happens to hold nothing but whole numbers from handing up BIGINT into a stream that is DOUBLE.
 ///
-/// A morsel is one row group of one Parquet file, or one whole CSV file.
+/// A morsel is one row group of one Parquet file, or one range of bytes of one CSV file.
 ///
 /// The row group is what the format stores and what a reader can be positioned at without having
 /// read what came before it, so it is the smallest unit two threads can take without one of them
-/// waiting on the other. A CSV file cannot be positioned at all, because nothing in it says where a
-/// row begins until every byte before it has been parsed, so a CSV morsel is a whole file and a
-/// query over one CSV file reads it on one thread.
+/// waiting on the other. A CSV file cannot be positioned, because nothing in it says where a row
+/// begins until every byte before it has been parsed, so its ranges guess where their first row
+/// starts and check the guess against where the range before ended. [`rudb_csv::split`] is where
+/// that is done. A CSV file is one morsel when it is short, when the query has one thread, and when
+/// the query wants `file_row_number`, since a range does not know how many rows came before it.
 ///
 /// The files are cut into morsels one file at a time rather than all at once. Cutting a file means
 /// reading its footer, and a directory of ten thousand files would be ten thousand footers read
@@ -2242,6 +2244,10 @@ struct Cutting {
     row: i64,
     /// How many morsels have been handed out, which is the next one's index.
     given: u64,
+    /// The CSV file being cut, once it has been cut into ranges, and the next range to hand out.
+    ///
+    /// The reader it was opened with is inside it, so [`Cutting::reader`] is `None` while it is set.
+    split: Option<(Arc<Split>, usize)>,
 }
 
 /// What one morsel covers, and the reader open on it.
@@ -2316,6 +2322,7 @@ impl<'a> FileScan<'a> {
                 skipped: 0,
                 row: 0,
                 given: 0,
+                split: None,
             }),
             open: Mutex::new(HashMap::new()),
             counters: None,
@@ -2397,6 +2404,7 @@ impl<'a> FileScan<'a> {
     /// Opens the next file and projects it, or leaves the reader empty at the end of the list.
     fn advance(&self, cutting: &mut Cutting) -> Result<()> {
         cutting.reader = None;
+        cutting.split = None;
         cutting.row = 0;
         cutting.group = 0;
         cutting.groups = 0;
@@ -2422,16 +2430,51 @@ impl<'a> FileScan<'a> {
         cutting.reader = Some(reader);
         cutting.at += 1;
         aim(cutting);
+        self.divide(cutting);
         Ok(())
+    }
+
+    /// Cuts the CSV file being read into ranges, when it is long enough and there are threads to
+    /// read them on.
+    ///
+    /// Not when the query wants `file_row_number`, since a range has no way to know how many rows
+    /// came before it short of reading them, and the number is the one thing the column is for.
+    fn divide(&self, cutting: &mut Cutting) {
+        if cutting.threads <= 1 || self.numbered {
+            return;
+        }
+        let size = rudb_csv::split::size();
+        match cutting.reader.take() {
+            Some(FileReader::Csv(reader)) if reader.ranges(size) > 1 => {
+                let ranges = reader.ranges(size);
+                let split = Split::new(reader, ranges);
+                cutting.pieces = split.ranges();
+                cutting.split = Some((Arc::new(split), 0));
+            }
+            other => cutting.reader = other,
+        }
     }
 
     /// The next morsel's worth of the file being cut, or `None` when that file has none left.
     ///
     /// A Parquet file gives one per row group and takes a split of the reader it was opened with. A
-    /// CSV file gives one, which takes the reader itself, because a CSV reader cannot be positioned
-    /// and a second one over the same file would parse the same bytes to find the same rows.
+    /// CSV file that was cut into ranges gives one per range, and one that was not gives one, which
+    /// takes the reader itself.
     fn cut(&self, cutting: &mut Cutting) -> Result<Option<Piece>> {
         let file = cutting.at.saturating_sub(1);
+        if let Some((split, next)) = cutting.split.as_mut() {
+            if *next == split.ranges() {
+                return Ok(None);
+            }
+            let part = split.part(*next);
+            *next += 1;
+            return Ok(Some(Piece {
+                file,
+                reader: Some(FileReader::Part(part)),
+                failure: None,
+                row: 0,
+            }));
+        }
         if let Some(FileReader::Parquet(reader)) = cutting.reader.as_ref() {
             // Row groups the filter above this scan has already ruled out are stepped over here
             // rather than handed out and thrown away downstream, which is the whole point: the data
@@ -2625,13 +2668,14 @@ impl Source for FileScan<'_> {
     /// The first file is already open, because opening it is how a scan reports a file that has
     /// gone missing since it was bound, so what its row groups come to is there to be read without
     /// opening anything. The rest are assumed to match, which is right for a directory written by
-    /// one writer and is the case worth being right about. A CSV file has one morsel however large
-    /// it is, since a CSV reader cannot be positioned, so a list of CSV files is as many morsels as
-    /// there are files.
+    /// one writer and is the case worth being right about. A CSV file is cut into ranges here, now
+    /// that the number of threads is known, so a list of CSV files is as many morsels as the first
+    /// file has ranges for every file.
     fn morsels(&self, threads: usize, _weight: usize) -> Option<usize> {
         let mut cutting = self.cutting.lock().ok()?;
         cutting.threads = threads;
         aim(&mut cutting);
+        self.divide(&mut cutting);
         Some(cutting.pieces.max(1).saturating_mul(self.paths.len().max(1)))
     }
 
@@ -2689,10 +2733,15 @@ impl Source for FileScan<'_> {
 /// file states nothing and interleaves everything, so every byte is parsed whatever the projection
 /// is and the projection only saves the conversion and the copy. The three calls they do share are
 /// exactly the three the scan above needs.
+///
+/// A range of a CSV file cut up by [`FileScan::divide`] is a third kind, which only a morsel holds.
+/// It was projected and settled as the whole file before it was cut, so it is only ever asked for
+/// chunks.
 #[derive(Debug)]
 enum FileReader {
     Parquet(Reader),
     Csv(CsvReader),
+    Part(Part),
 }
 
 impl FileReader {
@@ -2709,6 +2758,7 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.fields(),
             Self::Csv(reader) => reader.fields(),
+            Self::Part(_) => Vec::new(),
         }
     }
 
@@ -2717,6 +2767,7 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.project(columns),
             Self::Csv(reader) => reader.project(columns),
+            Self::Part(_) => Err(cut_already()),
         }
     }
 
@@ -2741,6 +2792,7 @@ impl FileReader {
                 let types: Vec<LogicalType> = wanted.iter().map(|field| field.ty.clone()).collect();
                 reader.retype(&types)
             }
+            Self::Part(_) => Err(cut_already()),
         }
     }
 
@@ -2749,26 +2801,34 @@ impl FileReader {
         match self {
             Self::Parquet(reader) => reader.next_chunk(),
             Self::Csv(reader) => reader.next_chunk(),
+            Self::Part(part) => part.next_chunk(),
         }
     }
 
     /// How many row groups the file has, which is how many morsels it is worth.
     ///
-    /// Zero for CSV, which has none, and which the scan reads as one morsel covering the file.
+    /// Zero for CSV, which has none, and whose morsels are its ranges.
     fn row_groups(&self) -> usize {
         match self {
             Self::Parquet(reader) => reader.metadata().row_groups.len(),
-            Self::Csv(_) => 0,
+            Self::Csv(_) | Self::Part(_) => 0,
         }
     }
 
-    /// Compressed column bytes read so far, where the reader exposes that distinction.
+    /// Bytes of the file read so far, which for Parquet is the compressed column bytes.
     fn bytes_read(&self) -> u64 {
         match self {
             Self::Parquet(reader) => reader.bytes_read(),
-            Self::Csv(_) => 0,
+            Self::Csv(reader) => reader.bytes_read(),
+            Self::Part(part) => part.bytes_read(),
         }
     }
+}
+
+/// What asking a range of a CSV file to be something other than read comes to, which is a scan
+/// that cut a file before it finished opening it.
+fn cut_already() -> Error {
+    Error::internal("a range of a CSV file was reshaped after the file was cut")
 }
 
 /// What the call's named parameters said about how the CSV files are written.
