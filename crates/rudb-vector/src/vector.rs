@@ -1463,16 +1463,15 @@ impl Vector {
         {
             return Ok(self.clone());
         }
-        // A range can fit the type while the width that covers it does not: `-2^31 + 5` to
-        // `2^31 - 9` needs 32 bits, and 32 bits up from the low end runs past `i32::MAX`. The
-        // packed form checks both ends of what its width can say, so this is a column it cannot
-        // hold, and the answer is to leave it flat rather than fail the caller.
-        let top = low + i128::from(u64::MAX >> (64 - width));
-        if layout_range(&self.ty).is_none_or(|(_, highest)| top > highest) {
+        // A range can fit the type while that width up from the smallest value does not: a column
+        // of a thousand values under `i32::MAX` needs ten bits, and ten bits up from the smallest
+        // of them runs past `i32::MAX`. The packed form checks both ends of what its width can
+        // say, so the base moves down until they both fit rather than the column being left flat.
+        let Some(base) = packing_base(&self.ty, low, high, width) else {
             return Ok(self.clone());
-        }
-        let words = pack(data, self.len, low, width);
-        let packed = Self::packed(self.ty.clone(), words, width, low, self.len)?;
+        };
+        let words = pack(data, self.len, base, width);
+        let packed = Self::packed(self.ty.clone(), words, width, base, self.len)?;
         Ok(packed.with_validity(self.validity.clone()))
     }
 
@@ -3389,6 +3388,30 @@ fn flat_bytes(data: &Data, len: usize) -> usize {
     crate::for_each_layout!(all, widths)
 }
 
+/// What to subtract before packing, so that the whole code range lands inside the column's type.
+///
+/// The smallest value in the column is the obvious base and it is the wrong one near the top of a
+/// type. [`Vector::packed`] checks the two ends of what the codes could say rather than the values
+/// that are actually there, which is one check instead of one per row and is what makes reading a
+/// packed column cheap. An `INTEGER` column of a thousand values just under `i32::MAX` needs ten
+/// bits, and based at its own smallest value those ten bits could say a number an `INTEGER` cannot
+/// hold, so the column was refused and the table would not write at all.
+///
+/// The base does not have to be the smallest value. Any base works where every code is still
+/// non-negative and the widest code the width allows still fits the type, which is `base <= low`,
+/// `high - base <= 2^width - 1`, `type low <= base` and `base + 2^width - 1 <= type high` together.
+///
+/// The largest base meeting all four is the one below, and it exists whenever the values fit the
+/// type at all: `high - (2^width - 1) <= low` because that is how the width was chosen, and
+/// `type low <= type high - (2^width - 1)` because a width wider than the type's own span is
+/// already refused. `None` is for a type with no integer layout, which cannot be packed anyway.
+fn packing_base(ty: &LogicalType, low: i128, high: i128, width: u32) -> Option<i128> {
+    let (floor, ceiling) = layout_range(ty)?;
+    let span = i128::from(u64::MAX >> (64 - width));
+    let base = low.min(ceiling - span);
+    (base >= floor && base >= high - span).then_some(base)
+}
+
 /// The lowest and highest value in the first `len` slots of a run of integer data.
 ///
 /// `None` for data that is not integers, which is what says a column cannot be packed. The null
@@ -4085,7 +4108,10 @@ mod tests {
 
     use rudb_common::{Field, LogicalType, Value};
 
-    use super::{Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, NO_ROW, VECTOR_SIZE, Vector};
+    use super::{
+        Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, NO_ROW, VECTOR_SIZE, Vector,
+        packing_base,
+    };
     use crate::buffer::Buffer;
     use crate::fsst::SymbolTable;
     use crate::string::{StringColumn, StringView};
@@ -5805,6 +5831,48 @@ mod tests {
         let values: Vec<i32> = (0..1024).map(|row| row * 2_000_000 - 1_000_000_000).collect();
         let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
         assert_eq!(flat.bit_packed().unwrap().form(), Form::Flat);
+    }
+
+    /// The column that would not write. A thousand values just under `i32::MAX` need ten bits, and
+    /// based at the smallest of them those ten bits could say a number an `INTEGER` cannot hold, so
+    /// the range check refused the column and `CREATE TABLE` came back with an internal error. The
+    /// base is what moves, not the check: it drops to where the widest code the width allows is the
+    /// largest value the type has.
+    #[test]
+    fn a_column_against_the_top_of_its_type_packs_rather_than_being_refused() {
+        let values: Vec<i32> = (0..4096).map(|row| i32::MAX - (row % 1000)).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.clone().into())).unwrap();
+        let packed = flat.bit_packed().unwrap();
+        assert_eq!(packed.form(), Form::BitPacked);
+        let parts = packed.packed_parts().expect("packed");
+        assert_eq!(parts.width(), 10, "a thousand values apart is ten bits");
+        assert_eq!(
+            parts.base() + i128::from(u64::MAX >> (64 - parts.width())),
+            i128::from(i32::MAX),
+            "the widest code the width allows is the largest value the type holds"
+        );
+        assert_eq!(
+            packed.iter().collect::<Vec<_>>(),
+            flat.iter().collect::<Vec<_>>(),
+            "the values came back different"
+        );
+    }
+
+    /// The other end of the same thing. A column that reaches both ends of its type needs every bit
+    /// the type has, and the only base that leaves room for those codes is the bottom of the type.
+    #[test]
+    fn a_column_that_reaches_both_ends_of_its_type_bases_at_the_bottom_of_it() {
+        let values: Vec<i32> = (0..4096)
+            .map(|row| if row % 2 == 0 { i32::MIN + row } else { i32::MAX - row })
+            .collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.clone().into())).unwrap();
+        // Thirty two bits of codes for a thirty two bit type buys nothing, so the size check leaves
+        // it flat. What matters is that it is left flat rather than refused.
+        assert_eq!(flat.bit_packed().unwrap().form(), Form::Flat);
+        assert_eq!(
+            packing_base(&LogicalType::Integer, i128::from(i32::MIN), i128::from(i32::MAX), 32),
+            Some(i128::from(i32::MIN))
+        );
     }
 
     /// A column of one value would pack to no bits at all, and one run is smaller than any packing
