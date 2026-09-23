@@ -152,6 +152,8 @@ fn ranged(inclusive: bool, args: &[Value]) -> Result<Vec<Value>> {
     // can leave the type.
     let mut at = start;
     let mut values = Vec::with_capacity(count);
+    // row at a time: this is the scalar form of range for one constant call, which hands back a
+    // list value, and the vector form over columns writes its child directly without this loop.
     for _ in 0..count {
         values.push(Value::BigInt(at));
         at = at.wrapping_add(step);
@@ -640,8 +642,9 @@ fn built<V: AsRef<Vector>>(
     if nested_or_null(element) || args.iter().any(|arg| arg.as_ref().logical_type() != &**element) {
         return Ok(None);
     }
-    let pieces: Vec<Vector> =
-        args.iter().map(|arg| arg.as_ref().flatten()).collect::<Result<_>>()?;
+    // flatten: the interleave copies every element into one child by position, and it reads flat
+    // values, so each argument is one copy either way.
+    let pieces = args.iter().map(|arg| arg.as_ref().flatten()).collect::<Result<Vec<_>>>()?;
     let width = args.len();
     let order: Vec<usize> =
         (0..rows).flat_map(|row| (0..width).map(move |at| at * rows + row)).collect();
@@ -667,6 +670,8 @@ fn series<V: AsRef<Vector>>(
     if args.iter().any(|arg| arg.as_ref().logical_type() != &LogicalType::BigInt) {
         return Ok(None);
     }
+    // flatten: the loop below reads each row's start, stop and step as plain i64 values, and the
+    // arguments are three scalars a row, small next to the series written for them.
     let flat: Vec<Vector> = args.iter().map(|arg| arg.as_ref().flatten()).collect::<Result<_>>()?;
     let mut columns = Vec::with_capacity(flat.len());
     for vector in &flat {
