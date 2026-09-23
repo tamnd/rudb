@@ -125,6 +125,17 @@ struct Column {
 }
 
 impl Column {
+    /// A column that has seen nothing yet.
+    fn new() -> Self {
+        Self {
+            // The default k is the only k here, so two of these can always be unioned. The
+            // constructor only fails on a k of zero.
+            sketch: Sketch::new(DEFAULT_K).unwrap_or_else(|_| Sketch::of(&[])),
+            tally: Tally::new(),
+            blind: false,
+        }
+    }
+
     /// Counts one vector, and gives up on the column if this is a form with no hash rule.
     fn add(&mut self, vector: &Vector) {
         if self.blind {
@@ -133,6 +144,49 @@ impl Column {
         if !walk(vector, &mut Sink::of(&mut self.sketch, &mut self.tally)) {
             self.blind();
         }
+    }
+
+    /// Takes in what `later` counted over the rows that came after this column's.
+    ///
+    /// The column ends as it would have had it read those rows itself. The union of two bottom-k
+    /// sketches is the sketch of the union of their values, and the tally takes the later values in
+    /// the order they first arrived, so its list comes out in the same order and with the same row
+    /// counts. A tally that goes past its cap on the way gives up the way it would have, and every
+    /// value either side was holding goes to the sketch.
+    fn absorb(&mut self, mut later: Self) {
+        if later.blind {
+            self.blind();
+        }
+        if self.blind {
+            return;
+        }
+        let mut stray = Vec::new();
+        if let Some(values) = later.tally.list_by_arrival() {
+            let mut values = values.into_iter();
+            if self.tally.counting() {
+                for (hash, rows, value) in values.by_ref() {
+                    // A tally only answers `false` with rows in hand when it has given up, which
+                    // is the case the rest of this is for.
+                    if rows > 0 && !self.tally.add(hash, rows, || value) {
+                        stray.push(hash);
+                        break;
+                    }
+                }
+            }
+            stray.extend(values.map(|(hash, _, _)| hash));
+        } else if self.tally.counting() {
+            self.tally.give_up();
+        }
+        stray.extend(self.tally.spilled().unwrap_or_default());
+        stray.extend(later.tally.spilled().unwrap_or_default());
+        match self.sketch.union(&later.sketch) {
+            Ok(union) => self.sketch = union,
+            Err(_) => return self.blind(),
+        }
+        for hash in stray {
+            self.sketch.add_hash(hash);
+        }
+        later.tally.forget();
     }
 
     /// Gives up on the column, which is what a form with no hash rule leaves behind.
@@ -157,23 +211,51 @@ impl Counting<'_> {
     pub fn add(&mut self, vector: &Vector) {
         self.column.add(vector);
     }
+
+    /// Takes in a count of the rows that came after every row this column has seen.
+    ///
+    /// Parts have to be absorbed in the order of their rows, the way chunks have to be added in it,
+    /// for the tally's list to come out the way reading the rows in order would have left it.
+    pub fn absorb(&mut self, part: Partial) {
+        self.column.absorb(part.column);
+    }
+}
+
+/// One column's count over a run of its rows, taken apart from the column so that the runs can be
+/// counted on threads of their own and absorbed afterwards. See [`Counting::absorb`].
+///
+/// A column split this way is split by rows and not by columns, which is the point. One wide string
+/// column costs more to count than the rest of `lineitem` together, and counting a column a thread
+/// left every other thread waiting on it (#1380).
+#[derive(Debug)]
+pub struct Partial {
+    column: Column,
+}
+
+impl Partial {
+    /// A count that has seen nothing yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { column: Column::new() }
+    }
+
+    /// Counts one vector, the same as [`Counting::add`] does.
+    pub fn add(&mut self, vector: &Vector) {
+        self.column.add(vector);
+    }
+}
+
+impl Default for Partial {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Counts {
     /// A counter for a table of `width` columns, holding nothing yet.
     #[must_use]
     pub fn new(width: usize) -> Self {
-        Self {
-            columns: (0..width)
-                .map(|_| Column {
-                    // The default k is the only k here, so two of these can always be unioned. The
-                    // constructor only fails on a k of zero.
-                    sketch: Sketch::new(DEFAULT_K).unwrap_or_else(|_| Sketch::of(&[])),
-                    tally: Tally::new(),
-                    blind: false,
-                })
-                .collect(),
-        }
+        Self { columns: (0..width).map(|_| Column::new()).collect() }
     }
 
     /// Counts one chunk, one column at a time.
@@ -764,7 +846,7 @@ mod tests {
     use rudb_encoding::sketch::{DEFAULT_K, Sketch};
     use rudb_vector::{Chunk, Form, Vector};
 
-    use super::{Counts, countable, hash_value};
+    use super::{Counts, Partial, countable, hash_value};
     use crate::tally::TALLY_VALUES;
 
     /// A flat `INTEGER` vector of `values`.
@@ -1026,6 +1108,21 @@ mod tests {
     }
 
     /// A column this cannot read says nothing rather than saying something low.
+    #[test]
+    fn a_blind_part_blinds_the_column_it_is_absorbed_into() {
+        let held = [Value::Interval { months: 1, days: 0, micros: 0 }].to_vec();
+        let unreadable = Vector::from_values(LogicalType::Interval, &held).expect("a column");
+        let mut counts = Counts::new(1);
+        counts.add(&Chunk::new(vec![flat(&[1, 2, 3])]).expect("a chunk"));
+        let mut part = Partial::new();
+        part.add(&unreadable);
+        part.add(&flat(&[4]));
+        let mut columns = counts.columns_mut();
+        columns.first_mut().expect("one column").absorb(part);
+        drop(columns);
+        assert_eq!(counts.distinct(0), None, "the part missed rows, so the column did too");
+    }
+
     #[test]
     fn a_type_with_no_rule_stops_the_column_answering_and_never_starts_again() {
         let held = [Value::Interval { months: 1, days: 0, micros: 0 }].to_vec();
