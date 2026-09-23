@@ -189,6 +189,15 @@ const FREQUENCY_TEXT_BUDGET: usize = 1024 * 1024;
 const MAX_FREQUENCY_WORKERS: usize = 32;
 
 /// How many threads the passes at the end of a commit are spread over on this machine.
+fn probe_cpu() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let after = stat.rsplit(')').next().unwrap_or("");
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let user: f64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let sys: f64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    (user + sys) / 100.0
+}
+
 fn close_workers() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from).min(MAX_FREQUENCY_WORKERS)
 }
@@ -3188,7 +3197,7 @@ impl Writer {
     /// If directory encoding or writing fails.
     fn close(&mut self) -> Result<Entry> {
         let clock = std::time::Instant::now();
-        eprintln!("PROBE close entered at {:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
+        eprintln!("PROBE close entered cpu={:.2} at {:?}", probe_cpu(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
         self.reclaim()?;
         self.flush_pending()?;
         eprintln!("PROBE flushed {:?}", clock.elapsed());
@@ -3228,7 +3237,7 @@ impl Writer {
             let numeric = scope.spawn(|| {
                 let (frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
                     this.numeric_frequencies()?.into_iter().unzip();
-                eprintln!("PROBE numeric {:?}", clock.elapsed());
+                eprintln!("PROBE numeric {:?} cpu={:.2}", clock.elapsed(), probe_cpu());
                 let frequencies = frequencies
                     .into_iter()
                     .map(|held| held.map(Frequencies::Held))
@@ -3238,7 +3247,7 @@ impl Writer {
                 Ok::<_, Error>((frequencies, distincts, pairs))
             });
             let closed = this.close_dictionaries();
-            eprintln!("PROBE dictionaries {:?}", clock.elapsed());
+            eprintln!("PROBE dictionaries {:?} cpu={:.2}", clock.elapsed(), probe_cpu());
             let numeric =
                 numeric.join().map_err(|_| Error::internal("the native frequency thread panicked"));
             (numeric, closed)
@@ -3291,7 +3300,7 @@ impl Writer {
         }
         let offset = self.at;
         self.put(&directory)?;
-        eprintln!("PROBE directory {:?} at {:?}", clock.elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
+        eprintln!("PROBE directory {:?} cpu={:.2} at {:?}", clock.elapsed(), probe_cpu(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
         drop(timing);
         if let Some(profile) = &profile {
             profile.moved(Stage::Dictionary, 0, placed, 0);
