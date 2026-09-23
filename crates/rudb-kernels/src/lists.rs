@@ -84,6 +84,16 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
                 (Err(error), _) | (_, Err(error)) => Err(error),
             }
         }
+        ("list_grade_up", [Value::List { values, .. }, spelled @ ..]) => {
+            let order = spelled.first().map(spelled_order).transpose();
+            let nulls = spelled.get(1).map(spelled_nulls).transpose();
+            match (order, nulls) {
+                (Ok(order), Ok(nulls)) => {
+                    graded(values, order.unwrap_or(false), nulls.unwrap_or(false)).and_then(list)
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
         ("list_reverse_sort", [Value::List { values, .. }, spelled @ ..]) => {
             match spelled.first().map(spelled_nulls).transpose() {
                 Ok(nulls) => sort(values, true, nulls.unwrap_or(false)).and_then(list),
@@ -336,15 +346,33 @@ fn unrecognized(spelled: &str, kind: &str) -> Error {
 }
 
 /// `list_sort`: the values in order, with the nulls kept together at one end.
+fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
+    Ok(grade(values, descending, nulls_first)?.into_iter().map(|at| values[at].clone()).collect())
+}
+
+/// `list_grade_up`: the one based place of each value in the order `list_sort` would put it.
+fn graded(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
+    grade(values, descending, nulls_first)?
+        .into_iter()
+        .map(|at| {
+            Ok(Value::BigInt(
+                i64::try_from(at + 1).map_err(|error| Error::internal(error.to_string()))?,
+            ))
+        })
+        .collect()
+}
+
+/// The places of the values in sorted order, with the nulls kept together at one end.
 ///
 /// The nulls go last unless asked otherwise whichever way the rest are sorted, which is the pin's
-/// default and not the reverse of an ascending sort.
-fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Value>> {
-    let mut held: Vec<Value> = values.iter().filter(|value| !value.is_null()).cloned().collect();
-    let nulls = values.len() - held.len();
+/// default and not the reverse of an ascending sort. The sort is stable, so equal values keep the
+/// order they came in, which is what makes the grade of a list with repeats the pin's.
+fn grade(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<usize>> {
+    let (mut held, nulls): (Vec<usize>, Vec<usize>) =
+        (0..values.len()).partition(|&at| !values[at].is_null());
     let mut failed = None;
-    held.sort_by(|left, right| {
-        let ordering = order(left, right).unwrap_or_else(|error| {
+    held.sort_by(|&left, &right| {
+        let ordering = order(&values[left], &values[right]).unwrap_or_else(|error| {
             failed.get_or_insert(error);
             Ordering::Equal
         });
@@ -353,15 +381,7 @@ fn sort(values: &[Value], descending: bool, nulls_first: bool) -> Result<Vec<Val
     if let Some(error) = failed {
         return Err(error);
     }
-    let mut sorted = Vec::with_capacity(values.len());
-    if nulls_first {
-        sorted.resize(nulls, Value::Null);
-    }
-    sorted.append(&mut held);
-    if !nulls_first {
-        sorted.resize(values.len(), Value::Null);
-    }
-    Ok(sorted)
+    Ok(if nulls_first { [nulls, held].concat() } else { [held, nulls].concat() })
 }
 
 /// A loop over whole vectors for the list calls that have one, or `None` for a call that goes
@@ -386,14 +406,15 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
         ("list_contains" | "list_position", [list, needle]) => {
             searched(name == "list_position", list.as_ref(), needle.as_ref())
         }
-        ("list_sort", [list, spelled @ ..]) => ordered(
+        ("list_sort" | "list_grade_up", [list, spelled @ ..]) => ordered(
             list.as_ref(),
             spelled.first().map(AsRef::as_ref),
             spelled.get(1).map(AsRef::as_ref),
             false,
+            name == "list_grade_up",
         ),
         ("list_reverse_sort", [list, spelled @ ..]) => {
-            ordered(list.as_ref(), None, spelled.first().map(AsRef::as_ref), true)
+            ordered(list.as_ref(), None, spelled.first().map(AsRef::as_ref), true, false)
         }
         _ => Ok(None),
     }
@@ -504,8 +525,9 @@ fn searched(position: bool, list: &Vector, needle: &Vector) -> Result<Option<Vec
     Ok(Some(answer.with_validity(list.validity().clone())))
 }
 
-/// `list_sort` and `list_reverse_sort` over an integer column: each row's run of the child sorted
-/// as indices, and the child gathered once in that order.
+/// `list_sort`, `list_reverse_sort` and `list_grade_up` over an integer column: each row's run of
+/// the child sorted as indices, and the child gathered once in that order. A grade answers with the
+/// places themselves and gathers nothing.
 ///
 /// The order and null order are constants, which the binder insists on, so they are read once for
 /// the whole vector. A null one is left to the row path, where it makes every row null. So is a
@@ -516,6 +538,7 @@ fn ordered(
     order: Option<&Vector>,
     nulls: Option<&Vector>,
     reverse: bool,
+    grade: bool,
 ) -> Result<Option<Vector>> {
     let Some((entries, child)) = list.list_parts() else {
         return Ok(None);
@@ -550,7 +573,17 @@ fn ordered(
         };
     }
     let (placed, indices) = permute!(Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64);
-    let child = child.gather(&indices)?;
+    let child = if grade {
+        // A grade is each index less the start of its row's run, counted from one.
+        let mut places = Vec::with_capacity(indices.len());
+        for (&(at, len), &(start, _)) in placed.iter().zip(entries) {
+            let run = &indices[at as usize..(at + len) as usize];
+            places.extend(run.iter().map(|&index| i64::from(index - start) + 1));
+        }
+        Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(places)))?
+    } else {
+        child.gather(&indices)?
+    };
     Ok(Some(Vector::list(placed, child)?.with_validity(list.validity().clone())))
 }
 

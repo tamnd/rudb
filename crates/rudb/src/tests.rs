@@ -8296,7 +8296,7 @@ fn the_list_calls_with_a_vector_loop_answer_over_a_column_the_way_they_do_a_row_
     assert_eq!(column("SELECT list_distinct(l) FROM held ORDER BY id"), "[1, 2];[5, 6];NULL;[2]");
     assert_eq!(column("SELECT list_unique(l) FROM held ORDER BY id"), "2;2;NULL;1");
     // Past the length where a run is checked against what it kept, so the set is what answers.
-    let long = vec!["a, b, c, id"; 9].join(", ");
+    let long = ["a, b, c, id"; 9].join(", ");
     assert_eq!(
         column(&format!("SELECT list_unique(list_value({long})) FROM shaped ORDER BY id")),
         "2;3;4;2"
@@ -8316,6 +8316,71 @@ fn the_list_calls_with_a_vector_loop_answer_over_a_column_the_way_they_do_a_row_
     assert_eq!(
         column("SELECT list_reverse_sort(l) FROM held ORDER BY id"),
         "[2, 1, NULL];[6, 5, NULL];NULL;[2, 2, 2]"
+    );
+    assert_eq!(
+        column("SELECT list_grade_up(l) FROM held ORDER BY id"),
+        "[1, 2, 3];[2, 3, 1];NULL;[1, 2, 3]"
+    );
+    assert_eq!(
+        column("SELECT list_grade_up(l, 'DESC', 'NULLS FIRST') FROM held ORDER BY id"),
+        "[3, 2, 1];[1, 3, 2];NULL;[1, 2, 3]"
+    );
+    assert_eq!(
+        column("SELECT array_grade_up(l, 'DESC') FROM held ORDER BY id"),
+        "[2, 1, 3];[3, 2, 1];NULL;[1, 2, 3]"
+    );
+    assert_eq!(column("SELECT contains(l, 2) FROM held ORDER BY id"), "true;false;NULL;true");
+    assert_eq!(column("SELECT contains(s, 'a') FROM shaped ORDER BY id"), "true;NULL;true;false");
+}
+
+#[test]
+fn a_boolean_column_casts_to_a_number_as_a_zero_or_a_one() {
+    let db = database();
+    db.execute("CREATE TABLE flags AS SELECT * FROM (VALUES (true), (false), (NULL), (true)) v(b)")
+        .expect("created");
+    let answer = rows(
+        &db,
+        "SELECT sum(b::INTEGER), sum(b::TINYINT), sum(b::DOUBLE), sum(b::FLOAT), \
+         sum(b::HUGEINT), max(b::DECIMAL(4, 2)), count(b::UBIGINT) FROM flags",
+    );
+    let answer: Vec<String> = answer[0].iter().map(ToString::to_string).collect();
+    assert_eq!(answer, ["2", "2", "2.0", "2.0", "2", "1.00", "3"]);
+}
+
+#[test]
+fn list_grade_up_and_contains_answer_the_way_the_pin_does() {
+    let db = database();
+    let row = |sql: &str| rows(&db, sql)[0][0].to_string();
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    let answers = [
+        ("SELECT list_grade_up([3, 1, NULL, 2])", "[2, 4, 1, 3]"),
+        ("SELECT list_grade_up([3, 1, NULL, 2], 'DESC')", "[1, 4, 2, 3]"),
+        ("SELECT list_grade_up([3, 1, NULL, 2], 'DESC', 'NULLS FIRST')", "[3, 1, 4, 2]"),
+        ("SELECT list_grade_up([1, 1, NULL, 0])", "[4, 1, 2, 3]"),
+        ("SELECT typeof(list_grade_up([1]))", "BIGINT[]"),
+        ("SELECT list_grade_up(NULL)", "NULL"),
+        ("SELECT list_grade_up([])", "[]"),
+        ("SELECT grade_up(['b', 'a'])", "[2, 1]"),
+        ("SELECT contains([1, 2], 2)", "true"),
+        ("SELECT contains([1, NULL], NULL)", "NULL"),
+        ("SELECT contains(['a'], 'a')", "true"),
+        ("SELECT contains([1, 2], 2.5)", "false"),
+        ("SELECT contains([[1]], [1])", "true"),
+        ("SELECT contains('abc', 'b')", "true"),
+        ("SELECT contains('héllo', 'é')", "true"),
+        ("SELECT contains('', '')", "true"),
+    ];
+    for (sql, answer) in answers {
+        assert_eq!(row(sql), answer, "{sql}");
+    }
+    assert_eq!(
+        error("SELECT list_grade_up([1], 'bad')"),
+        "Not implemented Error: Enum value: unrecognized value \"BAD\" for enum \"OrderType\""
+    );
+    assert!(
+        error("SELECT contains(1, 2)").contains("contains(col0 T[], col1 T) -> BOOLEAN"),
+        "{}",
+        error("SELECT contains(1, 2)")
     );
 }
 

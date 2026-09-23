@@ -285,6 +285,9 @@ enum Shape {
     /// The strings are not cast, so `list_sort([1], 1)` is refused as it is on the pin, and the
     /// binder holds them to constants.
     Sorted,
+    /// A list and the same two strings, answering with the places `list_sort` would put each
+    /// element at rather than the elements. `list_grade_up`.
+    Graded,
 }
 
 /// How a shape names the argument whose type the call decides, and the result that follows it.
@@ -533,6 +536,9 @@ const TABLE: &[Entry] = &[
         numeric_only: false,
     },
     text("position", Arity::exactly(2), Fixed::BigInt),
+    // `contains` is also the list search when its first argument is a list, and [`resolve`] sends
+    // it to `list_contains` in that case. This row is the string overload.
+    text("contains", Arity::exactly(2), Fixed::Boolean),
     text("strpos", Arity::exactly(2), Fixed::BigInt),
     text("instr", Arity::exactly(2), Fixed::BigInt),
     text("trim", Arity::between(1, 2), Fixed::Varchar),
@@ -755,6 +761,13 @@ const TABLE: &[Entry] = &[
         kind: FunctionKind::Scalar,
         arity: Arity::between(1, 2),
         shape: Shape::Sorted,
+        numeric_only: false,
+    },
+    Entry {
+        name: "list_grade_up",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 3),
+        shape: Shape::Graded,
         numeric_only: false,
     },
     Entry {
@@ -985,6 +998,11 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     })?;
     if !entry.arity.accepts(arguments.len()) {
         return Err(no_match(entry.name, arguments));
+    }
+    if entry.name == "contains"
+        && matches!(arguments.first(), Some(LogicalType::List(_) | LogicalType::Array(..)))
+    {
+        return resolve("list_contains", arguments);
     }
     if let Some((cast_to, returns)) = temporal(entry.name, arguments) {
         return Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns });
@@ -1387,6 +1405,21 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             };
             listed_or_null(&arguments[0], element, arguments[1..].to_vec())
         }
+        Shape::Graded => {
+            let spelled = arguments[1..]
+                .iter()
+                .all(|ty| matches!(ty, LogicalType::Varchar | LogicalType::Null));
+            let Some(element) = element_of_list(&arguments[0]).filter(|_| spelled) else {
+                return Err(no_match(entry.name, arguments));
+            };
+            let (cast_to, returns) =
+                listed_or_null(&arguments[0], element, arguments[1..].to_vec());
+            let returns = match returns {
+                LogicalType::Null => LogicalType::Null,
+                _ => LogicalType::list(LogicalType::BigInt),
+            };
+            (cast_to, returns)
+        }
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
@@ -1582,6 +1615,14 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "list_grade_up",
+        &[
+            "list_grade_up(list ANY[]) -> ANY[]",
+            "list_grade_up(list ANY[], sort_order VARCHAR) -> ANY[]",
+            "list_grade_up(list ANY[], sort_order VARCHAR, null_order VARCHAR) -> ANY[]",
+        ],
+    ),
+    (
         "list_resize",
         &[
             "list_resize(col0 ANY[], col1 ANY) -> ANY[]",
@@ -1610,6 +1651,15 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("position", &["\"position\"(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
+    (
+        "contains",
+        &[
+            "contains(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN",
+            "contains(col0 T[], col1 T) -> BOOLEAN",
+            "contains(col0 MAP(K, V), col1 K) -> BOOLEAN",
+            "contains(col0 TUPLE, col1 ANY) -> BOOLEAN",
+        ],
+    ),
     ("strpos", &["strpos(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
     ("instr", &["instr(col0 VARCHAR, col1 VARCHAR) -> BIGINT"]),
     (
@@ -2141,6 +2191,7 @@ impl Shape {
             Self::Flattened => (all("T[][]"), SAME_LIST),
             Self::Resized => (leading(1, ANY_LIST, ANY), ANY_LIST),
             Self::Sorted => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
+            Self::Graded => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
         }
     }
 }
@@ -2214,6 +2265,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("array_resize", "list_resize"),
     ("array_sort", "list_sort"),
     ("array_reverse_sort", "list_reverse_sort"),
+    ("array_grade_up", "list_grade_up"),
+    ("grade_up", "list_grade_up"),
     ("rank_dense", "dense_rank"),
 ];
 
@@ -2668,7 +2721,7 @@ mod tests {
                     }
                     Shape::Flattened => arguments = vec![LogicalType::list(strings())],
                     Shape::Resized => arguments[0] = strings(),
-                    Shape::Sorted => {
+                    Shape::Sorted | Shape::Graded => {
                         arguments = vec![LogicalType::Varchar; count];
                         arguments[0] = strings();
                     }

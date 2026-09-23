@@ -97,6 +97,11 @@ pub(crate) fn position(haystack: &Value, needle: &Value) -> Result<Value> {
     Ok(Value::BigInt(found))
 }
 
+/// `contains` over two strings: whether the second appears anywhere in the first.
+pub(crate) fn contains(haystack: &Value, needle: &Value) -> Result<Value> {
+    Ok(Value::Boolean(string(haystack)?.contains(string(needle)?)))
+}
+
 /// `trim`, `ltrim` and `rtrim`, with the characters to strip or without them.
 pub(crate) fn trim(name: &str, text: &Value, characters: Option<&Value>) -> Result<Value> {
     let text = string(text)?;

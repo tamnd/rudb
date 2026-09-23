@@ -2762,6 +2762,7 @@ pub fn call_values(
             text::substring(held, start, Some(length))
         }
         ("position" | "strpos" | "instr", [haystack, needle]) => text::position(haystack, needle),
+        ("contains", [haystack, needle]) => text::contains(haystack, needle),
         ("left" | "right", [held, count]) => text::end(name, held, count),
         ("replace", [held, needle, replacement]) => text::replace(held, needle, replacement),
         ("chr", [code]) => text::chr(code),
