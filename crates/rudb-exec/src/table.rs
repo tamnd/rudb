@@ -4488,8 +4488,12 @@ mod tests {
         let coded = coded_within(&third, 2, &held, Some(&mut values)).expect("read by value");
         assert!(coded.by_value() && coded.same_as(&held), "the window outlives the chunk");
         let back = [Vector::dictionary(vec![1, 0], integers(&[Some(3), Some(4)])).expect("codes")];
-        let coded = coded_within(&back, 2, &held, Some(&mut values)).expect("codes of its own");
-        assert!(!coded.by_value(), "codes that go back are not a selection");
+        // Codes that go back are read against the window the same as a filter's rows, because the
+        // gather reads each row where it is and does not care which way the codes go.
+        let coded = coded_within(&back, 2, &held, Some(&mut values)).expect("read by value");
+        assert!(coded.by_value() && coded.same_as(&held), "codes that go back fit the window");
+        let places = placed(&coded, 2);
+        assert_eq!(places[0], places[1] + 1, "4 sits one place past 3");
         let text = |words: &[&str]| {
             let words: Vec<Value> = words.iter().map(|&word| Value::Varchar(word.into())).collect();
             [Vector::dictionary(vec![1, 0, 1], flat(LogicalType::Varchar, &words)).expect("codes")]
