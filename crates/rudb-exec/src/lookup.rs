@@ -131,6 +131,25 @@ impl Lookup {
         threads: &Lease<'_>,
         cancel: &Cancel,
     ) -> Result<Self> {
+        Self::build_among(keys, rows, nulls, None, threads, cancel)
+    }
+
+    /// The same, leaving out every row `allowed` says no to, as if its key held a rejected null.
+    ///
+    /// For a join that knows some of its gathered rows cannot match any driving row. See
+    /// [`Probe::narrowed_by`](crate::join::Probe::narrowed_by).
+    ///
+    /// # Errors
+    ///
+    /// The ones [`Lookup::build`] raises.
+    pub(crate) fn build_among(
+        keys: &[Vector],
+        rows: usize,
+        nulls: &[bool],
+        allowed: Option<&[bool]>,
+        threads: &Lease<'_>,
+        cancel: &Cancel,
+    ) -> Result<Self> {
         if rows >= NONE as usize {
             return Err(too_many_rows());
         }
@@ -141,6 +160,11 @@ impl Lookup {
         crate::table::hash(keys, rows, &mut hashes, crate::table::Across::TwoInputs);
         let mut keyed = Vec::new();
         which_are_keyed(keys, rows, nulls, &mut keyed);
+        if let Some(allowed) = allowed {
+            for (keyed, &allowed) in keyed.iter_mut().zip(allowed) {
+                *keyed = *keyed && allowed;
+            }
+        }
 
         let bits = split_into(rows, threads.degree());
         let count = 1usize << bits;

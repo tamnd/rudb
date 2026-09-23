@@ -257,6 +257,7 @@ fn build_measured_with_sink<'a>(
         pushing: None,
         sideways: None,
         above: Vec::new(),
+        armed: Vec::new(),
         cutoff: None,
         top_counts: Vec::new(),
         held: Vec::new(),
@@ -1406,6 +1407,11 @@ struct Building<'a, 'b> {
     /// [`sideways::through`] for which joins do. Cleared by every node that `sideways` is cleared
     /// by and that is not such a join.
     above: Vec<Arc<Sideways<'a>>>,
+    /// Every join's runtime filter, in the order the joins were built.
+    ///
+    /// A join reads the ones its driving side added to narrow its own table. See
+    /// [`crate::join::Probe::narrowed_by`].
+    armed: Vec<Arc<Sideways<'a>>>,
     /// The cutoff of the TopN whose input is being walked into, for the scan at the bottom of it.
     ///
     /// The same walk `sideways` survives, minus the table function: a file scan prunes by row group
@@ -1813,9 +1819,14 @@ impl<'a> Building<'a, '_> {
         // Offered to the driving side while it is built, which is how it reaches the scan
         // down there. Cleared afterwards so that nothing built later picks it up.
         self.sideways = Some(Arc::clone(&sideways));
+        let from = self.armed.len();
         let mut left = self.node(driving)?;
         self.sideways = None;
         self.above.clear();
+        // The filters of the joins on the driving side, which are the only ones this join may use
+        // on its own table, and then its own for the joins above it.
+        let below: Vec<Arc<Sideways<'a>>> = self.armed[from..].to_vec();
+        self.armed.push(Arc::clone(&sideways));
         let side = Gathered { schema: &held_schema, chunks: gathered, marker, swapped };
         // A lookup answers this join and the kind decides about a driving row from that
         // row's own matches, so nothing has to be held and the driving side streams
@@ -1912,6 +1923,19 @@ impl<'a> Building<'a, '_> {
         {
             let probe = probe.in_session(self.session);
             arm(probe.sideways());
+            // A filter below is about the scan's column, so this join's driving column is named
+            // the same way before the two are compared.
+            let narrowing = probe
+                .driving_columns()
+                .into_iter()
+                .filter_map(|(at, binding)| {
+                    let binding = sideways::beneath(plan, driving, binding)?;
+                    let found = below.iter().find(|below| below.binding() == Some(binding))?;
+                    found.wanted();
+                    Some((at, Arc::clone(found)))
+                })
+                .collect();
+            let probe = probe.narrowed_by(narrowing);
             let schema = probe.schema().clone();
             let counters = self.watch(reference, id, pipeline, "Probe", None);
             let probe = probe.watched(Arc::clone(&counters));
