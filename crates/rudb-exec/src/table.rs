@@ -4260,8 +4260,9 @@ mod tests {
         let after = [packed_numbers(&[107, 105, 104, 106], 2, 104)];
         let coded = coded_within(&after, 4, &held, Some(&mut values)).expect("read by value");
         assert!(coded.by_value() && coded.same_as(&held), "the window outlives the page");
-        let filtered = [Vector::dictionary(vec![3, 0], packed_numbers(&[108, 109, 110, 111], 2, 108))
-            .expect("the rows a filter kept")];
+        let filtered =
+            [Vector::dictionary(vec![3, 0], packed_numbers(&[108, 109, 110, 111], 2, 108))
+                .expect("the rows a filter kept")];
         let coded = coded_within(&filtered, 2, &held, Some(&mut values)).expect("read by value");
         assert!(coded.by_value() && coded.same_as(&held), "a filtered page lands in it too");
         assert_eq!(placed(&coded, 2)[0] - placed(&coded, 2)[1], 3);
