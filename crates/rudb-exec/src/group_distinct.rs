@@ -451,7 +451,7 @@ impl Exchange {
 
     pub(crate) fn combine(&self, mut local: Local) -> Result<()> {
         for (at, run) in local.partitions.iter_mut().enumerate() {
-            if !run.rows.is_empty() {
+            if !run.is_empty() {
                 let run = std::mem::take(run);
                 self.partitions[at].lock().map_err(poisoned)?.runs.push(run);
             }
