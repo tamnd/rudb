@@ -3183,8 +3183,11 @@ impl Writer {
     ///
     /// If directory encoding or writing fails.
     fn close(&mut self) -> Result<Entry> {
+        let clock = std::time::Instant::now();
+        eprintln!("PROBE close entered at {:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
         self.reclaim()?;
         self.flush_pending()?;
+        eprintln!("PROBE flushed {:?}", clock.elapsed());
         // The rest of a table is its statistics, its dictionaries and its directory. The dictionary
         // work is charged as its own stage, because ranking a global dictionary can be most of what
         // this costs, and the rest as publish.
@@ -3209,6 +3212,7 @@ impl Writer {
         let placing = self.at;
         finish_dictionaries(&mut self.dictionaries)?;
         self.place_blocks()?;
+        eprintln!("PROBE placed {:?}", clock.elapsed());
         // The numeric frequencies and the global dictionaries read what is already written and
         // write nothing, so they run at the same time. Each was most of a second on `hits` with the
         // other waiting for it, and neither keeps every core busy on its own: each is as long as
@@ -3220,6 +3224,7 @@ impl Writer {
             let numeric = scope.spawn(|| {
                 let (frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
                     this.numeric_frequencies()?.into_iter().unzip();
+                eprintln!("PROBE numeric {:?}", clock.elapsed());
                 let frequencies = frequencies
                     .into_iter()
                     .map(|held| held.map(Frequencies::Held))
@@ -3229,6 +3234,7 @@ impl Writer {
                 Ok::<_, Error>((frequencies, distincts, pairs))
             });
             let closed = this.close_dictionaries();
+            eprintln!("PROBE dictionaries {:?}", clock.elapsed());
             let numeric =
                 numeric.join().map_err(|_| Error::internal("the native frequency thread panicked"));
             (numeric, closed)
@@ -3269,16 +3275,19 @@ impl Writer {
                 hash: checksum(&encoded.index),
             });
         }
+        eprintln!("PROBE dictionaries written {:?}", clock.elapsed());
         drop(timing);
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let placed = self.at - placing;
         self.write_stats()?;
+        eprintln!("PROBE stats {:?}", clock.elapsed());
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
         }
         let offset = self.at;
         self.put(&directory)?;
+        eprintln!("PROBE directory {:?} at {:?}", clock.elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default());
         drop(timing);
         if let Some(profile) = &profile {
             profile.moved(Stage::Dictionary, 0, placed, 0);
