@@ -589,18 +589,20 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
     fn bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
         Ok(self.bytes_at(index)?.map(<[u8]>::len))
     }
-    /// The byte length at each of `indices`, into the same place of `into`, and zero for a position
-    /// the source does not have.
+    /// The byte length at each of `indices`, appended to `into` in the same order, and zero for a
+    /// position the source does not have.
     ///
     /// The same answers as [`bytes_len_at`](Self::bytes_len_at) a position at a time, which is what
     /// the default does. A source overrides it when it can answer a run of positions for less than
     /// the run of calls: a length asked once per row goes through a dispatch here, a dispatch in the
     /// vector and a `Result` at each, and on a column whose lengths are one load each that was most
-    /// of what `STRLEN` cost.
-    fn bytes_lens_at(&self, indices: &[u32], into: &mut [i64]) -> Result<()> {
-        for (slot, &index) in into.iter_mut().zip(indices) {
+    /// of what `STRLEN` cost. Appended rather than written into place, so that the caller has no
+    /// zeroed buffer to make first only for every slot of it to be written over.
+    fn bytes_lens_at(&self, indices: &[u32], into: &mut Vec<i64>) -> Result<()> {
+        into.reserve(indices.len());
+        for &index in indices {
             let len = self.bytes_len_at(index as usize)?.unwrap_or_default();
-            *slot = i64::try_from(len).unwrap_or(i64::MAX);
+            into.push(i64::try_from(len).unwrap_or(i64::MAX));
         }
         Ok(())
     }
@@ -2449,7 +2451,8 @@ impl Vector {
 
     /// The byte length of every row, in one call to whatever holds the text, when that is possible.
     ///
-    /// `into` is one slot per row. The answer is whether it was filled: a vector with nulls in it,
+    /// `into` is cleared and given one length per row. The answer is whether it was: a vector with
+    /// nulls in it,
     /// or one whose text is not read from a [`TextSource`], answers `false` and leaves the caller to
     /// ask a row at a time through [`Self::try_bytes_len_at`], which is right for every shape. The
     /// two shapes taken here are the two a scan of a stored string column hands out, the text itself
@@ -2459,10 +2462,11 @@ impl Vector {
     /// # Errors
     ///
     /// Whatever reading the lengths out of storage raises.
-    pub fn try_bytes_lens(&self, into: &mut [i64]) -> Result<bool> {
-        if into.len() != self.len || !matches!(self.validity, Validity::AllValid) {
+    pub fn try_bytes_lens(&self, into: &mut Vec<i64>) -> Result<bool> {
+        if !matches!(self.validity, Validity::AllValid) {
             return Ok(false);
         }
+        into.clear();
         match &self.body {
             Body::ExternalText { source } => {
                 let Ok(rows) = u32::try_from(self.len) else { return Ok(false) };
@@ -2472,6 +2476,7 @@ impl Vector {
             }
             Body::Dictionary { codes, values, .. } => match &values.body {
                 Body::ExternalText { source } if matches!(values.validity, Validity::AllValid) => {
+                    let Some(codes) = codes.get(..self.len) else { return Ok(false) };
                     source.bytes_lens_at(codes, into)?;
                     Ok(true)
                 }

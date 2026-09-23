@@ -759,10 +759,11 @@ fn bytes_of<A: Fn(usize) -> usize>(
     if returns != &LogicalType::BigInt {
         return Ok(None);
     }
-    let mut out = vec![0i64; rows];
+    let mut out = Vec::new();
     // A stored column answers the whole vector in one call where it can, which on ClickBench 28 is
     // the difference between a length costing a load and costing four calls. A vector with no nulls
-    // has the argument's mask as its answer's, so there is nothing left to do after it.
+    // has the argument's mask as its answer's, so there is nothing left to do after it. The lengths
+    // are appended, so the buffer is not zeroed first for every slot of it to be written over.
     let whole = match text {
         Text::Read(vector) if matches!(base, Validity::AllValid) => {
             vector.try_bytes_lens(&mut out)?
@@ -772,6 +773,8 @@ fn bytes_of<A: Fn(usize) -> usize>(
     if whole {
         return finish(returns, Data::Int64(out.into()), Validity::AllValid);
     }
+    out.clear();
+    out.resize(rows, 0);
     let validity = over_valid(rows, base, |index| {
         out[index] = i64::try_from(text.len(index)?).unwrap_or(i64::MAX);
         Ok(())

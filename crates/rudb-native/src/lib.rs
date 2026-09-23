@@ -4533,36 +4533,39 @@ impl TextSource for NativeText {
     /// caller asking for a vector of lengths has said how many it wants, and a vector of them is
     /// usually enough on its own. Until the table is worth building this is the row at a time read,
     /// the same as the default.
-    fn bytes_lens_at(&self, indices: &[u32], into: &mut [i64]) -> Result<()> {
+    fn bytes_lens_at(&self, indices: &[u32], into: &mut Vec<i64>) -> Result<()> {
         self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed);
+        into.reserve(indices.len());
         let Some(ends) = self.value_ends() else {
-            for (slot, &index) in into.iter_mut().zip(indices) {
-                *slot = self
-                    .bytes_len_at(index as usize)?
-                    .map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX));
+            for &index in indices {
+                into.push(
+                    self.bytes_len_at(index as usize)?
+                        .map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX)),
+                );
             }
             return Ok(());
         };
         if let Some(lens) = self.value_lens.get_or_init(|| lengths_of(ends)) {
-            for (slot, &index) in into.iter_mut().zip(indices) {
-                // Past the end is no value and so no length, which is what a row at a time read
-                // says.
-                *slot = lens.get(index as usize).map_or(0, |&len| i64::from(len));
-            }
+            // Past the end is no value and so no length, which is what a row at a time read says.
+            into.extend(
+                indices
+                    .iter()
+                    .map(|&index| lens.get(index as usize).map_or(0, |&len| i64::from(len))),
+            );
             return Ok(());
         }
-        for (slot, &index) in into.iter_mut().zip(indices) {
+        for &index in indices {
             let index = index as usize;
             // Past the end is no value and so no length, which is what a row at a time read says.
             let Some(&end) = ends.get(index) else {
-                *slot = 0;
+                into.push(0);
                 continue;
             };
             let start = if index % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[index - 1] };
             if start > end {
                 return Err(invalid("global dictionary value ends before it starts"));
             }
-            *slot = i64::from(end - start);
+            into.push(i64::from(end - start));
         }
         Ok(())
     }
