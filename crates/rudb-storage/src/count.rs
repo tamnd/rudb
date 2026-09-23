@@ -749,7 +749,7 @@ fn narrow<T: Copy + Ord + Into<i128>>(held: &[T], vector: &Vector, sink: &mut Si
     let (low, high) =
         held.iter().fold((start, start), |(low, high), &value| (low.min(value), high.max(value)));
     let low: i128 = low.into();
-    let span = high.into() - low;
+    let Some(span) = Into::<i128>::into(high).checked_sub(low) else { return false };
     if rows < NARROW_ROWS || span >= rows as i128 {
         return false;
     }

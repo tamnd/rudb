@@ -68,7 +68,7 @@ pub use zones::{Common, Stripes, ascending, distincts};
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
-const FORMAT: u32 = 27;
+const FORMAT: u32 = 28;
 
 /// Formats this build can open.
 ///
@@ -92,10 +92,13 @@ const FORMAT: u32 = 27;
 /// index and the sorted order and nothing else. A format 26 file has its blocks inside the page,
 /// and the reader tells the two apart by whether the page has room left over for them.
 ///
-/// This is not a general compatibility promise. Six formats are readable because there was a
+/// Format 28 adds per-payload-block substring signatures to global string dictionaries. Older
+/// files have no signatures and use the ordinary exact string filter.
+///
+/// This is not a general compatibility promise. Seven formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
 /// carrying.
-const READABLE: &[u32] = &[22, 23, 24, 25, 26, FORMAT];
+const READABLE: &[u32] = &[22, 23, 24, 25, 26, 27, FORMAT];
 
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
@@ -1031,6 +1034,8 @@ struct GlobalDictionary {
     nulls: u64,
     /// The values of the block being filled, back to back.
     filling: Vec<u8>,
+    /// One conservative four-byte substring signature per sealed payload block.
+    grams: Vec<[u8; TEXT_GRAM_BYTES]>,
     /// Blocks that have filled and not been encoded yet, each with its block number.
     ///
     /// Empty except between a block filling and the end of the stripe that filled it, and while the
@@ -1079,6 +1084,7 @@ impl GlobalDictionary {
             counts: Vec::new(),
             nulls: 0,
             filling: Vec::new(),
+            grams: Vec::new(),
             waiting: Vec::new(),
             sample: Vec::new(),
             stride: 1,
@@ -1155,6 +1161,15 @@ impl GlobalDictionary {
     fn seal(&mut self) {
         let at = self.ends.len().div_ceil(TEXT_PAYLOAD_VALUES) - 1;
         let bytes = std::mem::take(&mut self.filling);
+        let mut grams = [0_u8; TEXT_GRAM_BYTES];
+        for value in self.slices(at, &bytes) {
+            for gram in value.windows(4) {
+                for bit in gram_bits(gram) {
+                    grams[bit / 8] |= 1 << (bit % 8);
+                }
+            }
+        }
+        self.grams.push(grams);
         if at % self.stride == 0 {
             self.sample.push((at, bytes.clone()));
             if self.sample.len() > PAYLOAD_SAMPLE_BLOCKS {
@@ -2641,6 +2656,7 @@ impl Writer {
             let offset = self.at;
             self.put(&encoded.index)?;
             self.put(&encoded.ranks)?;
+            self.put(&encoded.grams)?;
             self.table.dictionary_payloads[index] = dictionary
                 .placed
                 .iter()
@@ -2650,6 +2666,7 @@ impl Writer {
                 .index
                 .len()
                 .checked_add(encoded.ranks.len())
+                .and_then(|len| len.checked_add(encoded.grams.len()))
                 .ok_or_else(|| invalid("dictionary page length overflow"))?;
             self.table.dictionaries[index] = Some(Page {
                 offset,
@@ -3228,6 +3245,8 @@ struct NativeText {
     starts: Vec<u64>,
     lengths: Vec<u64>,
     hashes: Vec<u64>,
+    /// Conservative four-byte substring signatures, read only by a compatible LIKE filter.
+    grams: Option<NativeGrams>,
     /// The payload, read and decoded a block at a time and kept after that.
     blocks: Vec<OnceLock<Result<Vec<u8>>>>,
     /// How many decoded payload bytes this column keeps before a sweep stops keeping what it reads.
@@ -3268,6 +3287,14 @@ struct NativeText {
     searched: Mutex<HashMap<Vec<u8>, (usize, bool)>>,
 }
 
+#[derive(Debug)]
+struct NativeGrams {
+    start: u64,
+    length: usize,
+    hash: u64,
+    loaded: OnceLock<Result<Vec<u8>>>,
+}
+
 /// How many searched for values a column's dictionary remembers the boundary of.
 ///
 /// See [`NativeText::searched`]. Small because the case it is for repeats one value, not because a
@@ -3290,6 +3317,23 @@ const TEXT_SEARCH_MEMO: usize = 64;
 /// 2.3 to 4.5. Going up to 4,096 buys two to six percent more and makes a block as much as 1.5 MB.
 /// Going down to 512 gives up five to nine percent.
 const TEXT_PAYLOAD_VALUES: usize = 1024;
+
+/// Two KiB per payload block makes a four-byte substring a useful negative test without keeping a
+/// large lookup table. The load and file-size costs must pass the same end-to-end gate as queries.
+const TEXT_GRAM_BYTES: usize = 2048;
+
+/// A fast mixing step for exactly four bytes, shared by load and query.
+fn gram_bits(bytes: &[u8]) -> [usize; 2] {
+    let original = u32::from_le_bytes(bytes.try_into().expect("a four-byte gram"));
+    let mut first = original ^ (original >> 16);
+    first = first.wrapping_mul(0x7feb_352d);
+    first ^= first >> 15;
+    let mut second = original ^ (original >> 17);
+    second = second.wrapping_mul(0x846c_a68b);
+    second ^= second >> 16;
+    let mask = TEXT_GRAM_BYTES * 8 - 1;
+    [(first as usize) & mask, (second as usize) & mask]
+}
 
 /// How many decoded payload bytes one dictionary keeps before a sweep stops keeping what it reads.
 ///
@@ -3339,6 +3383,8 @@ const DICTIONARY_HEADER: usize = 16;
 /// is held until the file is closed. That is the memory the load cannot afford. What it costs is
 /// eight bytes a block, against the block being a thousand values.
 const DICTIONARY_SCATTERED: u32 = 1 << 31;
+/// The dictionary index carries one four-byte substring signature per payload block.
+const DICTIONARY_GRAMS: u32 = 1 << 30;
 
 /// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
 /// unit.
@@ -3694,6 +3740,32 @@ impl TextSource for NativeText {
         self.values
     }
 
+    fn might_contain(&self, first: usize, literal: &[u8]) -> Result<bool> {
+        let Some(grams) = &self.grams else { return Ok(true) };
+        if literal.len() < 4 || first >= self.values {
+            return Ok(true);
+        }
+        let bytes = grams
+            .loaded
+            .get_or_init(|| {
+                let mut bytes = vec![0; grams.length];
+                read_at(&self.file, grams.start, &mut bytes)?;
+                if checksum(&bytes) != grams.hash {
+                    return Err(invalid("global dictionary substring signatures checksum differs"));
+                }
+                Ok(bytes)
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let block = first / TEXT_PAYLOAD_VALUES;
+        let Some(bits) = bytes.get(block * TEXT_GRAM_BYTES..(block + 1) * TEXT_GRAM_BYTES) else {
+            return Ok(true);
+        };
+        Ok(literal.windows(4).all(|gram| {
+            gram_bits(gram).into_iter().all(|bit| bits[bit / 8] & (1 << (bit % 8)) != 0)
+        }))
+    }
+
     fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
         if index >= self.values {
             return Ok(None);
@@ -3960,6 +4032,12 @@ impl TextSource for NativeText {
             + self.hashes.capacity() * size_of::<u64>()
             + self.starts.capacity() * size_of::<u64>()
             + self.lengths.capacity() * size_of::<u64>()
+            + self
+                .grams
+                .as_ref()
+                .and_then(|grams| grams.loaded.get())
+                .and_then(|result| result.as_ref().ok())
+                .map_or(0, Vec::capacity)
             + self
                 .blocks
                 .iter()
@@ -7977,6 +8055,7 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
 struct EncodedDictionary {
     index: Vec<u8>,
     ranks: Vec<u8>,
+    grams: Vec<u8>,
 }
 
 /// Sorts codes into the byte order of the values they name, eight bytes of depth at a time.
@@ -8186,6 +8265,9 @@ fn encode_global_dictionary(
     if places.len() != blocks {
         return Err(invalid("global dictionary payload is not the blocks it says it is"));
     }
+    if dictionary.grams.len() != blocks {
+        return Err(invalid("global dictionary signatures do not cover its blocks"));
+    }
     let (ranks, rank_ends) = encode_ranks(order, code_width(values))?;
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
     let offset_bits = offset_width(&dictionary.ends);
@@ -8194,6 +8276,7 @@ fn encode_global_dictionary(
         .checked_add(offset_bytes(values, offset_bits))
         .and_then(|len| len.checked_add(blocks.checked_mul(payload_words * 8)?))
         .and_then(|len| len.checked_add(rank_blocks.checked_mul(16)?))
+        .and_then(|len| len.checked_add(8))
         .ok_or_else(|| invalid("global dictionary index length overflow"))?;
     let mut index = Vec::with_capacity(index_len);
     put_u32(
@@ -8205,7 +8288,7 @@ fn encode_global_dictionary(
         &mut index,
         u32::try_from(blocks).map_err(|_| invalid("global dictionary has too many blocks"))?,
     );
-    let flag = if scattered { DICTIONARY_SCATTERED } else { 0 };
+    let flag = (if scattered { DICTIONARY_SCATTERED } else { 0 }) | DICTIONARY_GRAMS;
     put_u32(&mut index, offset_bits as u32 | flag);
     encode_offsets(&dictionary.ends, offset_bits, &mut index)?;
     // Where each block is and how long it is, so a reader can find one. The stored blocks are
@@ -8241,10 +8324,18 @@ fn encode_global_dictionary(
         put_u64(&mut index, checksum(&ranks[at..end]));
         at = end;
     }
+    let gram_len = blocks
+        .checked_mul(TEXT_GRAM_BYTES)
+        .ok_or_else(|| invalid("global dictionary signature count overflow"))?;
+    let mut grams = Vec::with_capacity(gram_len);
+    for block in &dictionary.grams {
+        grams.extend_from_slice(block);
+    }
+    put_u64(&mut index, checksum(&grams));
     if index.len() != index_len {
         return Err(invalid("global dictionary index is not the length it was laid out for"));
     }
-    Ok(EncodedDictionary { index, ranks })
+    Ok(EncodedDictionary { index, ranks, grams })
 }
 
 /// How many blocks of the payload the shape is settled on.
@@ -8488,7 +8579,8 @@ fn open_global_dictionary(
     let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
     let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
     let scattered = width & DICTIONARY_SCATTERED != 0;
-    let offset_bits = (width & !DICTIONARY_SCATTERED) as usize;
+    let has_grams = width & DICTIONARY_GRAMS != 0;
+    let offset_bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
     if per_block != TEXT_PAYLOAD_VALUES {
         return Err(invalid("global dictionary block width differs"));
     }
@@ -8512,7 +8604,15 @@ fn open_global_dictionary(
     let hash_len = blocks
         .checked_mul(payload_words * 8)
         .and_then(|len| len.checked_add(rank_blocks.checked_mul(16)?))
+        .and_then(|len| len.checked_add(usize::from(has_grams) * 8))
         .ok_or_else(|| invalid("global dictionary block count overflow"))?;
+    let gram_len = if has_grams {
+        blocks
+            .checked_mul(TEXT_GRAM_BYTES)
+            .ok_or_else(|| invalid("global dictionary signature count overflow"))?
+    } else {
+        0
+    };
     let index_len = DICTIONARY_HEADER
         .checked_add(offset_len)
         .and_then(|len| len.checked_add(hash_len))
@@ -8527,7 +8627,10 @@ fn open_global_dictionary(
         return Err(invalid("global dictionary index checksum differs"));
     }
     let offsets = index[DICTIONARY_HEADER..DICTIONARY_HEADER + offset_len].to_vec();
-    let mut words = index[DICTIONARY_HEADER + offset_len..]
+    let word_end = index_len - usize::from(has_grams) * 8;
+    let gram_hash = has_grams
+        .then(|| u64::from_le_bytes(index[word_end..index_len].try_into().expect("eight bytes")));
+    let mut words = index[DICTIONARY_HEADER + offset_len..word_end]
         .chunks_exact(8)
         .map(|part| u64::from_le_bytes(part.try_into().expect("eight bytes")))
         .collect::<Vec<_>>();
@@ -8547,6 +8650,18 @@ fn open_global_dictionary(
     if body_len > page.length as usize {
         return Err(invalid("global dictionary order exceeds its page"));
     }
+    let gram_end = body_len
+        .checked_add(gram_len)
+        .ok_or_else(|| invalid("global dictionary signature length overflow"))?;
+    if gram_end > page.length as usize {
+        return Err(invalid("global dictionary signatures exceed their page"));
+    }
+    let grams = gram_hash.map(|hash| NativeGrams {
+        start: page.offset + body_len as u64,
+        length: gram_len,
+        hash,
+        loaded: OnceLock::new(),
+    });
     let hashes = words.split_off(blocks * (payload_words - 1));
     let (starts, lengths) = if scattered {
         let mut starts = Vec::with_capacity(blocks);
@@ -8560,7 +8675,7 @@ fn open_global_dictionary(
         // A file written before the blocks said where they were has them behind one another at the
         // end of the page, so the base is where the sorted order stops and each end is the start of
         // the one after it. Turning them round here is what lets everything below take one shape.
-        let base = page.offset + body_len as u64;
+        let base = page.offset + gram_end as u64;
         let mut starts = Vec::with_capacity(blocks);
         let mut lengths = Vec::with_capacity(blocks);
         let mut at = 0_u64;
@@ -8579,7 +8694,7 @@ fn open_global_dictionary(
     // thing that ties the index to the page. From format 27 the blocks are written during the load
     // and the page is only the index and the order, so there the most that can be said is that
     // every block is somewhere in the file past its header.
-    let stored_len = page.length as u64 - body_len as u64;
+    let stored_len = page.length as u64 - gram_end as u64;
     if scattered && stored_len == 0 {
         let size = file.metadata().map_err(io)?.len();
         let inside = starts.iter().zip(&lengths).all(|(&start, &len)| {
@@ -8610,6 +8725,7 @@ fn open_global_dictionary(
             starts,
             lengths,
             hashes,
+            grams,
             blocks: (0..blocks).map(|_| OnceLock::new()).collect(),
             keep_budget,
             payload_kept: AtomicUsize::new(0),
@@ -9283,13 +9399,14 @@ mod tests {
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
         let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
-        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
         let payload_words = if width & DICTIONARY_SCATTERED == 0 { 2 } else { 3 };
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
         DICTIONARY_HEADER as u64
             + offset_bytes(count as usize, bits) as u64
             + blocks * payload_words * 8
             + rank_blocks * 16
+            + if width & DICTIONARY_GRAMS == 0 { 0 } else { 8 }
     }
 
     fn sample() -> Chunk {
@@ -11400,7 +11517,7 @@ mod tests {
         let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
         let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
         assert_ne!(width & DICTIONARY_SCATTERED, 0, "the blocks say where they are");
-        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
         let mut start = [0; 8];
         let at = dictionary.offset + (DICTIONARY_HEADER + offset_bytes(count, bits)) as u64;
         read_at(&reader.file, at, &mut start).expect("the first block's start");
@@ -11537,7 +11654,7 @@ mod tests {
         let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
         let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
         let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
-        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
         let mut place = [0; 16];
         let at = DICTIONARY_HEADER + offset_bytes(count, bits) + (blocks - 1) * 16;
         read_at(&reader.file, dictionary.offset + at as u64, &mut place).expect("its place");
@@ -12012,6 +12129,10 @@ mod tests {
         let reader = Reader::open(&path).expect("valid directory");
         let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
         assert_eq!(dictionary.len(), spellings.len(), "every value is distinct");
+        for first in [0, TEXT_PAYLOAD_VALUES, TEXT_PAYLOAD_VALUES * 2] {
+            assert!(dictionary.text_block_might_contain(first, b"value").expect("signature"));
+            assert!(!dictionary.text_block_might_contain(first, b"google").expect("signature"));
+        }
 
         let resting = dictionary.footprint();
         let sweep = || {
@@ -12051,6 +12172,38 @@ mod tests {
             grown == 0 || grown == dictionary.len() * size_of::<u32>(),
             "a point read of a kept block decodes nothing, and {grown} bytes grew"
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_damaged_substring_signature_is_checked_only_when_used() {
+        let path = path("damaged-substring-signature");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        let rows = [Value::Varchar("google".into()), Value::Varchar("example".into())];
+        writer
+            .append(
+                &Chunk::new(vec![
+                    Vector::from_values(LogicalType::Varchar, &rows).expect("strings"),
+                ])
+                .expect("one column"),
+            )
+            .expect("stripe written");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let page = reader.table.dictionaries[0].expect("string dictionary page");
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
+        file.seek(SeekFrom::Start(page.offset + u64::from(page.length) - 1))
+            .expect("last signature byte");
+        file.write_all(&[255]).expect("damage signature");
+        let reader = Reader::open(&path).expect("the directory is still valid");
+        let dictionary = reader.dictionary(0).expect("index is still valid").expect("dictionary");
+        let error = dictionary
+            .text_block_might_contain(0, b"goog")
+            .expect_err("a used signature checks its own checksum");
+        assert!(error.message().contains("substring signatures checksum differs"), "{error}");
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -12317,18 +12470,20 @@ mod tests {
                 let offset = bytes.len() as u64;
                 bytes.extend_from_slice(&encoded.index);
                 bytes.extend_from_slice(&encoded.ranks);
-                let length = encoded.index.len() + encoded.ranks.len();
+                bytes.extend_from_slice(&encoded.grams);
+                let length = encoded.index.len() + encoded.ranks.len() + encoded.grams.len();
                 (bytes, encoded, offset, length)
             } else {
                 // The index is the same length wherever the blocks are, so a first pass says where
                 // the page ends and the second writes the places that follow it.
                 let first = encode_global_dictionary(&dictionary, &order, &laid(0), scattered)
                     .expect("an encoding");
-                let body = (first.index.len() + first.ranks.len()) as u64;
+                let body = (first.index.len() + first.ranks.len() + first.grams.len()) as u64;
                 let encoded = encode_global_dictionary(&dictionary, &order, &laid(body), scattered)
                     .expect("an encoding");
                 let mut bytes = encoded.index.clone();
                 bytes.extend_from_slice(&encoded.ranks);
+                bytes.extend_from_slice(&encoded.grams);
                 bytes.extend_from_slice(&payload);
                 let length = bytes.len();
                 (bytes, encoded, 0, length)

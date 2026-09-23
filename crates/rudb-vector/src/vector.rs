@@ -581,6 +581,14 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         body(first, self.bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
     }
+    /// Whether the payload block holding `first` might contain `literal` in any value.
+    ///
+    /// A false answer is a proof that every value in the block misses. A source without a stored
+    /// substring signature answers true, which keeps the ordinary exact comparison authoritative.
+    fn might_contain(&self, first: usize, literal: &[u8]) -> Result<bool> {
+        let _ = (first, literal);
+        Ok(true)
+    }
     /// Hands over the values at `indices`, which rise, without keeping what reading them decoded.
     ///
     /// The scattered twin of [`sweep`](Self::sweep). A caller that wants a few hundred values spread
@@ -2296,6 +2304,19 @@ impl Vector {
         }
         body(first, self.try_bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
+    }
+
+    /// A conservative substring test for the payload block holding `first`.
+    ///
+    /// Only a file-backed string source with all-valid values can skip a whole block. Every other
+    /// form returns true and lets the ordinary sweep decide its values.
+    pub fn text_block_might_contain(&self, first: usize, literal: &[u8]) -> Result<bool> {
+        match &self.body {
+            Body::ExternalText { source } if matches!(self.validity, Validity::AllValid) => {
+                source.might_contain(first, literal)
+            }
+            _ => Ok(true),
+        }
     }
 
     /// The values at `indices`, which rise, without keeping what reading them decoded.
