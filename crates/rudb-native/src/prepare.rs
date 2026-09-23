@@ -521,6 +521,7 @@ impl Step<'_> {
     /// Merges the column, settles its dictionary's shape and hands out the blocks it filled.
     fn run(self, rows: usize, coded: &[AtomicBool]) -> Result<(usize, Merge, Vec<Unencoded>)> {
         let Self { index, column, dictionary, gather } = self;
+        let t0 = std::time::Instant::now();
         if let Some((mine, stripe)) = gather {
             mine.absorb(stripe);
         }
@@ -549,6 +550,7 @@ impl Step<'_> {
         // filled go out with it already knowing their shape. A column still too small to settle
         // one keeps its blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them,
         // because encoding them now would be encoding them without having looked at the column.
+        let t1 = t0.elapsed().as_secs_f64() * 1e3;
         let blocks = match dictionary {
             Some(dictionary) => {
                 dictionary.settle()?;
@@ -556,6 +558,10 @@ impl Step<'_> {
             }
             None => Vec::new(),
         };
+        let t2 = t0.elapsed().as_secs_f64() * 1e3;
+        if t2 > 3.0 {
+            eprintln!("PROBE col {index} merge {t1:.1} total {t2:.1}");
+        }
         Ok((index, merge, blocks))
     }
 }
