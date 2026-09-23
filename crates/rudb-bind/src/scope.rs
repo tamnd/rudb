@@ -35,6 +35,9 @@ pub(crate) struct Visible {
     /// also what the reference binary says. `DESCRIBE SELECT * FROM t` keeps `NO` on a `NOT NULL`
     /// column and `DESCRIBE SELECT c + 0 FROM t` does not.
     pub(crate) not_null: bool,
+    /// `PRI` or `UNI` when the column it came from is in a key of its table, carried the same way
+    /// and for the same reader as `not_null`.
+    pub(crate) key: Option<&'static str>,
     /// A second name the column answers to when no column has the one asked for.
     ///
     /// Only `range` and `generate_series` set it. `FROM range(3) r` names the one column `r`, the
@@ -299,6 +302,7 @@ mod tests {
             binding: ColumnBinding::new(0, 0),
             ty: LogicalType::BigInt,
             not_null: false,
+            key: None,
             also: None,
         });
         scope.push(Visible {
@@ -307,6 +311,7 @@ mod tests {
             binding: ColumnBinding::new(0, 1),
             ty: LogicalType::Varchar,
             not_null: false,
+            key: None,
             also: None,
         });
         scope.push(Visible {
@@ -315,6 +320,7 @@ mod tests {
             binding: ColumnBinding::new(1, 0),
             ty: LogicalType::Varchar,
             not_null: false,
+            key: None,
             also: None,
         });
         scope

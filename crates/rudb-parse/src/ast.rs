@@ -190,6 +190,11 @@ pub struct CreateTable {
     pub or_replace: bool,
     /// Whether `TEMP` or `TEMPORARY` was written.
     pub temporary: bool,
+    /// The column names of each `PRIMARY KEY` and `UNIQUE`, as a run of name lists in the order
+    /// they were written, whether on a column or on the table.
+    pub keys: Slice,
+    /// Which of `keys` is the primary key, or `NONE`.
+    pub primary: u32,
 }
 
 /// One column of a `CREATE TABLE`.

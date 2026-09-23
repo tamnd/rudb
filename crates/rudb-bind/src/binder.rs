@@ -592,6 +592,7 @@ impl<'a> Binder<'a> {
             binding: ColumnBinding::new(index, 0),
             ty: LogicalType::Varchar,
             not_null: false,
+            key: None,
             also: None,
         });
         Ok((node, scope))
@@ -606,12 +607,11 @@ impl<'a> Binder<'a> {
     /// `SELECT column_name FROM (DESCRIBE ...) WHERE ...` an ordinary query over an ordinary
     /// relation with no special case above it.
     ///
-    /// The six columns, their order and their types are the reference binary's. `key`, `default`
-    /// and `extra` are null for everything this engine can declare, since `PRIMARY KEY`, `UNIQUE`
-    /// and `DEFAULT` are all refused by `CREATE TABLE` today and there is nothing for the first two
-    /// to hold, and `extra` is empty upstream as well on every table it was asked about. They are
-    /// here rather than left out because the width of a result is part of the result, and a program
-    /// that reads the fifth column has to find one.
+    /// The six columns, their order and their types are the reference binary's. `key` says which
+    /// key of its table a column passed straight through from one is in. `default` is null because `DEFAULT` is refused by `CREATE TABLE` today, and
+    /// `extra` is empty upstream as well on every table it was asked about. They are here rather
+    /// than left out because the width of a result is part of the result, and a program that reads
+    /// the fifth column has to find one.
     fn bind_describe(
         &mut self,
         ast: &Ast,
@@ -636,7 +636,10 @@ impl<'a> Binder<'a> {
                 .into_iter()
                 .map(|text| self.plan.add_constant(Value::Varchar(text)))
                 .collect();
-            for _ in 0..3 {
+            if let Some(mark) = column.key {
+                items.push(self.plan.add_constant(Value::Varchar(mark.to_owned())));
+            }
+            while items.len() < 6 {
                 let empty = self.plan.add_constant(Value::Null);
                 items.push(self.cast_to(empty, &LogicalType::Varchar));
             }
@@ -654,6 +657,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: false,
+                key: None,
                 also: None,
             });
         }
@@ -674,6 +678,14 @@ impl<'a> Binder<'a> {
     fn passes_through(&self, expr: ExprRef, input: &Scope) -> bool {
         let Expr::Column(binding) = *self.plan.expr(expr) else { return false };
         input.columns.iter().any(|column| column.binding == binding && column.not_null)
+    }
+
+    /// The key a projected expression is in, when it is a column passed straight through from a
+    /// table that has one. The same question as [`Self::passes_through`], asked for `DESCRIBE`'s
+    /// `key` column.
+    fn key_through(&self, expr: ExprRef, input: &Scope) -> Option<&'static str> {
+        let Expr::Column(binding) = *self.plan.expr(expr) else { return None };
+        input.columns.iter().find(|column| column.binding == binding).and_then(|column| column.key)
     }
 
     /// `VALUES (1, 'a'), (2, 'b')`, as a query in its own right.
@@ -754,6 +766,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: false,
+                key: None,
                 also: None,
             });
         }
@@ -804,6 +817,7 @@ impl<'a> Binder<'a> {
                 // A column of a set operation is nullable whatever the two sides were, because a
                 // column that refuses nulls on one side and takes them on the other takes them.
                 not_null: false,
+                key: None,
                 also: None,
             });
         }
@@ -940,6 +954,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(project, at as u32),
                 ty: self.plan.expr_type(*expr).clone(),
                 not_null: self.passes_through(*expr, &input),
+                key: self.key_through(*expr, &input),
                 also: None,
             });
         }
@@ -1035,6 +1050,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty,
                 not_null: output.columns[at].not_null,
+                key: output.columns[at].key,
                 also: None,
             });
         }
@@ -1790,6 +1806,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: field.not_null,
+                key: None,
                 also: None,
             });
         }
@@ -1838,6 +1855,16 @@ impl<'a> Binder<'a> {
     ) -> Result<(NodeRef, Scope)> {
         let table = self.catalog.table(resolved)?;
         let fields: Vec<Field> = table.columns().to_vec();
+        // `PRI` for a column of the primary key and `UNI` for one of a unique key, the primary key
+        // winning where a column is in both.
+        let mut marks = vec![None; fields.len()];
+        for key in table.keys() {
+            for &column in &key.columns {
+                if key.primary || marks[column].is_none() {
+                    marks[column] = Some(if key.primary { "PRI" } else { "UNI" });
+                }
+            }
+        }
         let index = self.fresh_index();
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
@@ -1847,6 +1874,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: field.not_null,
+                key: marks[at],
                 also: None,
             });
         }
@@ -2193,6 +2221,7 @@ impl<'a> Binder<'a> {
                 binding: ColumnBinding::new(index, at as u32),
                 ty: field.ty.clone(),
                 not_null: false,
+                key: None,
                 also: None,
             });
         }
@@ -2505,6 +2534,7 @@ impl<'a> Binder<'a> {
                 // A reader takes what the file has, and no file format this reads says a column
                 // cannot be null. The reference binary answers YES for every column of a Parquet.
                 not_null: false,
+                key: None,
                 also: None,
             });
         }
