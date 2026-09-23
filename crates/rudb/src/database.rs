@@ -29,6 +29,36 @@ use crate::settings::Settings;
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
 const MEMORY: &str = ":memory:";
 
+/// A deliberately small recognizer for a single unquoted AVG(column) statement. Anything with
+/// another clause, expression, or quoting rule goes through the SQL parser instead.
+fn native_simple_average_statement(sql: &str) -> Option<(&str, &str)> {
+    fn identifier(text: &str) -> bool {
+        let mut bytes = text.bytes();
+        matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let aggregate = words.next()?;
+    let from = words.next()?;
+    let table = words.next()?;
+    if words.next().is_some()
+        || !select.eq_ignore_ascii_case("select")
+        || !from.eq_ignore_ascii_case("from")
+    {
+        return None;
+    }
+    let prefix = aggregate.get(..4)?;
+    if !prefix.eq_ignore_ascii_case("avg(") || !aggregate.ends_with(')') {
+        return None;
+    }
+    let column = &aggregate[4..aggregate.len() - 1];
+    (identifier(column) && identifier(table)).then_some((table, column))
+}
+
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
 /// Keep this check strict: every clause it does not understand belongs to the regular binder.
 fn native_nonzero_shape(ast: &Ast) -> Option<(&str, &str, &str)> {
@@ -661,6 +691,31 @@ impl Database {
         }
         let average = avg_sum as f64 / avg_count as f64;
         Ok(Some((sum, rows, average)))
+    }
+
+    /// Reads a certified integer average for a simple one-statement CSV invocation without
+    /// allocating a parsed query or result vectors. Null and unsupported cases use the normal path.
+    pub fn query_native_average_value_once(path: &str, sql: &str) -> Result<Option<f64>> {
+        let Some((table, column)) = native_simple_average_statement(sql) else {
+            return Ok(None);
+        };
+        let catalog = rudb_native::Catalog::open(path)?;
+        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table)) else {
+            return Ok(None);
+        };
+        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
+        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(None);
+        };
+        let Some(sums) = catalog.aggregate_sums(name, &[index])? else {
+            return Ok(None);
+        };
+        let (sum, count) = sums.columns[0];
+        if count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(sum as f64 / count as f64))
     }
 
     /// Answers supported read-only aggregates directly from certified native synopses.
@@ -3203,8 +3258,8 @@ mod tests {
 
     use super::{
         Database, native_extrema_shape, native_frequency_group_shape, native_nonzero_shape,
-        native_single_average_shape, native_single_distinct_shape, native_three_aggregate_shape,
-        publish,
+        native_simple_average_statement, native_single_average_shape, native_single_distinct_shape,
+        native_three_aggregate_shape, publish,
     };
 
     #[test]
@@ -3376,6 +3431,25 @@ mod tests {
     }
 
     #[test]
+    fn simple_average_statement_rejects_other_sql() {
+        assert_eq!(
+            native_simple_average_statement(" SELECT AVG(UserID) FROM hits; "),
+            Some(("hits", "UserID"))
+        );
+        for sql in [
+            "SELECT AVG(UserID) FROM hits WHERE UserID > 0",
+            "SELECT AVG(DISTINCT UserID) FROM hits",
+            "SELECT AVG(UserID + 1) FROM hits",
+            "SELECT AVG(UserID) FROM hits; SELECT 1",
+            "SELECT AVG(UserID) FROM hits GROUP BY RegionID",
+            "SELECT AVG(UserID) FROM hits -- comment",
+            "SELECT AVG(UserID) FROM hits; ;",
+        ] {
+            assert_eq!(native_simple_average_statement(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
     fn cold_average_matches_regular_execution_for_bigints_and_nulls() {
         let path = std::env::temp_dir().join(format!("rudb-q4-{}.rdb", std::process::id()));
         let name = path.to_str().unwrap();
@@ -3397,6 +3471,14 @@ mod tests {
         for (sql, expected) in cases.into_iter().zip(expected) {
             let actual = Database::query_native_once(name, sql).unwrap().unwrap();
             assert_eq!(actual.rows().collect::<Vec<_>>(), expected, "{sql}");
+        }
+        assert_eq!(
+            Database::query_native_average_value_once(name, "SELECT AVG(UserID) FROM hits")
+                .unwrap(),
+            Some((2414420660257356000_i128 + 2534231104689841000_i128) as f64 / 2.0)
+        );
+        for sql in ["SELECT AVG(UserID) FROM empty_hits", "SELECT AVG(UserID) FROM null_hits"] {
+            assert_eq!(Database::query_native_average_value_once(name, sql).unwrap(), None);
         }
         std::fs::remove_file(path).unwrap();
     }
