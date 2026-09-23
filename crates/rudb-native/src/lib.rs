@@ -72,6 +72,8 @@ const NONZERO_COUNTS: &[u8; 8] = b"RUDBNZ10";
 const AGGREGATE_SUMS: &[u8; 8] = b"RUDBAG10";
 const DISTINCT_COUNTS: &[u8; 8] = b"RUDBDC10";
 const INTEGER_EXTREMES: &[u8; 8] = b"RUDBEX10";
+const COMPLETE_FREQUENCIES: &[u8; 8] = b"RUDBFQ10";
+const MAX_CATALOG_FREQUENCIES: usize = 64;
 const FORMAT: u32 = 28;
 
 /// Formats this build can open.
@@ -999,9 +1001,12 @@ struct Entry {
     distincts: Vec<Option<u64>>,
     /// Exact integer or date bounds; the inner `None` means every row is null.
     extremes: Vec<StoredIntegerExtremes>,
+    /// Complete bounded numeric frequencies, including NULL when present.
+    frequencies: Vec<StoredNumericFrequencies>,
 }
 
 type StoredIntegerExtremes = Option<Option<(i128, i128)>>;
+type StoredNumericFrequencies = Option<NumericFrequencies>;
 
 /// One view's line in the catalog directory.
 ///
@@ -2939,6 +2944,7 @@ impl Writer {
             aggregates: table_aggregate_sums(&self.table),
             distincts: self.table.distincts.clone(),
             extremes: table_integer_extremes(&self.table),
+            frequencies: table_complete_numeric_frequencies(&self.table),
             directory: Page {
                 offset,
                 length: u32::try_from(directory.len())
@@ -3101,7 +3107,7 @@ impl Writer {
         Ok(())
     }
 
-    /// Adds exact count, sum, distinct, and integer-bound certificates to an older file without
+    /// Adds exact count, sum, distinct, bound, and bounded frequency certificates to an older file without
     /// rewriting table pages. The old slot remains readable until the new catalog is synced.
     pub fn certify_summaries(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
@@ -3116,6 +3122,7 @@ impl Writer {
                 .map(|column| reader.distinct_values(column))
                 .collect::<Result<Vec<_>>>()?;
             entry.extremes = reader_integer_extremes(&reader)?;
+            entry.frequencies = reader_complete_numeric_frequencies(&reader)?;
         }
         let generation = slot
             .generation
@@ -4636,6 +4643,9 @@ pub enum IntegerExtremes {
     Values { low: i128, high: i128 },
 }
 
+/// A complete numeric value-to-row-count synopsis; `None` represents SQL NULL.
+pub type NumericFrequencies = Vec<(Option<i128>, u64)>;
+
 impl Catalog {
     /// Reads the highest valid catalog slot and nothing under it.
     ///
@@ -4841,6 +4851,28 @@ impl Catalog {
             None => IntegerExtremes::Null,
             Some((low, high)) => IntegerExtremes::Values { low, high },
         }))
+    }
+
+    /// Complete numeric frequencies from the small catalog, after checking the table directory.
+    pub fn exact_numeric_frequencies(
+        &self,
+        name: &str,
+        column: usize,
+    ) -> Result<Option<NumericFrequencies>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| invalid(&format!("the file holds no table called {name}")))?;
+        let Some(frequencies) = entry.frequencies.get(column).cloned() else {
+            return Err(invalid("numeric frequency column index out of range"));
+        };
+        let Some(frequencies) = frequencies else { return Ok(None) };
+        let (offset, length) = (entry.directory.offset, entry.directory.length as usize);
+        if file_checksum(&self.file, offset, length)? != entry.directory.hash {
+            return Err(invalid(&format!("the directory of table {name} does not checksum")));
+        }
+        Ok(Some(frequencies))
     }
 
     /// The schema copied into the small file catalog, available without opening the table directory.
@@ -6900,6 +6932,82 @@ fn reader_integer_extremes(reader: &Reader) -> Result<Vec<StoredIntegerExtremes>
         .collect()
 }
 
+fn table_complete_numeric_frequencies(table: &Table) -> Vec<StoredNumericFrequencies> {
+    table
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column, field)| {
+            if !integer_or_date(&field.ty) {
+                return None;
+            }
+            let Some(Frequencies::Held(summary)) = table.frequencies.get(column)?.as_ref() else {
+                return None;
+            };
+            if summary.omitted_max != 0 || summary.entries.len() > MAX_CATALOG_FREQUENCIES {
+                return None;
+            }
+            let entries = summary
+                .entries
+                .iter()
+                .map(|entry| {
+                    let value = match entry.value {
+                        FrequencyValue::Null => None,
+                        FrequencyValue::Integer(value) => Some(value),
+                        FrequencyValue::Code(_) => return None,
+                    };
+                    Some((value, entry.count))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let rows = entries.iter().try_fold(0_u64, |sum, (_, count)| sum.checked_add(*count))?;
+            (rows == table.rows as u64).then_some(entries)
+        })
+        .collect()
+}
+
+fn numeric_frequency_value(value: &Value) -> Option<Option<i128>> {
+    Some(match value {
+        Value::Null => None,
+        Value::TinyInt(value) => Some(i128::from(*value)),
+        Value::SmallInt(value) => Some(i128::from(*value)),
+        Value::Integer(value) | Value::Date(value) => Some(i128::from(*value)),
+        Value::BigInt(value) => Some(i128::from(*value)),
+        Value::UTinyInt(value) => Some(i128::from(*value)),
+        Value::USmallInt(value) => Some(i128::from(*value)),
+        Value::UInteger(value) => Some(i128::from(*value)),
+        Value::UBigInt(value) => Some(i128::from(*value)),
+        _ => return None,
+    })
+}
+
+fn reader_complete_numeric_frequencies(reader: &Reader) -> Result<Vec<StoredNumericFrequencies>> {
+    reader
+        .table
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column, field)| {
+            if !integer_or_date(&field.ty) {
+                return Ok(None);
+            }
+            let Some(summary) = reader.frequency_summary(column)? else { return Ok(None) };
+            if summary.omitted_max != 0 || summary.entries.len() > MAX_CATALOG_FREQUENCIES {
+                return Ok(None);
+            }
+            let entries = reader.decode_frequencies(column, &field.ty, &summary.entries)?;
+            let Some(entries) = entries
+                .iter()
+                .map(|(value, count)| Some((numeric_frequency_value(value)?, *count)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            let rows = entries.iter().try_fold(0_u64, |sum, (_, count)| sum.checked_add(*count));
+            Ok((rows == Some(reader.table.rows as u64)).then_some(entries))
+        })
+        .collect()
+}
+
 fn table_exact_sum(table: &Table, column: usize) -> Option<(i128, u64)> {
     table.stripes.iter().try_fold((0_i128, 0_u64), |(sum, count), stripe| {
         let range = stripe.zone.column(column)?;
@@ -7099,6 +7207,46 @@ fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
             }
         }
     }
+    out.extend_from_slice(COMPLETE_FREQUENCIES);
+    for entry in entries {
+        if entry.frequencies.len() != entry.fields.len() {
+            return Err(invalid("numeric frequency width differs from schema"));
+        }
+        for (field, frequencies) in entry.fields.iter().zip(&entry.frequencies) {
+            match frequencies {
+                None => out.push(0),
+                Some(entries)
+                    if integer_or_date(&field.ty) && entries.len() <= MAX_CATALOG_FREQUENCIES =>
+                {
+                    let mut total = 0_u64;
+                    for (at, (value, count)) in entries.iter().enumerate() {
+                        if entries[..at].iter().any(|(held, _)| held == value) {
+                            return Err(invalid("numeric frequency value repeats"));
+                        }
+                        total = total
+                            .checked_add(*count)
+                            .ok_or_else(|| invalid("numeric frequency count overflows"))?;
+                    }
+                    if total != entry.rows as u64 {
+                        return Err(invalid("numeric frequencies do not cover table rows"));
+                    }
+                    out.push(1);
+                    out.push(entries.len() as u8);
+                    for (value, count) in entries {
+                        match value {
+                            None => out.push(0),
+                            Some(value) => {
+                                out.push(1);
+                                out.extend_from_slice(&value.to_le_bytes());
+                            }
+                        }
+                        put_u64(&mut out, *count);
+                    }
+                }
+                _ => return Err(invalid("numeric frequency type or width differs")),
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -7153,6 +7301,7 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
         let aggregates = vec![None; fields.len()];
         let distincts = vec![None; fields.len()];
         let extremes = vec![None; fields.len()];
+        let frequencies = vec![None; fields.len()];
         entries.push(Entry {
             name,
             fields,
@@ -7162,6 +7311,7 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
             aggregates,
             distincts,
             extremes,
+            frequencies,
         });
     }
     // A catalog that ends where the tables end is a catalog with no views in it, which is every
@@ -7304,6 +7454,48 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
                         Some(Some((low, high)))
                     }
                     _ => return Err(invalid("integer extremes tag or type differs")),
+                };
+            }
+        }
+    }
+    if !cur.done() {
+        if cur.take(8)? != COMPLETE_FREQUENCIES {
+            return Err(invalid("numeric frequency catalog extension magic differs"));
+        }
+        for entry in &mut entries {
+            for (field, frequencies) in entry.fields.iter().zip(&mut entry.frequencies) {
+                *frequencies = match cur.u8()? {
+                    0 => None,
+                    1 if integer_or_date(&field.ty) => {
+                        let len = cur.u8()? as usize;
+                        if len > MAX_CATALOG_FREQUENCIES {
+                            return Err(invalid("too many catalog numeric frequencies"));
+                        }
+                        let mut values = Vec::with_capacity(len);
+                        let mut total = 0_u64;
+                        for _ in 0..len {
+                            let value = match cur.u8()? {
+                                0 => None,
+                                1 => Some(i128::from_le_bytes(cur.take(16)?.try_into().map_err(
+                                    |_| invalid("numeric frequency value is truncated"),
+                                )?)),
+                                _ => return Err(invalid("numeric frequency value tag differs")),
+                            };
+                            if values.iter().any(|(held, _)| *held == value) {
+                                return Err(invalid("numeric frequency value repeats"));
+                            }
+                            let count = cur.u64()?;
+                            total = total
+                                .checked_add(count)
+                                .ok_or_else(|| invalid("numeric frequency count overflows"))?;
+                            values.push((value, count));
+                        }
+                        if total != entry.rows as u64 {
+                            return Err(invalid("numeric frequencies do not cover table rows"));
+                        }
+                        Some(values)
+                    }
+                    _ => return Err(invalid("numeric frequency tag or type differs")),
                 };
             }
         }
@@ -11742,6 +11934,7 @@ mod tests {
                 aggregates: vec![None],
                 distincts: vec![None],
                 extremes: vec![None],
+                frequencies: vec![None],
             }],
             &[sample_view("items")],
         )
@@ -13008,6 +13201,12 @@ mod tests {
         assert_eq!(catalog.entries[0].nonzero, vec![None, Some(2)]);
         assert_eq!(catalog.entries[0].aggregates, vec![None, Some((10, 4))]);
         assert_eq!(catalog.entries[0].distincts, vec![Some(1), Some(3)]);
+        let frequencies =
+            catalog.exact_numeric_frequencies("items", 1).expect("frequencies").expect("complete");
+        assert_eq!(frequencies.len(), 4);
+        for pair in [(Some(0), 2), (Some(3), 1), (Some(7), 1), (None, 2)] {
+            assert!(frequencies.contains(&pair), "missing {pair:?}");
+        }
         assert_eq!(catalog.distinct_count("items", 1).expect("distinct count"), Some(3));
         assert_eq!(
             catalog.integer_extremes("items", 1).expect("extremes"),
@@ -13038,6 +13237,13 @@ mod tests {
         assert_eq!(
             Catalog::open(&path).expect("reopen").integer_extremes("items", 1).expect("ends"),
             Some(IntegerExtremes::Values { low: 0, high: 7 })
+        );
+        assert_eq!(
+            Catalog::open(&path)
+                .expect("reopen")
+                .exact_numeric_frequencies("items", 1)
+                .expect("frequencies"),
+            Some(frequencies)
         );
         assert_eq!(catalog.table("items").expect("reader").null_count(1).expect("nulls"), 2);
         fs::remove_file(path).expect("remove scratch file");
