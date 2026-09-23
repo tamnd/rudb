@@ -158,13 +158,20 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 /// `version = 4`, which is the lock format's own number and not a package's. A substring rule that
 /// happened to match it would rewrite the format version to a crate version and produce a lock file
 /// cargo refuses to read.
+///
+/// And only a package with no `source` line, which is how a lock file marks a crate of ours. An
+/// outside crate can carry our number by chance: `slab` was at 0.4.12 when the workspace was, and
+/// the release of 0.4.13 stopped on the count because of it. Cargo writes `source` on the line
+/// right after `version`, so looking one line ahead is enough.
 fn relabel(text: &str, current: &str, wanted: &str) -> (String, usize) {
     let from = format!("version = \"{current}\"");
     let to = format!("version = \"{wanted}\"");
     let mut written = String::with_capacity(text.len());
     let mut moved = 0;
-    for line in text.lines() {
-        if line == from {
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let outside = lines.peek().is_some_and(|next| next.starts_with("source = "));
+        if line == from && !outside {
             written.push_str(&to);
             moved += 1;
         } else {
@@ -218,6 +225,17 @@ version = \"0.2.0\"
         assert!(written.contains("version = 4\n"), "{written}");
         assert_eq!(written.matches("version = \"0.2.1\"").count(), 2, "{written}");
         assert!(!written.contains("0.2.0"), "{written}");
+    }
+
+    #[test]
+    fn an_outside_crate_at_our_version_stays_where_it_is() {
+        let lock = format!(
+            "{LOCK}\n[[package]]\nname = \"slab\"\nversion = \"0.2.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+        );
+        let (written, moved) = relabel(&lock, "0.2.0", "0.2.1");
+        assert_eq!(moved, 2);
+        assert!(written.contains("name = \"slab\"\nversion = \"0.2.0\"\n"), "{written}");
     }
 
     #[test]
