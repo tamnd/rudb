@@ -26,7 +26,7 @@
 //!
 //! Not in the sort. The chunks are kept as they arrived and a row is a chunk and a row in it, so
 //! what the comparator moves is the keys and two pairs of numbers rather than a copy of every
-//! column. The columns are moved once at the end, by [`gathered`], which hands each column's
+//! column. The columns are moved once at the end, by [`lay`], which hands each column's
 //! pieces to an [`Assembly`] and lets it do the interleave as a typed copy per physical layout.
 //!
 //! This used to hold a `Vec<Value>` of the whole row per row. Sorting lineitem at SF1 on three
@@ -84,13 +84,13 @@
 //! is around ten gigabytes of payload, so two copies of it is twenty, and the limit on a machine
 //! with 24 GiB lands at 19.1.
 //!
-//! It does not have to hold both. [`gathered`] lays one column at a time, so the input's copy of a
+//! It does not have to hold both. [`lay`] lays one column at a time, so the input's copy of a
 //! column is finished with the moment that column has been laid, and the input is taken apart into
 //! its columns up front so that each one can be dropped exactly then. What the sort holds is
 //! therefore one payload and one column of headroom rather than two payloads, whichever column it
 //! is on, and the charge against the memory limit comes down as the columns go.
 //!
-//! The rows themselves go before any of that. All [`gathered`] wants from them is where each input
+//! The rows themselves go before any of that. All [`lay`] wants from them is where each input
 //! row lands, which is four bytes a row, against the forty eight a row that carries a normalized
 //! key and an arrival. So the order is turned into that and the rows are dropped, which at SF10 is
 //! another three gigabytes that is not held while the assembly runs.
@@ -399,6 +399,14 @@ impl Sort {
     /// share of the limit fills the disk on a load that had memory to spare. The rule that spills
     /// when the database is close to its limit does not.
     ///
+    /// Close is three quarters, and that is a measured answer rather than a round one. Writing a run
+    /// used to cost 1.6 times the payload being spilled, because the run was built as chunks and no
+    /// chunk is finished until every column is laid, so no fraction above three quarters left room
+    /// to spill in. Runs are written a column at a time now (#1347) and the clustered SF1 load
+    /// spills fine at fifteen sixteenths, but the clustered SF10 load at the default limit was
+    /// fastest at three quarters, 2:30 against 3:02, and the room below the line is room the
+    /// operators after the sort get to use.
+    ///
     /// The second is that this instance is holding enough for a file to be worth opening, because
     /// otherwise a query that is short of memory for some other reason would turn every chunk that
     /// arrived into a run of one chunk, and a merge of ten thousand of those is slower than the
@@ -466,21 +474,23 @@ impl Sort {
         let taken = rows.footprint();
         drop(rows);
         give(charged, taken);
-        let mut held = self.memory.reservation();
-        let out = gathered(&self.types, chunks, &at, total, &mut held, charged)?;
         let mut types = self.types.clone();
         types.push(LogicalType::Blob);
         let mut file = Runs::new("sort", types)?;
-        let mut start = 0usize;
-        for chunk in out {
-            let rows = chunk.len();
-            let Some(orders) = orders.get(start..start + rows) else {
+        file.begin(total)?;
+        // Laid and written one column at a time, and this is the whole reason the run file is
+        // written the way it is. The sort is spilling because it has run out of memory, so the one
+        // thing it cannot do on the way out is hold a second copy of what it is holding, and a run
+        // built as chunks would: no chunk is finished until every column has been laid. See #1347.
+        lay(&self.types, chunks, &at, total, charged, |whole| file.column(whole))?;
+        // The ordering column, a block at a time, because `orders` is already the bytes and turning
+        // the whole of it into a column would be those bytes twice over.
+        for block in 0..total.div_ceil(VECTOR_SIZE) {
+            let start = block * VECTOR_SIZE;
+            let Some(orders) = orders.get(start..(start + VECTOR_SIZE).min(total)) else {
                 return Err(Error::internal("a sorted run with fewer keys in it than rows"));
             };
-            let mut columns = chunk.into_columns();
-            columns.push(ordering(orders)?);
-            file.write(&Chunk::with_rows(columns, rows)?)?;
-            start += rows;
+            file.part(&ordering(orders)?)?;
         }
         Ok(file)
     }
@@ -644,7 +654,7 @@ fn give(charged: &mut Vec<Reservation>, mut bytes: u64) {
     }
 }
 
-/// The sorted rows as chunks, with every column moved once.
+/// The sorted rows, one whole column at a time, handed to `each` as they are finished.
 ///
 /// This is where the sort stops being row shaped. The order is a permutation of the rows that
 /// arrived, so what each column needs is for its values to be written out in that order, and an
@@ -654,8 +664,7 @@ fn give(charged: &mut Vec<Reservation>, mut bytes: u64) {
 /// copied into once.
 ///
 /// One column at a time, because the assembly for a column holds a second copy of that column and
-/// holding one of them at a time is a column of headroom rather than a table of it. The finished
-/// column is then cut into chunk sized windows, which for a page is a window and no copy.
+/// holding one of them at a time is a column of headroom rather than a table of it.
 ///
 /// The chunks come in by value and are taken apart into their columns before anything is laid, so
 /// that the input's copy of a column can be dropped the moment it has been laid and the charge
@@ -663,20 +672,24 @@ fn give(charged: &mut Vec<Reservation>, mut bytes: u64) {
 /// column that is finished with, and the sort ends up holding the whole input and the whole output
 /// at once, which is what made a big one die at the allocator rather than get slower.
 ///
+/// What `each` does with a finished column is the difference between the two callers. A sort that
+/// fitted cuts it into chunk sized windows and keeps them, which for a page is a window and no
+/// copy. A sort that is spilling writes it to a run file and drops it, which is why it can write a
+/// run without holding one.
+///
 /// # Errors
 ///
-/// If a column has no layout an assembly can lay, or if the chunks pass the limit the database was
-/// opened with.
-fn gathered(
+/// If a column has no layout an assembly can lay, or whatever `each` fails with.
+fn lay(
     types: &[LogicalType],
     chunks: Vec<Chunk>,
     at: &[Vec<u32>],
     rows: usize,
-    held: &mut Reservation,
     charged: &mut Vec<Reservation>,
-) -> Result<Vec<Chunk>> {
+    mut each: impl FnMut(&Vector) -> Result<()>,
+) -> Result<()> {
     if rows == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
     // Transposed: the pieces of one column of every chunk, so that a column is one thing to drop.
     let mut pieces: Vec<Vec<Vector>> = vec![Vec::with_capacity(chunks.len()); types.len()];
@@ -688,8 +701,6 @@ fn gathered(
             into.push(column);
         }
     }
-    let blocks = rows.div_ceil(VECTOR_SIZE);
-    let mut columns: Vec<Vec<Vector>> = vec![Vec::with_capacity(types.len()); blocks];
     for (position, ty) in types.iter().enumerate() {
         let mut assembly = Assembly::new(ty.clone(), rows)?;
         let laid = pieces.get_mut(position).map(std::mem::take).unwrap_or_default();
@@ -699,12 +710,36 @@ fn gathered(
         let given = laid.iter().map(Vector::footprint).sum::<usize>();
         drop(laid);
         give(charged, u64::try_from(given).unwrap_or(u64::MAX));
-        let whole = assembly.finish()?.into_pages();
+        each(&assembly.finish()?.into_pages())?;
+    }
+    Ok(())
+}
+
+/// The sorted rows as chunks, for a sort that is going to hand them back rather than write them.
+///
+/// # Errors
+///
+/// As [`lay`], or if the chunks pass the limit the database was opened with.
+fn gathered(
+    types: &[LogicalType],
+    chunks: Vec<Chunk>,
+    at: &[Vec<u32>],
+    rows: usize,
+    held: &mut Reservation,
+    charged: &mut Vec<Reservation>,
+) -> Result<Vec<Chunk>> {
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+    let blocks = rows.div_ceil(VECTOR_SIZE);
+    let mut columns: Vec<Vec<Vector>> = vec![Vec::with_capacity(types.len()); blocks];
+    lay(types, chunks, at, rows, charged, |whole| {
         for (block, into) in columns.iter_mut().enumerate() {
             let start = block * VECTOR_SIZE;
             into.push(whole.slice(start, (rows - start).min(VECTOR_SIZE))?);
         }
-    }
+        Ok(())
+    })?;
     let mut built = Vec::with_capacity(blocks);
     for (block, columns) in columns.into_iter().enumerate() {
         let start = block * VECTOR_SIZE;
