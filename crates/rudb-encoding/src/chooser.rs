@@ -66,6 +66,19 @@ pub trait Chooser: std::fmt::Debug + Sync {
         offered: &[integer::Kind],
         depth: u8,
     ) -> Vec<integer::Kind>;
+
+    /// Whether `kind` can ever be in what [`Chooser::narrow_integers`] returns at `depth`.
+    ///
+    /// Asked before the candidates are worked out, so a kind this rules out is never tested for.
+    /// That matters because the test is not free: finding out whether a dictionary or a sparse
+    /// encoding applies used to sort a copy of the chunk, at every level of the cascade, for a
+    /// chooser that was going to throw both away. Saying yes to a kind that is then dropped only
+    /// costs the test. Saying no to a kind the narrowing would have kept changes what gets written,
+    /// so the default is yes and an implementation only says no where its narrowing always would.
+    fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
+        let _ = (kind, depth);
+        true
+    }
 }
 
 /// Encode every candidate that applies and keep the smallest.

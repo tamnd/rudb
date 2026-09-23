@@ -7155,17 +7155,37 @@ impl chooser::Chooser for Codes {
         offered: &[integer::Kind],
         depth: u8,
     ) -> Vec<integer::Kind> {
-        let keep: &[integer::Kind] = if depth == 0 {
+        // The contract is a non empty subset, and a chunk that offers none of the three is a chunk
+        // this has no opinion about rather than one that cannot be written.
+        narrowed_to(Codes::keep(depth), offered)
+    }
+
+    fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
+        Codes::keep(depth).contains(&kind)
+    }
+}
+
+impl Codes {
+    fn keep(depth: u8) -> &'static [integer::Kind] {
+        if depth == 0 {
             &[integer::Kind::Constant, integer::Kind::Packed, integer::Kind::Rle]
         } else {
             &[integer::Kind::Constant, integer::Kind::Packed]
-        };
-        let narrowed: Vec<integer::Kind> =
-            offered.iter().copied().filter(|kind| keep.contains(kind)).collect();
-        // The contract is a non empty subset, and a chunk that offers none of the three is a chunk
-        // this has no opinion about rather than one that cannot be written.
-        if narrowed.is_empty() { offered.to_vec() } else { narrowed }
+        }
     }
+}
+
+/// The kinds of `offered` that are in `keep`, or all of `offered` when none of them are.
+///
+/// `Packed` applies to every chunk and both choosers keep it, so the fallback is never taken on a
+/// chunk the cascade offers. It is there because the contract is a non empty subset and a chooser
+/// that returned nothing would be a chunk that cannot be written. It is also why saying no to a kind
+/// in `considers_integer` is safe: a kind that is never offered could only have been kept through
+/// this fallback, and the fallback is never reached.
+fn narrowed_to(keep: &[integer::Kind], offered: &[integer::Kind]) -> Vec<integer::Kind> {
+    let narrowed: Vec<integer::Kind> =
+        offered.iter().copied().filter(|kind| keep.contains(kind)).collect();
+    if narrowed.is_empty() { offered.to_vec() } else { narrowed }
 }
 
 /// Which cascades are worth trying on a part of plain integers.
@@ -7202,7 +7222,17 @@ impl chooser::Chooser for Fixed {
         offered: &[integer::Kind],
         depth: u8,
     ) -> Vec<integer::Kind> {
-        let keep: &[integer::Kind] = if depth == 0 {
+        narrowed_to(Fixed::keep(depth), offered)
+    }
+
+    fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
+        Fixed::keep(depth).contains(&kind)
+    }
+}
+
+impl Fixed {
+    fn keep(depth: u8) -> &'static [integer::Kind] {
+        if depth == 0 {
             &[
                 integer::Kind::Constant,
                 integer::Kind::Packed,
@@ -7213,10 +7243,7 @@ impl chooser::Chooser for Fixed {
             ]
         } else {
             &[integer::Kind::Constant, integer::Kind::Packed, integer::Kind::Delta]
-        };
-        let narrowed: Vec<integer::Kind> =
-            offered.iter().copied().filter(|kind| keep.contains(kind)).collect();
-        if narrowed.is_empty() { offered.to_vec() } else { narrowed }
+        }
     }
 }
 
@@ -9237,6 +9264,65 @@ mod tests {
     use rudb_common::stat::Provenance;
 
     use super::*;
+
+    /// The chooser as it was before it could rule kinds out up front: the same narrowing, with every
+    /// kind tested for. What it writes is what the file used to hold.
+    #[derive(Debug)]
+    struct TestsEverything<'a>(&'a dyn chooser::Chooser);
+
+    impl chooser::Chooser for TestsEverything<'_> {
+        fn name(&self) -> &'static str {
+            "tests everything"
+        }
+
+        fn narrow_strings(
+            &self,
+            values: &[&[u8]],
+            offered: &[string::Kind],
+            depth: u8,
+        ) -> Vec<string::Kind> {
+            self.0.narrow_strings(values, offered, depth)
+        }
+
+        fn narrow_integers(
+            &self,
+            values: &[i64],
+            offered: &[integer::Kind],
+            depth: u8,
+        ) -> Vec<integer::Kind> {
+            self.0.narrow_integers(values, offered, depth)
+        }
+    }
+
+    #[test]
+    fn ruling_kinds_out_before_testing_for_them_writes_the_same_bytes() {
+        let columns: Vec<Vec<i64>> = vec![
+            vec![],
+            vec![5; 1000],
+            (0..1000).collect(),
+            (0..1000).map(|row| 1_600_000_000_000_000 + row * 1_000_000).collect(),
+            (0..1000).map(|row| row / 50).collect(),
+            (0..1000).map(|row| if row % 97 == 0 { row } else { 0 }).collect(),
+            (0..1000).map(|row| (row * 7919) % 13).collect(),
+            (0..1000).map(|row| (row * 2_654_435_761) % 1_000_003).collect(),
+            (0..1000).map(|row| [3, 3, 3, 9, 9, 1][row as usize % 6]).collect(),
+            (0..1000).map(|row| i64::MIN + row % 3).collect(),
+        ];
+        let choosers: [&dyn chooser::Chooser; 2] = [&Fixed, &Codes];
+        for column in &columns {
+            for chooser in choosers {
+                let quick = integer::encode_with(column, chooser).unwrap();
+                let full = integer::encode_with(column, &TestsEverything(chooser)).unwrap();
+                assert_eq!(
+                    quick,
+                    full,
+                    "{} on {:?}",
+                    chooser.name(),
+                    &column[..column.len().min(8)]
+                );
+            }
+        }
+    }
 
     #[test]
     fn checksum_matches_fixed_vectors() {
