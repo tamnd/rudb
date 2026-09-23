@@ -350,24 +350,31 @@ impl SymbolTable {
     ///
     /// As [`Self::decompress`], and if `out` runs out of room, which a string that really
     /// decompresses to the length the caller sized for never does.
+    ///
+    /// Inlined because a caller replaying a chunk asks for about nine short runs per value, and as
+    /// a call the pushes, pops and return around each one were a third of the time spent in here.
+    #[inline]
     pub fn decompress_at(&self, input: &[u8], out: &mut [u8], mut at: usize) -> Result<usize> {
-        let mut read = 0;
-        while read < input.len() {
-            let code = input[read];
-            read += 1;
+        let symbols = self.symbols.as_slice();
+        let mut codes = input.iter();
+        while let Some(&code) = codes.next() {
             if code == ESCAPE {
-                let literal = *input.get(read).ok_or_else(|| truncated("an escaped byte"))?;
-                read += 1;
-                *out.get_mut(at).ok_or_else(out_of_room)? = literal;
+                let Some(&literal) = codes.next() else {
+                    return Err(truncated("an escaped byte"));
+                };
+                let Some(slot) = out.get_mut(at) else {
+                    return Err(out_of_room());
+                };
+                *slot = literal;
                 at += 1;
             } else {
-                let symbol = *self
-                    .symbols
-                    .get(code as usize)
-                    .ok_or_else(|| Error::internal(format!("code {code} is not in the table")))?;
-                out.get_mut(at..at + MAX_SYMBOL_LEN)
-                    .ok_or_else(out_of_room)?
-                    .copy_from_slice(&symbol.value.to_le_bytes());
+                let Some(symbol) = symbols.get(code as usize) else {
+                    return Err(not_in_table(code));
+                };
+                let Some(slot) = out.get_mut(at..at + MAX_SYMBOL_LEN) else {
+                    return Err(out_of_room());
+                };
+                slot.copy_from_slice(&symbol.value.to_le_bytes());
                 at += symbol.len();
             }
         }
@@ -660,10 +667,17 @@ fn symbol_of(table: &SymbolTable, id: u16) -> Symbol {
     }
 }
 
+#[cold]
+fn not_in_table(code: u8) -> Error {
+    Error::internal(format!("code {code} is not in the table"))
+}
+
+#[cold]
 fn out_of_room() -> Error {
     Error::internal("a string decompresses to more than its length says")
 }
 
+#[cold]
 fn truncated(what: &str) -> Error {
     Error::internal(format!("the input ended in the middle of {what}"))
 }
