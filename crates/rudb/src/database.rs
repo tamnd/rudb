@@ -2230,8 +2230,13 @@ impl Shared {
             return Err(Error::transaction("Current transaction is aborted (please ROLLBACK)"));
         }
         let result = run();
+        // A statement rudb does not run yet leaves the transaction open. The pin would have run it,
+        // so aborting here would turn one gap into a refusal of everything after it.
         if let Err(error) = &result
-            && error.code() != rudb_common::ErrorCode::Parser
+            && !matches!(
+                error.code(),
+                rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented
+            )
             && let Some(open) = self.open().as_mut()
         {
             open.aborted = true;
