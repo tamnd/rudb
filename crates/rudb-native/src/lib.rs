@@ -6045,15 +6045,19 @@ impl<'a> Cursor<'a> {
         self.at += len;
         Ok(self.held(self.at - len, len))
     }
+    #[inline]
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
+    #[inline]
     fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("two bytes")))
     }
+    #[inline]
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
     }
+    #[inline]
     fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
     }
@@ -8324,10 +8328,12 @@ fn decode(
         let width = u32::from(cur.u8()?);
         let base = i128::from_le_bytes(cur.take(16)?.try_into().expect("sixteen bytes"));
         let count = cur.u32()? as usize;
-        let mut words = Vec::with_capacity(count);
-        for _ in 0..count {
-            words.push(cur.u64()?);
-        }
+        let length = count.checked_mul(8).ok_or_else(|| invalid("packed page is too long"))?;
+        let words: Vec<u64> = cur
+            .take(length)?
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
+            .collect();
         if cur.at != bytes.len() {
             return Err(invalid("packed page has trailing bytes"));
         }
