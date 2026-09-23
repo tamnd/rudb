@@ -125,7 +125,7 @@ fn found(entries: &[(Value, Value)], needle: &Value) -> Result<Option<usize>> {
 }
 
 /// A map of these pairs, refused if a key is null or appears twice.
-fn build(entries: Vec<(Value, Value)>, returns: &LogicalType) -> Result<Value> {
+pub(crate) fn build(entries: Vec<(Value, Value)>, returns: &LogicalType) -> Result<Value> {
     let LogicalType::Map(key, value) = returns else {
         return Err(Error::internal(format!("a map call returning {returns}")));
     };

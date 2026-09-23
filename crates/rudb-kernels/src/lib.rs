@@ -68,6 +68,7 @@ mod lists;
 pub mod logic;
 mod maps;
 pub mod membership;
+mod nested_text;
 mod number;
 mod peel;
 pub mod prepare;

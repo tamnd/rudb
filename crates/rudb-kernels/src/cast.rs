@@ -50,6 +50,7 @@ use crate::datetime::{
 use crate::fallback::{self, Kernel};
 use crate::number::{approximate, digits, fit, integral, pow10, rescale};
 use crate::shape::{identity, nulls_of};
+use crate::{maps, nested_text};
 
 /// Casts every value of a vector.
 ///
@@ -717,6 +718,24 @@ pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result
     if let (LogicalType::Struct(wanted), Value::Struct(fields)) = (target, value) {
         return to_struct(fields, wanted, try_cast);
     }
+    if let LogicalType::Map(key, value_type) = target {
+        match value {
+            Value::Map { entries, .. } => {
+                return to_map(entries.clone(), key, value_type, try_cast);
+            }
+            Value::Struct(fields) if !Field::unnamed(&fields_of(fields)) => {
+                let entries =
+                    fields.iter().map(|(name, v)| (Value::Varchar(name.clone()), v.clone()));
+                return to_map(entries.collect(), key, value_type, try_cast);
+            }
+            _ => {}
+        }
+    }
+    if let Value::Varchar(text) = value {
+        if let Some(answer) = from_text(text, target, try_cast) {
+            return answer;
+        }
+    }
     match convert(value, target) {
         Ok(converted) => Ok(converted),
         Err(error) if try_cast && recoverable(&error) => Ok(Value::Null),
@@ -831,6 +850,79 @@ fn to_struct(fields: &[(String, Value)], wanted: &[Field], try_cast: bool) -> Re
         out.push((field.name.clone(), value));
     }
     Ok(Value::Struct(out))
+}
+
+/// The fields of a struct value as the type's fields, for asking whether they are named.
+fn fields_of(fields: &[(String, Value)]) -> Vec<Field> {
+    fields.iter().map(|(name, value)| Field::new(name.clone(), value.logical_type())).collect()
+}
+
+/// A map with every key and value cast, refused if two keys come out the same. A key that a
+/// `TRY_CAST` could not take makes the whole map null, which is what the pin does rather than keep
+/// an entry with no key.
+fn to_map(
+    entries: Vec<(Value, Value)>,
+    key: &LogicalType,
+    value: &LogicalType,
+    try_cast: bool,
+) -> Result<Value> {
+    let mut cast = Vec::with_capacity(entries.len());
+    for (k, v) in entries {
+        let k = cast_value(&k, key, try_cast)?;
+        if k.is_null() {
+            return Ok(Value::Null);
+        }
+        cast.push((k, cast_value(&v, value, try_cast)?));
+    }
+    match maps::build(cast, &LogicalType::Map(Box::new(key.clone()), Box::new(value.clone()))) {
+        Err(error) if try_cast && recoverable(&error) => Ok(Value::Null),
+        answer => answer,
+    }
+}
+
+/// A list, a struct or a map read out of the text it prints as, or `None` when the target is none
+/// of those. The text is split by [`nested_text`] and every piece is cast to the type its place
+/// has, so `'[1, x]'` fails on the `x` as a cast of `'x'` to an integer would, and a `TRY_CAST`
+/// makes only that element null. Text that is not the shape at all is refused naming the whole
+/// string, or is a null under `TRY_CAST`.
+fn from_text(text: &str, target: &LogicalType, try_cast: bool) -> Option<Result<Value>> {
+    let piece = |piece: Option<String>, ty: &LogicalType| match piece {
+        Some(piece) => cast_value(&Value::Varchar(piece), ty, try_cast),
+        None => Ok(Value::Null),
+    };
+    let answer = match target {
+        LogicalType::List(element) => nested_text::list(text).map(|items| {
+            let values = items.into_iter().map(|item| piece(item, element));
+            Ok(Value::List { element: (**element).clone(), values: values.collect::<Result<_>>()? })
+        }),
+        LogicalType::Struct(wanted) => {
+            let names: Vec<&str> = wanted.iter().map(|field| field.name.as_str()).collect();
+            nested_text::fields(text, &names, Field::unnamed(wanted)).map(|found| {
+                let mut out = Vec::with_capacity(wanted.len());
+                for (field, item) in wanted.iter().zip(found) {
+                    out.push((field.name.clone(), piece(item, &field.ty)?));
+                }
+                Ok(Value::Struct(out))
+            })
+        }
+        LogicalType::Map(key, value) => nested_text::map(text).map(|entries| {
+            let entries = entries
+                .into_iter()
+                .map(|(k, v)| (Value::Varchar(k), v.map_or(Value::Null, Value::Varchar)))
+                .collect();
+            to_map(entries, key, value, try_cast)
+        }),
+        _ => return None,
+    };
+    Some(answer.unwrap_or_else(|| {
+        if try_cast {
+            Ok(Value::Null)
+        } else {
+            Err(Error::conversion(format!(
+                "Type VARCHAR with value '{text}' can't be cast to the destination type {target}"
+            )))
+        }
+    }))
 }
 
 fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
