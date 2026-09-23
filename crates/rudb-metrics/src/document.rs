@@ -279,6 +279,16 @@ impl Document {
                             });
                         });
                     }
+                    // Only a scan under a reduced join has one, for the reason a join is the only
+                    // operator with the key above.
+                    if let Some(reduced) = &operator.reduced {
+                        out.key("reduced");
+                        out.object(|out| {
+                            out.count("kept", reduced.kept);
+                            out.count("rows", reduced.rows);
+                            out.flag("stopped", reduced.stopped);
+                        });
+                    }
                 });
             }
         });
@@ -731,6 +741,27 @@ pub struct Operator {
     /// row's own [`Operator::rows_in`] is the driving side alone and the gathered side is
     /// unaccounted for without this. See [`Joined`].
     pub joined: Option<Joined>,
+    /// What a join's exact reduction left this scan to read, for a scan under one.
+    ///
+    /// Nothing for every other operator, and nothing for a scan whose join had no stored link to
+    /// reduce it with. See [`Reduced`].
+    pub reduced: Option<Reduced>,
+}
+
+/// What pushing a join's build side through a stored link left the scan under it.
+///
+/// spec/graph/05-execution.md section 5.4. The number worth having is `kept` against `rows`,
+/// because it is the one that says whether the reduction paid for itself, and a reduction that
+/// stopped early is written down as one because its `kept` is every row and a reader would
+/// otherwise take that for a set that happened to hold everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reduced {
+    /// Rows of the table the reduction said can match.
+    pub kept: u64,
+    /// Rows of the table.
+    pub rows: u64,
+    /// Whether the push gave up after a third of the table because it had removed nothing.
+    pub stopped: bool,
 }
 
 /// How a join found the rows one row matches.
@@ -847,6 +878,7 @@ impl Operator {
             implementations: Vec::new(),
             reference_impl: false,
             joined: None,
+            reduced: None,
         }
     }
 

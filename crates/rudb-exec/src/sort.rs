@@ -26,8 +26,8 @@
 //!
 //! Not in the sort. The chunks are kept as they arrived and a row is a chunk and a row in it, so
 //! what the comparator moves is the keys and two pairs of numbers rather than a copy of every
-//! column. The columns are moved once at the end, by [`lay`], which hands each column's
-//! pieces to an [`Assembly`] and lets it do the interleave as a typed copy per physical layout.
+//! column. The columns are moved once at the end, by [`lay`], which lays each column's pieces end
+//! to end and reads them back in sorted order with [`interleave`], a typed copy per physical layout.
 //!
 //! This used to hold a `Vec<Value>` of the whole row per row. Sorting lineitem at SF1 on three
 //! keys cost 197 billion instructions that way, of which most were the allocator: sixteen columns
@@ -102,7 +102,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
-use rudb_vector::{Assembly, Chunk, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, VECTOR_SIZE, Vector, interleave};
 
 use crate::merged::{ORDER, Sorted, order_of, ordering};
 use crate::normal::{self, Normal};
@@ -484,7 +484,7 @@ impl Sort {
             return Err(too_many());
         }
         let orders = rows.orders()?;
-        let at = places(&chunks, &rows)?;
+        let order = order(&chunks, &rows)?;
         let taken = rows.footprint();
         drop(rows);
         give(charged, taken);
@@ -496,7 +496,7 @@ impl Sort {
         // written the way it is. The sort is spilling because it has run out of memory, so the one
         // thing it cannot do on the way out is hold a second copy of what it is holding, and a run
         // built as chunks would: no chunk is finished until every column has been laid. See #1347.
-        lay(&self.types, chunks, &at, total, charged, |whole| file.column(whole))?;
+        lay(&self.types, chunks, &order, total, charged, |whole| file.column(whole))?;
         // The ordering column, a block at a time, because `orders` is already the bytes and turning
         // the whole of it into a column would be those bytes twice over.
         for block in 0..total.div_ceil(VECTOR_SIZE) {
@@ -542,25 +542,36 @@ impl Sink for Sort {
         self.exprs.evaluate(chunk, &mut local.scratch, &mut keys)?;
         let at = u32::try_from(local.held.chunks.len()).map_err(|_| too_many())?;
         let mut taken = u64::try_from(chunk.footprint()).unwrap_or(u64::MAX);
-        // row at a time: the keys, and nothing else. The payload is not read here at all, which is
-        // the point of `Sortable`.
         match (&self.widths, &mut local.held.rows) {
             (Some(widths), Keyed::Normal(rows)) => {
-                for row in 0..chunk.len() {
-                    let mut key: Normal = [0; normal::WIDTH];
-                    let mut written = 0;
-                    for (at, column) in keys.iter().enumerate() {
-                        let wide = *widths.get(at).ok_or_else(mismatched)?;
-                        let value = column.try_value_at(row)?;
-                        normal::write(&mut key, written, wide, &value, self.keys[at])?;
-                        written += wide;
-                    }
-                    taken += NORMALIZED;
-                    let row = u32::try_from(row).map_err(|_| too_many())?;
-                    rows.push((key, local.place.of(row as usize), (at, row)));
+                // A key column at a time into the rows' keys, a typed loop per layout rather than a
+                // value a key a row. The payload is not read here at all, which is the point of
+                // `Normalized`.
+                let first = rows.len();
+                let place = &local.place;
+                rows.extend(
+                    (0..chunk.len())
+                        .map(|row| ([0; normal::WIDTH], place.of(row), (at, row as u32))),
+                );
+                let fresh = rows.get_mut(first..).ok_or_else(mismatched)?;
+                let mut written = 0;
+                for (position, column) in keys.iter().enumerate() {
+                    let wide = *widths.get(position).ok_or_else(mismatched)?;
+                    let key = *self.keys.get(position).ok_or_else(mismatched)?;
+                    normal::write_column(
+                        fresh.iter_mut().map(|row| &mut row.0),
+                        written,
+                        wide,
+                        column,
+                        key,
+                    )?;
+                    written += wide;
                 }
+                taken += NORMALIZED * chunk.len() as u64;
             }
             (None, Keyed::Valued(rows)) => {
+                // row at a time: the keys as values, which is the path for a key list with a string
+                // or a float in it and has no fixed width bytes to write a column at a time.
                 for row in 0..chunk.len() {
                     let key: Vec<Value> = keys
                         .iter()
@@ -620,14 +631,14 @@ impl Sink for Sort {
         if u32::try_from(total).is_err() {
             return Err(too_many());
         }
-        let at = places(&chunks, &rows)?;
+        let order = order(&chunks, &rows)?;
         // The rows have said everything they had to say. Holding them through the assembly is
-        // holding a key and an arrival a row for the sake of a number that is already in `at`.
+        // holding a key and an arrival a row for the sake of a number that is already in `order`.
         let taken = rows.footprint();
         drop(rows);
         give(&mut charged, taken);
         let mut held = self.held.lock().map_err(poisoned)?;
-        let out = gathered(&self.types, chunks, &at, total, &mut held, &mut charged, threads)?;
+        let out = gathered(&self.types, chunks, &order, total, &mut held, &mut charged, threads)?;
         self.out.hold(out)?;
         Ok(())
     }
@@ -668,21 +679,36 @@ fn spread<T: Send>(
     Ok(())
 }
 
-/// Where each row that arrived lands, kept the way an [`Assembly`] wants to be handed it.
+/// Where each row of the answer reads from, as a row of the chunks that arrived laid end to end.
 ///
-/// One run of positions a chunk, indexed by the row's place in that chunk. Every input row reaches
-/// the sort and every one of them is somewhere in the order, so every position is written and the
-/// zero this starts from is never read.
-fn places(chunks: &[Chunk], rows: &Keyed) -> Result<Vec<Vec<u32>>> {
-    let mut at: Vec<Vec<u32>> = chunks.iter().map(|chunk| vec![0; chunk.len()]).collect();
-    for (rank, (chunk, row)) in rows.sources().enumerate() {
-        let Some(place) = at.get_mut(chunk as usize).and_then(|run| run.get_mut(row as usize))
-        else {
-            return Err(Error::internal("a sorted row pointing outside the chunks it came from"));
-        };
-        *place = rank as u32;
+/// Worked out once for the whole sort and read by every column, which is the point of it. It used
+/// to be the other way round, a place for each row that arrived, which every column then had to
+/// scatter into a map of its own before it could gather anything: on SF1 `lineitem` that was a
+/// column taking 0.6s to 1.3s on its own, most of it in pages of maps being faulted in (#1365).
+fn order(chunks: &[Chunk], rows: &Keyed) -> Result<Vec<usize>> {
+    let mut starts = Vec::with_capacity(chunks.len());
+    let mut start = 0;
+    for chunk in chunks {
+        starts.push(start);
+        start += chunk.len();
     }
-    Ok(at)
+    rows.sources()
+        .map(|(chunk, row)| {
+            let (Some(&start), Some(len)) =
+                (starts.get(chunk as usize), chunks.get(chunk as usize).map(Chunk::len))
+            else {
+                return Err(Error::internal(
+                    "a sorted row pointing outside the chunks it came from",
+                ));
+            };
+            if row as usize >= len {
+                return Err(Error::internal(
+                    "a sorted row pointing outside the chunks it came from",
+                ));
+            }
+            Ok(start + row as usize)
+        })
+        .collect()
 }
 
 /// Gives `bytes` back across the reservations the instances handed over.
@@ -706,14 +732,13 @@ fn give(charged: &mut Vec<Reservation>, mut bytes: u64) {
 /// The sorted rows, one whole column at a time, handed to `each` as they are finished.
 ///
 /// This is where the sort stops being row shaped. The order is a permutation of the rows that
-/// arrived, so what each column needs is for its values to be written out in that order, and an
-/// [`Assembly`] is exactly that: the chunks that arrived are placed into it, each row landing at
-/// the position the sort gave it, and the interleave is one typed copy per physical layout rather
-/// than a `Value` a field. A string moves as sixteen bytes of view over an arena its bytes were
-/// copied into once.
+/// arrived, so what each column needs is for its values to be written out in that order, and
+/// [`interleave`] is exactly that: the pieces are laid end to end and read back through the order,
+/// one typed copy per physical layout rather than a `Value` a field. A string moves as sixteen
+/// bytes of view over an arena its bytes were copied into once.
 ///
-/// One column at a time, because the assembly for a column holds a second copy of that column and
-/// holding one of them at a time is a column of headroom rather than a table of it.
+/// One column at a time, because laying a column holds a second copy of that column and holding
+/// one of them at a time is a column of headroom rather than a table of it.
 ///
 /// The chunks come in by value and are taken apart into their columns before anything is laid, so
 /// that the input's copy of a column can be dropped the moment it has been laid and the charge
@@ -728,11 +753,11 @@ fn give(charged: &mut Vec<Reservation>, mut bytes: u64) {
 ///
 /// # Errors
 ///
-/// If a column has no layout an assembly can lay, or whatever `each` fails with.
+/// If a column has no layout that can be laid, or whatever `each` fails with.
 fn lay(
     types: &[LogicalType],
     chunks: Vec<Chunk>,
-    at: &[Vec<u32>],
+    order: &[usize],
     rows: usize,
     charged: &mut Vec<Reservation>,
     mut each: impl FnMut(&Vector) -> Result<()>,
@@ -741,7 +766,7 @@ fn lay(
         return Ok(());
     }
     for (ty, pieces) in types.iter().zip(transposed(types, chunks)?) {
-        let (whole, given) = column(ty, pieces, at, rows)?;
+        let (whole, given) = column(ty, pieces, order)?;
         give(charged, given);
         each(&whole)?;
     }
@@ -763,19 +788,11 @@ fn transposed(types: &[LogicalType], chunks: Vec<Chunk>) -> Result<Vec<Vec<Vecto
 }
 
 /// One column laid in sorted order, and how many bytes of input dropping its pieces gave back.
-fn column(
-    ty: &LogicalType,
-    pieces: Vec<Vector>,
-    at: &[Vec<u32>],
-    rows: usize,
-) -> Result<(Vector, u64)> {
-    let mut assembly = Assembly::new(ty.clone(), rows)?;
-    for (piece, places) in pieces.iter().zip(at) {
-        assembly.place(places, piece)?;
-    }
+fn column(ty: &LogicalType, pieces: Vec<Vector>, order: &[usize]) -> Result<(Vector, u64)> {
+    let whole = interleave(ty, &pieces, order)?.into_pages();
     let given = pieces.iter().map(Vector::footprint).sum::<usize>();
     drop(pieces);
-    Ok((assembly.finish()?.into_pages(), u64::try_from(given).unwrap_or(u64::MAX)))
+    Ok((whole, u64::try_from(given).unwrap_or(u64::MAX)))
 }
 
 /// The sorted rows as chunks, for a sort that is going to hand them back rather than write them.
@@ -793,7 +810,7 @@ fn column(
 fn gathered(
     types: &[LogicalType],
     chunks: Vec<Chunk>,
-    at: &[Vec<u32>],
+    order: &[usize],
     rows: usize,
     held: &mut Reservation,
     charged: &mut Vec<Reservation>,
@@ -802,22 +819,43 @@ fn gathered(
     if rows == 0 {
         return Ok(Vec::new());
     }
-    let pieces: Vec<Mutex<Vec<Vector>>> =
-        transposed(types, chunks)?.into_iter().map(Mutex::new).collect();
+    let pieces = transposed(types, chunks)?;
+    // The longest columns first. The threads take columns in the order they are handed out, and a
+    // string column that is handed out last starts after a number column has finished on its
+    // thread, so the whole thing takes the two of them end to end rather than the longer one. On
+    // SF1 `lineitem` the strings come last in the schema and that was 150ms of 490.
+    let mut longest: Vec<usize> = (0..types.len()).collect();
+    longest.sort_by_key(|&position| {
+        let stringy = types
+            .get(position)
+            .is_some_and(|ty| matches!(ty, LogicalType::Varchar | LogicalType::Blob));
+        let bytes = pieces.get(position).map_or(0, |run| run.iter().map(Vector::footprint).sum());
+        std::cmp::Reverse((stringy, bytes))
+    });
+    let pieces: Vec<Mutex<Vec<Vector>>> = pieces.into_iter().map(Mutex::new).collect();
     let charged = Mutex::new(charged);
-    let wholes =
-        in_parallel(threads, types.len(), threads.degree(), "laid sorted column", |position| {
-            let (Some(ty), Some(pieces)) = (types.get(position), pieces.get(position)) else {
-                return Err(Error::internal("a sorted column past the end of the schema"));
-            };
-            let pieces = std::mem::take(&mut *pieces.lock().map_err(poisoned)?);
-            let (whole, given) = column(ty, pieces, at, rows)?;
-            give(*charged.lock().map_err(poisoned)?, given);
-            Ok(whole)
-        })?;
+    let laid = in_parallel(threads, types.len(), threads.degree(), "laid sorted column", |rank| {
+        let position = longest.get(rank).copied().unwrap_or(rank);
+        let (Some(ty), Some(pieces)) = (types.get(position), pieces.get(position)) else {
+            return Err(Error::internal("a sorted column past the end of the schema"));
+        };
+        let pieces = std::mem::take(&mut *pieces.lock().map_err(poisoned)?);
+        let (whole, given) = column(ty, pieces, order)?;
+        give(*charged.lock().map_err(poisoned)?, given);
+        Ok((position, whole))
+    })?;
+    let mut wholes: Vec<Option<Vector>> = vec![None; types.len()];
+    for (position, whole) in laid {
+        if let Some(slot) = wholes.get_mut(position) {
+            *slot = Some(whole);
+        }
+    }
     let blocks = rows.div_ceil(VECTOR_SIZE);
     let mut columns: Vec<Vec<Vector>> = vec![Vec::with_capacity(types.len()); blocks];
     for whole in &wholes {
+        let Some(whole) = whole else {
+            return Err(Error::internal("a sorted column nobody laid"));
+        };
         for (block, into) in columns.iter_mut().enumerate() {
             let start = block * VECTOR_SIZE;
             into.push(whole.slice(start, (rows - start).min(VECTOR_SIZE))?);
@@ -837,7 +875,7 @@ fn gathered(
 /// More rows or more chunks than a sort addresses.
 ///
 /// A row is found by a chunk and a row in it, both counted in a `u32`, and it lands at a position
-/// an [`Assembly`] also counts in a `u32`. Four billion rows is a sort of something like a hundred
+/// the answer also counts in a `u32`. Four billion rows is a sort of something like a hundred
 /// gigabytes, which is past where this operator should be asked anyway, and saying so is better
 /// than an index that wrapped and an answer in the wrong order.
 fn too_many() -> Error {

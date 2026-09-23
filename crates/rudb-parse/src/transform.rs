@@ -1989,6 +1989,7 @@ impl<'a> Transform<'a> {
                 "FunctionExpression" => return self.function(node),
                 "CoalesceExpression" => return self.coalesce(node),
                 "NullIfExpression" => return self.null_if(node),
+                "LambdaExpression" => return self.lambda(node),
                 "SubstringExpression" => return self.substring(node),
                 "PositionExpression" => return self.position(node),
                 "TrimExpression" => return self.trim(node),
@@ -2025,6 +2026,14 @@ impl<'a> Transform<'a> {
         let head = kids.next().unwrap_or(NONE);
         let mut left = self.expr(head)?;
         for tail in kids {
+            // `SingleArrowPair <- '->' LogicalOrExpression` has no operator node, since the arrow is
+            // a bare token, so the one child is the operand. It is the old lambda spelling or the
+            // JSON operator, and the binder is where the two are told apart.
+            if self.name(tail) == "SingleArrowPair" {
+                let right = self.expr(self.first(tail))?;
+                left = self.push(Expr::Binary { op: BinaryOp::Arrow, left, right });
+                continue;
+            }
             let operator = self.first(tail);
             // `ComparisonExpressionTail <- ComparisonOperator NotExpression? BetweenInLikeExpression`
             // is the one tail with an optional middle, so the operand is the last child and not the
@@ -2784,6 +2793,29 @@ impl<'a> Transform<'a> {
         let args = self.expr_slice(args);
         let name = self.function_name("coalesce");
         Ok(self.push(Expr::Function { name, args, distinct: false, filter: NONE }))
+    }
+
+    /// `LambdaExpression <- 'LAMBDA' List(ColIdOrString) ':' Expression`.
+    ///
+    /// Every child but the last is a parameter, since the list and the keyword leave no node of
+    /// their own behind, and the last one is the body. A parameter is a name and is read the way a
+    /// column name is, so `lambda "x": x` is the parameter `x` and `lambda X: x` keeps its case for
+    /// the column heading and still answers to `x`, which the binder matches without case.
+    fn lambda(&mut self, node: u32) -> Result<ExprRef> {
+        let kids: Vec<u32> = self.kids(node).collect();
+        let Some((&body, params)) = kids.split_last() else {
+            return self.unsupported(node);
+        };
+        if params.is_empty() {
+            return self.unsupported(node);
+        }
+        let mut names = Vec::with_capacity(params.len());
+        for &param in params {
+            names.push(self.identifier(param));
+        }
+        let params = self.part_slice(names);
+        let body = self.expr(body)?;
+        Ok(self.push(Expr::Lambda { params, body }))
     }
 
     /// `NullIfExpression <- 'NULLIF' Parens(NullIfArguments)` and
@@ -3641,6 +3673,10 @@ mod tests {
                 format!("({not}{} IN [{}])", show(ast, operand), list(items))
             }
             Expr::List { items } => format!("[{}]", list(items)),
+            Expr::Lambda { params, body } => {
+                let params: Vec<&str> = ast.name(params).collect();
+                format!("(lambda {}: {})", params.join(", "), show(ast, body))
+            }
             Expr::Parameter { name } => format!("${}", ast.string(name)),
             Expr::Row { items } => format!("ROW({})", list(items)),
             Expr::Subquery { query } => format!("({})", show_query(ast, query)),

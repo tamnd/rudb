@@ -45,7 +45,7 @@
 use std::sync::Arc;
 
 use rudb_catalog::{Catalog, Parent, QualifiedName, Table};
-use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Session, Value};
+use rudb_common::{Cancel, Error, Field, LogicalType, Memory, Result, Rule, Session, Value};
 use rudb_functions::TableFunction;
 use rudb_graph::Link;
 use rudb_kernels::Accumulator;
@@ -86,7 +86,7 @@ use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
 use crate::settingnames::settingnames;
-use crate::sideways::{self, Keyed, Sideways};
+use crate::sideways::{self, Exact, Keyed, Sideways};
 use crate::sort::Sort;
 use crate::source::{
     Dummy, FileScan, Filters, Frequencies, Pushdown, Scan, Series, Summary, Values,
@@ -596,6 +596,43 @@ fn scanned<'a>(
         }
     }
     Ok(None)
+}
+
+/// What turns a join's build side into exact driving rows, when the join is over a stored link.
+///
+/// spec/graph/05-execution.md section 5.4, and the conditions that make it exact rather than
+/// approximately right. The build side's key has to be the parent's stored key column, read as it
+/// is, so that every key on that side is a key the parent's key map holds. The driving column has
+/// to be the child's stored column the link was built over, so that the link says which parent
+/// every driving row's value names. And both tables have to be one committed file each, so that a
+/// row's position in the scan is its `rid`. The join kind and the null rule were settled by the
+/// operator before this was asked, the same as for the filter.
+///
+/// `None` on anything else, which is a join that gets the Bloom filter it always got. A catalog
+/// error is `None` as well rather than a failed query, because the only thing lost is a faster path.
+fn exact(
+    plan: &Plan,
+    catalog: &Catalog,
+    parent: NodeRef,
+    key: ExprRef,
+    driving: NodeRef,
+    binding: ColumnBinding,
+) -> Option<Exact> {
+    let Expr::Column(key) = *plan.expr(key) else { return None };
+    let key = sideways::beneath(plan, parent, key)?;
+    let (parent_table, parent_columns) = scanned(plan, catalog, parent, key.table).ok()??;
+    let (child_table, child_columns) = scanned(plan, catalog, driving, binding.table).ok()??;
+    let (child_rows, parent_rows) = (child_table.rows().stored()?, parent_table.rows().stored()?);
+    let parent_column = stored_column(plan, parent_table, key.table, parent_columns, key)?;
+    let edge = rudb_native::graph::Edge {
+        child: child_table.name().table.clone(),
+        child_column: stored_column(plan, child_table, binding.table, child_columns, binding)?,
+        parent: parent_table.name().table.clone(),
+        parent_column,
+    };
+    let link = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)?;
+    let keys = rudb_native::graph::key_map(parent_rows, parent_column)?;
+    Some(Exact::new(keys, link))
 }
 
 /// The two columns one equality holds equal, when that is what the conditions are.
@@ -1430,6 +1467,7 @@ impl<'a> Building<'a, '_> {
         };
         let gather_id = self.gathered(reference);
         let gathering = self.shape.pipeline(held);
+        let parent = held;
         let held = self.node(held)?;
         let held_schema = held.schema.clone();
         // The edge this join's runtime filter crosses, made before either side is built
@@ -1478,6 +1516,8 @@ impl<'a> Building<'a, '_> {
         // together, because the build side pass that fills the filter is only worth making
         // when there is a scan that will read it.
         let zone = self.session.session_time_zone();
+        let (catalog, reducing) =
+            (self.catalog, self.session.rules().enabled(Rule::GraphReduction));
         let arm = |keyed: Option<(ExprRef, ColumnBinding)>| {
             let Some((key, binding)) = keyed else {
                 return;
@@ -1485,6 +1525,11 @@ impl<'a> Building<'a, '_> {
             let Some(binding) = sideways::beneath(plan, driving, binding) else {
                 return;
             };
+            if reducing {
+                if let Some(exact) = exact(plan, catalog, parent, key, driving, binding) {
+                    sideways.exactly(exact);
+                }
+            }
             sideways.keying(Keyed::new(plan, key, held_schema.clone(), zone));
             sideways.about(binding);
         };

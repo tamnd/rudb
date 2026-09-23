@@ -89,7 +89,7 @@ pub use clock::{Span, thread_cpu_ns};
 pub use counters::Counters;
 pub use document::{
     Algorithm, Blocked, Declined, Document, Engine, Implementation, Joined, Machine, Memory,
-    Operator, Outcome, Pipeline, Query, Resource, Settings, Strategy, Timing,
+    Operator, Outcome, Pipeline, Query, Reduced, Resource, Settings, Strategy, Timing,
 };
 pub use driver::{Driver, Running};
 pub use qerror::{QErrors, Spread, q_error, tenths, word};

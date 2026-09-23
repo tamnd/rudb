@@ -15,8 +15,8 @@
 
 use std::fmt::{self, Write};
 
-use rudb_common::Value;
-use rudb_plan::{Expr, ExprRef, Plan};
+use rudb_common::{Field, LogicalType, Value};
+use rudb_plan::{ColumnBinding, Expr, ExprRef, Plan};
 
 use crate::schema::Schema;
 
@@ -87,6 +87,33 @@ fn form<W: Write>(plan: &Plan, out: &mut W, expr: ExprRef, schema: &Schema) -> f
                 form(plan, out, otherwise, schema)?;
             }
             out.write_str(" END")
+        }
+        // The body is run over the parameters as columns of their own, and when the message comes
+        // from inside it the schema it was given has them under their names. From outside, the
+        // lambda puts them there itself.
+        Expr::LambdaParam(binding) => match schema.position_of(binding) {
+            Some(position) => out.write_str(&schema.fields()[position].name),
+            None => write!(out, "@{}.{}", binding.table, binding.column),
+        },
+        Expr::Lambda { table, params, body } => {
+            let names = plan.name_list(params);
+            out.write_str("(lambda ")?;
+            let mut fields = Vec::with_capacity(names.len());
+            let mut bindings = Vec::with_capacity(names.len());
+            for (at, &name) in names.iter().enumerate() {
+                if at > 0 {
+                    out.write_str(", ")?;
+                }
+                out.write_str(plan.string(name))?;
+                fields.push(Field::new(plan.string(name), LogicalType::Null));
+                bindings.push(ColumnBinding::new(table, at as u32));
+            }
+            out.write_str(": ")?;
+            match Schema::new(fields, bindings) {
+                Ok(inner) => form(plan, out, body, &Schema::concat(schema, &inner))?,
+                Err(_) => form(plan, out, body, schema)?,
+            }
+            out.write_char(')')
         }
     }
 }

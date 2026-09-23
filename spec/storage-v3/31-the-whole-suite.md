@@ -137,9 +137,60 @@ Third, the load, which is 1.6 times DuckDB's processor. It is the one cost every
 
 Not the middle group. Eighteen queries at parity are eighteen queries where both engines read the same bytes, and document 30's argument is that no amount of work on the scan makes that ten times.
 
+## The first item, built
+
+The writer now keeps the set. `rudb-native/src/distinct.rs` holds each integer column's values as their sixty four bits in a flat table with linear probing, filled on the frequency pass the writer already made, capped at 2^25 slots so a near unique column gives up rather than holding a gigabyte, and the count goes into the directory slot a string column's dictionary count already used. The format did not change.
+
+The same ten million rows, loaded and run again:
+
+| | before | after | DuckDB |
+| --- | ---: | ---: | ---: |
+| q5 processor | 1.20 s | 0.01 s | 1.23 s |
+| q5 peak | 153.4 MiB | 13.0 MiB | 107.9 MiB |
+| load processor | 698.2 s | 745.0 s | 440.5 s |
+| file | 1,069 MiB | 1,071 MiB | 1,866 MiB |
+
+q5 goes from level to 123 times on processor and 8.3 times on memory, and it does not clear both axes, for the reason the section on the memory floor gives: DuckDB answers it in 107.9 MiB and rudb cannot go below 12.8. The load pays 7 percent more processor for it, and the file 1.7 MB.
+
+The other forty two moved by what the host's load moved them by, in both directions, and their answers are the ones they were apart from ties at the limit. The suite total went from 63.4 to 54.7 seconds, most of that noise. Three of forty three still clear both axes. The change is worth recording as the kind of change that works, a number the writer can afford and the competitor's format has no place for, and as a measurement of how little one such number moves a target stated over the whole suite.
+
+## The second item, tried and not kept
+
+q9, q10 and q23 keep their grouped distinct pairs in `rudb-exec/src/pairs.rs`, where every row becomes a sixteen byte record in one of sixty four radix partitions per scan thread and duplicates are removed only when the partitions are finished. That is why q9 holds 253.9 MiB for about one and a half million users: the memory follows the ten million rows, not the pairs.
+
+The obvious fix is to have each thread's partition sort itself and drop repeats whenever it doubles. It was built and measured on three million rows shaped like the real column, 450,000 users seen about six and a half times each: the peak went from 127 to between 117 and 125 MiB and the processor time doubled, 0.04 to 0.08 seconds, with the same answers. On three million distinct users there was nothing to drop and it cost half again.
+
+The reason is arithmetic, not tuning. A pair seen six times over the whole table, dealt across ten threads and sixty four partitions, turns up in any one thread's partition less than once on average, so the thread that holds a record almost never holds its duplicate. Repeats only meet where the threads' partitions meet, at the finish. A fix that saves memory has to deduplicate in a structure the threads share, or change what a record costs, and neither is the local change it looked like.
+
+It also cannot reach the target on this query. DuckDB's peak on q9 is 137.3 MiB, so ten times less is 13.7 MiB, one megabyte over the process floor, and no representation of a million and a half pairs fits in one megabyte. The grouped distinct queries are worth making no longer behind, and that is the whole of what they can give.
+## What the planner held
+
+q13 was 21.5 times ahead on processor and 9.8 times on memory, 27.9 MiB against DuckDB's 273.1, the nearest miss in the suite. Its operators held 6.2 KiB at the peak, because the answer comes out of the writer's frequency synopsis and not out of the rows. A plain `EXPLAIN` of it peaked at 27.8 MiB. The memory was the planner's.
+
+The synopsis stores a string column's frequent values as dictionary codes. Turning its 512 codes into values for an estimate read each one through the dictionary's point read, which decodes the payload block a code sits in and keeps it for as long as the reader lives, and on `SearchPhrase` the 512 codes land in a hundred and twenty five of the six hundred and seventy seven blocks. A trace of the `EXPLAIN` showed 6.4 MB read, about 4 MB of it those blocks, which decode to about three times that.
+
+`TextSource::visit` now reads a set of positions a block at a time and keeps nothing it decoded, and the reader keeps the synopsis's values instead, a few kilobytes per column, so the estimates that ask again do not decode again. Nothing about the file changed.
+
+The same file and binary built before and after, on the same host, with a load average near twenty three from other work on it, so the processor column moved in both directions and the memory column is the one to read:
+
+| | before | after | DuckDB |
+| --- | ---: | ---: | ---: |
+| q13 processor | 0.10 s | 0.11 s | 1.72 s |
+| q13 peak | 28.3 MiB | 18.3 MiB | 273.1 MiB |
+| q34 peak | 39.0 MiB | 25.9 MiB | 989.9 MiB |
+| q35 peak | 38.9 MiB | 25.3 MiB | 1013.7 MiB |
+| q17 peak | 375.2 MiB | 328.6 MiB | 337.4 MiB |
+| q19 peak | 399.6 MiB | 349.4 MiB | 579.4 MiB |
+| q28 peak | 81.5 MiB | 62.7 MiB | 337.3 MiB |
+| q38 peak | 62.4 MiB | 44.8 MiB | 59.7 MiB |
+
+q13 now clears both axes, 15.6 times on processor and 14.9 on memory, which makes four of forty three with q6, q34 and q35. q17 and q38 go from behind DuckDB on memory to ahead of it. Twenty four of the forty three peaks fell by more than a megabyte. Four rose in that single pass, q7, q24, q39 and q43, by up to 10.6 MiB, and run three times each interleaved with the old binary they read the same as it, 402 to 411 MiB on q24 and 35 to 36 on q43, so those were the host. Every answer is the one it was, apart from which rows tie at the limit in q22, q32 and q33 and the order of equal rows in q23.
+
+The lesson is the one this document keeps arriving at from a different side. The synopsis was built so that a query could skip the rows, and it did, and then the path that read the synopsis paid in dictionary blocks what the rows would have cost in memory. A structure that lets a query do less work is only worth what its own read costs.
+
 ## What this does not claim
 
-It does not claim the target is met. Three of forty three queries clear both axes, in the native quadrant, at one scale. The Parquet quadrant is not measured here and document 25's arithmetic still stands in it.
+It does not claim the target is met. Four of forty three queries clear both axes, in the native quadrant, at one scale. The Parquet quadrant is not measured here and document 25's arithmetic still stands in it.
 
 It does not claim the ratios hold at a hundred million. Every query here is ten times smaller than the scale documents 28 through 30 measured at. The synopsis queries should improve with scale, because DuckDB's work grows and rudb's does not, and documents 28 and 29 measured that. The fallback should get worse, because document 29 measured that too.
 

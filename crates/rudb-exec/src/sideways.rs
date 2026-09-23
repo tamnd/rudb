@@ -71,6 +71,8 @@ use std::sync::{Arc, OnceLock};
 
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{Result, SessionTimeZone};
+use rudb_graph::{KeyMap, Link, Pushed, Rids};
+use rudb_metrics::Reduced;
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
 use rudb_vector::{Chunk, Vector};
@@ -101,6 +103,9 @@ pub(crate) struct Sideways<'a> {
     /// The column of the driving side the key is compared against, which is the column this is
     /// about. Written at the same moment as `keyed` and read by the scan.
     binding: OnceLock<ColumnBinding>,
+    /// The stored structures that turn the build side's keys into exact driving rows, when the join
+    /// is over a relationship with a link in the file. Written with `keyed` and read by the sink.
+    exact: OnceLock<Exact>,
     /// What the build side turned out to hold. Written by the sink when the build side finishes and
     /// read by the scan when it is asked for its morsels.
     found: OnceLock<Found>,
@@ -118,6 +123,42 @@ pub(crate) struct Found {
     range: Option<(Bound, Bound)>,
     /// The keys themselves, to the precision ten bits each buys.
     filter: Option<Blocked>,
+    /// The driving rows that can match, exactly, when the join was armed with an [`Exact`].
+    ///
+    /// When this is there the filter is not, because it answers the same question with no false
+    /// positives and a bit test in place of a hash.
+    rows: Option<Rids>,
+    /// What the exact reduction came to, for the scan to report, including one that stopped early
+    /// and so left `rows` empty.
+    reduced: Option<Reduced>,
+}
+
+/// What turns a build side's keys into the set of driving rows that can match them, exactly.
+///
+/// spec/graph/05-execution.md section 5.4. The build side of a join over a relationship is some
+/// subset of the parent's rows, and the key map says which row holds each key, so the keys become a
+/// set of parent rows. The link says which parent every child row points at, so pushing that set
+/// through it gives the child rows that have a partner on the build side and no others. That is the
+/// runtime filter with the false positives taken out: a Bloom filter keeps a row the join will drop
+/// about one time in a hundred and costs a hash per row, and this keeps none and costs a bit test.
+///
+/// It is only made where the key the build side is hashed on is the parent's stored key column and
+/// the driving column is the child's stored link column, both read as they are with nothing
+/// computed over them. [`crate::build`] checks that, and the link it takes has already been checked
+/// against the parent's generation by [`rudb_native::graph::stored_link`].
+#[derive(Debug)]
+pub(crate) struct Exact {
+    /// Which parent row holds a key.
+    keys: KeyMap,
+    /// Which parent row every driving row points at.
+    link: Link,
+}
+
+impl Exact {
+    /// The key map of the parent and the link from the driving table to it.
+    pub(crate) fn new(keys: KeyMap, link: Link) -> Self {
+        Self { keys, link }
+    }
 }
 
 /// How to read one key column out of a chunk of the build side.
@@ -178,6 +219,19 @@ impl<'a> Sideways<'a> {
         self.keyed.get()
     }
 
+    /// Says the build side's keys can be turned into exact driving rows, and with what.
+    ///
+    /// Called at most once, next to [`Sideways::keying`], and only for a join over a relationship
+    /// whose link the file holds.
+    pub(crate) fn exactly(&self, exact: Exact) {
+        let _ = self.exact.set(exact);
+    }
+
+    /// What turns the keys into rows, for the sink, when the join was armed with it.
+    pub(crate) fn exact(&self) -> Option<&Exact> {
+        self.exact.get()
+    }
+
     /// Records what the build side held. Called once, when the build side's pipeline finishes.
     pub(crate) fn found(&self, found: Found) {
         let _ = self.found.set(found);
@@ -212,6 +266,28 @@ impl<'a> Sideways<'a> {
             return None;
         }
         Some((binding.column as usize, self.found.get()?.filter.as_ref()?))
+    }
+
+    /// The exact set of rows a scan of `index` should keep, by their position in the table.
+    ///
+    /// `None` on everything the tests above answer nothing about, and on a join that was not armed
+    /// with an [`Exact`] or whose keys could not all be read as integers.
+    pub(crate) fn rows(&self, index: u32) -> Option<&Rids> {
+        if self.binding.get()?.table != index {
+            return None;
+        }
+        self.found.get()?.rows.as_ref()
+    }
+
+    /// What the exact reduction came to for a scan of `index`, for `EXPLAIN ANALYZE` to show.
+    ///
+    /// Asked once by the scan rather than kept up to date, because it is settled when the build side
+    /// finishes and nothing changes it after.
+    pub(crate) fn reduction(&self, index: u32) -> Option<Reduced> {
+        if self.binding.get()?.table != index {
+            return None;
+        }
+        self.found.get()?.reduced
     }
 }
 
@@ -266,11 +342,23 @@ pub(crate) fn beneath(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Opt
 ///
 /// Whatever evaluating the key expression raises, which is what the hash table build would have
 /// raised over the same rows a moment later.
-pub(crate) fn found(keyed: &Keyed<'_>, chunks: &[Chunk]) -> Result<Found> {
+pub(crate) fn found(keyed: &Keyed<'_>, exact: Option<&Exact>, chunks: &[Chunk]) -> Result<Found> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
+    let pushed = exact.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten();
+    let reduced = pushed.as_ref().map(|pushed| Reduced {
+        kept: pushed.rids.len(),
+        rows: pushed.rids.rows(),
+        stopped: pushed.stopped,
+    });
+    // The exact rows answer everything the filter would, with no false positives, so a side that
+    // has them does not pay for building the filter too. Nor does a side whose reduction stopped
+    // early, because it stopped on finding that the first third of the driving table all matches,
+    // and a filter over the same keys would pass the same rows at the price of a hash each.
+    let stopped = pushed.as_ref().is_some_and(|pushed| pushed.stopped);
+    let exact = pushed.filter(|pushed| !pushed.stopped).map(|pushed| pushed.rids);
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     let mut extremes = Extremes::default();
-    let mut filter = Blocked::sized(rows, BUDGET);
+    let mut filter = if exact.is_some() || stopped { None } else { Blocked::sized(rows, BUDGET) };
     let mut hashes = Vec::new();
     for chunk in chunks {
         let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
@@ -289,7 +377,43 @@ pub(crate) fn found(keyed: &Keyed<'_>, chunks: &[Chunk]) -> Result<Found> {
             filter.add(word);
         }
     }
-    Ok(Found { range: extremes.into_range(), filter })
+    Ok(Found { range: extremes.into_range(), filter, rows: exact, reduced })
+}
+
+/// The driving rows whose link points at a parent row the build side holds.
+///
+/// One lookup per build row to make a set of parent rows, then one push of that set through the
+/// link, which skips every part of the driving table whose parents all fall outside it. The key
+/// expression is evaluated here a second time rather than once for both, because it is a column
+/// read and a side that is armed with this is the side the join was going to hash anyway.
+///
+/// `None` when a key does not read as an integer or is not in the key map. Neither should happen,
+/// because the build side is a subset of the parent's rows and the map is over all of them. If one
+/// does, the join gets the filter instead, which is slower and is never wrong. The push stops early
+/// when the first third of the driving table all matches, see [`Rids::forward_or_stop`].
+fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushed>> {
+    let (plan, exprs, schema, time_zone) = keyed.parts();
+    let parents = exact.link.parents();
+    let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).unwrap_or(usize::MAX)];
+    for chunk in chunks {
+        let keys = evaluate_all_in_time_zone(plan, &exprs, schema, chunk, time_zone)?;
+        let Some(keys) = keys.first() else { continue };
+        let nullable = has_nulls(keys, chunk.len());
+        for row in 0..chunk.len() {
+            // A null key matches nothing under the rule this is armed for, the same as in the filter.
+            if nullable && keys.is_null_at(row) {
+                continue;
+            }
+            let Some(key) = keys.signed_at(row) else { return Ok(None) };
+            let Some(rid) = exact.keys.lookup(key)? else { return Ok(None) };
+            let Some(word) = usize::try_from(rid / 64).ok().and_then(|at| words.get_mut(at)) else {
+                return Ok(None);
+            };
+            *word |= 1 << (rid % 64);
+        }
+    }
+    let held = Rids::from_words(parents, words)?;
+    Ok(Some(held.forward_or_stop(&exact.link)?))
 }
 
 /// The smallest and largest key one side of a join holds, widened a chunk at a time.
@@ -338,7 +462,13 @@ impl Found {
     /// A build side that turned out to hold this, for the tests that stand in for one.
     #[cfg(test)]
     pub(crate) fn of(range: Option<(Bound, Bound)>, filter: Option<Blocked>) -> Self {
-        Self { range, filter }
+        Self { range, filter, rows: None, reduced: None }
+    }
+
+    /// The same, with an exact set of driving rows.
+    #[cfg(test)]
+    pub(crate) fn exactly(range: Option<(Bound, Bound)>, rows: Rids) -> Self {
+        Self { range, filter: None, rows: Some(rows), reduced: None }
     }
 }
 
@@ -350,7 +480,9 @@ mod tests {
     use rudb_storage::Blocked;
     use rudb_vector::{Chunk, Vector};
 
-    use super::{Across, Extremes, Found, Keyed, Schema, Sideways, beneath, found, hash};
+    use rudb_graph::{KeyMap, Link};
+
+    use super::{Across, Exact, Extremes, Found, Keyed, Schema, Sideways, beneath, found, hash};
 
     fn column(values: &[Option<i32>]) -> Vector {
         let values: Vec<Value> =
@@ -443,7 +575,7 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
-        let found = found(&keyed, &[chunk(&[Some(5), Some(9)]), chunk(&[Some(2)])])
+        let found = found(&keyed, None, &[chunk(&[Some(5), Some(9)]), chunk(&[Some(2)])])
             .expect("a column of integers");
 
         assert_eq!(found.range, Some((Bound::Int(2), Bound::Int(9))));
@@ -461,7 +593,7 @@ mod tests {
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
         let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 7 + 11)).collect();
 
-        let found = found(&keyed, &chunks(&keys)).expect("a column of integers");
+        let found = found(&keyed, None, &chunks(&keys)).expect("a column of integers");
 
         let filter = found.filter.expect("a filter over four thousand keys");
         assert!(through(&filter, &keys).into_iter().all(|held| held), "a key it was given");
@@ -479,7 +611,7 @@ mod tests {
         let absent: Vec<Option<i32>> =
             (0..4_000).map(|value| Some(value * 7 + 1_000_000)).collect();
 
-        let found = found(&keyed, &chunks(&keys)).expect("a column of integers");
+        let found = found(&keyed, None, &chunks(&keys)).expect("a column of integers");
 
         let filter = found.filter.expect("a filter over four thousand keys");
         let through = through(&filter, &absent).into_iter().filter(|&held| held).count();
@@ -494,7 +626,7 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
-        let found = found(&keyed, &[chunk(&[Some(3), None, Some(4)])]).expect("integers");
+        let found = found(&keyed, None, &[chunk(&[Some(3), None, Some(4)])]).expect("integers");
 
         assert_eq!(found.range, Some((Bound::Int(3), Bound::Int(4))));
         assert_eq!(through(&found.filter.expect("a filter"), &[None]), [false]);
@@ -508,10 +640,54 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
-        let found = found(&keyed, &[]).expect("nothing to read");
+        let found = found(&keyed, None, &[]).expect("nothing to read");
 
         assert_eq!(found.range, None);
         assert_eq!(through(&found.filter.expect("a filter of no keys"), &[Some(1)]), [false]);
+    }
+
+    /// Section 5.4 on the smallest case that shows it. Parents keyed 100 upwards, children pointing
+    /// at them in order, and a build side holding two of the keys: the rows kept are exactly the
+    /// children of those two parents, and no filter is built beside them.
+    #[test]
+    fn an_exact_side_keeps_the_children_of_the_parents_it_holds_and_no_others() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let parent_keys: Vec<Option<i128>> = (0..50).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..5_000).map(|child| child / 100).collect();
+        let exact = Exact::new(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Link::build(&parents_of, 50).expect("every parent exists"),
+        );
+
+        let found = found(&keyed, Some(&exact), &[chunk(&[Some(103), None]), chunk(&[Some(140)])])
+            .expect("integers");
+
+        assert!(found.filter.is_none(), "the exact rows make the filter redundant");
+        let rows = found.rows.expect("an exact side");
+        let kept: Vec<u64> = rows.iter().collect();
+        let expected: Vec<u64> = (300..400).chain(4_000..4_100).collect();
+        assert_eq!(kept, expected);
+        assert_eq!(found.range, Some((Bound::Int(103), Bound::Int(140))));
+    }
+
+    /// A key the map has never heard of cannot come from the parent, so something upstream is not
+    /// what the builder checked for. The join falls back to the filter rather than trusting the set.
+    #[test]
+    fn a_key_the_parent_does_not_hold_falls_back_to_the_filter() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let exact = Exact::new(
+            KeyMap::build(&[Some(1), Some(2)]).expect("unique keys"),
+            Link::build(&[0, 1, 1], 2).expect("both parents exist"),
+        );
+
+        let found = found(&keyed, Some(&exact), &[chunk(&[Some(1), Some(9)])]).expect("integers");
+
+        assert!(found.rows.is_none());
+        assert!(found.filter.is_some(), "the filter is what the join gets instead");
     }
 
     /// A driving side written as plan text, which is how every other operator test in this crate

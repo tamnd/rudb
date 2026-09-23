@@ -328,11 +328,12 @@ impl Printing<'_> {
             Statistics::NotAsked => String::new(),
         };
         let chose = chosen(self.plan, node, self.context);
+        let room = sized(self.plan, node);
         // The estimate goes after the operator rather than in a column of its own, because the tree
         // is indented and a column would have to be wider than the deepest line to line up.
         let _ = writeln!(
             out,
-            "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{told}{chose}{marker}{actual}",
+            "{:indent$}{printed}  [{estimate}] [pipeline {pipeline}]{told}{room}{chose}{marker}{actual}",
             "",
             indent = depth * 2
         );
@@ -355,6 +356,38 @@ impl Printing<'_> {
             self.write_node(child, depth + 1, moved, out);
         }
     }
+}
+
+/// What the statistics decided about an aggregate's table, as a bracket on its line.
+///
+/// Two passes write a number onto an aggregate and neither of them moves an operator.
+/// [`crate::presize`] says how many groups the table should have room for before the first row
+/// arrives, and [`crate::dense`] says the key can be an address into an array instead of a probe
+/// into buckets. A plan either of them has run over prints exactly as it printed before, so from
+/// the outside there is no way to tell a group by that presized from one that did not, and no way to
+/// tell a run with `SET stats_presize = false` from a run where the pass found nothing to do. That
+/// is the same silence `chosen` below was written for.
+///
+/// The numbers are printed and not just the fact, because the number is the part that can be wrong.
+/// A table sized for a hundred groups that ends up holding a million rehashed its way there anyway,
+/// and an array over a range far wider than the groups it holds is the case
+/// `spec/stats/05-every-query.md` section 5.4 warns about. Neither is visible from the word alone.
+///
+/// Nothing on any other kind of node, and nothing on an aggregate no pass wrote a number for, which
+/// is every aggregate over a table nobody counted.
+fn sized(plan: &Plan, node: NodeRef) -> String {
+    let Node::Aggregate { index, .. } = *plan.node(node) else { return String::new() };
+    let mut said = Vec::new();
+    if let Some(groups) = plan.presized(index) {
+        said.push(format!("room for {} groups", commas(groups)));
+    }
+    // After the size and not instead of it, because the operator keeps both: the array is the index
+    // and the buckets are still the proof, per the last section of `crate::dense`. A line that said
+    // only one of the two would read as the other one having been declined.
+    if let Some((low, values)) = plan.dense(index) {
+        said.push(format!("addressed directly over {} values from {low}", commas(values)));
+    }
+    if said.is_empty() { String::new() } else { format!(" [{}]", said.join(", ")) }
 }
 
 /// Which join algorithm this node is, and why the other one was not, as a bracket on its line.
@@ -425,6 +458,16 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
     } else {
         format!(", {} of {parts} parts skipped", operator.parts_pruned)
     };
+    // The reduction goes next to the parts it skipped, since those are where most of what it saved
+    // shows. A reduction that stopped says so in words, because its row count is the whole table
+    // and a reader would otherwise take it for a set that happened to hold every row.
+    let reduced = match &operator.reduced {
+        None => String::new(),
+        Some(reduced) if reduced.stopped => {
+            ", link reduction stopped after a third of the rows removed nothing".to_owned()
+        }
+        Some(reduced) => format!(", link kept {} of {} rows", reduced.kept, reduced.rows),
+    };
     // Both clocks, named, because one number here was read as the other three times. The wall
     // figure is the operator's elapsed time summed over its instances, so on a plan that runs eight
     // ways it can exceed the whole statement's CPU and is not a share of anything. The CPU figure is
@@ -436,7 +479,10 @@ fn actually(measured: &Document, id: OperatorRef, filtered: bool) -> String {
     } else {
         format!("{} wall, {} cpu", duration(operator.wall_ns), duration(operator.cpu_ns))
     };
-    format!("  [{} rows{after}, {spent}{joined}{skipped}{memory}{slow}]", operator.rows_out)
+    format!(
+        "  [{} rows{after}, {spent}{joined}{skipped}{reduced}{memory}{slow}]",
+        operator.rows_out
+    )
 }
 
 /// The operator row with this id.
@@ -823,6 +869,48 @@ mod tests {
         for line in tree(&out) {
             assert!(line.contains(", read to decide]"), "{line}");
         }
+    }
+
+    /// An aggregate with whatever the two sizing passes decided already written onto it.
+    ///
+    /// Written by hand rather than by running the passes, because what is being tested here is what
+    /// the line says about a decision and not which decision was made. The passes have their own
+    /// tests for the second half, and they need a store with bounds in it to make one at all.
+    fn aggregate(room: Option<u64>, array: Option<(i128, u64)>) -> Plan {
+        let text = concat!(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n",
+            "  Get memory.main.t AS t #0 [a::INTEGER]\n",
+        );
+        let mut plan = parsed(text);
+        if let Some(groups) = room {
+            plan.presize(1, groups);
+        }
+        if let Some((low, values)) = array {
+            plan.densify(1, low, values);
+        }
+        plan
+    }
+
+    #[test]
+    fn an_aggregate_says_how_much_room_it_asked_for_and_how_it_finds_a_group() {
+        let out =
+            explain(&aggregate(Some(120_000), Some((100, 1_000_000))), &knowing(&[("t", 10)]));
+        let first = tree(&out)[0];
+        // Both, in the order the two passes run, because the operator ends up with both: the array
+        // is how a row finds its slot and the buckets it sized are still where the group lives.
+        assert!(first.contains("[room for 120,000 groups, addressed directly"), "{first}");
+        assert!(first.contains("over 1,000,000 values from 100]"), "{first}");
+    }
+
+    #[test]
+    fn an_aggregate_no_pass_wrote_a_number_for_says_nothing_extra_at_all() {
+        // Which is every aggregate over a table nobody counted, so it is the common case and the one
+        // a plan reader sees. A clause here saying no statistic was available would be a second
+        // sentence on every group by of every query for a question nobody asked.
+        let out = explain(&aggregate(None, None), &knowing(&[("t", 10)]));
+        let first = tree(&out)[0];
+        assert!(!first.contains("room for"), "{first}");
+        assert!(!first.contains("addressed"), "{first}");
     }
 
     #[test]

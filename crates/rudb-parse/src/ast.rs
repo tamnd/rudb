@@ -821,6 +821,17 @@ pub enum Expr {
         /// The items, as a run of [`ExprRef`], in the order they were written.
         items: Slice,
     },
+    /// `LAMBDA x, i: body`, a function written inline as the argument of one that takes it.
+    ///
+    /// It is an expression only so that it can sit in an argument list. Anywhere else it means
+    /// nothing, and the binder says so in upstream's words rather than the parser refusing it,
+    /// because upstream's parser accepts it anywhere too.
+    Lambda {
+        /// The parameter names, as a run of [`StrRef`], in the order they were written.
+        params: Slice,
+        /// What the function computes from them.
+        body: ExprRef,
+    },
     /// A parenthesised list of more than one expression, which is a row value.
     Row {
         /// The items, as a run of [`ExprRef`].

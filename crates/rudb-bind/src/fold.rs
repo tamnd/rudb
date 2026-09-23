@@ -68,7 +68,11 @@ pub const VOLATILE: [&str; 17] = [
 pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
     let value = match *plan.expr(expr) {
         Expr::Constant(value) => plan.value(value).clone(),
-        Expr::Column(_) | Expr::Aggregate { .. } | Expr::Window { .. } => return Ok(None),
+        Expr::Column(_)
+        | Expr::Aggregate { .. }
+        | Expr::Window { .. }
+        | Expr::Lambda { .. }
+        | Expr::LambdaParam(_) => return Ok(None),
         Expr::Cast { input, try_cast } => {
             if plan.expr_type(input) == &LogicalType::TimestampTz
                 && plan.expr_type(expr) == &LogicalType::Varchar

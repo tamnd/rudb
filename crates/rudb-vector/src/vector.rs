@@ -581,6 +581,26 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         body(first, self.bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
     }
+    /// Hands over the values at `indices`, which rise, without keeping what reading them decoded.
+    ///
+    /// The scattered twin of [`sweep`](Self::sweep). A caller that wants a few hundred values spread
+    /// over the whole source once, which is what turning a frequency synopsis's codes into values
+    /// is, would otherwise leave every block it touched decoded and held for the rest of the
+    /// source's life. On ClickBench `SearchPhrase` that is a hundred and twenty five blocks, the
+    /// larger part of what a query answered out of the synopsis was holding.
+    ///
+    /// `body` is told the position in `indices` and the bytes. The default reads through
+    /// `bytes_at`, which is right for every source that keeps everything anyway.
+    fn visit(
+        &self,
+        indices: &[usize],
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        for (at, &index) in indices.iter().enumerate() {
+            body(at, self.bytes_at(index)?.unwrap_or_default())?;
+        }
+        Ok(())
+    }
     /// Resident bytes retained by this source.
     fn footprint(&self) -> usize;
     /// How many ranks this source's sorted value order has, when it has one.
@@ -2278,6 +2298,31 @@ impl Vector {
         Ok(first + 1)
     }
 
+    /// The values at `indices`, which rise, without keeping what reading them decoded.
+    ///
+    /// [`TextSource::visit`] is what this is for. A vector that is not reading text out of a file, or
+    /// that has nulls of its own, reads a value at a time through the reader that checks.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading a value raises.
+    pub fn try_values_visited(&self, indices: &[usize]) -> Result<Vec<Value>> {
+        if let Body::ExternalText { source } = &self.body {
+            if matches!(self.validity, Validity::AllValid) {
+                let mut out = vec![Value::Null; indices.len()];
+                let mut own = |at: usize, bytes: &[u8]| {
+                    if indices[at] < self.len {
+                        out[at] = bytes_as(&self.ty, bytes);
+                    }
+                    Ok(())
+                };
+                source.visit(indices, &mut own)?;
+                return Ok(out);
+            }
+        }
+        indices.iter().map(|&index| self.try_value_at(index)).collect()
+    }
+
     /// Variable length byte count at `index`, preserving storage failures.
     pub fn try_bytes_len_at(&self, index: usize) -> Result<Option<usize>> {
         if index >= self.len || !self.validity.is_valid(index) {
@@ -3126,7 +3171,12 @@ impl Packed<'_> {
     ///
     /// Out of range rows read as zero rather than panicking, the way every other accessor in this
     /// file answers for a row that is not there.
+    ///
+    /// Marked inline because every caller that matters is a kernel in another crate reading one code
+    /// per row, and thin LTO was leaving it as a call there. On TPC-H SF1 that call was 1.5 percent of
+    /// the suite and a tenth of q12.
     #[must_use]
+    #[inline]
     pub fn code(&self, row: usize) -> u64 {
         code_at(self.words, (self.offset + row) * self.width as usize, self.width)
     }
@@ -3354,6 +3404,7 @@ fn unpack(
 ///
 /// Zero for bits past the end of the words, which keeps a read of a row that is not there from
 /// panicking and matches what every other accessor here does with one.
+#[inline]
 fn code_at(words: &[u64], bit: usize, width: u32) -> u64 {
     let word = bit / u64::BITS as usize;
     let shift = (bit % u64::BITS as usize) as u32;

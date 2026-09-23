@@ -25,7 +25,7 @@
 //! `SET stats.presize = false` turns off one optimization so that its worth can be measured on its
 //! own, and `SET statistics = off` turns off all of them at once, which is the ablation
 //! `spec/stats/09-measurement.md` section 9.3 runs on every commit. `SET graph_sections = off` is
-//! the same idea for the stored graph sections. None of the ten is a DuckDB setting either, so none
+//! the same idea for the stored graph sections. None of the eleven is a DuckDB setting either, so none
 //! of them is in the settings catalog and `duckdb_settings()` does not list them.
 //!
 //! `cluster_by` is an exception of a third kind, and the interesting one. It is not a DuckDB

@@ -204,6 +204,11 @@ fn cost(plan: &Plan, expr: ExprRef) -> f64 {
         // An aggregate or a window inside a filter is a shape the binder does not build, and
         // costing one would be inventing a number for something that cannot get here.
         Expr::Aggregate { .. } | Expr::Window { .. } => 0.0,
+        // A parameter is read out of the chunk the body runs over, the way a column is.
+        Expr::LambdaParam(_) => 0.0,
+        // A body runs once per element rather than once per row, and the list's length is not
+        // known here, so it is charged as a `CASE` is, by what it holds and not by how often.
+        Expr::Lambda { body, .. } => 4.0 + cost(plan, body),
     }
 }
 

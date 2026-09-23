@@ -19,6 +19,7 @@ use rudb_csv::Reader as CsvReader;
 use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
 };
+use rudb_graph::Rids;
 use rudb_kernels::cast;
 use rudb_metrics::Counters;
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
@@ -691,6 +692,13 @@ impl<'a> Scan<'a> {
     fn testing(&self) -> &[Probe] {
         self.testing.get_or_init(|| {
             let Some(sideways) = self.sideways.as_ref() else { return self.probes.clone() };
+            // Here because this is the one moment every instance of the scan passes through after
+            // the build side has finished and before a row is read.
+            if let (Some(counters), Some(reduced)) =
+                (&self.counters, sideways.reduction(self.index))
+            {
+                counters.reducing(reduced);
+            }
             let mut probes = self.probes.clone();
             probes.extend(onto(&self.columns, sideways.tests(self.index)));
             probes
@@ -717,6 +725,57 @@ impl<'a> Scan<'a> {
         let rows = self.table.rows();
         (!probes.is_empty() && rows.skips(at, probes))
             || (!cutoff.is_empty() && rows.skips(at, cutoff))
+            || self.reduced_away(at)
+    }
+
+    /// The exact rows a join above handed down, and where part `at` starts, when there are some.
+    ///
+    /// The position is the row's place in the table, which is what a link calls a child `rid`, so
+    /// the set can be asked about a part without reading anything.
+    fn reduced(&self, at: usize) -> Option<(&Rids, u64)> {
+        let rows = self.sideways.as_ref()?.rows(self.index)?;
+        let first = u64::try_from(*self.offsets.get(at)?).ok()?;
+        Some((rows, first))
+    }
+
+    /// Whether the exact rows hold nothing inside part `at`, so the part is never read.
+    ///
+    /// spec/graph/05-execution.md section 5.5. On a child stored in the order of its parent, which
+    /// is `lineitem` against `orders`, a selective filter on the parent leaves most parts of the
+    /// child with no member at all, and this is where they go.
+    fn reduced_away(&self, at: usize) -> bool {
+        let Some((rows, first)) = self.reduced(at) else { return false };
+        let Some(len) =
+            self.table.rows().chunk_len(at).ok().and_then(|len| u64::try_from(len).ok())
+        else {
+            return false;
+        };
+        len > 0 && !rows.any_between(first, first + len - 1)
+    }
+
+    /// Drops the rows of part `at` that the exact rows from a join above do not hold.
+    ///
+    /// Before the pushed filter, because it is a bit test per row where the filter is an expression,
+    /// and because the filter narrows the chunk and after that a row's position in it is no longer
+    /// its position in the table. The rows are the part's own, so the row numbers a scan makes up
+    /// are still in step with them here.
+    ///
+    /// # Errors
+    ///
+    /// Whatever narrowing the chunk to the rows that survived raises.
+    fn reduce(&self, at: usize, chunk: &mut Chunk) -> Result<()> {
+        let Some((rows, first)) = self.reduced(at) else { return Ok(()) };
+        if rows.is_full() {
+            return Ok(());
+        }
+        let len = chunk.len();
+        let kept = Selection::from_predicate(len, |row| rows.contains(first + row as u64));
+        if kept.len() == len {
+            return Ok(());
+        }
+        let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+        *chunk = whole.select(&kept)?;
+        Ok(())
     }
 
     /// The parts the statistics leave alive, by stripe, and how many rows they hold between them.
@@ -999,6 +1058,7 @@ impl Source for Scan<'_> {
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
             *out = read;
+            self.reduce(at, out)?;
             self.apply(at, out)?;
             self.sift(out)?;
             return Ok(more(morsel));
@@ -1014,6 +1074,7 @@ impl Source for Scan<'_> {
             }
         }
         *out = Chunk::with_rows(held, read.len())?;
+        self.reduce(at, out)?;
         self.apply(at, out)?;
         self.sift(out)?;
         Ok(more(morsel))
@@ -2691,7 +2752,9 @@ mod tests {
         Scan {
             table,
             columns: vec![Some(0)],
-            offsets: vec![0],
+            offsets: (0..table.rows().chunk_count())
+                .map(|at| i64::try_from(at * VECTOR_SIZE).expect("a small table"))
+                .collect(),
             probes,
             sideways: None,
             cutoff: None,
@@ -2948,6 +3011,25 @@ mod tests {
 
         assert_eq!(counted_rows(&scan), VECTOR_SIZE, "one chunk's worth");
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// The exact tier, which answers by position rather than by value. Five chunks, and the join
+    /// above handed down ten rows of the third and one of the fifth, so three chunks are never read
+    /// and only those eleven rows come out of the two that are.
+    #[test]
+    fn a_scan_keeps_exactly_the_rows_a_reduction_handed_down() {
+        let table = counted(VECTOR_SIZE * 5);
+        let size = u64::try_from(VECTOR_SIZE).expect("a small number");
+        let kept: Vec<u64> = (2 * size + 5..2 * size + 15).chain([4 * size + 7]).collect();
+        let sideways = Sideways::new();
+        sideways.about(ColumnBinding::new(0, 0));
+        let rows = rudb_graph::Rids::from_sorted(5 * size, kept).expect("in order");
+        sideways.found(Found::exactly(None, rows));
+        let mut scan = scanning(&table, Vec::new());
+        scan.sideways = Some(sideways);
+
+        assert_eq!(counted_rows(&scan), 11);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 3);
     }
 
     /// A filter over three keys, hashed the way the build side of a join hashes the column it is

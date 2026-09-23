@@ -389,6 +389,11 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         // And a parenthesised list is a call to `row`, which needs its quotes because it is a
         // keyword.
         Expr::Row { items } => format!("\"row\"({})", exprs(ast, items)),
+        // Upstream brackets a lambda whole, and names the parameters the way it names columns.
+        Expr::Lambda { params, body } => {
+            let params: Vec<String> = ast.name(params).map(quoted).collect();
+            format!("(lambda {}: {})", params.join(", "), expr(ast, body))
+        }
         Expr::Subquery { query: inner } => format!("({})", query(ast, inner)),
         Expr::Exists { query: inner, negated } => {
             let exists = format!("EXISTS({})", query(ast, inner));

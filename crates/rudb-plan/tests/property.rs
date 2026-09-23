@@ -202,6 +202,8 @@ fn form_of(expr: &Expr) -> &'static str {
         Expr::Aggregate { .. } => "Aggregate",
         Expr::Window { .. } => "Window",
         Expr::Case { .. } => "Case",
+        Expr::Lambda { .. } => "Lambda",
+        Expr::LambdaParam(_) => "LambdaParam",
     }
 }
 

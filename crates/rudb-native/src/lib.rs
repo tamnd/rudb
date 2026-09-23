@@ -51,6 +51,7 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
+mod distinct;
 pub mod graph;
 pub mod section;
 pub mod stats;
@@ -1910,7 +1911,12 @@ impl Writer {
     /// Finds exact heavy hitters without keeping a hash table for every numeric column while the
     /// load is live. The pages are already in the target file, so one column at a time uses a
     /// bounded Misra-Gries candidate table and then recounts only those candidates.
-    fn numeric_frequency(&self, column: usize) -> Result<Option<FrequencySummary>> {
+    ///
+    /// The first of those passes also counts the column's distinct values exactly, up to the cap in
+    /// [`distinct`], which is the number a string column gets from its dictionary. It comes back
+    /// beside the summary because a column whose heavy hitters cannot be proved can still have been
+    /// counted.
+    fn numeric_frequency(&self, column: usize) -> Result<(Option<FrequencySummary>, Option<u64>)> {
         let ty = &self.table.fields[column].ty;
         if !matches!(
             ty,
@@ -1925,11 +1931,16 @@ impl Writer {
                 | LogicalType::Date
                 | LogicalType::Timestamp
         ) {
-            return Ok(None);
+            return Ok((None, None));
         }
         let mut candidates: HashMap<FrequencyValue, u32> = HashMap::new();
         let mut decrements = 0_u64;
+        let mut distinct = distinct::ExactDistinct::new();
         self.visit_numeric(column, |_, value| {
+            // The low sixty four bits, which is every bit any integer column stores.
+            if let FrequencyValue::Integer(value) = value {
+                distinct.insert(value as u64);
+            }
             if let Some(count) = candidates.get_mut(&value) {
                 *count = count.saturating_add(1);
             } else if candidates.len() < FREQUENCY_CANDIDATES {
@@ -1956,7 +1967,7 @@ impl Writer {
             if lower.len() < FREQUENCY_BUILD_RANK
                 || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
             {
-                return Ok(None);
+                return Ok((None, distinct.count()));
             }
             let mut exact =
                 candidates.into_keys().map(|value| (value, 0_u64)).collect::<HashMap<_, _>>();
@@ -1982,7 +1993,7 @@ impl Writer {
             .map(|(value, count)| FrequencyEntry { value, count })
             .collect::<Vec<_>>();
         let omitted_max = keep_most_frequent(&mut entries).max(decrements);
-        Ok(Some(FrequencySummary { entries, omitted_max, ordinals }))
+        Ok((Some(FrequencySummary { entries, omitted_max, ordinals }), distinct.count()))
     }
 
     fn visit_numeric(
@@ -2041,7 +2052,7 @@ impl Writer {
     /// of a `TINYINT` through the decode, and a run of them sits together in a schema the way it
     /// sits together in `hits`, so a worker that was handed the wrong six columns finishes long
     /// after one that was handed the right six and the whole phase waits for it.
-    fn numeric_frequencies(&self) -> Result<Vec<Option<FrequencySummary>>> {
+    fn numeric_frequencies(&self) -> Result<Vec<(Option<FrequencySummary>, Option<u64>)>> {
         let mut columns = self
             .table
             .fields
@@ -2069,7 +2080,7 @@ impl Writer {
             .min(MAX_FREQUENCY_WORKERS)
             .min(columns.len());
         if workers <= 1 {
-            let mut frequencies = vec![None; self.table.fields.len()];
+            let mut frequencies = vec![(None, None); self.table.fields.len()];
             for column in columns {
                 frequencies[column] = self.numeric_frequency(column)?;
             }
@@ -2104,7 +2115,7 @@ impl Writer {
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
-        let mut frequencies = vec![None; self.table.fields.len()];
+        let mut frequencies = vec![(None, None); self.table.fields.len()];
         for piece in pieces {
             for (column, summary) in piece {
                 frequencies[column] = summary;
@@ -2138,7 +2149,9 @@ impl Writer {
             previous = Some(*last);
         }
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
-        self.table.frequencies = self.numeric_frequencies()?;
+        let (frequencies, distincts) = self.numeric_frequencies()?.into_iter().unzip();
+        self.table.frequencies = frequencies;
+        self.table.distincts = distincts;
         for dictionary in self.dictionaries.iter_mut().flatten() {
             dictionary.finish_blocks()?;
         }
@@ -2506,6 +2519,10 @@ pub fn attach(
     Ok(held)
 }
 
+/// One column's frequency synopsis as values with their row counts, shared by every clone of a
+/// reader.
+type Synopsis = Arc<Vec<(Value, u64)>>;
+
 /// Reads committed native column pages without holding the table in memory.
 #[derive(Debug, Clone)]
 pub struct Reader {
@@ -2521,6 +2538,9 @@ pub struct Reader {
     /// all but one throw the answer away. ClickBench 38 reads the URL dictionary, which is 515,958
     /// entries, and was paying for it twice.
     loading: Arc<Vec<Mutex<()>>>,
+    /// Each column's frequency synopsis as values, the first time anything asks for it. See
+    /// [`Reader::decode_frequencies`].
+    frequency_values: Arc<Vec<OnceLock<Synopsis>>>,
     /// How many global dictionaries have been opened. A scan of a dictionary column should open its
     /// dictionary once however many workers it has, and the test that says so is the only thing
     /// keeping it that way.
@@ -3297,6 +3317,45 @@ impl TextSource for NativeText {
         Ok(last)
     }
 
+    /// Each block the indices land in, decoded once and dropped, or read where it is already kept.
+    ///
+    /// Never kept, unlike [`Self::sweep`] under its budget, because a scattered read is a one off:
+    /// a synopsis turned into values is turned once and remembered by the reader as values, a few
+    /// kilobytes, where the blocks it went through are megabytes nobody asks for again.
+    fn visit(
+        &self,
+        indices: &[usize],
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut at = 0;
+        while at < indices.len() {
+            let block = indices[at] / TEXT_PAYLOAD_VALUES;
+            let upto =
+                at + indices[at..].partition_point(|&index| index / TEXT_PAYLOAD_VALUES == block);
+            let wanted = &indices[at..upto];
+            if wanted.iter().any(|&index| index >= self.values) {
+                return Err(invalid("a visited value is past the global dictionary"));
+            }
+            let decoded;
+            let bytes: &[u8] = match self.blocks.get(block).and_then(OnceLock::get) {
+                Some(Ok(kept)) => kept,
+                _ => {
+                    decoded = self.decode_block(block)?;
+                    &decoded
+                }
+            };
+            for (offset, &index) in wanted.iter().enumerate() {
+                let (start, end) = self.span_within(index)?;
+                let value = bytes
+                    .get(start as usize..end as usize)
+                    .ok_or_else(|| invalid("global dictionary value is past its block"))?;
+                body(at + offset, value)?;
+            }
+            at = upto;
+        }
+        Ok(())
+    }
+
     fn ranks(&self) -> Option<usize> {
         (self.ranks > 0).then_some(self.ranks)
     }
@@ -3725,6 +3784,7 @@ impl Reader {
             table: Arc::new(table),
             dictionaries: Arc::new(dictionaries),
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
+            frequency_values: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
             part_ranges: Arc::new(part_ranges),
@@ -3990,13 +4050,48 @@ impl Reader {
     }
 
     /// Turns stored frequency entries into values of the column's own type.
+    ///
+    /// Remembered per column, because the planner asks once for every estimate that touches the
+    /// column and the executor asks again, and the answer is a few hundred values. The codes of a
+    /// string column are read through [`Vector::try_values_visited`], which does not keep the blocks
+    /// it decodes, so what a query answered out of the synopsis holds is those values and not the
+    /// hundred or so dictionary blocks they are scattered over.
     fn decode_frequencies(
         &self,
         column: usize,
         ty: &LogicalType,
         entries: &[FrequencyEntry],
     ) -> Result<Vec<(Value, u64)>> {
+        if let Some(values) = self.frequency_values.get(column).and_then(OnceLock::get) {
+            return Ok(values.as_ref().clone());
+        }
+        let values = self.decode_frequencies_once(column, ty, entries)?;
+        if let Some(slot) = self.frequency_values.get(column) {
+            let _ = slot.set(Arc::new(values.clone()));
+        }
+        Ok(values)
+    }
+
+    fn decode_frequencies_once(
+        &self,
+        column: usize,
+        ty: &LogicalType,
+        entries: &[FrequencyEntry],
+    ) -> Result<Vec<(Value, u64)>> {
         let dictionary = if *ty == LogicalType::Varchar { self.dictionary(column)? } else { None };
+        let mut codes = entries
+            .iter()
+            .filter_map(|entry| match entry.value {
+                FrequencyValue::Code(code) => Some(code as usize),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        let texts = match &dictionary {
+            Some(dictionary) if !codes.is_empty() => dictionary.try_values_visited(&codes)?,
+            _ => Vec::new(),
+        };
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
             let value = match entry.value {
@@ -4044,10 +4139,15 @@ impl Reader {
                     ),
                     _ => return Err(invalid("integer frequency belongs to another type")),
                 },
-                FrequencyValue::Code(code) => dictionary
-                    .as_ref()
-                    .ok_or_else(|| invalid("frequency code has no dictionary"))?
-                    .try_value_at(code as usize)?,
+                FrequencyValue::Code(code) => {
+                    if dictionary.is_none() {
+                        return Err(invalid("frequency code has no dictionary"));
+                    }
+                    let at = codes
+                        .binary_search(&(code as usize))
+                        .map_err(|_| invalid("frequency code was not among the codes read"))?;
+                    texts[at].clone()
+                }
             };
             out.push((value, entry.count));
         }
@@ -4097,8 +4197,10 @@ impl Reader {
     /// that number. This reads it rather than the size of the dictionary, which also means the
     /// dictionary page is not opened to answer.
     ///
-    /// `None` for a column the file has no dictionary for, which is every column that is not a
-    /// string. A sketch would answer that approximately and SQL asked for the exact number.
+    /// An integer column has no dictionary, and its count comes from the set the writer keeps on its
+    /// numeric frequency pass instead, which is exact up to a cap. `None` for a column past that cap
+    /// and for every column that is neither, where a sketch would answer approximately and SQL asked
+    /// for the exact number.
     ///
     /// # Errors
     ///
@@ -10191,6 +10293,51 @@ mod tests {
                 );
             }
         }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A string column's synopsis is turned into values without keeping the blocks it went through.
+    ///
+    /// Three thousand values, every fifth of them four times over, so the synopsis is a prefix of
+    /// five hundred and twelve codes spread over all three payload blocks. Reading it used to leave
+    /// all three decoded for as long as the reader lived. It leaves none of them now, and the second
+    /// read answers out of what the first remembered.
+    #[test]
+    fn a_string_synopsis_is_read_without_keeping_the_dictionary_blocks() {
+        let path = path("synopsis-keeps-no-block");
+        let spelled = |index: usize| Value::Varchar(format!("phrase {index:05}"));
+        let mut values = (0..3_000).map(spelled).collect::<Vec<_>>();
+        for _ in 0..3 {
+            values.extend((0..3_000).step_by(5).map(spelled));
+        }
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in values.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("a part");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        let resting = dictionary.footprint();
+        let prefix = reader.frequency_prefix(0).expect("a readable synopsis").expect("one");
+        assert_eq!(prefix.entries.len(), 512);
+        for (value, count) in &prefix.entries {
+            let Value::Varchar(text) = value else { panic!("a string column gave {value:?}") };
+            let index = text["phrase ".len()..].parse::<usize>().expect("a spelled number");
+            assert_eq!((index % 5, *count), (0, 4), "{text} came back with {count}");
+        }
+        assert_eq!(dictionary.footprint(), resting, "reading the synopsis kept a decoded block");
+        let again = reader.frequency_prefix(0).expect("a readable synopsis").expect("one");
+        assert_eq!(again.entries, prefix.entries);
         fs::remove_file(path).expect("remove scratch file");
     }
 

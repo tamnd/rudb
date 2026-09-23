@@ -36,6 +36,7 @@ pub mod keymap;
 pub mod link;
 pub mod rel;
 pub mod rid;
+pub mod rids;
 pub mod wire;
 
 pub use bits::BitVector;
@@ -44,4 +45,5 @@ pub use keymap::{DENSE_THRESHOLD, Form, KeyMap, Keys, Observed};
 pub use link::{Bounds, Link};
 pub use rel::{Cardinality, Relationship, Side, parse_links};
 pub use rid::{NO_PARENT, PART_ROWS, Place, Places, Rid, STRIPE_PARTS};
+pub use rids::{Pushed, Rids, SPARSE_RATIO, STOP_AFTER};
 pub use wire::Payload;

@@ -39,11 +39,12 @@
 //! position per row and a flatten per piece to answer something that is a run of `memcpy`s, so it is
 //! its own function. What the two share is the typed append underneath both of them.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value};
 
-use crate::string::StringView;
+use crate::string::{Arenas, StringView};
 use crate::validity::Validity;
 use crate::vector::{Data, Form, NOWHERE, Vector, copy_of, data_for, empty_data_for, layout_of};
 
@@ -137,7 +138,7 @@ impl Assembly {
             return Err(Error::internal("a flattened vector with no run of data in it"));
         };
         let start = self.data.len();
-        let appended = extend(&mut self.data, from)?;
+        let appended = extend(&mut self.data, from, &mut Arenas::default())?;
         for (slot, &row) in positions.iter().enumerate() {
             let row = row as usize;
             // A piece whose data is empty is the untyped null, so it claims its rows and they are
@@ -246,11 +247,12 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
     // rows that went into it. Growing from empty instead ends at the next power of two, which on a
     // full row group is eight thousand values of slack carried for the life of the table.
     let mut data = data_for(ty, rows)?;
+    let mut arenas = arenas_of(pieces);
     for piece in pieces {
         let from = piece
             .data()
             .ok_or_else(|| Error::internal("a flat vector with no run of data in it"))?;
-        let appended = extend(&mut data, from)?;
+        let appended = extend(&mut data, from, &mut arenas)?;
         if appended != piece.len() {
             return Err(Error::internal(format!(
                 "a piece of {} rows laid {appended} values end to end",
@@ -265,6 +267,182 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
         return Ok(Some(page.with_validity(validity)));
     }
     Ok(Some(Vector::flat(ty.clone(), data)?.with_validity(validity).into_pages()))
+}
+
+/// Several vectors of one type laid end to end and then read back in `order`.
+///
+/// What a sort is. Row `n` of the answer is row `order[n]` of the pieces laid end to end, so the
+/// pieces are laid once and the answer is one gather, which writes the answer front to back. An
+/// [`Assembly`] answers the same question the other way round, with a position per input row that
+/// it scatters into, and that costs it a map of the whole column and a scatter per column, which for
+/// a sort is the same permutation worked out again for every column. Here the caller works it out
+/// once and every column reads it.
+///
+/// A string column comes back as views over the one arena its bytes were laid into, the same as
+/// [`concat()`] gives, so the gather moves sixteen bytes a row.
+///
+/// # Errors
+///
+/// If the type has no layout this can lay, if a piece holds fewer values than it has rows, or if
+/// an entry of `order` is past the end of the pieces.
+pub fn interleave(ty: &LogicalType, pieces: &[Vector], order: &[usize]) -> Result<Vector> {
+    let rows: usize = pieces.iter().map(Vector::len).sum();
+    if let Some(&past) = order.iter().find(|&&index| index >= rows) {
+        return Err(Error::internal(format!("row {past} read out of pieces of {rows} rows")));
+    }
+    if matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _)) {
+        // row at a time: the nested types, for the reason `Assembly::values` gives. They have no run
+        // of data to lay end to end and no typed copy to gather with.
+        let laid: Vec<Value> = pieces
+            .iter()
+            .flat_map(|piece| (0..piece.len()).map(|row| piece.value_at(row)))
+            .collect();
+        let values: Vec<Value> =
+            order.iter().map(|&index| laid.get(index).cloned().unwrap_or(Value::Null)).collect();
+        return Vector::from_values(ty.clone(), &values);
+    }
+    if let Some(merged) = merged_dictionary(ty, pieces, order)? {
+        return Ok(merged);
+    }
+    let mut data = data_for(ty, rows)?;
+    // The untyped null, which has no run of data to lay or to gather out of, and is null whatever
+    // the order is.
+    if matches!(data, Data::Empty) {
+        return Ok(Vector::constant(ty.clone(), Value::Null, order.len()));
+    }
+    // Each piece's validity, taken after it is flattened, because a constant null keeps its null in
+    // its value rather than in its mask and a flattened one has it in the mask like any other row.
+    let mut arenas = arenas_of(pieces);
+    let mut masks = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        // flatten: the gather below reads one run of data, and a piece can arrive dictionary
+        // encoded, constant or bit packed. The flatten is a typed loop per layout, a flat piece is
+        // not copied by it, and one piece is flattened at a time so a column is never held twice.
+        let flat = piece.flatten()?;
+        let from = flat.data().ok_or_else(|| Error::internal("a flattened vector with no data"))?;
+        let appended = extend(&mut data, from, &mut arenas)?;
+        if appended != piece.len() {
+            return Err(Error::internal(format!(
+                "a piece of {} rows laid {appended} values end to end",
+                piece.len()
+            )));
+        }
+        masks.push((flat.len(), flat.validity().clone()));
+    }
+    let laid = if masks.iter().all(|(_, mask)| matches!(mask, Validity::AllValid)) {
+        Validity::AllValid
+    } else {
+        let mut live = Vec::with_capacity(rows);
+        for (len, mask) in &masks {
+            // row at a time: a bit a row for the mixed case, once a column rather than once a
+            // piece of every column the way it would be read otherwise.
+            live.extend((0..*len).map(|row| mask.is_valid(row)));
+        }
+        Validity::from_run(&live)
+    };
+    if laid.count_valid(rows) == 0 {
+        return Ok(Vector::constant(ty.clone(), Value::Null, order.len()));
+    }
+    let validity = match laid {
+        Validity::AllValid => Validity::AllValid,
+        laid => Validity::from_iter(order.len(), |row| {
+            order.get(row).is_some_and(|&index| laid.is_valid(index))
+        }),
+    };
+    if let Data::Varlen(column) = data {
+        let (views, arena) = column.into_parts();
+        let gathered = order
+            .iter()
+            .map(|&index| views.get(index).copied().unwrap_or_else(StringView::empty))
+            .collect();
+        return Ok(
+            Vector::string_views(ty.clone(), gathered, Arc::new(arena))?.with_validity(validity)
+        );
+    }
+    Ok(Vector::flat(ty.clone(), copy_of(&data, order))?.with_validity(validity))
+}
+
+/// How many rows a merged dictionary entry has to stand for on average before a string column is
+/// gathered as codes rather than as views.
+///
+/// A Parquet file carries one dictionary per row group, so a sorted `lineitem` column arrives as
+/// 733 pieces over 49 dictionaries. The low cardinality columns have 98 to 343 entries between all
+/// of them, and merging those is nothing next to gathering six million views. A column whose
+/// dictionaries are nearly as long as the column is one the writer should not have encoded, and
+/// merging it would hash every value to save nothing, so it is gathered flat.
+const ROWS_PER_MERGED_ENTRY: usize = 8;
+
+/// The string column gathered by `order` as one dictionary, when every piece is a dictionary.
+///
+/// The pieces' dictionaries are merged into one with each distinct value once, so the codes mean
+/// the same thing on every page cut from the result and the result is a stable dictionary. The
+/// gather is then four bytes a row instead of sixteen, and the append after the sort gets the
+/// dictionary the scan handed up rather than a flat column it has to read a row at a time.
+///
+/// `None` when the column is not a string, when any piece is not a dictionary or has nulls at its
+/// own level, or when the dictionaries are too long for the merge to pay.
+fn merged_dictionary(
+    ty: &LogicalType,
+    pieces: &[Vector],
+    order: &[usize],
+) -> Result<Option<Vector>> {
+    if !matches!(ty, LogicalType::Varchar | LogicalType::Blob) || pieces.is_empty() {
+        return Ok(None);
+    }
+    let rows: usize = pieces.iter().map(Vector::len).sum();
+    let mut dictionaries: Vec<&Arc<Vector>> = Vec::new();
+    let mut which = Vec::with_capacity(pieces.len());
+    let mut entries = 0;
+    for piece in pieces {
+        let Some((_, values)) = piece.shared_dictionary_parts() else {
+            return Ok(None);
+        };
+        if !matches!(piece.validity(), Validity::AllValid) {
+            return Ok(None);
+        }
+        let at = match dictionaries.iter().position(|seen| Arc::ptr_eq(seen, values)) {
+            Some(at) => at,
+            None => {
+                entries += values.len();
+                if entries.saturating_mul(ROWS_PER_MERGED_ENTRY) > rows {
+                    return Ok(None);
+                }
+                dictionaries.push(values);
+                dictionaries.len() - 1
+            }
+        };
+        which.push(at);
+    }
+    // A null entry has no bytes, so it merges with every other null entry.
+    let mut merged: HashMap<Option<&[u8]>, u32> = HashMap::new();
+    let mut values = Vec::new();
+    let mut remaps = Vec::with_capacity(dictionaries.len());
+    for dictionary in &dictionaries {
+        let mut remap = Vec::with_capacity(dictionary.len());
+        // row at a time: over the dictionary entries, a few hundred of them against millions of
+        // rows, and only the first sighting of each value becomes one.
+        for entry in 0..dictionary.len() {
+            let next = u32::try_from(values.len())
+                .map_err(|_| Error::internal("a merged dictionary past four billion entries"))?;
+            let code = *merged.entry(dictionary.bytes_at(entry)).or_insert_with(|| {
+                values.push(dictionary.value_at(entry));
+                next
+            });
+            remap.push(code);
+        }
+        remaps.push(remap);
+    }
+    let mut laid = Vec::with_capacity(rows);
+    for (piece, &at) in pieces.iter().zip(&which) {
+        let (codes, _) = piece
+            .dictionary_parts()
+            .ok_or_else(|| Error::internal("a dictionary piece lost its dictionary"))?;
+        let remap = &remaps[at];
+        laid.extend(codes.iter().map(|&code| remap[code as usize]));
+    }
+    let codes = order.iter().map(|&index| laid[index]).collect();
+    let values = Vector::from_values(ty.clone(), &values)?;
+    Ok(Some(Vector::stable_dictionary(codes, Arc::new(values))?))
 }
 
 /// The validity of the pieces laid end to end, in `rows` rows.
@@ -295,12 +473,23 @@ fn straight(at: &[usize]) -> bool {
     at.iter().enumerate().all(|(row, &index)| row == index)
 }
 
+/// The arenas the flat string pieces among `pieces` share, counted before any of them is laid.
+fn arenas_of(pieces: &[Vector]) -> Arenas {
+    let mut arenas = Arenas::default();
+    for piece in pieces {
+        if let Some(Data::Varlen(column)) = piece.data() {
+            arenas.count(column);
+        }
+    }
+    arenas
+}
+
 /// Lays a run of data end to end after another, answering how many values it appended.
 ///
 /// The typed loop per layout is the whole point: an append of a thousand `i64` is one `memcpy` and
-/// an append of a thousand strings is one arena growth and a thousand sixteen byte views, neither of
-/// which touches a `Value`.
-fn extend(into: &mut Data, from: &Data) -> Result<usize> {
+/// an append of a thousand strings is at most one copy of an arena and a thousand sixteen byte views,
+/// neither of which touches a `Value`. `arenas` is what says whether the arena is copied whole.
+fn extend(into: &mut Data, from: &Data, arenas: &mut Arenas) -> Result<usize> {
     macro_rules! extended {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match (&mut *into, from) {
@@ -312,21 +501,9 @@ fn extend(into: &mut Data, from: &Data) -> Result<usize> {
                     Ok(values.len())
                 })+
                 // The one layout where an append is a copy of bytes rather than a copy of fixed
-                // width slots. The arena is grown once for all of them, because a view carries its
-                // length so the total is known before any of the bytes move.
+                // width slots, and the column decides whether that is one copy or one a string.
                 (Data::Varlen(out), Data::Varlen(values)) => {
-                    out.reserve_views(values.len());
-                    out.reserve_bytes(
-                        values
-                            .views()
-                            .iter()
-                            .filter(|view| !view.is_inline())
-                            .map(StringView::len)
-                            .sum(),
-                    );
-                    for index in 0..values.len() {
-                        out.push_from(values, index);
-                    }
+                    out.push_column(values, arenas);
                     Ok(values.len())
                 }
                 (out, from) => Err(Error::internal(format!(
@@ -672,5 +849,101 @@ mod tests {
         let other =
             Vector::from_values(LogicalType::Integer, &[Value::Integer(1)]).expect("an int");
         assert!(concat(&ty, &[flat, other]).expect("no error").is_none(), "two types laid");
+    }
+
+    /// Pieces of every form a sort hands over, read back through an order, against the same order
+    /// read a value at a time.
+    #[test]
+    fn an_interleave_reads_the_pieces_in_the_order_it_is_given() {
+        let words: Vec<Value> = ["a long enough word to leave the inline view", "b", "c"]
+            .iter()
+            .map(|word| Value::Varchar((*word).to_string()))
+            .collect();
+        let dictionary = Vector::from_values(LogicalType::Varchar, &words).expect("words");
+        let strings = [
+            Vector::dictionary(vec![2, 0, 1], dictionary).expect("a dictionary"),
+            Vector::from_values(
+                LogicalType::Varchar,
+                &[Value::Null, Value::Varchar("another string past twelve bytes".to_string())],
+            )
+            .expect("flat"),
+        ];
+        let numbers = [
+            Vector::from_values(
+                LogicalType::BigInt,
+                &[Value::BigInt(7), Value::Null, Value::BigInt(9)],
+            )
+            .expect("flat"),
+            Vector::constant(LogicalType::BigInt, Value::BigInt(4), 1),
+            Vector::constant(LogicalType::BigInt, Value::Null, 1),
+        ];
+        let lists = [
+            Vector::from_values(
+                LogicalType::List(Box::new(LogicalType::Integer)),
+                &[
+                    Value::List { element: LogicalType::Integer, values: vec![Value::Integer(1)] },
+                    Value::Null,
+                    Value::List { element: LogicalType::Integer, values: vec![] },
+                ],
+            )
+            .expect("lists"),
+            Vector::from_values(
+                LogicalType::List(Box::new(LogicalType::Integer)),
+                &[
+                    Value::List {
+                        element: LogicalType::Integer,
+                        values: vec![Value::Integer(2), Value::Integer(3)],
+                    },
+                    Value::Null,
+                ],
+            )
+            .expect("lists"),
+        ];
+        let order = [4, 0, 3, 1, 2, 3];
+        for pieces in [&strings[..], &numbers[..], &lists[..]] {
+            let ty = pieces[0].logical_type().clone();
+            let laid: Vec<Value> = pieces.iter().flat_map(values).collect();
+            let expected: Vec<Value> = order.iter().map(|&index| laid[index].clone()).collect();
+            let got = interleave(&ty, pieces, &order).expect("an interleave");
+            assert_eq!(values(&got), expected, "{ty}");
+        }
+        assert!(interleave(&LogicalType::BigInt, &numbers, &[5]).is_err(), "row 5 of 5 rows");
+        let untyped = [Vector::constant(LogicalType::Null, Value::Null, 3)];
+        let got = interleave(&LogicalType::Null, &untyped, &[2, 0]).expect("an untyped null");
+        assert_eq!(values(&got), vec![Value::Null, Value::Null]);
+    }
+
+    #[test]
+    fn an_interleave_of_dictionaries_merges_them_into_one() {
+        let word = |text: &str| Value::Varchar(text.to_string());
+        let first = [word("MAIL"), word("a word long enough to leave the inline view")];
+        let second = [Value::Null, word("MAIL"), word("SHIP")];
+        let first = Arc::new(Vector::from_values(LogicalType::Varchar, &first).expect("words"));
+        let second = Arc::new(Vector::from_values(LogicalType::Varchar, &second).expect("words"));
+        let over = |codes: Vec<u32>, dictionary: &Arc<Vector>| {
+            Vector::dictionary_over(codes, Arc::clone(dictionary)).expect("a dictionary")
+        };
+        let pieces = [
+            over((0..16).map(|row| row % 2).collect(), &first),
+            over((0..16).map(|row| row % 3).collect(), &second),
+            over(vec![1; 8], &first),
+        ];
+        let order: Vec<usize> = (0..40).rev().collect();
+        let laid: Vec<Value> = pieces.iter().flat_map(values).collect();
+        let expected: Vec<Value> = order.iter().map(|&index| laid[index].clone()).collect();
+        let got = interleave(&LogicalType::Varchar, &pieces, &order).expect("an interleave");
+        assert_eq!(values(&got), expected);
+        let (_, merged) = got.stable_dictionary_parts().expect("one stable dictionary");
+        assert_eq!(merged.len(), 4, "MAIL once, the long word, the null and SHIP");
+
+        let mixed = [pieces[0].clone(), pieces[1].flatten().expect("flat")];
+        let got = interleave(&LogicalType::Varchar, &mixed, &order[8..]).expect("an interleave");
+        assert!(got.dictionary_parts().is_none(), "a flat piece gathers flat");
+        let few = &pieces[..1];
+        let got = interleave(&LogicalType::Varchar, few, &[3, 2]).expect("an interleave");
+        assert_eq!(
+            values(&got),
+            vec![word("a word long enough to leave the inline view"), word("MAIL")]
+        );
     }
 }
