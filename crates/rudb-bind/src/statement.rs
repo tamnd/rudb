@@ -158,7 +158,7 @@ pub struct Insert {
     pub write: Write,
     /// The `RETURNING` list, bound as a query over the table and run over the rows the statement
     /// wrote in place of the table's own.
-    pub returning: Option<Plan>,
+    pub returning: Option<Box<Plan>>,
 }
 
 /// What an [`Insert`]'s source means for the table.
@@ -181,11 +181,11 @@ fn returning(
     parameters: &Parameters,
     session: &Session,
     query: Option<ast::QueryRef>,
-) -> Result<Option<Plan>> {
+) -> Result<Option<Box<Plan>>> {
     let Some(query) = query else { return Ok(None) };
     let mut binder = Binder::with(catalog, parameters, session);
     let (root, _) = binder.bind_query(ast, query)?;
-    Ok(Some(finish(binder, root)?))
+    Ok(Some(Box::new(finish(binder, root)?)))
 }
 
 /// Binds one parsed statement against a catalog.

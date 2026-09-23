@@ -1060,13 +1060,13 @@ impl<'a> Transform<'a> {
             targets.push(self.target(kid)?);
         }
         let targets = self.target_slice(targets);
-        let from = self.from_table(name, alias);
+        let from = self.written_table(name, alias);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         Ok(Some(self.push_query(Query::bare(QueryBody::Select(select)))))
     }
 
     /// A `FROM` of the one table a writing statement names.
-    fn from_table(&mut self, name: Slice, alias: StrRef) -> Slice {
+    fn written_table(&mut self, name: Slice, alias: StrRef) -> Slice {
         let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
         let start = self.ast.source_lists.len() as u32;
         self.ast.source_lists.push(source);
@@ -1154,7 +1154,7 @@ impl<'a> Transform<'a> {
             targets.push(Target { expr: value, alias: NONE });
         }
         let targets = self.target_slice(targets);
-        let from = self.from_table(name, alias);
+        let from = self.written_table(name, alias);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         let source = self.push_query(Query::bare(QueryBody::Select(select)));
         let columns = self.part_slice(columns);
