@@ -67,16 +67,7 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             ExitCode::FAILURE
         }
         Action::Run(options) => {
-            if options.readonly
-                && options.stop_after_commands
-                && options.sets.is_empty()
-                && options.metrics.is_none()
-                && !options.fallbacks
-                && !options.echo
-                && let [Command::Sql(sql)] = options.commands.as_slice()
-                && !sql.starts_with('.')
-                && let Ok(Some(result)) = Database::query_native_once(&options.database, sql)
-            {
+            if let Some(result) = answer_once(&options) {
                 let mut out = out;
                 let _ = write!(out, "{}", format::render(&result, &options.settings));
                 return ExitCode::SUCCESS;
@@ -126,6 +117,30 @@ fn settings(sets: &[String]) -> Vec<Command> {
             Command::Sql(format!("SET \"{name}\" = '{value}';"))
         })
         .collect()
+}
+
+/// The answer to a one statement read-only run that a native file can give without being opened
+/// as a database, or `None` when the run is anything else or the file cannot answer it.
+///
+/// Anything that would change what the statement sees or prints, a `SET`, a metrics file, echo or
+/// the fallback report, sends the run the ordinary way so that those still apply.
+fn answer_once(options: &Options) -> Option<rudb::QueryResult> {
+    if !options.readonly
+        || !options.stop_after_commands
+        || !options.sets.is_empty()
+        || options.metrics.is_some()
+        || options.fallbacks
+        || options.echo
+    {
+        return None;
+    }
+    let [Command::Sql(sql)] = options.commands.as_slice() else {
+        return None;
+    };
+    if sql.starts_with('.') {
+        return None;
+    }
+    Database::query_native_once(&options.database, sql).ok().flatten()
 }
 
 /// Reads whatever is on standard input, with a prompt if that is a terminal.
