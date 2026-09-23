@@ -217,6 +217,14 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<(), String> {
          limit, which steps two and three of the tie rule in \
          spec/bench/tpc-h/04-the-answers.md section 4.4 both allow"
     );
+    if let Some((low, high)) = band(&rows) {
+        println!(
+            "the suite column of a rule that fired on nothing is this run's suite level noise, and \
+             here it ran from {} to {}, so a suite delta inside that is not a result",
+            percent(Some(low)),
+            percent(Some(high))
+        );
+    }
 
     for (rule, row) in &rows {
         if !row.fired.is_empty() {
@@ -594,6 +602,26 @@ fn suite(row: &Row) -> Option<f64> {
     Some(delta(row.on, row.off))
 }
 
+/// How far the suite column moved on the rules that changed no plan anywhere, low and high.
+///
+/// The floor column protects the median and nothing protected the suite column, which is the harder
+/// of the two to read. A median over queries is held down by the many short ones, and a ratio of two
+/// sums is whatever the few long ones did, so the suite column is the noisier number of the pair
+/// however quiet the host is. A rule that fired on nothing ran the same plans twice and its suite
+/// column is therefore the size of that noise, measured rather than assumed.
+///
+/// `None` when every rule fired somewhere, which leaves the run with nothing to say this from.
+fn band(rows: &[(Rule, Row)]) -> Option<(f64, f64)> {
+    let idle: Vec<f64> = rows
+        .iter()
+        .filter(|(_, row)| row.fired.is_empty())
+        .filter_map(|(_, row)| suite(row))
+        .collect();
+    let low = idle.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = idle.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if idle.is_empty() { None } else { Some((low, high)) }
+}
+
 /// The middle of a list of deltas, or nothing when the list is empty.
 ///
 /// The median and not the mean, because one query that spilled differently is enough to move a mean
@@ -736,8 +764,8 @@ fn say(error: rudb_common::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Answer, Query, Row, Rule, compare, delta, fingerprint, median, percent, suite, switch,
-        unlimited,
+        Answer, Query, Row, Rule, band, compare, delta, fingerprint, median, percent, suite,
+        switch, unlimited,
     };
 
     /// A baseline query that answered those rows, and that either was or was not reproducible.
@@ -869,6 +897,29 @@ mod tests {
     #[test]
     fn a_rule_that_was_never_timed_has_no_suite_share_rather_than_a_zero() {
         assert_eq!(suite(&Row::default()), None);
+    }
+
+    #[test]
+    fn the_suite_band_is_taken_from_the_rules_that_changed_no_plan() {
+        // Two rules that fired on nothing, one of them a tenth out, and one that fired and is a
+        // fifth out. The band is the two idle ones, because the rule that fired is the thing the
+        // band exists to be compared against.
+        let idle = |on: f64| Row { on, off: 100.0, ..Row::default() };
+        let busy = Row { on: 80.0, off: 100.0, fired: vec!["q1".to_owned()], ..Row::default() };
+        let rows = vec![
+            (Rule::Presize, busy),
+            (Rule::ValidityFree, idle(90.0)),
+            (Rule::TopNSeed, idle(102.0)),
+        ];
+        let (low, high) = band(&rows).expect("two rules fired on nothing");
+        assert!((low + 0.02).abs() < 1e-9, "{low}");
+        assert!((high - 0.10).abs() < 1e-9, "{high}");
+    }
+
+    #[test]
+    fn a_run_where_every_rule_fired_has_no_band_to_report() {
+        let busy = Row { on: 80.0, off: 100.0, fired: vec!["q1".to_owned()], ..Row::default() };
+        assert_eq!(band(&[(Rule::Presize, busy)]), None);
     }
 
     #[test]
