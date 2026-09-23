@@ -30,8 +30,8 @@ use rudb_common::{
     stage,
 };
 use rudb_kernels::{
-    Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_general, update_runs,
-    update_scattered,
+    Accumulator, NOWHERE, finish_run, group_tally, is_true, settle_extremes, update_general,
+    update_runs, update_tallied,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -2053,6 +2053,9 @@ impl<'a> Aggregate<'a> {
         // The aggregate half of #61. Every call that is not `DISTINCT` folds the whole chunk in one
         // pass, with the aggregate and the layout of its argument matched on once for the chunk
         // rather than once per row, and with no `Value` built at all on the paths the kernel covers.
+        // How many rows land in each group, taken the first time a call can use it. See
+        // [`rudb_kernels::group_tally`].
+        let mut counted: Option<Option<Vec<i64>>> = None;
         for (at, call) in self.calls.iter().enumerate() {
             if self.count_only || self.compact_numeric {
                 break;
@@ -2070,8 +2073,13 @@ impl<'a> Aggregate<'a> {
             {
                 continue;
             }
-            let picked = match &filters[at] {
-                None => &*slots,
+            let (picked, tallied) = match &filters[at] {
+                None => {
+                    let rows = slots.len().min(*length);
+                    let groups = states.len().checked_div(calls).unwrap_or(usize::MAX);
+                    let tally = counted.get_or_insert_with(|| group_tally(&slots[..rows], groups));
+                    (&*slots, tally.as_deref())
+                }
                 Some(flags) => {
                     // A row the filter dropped belongs to nothing, which is the same thing the
                     // scatter already understands a spilled row to be, so the filter goes into the
@@ -2084,11 +2092,12 @@ impl<'a> Aggregate<'a> {
                             NOWHERE
                         }
                     }));
-                    &*kept
+                    (&*kept, None)
                 }
             };
             if !update_general(states, picked, calls, at, &arguments[at], *length)? {
-                update_scattered(states, picked, calls, at, arguments[at].first(), *length)?;
+                let argument = arguments[at].first();
+                update_tallied(states, picked, tallied, calls, at, argument, *length)?;
             }
         }
         rows::capacity(table.owned(), charged_keys, scratch)?;
