@@ -179,8 +179,32 @@ fn stepped(
     inclusive: bool,
     start: &Value,
     stop: &Value,
-    (months, days, micros): (i32, i32, i64),
+    interval: (i32, i32, i64),
 ) -> Result<Vec<Value>> {
+    let moment = |value: &Value| match value {
+        Value::Timestamp(stamp) | Value::TimestampTz(stamp) => Ok(*stamp),
+        other => Err(Error::internal(format!("a range from a {}", other.logical_type()))),
+    };
+    let mut stamps = Vec::new();
+    step_stamps(inclusive, moment(start)?, moment(stop)?, interval, &mut stamps)?;
+    let zoned = matches!(start, Value::TimestampTz(_));
+    Ok(stamps
+        .into_iter()
+        .map(|stamp| if zoned { Value::TimestampTz(stamp) } else { Value::Timestamp(stamp) })
+        .collect())
+}
+
+/// Appends the series of moments from `start` toward `end` to `out` and says how many it added.
+///
+/// An interval that is neither forward nor backward is an empty series, and one that is both is
+/// refused, which are the pin's two answers.
+fn step_stamps(
+    inclusive: bool,
+    start: i64,
+    end: i64,
+    (months, days, micros): (i32, i32, i64),
+    out: &mut Vec<i64>,
+) -> Result<usize> {
     let forward = months > 0 || days > 0 || micros > 0;
     let backward = months < 0 || days < 0 || micros < 0;
     if forward && backward {
@@ -188,28 +212,22 @@ fn stepped(
             "Interval with mix of negative/positive entries not supported",
         ));
     }
-    let moment = |value: &Value| match value {
-        Value::Timestamp(stamp) | Value::TimestampTz(stamp) => Ok(*stamp),
-        other => Err(Error::internal(format!("a range from a {}", other.logical_type()))),
-    };
-    let end = moment(stop)?;
-    let step = Value::Interval { months, days, micros };
-    let mut values = Vec::new();
-    let mut at = start.clone();
+    let from = out.len();
     if !forward && !backward {
-        return Ok(values);
+        return Ok(0);
     }
+    let (months, days, micros) = (i64::from(months), i64::from(days), i128::from(micros));
+    let mut at = start;
     loop {
-        let stamp = moment(&at)?;
-        let past = if forward { stamp > end } else { stamp < end };
-        if past || (stamp == end && !inclusive) {
-            return Ok(values);
+        let past = if forward { at > end } else { at < end };
+        if past || (at == end && !inclusive) {
+            return Ok(out.len() - from);
         }
-        if values.len() == MAX_SERIES {
+        if out.len() - from == MAX_SERIES {
             return Err(too_long());
         }
-        let next = datetime::shift(&at, &step, false)?;
-        values.push(at);
+        let next = datetime::shifted_stamp(at, months, days, micros)?;
+        out.push(at);
         at = next;
     }
 }
@@ -497,7 +515,9 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
 ) -> Result<Option<Vector>> {
     match (name, args) {
         ("list_value", [_, ..]) => built(args, returns, rows),
-        ("range" | "generate_series", [_, ..]) => series(name == "generate_series", args, rows),
+        ("range" | "generate_series", [_, ..]) => {
+            series(name == "generate_series", args, returns, rows)
+        }
         ("list_reverse", [list]) => reversed(list.as_ref()),
         ("length" | "array_length", [list]) => counted(list.as_ref()),
         ("list_distinct", [list]) => deduplicated(false, list.as_ref()),
@@ -547,7 +567,17 @@ fn built<V: AsRef<Vector>>(
 
 /// `range` and `generate_series` over integer columns, with every row's series written straight
 /// into one child and no `Value` made for any element. A row with a null argument is a null list.
-fn series<V: AsRef<Vector>>(inclusive: bool, args: &[V], rows: usize) -> Result<Option<Vector>> {
+fn series<V: AsRef<Vector>>(
+    inclusive: bool,
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    if let [start, stop, step] = args {
+        if step.as_ref().logical_type() == &LogicalType::Interval {
+            return timed(inclusive, [start.as_ref(), stop.as_ref(), step.as_ref()], returns, rows);
+        }
+    }
     if args.iter().any(|arg| arg.as_ref().logical_type() != &LogicalType::BigInt) {
         return Ok(None);
     }
@@ -592,6 +622,51 @@ fn series<V: AsRef<Vector>>(inclusive: bool, args: &[V], rows: usize) -> Result<
         entries.push((at, entry(count)?));
     }
     let child = Vector::flat(LogicalType::BigInt, Data::Int64(Buffer::from(child)))?;
+    let validity = Validity::from_iter(rows, |row| live[row]).normalize(rows);
+    Ok(Some(Vector::list(entries, child)?.with_validity(validity)))
+}
+
+/// `range` and `generate_series` over moments and an interval, the same way as [`series`] and
+/// with each step taken on the raw microseconds.
+fn timed(
+    inclusive: bool,
+    args: [&Vector; 3],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let LogicalType::List(element) = returns else {
+        return Ok(None);
+    };
+    if args[..2].iter().any(|arg| arg.logical_type() != &**element) {
+        return Ok(None);
+    }
+    let [start, stop, step] = args.map(Vector::flatten);
+    let (start, stop, step) = (start?, stop?, step?);
+    let (Some(Data::Int64(starts)), Some(Data::Int64(stops)), Some(Data::Interval(steps))) =
+        (start.data(), stop.data(), step.data())
+    else {
+        return Ok(None);
+    };
+    let (starts, stops, steps) = (starts.as_slice(), stops.as_slice(), steps.as_slice());
+    let lives = [start.validity().live(), stop.validity().live(), step.validity().live()];
+    let mut entries = Vec::with_capacity(rows);
+    let mut child = Vec::new();
+    let mut live = vec![true; rows];
+    for row in 0..rows {
+        let at = entry(child.len())?;
+        let held = (starts.get(row), stops.get(row), steps.get(row));
+        let (Some(&from), Some(&to), Some(&interval)) = held else {
+            return Ok(None);
+        };
+        if lives.iter().any(|live| !live.at(row)) {
+            entries.push((at, 0));
+            live[row] = false;
+            continue;
+        }
+        let count = step_stamps(inclusive, from, to, interval, &mut child)?;
+        entries.push((at, entry(count)?));
+    }
+    let child = Vector::flat((**element).clone(), Data::Int64(Buffer::from(child)))?;
     let validity = Validity::from_iter(rows, |row| live[row]).normalize(rows);
     Ok(Some(Vector::list(entries, child)?.with_validity(validity)))
 }

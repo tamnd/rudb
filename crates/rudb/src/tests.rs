@@ -8420,6 +8420,22 @@ fn range_and_generate_series_as_scalars_answer_with_the_pins_lists() {
         .map(|r| r[0].to_string())
         .collect();
     assert_eq!(column, ["[0, 1, 2, 3]", "NULL", "[0]"]);
+    db.execute(
+        "CREATE TABLE stops AS SELECT * FROM (VALUES (1, TIMESTAMP '2020-01-02'), (2, NULL), \
+         (3, TIMESTAMP '2019-12-31')) v(id, s)",
+    )
+    .expect("created");
+    let column: Vec<String> = rows(
+        &db,
+        "SELECT generate_series(TIMESTAMP '2020-01-01', s, INTERVAL 12 HOUR) FROM stops ORDER BY id",
+    )
+    .iter()
+    .map(|r| r[0].to_string())
+    .collect();
+    assert_eq!(
+        column,
+        ["[2020-01-01 00:00:00, 2020-01-01 12:00:00, 2020-01-02 00:00:00]", "NULL", "[]"]
+    );
     assert_eq!(row("SELECT count(*) FROM range(4)"), "4");
 }
 
