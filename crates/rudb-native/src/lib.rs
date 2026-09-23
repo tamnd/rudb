@@ -2511,7 +2511,11 @@ impl Writer {
     ///
     /// If directory encoding or writing fails.
     fn close(&mut self) -> Result<Entry> {
+        let t0 = std::time::Instant::now();
+        let trace = std::env::var_os("RUDB_CLOSE_TRACE").is_some();
+        let mark = |what: &str| if trace { eprintln!("close {:>8.3} {what}", t0.elapsed().as_secs_f64()) };
         self.flush_pending()?;
+        mark("flushed");
         // The rest of a table is its statistics, its dictionaries and its directory. The dictionary
         // work is charged as its own stage, because ranking a global dictionary can be most of what
         // this costs, and the rest as publish.
@@ -2537,6 +2541,7 @@ impl Writer {
         drop(timing);
         let (frequencies, distincts): (Vec<Option<FrequencySummary>>, _) =
             self.numeric_frequencies()?.into_iter().unzip();
+        mark("numeric frequencies");
         self.table.frequencies =
             frequencies.into_iter().map(|held| held.map(Frequencies::Held)).collect();
         self.table.distincts = distincts;
@@ -2545,8 +2550,11 @@ impl Writer {
         for dictionary in self.dictionaries.iter_mut().flatten() {
             dictionary.finish_blocks()?;
         }
+        mark("finish blocks");
         self.place_blocks()?;
+        mark("place blocks");
         self.table.pair_frequencies = self.pair_frequencies()?;
+        mark("pair frequencies");
         let dictionaries = std::mem::take(&mut self.dictionaries);
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         self.table.frequency_texts = vec![Vec::new(); self.table.fields.len()];
@@ -2558,6 +2566,7 @@ impl Writer {
         for (index, dictionary) in dictionaries.into_iter().enumerate() {
             let Some(dictionary) = dictionary else { continue };
             let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
+            mark(&format!("ranked {index} values {} bytes {}", order.len(), flat.len()));
             // A code nothing counted is a code no non-null row of this column holds, which is the
             // empty string a null was written as and nothing else, because a code is only ever made
             // by a row asking for one.
@@ -2571,7 +2580,9 @@ impl Writer {
             }
             drop(flat);
             drop(bases);
+            mark(&format!("code frequency {index}"));
             let encoded = encode_global_dictionary(&dictionary, &order, &dictionary.placed, true)?;
+            mark(&format!("encoded {index}"));
             drop(order);
             let offset = self.at;
             self.put(&encoded.index)?;
@@ -2597,7 +2608,9 @@ impl Writer {
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let placed = self.at - placing;
         self.write_stats()?;
+        mark("stats");
         let directory = encode_directory(&self.table)?;
+        mark("directory");
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
         }
