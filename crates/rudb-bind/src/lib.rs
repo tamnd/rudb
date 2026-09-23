@@ -24,6 +24,7 @@ mod expr;
 pub mod fold;
 mod lambda;
 mod listaggr;
+mod maps;
 mod parameters;
 mod scope;
 mod statement;

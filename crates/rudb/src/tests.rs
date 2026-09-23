@@ -8814,3 +8814,67 @@ fn rows_are_unnamed_structs_and_struct_pack_takes_names_the_way_the_pin_does() {
         ["\"row\"(1, 2)", "struct_pack(a := 1)"]
     );
 }
+
+/// `MAP {k: v}` is `map([k], [v])`, and the calls that read a map answer what the pin does,
+/// including the ones that step around a null argument.
+#[test]
+fn maps_build_and_read_back_the_way_the_pin_has_them() {
+    let db = database();
+    let column = |sql: &str| {
+        let rows = rows(&db, sql);
+        rows.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join(";")
+    };
+    let error = |sql: &str| db.query(sql).unwrap_err().to_string();
+    assert_eq!(column("SELECT MAP {1: 'a', 2: 'b'}"), "{1=a, 2=b}");
+    assert_eq!(column("SELECT MAP([1, 2], ['a', NULL])"), "{1=a, 2=NULL}");
+    assert_eq!(column("SELECT typeof(MAP {'x': 1.5})"), "MAP(VARCHAR, DECIMAL(2,1))");
+    assert_eq!(column("SELECT MAP()"), "{}");
+    assert_eq!(column("SELECT MAP([1, 2], NULL)"), "NULL");
+    assert_eq!(column("SELECT MAP {'a': NULL, 'it''s': 'x y'}"), "{a=NULL, 'it\\'s'=x y}");
+    assert_eq!(column("SELECT MAP {1: 'a'}[1]"), "a");
+    assert_eq!(column("SELECT MAP {1: 'a'}[3]"), "NULL");
+    assert_eq!(column("SELECT MAP {1: 'a'}['1']"), "a");
+    assert_eq!(column("SELECT map_extract(MAP {1: 'a'}, 1)"), "[a]");
+    assert_eq!(column("SELECT element_at(MAP {1: 'a'}, 5)"), "[]");
+    assert_eq!(column("SELECT map_extract(MAP {1: 'a'}, NULL)"), "[]");
+    assert_eq!(column("SELECT map_extract_value(MAP {1: 'a'}, 1)"), "a");
+    assert_eq!(column("SELECT map_keys(MAP {1: 'a', 2: 'b'})"), "[1, 2]");
+    assert_eq!(column("SELECT map_values(MAP {1: 'a', 2: 'b'})"), "[a, b]");
+    assert_eq!(
+        column("SELECT map_entries(MAP {1: 'a', 2: 'b'})"),
+        "[{'key': 1, 'value': a}, {'key': 2, 'value': b}]"
+    );
+    assert_eq!(column("SELECT map_from_entries([(1, 'a'), (2, 'b')])"), "{1=a, 2=b}");
+    assert_eq!(column("SELECT map_from_entries([{'k': 1, 'v': 'a'}])"), "{1=a}");
+    assert_eq!(column("SELECT cardinality(MAP {1: 'a', 2: 'b'})"), "2");
+    assert_eq!(column("SELECT typeof(cardinality(MAP {1: 'a'}))"), "UBIGINT");
+    assert_eq!(column("SELECT map_concat(MAP {1: 'a'}, MAP {1: 'b', 2: 'c'})"), "{1=b, 2=c}");
+    assert_eq!(column("SELECT map_concat(MAP {1: 'a'}, NULL)"), "{1=a}");
+    assert_eq!(column("SELECT map_contains(MAP {1: 'a'}, 1)"), "true");
+    assert_eq!(column("SELECT map_contains_value(MAP {1: 'a'}, 'a')"), "true");
+    assert_eq!(column("SELECT map_contains_entry(MAP {1: 'a'}, 1, 'b')"), "false");
+    assert_eq!(column("SELECT MAP {1: 'a', 2: 'x'} < MAP {2: 'a'}"), "true");
+    assert_eq!(column("SELECT MAP {'a': 1} = MAP {'a': 1}"), "true");
+    assert_eq!(
+        column(
+            "SELECT m::VARCHAR || ':' || count(*) FROM (VALUES (MAP {1: 'a'}), (MAP {1: 'a'}), \
+             (MAP {2: 'b'})) t(m) GROUP BY m ORDER BY m"
+        ),
+        "{1=a}:2;{2=b}:1"
+    );
+    assert_eq!(column("SELECT MAP([i], [i * 2]) FROM range(2) t(i)"), "{0=0};{1=2}");
+    assert_eq!(
+        error("SELECT MAP([1, 1], ['a', 'b'])"),
+        "Invalid Input Error: Map keys must be unique."
+    );
+    assert_eq!(error("SELECT MAP {NULL: 1}"), "Invalid Input Error: Map keys can not be NULL.");
+    assert_eq!(
+        error("SELECT MAP([1], ['a', 'b'])"),
+        "Invalid Input Error: The map key list does not align with the map value list."
+    );
+    assert!(error("SELECT MAP(1, 2)").starts_with("Binder Error: No function matches"));
+    assert_eq!(
+        db.query("SELECT MAP {1: 'a'}").unwrap().names(),
+        ["\"map\"(list_value(1), list_value('a'))"]
+    );
+}

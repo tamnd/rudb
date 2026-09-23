@@ -635,6 +635,9 @@ impl Binder<'_> {
                 "Need named argument for struct pack, e.g. STRUCT_PACK(a := b)",
             ));
         }
+        if let Some(call) = self.map_call(&written, &bound)? {
+            return Ok(call);
+        }
         if let Some(field) = self.struct_field(&written, &bound)? {
             return Ok(field);
         }
