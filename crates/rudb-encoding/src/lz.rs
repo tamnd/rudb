@@ -62,6 +62,15 @@ const HASH_BITS: u32 = 16;
 /// this buys tenths of a ratio point for a proportional amount of time.
 const MAX_TRIES: usize = 32;
 
+fn knob(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn knobs() -> (usize, usize, usize) {
+    static K: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    *K.get_or_init(|| (knob("LZ_TRIES", MAX_TRIES), knob("LZ_NICE", usize::MAX), knob("LZ_INSERT", usize::MAX)))
+}
+
 /// What a match finder produced, as three streams rather than one.
 pub(crate) struct Tokens<'a> {
     /// The bytes no copy covered, one run a token, empty where a copy followed a copy.
@@ -123,8 +132,10 @@ fn matches_in(
         match found {
             Some((length, offset)) => {
                 push(raw, (literal_start, at), length, offset);
-                for step in 1..length {
-                    insert(input, at + step, end, head, prev, start);
+                if length <= knobs().2 {
+                    for step in 1..length {
+                        insert(input, at + step, end, head, prev, start);
+                    }
                 }
                 at += length;
                 literal_start = at;
@@ -148,7 +159,8 @@ fn longest(
 ) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     let mut tries = 0;
-    while candidate != u32::MAX && tries < MAX_TRIES {
+    let (max_tries, nice, _) = knobs();
+    while candidate != u32::MAX && tries < max_tries {
         let position = start + candidate as usize;
         if position >= at {
             break;
@@ -170,6 +182,9 @@ fn longest(
         let length = shared(&input[position..end], &input[at..end]);
         if length >= MIN_MATCH && best.is_none_or(|(had, _)| length > had) {
             best = Some((length, at - position));
+            if length >= nice {
+                break;
+            }
         }
         candidate = prev[candidate as usize];
         tries += 1;
@@ -342,6 +357,27 @@ fn shared(a: &[u8], b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "probe"]
+    fn probe_lz() {
+        let text = std::fs::read(std::env::var("LZ_FILE").unwrap()).unwrap();
+        let lines: Vec<&[u8]> = text.split(|b| *b == b'\n').collect();
+        let mut matched = std::time::Duration::ZERO;
+        let mut size = 0;
+        let mut raw = 0;
+        for chunk in lines.chunks(122_880) {
+            let (_, suffixes) = crate::string::front_code(chunk);
+            let joined = suffixes.concat();
+            let clock = std::time::Instant::now();
+            let tokens = tokens_of(&joined);
+            matched += clock.elapsed();
+            std::hint::black_box(&tokens);
+            raw += chunk.iter().map(|v| v.len()).sum::<usize>();
+            size += crate::string::encode(chunk).unwrap().len();
+        }
+        eprintln!("PROBE knobs={:?} match_ms={} size={} raw={}", knobs(), matched.as_millis(), size, raw);
+    }
 
     fn round_trip(input: &[u8]) {
         let tokens = tokens_of(input);
