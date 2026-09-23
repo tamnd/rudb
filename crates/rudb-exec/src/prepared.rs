@@ -746,6 +746,34 @@ impl Prepared {
                 Some(live) => refine_prepared(*op, one, other, live, held),
             };
         }
+        // A later LIKE in a threaded filter often sees only a handful of survivors.
+        // Gather its arguments, not the whole chunk, while preserving the stable
+        // dictionary behind a gathered string column. The ordinary full-vector
+        // path remains cheaper when most rows are still live.
+        if let (Some(live), Step::Function { recipe, written, start, len }) =
+            (live, &self.steps[index])
+        {
+            if matches!(recipe.name(), "~~" | "!~~" | "~~*" | "!~~*")
+                && live.len().saturating_mul(4) <= chunk.len()
+            {
+                let flags = self
+                    .with_operands(*start, *len, chunk, &scratch.slots, |args| {
+                        let gathered = args
+                            .iter()
+                            .map(|arg| arg.gather(live.indices()))
+                            .collect::<Result<Vec<_>>>()?;
+                        let narrowed = gathered.iter().collect::<Vec<_>>();
+                        rudb_kernels::call_prepared(
+                            recipe,
+                            &narrowed,
+                            &self.types[index],
+                            Some(&|| written.clone()),
+                        )
+                    })
+                    .map_err(|error| error.with_fallback_span(self.spans[index]))?;
+                return Ok(selection(&flags, live.len()).compose(live));
+            }
+        }
         self.run_step(index, chunk, scratch)?;
         let flags = self.operand(index, chunk, &scratch.slots)?;
         match live {
@@ -1735,6 +1763,18 @@ mod tests {
         filters(
             "(((#0.1::VARCHAR = 'c'::VARCHAR)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN)\
              ::BOOLEAN AND (#0.0::INTEGER <> 1::INTEGER)::BOOLEAN)::BOOLEAN",
+        );
+    }
+
+    #[test]
+    fn a_selective_conjunct_evaluates_later_like_on_its_survivors() {
+        filters(
+            "((#0.0::INTEGER > 2::INTEGER)::BOOLEAN AND \
+             \"~~\"(#0.1::VARCHAR, '%a%'::VARCHAR)::BOOLEAN)::BOOLEAN",
+        );
+        filters(
+            "((#0.0::INTEGER > 2::INTEGER)::BOOLEAN AND \
+             \"!~~\"(#0.1::VARCHAR, '%a%'::VARCHAR)::BOOLEAN)::BOOLEAN",
         );
     }
 
