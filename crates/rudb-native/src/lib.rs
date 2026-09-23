@@ -6523,7 +6523,7 @@ impl Reader {
 
     /// Whether the column's dictionary stopped taking values partway through the load, and so
     /// decodes the stripes written before that and says nothing about the column as a whole. See
-    /// [`DEMOTED`].
+    /// `DEMOTED`.
     #[must_use]
     pub fn demoted(&self, column: usize) -> bool {
         self.table.demoted.get(column).copied().unwrap_or(false)
