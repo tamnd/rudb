@@ -261,7 +261,12 @@ pub fn select_prepared(
     // and so this does too rather than casting past it.
     if u32::try_from(len).is_ok() {
         if let Some(answers) = external_text_literal(op, left, right, len, identity, held)? {
-            return Ok(crate::select::picked(&answers, identity, len, &left_valid.and(&right_valid, len)));
+            return Ok(crate::select::picked(
+                &answers,
+                identity,
+                len,
+                &left_valid.and(&right_valid, len),
+            ));
         }
         if let Some(answers) =
             specialized(op, left, right, &left_valid, &right_valid, len, identity, held)
@@ -1786,7 +1791,14 @@ mod tests {
         let fast = compare(op, left, right).expect("compares");
         let slow = oracle(op, left, right);
         assert_eq!(fast, slow, "{op:?} on a {:?} against a {:?}", left.form(), right.form());
-        // The rows straight from the answers are the rows the flag vector gives.
+    }
+
+    /// [`agrees`], and the rows picked straight from the answers are the rows the flag vector
+    /// gives. Kept apart from `agrees` because a pair of forms with no loop goes the long way here
+    /// too, and the tests that count the long way would count it twice.
+    fn agrees_and_selects(op: Comparison, left: &Vector, right: &Vector) {
+        agrees(op, left, right);
+        let slow = oracle(op, left, right);
         let picked = select_prepared(op, left, right, None).expect("selects");
         assert_eq!(
             picked.indices(),
@@ -2013,34 +2025,34 @@ mod tests {
                 let other_runs = Vector::runs(ends, right.clone()).expect("one value for each run");
 
                 for op in EVERY {
-                    agrees(op, &left, &right);
-                    agrees(op, &left, &constant);
-                    agrees(op, &constant, &left);
-                    agrees(op, &left, &null_constant);
-                    agrees(op, &null_constant, &left);
-                    agrees(op, &dictionary, &constant);
-                    agrees(op, &constant, &dictionary);
+                    agrees_and_selects(op, &left, &right);
+                    agrees_and_selects(op, &left, &constant);
+                    agrees_and_selects(op, &constant, &left);
+                    agrees_and_selects(op, &left, &null_constant);
+                    agrees_and_selects(op, &null_constant, &left);
+                    agrees_and_selects(op, &dictionary, &constant);
+                    agrees_and_selects(op, &constant, &dictionary);
                     // The dictionary against a flat column, which reads a null from either side and
                     // from the dictionary's values as well, so it is the pair with the most ways to
                     // disagree with the oracle and the one that got a loop last.
-                    agrees(op, &dictionary, &right);
-                    agrees(op, &right, &dictionary);
+                    agrees_and_selects(op, &dictionary, &right);
+                    agrees_and_selects(op, &right, &dictionary);
                     // The same four pairings for run length, which reaches the same loops through
                     // the same accessor, so what is being checked is that the positions it works
                     // out are the positions the row at a time path reads.
-                    agrees(op, &runs, &constant);
-                    agrees(op, &constant, &runs);
-                    agrees(op, &runs, &right);
-                    agrees(op, &right, &runs);
+                    agrees_and_selects(op, &runs, &constant);
+                    agrees_and_selects(op, &constant, &runs);
+                    agrees_and_selects(op, &runs, &right);
+                    agrees_and_selects(op, &right, &runs);
                     // Both sides reached through codes, which is the pair TPC-H actually hits:
                     // `l_commitdate < l_receiptdate` is two dictionary encoded columns of one
                     // table. A null here can be in four places at once, the two dictionaries' own
                     // masks and the two value vectors, and the answer has to be null if it is in
                     // any of them.
-                    agrees(op, &dictionary, &other_dictionary);
-                    agrees(op, &runs, &other_runs);
-                    agrees(op, &dictionary, &other_runs);
-                    agrees(op, &runs, &other_dictionary);
+                    agrees_and_selects(op, &dictionary, &other_dictionary);
+                    agrees_and_selects(op, &runs, &other_runs);
+                    agrees_and_selects(op, &dictionary, &other_runs);
+                    agrees_and_selects(op, &runs, &other_dictionary);
                 }
             }
         }
