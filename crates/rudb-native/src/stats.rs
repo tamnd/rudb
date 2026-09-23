@@ -696,6 +696,30 @@ impl Pass {
         });
     }
 
+    /// Takes in a pass that read whole stripes of the same column on its own. See [`Gather::absorb`].
+    ///
+    /// Only between stripes, which is the only place a pass is ever handed over: the fields that
+    /// describe the stripe being read are empty then on both sides.
+    fn absorb(&mut self, later: Pass) {
+        self.rows += later.rows;
+        self.nulls += later.nulls;
+        self.bounded &= later.bounded;
+        self.bytes = self.bytes.saturating_add(later.bytes);
+        self.widest = self.widest.max(later.widest);
+        if let Some(low) = later.low {
+            if takes(&self.low, &low, Ordering::Less) {
+                self.low = Some(low);
+            }
+        }
+        if let Some(high) = later.high {
+            if takes(&self.high, &high, Ordering::Greater) {
+                self.high = Some(high);
+            }
+        }
+        self.stripes.extend(later.stripes);
+        self.pieces.extend(later.pieces);
+    }
+
     /// Puts the stripes' order fields together in the order the table is read in.
     ///
     /// A pass that never opened a stripe has nothing here and keeps what it counted as it went.
@@ -1124,6 +1148,20 @@ impl Gather {
             self.pass.scan(vector);
         }
         self.pass.close_stripe();
+    }
+
+    /// Takes in a gather that folded stripes of the same column on its own, as though this had
+    /// folded them.
+    ///
+    /// This is what lets a stripe be summarized on the thread that encodes it, before the writer's
+    /// lock is taken. Nothing a stripe adds depends on the stripes before it: the order fields are
+    /// kept a stripe at a time and put together by key at the end, the ends and the totals are a
+    /// minimum, a maximum and sums, and the counts union. The one thing that does depend on order
+    /// is the tally's list, which comes out in the order the stripes are absorbed in, and that is
+    /// the order they reached the writer in, which is what it was before.
+    pub(crate) fn absorb(&mut self, later: Gather) {
+        self.pass.absorb(later.pass);
+        self.counts.absorb(later.counts);
     }
 
     /// How many rows went past, which is what the caller checks against the table's own count.
