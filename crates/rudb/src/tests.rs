@@ -9288,3 +9288,35 @@ fn a_set_of_several_columns_takes_a_row_one_value_each_or_one_value_for_all() {
         assert!(error.contains(message), "{sql}: {error}");
     }
 }
+
+#[test]
+fn a_with_ahead_of_a_write_is_in_scope_for_all_of_it() {
+    let db = Database::new();
+    let answer = |sql: &str| {
+        let result = db.execute(sql).unwrap();
+        (0..result.len())
+            .map(|row| {
+                (0..result.width()).map(|at| result.text_at(row, at)).collect::<Vec<_>>().join(",")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    db.execute("CREATE TABLE t (a INTEGER, b VARCHAR)").unwrap();
+    assert_eq!(
+        answer("WITH v AS (SELECT 5 AS a, 'cte' AS b) INSERT INTO t SELECT * FROM v RETURNING a"),
+        "5"
+    );
+    db.execute("INSERT INTO t VALUES (3, 'x'), (10, 'y')").unwrap();
+    assert_eq!(
+        answer(
+            "WITH n AS MATERIALIZED (SELECT 100 AS new_a, 3 AS old_a) UPDATE t SET a = n.new_a \
+             FROM n WHERE t.a = n.old_a RETURNING a"
+        ),
+        "100"
+    );
+    assert_eq!(
+        answer("WITH d AS (SELECT 10 AS x) DELETE FROM t WHERE a IN (SELECT x FROM d) RETURNING b"),
+        "y"
+    );
+    assert_eq!(answer("SELECT * FROM t ORDER BY a"), "5,cte;100,x");
+}
