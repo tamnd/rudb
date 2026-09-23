@@ -64,6 +64,7 @@ pub mod compare;
 mod datetime;
 pub mod fallback;
 mod general;
+mod lists;
 pub mod logic;
 pub mod membership;
 mod number;

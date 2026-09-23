@@ -253,6 +253,38 @@ enum Shape {
     /// `duckdb_functions()` reports, and what `now(1)` says, which is the arity error rather than a
     /// missing function.
     Constant(Fixed),
+    /// A list and a value its elements are compared with, and a fixed result. `list_position` and
+    /// `list_contains`.
+    ///
+    /// The pin declares these `(T[], T)`, so the element type and the value meet at one type the way
+    /// the two sides of `=` do. Two that will not meet are refused with the pin's sentence about the
+    /// type variable, which names the two readings of `T` it could not reconcile.
+    ListSearched(Fixed),
+    /// Two lists whose elements meet at one type, and either a list of that type back, which is
+    /// `list_intersect`, or a fixed result, which is `list_has_any` and `list_has_all`.
+    ListsMet(Option<Fixed>),
+    /// One list, and a list of the same type back. `list_distinct` and `list_reverse`.
+    ListKept,
+    /// One list of anything, and a fixed result. `list_unique`.
+    ListTo(Fixed),
+    /// A list, and a second list of a fixed element type that picks from it. `list_where` takes a
+    /// list of booleans and `list_select` a list of whole numbers.
+    ///
+    /// The second list is not cast, so `list_select([1], [1.5])` is refused as it is on the pin and
+    /// not rounded to the first element.
+    ListPicked(Fixed),
+    /// A list of lists, and the list of their elements. `flatten`.
+    Flattened,
+    /// A list, the length it should have, and what to pad it with. `list_resize`.
+    ///
+    /// The length is cast to UBIGINT, which is where the pin sends it, so a negative length is that
+    /// cast's out of range error. The padding is cast to the element type.
+    Resized,
+    /// A list and up to two strings saying how to order it. `list_sort` and `list_reverse_sort`.
+    ///
+    /// The strings are not cast, so `list_sort([1], 1)` is refused as it is on the pin, and the
+    /// binder holds them to constants.
+    Sorted,
 }
 
 /// How a shape names the argument whose type the call decides, and the result that follows it.
@@ -284,6 +316,7 @@ enum Fixed {
     Boolean,
     Integer,
     BigInt,
+    UBigInt,
     Double,
     Varchar,
     Date,
@@ -300,6 +333,7 @@ impl Fixed {
             Self::Boolean => LogicalType::Boolean,
             Self::Integer => LogicalType::Integer,
             Self::BigInt => LogicalType::BigInt,
+            Self::UBigInt => LogicalType::UBigInt,
             Self::Double => LogicalType::Double,
             Self::Varchar => LogicalType::Varchar,
             Self::Date => LogicalType::Date,
@@ -695,6 +729,41 @@ const TABLE: &[Entry] = &[
         shape: Shape::ListConcatenated,
         numeric_only: false,
     },
+    // Looking inside a list. Every row here is one overload on the pin, and all but `list_unique`,
+    // `list_resize` and `flatten` are declared over `T`, which is what makes a list of numbers and a
+    // string needle a binder error rather than a comparison that is never true.
+    list_row("list_position", 2, Shape::ListSearched(Fixed::Integer)),
+    list_row("list_contains", 2, Shape::ListSearched(Fixed::Boolean)),
+    list_row("list_has_any", 2, Shape::ListsMet(Some(Fixed::Boolean))),
+    list_row("list_has_all", 2, Shape::ListsMet(Some(Fixed::Boolean))),
+    list_row("list_intersect", 2, Shape::ListsMet(None)),
+    list_row("list_distinct", 1, Shape::ListKept),
+    list_row("list_reverse", 1, Shape::ListKept),
+    list_row("list_unique", 1, Shape::ListTo(Fixed::UBigInt)),
+    list_row("list_where", 2, Shape::ListPicked(Fixed::Boolean)),
+    list_row("list_select", 2, Shape::ListPicked(Fixed::BigInt)),
+    list_row("flatten", 1, Shape::Flattened),
+    Entry {
+        name: "list_sort",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 3),
+        shape: Shape::Sorted,
+        numeric_only: false,
+    },
+    Entry {
+        name: "list_reverse_sort",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(1, 2),
+        shape: Shape::Sorted,
+        numeric_only: false,
+    },
+    Entry {
+        name: "list_resize",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::Resized,
+        numeric_only: false,
+    },
     // The type of an expression, as a string. Nothing is cast and nothing runs: the binder folds
     // this to the name of the type it just decided, so the argument is only ever looked at and the
     // executor never sees the call.
@@ -816,6 +885,17 @@ const fn text(name: &'static str, arity: Arity, returns: Fixed) -> Entry {
         kind: FunctionKind::Scalar,
         arity,
         shape: Shape::Exact(Fixed::Varchar, returns),
+        numeric_only: false,
+    }
+}
+
+/// A scalar over lists that takes exactly `count` arguments.
+const fn list_row(name: &'static str, count: usize, shape: Shape) -> Entry {
+    Entry {
+        name,
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(count),
+        shape,
         numeric_only: false,
     }
 }
@@ -1210,6 +1290,103 @@ pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
         // The arity check above already refused every call but the one with no arguments, so there
         // is nothing to cast and nothing left to decide.
         Shape::Constant(fixed) => (Vec::new(), fixed.ty()),
+        Shape::ListSearched(to) => {
+            let Some(element) = element_of_list(&arguments[0]) else {
+                return Err(no_match(entry.name, arguments));
+            };
+            let element = deduce(entry, &element, &arguments[1])?;
+            (vec![LogicalType::list(element.clone()), element], to.ty())
+        }
+        Shape::ListsMet(to) => {
+            let (Some(left), Some(right)) =
+                (element_of_list(&arguments[0]), element_of_list(&arguments[1]))
+            else {
+                return Err(no_match(entry.name, arguments));
+            };
+            let list = LogicalType::list(deduce(entry, &left, &right)?);
+            let returns = to.map_or_else(|| list.clone(), Fixed::ty);
+            (vec![list.clone(), list], returns)
+        }
+        Shape::ListKept => {
+            let Some(element) = element_of_list(&arguments[0]) else {
+                // `list_reverse` is a macro over a slice on the pin, so what it says about a value
+                // that is not a list is what the slice says.
+                if entry.name == "list_reverse" {
+                    return Err(match arguments[0] {
+                        LogicalType::Varchar => Error::not_implemented(STEPPED_STRING),
+                        _ => Error::binder("ARRAY_SLICE can only operate on LISTs and VARCHARs"),
+                    });
+                }
+                return Err(no_match(entry.name, arguments));
+            };
+            listed_or_null(&arguments[0], element, Vec::new())
+        }
+        Shape::ListTo(to) => {
+            let Some(element) = element_of_list(&arguments[0]) else {
+                return Err(no_match(entry.name, arguments));
+            };
+            let taken = match arguments[0] {
+                LogicalType::Null => LogicalType::Null,
+                _ => LogicalType::list(element),
+            };
+            (vec![taken], to.ty())
+        }
+        Shape::ListPicked(by) => {
+            let picks = match &arguments[1] {
+                LogicalType::Null => true,
+                LogicalType::List(inner) => match by {
+                    Fixed::Boolean => matches!(**inner, LogicalType::Boolean | LogicalType::Null),
+                    _ => inner.is_integer() || **inner == LogicalType::Null,
+                },
+                _ => false,
+            };
+            let Some(element) = element_of_list(&arguments[0]).filter(|_| picks) else {
+                return Err(no_match(entry.name, arguments));
+            };
+            listed_or_null(&arguments[0], element, vec![LogicalType::list(by.ty())])
+        }
+        Shape::Flattened => {
+            let element = match &arguments[0] {
+                LogicalType::Null => None,
+                LogicalType::List(inner) | LogicalType::Array(inner, _) => match &**inner {
+                    LogicalType::Null => Some(LogicalType::Null),
+                    LogicalType::List(element) | LogicalType::Array(element, _) => {
+                        Some((**element).clone())
+                    }
+                    _ => return Err(no_match(entry.name, arguments)),
+                },
+                _ => return Err(no_match(entry.name, arguments)),
+            };
+            match element {
+                None => (vec![LogicalType::Null], LogicalType::Null),
+                Some(element) => {
+                    let list = LogicalType::list(element.clone());
+                    (vec![LogicalType::list(list.clone())], list)
+                }
+            }
+        }
+        Shape::Resized => {
+            let Some(element) = element_of_list(&arguments[0]) else {
+                return Err(no_match(entry.name, arguments));
+            };
+            let mut rest = vec![LogicalType::UBigInt];
+            if arguments.len() == 3 {
+                rest.push(match element {
+                    LogicalType::Null => arguments[2].clone(),
+                    ref element => element.clone(),
+                });
+            }
+            listed_or_null(&arguments[0], element, rest)
+        }
+        Shape::Sorted => {
+            let spelled = arguments[1..]
+                .iter()
+                .all(|ty| matches!(ty, LogicalType::Varchar | LogicalType::Null));
+            let Some(element) = element_of_list(&arguments[0]).filter(|_| spelled) else {
+                return Err(no_match(entry.name, arguments));
+            };
+            listed_or_null(&arguments[0], element, arguments[1..].to_vec())
+        }
     };
     Ok(Resolved { name: entry.name, kind: entry.kind, arguments: cast_to, returns })
 }
@@ -1379,6 +1556,38 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     // The other variadic, and the one the pin prints with no leading parameter at all, which is why
     // the zero argument call binds there. See the entry in [`TABLE`].
     ("list_concat", &["list_concat([ANY[]...]) -> ANY[]"]),
+    ("list_position", &["list_position(col0 T[], col1 T) -> INTEGER"]),
+    ("list_contains", &["list_contains(col0 T[], col1 T) -> BOOLEAN"]),
+    ("list_has_any", &["list_has_any(col0 T[], col1 T[]) -> BOOLEAN"]),
+    ("list_has_all", &["list_has_all(col0 T[], col1 T[]) -> BOOLEAN"]),
+    ("list_intersect", &["list_intersect(col0 T[], col1 T[]) -> T[]"]),
+    ("list_distinct", &["list_distinct(col0 T[]) -> T[]"]),
+    ("list_unique", &["list_unique(col0 ANY[]) -> UBIGINT"]),
+    ("list_where", &["list_where(col0 T[], col1 BOOLEAN[]) -> T[]"]),
+    ("list_select", &["list_select(col0 T[], col1 BIGINT[]) -> T[]"]),
+    ("flatten", &["flatten(col0 T[][]) -> T[]"]),
+    (
+        "list_sort",
+        &[
+            "list_sort(list ANY[]) -> ANY[]",
+            "list_sort(list ANY[], sort_order VARCHAR) -> ANY[]",
+            "list_sort(list ANY[], sort_order VARCHAR, null_order VARCHAR) -> ANY[]",
+        ],
+    ),
+    (
+        "list_reverse_sort",
+        &[
+            "list_reverse_sort(list ANY[]) -> ANY[]",
+            "list_reverse_sort(list ANY[], null_order VARCHAR) -> ANY[]",
+        ],
+    ),
+    (
+        "list_resize",
+        &[
+            "list_resize(col0 ANY[], col1 ANY) -> ANY[]",
+            "list_resize(col0 ANY[], col1 ANY, col2 ANY) -> ANY[]",
+        ],
+    ),
     (
         "substring",
         &[
@@ -1498,6 +1707,55 @@ const CANDIDATES: &[(&str, &[&str])] = &[
 /// A STRUCT is subscripted by name rather than by position and is not one of these. `x.y` is
 /// `struct_extract(x, 'y')` by the time it leaves the transformer, which is a function this table
 /// does not have yet, so that call fails with the name of the function it is missing.
+/// What the pin says about a slice with a step over a string, which is what `list_reverse` is on the
+/// pin, unbalanced parenthesis and all.
+const STEPPED_STRING: &str = "Slice with steps has not been implemented for string types, you can \
+     consider rewriting your query as follows:\n SELECT array_to_string((str_split(string, \
+     '')[begin:end:step], '');";
+
+/// The element type of a list argument, or of an array, which is cast to a list, or the untyped
+/// null for a null argument, and `None` for anything else.
+fn element_of_list(ty: &LogicalType) -> Option<LogicalType> {
+    match ty {
+        LogicalType::Null => Some(LogicalType::Null),
+        LogicalType::List(element) | LogicalType::Array(element, _) => Some((**element).clone()),
+        _ => None,
+    }
+}
+
+/// The one type two readings of `T` meet at, or the pin's sentence for two that do not. Only the
+/// two argument shapes ask this.
+fn deduce(entry: &Entry, first: &LogicalType, second: &LogicalType) -> Result<LogicalType> {
+    first.promote(second).ok_or_else(|| {
+        let (arguments, returns) = entry.shape.declared(2);
+        Error::binder(format!(
+            "Cannot deduce template type 'T' in function: '{}({}) -> {returns}'\nType 'T' was \
+             inferred to be:\n - '{first}', from first occurrence\n - '{second}', which is \
+             incompatible with previously inferred type!",
+            entry.name,
+            arguments.join(", ")
+        ))
+    })
+}
+
+/// The cast list and result for a function that answers in the type of its list argument: a list
+/// of `element` when the argument is one, and the untyped null when the argument is a null.
+fn listed_or_null(
+    first: &LogicalType,
+    element: LogicalType,
+    mut rest: Vec<LogicalType>,
+) -> (Vec<LogicalType>, LogicalType) {
+    let (taken, returns) = match first {
+        LogicalType::Null => (LogicalType::Null, LogicalType::Null),
+        _ => {
+            let list = LogicalType::list(element);
+            (list.clone(), list)
+        }
+    };
+    rest.insert(0, taken);
+    (rest, returns)
+}
+
 fn element_of(ty: &LogicalType) -> Option<LogicalType> {
     match ty {
         LogicalType::Varchar | LogicalType::Null => Some(LogicalType::Varchar),
@@ -1760,6 +2018,7 @@ impl Fixed {
             Self::Boolean => "BOOLEAN",
             Self::Integer => "INTEGER",
             Self::BigInt => "BIGINT",
+            Self::UBigInt => "UBIGINT",
             Self::Double => "DOUBLE",
             Self::Varchar => "VARCHAR",
             Self::Date => "DATE",
@@ -1868,6 +2127,20 @@ impl Shape {
             Self::ListCounted => (leading(1, ANY_LIST, "BIGINT"), Fixed::BigInt.name()),
             // No arguments, so `all` is empty whatever it is handed and only the result is named.
             Self::Constant(fixed) => (Vec::new(), fixed.name()),
+            Self::ListSearched(to) => (leading(1, SAME_LIST, SAME), to.name()),
+            Self::ListsMet(to) => (all(SAME_LIST), to.map_or(SAME_LIST, Fixed::name)),
+            Self::ListKept => (all(SAME_LIST), SAME_LIST),
+            Self::ListTo(to) => (all(ANY_LIST), to.name()),
+            Self::ListPicked(by) => {
+                let picks = match by {
+                    Fixed::Boolean => "BOOLEAN[]",
+                    _ => "BIGINT[]",
+                };
+                (leading(1, SAME_LIST, picks), SAME_LIST)
+            }
+            Self::Flattened => (all("T[][]"), SAME_LIST),
+            Self::Resized => (leading(1, ANY_LIST, ANY), ANY_LIST),
+            Self::Sorted => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
         }
     }
 }
@@ -1924,6 +2197,23 @@ const ALIASES: &[(&str, &str)] = &[
     ("list_cat", "list_concat"),
     ("array_concat", "list_concat"),
     ("array_cat", "list_concat"),
+    ("list_indexof", "list_position"),
+    ("array_position", "list_position"),
+    ("array_indexof", "list_position"),
+    ("list_has", "list_contains"),
+    ("array_contains", "list_contains"),
+    ("array_has", "list_contains"),
+    ("array_has_any", "list_has_any"),
+    ("array_has_all", "list_has_all"),
+    ("array_intersect", "list_intersect"),
+    ("array_distinct", "list_distinct"),
+    ("array_reverse", "list_reverse"),
+    ("array_unique", "list_unique"),
+    ("array_where", "list_where"),
+    ("array_select", "list_select"),
+    ("array_resize", "list_resize"),
+    ("array_sort", "list_sort"),
+    ("array_reverse_sort", "list_reverse_sort"),
     ("rank_dense", "dense_rank"),
 ];
 
@@ -2359,12 +2649,30 @@ mod tests {
                 // number, so a row of strings is not a call either one accepts and not a call worth
                 // asserting it accepts.
                 let leading = match entry.shape {
-                    Shape::Extracted | Shape::Sliced | Shape::ListCounted => 1,
+                    Shape::Extracted | Shape::Sliced | Shape::ListCounted | Shape::Resized => 1,
                     Shape::TextThenIndex(leading, _) => leading,
                     _ => count,
                 };
                 for bound in arguments.iter_mut().skip(leading) {
                     *bound = LogicalType::BigInt;
+                }
+                // The list functions each want their own mix of lists and values.
+                let strings = || LogicalType::list(LogicalType::Varchar);
+                match entry.shape {
+                    Shape::ListSearched(_) => arguments = vec![strings(), LogicalType::Varchar],
+                    Shape::ListsMet(_) | Shape::ListKept | Shape::ListTo(_) => {
+                        arguments = vec![strings(); count];
+                    }
+                    Shape::ListPicked(by) => {
+                        arguments = vec![strings(), LogicalType::list(by.ty())]
+                    }
+                    Shape::Flattened => arguments = vec![LogicalType::list(strings())],
+                    Shape::Resized => arguments[0] = strings(),
+                    Shape::Sorted => {
+                        arguments = vec![LogicalType::Varchar; count];
+                        arguments[0] = strings();
+                    }
+                    _ => {}
                 }
                 resolve(entry.name, &arguments).unwrap_or_else(|error| {
                     panic!("{} does not resolve at {count} arguments: {error}", entry.name)
