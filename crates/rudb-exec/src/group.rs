@@ -29,7 +29,9 @@ use rudb_common::{
     Error, Field, LogicalType, Memory, PhysicalType, Reservation, Result, Session, Stage, Value,
     stage,
 };
-use rudb_kernels::{Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_scattered};
+use rudb_kernels::{
+    Accumulator, NOWHERE, finish_run, is_true, settle_extremes, update_runs, update_scattered,
+};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
@@ -390,6 +392,49 @@ const EMPTY_SLOT: u32 = SLOT_MASK;
 const fn slot_tag(hash: u64) -> u32 {
     (((hash >> SLOT_BITS) as u32) & 0xff) << SLOT_BITS
 }
+
+/// Cuts a chunk's slots into runs of one slot, each given as its slot and the row it ends before,
+/// when they come in runs at least [`RUN_ROWS`] long on average.
+///
+/// One pass, and most of it sixteen slots at a time: a block that holds nothing but the slot of
+/// the run it is in is an or of sixteen differences the compiler does as a few vector
+/// instructions, and only a block where the slot changes is walked a row at a time. The first
+/// version counted the changes before cutting and did both a row at a time, and at twenty
+/// instructions a row it cost more than the counting loop it was there to replace. A chunk of keys
+/// in no order is given up on as soon as it has more runs than it is allowed. `false`, with `into`
+/// empty, for a chunk that is not worth it.
+fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>) -> bool {
+    into.clear();
+    let Some(&first) = slots.first() else {
+        return false;
+    };
+    let most = slots.len() / RUN_ROWS;
+    let mut current = first;
+    let mut row = 0;
+    while row < slots.len() {
+        let end = (row + 16).min(slots.len());
+        let block = &slots[row..end];
+        if block.iter().fold(0, |differ, &slot| differ | (slot ^ current)) != 0 {
+            for (at, &slot) in block.iter().enumerate() {
+                if slot != current {
+                    if into.len() >= most {
+                        into.clear();
+                        return false;
+                    }
+                    into.push((current, row + at));
+                    current = slot;
+                }
+            }
+        }
+        row = end;
+    }
+    into.push((current, slots.len()));
+    true
+}
+
+/// How many rows a run of one slot has to hold on average for [`slot_runs_of`] to cut a chunk
+/// into runs, which is where folding a run at once costs less than the pass that finds them.
+const RUN_ROWS: usize = 8;
 
 /// A bucket for a group at this slot with this hash, or an error when the partition is too large.
 fn bucket_for(slot: usize, hash: u64, what: &'static str) -> Result<u32> {
@@ -1511,6 +1556,7 @@ impl<'a> Aggregate<'a> {
             coded_on: Vec::new(),
             coded_places: Vec::new(),
             coded_values: Vec::new(),
+            slot_runs: Vec::new(),
             coded_spent: 0,
             coded_read: 0,
             coded_map: Vec::new(),
@@ -1569,6 +1615,7 @@ impl<'a> Aggregate<'a> {
             coded_on,
             coded_places,
             coded_values,
+            slot_runs,
             coded_spent,
             coded_read,
             coded_map,
@@ -1875,10 +1922,25 @@ impl<'a> Aggregate<'a> {
                 )?;
             }
         }
+        // A chunk whose key the rows are sorted on lands in a handful of groups one after another,
+        // and then each aggregate takes a run of rows into one group at once rather than a row at
+        // a time. The pass that finds out is one compare a row, so it is only taken where the
+        // slots can come in runs at all, which is a key whose rows are grouped together.
+        let by_runs = slot_runs_of(slots, slot_runs);
         if self.count_only {
-            for &slot in slots.iter() {
-                if slot != NOWHERE {
-                    counts[slot] += 1;
+            if by_runs {
+                let mut start = 0;
+                for &(slot, end) in slot_runs.iter() {
+                    if slot != NOWHERE {
+                        counts[slot] += (end - start) as i64;
+                    }
+                    start = end;
+                }
+            } else {
+                for &slot in slots.iter() {
+                    if slot != NOWHERE {
+                        counts[slot] += 1;
+                    }
                 }
             }
         }
@@ -1894,6 +1956,12 @@ impl<'a> Aggregate<'a> {
             }
             if call.distinct {
                 aside += self.distinct(states, seen, seen_rows, slots, at, given)?;
+                continue;
+            }
+            if by_runs
+                && filters[at].is_none()
+                && update_runs(states, slot_runs, calls, at, arguments[at].first(), *length)?
+            {
                 continue;
             }
             let picked = match &filters[at] {
@@ -3555,6 +3623,9 @@ pub(crate) struct Building {
     coded_places: Vec<usize>,
     /// The values of each integer key column the map reads by value, widened, one run per column.
     coded_values: Vec<Vec<i64>>,
+    /// The last chunk's slots cut into runs of one slot, each its slot and the row it ends before,
+    /// when they came in runs long enough to fold a run at a time.
+    slot_runs: Vec<(usize, usize)>,
     /// How many places the maps built on a window of values have cleared, summed over every build.
     coded_spent: usize,
     /// How many rows this table has folded, which is what pays for a map read by value.
@@ -5936,6 +6007,7 @@ mod tests {
     use std::sync::Arc;
 
     use rudb_common::{Field, LogicalType, Memory, Value};
+    use rudb_kernels::NOWHERE;
     use rudb_pipeline::Sink;
     use rudb_plan::{Plan, Slice};
     use rudb_vector::{Chunk, Data, Vector};
@@ -5944,7 +6016,7 @@ mod tests {
         Aggregate, BigIntDistinct, BigIntDistinctRuns, Call, CompactNumeric, Distinct,
         EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition, FixedRecord,
         FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, encoded_count_partition, fixed_partition,
+        bigint_distinct_partition, encoded_count_partition, fixed_partition, slot_runs_of,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -5965,6 +6037,33 @@ mod tests {
     fn column(out: &Buffered) -> Vec<Value> {
         let chunk = out.at(0).expect("readable").expect("one chunk");
         (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect()
+    }
+
+    /// Slots cut into runs come back as the runs they are, across the blocks the cut reads them in,
+    /// and slots in no order come back as nothing.
+    #[test]
+    fn slots_in_runs_are_cut_into_them_and_slots_in_no_order_are_not() {
+        let lengths = [(4, 40), (NOWHERE, 17), (1, 1), (4, 30), (0, 16)];
+        let slots: Vec<usize> =
+            lengths.iter().flat_map(|&(slot, length)| std::iter::repeat_n(slot, length)).collect();
+        let mut runs = Vec::new();
+        assert!(slot_runs_of(&slots, &mut runs));
+        let mut end = 0;
+        let expected: Vec<(usize, usize)> = lengths
+            .iter()
+            .map(|&(slot, length)| {
+                end += length;
+                (slot, end)
+            })
+            .collect();
+        assert_eq!(runs, expected);
+        let one = vec![7; 1_000];
+        assert!(slot_runs_of(&one, &mut runs));
+        assert_eq!(runs, [(7, 1_000)]);
+        let scattered: Vec<usize> = (0..1_000).map(|row| row * 7 % 13).collect();
+        assert!(!slot_runs_of(&scattered, &mut runs));
+        assert!(runs.is_empty());
+        assert!(!slot_runs_of(&[], &mut runs));
     }
 
     #[test]
