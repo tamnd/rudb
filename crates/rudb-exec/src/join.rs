@@ -1278,9 +1278,13 @@ impl<'a> Probe<'a> {
     /// rule under which a null key matches nothing, and the driving half has to be a column rather
     /// than an expression, because a range about a value says nothing about what an expression over
     /// it produces.
-    pub(crate) fn sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
+    ///
+    /// Every equality that qualifies, in the order they were written, because which of them reaches
+    /// a scan is a question about the plan below and not about this join. A join on two keys where
+    /// one of them came out of an earlier join has only the other to offer.
+    pub(crate) fn sideways(&self) -> Vec<(ExprRef, ColumnBinding)> {
         if !matches!(self.kind, JoinKind::Inner | JoinKind::Semi) {
-            return None;
+            return Vec::new();
         }
         self.keyed_sideways()
     }
@@ -1290,12 +1294,17 @@ impl<'a> Probe<'a> {
     /// [`Marking`] answers that question differently and everything else about the key is the
     /// same, so the two refusals that are about the equality live here and the one that is about
     /// what the join does with a driving row lives with each operator.
-    fn keyed_sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
-        let at = self.equalities.null_is_a_value.iter().position(|&stored| !stored)?;
-        let Expr::Column(binding) = *self.plan.expr(*self.equalities.left.get(at)?) else {
-            return None;
-        };
-        Some((*self.equalities.right.get(at)?, binding))
+    fn keyed_sideways(&self) -> Vec<(ExprRef, ColumnBinding)> {
+        let equalities = &self.equalities;
+        (0..equalities.null_is_a_value.len())
+            .filter(|&at| !equalities.null_is_a_value[at])
+            .filter_map(|at| {
+                let Expr::Column(binding) = *self.plan.expr(*equalities.left.get(at)?) else {
+                    return None;
+                };
+                Some((*equalities.right.get(at)?, binding))
+            })
+            .collect()
     }
 
     /// A mark join's answer for one driving chunk, which is that chunk with a marker beside it.
@@ -1758,7 +1767,7 @@ impl<'a> Marking<'a> {
     /// gathered side's range sets no bit whether it is read or not. So an anti join is on the list
     /// here, and it is the one that wants it most, since the side it drives is the larger one by
     /// construction.
-    pub(crate) fn sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
+    pub(crate) fn sideways(&self) -> Vec<(ExprRef, ColumnBinding)> {
         self.probe.keyed_sideways()
     }
 }
@@ -2013,8 +2022,8 @@ impl<'a> Padding<'a> {
     /// half of a full join's answer that comes out of the drain. A right join could have it and
     /// does not, because the two kinds share this operator and a filter that is right for one of
     /// them and wrong for the other is worse than none.
-    pub(crate) fn sideways(&self) -> Option<(ExprRef, ColumnBinding)> {
-        None
+    pub(crate) fn sideways(&self) -> Vec<(ExprRef, ColumnBinding)> {
+        Vec::new()
     }
 
     /// Note that every one of these gathered rows has now been matched.
@@ -3583,7 +3592,7 @@ mod tests {
         )
         .expect("one equality is enough to look up");
 
-        probe.sideways()
+        probe.sideways().into_iter().next()
     }
 
     /// The plain shape, which is the one the filter is for: the gathered side's key to measure the
@@ -3948,7 +3957,7 @@ mod tests {
                 &memory,
             )
             .expect("one equality is enough to mark on");
-            assert!(mark.sideways().is_some(), "a {} join has a key to offer", kind.keyword());
+            assert!(!mark.sideways().is_empty(), "a {} join has a key to offer", kind.keyword());
         }
     }
 
@@ -4240,7 +4249,7 @@ mod tests {
             &memory,
         )
         .expect("one equality is enough to pair on");
-        assert!(pad.sideways().is_none(), "a padding join has no key it can offer");
+        assert!(pad.sideways().is_empty(), "a padding join has no key it can offer");
     }
 
     /// The operator refuses the join it was not written for rather than answering it wrongly.
