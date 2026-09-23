@@ -126,6 +126,8 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
             };
             let mut children = Vec::with_capacity(args.len());
             for (field, arg) in fields.iter().zip(args) {
+                // flatten: a struct's children are plain vectors of its own length, and a child
+                // that stays behind a selection or a constant would not line up with the struct.
                 children.push((field.name.clone(), arg.as_ref().flatten()?));
             }
             Ok(Some(Vector::structure(children)?))
@@ -144,8 +146,13 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
                 return Ok(None);
             }
             let child = &children[at];
-            let child =
-                if child.form() == Form::Flat { (**child).clone() } else { child.flatten()? };
+            let child = if child.form() == Form::Flat {
+                (**child).clone()
+            } else {
+                // flatten: the struct's own validity is laid over the child's below, and that needs
+                // the child's rows in the struct's order, which only a flat child is sure to have.
+                child.flatten()?
+            };
             let validity = input.validity().and(child.validity(), input.len());
             Ok(Some(child.with_validity(validity)))
         }
