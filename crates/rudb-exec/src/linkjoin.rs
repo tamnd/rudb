@@ -46,6 +46,7 @@
 //! against a table that has since been rewritten and a read of whatever happens to be at that
 //! offset.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Parent;
@@ -56,6 +57,7 @@ use rudb_plan::{ExprRef, JoinKind, Plan};
 use rudb_seam::{Context, SeamId, Settings};
 use rudb_vector::{Chunk, Data, NO_ROW, Selection, Vector};
 
+use crate::pairs::together;
 use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
 use crate::schema::Schema;
@@ -234,10 +236,45 @@ impl LinkJoin {
     /// materialises the same columns and then builds a table over them, so it costs strictly more
     /// than this does. A parent whose projection will not fit here is a parent whose hash join
     /// would not have fit either, and reporting it is what the hash join would have done.
-    fn read_parent(&self) -> Result<()> {
+    ///
+    /// # Why the lease goes down into the read
+    ///
+    /// Because this happens with the pipeline stopped. It is called from [`Stream::prepare`], which
+    /// runs before the instances are handed out, so a read on the calling thread is one thread
+    /// decoding a column while the rest of the lease is parked, and the whole of it lands on the
+    /// pipeline's wall clock.
+    ///
+    /// That was measured, and it was most of the operator. On TPC-H q12 at scale factor one the link
+    /// plan's one pipeline took 158 ms of wall clock, of which the slowest instance was 56 ms and the
+    /// stagger 3 ms: about 100 ms was this function, reading 1.5 million rows of one string column on
+    /// one thread. The hash join it is compared against reads the same column as an ordinary pipeline
+    /// and so reads it on six, which is why the rule looked like it was choosing the slower plan when
+    /// what it was choosing was the same work done serially.
+    ///
+    /// The columns are still read one after another, because a projection is a handful of columns and
+    /// the parts of one column are hundreds of pieces. The parallelism that matters is inside.
+    fn read_parent(&self, threads: &Lease<'_>) -> Result<()> {
+        // Off a counter rather than by dealing the parts out in advance, because the parts of a real
+        // table are not the same size and a thread that drew a cheap one should take the next one
+        // instead of finishing early. Not [`in_parallel`], which is the same loop with a slot per
+        // piece to bring a result back in: the pieces here come back through the catalog's own
+        // slots, so a second set of them holding units would be an allocation per part for nothing.
+        let spread = |count: usize, task: &(dyn Fn(usize) + Sync)| -> Result<()> {
+            let next = AtomicUsize::new(0);
+            let step = || {
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    if at >= count {
+                        return;
+                    }
+                    task(at);
+                }
+            };
+            together(threads, threads.degree().min(count), &step)
+        };
         for (column, ty) in &self.projected {
             self.cancel.check()?;
-            if self.parent.column(*column, ty)?.is_none() {
+            if self.parent.column_on(*column, ty, &spread)?.is_none() {
                 return Err(Error::out_of_memory(
                     "a link join could not hold the parent columns it gathers from".to_string(),
                 ));
@@ -260,8 +297,8 @@ impl Stream for LinkJoin {
         Linking { scratch: self.rid.scratch(), rids: Vec::new(), gauge: Gauge::new(1) }
     }
 
-    fn prepare(&self, _threads: &Lease<'_>) -> Result<()> {
-        self.read_parent()
+    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
+        self.read_parent(threads)
     }
 
     fn push(&self, chunk: &mut Chunk, local: &mut Linking) -> Result<Progress> {

@@ -55,12 +55,39 @@
 //! because of a column this one could not use anyway.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{LogicalType, Result};
 use rudb_vector::{Form, Vector, concat};
 
 use crate::table::Rows;
+
+/// Somewhere to run one piece of work per part, which is the thread lease of whoever is reading.
+///
+/// This crate is under the pipeline layer and has no threads to hand out, and reading a part of a
+/// column is the most parallel work there is: a part depends on no other part and nothing is written
+/// but that part's own slot. So a caller that does have threads passes them in as this, and a caller
+/// that does not gets [`serially`], which is what [`Parent::column`] uses.
+///
+/// The contract is that every index below `count` is run exactly once and that all of them have
+/// finished when this returns. How they are shared out is the caller's business, and the caller with
+/// threads does it off a counter rather than by dealing ranges in advance, because the parts of a
+/// real table are not the same size.
+pub type Spread<'a> = dyn Fn(usize, &(dyn Fn(usize) + Sync)) -> Result<()> + 'a;
+
+/// Every piece on the calling thread, in order.
+///
+/// # Errors
+///
+/// Never. The signature is [`Spread`]'s, and a caller with threads to lend has a thread that can
+/// panic and so has something to report.
+pub fn serially(count: usize, task: &(dyn Fn(usize) + Sync)) -> Result<()> {
+    for at in 0..count {
+        task(at);
+    }
+    Ok(())
+}
 
 /// The projected columns of one table, each held whole, each read at most once.
 ///
@@ -93,6 +120,30 @@ impl Parent {
     ///
     /// If a part of the column cannot be read, or if the parts do not lay end to end.
     pub fn column(&self, column: usize, ty: &LogicalType) -> Result<Option<Arc<Vector>>> {
+        self.column_on(column, ty, &serially)
+    }
+
+    /// The same, reading the parts on whatever threads `spread` has.
+    ///
+    /// This is the one a link join calls, and the difference it makes is the whole reason it exists.
+    /// A parent column is read once per query in [`Stream::prepare`], before any instance of the
+    /// pipeline starts, so every nanosecond of it is on the pipeline's wall clock with nothing else
+    /// happening. On TPC-H q12 at scale factor one that read was two thirds of the link plan's wall
+    /// clock while the hash join it was being compared against built its table on the whole lease.
+    ///
+    /// [`Stream::prepare`]: https://docs.rs/rudb-pipeline
+    ///
+    /// # Errors
+    ///
+    /// If a part of the column cannot be read, or if the parts do not lay end to end. A part that
+    /// failed is reported in part order rather than in the order the threads finished, so the same
+    /// table reports the same error however the parts were shared out.
+    pub fn column_on(
+        &self,
+        column: usize,
+        ty: &LogicalType,
+        spread: &Spread<'_>,
+    ) -> Result<Option<Arc<Vector>>> {
         // The lock is held across the read, which serializes two threads that want the same column
         // of the same parent. That is the intended trade: the alternative is both of them reading
         // it, and the column is the expensive thing here while the wait is one read of it.
@@ -100,7 +151,7 @@ impl Parent {
         if let Some(found) = held.get(&column) {
             return Ok(found.clone());
         }
-        let read = self.read(column, ty, &held)?;
+        let read = self.read(column, ty, &held, spread)?;
         held.insert(column, read.clone());
         Ok(read)
     }
@@ -120,31 +171,58 @@ impl Parent {
         column: usize,
         ty: &LogicalType,
         held: &HashMap<usize, Option<Arc<Vector>>>,
+        spread: &Spread<'_>,
     ) -> Result<Option<Arc<Vector>>> {
         let room = self.budget.saturating_sub(spent(held));
-        let mut pieces = Vec::with_capacity(self.rows.chunk_count());
-        let mut cost = 0usize;
-        for part in 0..self.rows.chunk_count() {
-            let chunk = self.rows.read(part, &[column])?;
-            let piece = chunk.column(0)?;
-            // A part with no rows in it contributes no rows to the run and would make `concat`
-            // decline the whole of it, which is a column given up on over a part that says nothing.
-            if piece.is_empty() {
-                continue;
+        let parts = self.rows.chunk_count();
+        // A slot per part rather than one growing list, because the parts may be read in any order
+        // and the run they make is in part order. A slot left empty is a part that said nothing or
+        // one nobody reached, and the walk below tells those apart from a part that failed.
+        let slots: Vec<Mutex<Option<Result<Option<Vector>>>>> =
+            (0..parts).map(|_| Mutex::new(None)).collect();
+        let cost = AtomicUsize::new(0);
+        let over = AtomicBool::new(false);
+        let task = |part: usize| {
+            // Whoever went past the budget has already decided the answer, so there is no reason to
+            // decode anything else. In a serial read that made the column cost one part; in a
+            // parallel one it is one part per thread, because the threads already reading cannot be
+            // called back. That is a bounded overshoot of a column that is being given up on.
+            if over.load(Ordering::Relaxed) {
+                return;
             }
-            // flatten: the whole point of this type is a run the gather can index by a row id of
-            // the parent table, and a row id has no meaning against a bit packed part that has not
-            // been decoded. See the module doc for why this is a decode the hash join pays as well.
-            let piece = if piece.form() == Form::Flat { piece.clone() } else { piece.flatten()? };
+            let read = self.piece(part, column);
+            let footprint = match &read {
+                Ok(Some(piece)) => piece.footprint(),
+                Ok(None) | Err(_) => 0,
+            };
             // Measured after the flattening, because the number the budget is about is what the
-            // column costs once it is a vector, and checked as the parts arrive rather than at the
-            // end so that a column far past the budget is abandoned after one part instead of all
-            // of them.
-            cost = cost.saturating_add(piece.footprint());
-            if cost > room {
-                return Ok(None);
+            // column costs once it is a vector, and added up as the parts arrive rather than at the
+            // end so that a column far past the budget is given up on early.
+            if cost.fetch_add(footprint, Ordering::Relaxed).saturating_add(footprint) > room {
+                over.store(true, Ordering::Relaxed);
+                return;
             }
-            pieces.push(piece);
+            let mut slot = slots[part].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(read);
+        };
+        spread(parts, &task)?;
+
+        let mut pieces = Vec::with_capacity(parts);
+        for slot in &slots {
+            let taken = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+            match taken {
+                // A part that failed fails the column, and the first one in part order is the one
+                // reported, which is why the walk is a walk rather than a look at whoever finished
+                // last.
+                Some(Err(error)) => return Err(error),
+                Some(Ok(piece)) => pieces.extend(piece),
+                // Nothing here is not a failure. Either the part had no rows, or the budget went
+                // while this one was still unread, and the test below is what tells those apart.
+                None => {}
+            }
+        }
+        if over.load(Ordering::Relaxed) {
+            return Ok(None);
         }
         let Some(whole) = concat(ty, &pieces)? else {
             return Ok(None);
@@ -169,6 +247,28 @@ impl Parent {
         // values.
         Ok(Some(Arc::new(whole.into_pages())))
     }
+
+    /// One part of one column, decoded, or nothing when the part holds no rows.
+    ///
+    /// Everything expensive about reading a parent column is in here, which is why this is the unit
+    /// the threads are shared out over: the read of the part and the decode of whatever encoding its
+    /// writer chose. It touches nothing but its own part.
+    fn piece(&self, part: usize, column: usize) -> Result<Option<Vector>> {
+        let chunk = self.rows.read(part, &[column])?;
+        let piece = chunk.column(0)?;
+        // A part with no rows in it contributes no rows to the run and would make `concat` decline
+        // the whole of it, which is a column given up on over a part that says nothing.
+        if piece.is_empty() {
+            return Ok(None);
+        }
+        // flatten: the whole point of this type is a run the gather can index by a row id of the
+        // parent table, and a row id has no meaning against a bit packed part that has not been
+        // decoded. See the module doc for why this is a decode the hash join pays as well.
+        if piece.form() == Form::Flat {
+            return Ok(Some(piece.clone()));
+        }
+        Ok(Some(piece.flatten()?))
+    }
 }
 
 /// What the columns already held cost between them.
@@ -180,7 +280,7 @@ fn spent(held: &HashMap<usize, Option<Arc<Vector>>>) -> usize {
 mod tests {
     use std::sync::Arc;
 
-    use rudb_common::{LogicalType, Value};
+    use rudb_common::{LogicalType, Result, Value};
     use rudb_storage::MemoryTable;
     use rudb_vector::{Chunk, Vector};
 
@@ -295,5 +395,75 @@ mod tests {
             None,
             "the second column is refused because the first one is still held"
         );
+    }
+
+    /// A [`Spread`] that runs each part on a thread of its own, in no particular order.
+    ///
+    /// Not what the engine passes, which shares the parts out over a fixed lease off a counter. This
+    /// is the harsher version on purpose: a thread per part and nothing deciding who goes first is
+    /// the widest the interleaving can get, so anything the read does that depends on part order
+    /// happening to be arrival order shows up here.
+    fn scattered(count: usize, task: &(dyn Fn(usize) + Sync)) -> Result<()> {
+        std::thread::scope(|scope| {
+            let running: Vec<_> =
+                (0..count).rev().map(|at| scope.spawn(move || task(at))).collect();
+            for thread in running {
+                thread.join().expect("a part reader panicked");
+            }
+        });
+        Ok(())
+    }
+
+    /// The point of the parallel read: the same column, whichever thread read which part.
+    ///
+    /// Row order is the whole of correctness here, because a `rid` is an offset into it, and the read
+    /// no longer appends the parts in the order it read them. So this asserts the order rather than
+    /// just the contents, at every part boundary and at both ends.
+    #[test]
+    fn a_column_read_on_many_threads_comes_back_in_the_same_order_as_one_read_on_one() {
+        let values: Vec<i32> = (0..1000).collect();
+        let one = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let many = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let serial = one.column(0, &LogicalType::Integer).expect("read").expect("it fits");
+        let parallel =
+            many.column_on(0, &LogicalType::Integer, &scattered).expect("read").expect("it fits");
+        assert_eq!(parallel.len(), serial.len());
+        for row in 0..serial.len() {
+            assert_eq!(parallel.value_at(row), serial.value_at(row), "row {row} moved");
+        }
+    }
+
+    /// A string column too, because that one is laid out rather than copied and the arena is built
+    /// from the pieces in the order the walk found them.
+    #[test]
+    fn a_string_column_read_on_many_threads_comes_back_in_row_order_and_over_a_page() {
+        let values = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
+        let held: Vec<&str> = (0..500).map(|row| values[row % values.len()]).collect();
+        let parent = Parent::new(strings(&held, 64), 64 * 1024 * 1024);
+        let column =
+            parent.column_on(0, &LogicalType::Varchar, &scattered).expect("read").expect("it fits");
+        let (_, arena) = column.shared_views().expect("a string column is string views");
+        assert!(arena.is_shared(), "a parallel read came back over an arena of its own");
+        assert_eq!(column.len(), 500);
+        for (row, want) in held.iter().enumerate() {
+            assert_eq!(column.value_at(row), Value::Varchar((*want).into()), "row {row} moved");
+        }
+    }
+
+    /// The budget still refuses, and still holds nothing afterwards, when the parts arrive at once.
+    ///
+    /// This is the case the parallel read changes the most. Serially the first part past the budget
+    /// ends the read; here every thread may be holding a part by the time one of them notices. What
+    /// has to survive is the answer, which is a refusal rather than a short column.
+    #[test]
+    fn a_column_past_the_budget_is_refused_however_many_threads_read_it() {
+        let values: Vec<i32> = (0..4096).collect();
+        let parent = Parent::new(table(&values, 512), 64);
+        assert_eq!(
+            parent.column_on(0, &LogicalType::Integer, &scattered).expect("no error"),
+            None,
+            "a column far past the budget is refused"
+        );
+        assert_eq!(parent.footprint(), 0, "and nothing is held on to afterwards");
     }
 }
