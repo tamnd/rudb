@@ -1676,6 +1676,24 @@ impl GlobalDictionary {
         if self.sample.len() < PAYLOAD_SAMPLE_BLOCKS {
             return Ok(());
         }
+        self.settle_on_sample()
+    }
+
+    /// Settles a shape on whatever sample there is, for a column the load ended before it had
+    /// enough of to settle one the usual way.
+    ///
+    /// Such a column has fewer than [`PAYLOAD_SAMPLE_BLOCKS`] blocks, so the sample is every block
+    /// it has. Trying every candidate on each of them instead runs at two to six megabytes a second,
+    /// and once `hits` stored its string columns with a dictionary, the forty or so small ones were
+    /// more than half the CPU of a million row load, all of it in the close.
+    fn settle_rest(&mut self) -> Result<()> {
+        if self.shape.is_some() || self.sample.is_empty() {
+            return Ok(());
+        }
+        self.settle_on_sample()
+    }
+
+    fn settle_on_sample(&mut self) -> Result<()> {
         let complete = self.ends.len() / TEXT_PAYLOAD_VALUES;
         if self.shape.is_some() && complete < self.settled.saturating_mul(4) {
             return Ok(());
@@ -10549,6 +10567,7 @@ fn finish_dictionaries(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<
             return Err(Error::internal("a dictionary block handed out never came back"));
         }
         dictionary.seal_rest();
+        dictionary.settle_rest()?;
     }
     encode_waiting(dictionaries)?;
     // A block handed out and never given back leaves a gap nothing above would notice when it was
