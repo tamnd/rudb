@@ -3090,6 +3090,20 @@ fn uncorrelated_scalar_subqueries_are_single_joins() {
         several.message(),
         "More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to previous behavior of returning a random row."
     );
+    // DuckDB raises it when there is no row to give the answer to as well, because it runs the
+    // subquery first either way.
+    let unused = db
+        .query("SELECT count(*) FROM (VALUES (1)) t(x) WHERE x > 5 AND x > (SELECT y FROM (VALUES (1), (2)) u(y))")
+        .expect_err("the subquery still has two rows");
+    assert_eq!(unused.code().duckdb_name(), "Invalid Input Error");
+    // A column wider than a vector, so the gathered row is put beside more than one chunk.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*), sum(m) FROM (SELECT (SELECT max(range) FROM range(10)) AS m FROM range(5000))"
+        ),
+        vec![vec![Value::BigInt(5000), Value::HugeInt(45000)]]
+    );
     let plan = db.plan("SELECT (SELECT 42)").expect("the scalar query plans");
     assert!(plan.contains("Join SINGLE"), "{plan}");
 }

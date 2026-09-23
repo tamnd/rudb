@@ -31,21 +31,47 @@
 //! `overlay('abcdef' PLACING 'XY' FROM 2 FOR -5)` is `aXYdef` and the two characters skipped are
 //! the two in `XY`.
 //!
-//! Everything here is one value at a time, the way [`crate::subscript`] is, and for the same reason:
-//! nothing on the board or in the TPC queries calls one of these over a column, and a call that does
-//! counts itself in [`crate::fallback`] so the report says how often it happened.
+//! Everything here is one value at a time, the way [`crate::subscript`] is, except `substring`. TPC-H
+//! q22 calls it over every customer's phone number, so it has a loop in [`crate::scalar`] that calls
+//! [`cut`] for each row. Any other call over a column counts itself in [`crate::fallback`] so the
+//! report says how often it happened.
 
 use rudb_common::{Error, Result, Value};
 
 /// `substring(text, start)` and `substring(text, start, length)` on one row.
 pub(crate) fn substring(text: &Value, start: &Value, length: Option<&Value>) -> Result<Value> {
-    let characters: Vec<char> = string(text)?.chars().collect();
     let start = whole(start)?;
     let length = match length {
         Some(held) => Some(whole(held)?),
         None => None,
     };
-    let count = characters.len() as i128;
+    Ok(Value::Varchar(cut(string(text)?, start, length).to_string()))
+}
+
+/// The part of `text` that `substring` keeps, as a slice of it rather than a copy.
+///
+/// This is what the vectorized path in [`crate::scalar`] calls for every row, so it avoids the
+/// `Vec<char>` the one row version used to build. Text that is all ASCII has a character at every
+/// byte and is cut on the byte offsets directly, which is every phone number and country code in
+/// TPC-H. Anything else counts its characters and finds the byte offsets of the two ends.
+pub(crate) fn cut(text: &str, start: i128, length: Option<i128>) -> &str {
+    if text.is_ascii() {
+        return match span(text.len() as i128, start, length) {
+            Some((from, to)) => &text[from..to],
+            None => "",
+        };
+    }
+    let count = text.chars().count() as i128;
+    let Some((from, to)) = span(count, start, length) else {
+        return "";
+    };
+    let byte =
+        |character: usize| text.char_indices().nth(character).map_or(text.len(), |(at, _)| at);
+    &text[byte(from)..byte(to)]
+}
+
+/// Which characters `substring` keeps out of `count`, as a zero based range, or `None` for none.
+fn span(count: i128, start: i128, length: Option<i128>) -> Option<(usize, usize)> {
     let begin = if start < 0 { count + start + 1 } else { start };
     // A missing length runs to the end, and a negative one runs backwards from the start and stops
     // one before it, which is what makes the end exclusive on one side and inclusive on the other.
@@ -55,11 +81,7 @@ pub(crate) fn substring(text: &Value, start: &Value, length: Option<&Value>) -> 
         Some(length) => (begin, begin + length - 1),
     };
     let (from, to) = (from.max(1), to.min(count));
-    if from > to {
-        return Ok(Value::Varchar(String::new()));
-    }
-    let kept: String = characters[(from - 1) as usize..to as usize].iter().collect();
-    Ok(Value::Varchar(kept))
+    (from <= to).then_some(((from - 1) as usize, to as usize))
 }
 
 /// `position(haystack, needle)`, which `strpos` and `instr` are the other two spellings of.
@@ -172,7 +194,7 @@ fn string(value: &Value) -> Result<&str> {
 }
 
 /// The number an index is, which the binder has already cast to a BIGINT.
-fn whole(value: &Value) -> Result<i128> {
+pub(crate) fn whole(value: &Value) -> Result<i128> {
     value
         .as_i64()
         .map(i128::from)

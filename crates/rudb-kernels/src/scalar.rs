@@ -192,6 +192,9 @@ fn specialized<V: AsRef<Vector>>(
     if regexp::is_regexp(name) {
         return regexp::vectorized(name, hoisted.regexp(), args, returns, rows);
     }
+    if matches!(name, "substring" | "substr") {
+        return substring_of(args, returns, rows);
+    }
     match args {
         [only] => unary(name, only.as_ref(), returns, rows),
         [left, right] => {
@@ -450,6 +453,84 @@ fn text_of<A: Fn(usize) -> usize>(
         "lower" | "upper" => fold_of(name, text, base, rows, returns),
         _ => Ok(None),
     }
+}
+
+/// `substring` over a column, with a start and a length that are the same on every row.
+///
+/// TPC-H q22 is `substring(c_phone, 1, 2)` over every customer, and the planner expands the `IN`
+/// list around it into seven comparisons that each evaluate it again. On the row at a time path
+/// each of those built a `Value`, a `Vec<char>` and a new string for every row, which was about 220
+/// nanoseconds a row. A start or a length that differs from row to row still goes that way, and so
+/// does a null one, because the answer is then null everywhere and the row at a time path says so.
+fn substring_of<V: AsRef<Vector>>(
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let (held, start, length) = match args {
+        [held, start] => (held.as_ref(), start.as_ref(), None),
+        [held, start, length] => (held.as_ref(), start.as_ref(), Some(length.as_ref())),
+        _ => return Ok(None),
+    };
+    if returns != &LogicalType::Varchar {
+        return Ok(None);
+    }
+    let fixed = |arg: &Vector| -> Result<Option<i128>> {
+        if arg.form() != Form::Constant || arg.is_null_at(0) {
+            return Ok(None);
+        }
+        text::whole(&arg.try_value_at(0)?).map(Some)
+    };
+    let Some(start) = fixed(start)? else {
+        return Ok(None);
+    };
+    let length = match length {
+        Some(length) => match fixed(length)? {
+            Some(length) => Some(length),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let base = nulls_of(held);
+    let text = match held.form() {
+        Form::Flat => match held.data() {
+            Some(Data::Varlen(column)) => {
+                return cut_each(&Text::Held { column, at: identity }, start, length, base, rows);
+            }
+            _ => return Ok(None),
+        },
+        Form::Dictionary | Form::Rle => match held.positions() {
+            Some((codes, values)) if codes.len() >= rows => match values.data() {
+                Some(Data::Varlen(column)) => {
+                    let at = move |index: usize| codes[index] as usize;
+                    return cut_each(&Text::Held { column, at }, start, length, base, rows);
+                }
+                _ => Text::read(held),
+            },
+            _ => None,
+        },
+        Form::StringView => Text::read(held),
+        _ => None,
+    };
+    match text {
+        Some(text) => cut_each(&text, start, length, base, rows),
+        None => Ok(None),
+    }
+}
+
+/// The loop `substring_of` runs once it knows where the text is.
+fn cut_each<A: Fn(usize) -> usize>(
+    text: &Text<'_, A>,
+    start: i128,
+    length: Option<i128>,
+    base: Validity,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let out = try_each_string(rows, &base, |index, into| {
+        into.push(text::cut(text.get(index)?, start, length));
+        Ok(())
+    })?;
+    finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows))
 }
 
 /// `make_date(days)`, which is the identity on the bytes.
@@ -3967,6 +4048,52 @@ mod tests {
                 let want = oracle(name, std::slice::from_ref(&arg), &returns)
                     .expect("the row at a time path answers");
                 assert_eq!(format!("{taken:?}"), format!("{want:?}"), "{name} on {form:?}");
+            }
+        }
+    }
+
+    /// `substring` with a start and a length that are literals, over every shape a text column
+    /// comes in, has a loop and answers what the row at a time path answers. The starts and lengths
+    /// cover the negative cases, which count from the end and backwards, and the values cover text
+    /// that is not ASCII, which is the one case where a character is not a byte.
+    #[test]
+    fn substring_with_a_literal_start_and_length_agrees_with_the_row_at_a_time_path() {
+        let values = ["Ärger", "b", "", "Straße", "13-715-945-6730", "日本語のテキスト"];
+        let kept = Kept(values.iter().map(|text| text.as_bytes().to_vec()).collect());
+        let read = Vector::external_text(LogicalType::Varchar, Arc::new(kept))
+            .expect("the source is text");
+        let coded = Vector::dictionary(vec![4, 0, 2, 1, 3, 5, 4], read.clone())
+            .expect("every code names a value");
+        let held = Vector::from_values(
+            LogicalType::Varchar,
+            &values.iter().map(|text| Value::Varchar((*text).into())).collect::<Vec<_>>(),
+        )
+        .expect("builds");
+        let mut rng = Rng(0x5eed_0f5b_57e1_0001);
+        let sampled = sample(&LogicalType::Varchar, 96, 7, &mut rng);
+        let mut columns = vec![read, coded];
+        columns.extend(forms(&held));
+        columns.extend(forms(&sampled));
+        let whole =
+            |at: i64, rows: usize| Vector::constant(LogicalType::BigInt, Value::BigInt(at), rows);
+        for arg in columns {
+            let rows = arg.len();
+            for start in [-9, -2, -1, 0, 1, 2, 3, 7] {
+                let begin = whole(start, rows);
+                if arg.form() != Form::Constant {
+                    let taken = substring_of(&[&arg, &begin], &LogicalType::Varchar, rows)
+                        .expect("the call is written");
+                    assert!(
+                        taken.is_some(),
+                        "substring on {:?} took the row at a time path",
+                        arg.form()
+                    );
+                }
+                agrees("substring", &[arg.clone(), begin.clone()], &LogicalType::Varchar);
+                for length in [-3, -1, 0, 1, 2, 5, 40] {
+                    let args = [arg.clone(), begin.clone(), whole(length, rows)];
+                    agrees("substring", &args, &LogicalType::Varchar);
+                }
             }
         }
     }
