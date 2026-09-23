@@ -602,6 +602,29 @@ impl Default for Candidates {
     }
 }
 
+/// Starts the exact distinct count of a column whose candidate table is about to turn a value away.
+///
+/// Until then nothing was decremented and the table holds every value seen, so the set starts as
+/// those values and `ended`, the run about to be added. It is the caller's to insert every value
+/// after that.
+fn count_from_full(
+    first: &Candidates,
+    distinct: &mut Option<distinct::ExactDistinct>,
+    ended: Option<u64>,
+) {
+    if distinct.is_some() || !first.full() {
+        return;
+    }
+    let mut set = distinct::ExactDistinct::new();
+    for held in first.held_bits() {
+        set.insert(held);
+    }
+    if let Some(ended) = ended {
+        set.insert(ended);
+    }
+    *distinct = Some(set);
+}
+
 impl Candidates {
     /// Counts `times` rows of `bits` and ends in the state `times` rows counted one at a time would.
     ///
@@ -637,6 +660,16 @@ impl Candidates {
             self.decrement();
             times -= 1;
         }
+    }
+
+    /// Whether a value not held yet would decrement the table rather than take a slot.
+    fn full(&self) -> bool {
+        self.held + usize::from(self.nulls != 0) >= FREQUENCY_CANDIDATES
+    }
+
+    /// The values held, in no particular order.
+    fn held_bits(&self) -> impl Iterator<Item = u64> + '_ {
+        self.slots.iter().filter(|slot| slot.count != 0).map(|slot| slot.bits)
     }
 
     /// The slot holding `bits` and `true`, or the empty slot a search for it stopped at and `false`.
@@ -1341,8 +1374,11 @@ const DICTIONARY_CHECK_SEED: u64 = 11_400_714_819_323_198_485;
 /// block base before writing.
 #[derive(Debug)]
 struct GlobalDictionary {
-    primary: HashMap<u64, u32>,
-    collisions: HashMap<u64, Vec<u32>>,
+    /// Keyed by the value's hash, which is already well spread, so the maps hash it once more
+    /// with a multiply rather than with SipHash. SipHash here was one percent of a ClickBench load,
+    /// and every stripe's merge of a column waits on the one before it.
+    primary: HashMap<u64, u32, Spread>,
+    collisions: HashMap<u64, Vec<u32>, Spread>,
     /// Every value's hash under [`DICTIONARY_CHECK_SEED`], in code order.
     checks: Vec<u64>,
     /// Where every value ends inside the payload block it is in, in code order.
@@ -1403,8 +1439,8 @@ type RankedDictionary = (Vec<(u64, u32)>, Vec<u8>, Vec<u64>);
 impl GlobalDictionary {
     fn new() -> Self {
         Self {
-            primary: HashMap::new(),
-            collisions: HashMap::new(),
+            primary: HashMap::default(),
+            collisions: HashMap::default(),
             checks: Vec::new(),
             ends: Vec::new(),
             counts: Vec::new(),
@@ -2691,22 +2727,34 @@ impl Writer {
         };
         // Rows arrive a run of equal values at a time, because a sorted column is runs and a flag
         // column is mostly one value, so a run is counted and inserted once rather than per row.
+        //
+        // The exact distinct count is left alone until the candidate table is full. Until then no
+        // candidate has been decremented, so the table holds every value the column has had and
+        // its size is the count. Most columns never fill it and so never build the set. The one
+        // that fills it hands the set everything it holds at that moment, plus the run it is about
+        // to add, and the set carries on from there as it always did.
         let mut first = Candidates::default();
-        let mut distinct = distinct::ExactDistinct::new();
+        let mut distinct: Option<distinct::ExactDistinct> = None;
         let mut run = Run::default();
         self.visit_numeric(column, signed, |_, bits| {
-            if let Some((bits, times)) = run.push(bits) {
-                first.add(bits, times);
+            if let Some((ended, times)) = run.push(bits) {
+                count_from_full(&first, &mut distinct, ended);
+                first.add(ended, times);
             }
             if run.times == 1 {
-                if let Some(bits) = bits {
+                if let (Some(distinct), Some(bits)) = (distinct.as_mut(), bits) {
                     distinct.insert(bits);
                 }
             }
         })?;
         if let Some((bits, times)) = run.take() {
+            count_from_full(&first, &mut distinct, bits);
             first.add(bits, times);
         }
+        let distinct_count = match distinct.as_mut() {
+            Some(distinct) => distinct.count(),
+            None => Some(first.held as u64),
+        };
         let (nulls, decrements) = (first.nulls, first.decrements);
         let (exact, null_count) = if decrements == 0 {
             let exact = first
@@ -2723,7 +2771,7 @@ impl Writer {
             if lower.len() < FREQUENCY_BUILD_RANK
                 || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
             {
-                return Ok((None, distinct.count()));
+                return Ok((None, distinct_count));
             }
             // Counted beside the slot each candidate sits in, since the table is not changed again
             // and a lookup in it is the one probe the first pass made.
@@ -2796,7 +2844,7 @@ impl Writer {
         }
         Ok((
             Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries }),
-            distinct.count(),
+            distinct_count,
         ))
     }
 
@@ -13855,6 +13903,54 @@ mod tests {
             );
         }
         fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn distinct_counts_are_exact_either_side_of_a_full_candidate_table() {
+        // The count comes from the candidate table while it has room and from the set once it
+        // fills, so the sizes around the fill, with and without a null taking a place, are where a
+        // value could be counted twice or missed. Zero is in every column because the set keeps it
+        // apart from the other values, and every value comes back later to be counted again.
+        let edge = FREQUENCY_CANDIDATES as i64;
+        for distinct in [0, 1, 7, edge - 2, edge - 1, edge, edge + 1, edge + 2, 3 * edge] {
+            for with_null in [false, true] {
+                let path = path("distinct-edge");
+                let mut writer =
+                    Writer::create(&path, "items", vec![Field::new("id", LogicalType::BigInt)])
+                        .expect("new file");
+                let mut values = Vec::new();
+                for round in 0..2 {
+                    for value in 0..distinct {
+                        let repeat = if round == 0 { 1 + (value % 3) as usize } else { 1 };
+                        values.extend(std::iter::repeat_n(
+                            Value::BigInt(value * 7_919 % distinct),
+                            repeat,
+                        ));
+                        if with_null && value % 1_000 == 0 {
+                            values.push(Value::Null);
+                        }
+                    }
+                }
+                if with_null {
+                    values.push(Value::Null);
+                }
+                for part in values.chunks(1_024) {
+                    let chunk = Chunk::new(vec![
+                        Vector::from_values(LogicalType::BigInt, part).expect("ids"),
+                    ])
+                    .expect("one column");
+                    writer.append(&chunk).expect("rows");
+                }
+                writer.finish().expect("commit");
+                let reader = Reader::open(&path).expect("reopen from disk");
+                assert_eq!(
+                    reader.distinct_values(0).expect("valid metadata"),
+                    Some(distinct as u64),
+                    "{distinct} values, null {with_null}"
+                );
+                fs::remove_file(path).expect("remove scratch file");
+            }
+        }
     }
 
     #[test]
