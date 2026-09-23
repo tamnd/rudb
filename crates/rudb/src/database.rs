@@ -44,6 +44,13 @@ fn native_simple_identifier(text: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+/// A bare name in a simple SQL shape cannot be one of the grammar's reserved words. The native
+/// catalog also contains quoted names, so merely finding the name there is not syntax validation.
+fn native_simple_unquoted_identifier(text: &str) -> bool {
+    native_simple_identifier(text)
+        && rudb_parse::classes(rudb_parse::lookup(text)) & rudb_parse::RESERVED == 0
+}
+
 /// A deliberately small recognizer for a single unquoted AVG(column) statement. Anything with
 /// another clause, expression, or quoting rule goes through the SQL parser instead.
 fn native_simple_average_statement(sql: &str) -> Option<(&str, &str)> {
@@ -146,6 +153,76 @@ fn native_simple_extrema_statement(sql: &str) -> Option<(&str, &str)> {
     let other = &maximum[4..maximum.len() - 1];
     (native_simple_identifier(column) && column.eq_ignore_ascii_case(other))
         .then_some((table, column))
+}
+
+/// Recognizes an unquoted sum, count, and average of requested columns. The full SQL parser
+/// handles forms with aliases, expressions, or clauses this small path does not understand.
+fn native_simple_three_statement(sql: &str) -> Option<(&str, &str, &str)> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let sum = words.next()?;
+    let count = words.next()?;
+    let average = words.next()?;
+    let from = words.next()?;
+    let table = words.next()?;
+    if words.next().is_some()
+        || !select.eq_ignore_ascii_case("select")
+        || !sum.get(..4)?.eq_ignore_ascii_case("sum(")
+        || !count.eq_ignore_ascii_case("count(*),")
+        || !average.get(..4)?.eq_ignore_ascii_case("avg(")
+        || !from.eq_ignore_ascii_case("from")
+        || !native_simple_unquoted_identifier(table)
+    {
+        return None;
+    }
+    let sum_column = sum.strip_suffix("),")?.get(4..)?;
+    let average_column = average.strip_suffix(')')?.get(4..)?;
+    (native_simple_unquoted_identifier(sum_column)
+        && native_simple_unquoted_identifier(average_column))
+    .then_some((table, sum_column, average_column))
+}
+
+/// Recognizes one unquoted numeric key grouped and ordered by its nonzero frequency.
+fn native_simple_frequency_statement(sql: &str) -> Option<(&str, &str)> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let key = words.next()?.strip_suffix(',')?;
+    let count = words.next()?;
+    let from = words.next()?;
+    let table = words.next()?;
+    let where_keyword = words.next()?;
+    let filtered = words.next()?;
+    let comparison = words.next()?;
+    let zero = words.next()?;
+    let group = words.next()?;
+    let group_by = words.next()?;
+    let grouped = words.next()?;
+    let order = words.next()?;
+    let order_by = words.next()?;
+    let order_count = words.next()?;
+    let descending = words.next()?;
+    (words.next().is_none()
+        && select.eq_ignore_ascii_case("select")
+        && count.eq_ignore_ascii_case("count(*)")
+        && from.eq_ignore_ascii_case("from")
+        && where_keyword.eq_ignore_ascii_case("where")
+        && comparison == "<>"
+        && zero == "0"
+        && group.eq_ignore_ascii_case("group")
+        && group_by.eq_ignore_ascii_case("by")
+        && order.eq_ignore_ascii_case("order")
+        && order_by.eq_ignore_ascii_case("by")
+        && order_count.eq_ignore_ascii_case("count(*)")
+        && descending.eq_ignore_ascii_case("desc")
+        && native_simple_unquoted_identifier(table)
+        && native_simple_unquoted_identifier(key)
+        && filtered.eq_ignore_ascii_case(key)
+        && grouped.eq_ignore_ascii_case(key))
+    .then_some((table, key))
 }
 
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
@@ -784,8 +861,7 @@ impl Database {
         path: &str,
         sql: &str,
     ) -> Result<Option<Vec<(i128, i64)>>> {
-        let ast = rudb_parse::parse_ast(sql)?;
-        let Some((table_name, column)) = native_frequency_group_shape(&ast) else {
+        let Some((table_name, column)) = native_simple_frequency_statement(sql) else {
             return Ok(None);
         };
         let native = rudb_native::Catalog::open(path)?;
@@ -806,9 +882,7 @@ impl Database {
         path: &str,
         sql: &str,
     ) -> Result<Option<(i128, i64, f64)>> {
-        let ast = rudb_parse::parse_ast(sql)?;
-        let Some((table_name, sum_column, avg_column, _)) = native_three_aggregate_shape(&ast)
-        else {
+        let Some((table_name, sum_column, avg_column)) = native_simple_three_statement(sql) else {
             return Ok(None);
         };
         let catalog = rudb_native::Catalog::open(path)?;
@@ -3630,7 +3704,8 @@ mod tests {
     use super::{
         Database, NativeExtremaValues, native_extrema_shape, native_frequency_group_shape,
         native_nonzero_shape, native_simple_average_statement, native_simple_distinct_statement,
-        native_simple_extrema_statement, native_single_average_shape, native_single_distinct_shape,
+        native_simple_extrema_statement, native_simple_frequency_statement,
+        native_simple_three_statement, native_single_average_shape, native_single_distinct_shape,
         native_three_aggregate_shape, publish,
     };
 
@@ -3648,6 +3723,28 @@ mod tests {
         ] {
             let parsed = rudb_parse::parse_ast(sql).unwrap();
             assert_eq!(native_frequency_group_shape(&parsed), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn simple_frequency_statement_keeps_the_filter_and_group_on_the_same_column() {
+        assert_eq!(
+            native_simple_frequency_statement(
+                " SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC; "
+            ),
+            Some(("other_events", "SourceID"))
+        );
+        for sql in [
+            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 1 GROUP BY SourceID ORDER BY COUNT(*) DESC",
+            "SELECT SourceID, COUNT(*) FROM other_events WHERE OtherID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC",
+            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY OtherID ORDER BY COUNT(*) DESC",
+            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY SourceID DESC",
+            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC LIMIT 1",
+            "SELECT SourceID, COUNT(*) FROM other_events WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC; SELECT 1",
+            "SELECT select, COUNT(*) FROM other_events WHERE select <> 0 GROUP BY select ORDER BY COUNT(*) DESC",
+            "SELECT SourceID, COUNT(*) FROM from WHERE SourceID <> 0 GROUP BY SourceID ORDER BY COUNT(*) DESC",
+        ] {
+            assert_eq!(native_simple_frequency_statement(sql), None, "{sql}");
         }
     }
 
@@ -3957,6 +4054,28 @@ mod tests {
         ] {
             let parsed = rudb_parse::parse_ast(sql).unwrap();
             assert_eq!(native_three_aggregate_shape(&parsed), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn simple_three_statement_uses_requested_columns_and_rejects_other_clauses() {
+        assert_eq!(
+            native_simple_three_statement(
+                " SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements; "
+            ),
+            Some(("measurements", "Points", "Width"))
+        );
+        for sql in [
+            "SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements WHERE Points > 0",
+            "SELECT SUM(DISTINCT Points), COUNT(*), AVG(Width) FROM measurements",
+            "SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements GROUP BY Width",
+            "SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements LIMIT 1",
+            "SELECT SUM(Points), COUNT(*), AVG(Width) FROM measurements; SELECT 1",
+            "SELECT SUM(Points), COUNT(*), AVG(Width + 1) FROM measurements",
+            "SELECT SUM(select), COUNT(*), AVG(Width) FROM measurements",
+            "SELECT SUM(Points), COUNT(*), AVG(Width) FROM from",
+        ] {
+            assert_eq!(native_simple_three_statement(sql), None, "{sql}");
         }
     }
 
