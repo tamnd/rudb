@@ -2216,6 +2216,12 @@ impl Writer {
 
     /// Writes one stripe whose pages are built, each column's parts contiguous on disk.
     fn write_stripe(&mut self, held: &[Part], encoded: Vec<ColumnStripe>) -> Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.write_stripe_inner(held, encoded);
+        probe_add(4, t);
+        r
+    }
+    fn write_stripe_inner(&mut self, held: &[Part], encoded: Vec<ColumnStripe>) -> Result<()> {
         let width = self.table.fields.len();
         let parts = held.len();
         if encoded.len() != width {
@@ -2234,7 +2240,9 @@ impl Writer {
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
         let before = self.at;
         encode_ready(&mut self.dictionaries)?;
+        let t = std::time::Instant::now();
         self.place_blocks()?;
+        probe_add(3, t);
         drop(timing);
         if let Some(profile) = &profile {
             profile.moved(Stage::Dictionary, 0, self.at - before, 0);
@@ -2987,7 +2995,11 @@ impl Writer {
     ///
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
+        let t = std::time::Instant::now();
         let entry = self.close()?;
+        probe_add(5, t);
+        eprintln!("PROBE merge {:?} settle {:?} encode {:?} place {:?} write_stripe {:?} close {:?}",
+            PROBE.iter().map(|p| std::time::Duration::from_nanos(p.load(std::sync::atomic::Ordering::Relaxed))).collect::<Vec<_>>(), 0,0,0,0,0);
         let profile = self.profile.take();
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
@@ -9650,10 +9662,20 @@ fn synced(file: &File, profile: Option<&LoadProfile>) -> Result<()> {
     Ok(())
 }
 
+pub static PROBE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+pub fn probe_add(slot: usize, since: std::time::Instant) {
+    PROBE[slot].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
 fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
+    let t = std::time::Instant::now();
     for dictionary in dictionaries.iter_mut().flatten() {
         dictionary.settle()?;
     }
+    probe_add(1, t);
+    let t = std::time::Instant::now();
+    let r = encode_waiting(dictionaries, false);
+    probe_add(2, t);
+    return r;
     // A column with no shape yet is a column with fewer blocks than the sample wants, so its blocks
     // wait. There are at most `PAYLOAD_SAMPLE_BLOCKS` of them and they are about to be encoded one
     // way or the other, and encoding them now would be encoding them without having looked at the

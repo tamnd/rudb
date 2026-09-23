@@ -591,6 +591,12 @@ impl Writer {
 
     /// [`Writer::merge`] for a stripe whose rows are already counted in.
     pub(crate) fn merge_held(&mut self, prepared: Prepared) -> Result<Merged> {
+        let t = std::time::Instant::now();
+        let r = self.merge_held_inner(prepared);
+        crate::probe_add(0, t);
+        r
+    }
+    fn merge_held_inner(&mut self, prepared: Prepared) -> Result<Merged> {
         let Prepared { parts, columns, gathers, profile, .. } = prepared;
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
         for (mine, stripe) in self.gathers.iter_mut().zip(gathers) {
