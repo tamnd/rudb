@@ -2765,6 +2765,8 @@ impl Writer {
         // are what is left to fill in behind them.
         columns.sort_by_key(|&column| weight(&self.table.fields[column].ty));
         let queue = Mutex::new(columns);
+        let phase = std::time::Instant::now();
+        let _phase = Phase(phase);
         let pieces = std::thread::scope(|scope| {
             (0..workers)
                 .map(|_| {
@@ -2777,7 +2779,17 @@ impl Writer {
                                 .map_err(|_| Error::internal("a native frequency worker panicked"))?
                                 .pop();
                             let Some(column) = taken else { break };
-                            mine.push((column, self.numeric_frequency(column)?));
+                            let began = std::time::Instant::now();
+                            let got = self.numeric_frequency(column)?;
+                            eprintln!(
+                                "probe-freq {} {:?} {} ms distinct {:?} summary {}",
+                                self.table.fields[column].name,
+                                self.table.fields[column].ty,
+                                began.elapsed().as_millis(),
+                                got.1,
+                                got.0.is_some()
+                            );
+                            mine.push((column, got));
                         }
                         Ok(mine)
                     })
@@ -15524,5 +15536,12 @@ mod tests {
         let wanted: Vec<Vec<u8>> =
             [&b""[..], b"app", b"apple", b"apples", b"pear"].iter().map(|v| v.to_vec()).collect();
         assert_eq!(seen, wanted, "shorter first where one runs out inside another");
+    }
+}
+
+struct Phase(std::time::Instant);
+impl Drop for Phase {
+    fn drop(&mut self) {
+        eprintln!("probe-freq phase {} ms", self.0.elapsed().as_millis());
     }
 }
