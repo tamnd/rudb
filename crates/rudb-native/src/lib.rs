@@ -62,7 +62,7 @@ pub mod section;
 pub mod stats;
 mod zones;
 
-pub use prepare::{Merged, Merger, Paged, Prepared, Preparer};
+pub use prepare::{DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepared, Preparer};
 pub use section::Section;
 pub use zones::{Common, Stripes, ascending, distincts};
 
@@ -146,6 +146,26 @@ const PAIR_FREQUENCIES: &[u8; 8] = b"RUDBPF1\0";
 /// format instead would have made every file this build writes unreadable to an older one, whether
 /// it has a declaration in it or not, to warn about a case that only arises when it does.
 const CLUSTERING: &[u8; 8] = b"RUDBCL1\0";
+/// The string columns whose global dictionary stopped taking values partway through the load.
+///
+/// Section 5.5 of the encoding spec: a column whose stripes are nearly all new values, or the
+/// fastest growing one once the dictionaries together pass their cap, stops adding to its
+/// dictionary, and every stripe after that is written plainly. The stripes before keep their codes,
+/// so the dictionary is still written and still decodes them, but it no longer holds every value of
+/// the column, and nothing that reads it as if it did can be trusted: not the distinct count, not
+/// the frequencies, not the sorted order's first and last value, and not the codes as a group key
+/// or a membership index. A reader that finds a column named here decodes its coded pages to plain
+/// strings and answers everything else the way it answers a column with no dictionary.
+///
+/// Same convention as [`CLUSTERING`], written only when a column was demoted, so a file with none
+/// is the bytes it always was. A build that predates it refuses a file that has one with
+/// `directory extension magic differs`, which is the right answer, because that build would trust
+/// the dictionary.
+///
+/// A stripe written after the demotion has no membership index for the column. Its slot in the
+/// stripe is written as a page of no bytes, which no real membership index is, since the smallest
+/// one holds its code count.
+const DEMOTED: &[u8; 8] = b"RUDBDM1\0";
 /// The graph section table, written after the clustering declaration and written even when empty.
 ///
 /// Same convention and the same reason as the block above it, with one difference: this one is
@@ -1068,6 +1088,12 @@ pub struct Table {
     /// Empty rather than a row of zeros on a table that has none, and read with `get` for that
     /// reason, so that a table built by hand in a test does not have to know about it.
     dictionary_payloads: Vec<u64>,
+    /// The columns whose dictionary stopped taking values partway through the load, see
+    /// [`DEMOTED`].
+    ///
+    /// Empty rather than a row of `false` on a table that has none, and read with `get`, for the
+    /// same reason `dictionary_payloads` is.
+    demoted: Vec<bool>,
     frequencies: Vec<Option<Frequencies>>,
     pair_frequencies: Vec<PairFrequencySummary>,
     /// String spellings aligned with each column's frequency entries.
@@ -1433,8 +1459,11 @@ struct GlobalDictionary {
     early: BTreeMap<usize, EncodedBlock>,
     /// Where every block already written to the file is, in block order.
     placed: Vec<Placed>,
-    /// What the load profile was last told this dictionary holds, see [`Self::recharge`].
+    /// What the dictionary held the last time it was asked, see [`Self::recharge`], which is also
+    /// what the load profile was told when there is one.
     charged: u64,
+    /// Whether the dictionary stopped taking values, see [`Self::demote`].
+    demoted: bool,
 }
 
 /// Where one payload block of a global dictionary is in the file, and its checksum.
@@ -1468,6 +1497,7 @@ impl GlobalDictionary {
             early: BTreeMap::new(),
             placed: Vec::new(),
             charged: 0,
+            demoted: false,
         }
     }
 
@@ -1516,16 +1546,36 @@ impl GlobalDictionary {
         bytes as u64
     }
 
-    /// Tells `profile` what the dictionary has grown or shrunk by since the last time.
-    fn recharge(&mut self, profile: Option<&LoadProfile>) {
-        let Some(profile) = profile else { return };
+    /// Tells `profile` what the dictionary has grown or shrunk by since the last time, and hands
+    /// back what it held then and what it holds now.
+    fn recharge(&mut self, profile: Option<&LoadProfile>) -> (u64, u64) {
+        let before = self.charged;
         let now = self.held_bytes();
-        if now >= self.charged {
-            profile.hold(now - self.charged);
-        } else {
-            profile.release(self.charged - now);
+        if let Some(profile) = profile {
+            if now >= before {
+                profile.hold(now - before);
+            } else {
+                profile.release(before - now);
+            }
         }
         self.charged = now;
+        (before, now)
+    }
+
+    /// Stops the dictionary taking values, for good.
+    ///
+    /// The block being filled is sealed so that it goes out with the others, and what the
+    /// dictionary keeps for looking values up is let go of, which on a column of mostly new values
+    /// is most of what it holds. What stays is what the close needs to write the dictionary's page:
+    /// where every value ends, how often each was seen and where its blocks went. The stripes that
+    /// were coded against it still need that page to be read. See [`DEMOTED`].
+    fn demote(&mut self) {
+        if self.demoted {
+            return;
+        }
+        self.seal_rest();
+        self.release_lookup();
+        self.demoted = true;
     }
 
     /// Frees what the dictionary keeps for coding new values, once none are coming.
@@ -1580,6 +1630,9 @@ impl GlobalDictionary {
     }
 
     fn insert(&mut self, text: &[u8], check: u64) -> Result<u32> {
+        if self.demoted {
+            return Err(Error::internal("a value was coded against a demoted dictionary"));
+        }
         let code = u32::try_from(self.ends.len())
             .map_err(|_| invalid("global dictionary has too many values"))?;
         self.filling.extend_from_slice(text);
@@ -1708,8 +1761,9 @@ impl GlobalDictionary {
     /// Seals the part block at the end of the load, if there is one.
     fn seal_rest(&mut self) {
         // Asked of the values rather than of the bytes, because a block of empty strings has values
-        // in it and no bytes, and a column of nulls is exactly that.
-        if self.ends.len() % TEXT_PAYLOAD_VALUES != 0 {
+        // in it and no bytes, and a column of nulls is exactly that. A demoted dictionary sealed its
+        // part block when it was demoted and has taken nothing since.
+        if !self.demoted && self.ends.len() % TEXT_PAYLOAD_VALUES != 0 {
             self.seal();
         }
     }
@@ -1917,7 +1971,7 @@ pub struct Writer {
     dictionaries: Vec<Option<GlobalDictionary>>,
     /// Which columns still have a global dictionary, shared with every [`Preparer`] this writer
     /// hands out so that a stripe prepared after a column lost its dictionary is not coded for it.
-    coded: Arc<[AtomicBool]>,
+    coded: Arc<prepare::Coding>,
     /// One per column, folding the rows into a summary and a sketch as they go past.
     ///
     /// `None` for a column with no hash rule, which is the interval and the nested types. See
@@ -2169,13 +2223,14 @@ impl Writer {
                 .iter()
                 .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
                 .collect(),
-            coded: fields.iter().map(|field| AtomicBool::new(coded_type(&field.ty))).collect(),
+            coded: Arc::new(prepare::Coding::new(fields.iter().map(|field| coded_type(&field.ty)))),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             lent: None,
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
                 dictionary_payloads: Vec::new(),
+                demoted: Vec::new(),
                 distincts: vec![None; fields.len()],
                 fields,
                 stripes: Vec::new(),
@@ -2242,13 +2297,14 @@ impl Writer {
                 .iter()
                 .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
                 .collect(),
-            coded: fields.iter().map(|field| AtomicBool::new(coded_type(&field.ty))).collect(),
+            coded: Arc::new(prepare::Coding::new(fields.iter().map(|field| coded_type(&field.ty)))),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, 1)).collect(),
             lent: None,
             table: Table {
                 name: name.into(),
                 dictionaries: vec![None; fields.len()],
                 dictionary_payloads: Vec::new(),
+                demoted: Vec::new(),
                 distincts: vec![None; fields.len()],
                 fields,
                 stripes: Vec::new(),
@@ -2348,13 +2404,14 @@ impl Writer {
                 .iter()
                 .map(|field| coded_type(&field.ty).then(GlobalDictionary::new))
                 .collect(),
-            coded: fields.iter().map(|field| AtomicBool::new(coded_type(&field.ty))).collect(),
+            coded: Arc::new(prepare::Coding::new(fields.iter().map(|field| coded_type(&field.ty)))),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
             lent: None,
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
                 dictionary_payloads: Vec::new(),
+                demoted: Vec::new(),
                 distincts: vec![None; fields.len()],
                 fields,
                 stripes: Vec::new(),
@@ -2396,6 +2453,15 @@ impl Writer {
     #[must_use]
     pub fn with_profile(mut self, profile: Arc<LoadProfile>) -> Self {
         self.profile = Some(profile);
+        self
+    }
+
+    /// Sets what the table's global dictionaries may hold between them before the one growing
+    /// fastest stops taking values, which is [`DICTIONARY_CAP_BYTES`] unless this says
+    /// otherwise. It applies to every [`Preparer`] and [`Merger`] this writer has handed out too.
+    #[must_use]
+    pub fn with_dictionary_cap(self, bytes: u64) -> Self {
+        self.coded.cap(bytes);
         self
     }
 
@@ -3238,6 +3304,14 @@ impl Writer {
         if let Some(profile) = &profile {
             profile.release(self.dictionaries.iter().flatten().map(|held| held.charged).sum());
         }
+        self.table.demoted = self
+            .dictionaries
+            .iter()
+            .map(|dictionary| dictionary.as_ref().is_some_and(|held| held.demoted))
+            .collect();
+        if !self.table.demoted.contains(&true) {
+            self.table.demoted = Vec::new();
+        }
         self.dictionaries = Vec::new();
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         self.table.frequency_texts = vec![Vec::new(); self.table.fields.len()];
@@ -3245,8 +3319,8 @@ impl Writer {
         for (index, closed) in closed.into_iter().enumerate() {
             let Some(closed) = closed else { continue };
             let ClosedDictionary { distinct, frequencies, texts, hosts, encoded, payload } = closed;
-            self.table.distincts[index] = Some(distinct);
-            self.table.frequencies[index] = Some(Frequencies::Held(frequencies));
+            self.table.distincts[index] = distinct;
+            self.table.frequencies[index] = frequencies.map(Frequencies::Held);
             self.table.frequency_texts[index] = texts;
             if hosts.is_some() {
                 self.table.host_groups = hosts;
@@ -3433,9 +3507,15 @@ impl Writer {
         let (order, flat, bases) = dictionary.ranked_with_values(Some(&*self.file))?;
         // A code nothing counted is a code no non-null row of this column holds, which is the
         // empty string a null was written as and nothing else, because a code is only ever made by
-        // a row asking for one.
-        let distinct = dictionary.counts.iter().filter(|count| **count != 0).count() as u64;
-        let (frequencies, texts) = code_frequency(dictionary, &flat, &bases)?;
+        // a row asking for one. A demoted dictionary counted the stripes before its demotion and
+        // none after, so it has no count or frequency of the column to give.
+        let (distinct, frequencies, texts) = if dictionary.demoted {
+            (None, None, Vec::new())
+        } else {
+            let distinct = dictionary.counts.iter().filter(|count| **count != 0).count() as u64;
+            let (frequencies, texts) = code_frequency(dictionary, &flat, &bases)?;
+            (Some(distinct), Some(frequencies), texts)
+        };
         // Deriving a fixed SQL host expression at load time materializes its answer.
         let hosts = None;
         drop(flat);
@@ -6200,7 +6280,7 @@ impl Reader {
     ///
     /// If the column is outside the schema, or a rank names a code the dictionary does not have.
     pub fn text_extremes(&self, column: usize) -> Result<Option<(Value, Value)>> {
-        if self.null_count(column)? > 0 {
+        if self.null_count(column)? > 0 || self.demoted(column) {
             return Ok(None);
         }
         let Some(dictionary) = self.dictionary(column)? else { return Ok(None) };
@@ -6311,6 +6391,14 @@ impl Reader {
             return Ok(None);
         }
         Ok(Some(summary.entries.clone()))
+    }
+
+    /// Whether the column's dictionary stopped taking values partway through the load, and so
+    /// decodes the stripes written before that and says nothing about the column as a whole. See
+    /// [`DEMOTED`].
+    #[must_use]
+    pub fn demoted(&self, column: usize) -> bool {
+        self.table.demoted.get(column).copied().unwrap_or(false)
     }
 
     /// The global dictionary of a column, opened once however many workers ask for it at once.
@@ -6468,6 +6556,11 @@ impl Reader {
     ///
     /// If the part, column, index page, checksum, or delta stream is invalid.
     pub fn skips_codes(&self, part: usize, column: usize, candidates: &[u32]) -> Result<bool> {
+        // A demoted column's later stripes hold values the dictionary never coded, so no list of
+        // codes can prove a stripe of it holds none of a value.
+        if self.demoted(column) {
+            return Ok(false);
+        }
         if candidates.is_empty() {
             return Ok(true);
         }
@@ -6664,10 +6757,16 @@ impl Reader {
             // projection of a bare column name does the same, and a cut of a flat run copies unless
             // the run is a page. One `Arc` per column per part buys all of those, and it moves the
             // run into the `Arc` without touching a value.
-            let vector = match positions {
+            let mut vector = match positions {
                 None => decode(&field.ty, rows, bytes, dictionary)?,
                 Some(positions) => decode_at(&field.ty, rows, bytes, dictionary, positions)?,
             };
+            // A demoted column's codes are not the column's codes, only the codes of the stripes
+            // written before the demotion, so they are not handed out as if they were. See
+            // [`DEMOTED`].
+            if self.demoted(column) && vector.stable_dictionary_parts().is_some() {
+                vector = vector.flatten()?;
+            }
             picked.push(vector.into_pages());
         }
         Chunk::with_rows(picked, positions.map_or(rows, <[u32]>::len))
@@ -7220,14 +7319,19 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         // decided against giving a dictionary has nothing for it to be about and writes none. Every
         // file written before that decision existed has a dictionary on every varchar column, so
         // this reads those files byte for byte the way it always did.
-        for ((field, dictionary), membership) in
-            table.fields.iter().zip(&table.dictionaries).zip(stripe.memberships.slots())
+        for (column, ((field, dictionary), membership)) in
+            table.fields.iter().zip(&table.dictionaries).zip(stripe.memberships.slots()).enumerate()
         {
             if !coded_type(&field.ty) || dictionary.is_none() {
                 continue;
             }
-            let page =
-                membership.ok_or_else(|| invalid("string page has no code membership index"))?;
+            let page = match membership {
+                Some(page) => page,
+                None if table.demoted.get(column).copied().unwrap_or(false) => {
+                    Page { offset: HEADER, length: 0, hash: 0 }
+                }
+                None => return Err(invalid("string page has no code membership index")),
+            };
             put_u64(&mut out, page.offset);
             put_u32(&mut out, page.length);
             put_u64(&mut out, page.hash);
@@ -7447,6 +7551,22 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             put_u16(
                 &mut out,
                 u16::try_from(column).map_err(|_| invalid("clustering column index overflow"))?,
+            );
+        }
+    }
+    let demoted = (0..table.fields.len())
+        .filter(|&column| table.demoted.get(column).copied().unwrap_or(false))
+        .collect::<Vec<_>>();
+    if !demoted.is_empty() {
+        out.extend_from_slice(DEMOTED);
+        put_u16(
+            &mut out,
+            u16::try_from(demoted.len()).map_err(|_| invalid("too many demoted columns"))?,
+        );
+        for column in demoted {
+            put_u16(
+                &mut out,
+                u16::try_from(column).map_err(|_| invalid("demoted column index overflow"))?,
             );
         }
     }
@@ -8681,7 +8801,11 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             if page.offset < HEADER || end > size || page.length as usize > MAX_PAGE {
                 return Err(invalid("membership page range is outside the file"));
             }
-            memberships[column] = Some(page);
+            // No bytes is a stripe written after the column's dictionary was demoted, see
+            // [`DEMOTED`], which is checked once the block that says so has been read.
+            if page.length != 0 {
+                memberships[column] = Some(page);
+            }
         }
         let mut sieves = vec![None; width];
         for sieve in sieves.iter_mut().take(width) {
@@ -8807,6 +8931,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut frequency_texts = vec![Vec::new(); width];
     let mut seen_frequency_texts = false;
     let mut host_groups = None;
+    let mut demoted = Vec::new();
     let mut seen_sections = false;
     let mut dictionary_payloads = Vec::new();
     let mut seen_payloads = false;
@@ -8993,6 +9118,22 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             clustering = Some(Clustering::new(columns, bucket, &fields).map_err(|_| {
                 invalid("stored clustering declaration does not match the table it is on")
             })?);
+        } else if &tag == DEMOTED {
+            if !demoted.is_empty() {
+                return Err(invalid("directory names two demoted column blocks"));
+            }
+            let count = cur.u16()? as usize;
+            if count == 0 || count > width {
+                return Err(invalid("demoted column count is outside the schema"));
+            }
+            demoted = vec![false; width];
+            for _ in 0..count {
+                let column = cur.u16()? as usize;
+                if dictionaries.get(column).copied().flatten().is_none() || demoted[column] {
+                    return Err(invalid("a demoted column is repeated or has no dictionary"));
+                }
+                demoted[column] = true;
+            }
         } else if &tag == SECTIONS {
             if seen_sections {
                 return Err(invalid("directory names two section tables"));
@@ -9047,6 +9188,17 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     if !cur.done() {
         return Err(invalid("directory has trailing bytes"));
     }
+    for stripe in &stripes {
+        for (column, field) in fields.iter().enumerate() {
+            if coded_type(&field.ty)
+                && dictionaries[column].is_some()
+                && stripe.memberships.get(column).is_none()
+                && !demoted.get(column).copied().unwrap_or(false)
+            {
+                return Err(invalid("string page has no code membership index"));
+            }
+        }
+    }
     Ok(Table {
         name,
         fields,
@@ -9054,6 +9206,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         rows,
         dictionaries,
         dictionary_payloads,
+        demoted,
         distincts,
         frequencies,
         pair_frequencies,
@@ -10139,8 +10292,9 @@ enum Closed {
 
 /// What [`Writer::close_dictionary`] builds for one column and [`Writer::close`] writes.
 struct ClosedDictionary {
-    distinct: u64,
-    frequencies: FrequencySummary,
+    /// `None` for a demoted dictionary, which holds only some of the column. See [`DEMOTED`].
+    distinct: Option<u64>,
+    frequencies: Option<FrequencySummary>,
     texts: Vec<Option<Vec<u8>>>,
     hosts: Option<host::HostSummary>,
     encoded: EncodedDictionary,
@@ -11940,6 +12094,7 @@ mod tests {
             rows: 0,
             dictionaries: vec![None],
             dictionary_payloads: Vec::new(),
+            demoted: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
             pair_frequencies: Vec::new(),
@@ -15537,6 +15692,7 @@ mod tests {
             rows: 0,
             dictionaries: vec![Some(dictionary)],
             dictionary_payloads: Vec::new(),
+            demoted: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
             pair_frequencies: Vec::new(),
@@ -16128,5 +16284,35 @@ mod tests {
         let wanted: Vec<Vec<u8>> =
             [&b""[..], b"app", b"apple", b"apples", b"pear"].iter().map(|v| v.to_vec()).collect();
         assert_eq!(seen, wanted, "shorter first where one runs out inside another");
+    }
+
+    /// A demoted dictionary gives back what it kept for looking values up, the load profile is told,
+    /// and it refuses any value after that.
+    #[test]
+    fn a_demoted_dictionary_holds_less_and_takes_no_more_values() {
+        let profile = LoadProfile::begin("demoted");
+        let mut dictionary = GlobalDictionary::new();
+        for value in 0..50_000 {
+            dictionary.code(&format!("https://example.com/page/{value}")).expect("a code");
+        }
+        let (_, grown) = dictionary.recharge(Some(&profile));
+        assert_eq!(profile.held(), grown, "the profile holds what the dictionary does");
+
+        dictionary.demote();
+        let (before, after) = dictionary.recharge(Some(&profile));
+        assert_eq!(before, grown);
+        // What stays is the ends, the counts and the blocks not yet written, which a load writes
+        // as it goes, so here the drop is the hash tables and the check hashes.
+        assert!(after < grown - grown / 4, "the lookup is let go of: {after} of {grown}");
+        assert_eq!(profile.held(), after, "the profile was told about the drop");
+        assert!(dictionary.code("one more").is_err(), "a demoted dictionary takes no values");
+
+        dictionary.demote();
+        assert_eq!(
+            dictionary.recharge(Some(&profile)),
+            (after, after),
+            "demoting twice is a no-op"
+        );
+        assert_eq!(dictionary.values(), 50_000, "the values coded before stay");
     }
 }
