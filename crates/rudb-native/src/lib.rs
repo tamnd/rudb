@@ -63,7 +63,7 @@ pub use zones::{Common, Stripes, distincts};
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";
 const CATALOG: &[u8; 8] = b"RUDBCA10";
-const FORMAT: u32 = 26;
+const FORMAT: u32 = 27;
 
 /// Formats this build can open.
 ///
@@ -81,12 +81,16 @@ const FORMAT: u32 = 26;
 /// catalog that ends where the tables end reads as a catalog with no views in it. What takes it
 /// from 25 to 26 is that a global dictionary's payload blocks now say where they are, and a file
 /// written before that has them behind one another, which [`open_global_dictionary`] reads by
-/// turning the ends it finds into the same places the newer files name outright.
+/// turning the ends it finds into the same places the newer files name outright. What takes it
+/// from 26 to 27 is that those blocks are written into the file as the load goes, between the
+/// stripes, rather than behind the dictionary's index at the end, so the dictionary's page is the
+/// index and the sorted order and nothing else. A format 26 file has its blocks inside the page,
+/// and the reader tells the two apart by whether the page has room left over for them.
 ///
-/// This is not a general compatibility promise. Five formats are readable because there was a
+/// This is not a general compatibility promise. Six formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
 /// carrying.
-const READABLE: &[u32] = &[22, 23, 24, 25, FORMAT];
+const READABLE: &[u32] = &[22, 23, 24, 25, 26, FORMAT];
 
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
@@ -116,6 +120,14 @@ const CLUSTERING: &[u8; 8] = b"RUDBCL1\0";
 /// that safe to add without a format bump, because a table with no sections answers every query
 /// the way it did before, only without the graph path.
 const SECTIONS: &[u8; 8] = b"RUDBSE1\0";
+/// How many bytes of each column's global dictionary live outside its page, written only when any do.
+///
+/// From format 27 a dictionary's payload blocks are written into the file while the load runs, so
+/// they sit between the stripes and the dictionary's page covers only its index and sorted order.
+/// Nothing needs the total to read the file, because the index names every block. It is here for
+/// what a file costs a column, which [`Reader::layout`] and the statistics budget both report, and
+/// which would otherwise lose most of the bytes of every large string column.
+const DICTIONARY_PAYLOADS: &[u8; 8] = b"RUDBDP1\0";
 
 /// The most sections one table's directory may name.
 ///
@@ -184,6 +196,12 @@ fn span_bytes(spans: &[Span], at: usize) -> u64 {
 /// One column's page out of a per column list, or zero when that column has no page at all.
 fn page_bytes(pages: &[Option<Page>], at: usize) -> u64 {
     pages.get(at).and_then(Option::as_ref).map_or(0, Page::bytes)
+}
+
+/// Everything one column's global dictionary costs the file, its page and the blocks outside it.
+fn dictionary_bytes(table: &Table, at: usize) -> u64 {
+    page_bytes(&table.dictionaries, at)
+        .saturating_add(table.dictionary_payloads.get(at).copied().unwrap_or(0))
 }
 
 /// The xxHash64 of `bytes`, which is what every span this format stores is checked against.
@@ -429,6 +447,12 @@ pub struct Table {
     stripes: Vec<Stripe>,
     rows: usize,
     dictionaries: Vec<Option<Page>>,
+    /// Bytes of each column's dictionary payload that are outside its page, which is all of them
+    /// from format 27 and none of them before. See [`DICTIONARY_PAYLOADS`].
+    ///
+    /// Empty rather than a row of zeros on a table that has none, and read with `get` for that
+    /// reason, so that a table built by hand in a test does not have to know about it.
+    dictionary_payloads: Vec<u64>,
     frequencies: Vec<Option<FrequencySummary>>,
     /// How many distinct values each column holds, for the columns that know.
     ///
@@ -749,8 +773,22 @@ struct GlobalDictionary {
     shape: Option<chooser::Settled>,
     /// How many blocks had filled when that shape was settled.
     settled: usize,
-    /// The blocks that are encoded, in block order.
+    /// The blocks that are encoded and not yet in the file, in block order, following `placed`.
+    ///
+    /// Empty between stripes, because [`Writer::place_blocks`] writes them the moment
+    /// [`encode_ready`] hands them back. Only a dictionary that never meets a writer, which is a
+    /// test's, keeps them here.
     blocks: Vec<Vec<u8>>,
+    /// Where every block already written to the file is, in block order.
+    placed: Vec<Placed>,
+}
+
+/// Where one payload block of a global dictionary is in the file, and its checksum.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    start: u64,
+    length: u64,
+    hash: u64,
 }
 
 impl GlobalDictionary {
@@ -769,12 +807,18 @@ impl GlobalDictionary {
             shape: None,
             settled: 0,
             blocks: Vec::new(),
+            placed: Vec::new(),
         }
     }
 
     /// How many distinct values this dictionary holds, which is one past its largest code.
     fn values(&self) -> usize {
         self.ends.len()
+    }
+
+    /// How many blocks are encoded, written or not, which is the number the next one has to have.
+    fn encoded(&self) -> usize {
+        self.placed.len() + self.blocks.len()
     }
 
     fn code(&mut self, text: &str) -> Result<u32> {
@@ -880,7 +924,7 @@ impl GlobalDictionary {
             self.seal();
         }
         for (at, bytes) in std::mem::take(&mut self.waiting) {
-            if self.blocks.len() != at {
+            if self.encoded() != at {
                 return Err(Error::internal("a dictionary block was encoded out of order"));
             }
             let values = self.slices(at, &bytes);
@@ -899,13 +943,30 @@ impl GlobalDictionary {
     /// takes the columns one at a time rather than across threads. One column's values is 1.3 GB on
     /// the worst ClickBench column, and five columns of that at once is the peak this was all meant
     /// to remove.
-    fn decoded(&self) -> Result<(Vec<u8>, Vec<u64>)> {
+    ///
+    /// The blocks already written are read back out of `file`, a block at a time, so what this holds
+    /// beyond the answer is one encoded block. They were written moments or minutes ago and are
+    /// almost always still in the page cache, so this is a copy rather than a read of the disk.
+    fn decoded(&self, file: Option<&File>) -> Result<(Vec<u8>, Vec<u64>)> {
         let mut flat = Vec::new();
-        let mut bases = Vec::with_capacity(self.blocks.len());
+        let mut bases = Vec::with_capacity(self.encoded());
+        let mut stored = Vec::new();
+        for place in &self.placed {
+            let file =
+                file.ok_or_else(|| Error::internal("a written dictionary block has no file"))?;
+            let length = usize::try_from(place.length)
+                .map_err(|_| invalid("global dictionary block does not fit in memory"))?;
+            stored.resize(length, 0);
+            read_at(file, place.start, &mut stored)?;
+            if checksum(&stored) != place.hash {
+                return Err(invalid("a global dictionary block did not read back as written"));
+            }
+            bases.push(flat.len() as u64);
+            flat.extend_from_slice(&string::decode_flat(&stored)?.into_bytes());
+        }
         for block in &self.blocks {
             bases.push(flat.len() as u64);
-            let values = string::decode_flat(block)?;
-            flat.extend_from_slice(&values.into_bytes());
+            flat.extend_from_slice(&string::decode_flat(block)?.into_bytes());
         }
         Ok((flat, bases))
     }
@@ -941,8 +1002,8 @@ impl GlobalDictionary {
     /// The heads are kept because a reader searching this order wants a comparison it can make out
     /// of the index alone. What they buy there depends entirely on the column and is much less than
     /// it looks on the columns that cost the most, which [`sort_by_value`] measures.
-    fn ranked(&self) -> Result<Vec<(u64, u32)>> {
-        let (flat, bases) = self.decoded()?;
+    fn ranked(&self, file: Option<&File>) -> Result<Vec<(u64, u32)>> {
+        let (flat, bases) = self.decoded(file)?;
         let value = |code: u32| {
             let (from, to) = Self::value_span(&self.ends, &bases, code as usize);
             flat.get(from..to).unwrap_or_default()
@@ -1178,6 +1239,7 @@ impl Writer {
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
+                dictionary_payloads: Vec::new(),
                 distincts: vec![None; fields.len()],
                 fields,
                 stripes: Vec::new(),
@@ -1226,6 +1288,7 @@ impl Writer {
             table: Table {
                 name: name.into(),
                 dictionaries: vec![None; fields.len()],
+                dictionary_payloads: Vec::new(),
                 distincts: vec![None; fields.len()],
                 fields,
                 stripes: Vec::new(),
@@ -1324,6 +1387,7 @@ impl Writer {
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
+                dictionary_payloads: Vec::new(),
                 distincts: vec![None; fields.len()],
                 fields,
                 stripes: Vec::new(),
@@ -1683,6 +1747,28 @@ impl Writer {
             .collect()
     }
 
+    /// Writes every encoded dictionary block that is not in the file yet and forgets its bytes.
+    ///
+    /// This is what keeps a load from holding its dictionaries' payload. The blocks land between
+    /// stripes wherever the writer is, which is fine because the index says where each one is.
+    fn place_blocks(&mut self) -> Result<()> {
+        let mut dictionaries = std::mem::take(&mut self.dictionaries);
+        let placed = dictionaries.iter_mut().flatten().try_for_each(|dictionary| {
+            for block in std::mem::take(&mut dictionary.blocks) {
+                let start = self.at;
+                self.put(&block)?;
+                dictionary.placed.push(Placed {
+                    start,
+                    length: block.len() as u64,
+                    hash: checksum(&block),
+                });
+            }
+            Ok(())
+        });
+        self.dictionaries = dictionaries;
+        placed
+    }
+
     /// Writes the buffered parts as one stripe, each column's parts contiguous on disk.
     fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
@@ -1697,6 +1783,7 @@ impl Writer {
         // Before a byte of the stripe is written, because the raw bytes this frees are the bytes the
         // load peaks on and the threads it uses are idle between here and the next chunk arriving.
         encode_ready(&mut self.dictionaries)?;
+        self.place_blocks()?;
         let mut pages = Vec::with_capacity(width);
         let mut memberships = vec![None; width];
         let mut ranges = Vec::with_capacity(width);
@@ -2065,33 +2152,39 @@ impl Writer {
         let (frequencies, distincts) = self.numeric_frequencies()?.into_iter().unzip();
         self.table.frequencies = frequencies;
         self.table.distincts = distincts;
+        for dictionary in self.dictionaries.iter_mut().flatten() {
+            dictionary.finish_blocks()?;
+        }
+        self.place_blocks()?;
         let dictionaries = std::mem::take(&mut self.dictionaries);
+        self.table.dictionary_payloads = vec![0; self.table.fields.len()];
         // One column at a time, and every column's values dropped before the next column's are read
         // back. Sorting the columns across threads is the obvious thing and was what this did, but
         // sorting a column now means decoding it, and five ClickBench string columns decoded at once
         // is the peak this change is about.
         for (index, dictionary) in dictionaries.into_iter().enumerate() {
-            let Some(mut dictionary) = dictionary else { continue };
-            dictionary.finish_blocks()?;
-            let order = dictionary.ranked()?;
+            let Some(dictionary) = dictionary else { continue };
+            let order = dictionary.ranked(Some(&self.file))?;
             // A code nothing counted is a code no non-null row of this column holds, which is the
             // empty string a null was written as and nothing else, because a code is only ever made
             // by a row asking for one.
             self.table.distincts[index] =
                 Some(dictionary.counts.iter().filter(|count| **count != 0).count() as u64);
             self.table.frequencies[index] = Some(code_frequency(&dictionary));
+            let encoded = encode_global_dictionary(&dictionary, &order, &dictionary.placed, true)?;
+            drop(order);
             let offset = self.at;
-            let encoded = encode_global_dictionary(dictionary, &order, offset, true)?;
             self.put(&encoded.index)?;
             self.put(&encoded.ranks)?;
-            for block in &encoded.payload {
-                self.put(block)?;
-            }
-            let payload_len =
-                encoded.payload.iter().try_fold(0_usize, |len, block| len.checked_add(block.len()));
-            let length = payload_len
-                .and_then(|len| len.checked_add(encoded.index.len()))
-                .and_then(|len| len.checked_add(encoded.ranks.len()))
+            self.table.dictionary_payloads[index] = dictionary
+                .placed
+                .iter()
+                .try_fold(0_u64, |sum, place| sum.checked_add(place.length))
+                .ok_or_else(|| invalid("global dictionary payload overflow"))?;
+            let length = encoded
+                .index
+                .len()
+                .checked_add(encoded.ranks.len())
                 .ok_or_else(|| invalid("dictionary page length overflow"))?;
             self.table.dictionaries[index] = Some(Page {
                 offset,
@@ -3741,7 +3834,7 @@ impl Reader {
                 memberships: sum(stripes.iter().map(|stripe| page_bytes(&stripe.memberships, at))),
                 sieves: sum(stripes.iter().map(|stripe| page_bytes(&stripe.sieves, at))),
                 part_ranges: sum(stripes.iter().map(|stripe| page_bytes(&stripe.part_ranges, at))),
-                dictionary: page_bytes(&table.dictionaries, at),
+                dictionary: dictionary_bytes(table, at),
             })
             .collect();
         Layout {
@@ -5190,6 +5283,16 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
     for held in &table.sections {
         held.encode(&mut out)?;
     }
+    if table.dictionary_payloads.iter().any(|&bytes| bytes != 0) {
+        out.extend_from_slice(DICTIONARY_PAYLOADS);
+        put_u16(
+            &mut out,
+            u16::try_from(table.fields.len()).map_err(|_| invalid("too many columns"))?,
+        );
+        for at in 0..table.fields.len() {
+            put_u64(&mut out, table.dictionary_payloads.get(at).copied().unwrap_or(0));
+        }
+    }
     Ok(out)
 }
 
@@ -5714,6 +5817,8 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
     let mut clustering = None;
     let mut sections = Vec::new();
     let mut seen_sections = false;
+    let mut dictionary_payloads = Vec::new();
+    let mut seen_payloads = false;
     // Zero until a section table says otherwise, which is what a format 22 table gets and what
     // makes every section stamp fail to match on one, because real generations start at one.
     let mut generation = 0;
@@ -5766,6 +5871,23 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
                     return Err(invalid("a section with no extents names an extent table"));
                 }
             }
+        } else if &tag == DICTIONARY_PAYLOADS {
+            if seen_payloads {
+                return Err(invalid("directory names two dictionary payload blocks"));
+            }
+            seen_payloads = true;
+            let count = cur.u16()? as usize;
+            if count != fields.len() {
+                return Err(invalid("dictionary payload block does not match the table's columns"));
+            }
+            dictionary_payloads = Vec::with_capacity(count);
+            for _ in 0..count {
+                let bytes = cur.u64()?;
+                if bytes > size {
+                    return Err(invalid("a dictionary payload is larger than the file"));
+                }
+                dictionary_payloads.push(bytes);
+            }
         } else {
             return Err(invalid("directory extension magic differs"));
         }
@@ -5779,6 +5901,7 @@ fn decode_directory(bytes: &[u8], size: u64) -> Result<Table> {
         stripes,
         rows,
         dictionaries,
+        dictionary_payloads,
         distincts,
         frequencies,
         clustering,
@@ -6748,9 +6871,6 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
 struct EncodedDictionary {
     index: Vec<u8>,
     ranks: Vec<u8>,
-    /// The payload as the blocks it is written as, kept apart rather than joined because joining
-    /// them is a second copy of a thing that is already gigabytes on the columns that matter.
-    payload: Vec<Vec<u8>>,
 }
 
 /// Sorts codes into the byte order of the values they name, eight bytes of depth at a time.
@@ -6831,21 +6951,20 @@ fn head(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(word)
 }
 
-/// One column's dictionary as the three runs of bytes a file holds it in.
+/// One column's dictionary page, which is its index and its sorted order.
 ///
-/// `base` is where the index is going to land, which the caller knows because it is about to write
-/// it there. It is needed rather than worked out afterwards because with `scattered` set the index
-/// names the place of every payload block in the file, and the index is what stands between `base`
-/// and the first of them.
+/// The payload is not in it. Its blocks are in the file already, written as each was encoded, and
+/// `places` says where, in block order. With `scattered` set the index records each block's start
+/// and length, so a reader can find one wherever it went.
 ///
 /// `scattered` false lays the blocks out the way a file written before format 26 has them, one
 /// behind the next with only the ends recorded. Nothing in the writer asks for that any more. It is
 /// kept because [`open_global_dictionary`] still reads those files and a reading path that nothing
 /// can produce is a reading path nothing tests.
 fn encode_global_dictionary(
-    dictionary: GlobalDictionary,
+    dictionary: &GlobalDictionary,
     order: &[(u64, u32)],
-    base: u64,
+    places: &[Placed],
     scattered: bool,
 ) -> Result<EncodedDictionary> {
     let values = dictionary.values();
@@ -6853,15 +6972,12 @@ fn encode_global_dictionary(
         return Err(invalid("global dictionary order does not cover its values"));
     }
     let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
-    let payload = dictionary.blocks;
-    if payload.len() != blocks {
+    if places.len() != blocks {
         return Err(invalid("global dictionary payload is not the blocks it says it is"));
     }
     let (ranks, rank_ends) = encode_ranks(order, code_width(values))?;
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
     let offset_bits = offset_width(&dictionary.ends);
-    // Worked out rather than measured at the end, because the places written into the index below
-    // are places in the file and the index is what stands between `base` and the first of them.
     let payload_words = if scattered { 3 } else { 2 };
     let index_len = DICTIONARY_HEADER
         .checked_add(offset_bytes(values, offset_bits))
@@ -6884,29 +7000,21 @@ fn encode_global_dictionary(
     // Where each block is and how long it is, so a reader can find one. The stored blocks are
     // shorter than the decoded ones and by a different amount each, so their lengths are the one
     // thing the offsets above no longer say, and where they start is no longer arithmetic on the
-    // block before once a block can be written the moment it fills.
-    let mut at = if scattered {
-        base.checked_add(index_len as u64)
-            .and_then(|at| at.checked_add(ranks.len() as u64))
-            .ok_or_else(|| invalid("global dictionary payload overflow"))?
-    } else {
-        0
-    };
-    for block in &payload {
+    // block before once a block is written the moment it is encoded.
+    let mut end = 0_u64;
+    for place in places {
         if scattered {
-            put_u64(&mut index, at);
-        }
-        at = at
-            .checked_add(block.len() as u64)
-            .ok_or_else(|| invalid("global dictionary payload overflow"))?;
-        if scattered {
-            put_u64(&mut index, block.len() as u64);
+            put_u64(&mut index, place.start);
+            put_u64(&mut index, place.length);
         } else {
-            put_u64(&mut index, at);
+            end = end
+                .checked_add(place.length)
+                .ok_or_else(|| invalid("global dictionary payload overflow"))?;
+            put_u64(&mut index, end);
         }
     }
-    for block in &payload {
-        put_u64(&mut index, checksum(block));
+    for place in places {
+        put_u64(&mut index, place.hash);
     }
     // The same two lists for the sorted order. A rank block is packed at whatever width its own
     // heads need, so where one ends is no longer arithmetic on the block number.
@@ -6922,13 +7030,10 @@ fn encode_global_dictionary(
         put_u64(&mut index, checksum(&ranks[at..end]));
         at = end;
     }
-    // The places above were worked out from this length before a byte of it existed, so a mismatch
-    // here is every block offset in the file being wrong by the same amount, which is worth one
-    // comparison to find out about now rather than on the read.
     if index.len() != index_len {
         return Err(invalid("global dictionary index is not the length it was laid out for"));
     }
-    Ok(EncodedDictionary { index, ranks, payload })
+    Ok(EncodedDictionary { index, ranks })
 }
 
 /// How many blocks of the payload the shape is settled on.
@@ -7065,7 +7170,7 @@ fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
         made.sort_by_key(|(at, _)| *at);
         let waiting = std::mem::take(&mut held.waiting);
         for ((block, _), (_, bytes)) in waiting.into_iter().zip(made) {
-            if held.blocks.len() != block {
+            if held.encoded() != block {
                 return Err(Error::internal("a dictionary block was encoded out of order"));
             }
             held.blocks.push(bytes);
@@ -7241,11 +7346,20 @@ fn open_global_dictionary(
         (starts, lengths)
     };
     // What the offsets bound is the decoded payload, and what the page length counts is the stored
-    // one, so the block lengths adding up to the rest of it is the one thing that ties the index to
-    // the page. Adding up rather than reaching the end, because a block that says where it is need
-    // not be behind the one before it, and the weight is the part that still has to agree.
+    // one, so on a format 26 file the block lengths adding up to the rest of the page is the one
+    // thing that ties the index to the page. From format 27 the blocks are written during the load
+    // and the page is only the index and the order, so there the most that can be said is that
+    // every block is somewhere in the file past its header.
     let stored_len = page.length as u64 - body_len as u64;
-    if lengths.iter().try_fold(0_u64, |sum, len| sum.checked_add(*len)) != Some(stored_len) {
+    if scattered && stored_len == 0 {
+        let size = file.metadata().map_err(io)?.len();
+        let inside = starts.iter().zip(&lengths).all(|(&start, &len)| {
+            start >= HEADER && start.checked_add(len).is_some_and(|end| end <= size)
+        });
+        if !inside {
+            return Err(invalid("global dictionary block lies outside the file"));
+        }
+    } else if lengths.iter().try_fold(0_u64, |sum, len| sum.checked_add(*len)) != Some(stored_len) {
         return Err(invalid("global dictionary blocks do not bound the payload"));
     }
     Vector::external_text(
@@ -7731,7 +7845,7 @@ mod tests {
     ///
     /// Only valid once `finish_blocks` has run, because until then the last part block is still raw.
     fn dictionary_values(dictionary: &GlobalDictionary) -> Vec<Vec<u8>> {
-        let (flat, bases) = dictionary.decoded().expect("the blocks decode");
+        let (flat, bases) = dictionary.decoded(None).expect("the blocks decode");
         (0..dictionary.values())
             .map(|code| {
                 let (from, to) = GlobalDictionary::value_span(&dictionary.ends, &bases, code);
@@ -7848,24 +7962,6 @@ mod tests {
             + offset_bytes(count as usize, bits) as u64
             + blocks * payload_words * 8
             + rank_blocks * 16
-    }
-
-    /// How long the sorted order is, which is where its last block ends.
-    fn last_rank_end(file: &File, offset: u64, header: &[u8; DICTIONARY_HEADER]) -> u64 {
-        let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
-        let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
-        let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
-        let bits = (width & !DICTIONARY_SCATTERED) as usize;
-        let payload_words = if width & DICTIONARY_SCATTERED == 0 { 2 } else { 3 };
-        let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
-        let at = offset
-            + DICTIONARY_HEADER as u64
-            + offset_bytes(count as usize, bits) as u64
-            + blocks * payload_words * 8
-            + (rank_blocks - 1) * 8;
-        let mut end = [0; 8];
-        read_at(file, at, &mut end).expect("the last rank block end");
-        u64::from_le_bytes(end)
     }
 
     fn sample() -> Chunk {
@@ -7992,6 +8088,7 @@ mod tests {
             stripes: Vec::new(),
             rows: 0,
             dictionaries: vec![None],
+            dictionary_payloads: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
             clustering: None,
@@ -9831,11 +9928,17 @@ mod tests {
         // else to the index does not silently turn this into a test that damages the index.
         let mut header = [0; DICTIONARY_HEADER];
         read_at(&reader.file, dictionary.offset, &mut header).expect("dictionary header");
-        let index_len = dictionary_index_len(&header);
-        let rank_len = last_rank_end(&reader.file, dictionary.offset, &header);
+        // The first block's start is the first word after the offsets, since the blocks are written
+        // during the load and are wherever the writer was when each was encoded.
+        let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
+        let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
+        assert_ne!(width & DICTIONARY_SCATTERED, 0, "the blocks say where they are");
+        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let mut start = [0; 8];
+        let at = dictionary.offset + (DICTIONARY_HEADER + offset_bytes(count, bits)) as u64;
+        read_at(&reader.file, at, &mut start).expect("the first block's start");
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
-        file.seek(SeekFrom::Start(dictionary.offset + index_len + rank_len))
-            .expect("inside dictionary payload");
+        file.seek(SeekFrom::Start(u64::from_le_bytes(start))).expect("inside dictionary payload");
         file.write_all(&[255]).expect("damage dictionary payload");
 
         let chunk = reader.read(0, &[1]).expect("code page and dictionary index remain valid");
@@ -9961,9 +10064,20 @@ mod tests {
             assert_eq!(chunk.value_at(0, 0), Value::Varchar(value(part * per_part)));
         }
 
+        // The last block is wherever the writer was when it was encoded, which the index says.
+        let mut header = [0; DICTIONARY_HEADER];
+        read_at(&reader.file, dictionary.offset, &mut header).expect("dictionary header");
+        let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
+        let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
+        let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
+        let bits = (width & !DICTIONARY_SCATTERED) as usize;
+        let mut place = [0; 16];
+        let at = DICTIONARY_HEADER + offset_bytes(count, bits) + (blocks - 1) * 16;
+        read_at(&reader.file, dictionary.offset + at as u64, &mut place).expect("its place");
+        let start = u64::from_le_bytes(place[..8].try_into().expect("eight bytes"));
+        let length = u64::from_le_bytes(place[8..].try_into().expect("eight bytes"));
         let mut file = OpenOptions::new().write(true).open(&path).expect("open dictionary page");
-        file.seek(SeekFrom::Start(dictionary.offset + u64::from(dictionary.length) - 4))
-            .expect("the last bytes of the page are payload");
+        file.seek(SeekFrom::Start(start + length - 4)).expect("the last bytes of the last block");
         file.write_all(&[255]).expect("damage the last payload block");
         let reader = Reader::open(&path).expect("the directory and the index are untouched");
         let chunk = reader.read(parts - 1, &[0]).expect("the code page remains valid");
@@ -10510,11 +10624,13 @@ mod tests {
         }
     }
 
-    /// Both block layouts come back as the same values in the same order.
+    /// All three block layouts come back as the same values in the same order.
     ///
-    /// The scattered one is what every file this build writes holds. The other is what a file
-    /// written before format 26 holds, and nothing in the writer produces it any more, so the only
-    /// way to find out whether the reader still understands those files is to write one here. The
+    /// Blocks outside the page are what every file this build writes holds. Blocks that say where
+    /// they are but sit inside the page behind the order are format 26, and blocks behind one
+    /// another with only their ends recorded are older still. Nothing in the writer produces the
+    /// last two any more, so the only way to find out whether the reader still understands those
+    /// files is to write them here. The
     /// bytes go straight into a file with no directory around them, because what is under test is
     /// [`open_global_dictionary`], which is handed a page and a file and asks the directory for
     /// nothing.
@@ -10528,26 +10644,59 @@ mod tests {
             .map(|index| format!("value {index:08} {}", "y".repeat(index % 40)))
             .collect::<Vec<_>>();
         let mut read = Vec::new();
-        for scattered in [true, false] {
+        for layout in ["outside", "inside", "behind"] {
             let mut dictionary = GlobalDictionary::new();
             for text in &spellings {
                 dictionary.code(text).expect("a code for every spelling");
             }
             dictionary.finish_blocks().expect("the last block encodes");
-            let order = dictionary.ranked().expect("a sorted order");
-            let encoded =
-                encode_global_dictionary(dictionary, &order, 0, scattered).expect("an encoding");
-            let mut bytes = encoded.index.clone();
-            bytes.extend_from_slice(&encoded.ranks);
-            for block in &encoded.payload {
-                bytes.extend_from_slice(block);
-            }
-            let path = path(if scattered { "blocks-scattered" } else { "blocks-behind" });
+            let order = dictionary.ranked(None).expect("a sorted order");
+            // Where the blocks go if they start at `from` and follow one another.
+            let laid = |from: u64| {
+                let mut at = from;
+                dictionary
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        let place =
+                            Placed { start: at, length: block.len() as u64, hash: checksum(block) };
+                        at += block.len() as u64;
+                        place
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let payload = dictionary.blocks.concat();
+            let scattered = layout != "behind";
+            let (bytes, encoded, offset, length) = if layout == "outside" {
+                let mut bytes = vec![0; HEADER as usize];
+                bytes.extend_from_slice(&payload);
+                let encoded = encode_global_dictionary(&dictionary, &order, &laid(HEADER), true)
+                    .expect("an encoding");
+                let offset = bytes.len() as u64;
+                bytes.extend_from_slice(&encoded.index);
+                bytes.extend_from_slice(&encoded.ranks);
+                let length = encoded.index.len() + encoded.ranks.len();
+                (bytes, encoded, offset, length)
+            } else {
+                // The index is the same length wherever the blocks are, so a first pass says where
+                // the page ends and the second writes the places that follow it.
+                let first = encode_global_dictionary(&dictionary, &order, &laid(0), scattered)
+                    .expect("an encoding");
+                let body = (first.index.len() + first.ranks.len()) as u64;
+                let encoded = encode_global_dictionary(&dictionary, &order, &laid(body), scattered)
+                    .expect("an encoding");
+                let mut bytes = encoded.index.clone();
+                bytes.extend_from_slice(&encoded.ranks);
+                bytes.extend_from_slice(&payload);
+                let length = bytes.len();
+                (bytes, encoded, 0, length)
+            };
+            let path = path(&format!("blocks-{layout}"));
             fs::write(&path, &bytes).expect("the dictionary is written on its own");
             let file = Arc::new(File::open(&path).expect("it opens again"));
             let page = Page {
-                offset: 0,
-                length: u32::try_from(bytes.len()).expect("a test dictionary is small"),
+                offset,
+                length: u32::try_from(length).expect("a test dictionary is small"),
                 hash: checksum(&encoded.index),
             };
             let opened =
@@ -10568,8 +10717,9 @@ mod tests {
         }
         let wanted =
             spellings.iter().map(|text| text.as_bytes().to_vec()).collect::<Vec<Vec<u8>>>();
-        assert_eq!(read[0], wanted, "the blocks that say where they are hold the values");
-        assert_eq!(read[1], read[0], "the blocks behind one another hold the same values");
+        assert_eq!(read[0], wanted, "the blocks outside the page hold the values");
+        assert_eq!(read[1], read[0], "the blocks inside the page hold the same values");
+        assert_eq!(read[2], read[0], "the blocks behind one another hold the same values");
     }
 
     /// A dictionary at its budget sweeps without keeping, and still answers what it answered.
@@ -10690,6 +10840,7 @@ mod tests {
             stripes: Vec::new(),
             rows: 0,
             dictionaries: vec![Some(dictionary)],
+            dictionary_payloads: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
             clustering: None,
@@ -11150,7 +11301,7 @@ mod tests {
             dictionary.code(value).expect("a code for every value");
         }
         dictionary.finish_blocks().expect("the last block encodes");
-        let ranked = dictionary.ranked().expect("a sorted order");
+        let ranked = dictionary.ranked(None).expect("a sorted order");
         assert_eq!(ranked.len(), values.len(), "one entry a distinct value");
 
         let spellings = dictionary_values(&dictionary);
@@ -11212,7 +11363,7 @@ mod tests {
     #[test]
     fn a_short_dictionary_sorts_without_a_bucketing_pass() {
         let empty = GlobalDictionary::new();
-        assert!(empty.ranked().expect("an empty order").is_empty(), "nothing in, nothing out");
+        assert!(empty.ranked(None).expect("an empty order").is_empty(), "nothing in, nothing out");
 
         let mut dictionary = GlobalDictionary::new();
         for value in ["pear", "apple", "", "apples", "app"] {
@@ -11221,7 +11372,7 @@ mod tests {
         dictionary.finish_blocks().expect("the one block encodes");
         let spellings = dictionary_values(&dictionary);
         let seen = dictionary
-            .ranked()
+            .ranked(None)
             .expect("a sorted order")
             .iter()
             .map(|&(_, code)| spellings[code as usize].clone())
