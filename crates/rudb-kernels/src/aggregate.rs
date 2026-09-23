@@ -2086,9 +2086,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                 else {
                     return Err(Error::internal("an exact total into another".to_string()));
                 };
-                *total = total
-                    .checked_add(base + i128::from(code(row)))
-                    .ok_or_else(overflowed)?;
+                *total = total.checked_add(base + i128::from(code(row))).ok_or_else(overflowed)?;
                 *seen = true;
             });
             Ok(true)
