@@ -278,6 +278,37 @@ impl<T: Clone> Buffer<T> {
         }
     }
 
+    /// This window and `next` as one window, when `next` starts in the same page where this ends.
+    ///
+    /// The way back from [`Self::slice`]. A producer that cut a page into chunks and a consumer
+    /// that lays those chunks end to end again would otherwise copy every value to rebuild a run
+    /// the page already holds. `None` for anything else, including an owned buffer, because two
+    /// `Vec`s are not one without a copy and the caller has a copying path for that.
+    #[must_use]
+    pub fn joined(&self, next: &Self) -> Option<Self> {
+        match (&self.store, &next.store) {
+            (
+                Store::Shared { page, from, len },
+                Store::Shared { page: other, from: start, len: more },
+            ) if Arc::ptr_eq(page, other) && from + len == *start => Some(Self {
+                store: Store::Shared { page: Arc::clone(page), from: *from, len: len + more },
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether this and `other` are the same window of the same page, which an owned run never is.
+    #[must_use]
+    pub fn same_window(&self, other: &Self) -> bool {
+        match (&self.store, &other.store) {
+            (
+                Store::Shared { page, from, len },
+                Store::Shared { page: theirs, from: start, len: held },
+            ) => Arc::ptr_eq(page, theirs) && from == start && len == held,
+            _ => false,
+        }
+    }
+
     /// The values, writable, copying them out of the page first if they are not owned.
     ///
     /// The copy on write point, and the only one. Everything that mutates a buffer goes through
@@ -520,6 +551,21 @@ mod tests {
         // Twice is not two pages, and the second call does not lose an offset either.
         let again = run.into_page();
         assert_eq!(again.as_slice().as_ptr() as usize, address + 4 * 4);
+    }
+
+    /// Two cuts of one page that meet lay back as one window, and nothing else does.
+    #[test]
+    fn neighbouring_cuts_of_a_page_join_and_others_do_not() {
+        let page = Buffer::from_vec((0u32..16).collect()).into_page();
+        let joined = page.slice(2, 3).joined(&page.slice(5, 4)).expect("neighbours join");
+        assert_eq!(joined.as_slice(), &[2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(joined.as_slice().as_ptr(), page.as_slice()[2..].as_ptr());
+        assert!(page.slice(2, 3).joined(&page.slice(6, 2)).is_none(), "a gap joined");
+        assert!(page.slice(5, 2).joined(&page.slice(2, 3)).is_none(), "the wrong order joined");
+        let other = Buffer::from_vec((0u32..16).collect()).into_page();
+        assert!(page.slice(2, 3).joined(&other.slice(5, 2)).is_none(), "two pages joined");
+        let owned = Buffer::from_vec(vec![1u32, 2]);
+        assert!(owned.joined(&owned).is_none(), "an owned run joined");
     }
 
     /// A cut that runs off the end comes back short, because the callers that cut a buffer are

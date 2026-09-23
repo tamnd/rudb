@@ -1115,7 +1115,10 @@ impl Cursor {
             let decoded = page.decode(&self.column, self.dictionary.as_ref());
             timing.stop(bytes);
             self.spare = page.body;
-            self.page = Some(decoded?);
+            // Held as a page, because it is about to be cut into chunks and every chunk is cloned
+            // again downstream, by a projection that keeps a column and by a sort that holds its
+            // input. On an owned run each of those is a copy of the values, on a page it is a count.
+            self.page = Some(decoded?.into_pages());
         }
         Ok(self.page.as_ref().map_or(0, |page| page.len() - self.offset))
     }

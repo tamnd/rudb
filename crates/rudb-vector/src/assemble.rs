@@ -263,6 +263,10 @@ pub fn concat(ty: &LogicalType, pieces: &[Vector]) -> Result<Option<Vector>> {
     if !laid {
         return Ok(None);
     }
+    if let Some(data) = adjoined(pieces) {
+        let validity = run_of(pieces, rows);
+        return Ok(Some(Vector::flat(ty.clone(), data)?.with_validity(validity)));
+    }
     // Sized before the first value moves, so the page is one allocation and holds no more than the
     // rows that went into it. Growing from empty instead ends at the next power of two, which on a
     // full row group is eight thousand values of slack carried for the life of the table.
@@ -711,6 +715,45 @@ fn arenas_of(pieces: &[Vector]) -> Arenas {
     arenas
 }
 
+/// The pieces as one window, when they are windows of one page that follow each other in it.
+///
+/// A sorted load is the case. Its answer is laid as one page a column and handed on in chunks cut
+/// out of that page, and a table then lays those chunks end to end into row groups, which without
+/// this copies every value back into a run the page already holds. A string column joins when its
+/// views are a page and every piece shares one arena, which is what a sorted string column is.
+fn adjoined(pieces: &[Vector]) -> Option<Data> {
+    macro_rules! joined {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match pieces.first()?.data()? {
+                $(Data::$variant(first) => {
+                    if !first.is_shared() {
+                        return None;
+                    }
+                    let mut run = first.clone();
+                    for piece in &pieces[1..] {
+                        let Some(Data::$variant(next)) = piece.data() else { return None };
+                        run = run.joined(next)?;
+                    }
+                    Some(Data::$variant(run))
+                })+
+                Data::Varlen(first) => {
+                    if !first.is_paged() {
+                        return None;
+                    }
+                    let mut run = first.clone();
+                    for piece in &pieces[1..] {
+                        let Some(Data::Varlen(next)) = piece.data() else { return None };
+                        run = run.joined(next)?;
+                    }
+                    Some(Data::Varlen(run))
+                }
+                _ => None,
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, joined)
+}
+
 /// Lays a run of data end to end after another, answering how many values it appended.
 ///
 /// The typed loop per layout is the whole point: an append of a thousand `i64` is one `memcpy` and
@@ -1019,6 +1062,54 @@ mod tests {
         // which is what the table cuts a chunk with.
         let window = built.slice(4, 5).expect("a window into the page");
         assert_eq!(values(&window), all_of(&pieces[1..2]), "the second piece, cut back out");
+    }
+
+    /// Windows of one page that follow each other lay as one window over it, and anything else
+    /// still lays by copying, which is what a sorted load hands a table.
+    #[test]
+    fn neighbouring_windows_of_one_page_lay_without_a_copy() {
+        let held: Vec<Value> =
+            (0..20).map(|at| if at % 7 == 3 { Value::Null } else { Value::BigInt(at) }).collect();
+        let page = Vector::from_values(LogicalType::BigInt, &held).expect("a run").into_pages();
+        let cut = |from: usize, len: usize| page.slice(from, len).expect("a window");
+        let address = |vector: &Vector| match vector.data() {
+            Some(Data::Int64(run)) => run.as_slice().as_ptr() as usize,
+            other => panic!("a bigint run laid as {other:?}"),
+        };
+        let built = laid(&LogicalType::BigInt, &[cut(2, 5), cut(7, 8), cut(15, 3)]);
+        assert_eq!(address(&built), address(&page) + 2 * 8, "the neighbours were copied");
+        // A gap, a piece out of order, and a piece of another page all fall back to the copy.
+        let other = Vector::from_values(LogicalType::BigInt, &held).expect("a run").into_pages();
+        let other_cut = other.slice(7, 3).expect("a window");
+        for pieces in [
+            vec![cut(2, 5), cut(8, 3)],
+            vec![cut(7, 3), cut(2, 5)],
+            vec![cut(2, 5), other_cut],
+            vec![Vector::from_values(LogicalType::BigInt, &held[..4]).expect("owned"), cut(4, 2)],
+        ] {
+            let built = laid(&LogicalType::BigInt, &pieces);
+            assert_ne!(address(&built), address(&page) + 2 * 8, "a copy was expected");
+        }
+    }
+
+    /// The same for strings: cuts of one paged column lay back as a window over its views and
+    /// its arena, and a cut of a column whose views are its own is copied.
+    #[test]
+    fn neighbouring_cuts_of_a_paged_string_column_lay_without_a_copy() {
+        let held: Vec<Value> = (0..20)
+            .map(|at| Value::Varchar(format!("a string long enough for the arena {at}")))
+            .collect();
+        let page = Vector::from_values(LogicalType::Varchar, &held).expect("a run").into_pages();
+        let cut = |from: usize, len: usize| page.slice(from, len).expect("a window");
+        let views = |vector: &Vector| match vector.data() {
+            Some(Data::Varlen(column)) => column.views().as_ptr() as usize,
+            other => panic!("a varchar run laid as {other:?}"),
+        };
+        let built = laid(&LogicalType::Varchar, &[cut(2, 5), cut(7, 8), cut(15, 3)]);
+        assert_eq!(views(&built), views(&page) + 2 * size_of::<StringView>(), "views copied");
+        let owned = Vector::from_values(LogicalType::Varchar, &held).expect("a run");
+        let copied = laid(&LogicalType::Varchar, &[owned.slice(0, 4).expect("a cut"), cut(4, 2)]);
+        assert_eq!(copied.len(), 6);
     }
 
     #[test]
