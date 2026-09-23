@@ -1060,6 +1060,35 @@ mod tests {
         );
     }
 
+    /// A Parquet integer column comes in as a dictionary, and it now goes through the block reader
+    /// rather than a row at a time. Both sieve shapes have to come out as the flat column's.
+    #[test]
+    fn a_dictionary_column_gets_the_sieve_its_flat_form_gets() {
+        for (entries, range) in [(40_i64, 3), (5000, 982_451_653)] {
+            let values = (0..entries).map(|n| Value::BigInt(n * range)).collect::<Vec<_>>();
+            let codes = (0..3000_u32).map(|n| (n * 7 + n / 3) % entries as u32).collect::<Vec<_>>();
+            let dictionary = Vector::dictionary(
+                codes.clone(),
+                Vector::from_values(LogicalType::BigInt, &values).expect("entries"),
+            )
+            .expect("a dictionary");
+            let flat = Vector::from_values(
+                LogicalType::BigInt,
+                &codes.iter().map(|&code| values[code as usize].clone()).collect::<Vec<_>>(),
+            )
+            .expect("a column");
+            let mut block = Vec::new();
+            assert!(dictionary.signed_block(&mut block), "the dictionary is read as a block");
+            let zone = Zone::of(&Chunk::new(vec![flat.clone()]).expect("a chunk"));
+            let range = zone.column(0).expect("one column");
+            assert_eq!(
+                Sieve::of(&dictionary, range, 1 << 20),
+                Sieve::of(&flat, range, 1 << 20),
+                "{entries} entries"
+            );
+        }
+    }
+
     #[test]
     fn a_sieve_survives_a_trip_through_its_bytes() {
         let held: Vec<Value> =

@@ -9115,7 +9115,9 @@ fn text_compressed(flat: &Vector) -> Result<Option<Vec<u8>>> {
     let mut values: Vec<&[u8]> = Vec::with_capacity(flat.len());
     let mut payload = 0_usize;
     for row in 0..flat.len() {
-        let text = flat.text_at(row).unwrap_or("").as_bytes();
+        // bytes_at: the rows were checked for UTF-8 on the way in, and checking them again here
+        // was most of what the loop cost.
+        let text = flat.bytes_at(row).unwrap_or(b"");
         payload = payload.saturating_add(text.len());
         values.push(text);
     }
@@ -9664,7 +9666,7 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
     let mut codes = Vec::with_capacity(vector.len());
     let mut plain_bytes = 0_usize;
     for row in 0..vector.len() {
-        let text = vector.text_at(row).unwrap_or("");
+        let text = vector.bytes_at(row).unwrap_or(b"");
         plain_bytes = plain_bytes.saturating_add(text.len());
         let code = match by_text.get(text) {
             Some(&code) => code,
@@ -9707,7 +9709,7 @@ fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
         put_u32(&mut out, offset);
     }
     for value in values {
-        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(value);
     }
     for code in codes {
         put_u32(&mut out, code);

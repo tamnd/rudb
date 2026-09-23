@@ -208,7 +208,9 @@ impl Local {
             let mut codes = Vec::with_capacity(flat.len());
             let mut last = None;
             for row in 0..flat.len() {
-                let text = flat.text_at(row).unwrap_or("").as_bytes();
+                // bytes_at rather than text_at: the rows were checked for UTF-8 when they came in,
+                // and checking every one again cost more than coding it.
+                let text = flat.bytes_at(row).unwrap_or(b"");
                 // A repeat of the row before is common enough on a sorted table to be worth a
                 // comparison before a hash, and the comparison fails on its first bytes when not.
                 let code = match last {
