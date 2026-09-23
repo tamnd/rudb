@@ -114,6 +114,11 @@ impl Pair {
     /// A different operator from the one above, because a grouped count is answered by reading a
     /// list of groups out of the file and an ungrouped one by adding a few numbers up, so the two
     /// say different things about themselves.
+    ///
+    /// Nothing answers a grouped count this way any more. #1649 took the path out, because a count
+    /// read out of a synopsis measured the synopsis and not the aggregation. So every call below now
+    /// asserts it did not happen, and the answers are still checked against memory, which is what
+    /// says the rows give what the synopsis used to.
     fn grouped(&self, query: &str) -> bool {
         self.answered(&self.file, query, "native frequencies")
     }
@@ -145,7 +150,10 @@ fn counting_a_whole_table_reads_the_row_count_the_file_wrote_down() {
 fn counting_the_distinct_values_of_a_string_column_reads_the_size_of_its_dictionary() {
     let pair = Pair::new("distinct", "SELECT 'v' || (i % 13) AS s FROM range(5000) r(i)");
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(13));
-    assert!(pair.summarised("SELECT COUNT(DISTINCT s) FROM t"), "the rows were grouped anyway");
+    assert!(
+        pair.summarised("SELECT COUNT(DISTINCT s) FROM t"),
+        "a grouped count was read out of the synopsis"
+    );
 }
 
 #[test]
@@ -170,7 +178,10 @@ fn a_column_with_a_null_in_it_is_counted_out_of_the_file_as_well() {
     // dictionary has fourteen entries here and the file says thirteen, because the writer counted
     // the rows that hold each code and the empty string's code is held by none of them.
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(13));
-    assert!(pair.summarised("SELECT COUNT(DISTINCT s) FROM t"), "the rows were grouped anyway");
+    assert!(
+        pair.summarised("SELECT COUNT(DISTINCT s) FROM t"),
+        "a grouped count was read out of the synopsis"
+    );
     // Counting the groups is a different number, because the nulls are a group of their own and are
     // not a distinct value. Fourteen groups over thirteen values.
     assert_eq!(
@@ -199,7 +210,10 @@ fn a_column_holding_both_nulls_and_empty_strings_counts_the_empty_string_once() 
          ELSE 'v' || (i % 13) END AS s FROM range(5000) r(i)",
     );
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(14));
-    assert!(pair.summarised("SELECT COUNT(DISTINCT s) FROM t"), "the rows were grouped anyway");
+    assert!(
+        pair.summarised("SELECT COUNT(DISTINCT s) FROM t"),
+        "a grouped count was read out of the synopsis"
+    );
 }
 
 #[test]
@@ -207,7 +221,10 @@ fn a_column_that_is_nothing_but_nulls_has_no_distinct_values_at_all() {
     let pair =
         Pair::new("allnullstrings", "SELECT CAST(NULL AS VARCHAR) AS s FROM range(500) r(i)");
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT s) FROM t"), Value::BigInt(0));
-    assert!(pair.summarised("SELECT COUNT(DISTINCT s) FROM t"), "the rows were grouped anyway");
+    assert!(
+        pair.summarised("SELECT COUNT(DISTINCT s) FROM t"),
+        "a grouped count was read out of the synopsis"
+    );
 }
 
 #[test]
@@ -298,11 +315,14 @@ fn a_grouped_count_over_a_complete_synopsis_is_read_out_of_it_filter_and_all() {
         pair.agree("SELECT COUNT(*) FROM t GROUP BY n ORDER BY 1 DESC LIMIT 1"),
         Value::BigInt(715)
     );
-    assert!(pair.grouped("SELECT n, COUNT(*) FROM t GROUP BY n"), "the rows were grouped anyway");
+    assert!(
+        !pair.grouped("SELECT n, COUNT(*) FROM t GROUP BY n"),
+        "a grouped count was read out of the synopsis"
+    );
     // A filter over the column being grouped only decides which groups survive, so it rides along.
     assert!(
-        pair.grouped("SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n ORDER BY 2 DESC"),
-        "the rows were grouped anyway"
+        !pair.grouped("SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n ORDER BY 2 DESC"),
+        "a grouped count was read out of the synopsis"
     );
     assert_eq!(
         pair.agree("SELECT COUNT(*) FROM (SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n) g"),
@@ -352,7 +372,7 @@ fn a_filtered_top_count_is_read_out_of_a_synopsis_that_is_only_a_prefix() {
     // With a bound the prefix is enough. The filter takes out the heaviest value, the fifth of the
     // survivors holds seven hundred rows, and no value the synopsis dropped holds more than one.
     let query = "SELECT s, COUNT(*) FROM t WHERE s <> 'h0' GROUP BY s ORDER BY 2 DESC LIMIT 5";
-    assert!(pair.grouped(query), "the rows were read for an answer the directory held");
+    assert!(!pair.grouped(query), "a grouped count was read out of the synopsis");
     // Checked against the rows, which is the only thing that makes the shortcut worth taking.
     let found = pair.listing(query);
     let wanted = [("h1", 900), ("h2", 850), ("h3", 800), ("h4", 750), ("h5", 700)];
@@ -416,8 +436,8 @@ fn keys_written_as_several_that_are_really_one_column_are_still_read_out_of_the_
     let words = Pair::new("foldconst", SKEWED);
     let plain = "SELECT s, COUNT(*) AS c FROM t GROUP BY s ORDER BY c DESC LIMIT 5";
     let constant = "SELECT 1, s, COUNT(*) AS c FROM t GROUP BY 1, s ORDER BY c DESC LIMIT 5";
-    assert!(words.grouped(plain), "one key was not read out of the directory");
-    assert!(words.grouped(constant), "a constant beside the key sent a provable query to the rows");
+    assert!(!words.grouped(plain), "a grouped count was read out of the synopsis");
+    assert!(!words.grouped(constant), "a grouped count was read out of the synopsis");
     let found = words.listing(constant);
     assert_eq!(found.len(), 5, "the limit is the answer's length");
     assert_eq!(found[0][1], Value::Varchar("h0".into()), "the heaviest value leads");
@@ -426,7 +446,7 @@ fn keys_written_as_several_that_are_really_one_column_are_still_read_out_of_the_
 
     let numbers = Pair::new("folddiff", SKEWED_NUMBERS);
     let differences = "SELECT n, n - 1, n - 2, COUNT(*) AS c FROM t GROUP BY n, n - 1, n - 2 ORDER BY c DESC LIMIT 5";
-    assert!(numbers.grouped(differences), "differences of the key sent the query to the rows");
+    assert!(!numbers.grouped(differences), "a grouped count was read out of the synopsis");
     let found = numbers.listing(differences);
     assert_eq!(found.len(), 5, "the limit is the answer's length");
     assert_eq!(found[0][0], Value::BigInt(0), "the heaviest value leads");
@@ -446,7 +466,10 @@ fn a_grouped_count_over_a_complete_synopsis_keeps_the_null_group_the_rows_would(
         pair.agree("SELECT COUNT(*) FROM (SELECT n, COUNT(*) FROM t GROUP BY n) g"),
         Value::BigInt(8),
     );
-    assert!(pair.grouped("SELECT n, COUNT(*) FROM t GROUP BY n"), "the rows were grouped anyway");
+    assert!(
+        !pair.grouped("SELECT n, COUNT(*) FROM t GROUP BY n"),
+        "a grouped count was read out of the synopsis"
+    );
     // With a filter on the same column the null group goes, because the comparison keeps neither
     // side of it, and that leaves the six groups the seven minus the filtered one comes to.
     assert_eq!(
@@ -454,8 +477,8 @@ fn a_grouped_count_over_a_complete_synopsis_keeps_the_null_group_the_rows_would(
         Value::BigInt(6),
     );
     assert!(
-        pair.grouped("SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n"),
-        "the rows were grouped anyway"
+        !pair.grouped("SELECT n, COUNT(*) FROM t WHERE n <> 1 GROUP BY n"),
+        "a grouped count was read out of the synopsis"
     );
     assert_eq!(
         pair.agree("SELECT SUM(c) FROM (SELECT COUNT(*) AS c FROM t WHERE n <> 1 GROUP BY n) g"),
@@ -467,7 +490,10 @@ fn a_grouped_count_over_a_complete_synopsis_keeps_the_null_group_the_rows_would(
 fn a_numeric_column_has_no_dictionary_and_its_distinct_values_are_counted_by_the_writer() {
     let pair = Pair::new("numeric", "SELECT i % 7 AS n FROM range(5000) r(i)");
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT n) FROM t"), Value::BigInt(7));
-    assert!(pair.summarised("SELECT COUNT(DISTINCT n) FROM t"), "the rows were grouped anyway");
+    assert!(
+        pair.summarised("SELECT COUNT(DISTINCT n) FROM t"),
+        "a grouped count was read out of the synopsis"
+    );
 }
 
 #[test]
