@@ -386,7 +386,7 @@ enum Body {
     /// Nothing here mutates a dictionary in place, so sharing one is only ever a read, and the one
     /// place that wants an owned copy of the values is [`compose`], which asks for one.
     Dictionary {
-        codes: Vec<u32>,
+        codes: Buffer<u32>,
         values: Arc<Vector>,
         stable: bool,
     },
@@ -1166,7 +1166,7 @@ impl Vector {
             ty: values.ty.clone(),
             len: codes.len(),
             validity: Validity::AllValid,
-            body: Body::Dictionary { codes, values, stable: false },
+            body: Body::Dictionary { codes: Buffer::from_vec(codes), values, stable: false },
         })
     }
 
@@ -1192,7 +1192,7 @@ impl Vector {
             ty: values.ty.clone(),
             len: codes.len(),
             validity: Validity::AllValid,
-            body: Body::Dictionary { codes, values, stable: true },
+            body: Body::Dictionary { codes: Buffer::from_vec(codes), values, stable: true },
         })
     }
 
@@ -1694,7 +1694,7 @@ impl Vector {
             Body::Constant(value) => value.footprint(),
             Body::Sequence { .. } => 0,
             Body::Dictionary { codes, values, .. } => {
-                codes.capacity() * size_of::<u32>() + share(values.footprint(), values)
+                codes.footprint() + share(values.footprint(), values)
             }
             Body::Packed { words, .. } => share(words.capacity() * size_of::<u64>(), words),
             Body::Views { views, arena } => {
@@ -2472,7 +2472,7 @@ impl Vector {
                 }
             }
             Body::Dictionary { codes, values, .. } => {
-                for &code in codes {
+                for &code in codes.iter() {
                     values.try_bytes_at(code as usize)?;
                 }
             }
@@ -2649,11 +2649,11 @@ impl Vector {
     /// This vector with its payload held as a page, so that copying or cutting it is free.
     ///
     /// For a producer that means to hand the same values out many times, which is what a stored
-    /// column is. A flat body is the form this changes, because it is the only one that owns a run
-    /// of values a copy would have to copy. Every other form already shares what is expensive and
-    /// owns only what a cut has to rewrite, so it comes back as it was: a dictionary shares its
-    /// values, a packed body shares its words, a string body shares its arena, an FSST body shares
-    /// its codes and its table, and a constant and a sequence have nothing to share.
+    /// column is. A flat body and a dictionary are the forms this changes, because they own a run a
+    /// copy would have to copy: the values of a flat body and the codes of a dictionary. Every other
+    /// form already shares what is expensive and owns only what a cut has to rewrite, so it comes
+    /// back as it was: a packed body shares its words, a string body shares its arena, an FSST body
+    /// shares its codes and its table, and a constant and a sequence have nothing to share.
     ///
     /// Not recursive into a nested column's children, because a `LIST` or a `STRUCT` holds its
     /// children behind an `Arc` already.
@@ -2661,6 +2661,9 @@ impl Vector {
     pub fn into_pages(self) -> Self {
         let body = match self.body {
             Body::Flat(data) => Body::Flat(data.into_pages()),
+            Body::Dictionary { codes, values, stable } => {
+                Body::Dictionary { codes: codes.into_page(), values, stable }
+            }
             other => other,
         };
         Self { body, ..self }
@@ -2703,7 +2706,7 @@ impl Vector {
                 Body::Sequence { start: start + step * at as i64, step: *step }
             }
             Body::Dictionary { codes, values, stable } => Body::Dictionary {
-                codes: codes[at..end].to_vec(),
+                codes: codes.slice(at, len),
                 values: Arc::clone(values),
                 stable: *stable,
             },
@@ -4677,7 +4680,7 @@ mod tests {
             panic!("a slice of a dictionary is a dictionary");
         };
         assert!(Arc::ptr_eq(whole, cut), "the cut copied the dictionary");
-        assert_eq!(codes, &[1, 1, 0], "the codes are the part that is cut");
+        assert_eq!(codes.as_slice(), &[1, 1, 0], "the codes are the part that is cut");
 
         // And a cut of a cut shares it too, since that is what a scan does to a page it reads twice.
         let again = piece.slice(1, 2).unwrap();
@@ -4688,6 +4691,32 @@ mod tests {
         assert_eq!(
             again.iter().collect::<Vec<_>>(),
             [Value::Varchar("blue".into()), Value::Varchar("red".into())]
+        );
+    }
+
+    /// Once the codes are a page, a cut and a clone of a coded column point at the same codes, which
+    /// is what a scan does to every page of a dictionary encoded Parquet column.
+    #[test]
+    fn a_paged_dictionary_shares_its_codes_with_its_cuts_and_clones() {
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &[Value::Varchar("red".into()), Value::Varchar("blue".into())],
+        )
+        .unwrap();
+        let vector = Vector::dictionary(vec![0, 1, 1, 0, 1], values).unwrap().into_pages();
+        let codes = |vector: &Vector| match &vector.body {
+            Body::Dictionary { codes, .. } => codes.as_slice().as_ptr() as usize,
+            _ => panic!("a dictionary vector holds a dictionary"),
+        };
+        assert_eq!(codes(&vector.slice(1, 3).unwrap()), codes(&vector) + 4, "the cut copied");
+        assert_eq!(codes(&vector.clone()), codes(&vector), "the clone copied");
+        assert_eq!(
+            vector.slice(1, 3).unwrap().iter().collect::<Vec<_>>(),
+            [
+                Value::Varchar("blue".into()),
+                Value::Varchar("blue".into()),
+                Value::Varchar("red".into())
+            ]
         );
     }
 
