@@ -11214,7 +11214,7 @@ mod tests {
         dictionary.finish_blocks().expect("the one block encodes");
         let spellings = dictionary_values(&dictionary);
         let seen = dictionary
-            .ranked()
+            .ranked(None)
             .expect("a sorted order")
             .iter()
             .map(|&(_, code)| spellings[code as usize].clone())
