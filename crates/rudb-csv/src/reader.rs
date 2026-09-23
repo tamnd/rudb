@@ -9,13 +9,14 @@
 //! is the first block, which is also the first block the reader then goes on to use, so opening a
 //! file reads its front once.
 
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_io::File;
-use rudb_kernels::cast_value;
-use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, VECTOR_SIZE};
 
+use crate::convert::{self, Cells};
 use crate::dialect::{self, Dialect, Given};
 use crate::infer;
+use crate::scan::Records;
 
 /// How much is read at a time, and how much the sniffer gets to look at.
 ///
@@ -39,6 +40,8 @@ pub struct Reader {
     drained: bool,
     line: u64,
     scratch: Vec<String>,
+    records: Records,
+    block: usize,
 }
 
 impl Reader {
@@ -64,6 +67,12 @@ impl Reader {
     ///
     /// Everything [`Reader::open`] reports.
     pub fn open_with(file: Box<dyn File>, path: &str, given: Given) -> Result<Self> {
+        Self::open_sized(file, path, given, BLOCK)
+    }
+
+    /// The same, reading `block` bytes at a time, which the tests make small so that a record
+    /// crosses a refill every few lines rather than once a megabyte.
+    fn open_sized(file: Box<dyn File>, path: &str, given: Given, block: usize) -> Result<Self> {
         let mut reader = Self {
             file,
             path: path.to_string(),
@@ -77,8 +86,10 @@ impl Reader {
             drained: false,
             line: 1,
             scratch: Vec::new(),
+            records: Records::default(),
+            block,
         };
-        reader.fill()?;
+        reader.fill(0)?;
         let sample = reader.buffer.clone();
         let quote = given.quote.or_else(|| dialect::quote(&sample));
         let delimiter = match given.delimiter {
@@ -161,49 +172,52 @@ impl Reader {
 
     /// The next chunk, or `None` at the end of the file.
     ///
+    /// The records are split first, all of them, and converted afterwards a column at a time, which
+    /// is also the order the errors come out in: a malformed record anywhere in the chunk is
+    /// reported ahead of a value that does not convert, and among values the first projected
+    /// column's first bad row is the one named.
+    ///
     /// # Errors
     ///
     /// A read error, a malformed record, or a value that does not fit the type the sample chose
     /// for its column.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-        while rows.len() < VECTOR_SIZE {
-            match self.next_record()? {
-                Some(fields) => rows.push(fields),
-                None => break,
+        self.records.clear();
+        let mut start = self.at;
+        loop {
+            self.at = crate::scan::records(
+                &self.buffer,
+                self.at,
+                self.dialect,
+                self.drained,
+                VECTOR_SIZE,
+                &mut self.records,
+            )?;
+            if self.records.len() == VECTOR_SIZE || self.drained {
+                break;
             }
+            // The records already read point into the buffer, so the refill keeps everything from
+            // the start of the chunk and moves their ranges down by whatever it dropped in front.
+            self.fill(start)?;
+            self.records.shift(start);
+            start = 0;
         }
-        if rows.is_empty() {
+        let rows = self.records.len();
+        if rows == 0 {
             return Ok(None);
         }
+        let first = self.line;
+        self.line += rows as u64;
+        let cells = Cells { bytes: &self.buffer, records: &self.records, dialect: self.dialect };
         let mut columns = Vec::with_capacity(self.projection.len());
         for &at in &self.projection {
             let field = &self.fields[at];
-            let mut values = Vec::with_capacity(rows.len());
-            for (row, held) in rows.iter().enumerate() {
-                let text = held.get(at).and_then(Option::as_deref);
-                values.push(self.convert(
-                    text,
-                    field,
-                    self.line - rows.len() as u64 + row as u64,
-                )?);
-            }
-            columns.push(Vector::from_values(field.ty.clone(), &values)?);
+            let refuse = |text: &str, row: usize| {
+                Error::conversion(self.conversion_error(text, field, first + row as u64))
+            };
+            columns.push(convert::column(&cells, at, &field.ty, &refuse)?);
         }
-        Ok(Some(Chunk::with_rows(columns, rows.len())?))
-    }
-
-    /// One value, cast from its text to the column's type.
-    fn convert(&self, text: Option<&str>, field: &Field, line: u64) -> Result<Value> {
-        let Some(text) = text else { return Ok(Value::Null) };
-        if field.ty == LogicalType::Varchar {
-            return Ok(Value::Varchar(text.to_string()));
-        }
-        let value = Value::Varchar(text.to_string());
-        match cast_value(&value, &field.ty, false) {
-            Ok(converted) => Ok(converted),
-            Err(_) => Err(Error::conversion(self.conversion_error(text, field, line))),
-        }
+        Ok(Some(Chunk::with_rows(columns, rows)?))
     }
 
     /// DuckDB's message for a value that does not fit the type its column was sniffed as.
@@ -243,7 +257,56 @@ impl Reader {
         )
     }
 
+    /// The next chunk the way it was read before the records were split a chunk at a time, one
+    /// record into owned strings and one cell into a `Value` at a time.
+    #[cfg(test)]
+    fn next_chunk_by_record(&mut self) -> Result<Option<Chunk>> {
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        while rows.len() < VECTOR_SIZE {
+            match self.next_record()? {
+                Some(fields) => rows.push(fields),
+                None => break,
+            }
+        }
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut columns = Vec::with_capacity(self.projection.len());
+        for &at in &self.projection {
+            let field = &self.fields[at];
+            let mut values = Vec::with_capacity(rows.len());
+            for (row, held) in rows.iter().enumerate() {
+                let text = held.get(at).and_then(Option::as_deref);
+                values.push(self.convert(
+                    text,
+                    field,
+                    self.line - rows.len() as u64 + row as u64,
+                )?);
+            }
+            columns.push(rudb_vector::Vector::from_values(field.ty.clone(), &values)?);
+        }
+        Ok(Some(Chunk::with_rows(columns, rows.len())?))
+    }
+
+    /// One value, cast from its text to the column's type.
+    #[cfg(test)]
+    fn convert(&self, text: Option<&str>, field: &Field, line: u64) -> Result<rudb_common::Value> {
+        let Some(text) = text else { return Ok(rudb_common::Value::Null) };
+        if field.ty == LogicalType::Varchar {
+            return Ok(rudb_common::Value::Varchar(text.to_string()));
+        }
+        let value = rudb_common::Value::Varchar(text.to_string());
+        match rudb_kernels::cast_value(&value, &field.ty, false) {
+            Ok(converted) => Ok(converted),
+            Err(_) => Err(Error::conversion(self.conversion_error(text, field, line))),
+        }
+    }
+
     /// The next record, as one entry per field, with an empty field as a null.
+    ///
+    /// This and [`Reader::next_chunk_by_record`] are how chunks were read before
+    /// [`crate::scan::records`], kept for the tests to hold the new path to the old answers.
+    #[cfg(test)]
     fn next_record(&mut self) -> Result<Option<Vec<Option<String>>>> {
         let Some(()) = self.advance()? else { return Ok(None) };
         Ok(Some(
@@ -273,7 +336,7 @@ impl Reader {
                     return Ok(Some(()));
                 }
                 None if self.drained => return Ok(None),
-                None => self.fill()?,
+                None => self.fill(self.at)?,
             }
         }
     }
@@ -284,12 +347,15 @@ impl Reader {
         Ok(())
     }
 
-    /// Drops what has been read and reads another block onto the end.
-    fn fill(&mut self) -> Result<()> {
-        self.buffer.drain(..self.at);
-        self.at = 0;
+    /// Drops the bytes before `keep` and reads another block onto the end.
+    ///
+    /// `keep` is where the first record anything still points at starts, which is the record being
+    /// read for one record at a time and the start of the chunk for a chunk.
+    fn fill(&mut self, keep: usize) -> Result<()> {
+        self.buffer.drain(..keep);
+        self.at -= keep;
         let held = self.buffer.len();
-        self.buffer.resize(held + BLOCK, 0);
+        self.buffer.resize(held + self.block, 0);
         let read = self.file.read_at(self.offset, &mut self.buffer[held..])?;
         self.buffer.truncate(held + read);
         self.offset += read as u64;
@@ -404,6 +470,7 @@ fn types(rows: &[Vec<Option<String>>], width: usize) -> Vec<LogicalType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rudb_common::Value;
     use rudb_io::{Filesystem, OpenMode, SimFilesystem};
     use std::path::Path;
 
@@ -651,6 +718,261 @@ mod tests {
         let mut reader = read("a,b\n1,two\n");
         let error = reader.retype(&[LogicalType::Double]).unwrap_err();
         assert!(error.message().contains("1 types for a projection of 2 columns"), "{error}");
+    }
+
+    /// Every chunk a reader hands back, as its length and its values written out, or the error
+    /// it stopped on. The values are compared as their debug text so that a NaN equals itself.
+    fn drained(reader: &mut Reader, old: bool) -> (Vec<(usize, Vec<String>)>, Option<String>) {
+        let mut chunks = Vec::new();
+        loop {
+            let next = if old { reader.next_chunk_by_record() } else { reader.next_chunk() };
+            match next {
+                Ok(Some(chunk)) => {
+                    let mut values = Vec::new();
+                    for row in 0..chunk.len() {
+                        for at in 0..chunk.width() {
+                            values.push(format!("{:?}", chunk.value_at(row, at)));
+                        }
+                    }
+                    chunks.push((chunk.len(), values));
+                }
+                Ok(None) => return (chunks, None),
+                Err(error) => return (chunks, Some(error.to_string())),
+            }
+        }
+    }
+
+    /// A small generator, since the crate has no dependencies to take one from.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// A typed CSV file with a header, whose values are mostly what their column says and now and
+    /// then something only the cast knows what to do with, or something nothing can convert.
+    fn typed_file(rng: &mut Rng, rows: usize) -> String {
+        const ODD: [&str; 27] = [
+            "",
+            " 1",
+            "1 ",
+            "1e3",
+            "0x10",
+            "inf",
+            "-nan",
+            "abc",
+            "\"12\"",
+            "\"a\"\"b\"",
+            "\"x,y\"",
+            "\"x\ny\"",
+            "h\u{e9}llo",
+            "99999999999999999999",
+            "9999999999999999999",
+            "-",
+            "+5",
+            "007",
+            "2020-02-30",
+            "2020-02-29",
+            "0000-01-01",
+            "TRUE",
+            "no",
+            "1_000",
+            "1.5e-3",
+            "-0",
+            "\"\"",
+        ];
+        let width = 1 + rng.below(6);
+        let kinds: Vec<usize> = (0..width).map(|_| rng.below(5)).collect();
+        let mut text: String = (0..width).map(|at| format!("c{at}")).collect::<Vec<_>>().join(",");
+        text.push('\n');
+        for _ in 0..rows {
+            let mut fields = Vec::with_capacity(width);
+            for &kind in &kinds {
+                let odd = rng.below(60) == 0;
+                fields.push(if odd {
+                    ODD[rng.below(ODD.len())].to_string()
+                } else {
+                    let n = rng.next();
+                    match kind {
+                        0 => format!("{}", (n % 2_000_001) as i64 - 1_000_000),
+                        1 => format!("{}.{:02}", n % 100_000, n % 100),
+                        2 => format!("{}-{:02}-{:02}", 1990 + n % 20, 1 + n % 12, 1 + n % 28),
+                        3 => ["true", "false", "t", "F"][(n % 4) as usize].to_string(),
+                        _ => ["x", "hello world", "a longer piece of text", "\"q,\"\"q\""]
+                            [(n % 4) as usize]
+                            .to_string(),
+                    }
+                });
+            }
+            if rng.below(200) == 0 {
+                fields.pop();
+            }
+            if rng.below(200) == 0 {
+                fields.push("extra".to_string());
+            }
+            text.push_str(&fields.join(","));
+            text.push_str(["\n", "\n", "\n", "\r\n", "\r"][rng.below(5)]);
+        }
+        if rng.below(4) == 0 {
+            text.pop();
+        }
+        text
+    }
+
+    fn open_sized(text: &[u8], block: usize) -> Result<Reader> {
+        let filesystem = SimFilesystem::new();
+        let path = Path::new("/t.csv");
+        let file = filesystem.open(path, OpenMode::Create).expect("creates");
+        file.write_at(0, text).expect("writes");
+        drop(file);
+        let file = filesystem.open(path, OpenMode::Read).expect("opens");
+        Reader::open_sized(file, "/t.csv", Given::default(), block)
+    }
+
+    /// The chunk at a time reader and the record at a time one, over generated files, read with
+    /// blocks small enough that records straddle the refills, projected and retyped at random so
+    /// that every type with a parser of its own gets values it takes and values it has to pass on.
+    #[test]
+    fn generated_files_read_the_same_a_chunk_at_a_time_as_a_record_at_a_time() {
+        let types = [
+            LogicalType::BigInt,
+            LogicalType::Integer,
+            LogicalType::SmallInt,
+            LogicalType::TinyInt,
+            LogicalType::UBigInt,
+            LogicalType::UInteger,
+            LogicalType::USmallInt,
+            LogicalType::UTinyInt,
+            LogicalType::Double,
+            LogicalType::Float,
+            LogicalType::Date,
+            LogicalType::Boolean,
+            LogicalType::Varchar,
+            LogicalType::Timestamp,
+            LogicalType::Decimal { width: 18, scale: 3 },
+        ];
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for case in 0..200 {
+            let rows = if case % 100 == 0 { 8192 + rng.below(1000) } else { rng.below(200) };
+            let mut text = typed_file(&mut rng, rows).into_bytes();
+            if rng.below(20) == 0 {
+                // A quoted field with rubbish after it somewhere, which is a malformed record.
+                let at = rng.below(text.len() + 1);
+                text.splice(at..at, *b",\"x\"y,");
+            }
+            for block in [1 << 20, 32 + rng.below(400)] {
+                let (Ok(mut new), Ok(mut old)) =
+                    (open_sized(&text, block), open_sized(&text, block))
+                else {
+                    continue;
+                };
+                assert_eq!(new.fields(), old.fields());
+                let width = new.fields().len();
+                if width > 0 && rng.below(2) == 0 {
+                    let columns: Vec<usize> =
+                        (0..rng.below(width + 2)).map(|_| rng.below(width)).collect();
+                    new.project(&columns).expect("projects");
+                    old.project(&columns).expect("projects");
+                    let wanted: Vec<LogicalType> =
+                        columns.iter().map(|_| types[rng.below(types.len())].clone()).collect();
+                    new.retype(&wanted).expect("retypes");
+                    old.retype(&wanted).expect("retypes");
+                }
+                let expected = drained(&mut old, true);
+                let found = drained(&mut new, false);
+                assert_eq!(found.1, expected.1, "case {case}, block {block}");
+                assert_eq!(found.0, expected.0, "case {case}, block {block}");
+            }
+        }
+    }
+
+    /// How much faster the chunk at a time reader is, on a file shaped like TPC-H's `lineitem`.
+    ///
+    /// Not run by default, because it is a measurement rather than a check. Run it with
+    /// `cargo test --release -p rudb-csv -- --ignored --nocapture reads_lineitem`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn reads_lineitem_faster_a_chunk_at_a_time() {
+        use rudb_io::RealFilesystem;
+        use std::time::Instant;
+
+        const ROWS: usize = 200_000;
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut text = String::from(
+            "l_orderkey,l_partkey,l_suppkey,l_linenumber,l_quantity,l_extendedprice,l_discount,\
+             l_tax,l_returnflag,l_linestatus,l_shipdate,l_commitdate,l_receiptdate,\
+             l_shipinstruct,l_shipmode,l_comment\n",
+        );
+        let words = ["carefully", "final", "deposits", "furiously", "regular", "ideas", "sleep"];
+        for row in 0..ROWS {
+            let n = rng.next();
+            let date = |shift: u64| {
+                format!(
+                    "{}-{:02}-{:02}",
+                    1992 + (n >> shift) % 7,
+                    1 + (n >> shift) % 12,
+                    1 + (n >> shift) % 28
+                )
+            };
+            let comment: Vec<&str> =
+                (0..3 + n % 4).map(|k| words[((n >> (k * 3)) % 7) as usize]).collect();
+            text.push_str(&format!(
+                "{},{},{},{},{}.00,{}.{:02},0.0{},0.0{},{},{},{},{},{},{},{},{}\n",
+                row / 4 + 1,
+                n % 200_000,
+                n % 10_000,
+                row % 4 + 1,
+                1 + n % 50,
+                900 + n % 100_000,
+                n % 100,
+                n % 10,
+                (n >> 7) % 9,
+                ["A", "N", "R"][(n % 3) as usize],
+                ["O", "F"][(n % 2) as usize],
+                date(3),
+                date(11),
+                date(19),
+                ["DELIVER IN PERSON", "NONE", "TAKE BACK RETURN"][(n % 3) as usize],
+                ["TRUCK", "MAIL", "AIR", "SHIP"][(n % 4) as usize],
+                comment.join(" "),
+            ));
+        }
+        let path = std::env::temp_dir().join(format!("rudb-lineitem-{}.csv", std::process::id()));
+        std::fs::write(&path, &text).expect("writes");
+        let megabytes = text.len() as f64 / 1e6;
+        let filesystem = RealFilesystem::new();
+        let mut best = [f64::MAX; 2];
+        for _ in 0..5 {
+            for (slot, old) in [(0, true), (1, false)] {
+                let file = filesystem.open(&path, OpenMode::Read).expect("opens");
+                let mut reader = Reader::open(file, "lineitem.csv").expect("sniffs");
+                let started = Instant::now();
+                let mut rows = 0;
+                loop {
+                    let next =
+                        if old { reader.next_chunk_by_record() } else { reader.next_chunk() };
+                    let Some(chunk) = next.expect("reads") else { break };
+                    rows += chunk.len();
+                }
+                assert_eq!(rows, ROWS);
+                best[slot] = best[slot].min(started.elapsed().as_secs_f64());
+            }
+        }
+        std::fs::remove_file(&path).expect("removes");
+        let (old, new) = (megabytes / best[0], megabytes / best[1]);
+        println!(
+            "{ROWS} rows, {megabytes:.1} MB: a record at a time {old:.1} MB/s, a chunk at a time"
+        );
+        println!("{new:.1} MB/s, {:.2}x", best[0] / best[1]);
     }
 
     fn all_or_error(reader: &mut Reader) -> Result<Vec<Vec<Value>>> {
