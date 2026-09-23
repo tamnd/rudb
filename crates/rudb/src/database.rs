@@ -18,7 +18,7 @@ use rudb_native::graph::Edge;
 use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_plan::{Expr, Node, Plan};
-use rudb_vector::{Chunk, Form, Selection, Vector};
+use rudb_vector::{Chunk, Data, Form, Selection, Vector};
 
 use crate::config::Config;
 use crate::connection::{Connection, single};
@@ -182,6 +182,48 @@ fn native_simple_three_statement(sql: &str) -> Option<(&str, &str, &str)> {
     (native_simple_unquoted_identifier(sum_column)
         && native_simple_unquoted_identifier(average_column))
     .then_some((table, sum_column, average_column))
+}
+
+/// Recognizes a single numeric key grouped by its nonzero values. This only selects a runtime
+/// column scan; the result is never read from stored frequency statistics.
+fn native_simple_group_count_statement(sql: &str) -> Option<(&str, &str)> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let key = words.next()?.strip_suffix(',')?;
+    let count = words.next()?;
+    let from = words.next()?;
+    let table = words.next()?;
+    let where_keyword = words.next()?;
+    let filtered = words.next()?;
+    let comparison = words.next()?;
+    let zero = words.next()?;
+    let group = words.next()?;
+    let group_by = words.next()?;
+    let grouped = words.next()?;
+    let order = words.next()?;
+    let order_by = words.next()?;
+    let order_count = words.next()?;
+    let descending = words.next()?;
+    (words.next().is_none()
+        && select.eq_ignore_ascii_case("select")
+        && count.eq_ignore_ascii_case("count(*)")
+        && from.eq_ignore_ascii_case("from")
+        && where_keyword.eq_ignore_ascii_case("where")
+        && comparison == "<>"
+        && zero == "0"
+        && group.eq_ignore_ascii_case("group")
+        && group_by.eq_ignore_ascii_case("by")
+        && order.eq_ignore_ascii_case("order")
+        && order_by.eq_ignore_ascii_case("by")
+        && order_count.eq_ignore_ascii_case("count(*)")
+        && descending.eq_ignore_ascii_case("desc")
+        && native_simple_unquoted_identifier(table)
+        && native_simple_unquoted_identifier(key)
+        && filtered.eq_ignore_ascii_case(key)
+        && grouped.eq_ignore_ascii_case(key))
+    .then_some((table, key))
 }
 
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
@@ -698,6 +740,134 @@ impl Database {
             .filter(|(value, _)| value.is_some_and(|value| value != 0))
             .try_fold(0_u64, |total, (_, count)| total.checked_add(*count));
         Ok(count.and_then(|count| i64::try_from(count).ok()))
+    }
+
+    /// Scans one native integer column and counts its nonzero values while this SQL runs.
+    /// The file's range statistic selects a small dense counter when possible; no frequency
+    /// statistic supplies a group or a count.
+    pub fn query_native_group_count_once(
+        path: &str,
+        sql: &str,
+    ) -> Result<Option<Vec<(i128, i64)>>> {
+        let Some((table, column)) = native_simple_group_count_statement(sql) else {
+            return Ok(None);
+        };
+        let catalog = rudb_native::Catalog::open(path)?;
+        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table)) else {
+            return Ok(None);
+        };
+        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
+        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            fields[index].ty,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
+        ) {
+            return Ok(None);
+        }
+        // A one-column counter is useful for a small domain. Leave high-cardinality grouping to
+        // the general executor instead of growing a tree for millions of distinct keys here.
+        let distinct = catalog.distinct_count(name, index)?;
+        if distinct.is_some_and(|count| count > 4096) {
+            return Ok(None);
+        }
+        let mut dense = match catalog.integer_extremes(name, index)? {
+            Some(rudb_native::IntegerExtremes::Values { low, high })
+                if (0..=4096).contains(&(high - low)) =>
+            {
+                Some((low, vec![0_u64; usize::try_from(high - low + 1).unwrap_or(0)]))
+            }
+            _ => None,
+        };
+        if distinct.is_none() && dense.is_none() {
+            return Ok(None);
+        }
+        let mut sparse = BTreeMap::<i128, u64>::new();
+        let reader = catalog.table(name)?;
+        for part in 0..reader.parts() {
+            let chunk = reader.read(part, &[index])?;
+            let column = chunk
+                .into_columns()
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::internal("native column scan returned no column"))?
+                .into_flat()?;
+            let validity = column.validity();
+            macro_rules! count_values {
+                ($values:expr) => {
+                    if let Some((low, counts)) = &mut dense {
+                        if column.none_null() {
+                            for &value in $values.as_slice() {
+                                let value = i128::from(value);
+                                if value != 0 {
+                                    let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
+                                    if let Some(held) = counts.get_mut(at) {
+                                        *held += 1;
+                                    } else {
+                                        *sparse.entry(value).or_default() += 1;
+                                    }
+                                }
+                            }
+                        } else {
+                            for (row, &value) in $values.as_slice().iter().enumerate() {
+                                let value = i128::from(value);
+                                if value != 0 && validity.is_valid(row) {
+                                    let at = usize::try_from(value - *low).unwrap_or(usize::MAX);
+                                    if let Some(held) = counts.get_mut(at) {
+                                        *held += 1;
+                                    } else {
+                                        *sparse.entry(value).or_default() += 1;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (row, &value) in $values.as_slice().iter().enumerate() {
+                            let value = i128::from(value);
+                            if value != 0 && validity.is_valid(row) {
+                                *sparse.entry(value).or_default() += 1;
+                            }
+                        }
+                    }
+                };
+            }
+            match column.data() {
+                Some(Data::Int8(values)) => count_values!(values),
+                Some(Data::Int16(values)) => count_values!(values),
+                Some(Data::Int32(values)) => count_values!(values),
+                Some(Data::Int64(values)) => count_values!(values),
+                Some(Data::UInt8(values)) => count_values!(values),
+                Some(Data::UInt16(values)) => count_values!(values),
+                Some(Data::UInt32(values)) => count_values!(values),
+                Some(Data::UInt64(values)) => count_values!(values),
+                _ => return Ok(None),
+            }
+        }
+        if let Some((low, counts)) = dense {
+            for (at, count) in counts.into_iter().enumerate() {
+                if count != 0 {
+                    sparse.insert(low + at as i128, count);
+                }
+            }
+        }
+        let mut groups = sparse
+            .into_iter()
+            .map(|(value, count)| i64::try_from(count).map(|count| (value, count)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::internal("grouped count exceeds BIGINT"))?;
+        groups.sort_unstable_by(|(left_value, left_count), (right_value, right_count)| {
+            right_count.cmp(left_count).then_with(|| left_value.cmp(right_value))
+        });
+        Ok(Some(groups))
     }
 
     /// Returns a sum, row count and average from certified native column sums.
@@ -3520,10 +3690,38 @@ mod tests {
         let database = Database::open(name).unwrap();
         database.execute("CREATE TABLE events (source_id SMALLINT)").unwrap();
         database.execute("INSERT INTO events VALUES (2), (2), (3), (0), (NULL)").unwrap();
+        database.execute("CREATE TABLE wide_events (source_id BIGINT)").unwrap();
+        database
+            .execute("INSERT INTO wide_events VALUES (-10000), (-10000), (10000), (0), (NULL)")
+            .unwrap();
         drop(database);
 
         let sql = "SELECT source_id, COUNT(*) FROM events WHERE source_id <> 0 GROUP BY source_id ORDER BY COUNT(*) DESC";
         assert!(Database::query_native_once(name, sql).unwrap().is_none());
+        assert_eq!(
+            Database::query_native_group_count_once(name, sql).unwrap(),
+            Some(vec![(2, 2), (3, 1)])
+        );
+        assert_eq!(
+            Database::query_native_group_count_once(
+                name,
+                "SELECT source_id, COUNT(*) FROM wide_events WHERE source_id <> 0 GROUP BY source_id ORDER BY COUNT(*) DESC"
+            )
+            .unwrap(),
+            Some(vec![(-10000, 2), (10000, 1)])
+        );
+        assert!(
+            Database::query_native_group_count_once(name, "SELECT COUNT(*) FROM events")
+                .unwrap()
+                .is_none()
+        );
+        for changed_sql in [
+            "SELECT source_id, COUNT(*) FROM events WHERE source_id <> 1 GROUP BY source_id ORDER BY COUNT(*) DESC",
+            "SELECT source_id, COUNT(*) FROM events WHERE source_id <> 0 GROUP BY source_id ORDER BY source_id DESC",
+            "SELECT source_id, COUNT(*) FROM events WHERE source_id <> 0 GROUP BY source_id ORDER BY COUNT(*) DESC LIMIT 1",
+        ] {
+            assert!(Database::query_native_group_count_once(name, changed_sql).unwrap().is_none());
+        }
         let database = Database::open(name).unwrap();
         let rows = database.query(sql).unwrap().rows().collect::<Vec<_>>();
         assert_eq!(
