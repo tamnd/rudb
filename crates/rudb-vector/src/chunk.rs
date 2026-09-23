@@ -212,7 +212,11 @@ impl Chunk {
     ///
     /// If the selection points past the end of the chunk.
     pub fn select(self, selection: &Selection) -> Result<Self> {
-        if let Some(bad) = selection.iter().find(|&index| index >= self.rows) {
+        // The largest position rather than the first one out of range, because a maximum is a loop
+        // the compiler vectorizes and a search that can stop early is not, and every filtered chunk
+        // comes through here.
+        let top = selection.indices().iter().max().map(|&index| index as usize);
+        if let Some(bad) = top.filter(|&top| top >= self.rows) {
             return Err(Error::internal(format!(
                 "a selection keeps row {bad} of a chunk that has {} rows",
                 self.rows
