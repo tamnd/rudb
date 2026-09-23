@@ -8294,6 +8294,11 @@ fn the_list_functions_that_look_inside_a_list_refuse_the_way_the_pin_does() {
          parameter."
     ));
     assert!(error("SELECT list_select([1], [NULL])").starts_with("Invalid Input Error: NULLs"));
+    assert_eq!(
+        error("SELECT list_resize([1, 2, 3], 4000999999999999999)"),
+        "Out of Range Error: Cannot resize vector to 4000999999999999999 rows: maximum allowed \
+         vector size is 128.0 GiB"
+    );
     assert!(
         error("SELECT list_reverse(1)")
             .starts_with("Binder Error: ARRAY_SLICE can only operate on LISTs and VARCHARs")

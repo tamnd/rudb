@@ -285,10 +285,24 @@ fn resize(values: &[Value], size: &Value, filler: &Value, returns: &LogicalType)
             return Err(Error::internal(format!("list_resize to a {}", other.logical_type())));
         }
     };
+    let element = match returns {
+        LogicalType::List(element) => element,
+        _ => &LogicalType::Null,
+    };
+    let width = element.physical().size().max(1);
+    if (size as u128) * (width as u128) > MAX_VECTOR_BYTES {
+        return Err(Error::out_of_range(format!(
+            "Cannot resize vector to {size} rows: maximum allowed vector size is 128.0 GiB"
+        )));
+    }
     let mut kept: Vec<Value> = values.iter().take(size).cloned().collect();
     kept.resize(size, filler.clone());
     listed(kept, returns)
 }
+
+/// The most bytes the pin lets one vector hold. A `list_resize` past it is refused before anything
+/// is allocated, so a size of a few quintillion is an error and not an abort.
+const MAX_VECTOR_BYTES: u128 = 1 << 37;
 
 /// Whether a sort order spelled out as a string is descending.
 fn spelled_order(spelled: &Value) -> Result<bool> {
