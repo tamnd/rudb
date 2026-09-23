@@ -4638,24 +4638,31 @@ impl NativeText {
             .ok_or_else(|| invalid("global dictionary rank is past the order"))?;
         let block = slot
             .get_or_init(|| {
-                let which = rank / TEXT_RANK_BLOCK;
-                let start = if which == 0 { 0 } else { self.rank_ends[which - 1] };
-                let end = self.rank_ends[which];
-                let mut bytes = vec![0; (end - start) as usize];
-                read_at(&self.file, self.rank_at + start, &mut bytes)?;
-                if checksum(&bytes)
-                    != *self
-                        .rank_hashes
-                        .get(rank / TEXT_RANK_BLOCK)
-                        .ok_or_else(|| invalid("global dictionary rank block has no checksum"))?
-                {
-                    return Err(invalid("global dictionary rank checksum differs"));
-                }
+                let mut bytes = Vec::new();
+                self.read_rank_block(rank / TEXT_RANK_BLOCK, &mut bytes)?;
                 Ok(bytes)
             })
             .as_ref()
             .map_err(Clone::clone)?;
         Ok((block.as_slice(), rank % TEXT_RANK_BLOCK))
+    }
+
+    /// Reads block `which` of the sorted order into `bytes`, checked against the hash the index
+    /// carries for it.
+    fn read_rank_block(&self, which: usize, bytes: &mut Vec<u8>) -> Result<()> {
+        let start = if which == 0 { 0 } else { self.rank_ends[which - 1] };
+        let end = self.rank_ends[which];
+        bytes.clear();
+        bytes.resize((end - start) as usize, 0);
+        read_at(&self.file, self.rank_at + start, bytes)?;
+        let expected = self
+            .rank_hashes
+            .get(which)
+            .ok_or_else(|| invalid("global dictionary rank block has no checksum"))?;
+        if checksum(bytes) != *expected {
+            return Err(invalid("global dictionary rank checksum differs"));
+        }
+        Ok(())
     }
 
     /// The first eight bytes of the value at `rank`, as the integer a comparison reads.
@@ -4983,15 +4990,27 @@ impl TextSource for NativeText {
                 let mut ranks = vec![u32::MAX; self.ranks];
                 // A block at a time rather than a rank at a time, because reading it per rank pays
                 // for the bounds check, the division and the lock on every one of them.
+                //
+                // A block nothing has read yet is read into one buffer that is reused, rather than
+                // through `rank_parts`, which would keep every block of the order once this is
+                // done with it. The inverse is all anything wants after this, and on the `Referer`
+                // column of the ClickBench file the blocks are tens of megabytes held for nothing.
+                let mut scratch = Vec::new();
+                let mut codes = vec![0u64; TEXT_RANK_BLOCK];
                 for first in (0..self.ranks).step_by(TEXT_RANK_BLOCK) {
-                    let (block, _) = self.rank_parts(first).ok()?;
+                    let which = first / TEXT_RANK_BLOCK;
+                    let block = match self.rank_blocks.get(which)?.get() {
+                        Some(kept) => kept.as_ref().ok()?.as_slice(),
+                        None => {
+                            self.read_rank_block(which, &mut scratch).ok()?;
+                            scratch.as_slice()
+                        }
+                    };
                     let count = self.rank_block_len(first);
-                    let codes = self.rank_codes(block, count).ok()?;
-                    for (within, code) in bitpack::unpack_tail(codes, self.code_bits, count)
-                        .ok()?
-                        .into_iter()
-                        .enumerate()
-                    {
+                    let packed = self.rank_codes(block, count).ok()?;
+                    let codes = codes.get_mut(..count)?;
+                    bitpack::unpack_tail_into(packed, self.code_bits, codes, |bits| bits).ok()?;
+                    for (within, &code) in codes.iter().enumerate() {
                         let code = usize::try_from(code).ok()?;
                         *ranks.get_mut(code)? = u32::try_from(first + within).ok()?;
                     }
