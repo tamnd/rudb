@@ -374,7 +374,10 @@ mod tests {
             matched += clock.elapsed();
             std::hint::black_box(&tokens);
             raw += chunk.iter().map(|v| v.len()).sum::<usize>();
-            size += crate::string::encode(chunk).unwrap().len();
+            if std::env::var("LZ_SIZE").is_err() {
+                size += crate::string::encode(chunk).unwrap().len();
+            }
+            size += tokens.lengths.len();
         }
         eprintln!("PROBE knobs={:?} match_ms={} size={} raw={}", knobs(), matched.as_millis(), size, raw);
     }
