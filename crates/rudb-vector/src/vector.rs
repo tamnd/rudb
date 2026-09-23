@@ -2907,6 +2907,27 @@ impl Vector {
         let rows = at.len();
         if forms_stay {
             if let Body::Dictionary { codes, values, stable: true } = &self.body {
+                // The ordinary case, a column with no nulls and a filter's rows all inside it, in
+                // one pass for the range and one for the gather. Every code taken is one of this
+                // vector's codes, which were range checked when it was built, so the result is not
+                // checked again the way a dictionary from outside is. The highest index rather than
+                // a test that stops at the first bad one, because a running maximum is vectorized
+                // and an early exit is not. On q1 the two passes this replaces and the check after
+                // them were a tenth of the instructions of the scan.
+                let highest = at.iter().copied().fold(0, usize::max);
+                if self.never_null() && (at.is_empty() || highest < codes.len()) {
+                    let gathered = at.iter().map(|&index| codes[index]).collect();
+                    return Ok(Self {
+                        ty: values.ty.clone(),
+                        len: rows,
+                        validity: Validity::AllValid,
+                        body: Body::Dictionary {
+                            codes: gathered,
+                            values: Arc::clone(values),
+                            stable: true,
+                        },
+                    });
+                }
                 // A gather off a column with no nulls in it is all valid as long as every index it
                 // was handed is in range, and both of those are answered by a word at a time rather
                 // than by asking each row whether it is null. That per row question reads through
@@ -3266,6 +3287,114 @@ impl Packed<'_> {
     fn mask(&self) -> u64 {
         u64::MAX >> (u64::BITS - self.width)
     }
+
+    /// The codes of rows `from` to `from + out.len()`, in one pass over the words.
+    ///
+    /// [`Self::code`] is a code at a time, and every one of them works out which word it is in, reads
+    /// it through a bound, and asks whether it straddles into the next. Sixty four codes of one
+    /// width fill exactly that many words and the straddles fall in the same places every time, so a
+    /// block of them is unpacked by a loop the width is a constant in, where every shift and every
+    /// straddle is known before it runs. On TPC-H q1 the code at a time reads were a third of the
+    /// instructions the query ran. The rows before the first whole block and after the last one
+    /// still go a code at a time.
+    pub fn unpack(&self, from: usize, out: &mut [u64]) {
+        let width = self.width as usize;
+        let start = self.offset + from;
+        let end = start + out.len();
+        let first = start.next_multiple_of(64).min(end);
+        let mut at = 0;
+        for row in start..first {
+            out[at] = code_at(self.words, row * width, self.width);
+            at += 1;
+        }
+        let mut row = first;
+        while row + 64 <= end {
+            let word = row / 64 * width;
+            let Some(words) = self.words.get(word..word + width) else { break };
+            let Some(Ok(block)) = out.get_mut(at..at + 64).map(<&mut [u64; 64]>::try_from) else {
+                break;
+            };
+            unpack_block(words, self.width, block);
+            row += 64;
+            at += 64;
+        }
+        for row in row..end {
+            out[at] = code_at(self.words, row * width, self.width);
+            at += 1;
+        }
+    }
+
+    /// The code of each of `rows` rows `at` names, in order.
+    ///
+    /// A filter's selection names rows close together and in order, so the span they cover is
+    /// unpacked whole with [`Self::unpack`] and each row read out of it. Rows spread too far apart
+    /// for that to pay are read a code at a time.
+    ///
+    /// Unpacking a block at a time into a buffer on the stack, and reading each row out of the
+    /// block it falls in, keeps less in the cache and was tried. The question of which block a row
+    /// is in, asked for every row, cost more than the misses it saved, 40.2 G instructions for ten
+    /// runs of q1 against 34.1 G this way.
+    pub fn codes_at<M: Fn(usize) -> usize>(&self, at: M, rows: usize) -> Vec<u64> {
+        let (mut low, mut high) = (usize::MAX, 0);
+        for index in 0..rows {
+            let row = at(index);
+            low = low.min(row);
+            high = high.max(row);
+        }
+        if rows == 0 || high - low >= rows.saturating_mul(4) {
+            return (0..rows).map(|index| self.code(at(index))).collect();
+        }
+        let mut run = vec![0; high - low + 1];
+        self.unpack(low, &mut run);
+        (0..rows).map(|index| run[at(index) - low]).collect()
+    }
+}
+
+/// Sixty four codes of `width` bits out of the `width` words that hold them, with the width made a
+/// constant so that the loop in [`unpack_width`] has nothing left to work out as it goes.
+fn unpack_block(words: &[u64], width: u32, out: &mut [u64; 64]) {
+    macro_rules! widths {
+        ($($width:literal)*) => {
+            match width {
+                $($width => unpack_width::<$width>(words, out),)*
+                _ => {
+                    for (at, code) in out.iter_mut().enumerate() {
+                        *code = code_at(words, at * width as usize, width);
+                    }
+                }
+            }
+        };
+    }
+    widths!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
+        33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63);
+}
+
+#[inline(always)]
+fn unpack_width<const WIDTH: usize>(words: &[u64], out: &mut [u64; 64]) {
+    let Ok(words) = <&[u64; WIDTH]>::try_from(&words[..WIDTH]) else { return };
+    // Written out sixty four times rather than as a loop, because the compiler kept the loop and
+    // with it a shift and a branch on the straddle for every code. Spelled out, the row is a
+    // constant in each step, so its word, its shift and whether it straddles are all worked out
+    // before the program runs and a code is a shift, an or where it straddles and a mask.
+    macro_rules! steps {
+        ($($at:literal)*) => {
+            $(unpack_step::<WIDTH, $at>(words, out);)*
+        };
+    }
+    steps!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
+        33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63);
+}
+
+#[inline(always)]
+fn unpack_step<const WIDTH: usize, const AT: usize>(words: &[u64; WIDTH], out: &mut [u64; 64]) {
+    let bit = AT * WIDTH;
+    let word = bit / 64;
+    let shift = bit % 64;
+    let mut value = words[word] >> shift;
+    if shift + WIDTH > 64 {
+        value |= words[word + 1] << (64 - shift);
+    }
+    out[AT] = value & (u64::MAX >> (64 - WIDTH));
 }
 
 /// The widest a packed code is allowed to be.
@@ -4119,6 +4248,35 @@ mod tests {
 
     fn integers(values: &[i32]) -> Vector {
         Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into())).unwrap()
+    }
+
+    #[test]
+    fn unpacking_in_bulk_reads_what_a_code_at_a_time_reads_at_every_width() {
+        let mut state = 0x5eed_0b17_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let words: Vec<u64> = (0..700).map(|_| next()).collect();
+        for width in 1..=super::PACKED_WIDTH_MAX {
+            for offset in [0, 1, 63, 64, 65] {
+                let packed = super::Packed { words: &words, width, base: 0, offset };
+                for (from, rows) in [(0, 0), (0, 1), (0, 64), (3, 200), (61, 130), (128, 512)] {
+                    let mut out = vec![u64::MAX; rows];
+                    packed.unpack(from, &mut out);
+                    let want: Vec<u64> = (from..from + rows).map(|row| packed.code(row)).collect();
+                    assert_eq!(out, want, "width {width} offset {offset} from {from}");
+                }
+                let at = [5_usize, 9, 9, 70, 6, 200, 131];
+                let want: Vec<u64> = at.iter().map(|&row| packed.code(row)).collect();
+                assert_eq!(packed.codes_at(|index| at[index], at.len()), want);
+                let far = [0_usize, 5000];
+                let want: Vec<u64> = far.iter().map(|&row| packed.code(row)).collect();
+                assert_eq!(packed.codes_at(|index| far[index], far.len()), want);
+            }
+        }
     }
 
     /// A `Value::List` of integers, which is what a row of a list column arrives as.

@@ -1779,68 +1779,74 @@ impl<'a> Aggregate<'a> {
                 coded_map.clear();
                 coded_map.resize(codes.combos(), NOWHERE);
             }
-            codes.places(*length, coded_places);
-            // A row the map has nothing for goes through the probe and the insert every row used to
-            // go through, there and then, and what comes back is written into the map before the
-            // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
-            // run, so the first row of the run is the only one that misses and the rest of it is
-            // answered by the map. Put aside for a second pass, every row of the run missed and
-            // was looked at twice, which was half the rows of ClickBench 28.
-            //
-            // The chunk is hashed at the first miss, because a chunk the map answers whole is the
-            // ordinary case once the first rows of a row group have been through. A key read by
-            // value is not hashed as a chunk at all, since the rows that miss are a few dozen and
-            // are hashed one at a time.
-            let one_at_a_time = prehashed.is_none() && codes.by_value();
-            let mut hashed = false;
-            let mut row = 0;
-            loop {
-                while row < *length {
-                    let found = coded_map[coded_places[row]];
-                    if found == NOWHERE {
+            // One pass that finds every row's slot straight out of the map when the key is one or
+            // two dictionary columns, which is the whole chunk once a row group's first rows are in.
+            // Only a chunk where some row found nothing goes through the places and the loop below.
+            let answered = codes.look_up(coded_map, slots) == Some(false);
+            if !answered {
+                codes.places(*length, coded_places);
+                // A row the map has nothing for goes through the probe and the insert every row used to
+                // go through, there and then, and what comes back is written into the map before the
+                // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
+                // run, so the first row of the run is the only one that misses and the rest of it is
+                // answered by the map. Put aside for a second pass, every row of the run missed and
+                // was looked at twice, which was half the rows of ClickBench 28.
+                //
+                // The chunk is hashed at the first miss, because a chunk the map answers whole is the
+                // ordinary case once the first rows of a row group have been through. A key read by
+                // value is not hashed as a chunk at all, since the rows that miss are a few dozen and
+                // are hashed one at a time.
+                let one_at_a_time = prehashed.is_none() && codes.by_value();
+                let mut hashed = false;
+                let mut row = 0;
+                loop {
+                    while row < *length {
+                        let found = coded_map[coded_places[row]];
+                        if found == NOWHERE {
+                            break;
+                        }
+                        slots[row] = found;
+                        row += 1;
+                    }
+                    if row == *length {
                         break;
                     }
-                    slots[row] = found;
-                    row += 1;
-                }
-                if row == *length {
-                    break;
-                }
-                let index = coded_places[row];
-                let hash = match prehashed {
-                    Some(prehashed) => prehashed[row],
-                    None if one_at_a_time => codes.hash_of(row),
-                    None => {
-                        if !hashed {
-                            crate::table::hash(
-                                keys,
-                                *length,
-                                hashes,
-                                crate::table::Across::OneInput,
-                            );
-                            hashed = true;
+                    let index = coded_places[row];
+                    let hash = match prehashed {
+                        Some(prehashed) => prehashed[row],
+                        None if one_at_a_time => codes.hash_of(row),
+                        None => {
+                            if !hashed {
+                                crate::table::hash(
+                                    keys,
+                                    *length,
+                                    hashes,
+                                    crate::table::Across::OneInput,
+                                );
+                                hashed = true;
+                            }
+                            hashes[row]
                         }
-                        hashes[row]
-                    }
-                };
-                match table.probe(hash, keys, row) {
-                    Probe::Found(slot) => {
-                        slots[row] = slot;
-                        coded_map[index] = slot;
-                    }
-                    Probe::Vacant(bucket) => {
-                        if !self.max_groups.is_some_and(|limit| table.len() >= limit) {
-                            slots[row] = table.insert(bucket, hash, keys, row)?;
-                            coded_map[index] = slots[row];
-                            *groups = table.len();
-                            self.fresh(states, counts, compact)?;
-                            if self.sets {
-                                self.fresh_seen(seen);
+                    };
+                    match table.probe(hash, keys, row) {
+                        Probe::Found(slot) => {
+                            slots[row] = slot;
+                            coded_map[index] = slot;
+                        }
+                        Probe::Vacant(bucket) => {
+                            if !self.max_groups.is_some_and(|limit| table.len() >= limit) {
+                                slots[row] = table.insert(bucket, hash, keys, row)?;
+                                coded_map[index] = slots[row];
+                                *groups = table.len();
+                                self.fresh(states, counts, compact)?;
+                                if self.sets {
+                                    self.fresh_seen(seen);
+                                }
                             }
                         }
                     }
+                    row += 1;
                 }
-                row += 1;
             }
         } else {
             coded_on.clear();

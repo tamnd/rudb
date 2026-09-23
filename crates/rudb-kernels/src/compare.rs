@@ -1060,12 +1060,15 @@ where
         return vec![same; len];
     };
     let mut answers = vec![false; len];
+    // Unpacked in bulk first, so that the loop under each arm is a compare of two numbers. See
+    // [`Packed::unpack`].
+    let codes = packed.codes_at(map, len);
     /// One pass over the rows with the comparison inlined into it.
     macro_rules! sweep {
         ($test:expr) => {{
             let test = $test;
-            for (row, answer) in answers.iter_mut().enumerate() {
-                *answer = test(packed.code(map(row)), code);
+            for (answer, &found) in answers.iter_mut().zip(&codes) {
+                *answer = test(found, code);
             }
         }};
     }

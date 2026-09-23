@@ -297,17 +297,17 @@ fn from_packed<M: Fn(usize) -> usize>(
     let base = packed.base();
     let mask = u64::MAX >> (u64::BITS - packed.width());
     base.checked_add(i128::from(mask))?;
+    // Unpacked in bulk once rather than a code at a time in each loop below. See
+    // [`rudb_vector::Packed::unpack`].
+    let codes = packed.codes_at(at, rows);
     if let Numeric::Exact { scale: now, width } = into {
         if now == was {
-            if let Some(data) = packed_straight(packed, &at, rows, width, physical) {
+            if let Some(data) = packed_straight(packed, &codes, width, physical) {
                 return Some(data);
             }
         }
     }
-    let mut run = Vec::with_capacity(rows);
-    for index in 0..rows {
-        run.push(base + i128::from(packed.code(at(index))));
-    }
+    let mut run: Vec<i128> = codes.iter().map(|&code| base + i128::from(code)).collect();
     match into {
         Numeric::Exact { scale: now, width } => {
             restage(&mut run, was, now)?;
@@ -352,10 +352,9 @@ fn from_packed<M: Fn(usize) -> usize>(
     clippy::cast_sign_loss,
     reason = "the two ends are checked against the target above, so nothing between them is lost"
 )]
-fn packed_straight<M: Fn(usize) -> usize>(
+fn packed_straight(
     packed: &rudb_vector::Packed<'_>,
-    at: M,
-    rows: usize,
+    codes: &[u64],
     width: Option<u8>,
     physical: PhysicalType,
 ) -> Option<Data> {
@@ -377,19 +376,14 @@ fn packed_straight<M: Fn(usize) -> usize>(
                     let low = i64::try_from(base).ok()?;
                     let reach = i64::try_from(mask).ok()?;
                     low.checked_add(reach)?;
-                    let mut out = Vec::with_capacity(rows);
-                    for index in 0..rows {
-                        out.push((low + packed.code(at(index)) as i64) as $native);
-                    }
+                    let out: Vec<$native> =
+                        codes.iter().map(|&code| (low + code as i64) as $native).collect();
                     Data::$variant(out.into())
                 })+
                 // The hugeint target has nothing to narrow into, so it adds at its own width and
                 // is still one pass rather than three.
                 PhysicalType::Int128 => {
-                    let mut out = Vec::with_capacity(rows);
-                    for index in 0..rows {
-                        out.push(base + i128::from(packed.code(at(index))));
-                    }
+                    let out: Vec<i128> = codes.iter().map(|&code| base + i128::from(code)).collect();
                     Data::Int128(out.into())
                 }
                 _ => return None,
