@@ -195,6 +195,18 @@ fn page_bytes(pages: &[Option<Page>], at: usize) -> u64 {
 /// was meant to be. That loop runs over every byte of every span a query reads, which on ClickBench
 /// 8 is about five percent of the query.
 fn checksum(bytes: &[u8]) -> u64 {
+    seeded_checksum(bytes, 0)
+}
+
+/// The xxHash64 of `bytes` started from `seed`, which is the same walk with a different beginning.
+///
+/// A seed is here for one caller: a global dictionary decides whether two values are the same by
+/// their hashes rather than by their bytes, and one sixty four bit hash is not enough to do that
+/// with. Twenty million distinct values collide on sixty four bits about once in a hundred thousand
+/// loads, which for a wrong answer is far too often. Two hashes of the same value under different
+/// seeds are independent, so the pair is a hundred and twenty eight bits and the same arithmetic
+/// puts that at around one in 1e24.
+fn seeded_checksum(bytes: &[u8], seed: u64) -> u64 {
     const P1: u64 = 11_400_714_785_074_694_791;
     const P2: u64 = 14_029_467_366_897_019_727;
     const P3: u64 = 1_609_587_929_392_839_161;
@@ -211,10 +223,10 @@ fn checksum(bytes: &[u8]) -> u64 {
     let mut blocks = bytes.chunks_exact(32);
     let mut rest = blocks.remainder();
     let mut hash = if bytes.len() >= 32 {
-        let mut one = P1.wrapping_add(P2);
-        let mut two = P2;
-        let mut three = 0;
-        let mut four = 0_u64.wrapping_sub(P1);
+        let mut one = seed.wrapping_add(P1).wrapping_add(P2);
+        let mut two = seed.wrapping_add(P2);
+        let mut three = seed;
+        let mut four = seed.wrapping_sub(P1);
         for block in blocks.by_ref() {
             one = round(one, word(&block[..8]));
             two = round(two, word(&block[8..16]));
@@ -228,7 +240,7 @@ fn checksum(bytes: &[u8]) -> u64 {
             .wrapping_add(four.rotate_left(18));
         merge(merge(merge(merge(combined, one), two), three), four)
     } else {
-        P5
+        seed.wrapping_add(P5)
     };
     hash = hash.wrapping_add(bytes.len() as u64);
     let mut words = rest.chunks_exact(8);
@@ -676,15 +688,68 @@ pub struct StoredPart {
     pub nulls: Option<usize>,
 }
 
-/// Appends pages and commits a new directory for one table.
+/// Seeds the second hash a global dictionary tells its values apart by.
+///
+/// Any value that is not zero does, since zero is the seed [`checksum`] already uses and the point
+/// is only that the two hashes of one value are not the same number. This one is the fractional part
+/// of the golden ratio in sixty four bits, which is the constant everything else here is built out
+/// of and is as good a nothing-up-my-sleeve number as any.
+const DICTIONARY_CHECK_SEED: u64 = 11_400_714_819_323_198_485;
+
+/// One column's table wide dictionary while the load is running.
+///
+/// The thing to understand about this is what it does not hold. A dictionary of `URL` at a hundred
+/// million ClickBench rows has about eighteen million distinct values and 1.3 GB of bytes in them,
+/// and five columns like it are twelve of the seventeen gigabytes a load of `hits` peaks at. So the
+/// bytes are not kept. A value's bytes go into [`GlobalDictionary::filling`], and when that reaches
+/// [`TEXT_PAYLOAD_VALUES`] values the block is sealed, handed to [`encode_ready`] at the end of the
+/// stripe and never seen in that form again. What is left is the encoded block, which is two to
+/// three times smaller, and that is the same bytes the file is going to hold anyway.
+///
+/// Two things needed the raw bytes and neither needs them now. Deciding whether a value has been
+/// seen before was a hash lookup and then a comparison of the bytes, and is now a hash lookup and a
+/// comparison of a second hash under a different seed, which is [`DICTIONARY_CHECK_SEED`] and the
+/// argument for why that is sound. Sorting the values at the end needed all of them at once, and
+/// now reads the blocks back through [`GlobalDictionary::decoded`] one column at a time, which is
+/// one column's bytes rather than every column's.
+///
+/// The offsets going block relative comes free with it, and takes the four gigabyte wall with it.
+/// They were `u32` into a per column payload, so a column could not hold more than four gigabytes of
+/// values however much memory the machine had, and `URL` and `Referer` are within a small factor of
+/// that at a hundred million rows. A `u32` into a block of 1,024 values is not a bound anything real
+/// reaches. The stored form is unchanged, because [`encode_offsets`] was already subtracting a per
+/// block base before writing.
 #[derive(Debug)]
 struct GlobalDictionary {
     primary: HashMap<u64, u32>,
     collisions: HashMap<u64, Vec<u32>>,
-    offsets: Vec<u32>,
-    payload: Vec<u8>,
+    /// Every value's hash under [`DICTIONARY_CHECK_SEED`], in code order.
+    checks: Vec<u64>,
+    /// Where every value ends inside the payload block it is in, in code order.
+    ends: Vec<u32>,
     counts: Vec<u64>,
     nulls: u64,
+    /// The values of the block being filled, back to back.
+    filling: Vec<u8>,
+    /// Blocks that have filled and not been encoded yet, each with its block number.
+    ///
+    /// Empty except between a block filling and the end of the stripe that filled it, and while the
+    /// column is still too small to settle a shape on.
+    waiting: Vec<(usize, Vec<u8>)>,
+    /// Blocks kept raw to settle a shape on, spread across the column, each with its number.
+    ///
+    /// At most [`PAYLOAD_SAMPLE_BLOCKS`] of them and so at most a few megabytes. Spread rather than
+    /// taken off the front for the reason [`settle_shape`] gives, and kept rather than read back
+    /// because reading back is a decode and this is a sample of a column that is still growing.
+    sample: Vec<(usize, Vec<u8>)>,
+    /// How far apart the blocks in `sample` are, which doubles every time there are too many.
+    stride: usize,
+    /// What the blocks encoded so far were encoded with, once the column is big enough to settle it.
+    shape: Option<chooser::Settled>,
+    /// How many blocks had filled when that shape was settled.
+    settled: usize,
+    /// The blocks that are encoded, in block order.
+    blocks: Vec<Vec<u8>>,
 }
 
 impl GlobalDictionary {
@@ -692,51 +757,168 @@ impl GlobalDictionary {
         Self {
             primary: HashMap::new(),
             collisions: HashMap::new(),
-            offsets: vec![0],
-            payload: Vec::new(),
+            checks: Vec::new(),
+            ends: Vec::new(),
             counts: Vec::new(),
             nulls: 0,
+            filling: Vec::new(),
+            waiting: Vec::new(),
+            sample: Vec::new(),
+            stride: 1,
+            shape: None,
+            settled: 0,
+            blocks: Vec::new(),
         }
     }
 
-    fn bytes(&self, code: u32) -> Option<&[u8]> {
-        let start = *self.offsets.get(code as usize)? as usize;
-        let end = *self.offsets.get(code as usize + 1)? as usize;
-        self.payload.get(start..end)
+    /// How many distinct values this dictionary holds, which is one past its largest code.
+    fn values(&self) -> usize {
+        self.ends.len()
     }
 
     fn code(&mut self, text: &str) -> Result<u32> {
         let hash = checksum(text.as_bytes());
+        let check = seeded_checksum(text.as_bytes(), DICTIONARY_CHECK_SEED);
         if let Some(&code) = self.primary.get(&hash) {
-            if self.bytes(code) == Some(text.as_bytes()) {
+            if self.checks.get(code as usize) == Some(&check) {
                 return Ok(code);
             }
             if let Some(codes) = self.collisions.get(&hash) {
                 if let Some(code) =
-                    codes.iter().copied().find(|&code| self.bytes(code) == Some(text.as_bytes()))
+                    codes.iter().copied().find(|&code| self.checks[code as usize] == check)
                 {
                     return Ok(code);
                 }
             }
-            let code = self.insert(text)?;
+            let code = self.insert(text, check)?;
             self.collisions.entry(hash).or_default().push(code);
             return Ok(code);
         }
-        let code = self.insert(text)?;
+        let code = self.insert(text, check)?;
         self.primary.insert(hash, code);
         Ok(code)
     }
 
-    fn insert(&mut self, text: &str) -> Result<u32> {
-        let code = u32::try_from(self.offsets.len() - 1)
+    fn insert(&mut self, text: &str, check: u64) -> Result<u32> {
+        let code = u32::try_from(self.ends.len())
             .map_err(|_| invalid("global dictionary has too many values"))?;
-        self.payload.extend_from_slice(text.as_bytes());
-        self.offsets.push(
-            u32::try_from(self.payload.len())
-                .map_err(|_| invalid("global dictionary payload exceeds 4 GiB"))?,
+        self.filling.extend_from_slice(text.as_bytes());
+        self.ends.push(
+            u32::try_from(self.filling.len())
+                .map_err(|_| invalid("a global dictionary value exceeds 4 GiB"))?,
         );
+        self.checks.push(check);
         self.counts.push(0);
+        if self.ends.len() % TEXT_PAYLOAD_VALUES == 0 {
+            self.seal();
+        }
         Ok(code)
+    }
+
+    /// Closes the block being filled and puts it in the queue to be encoded.
+    ///
+    /// Also keeps a copy of it if it lands on the sample's stride, and halves the sample when that
+    /// has left too many, which is what keeps the kept blocks spread evenly over however much of the
+    /// column exists rather than bunched at whichever end was cheap to remember.
+    fn seal(&mut self) {
+        let at = self.ends.len().div_ceil(TEXT_PAYLOAD_VALUES) - 1;
+        let bytes = std::mem::take(&mut self.filling);
+        if at % self.stride == 0 {
+            self.sample.push((at, bytes.clone()));
+            if self.sample.len() > PAYLOAD_SAMPLE_BLOCKS {
+                self.stride *= 2;
+                let stride = self.stride;
+                self.sample.retain(|(at, _)| at % stride == 0);
+            }
+        }
+        self.waiting.push((at, bytes));
+    }
+
+    /// The values of one block, as slices into the bytes the block was filled with.
+    fn slices<'a>(&self, at: usize, bytes: &'a [u8]) -> Vec<&'a [u8]> {
+        let first = at * TEXT_PAYLOAD_VALUES;
+        let last = (first + TEXT_PAYLOAD_VALUES).min(self.ends.len());
+        let mut out = Vec::with_capacity(last.saturating_sub(first));
+        let mut from = 0;
+        for value in first..last {
+            let to = self.ends[value] as usize;
+            out.push(&bytes[from..to]);
+            from = to;
+        }
+        out
+    }
+
+    /// Settles the shape the waiting blocks are about to be encoded with, if there is enough column
+    /// to settle one on.
+    ///
+    /// Settled again once the column has grown fourfold, because the sample it was settled on then
+    /// covered a quarter of what exists now and a dictionary in first seen order does not look the
+    /// same at both ends. Blocks already encoded keep the shape they were encoded with. They can,
+    /// because a block says what it is: nothing reading one asks the column what shape to expect.
+    fn settle(&mut self) -> Result<()> {
+        if self.sample.len() < PAYLOAD_SAMPLE_BLOCKS {
+            return Ok(());
+        }
+        let complete = self.ends.len() / TEXT_PAYLOAD_VALUES;
+        if self.shape.is_some() && complete < self.settled.saturating_mul(4) {
+            return Ok(());
+        }
+        let sample =
+            self.sample.iter().map(|(at, bytes)| self.slices(*at, bytes)).collect::<Vec<_>>();
+        self.shape = Some(settle_shape(&sample)?);
+        self.settled = complete;
+        Ok(())
+    }
+
+    /// Encodes whatever is still raw, which is the part block at the end of the load and, for a
+    /// column too small to have settled a shape, every block it has.
+    fn finish_blocks(&mut self) -> Result<()> {
+        // Asked of the values rather than of the bytes, because a block of empty strings has values
+        // in it and no bytes, and a column of nulls is exactly that.
+        if self.ends.len() % TEXT_PAYLOAD_VALUES != 0 {
+            self.seal();
+        }
+        for (at, bytes) in std::mem::take(&mut self.waiting) {
+            if self.blocks.len() != at {
+                return Err(Error::internal("a dictionary block was encoded out of order"));
+            }
+            let values = self.slices(at, &bytes);
+            self.blocks.push(match &self.shape {
+                Some(shape) => string::encode_with(&values, shape)?,
+                None => string::encode(&values)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// Every value of this dictionary read back out of its encoded blocks, as the bytes back to back
+    /// and where each block starts in them.
+    ///
+    /// This is the one place the whole column is in memory at once and the reason [`Writer::close`]
+    /// takes the columns one at a time rather than across threads. One column's values is 1.3 GB on
+    /// the worst ClickBench column, and five columns of that at once is the peak this was all meant
+    /// to remove.
+    fn decoded(&self) -> Result<(Vec<u8>, Vec<u64>)> {
+        let mut flat = Vec::new();
+        let mut bases = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            bases.push(flat.len() as u64);
+            let values = string::decode_flat(block)?;
+            flat.extend_from_slice(&values.into_bytes());
+        }
+        Ok((flat, bases))
+    }
+
+    /// Where the value at `code` sits in the bytes [`GlobalDictionary::decoded`] handed back.
+    ///
+    /// A block's first value starts at the block, and every other value starts where the one before
+    /// it ended, which is what makes 1,024 values 1,024 numbers rather than 1,025.
+    fn value_span(ends: &[u32], bases: &[u64], code: usize) -> (usize, usize) {
+        let Some(&base) = bases.get(code / TEXT_PAYLOAD_VALUES) else { return (0, 0) };
+        let Some(&end) = ends.get(code) else { return (0, 0) };
+        let base = base as usize;
+        let from = if code % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[code - 1] as usize };
+        (base + from, base + end as usize)
     }
 
     /// This dictionary's values in sorted order, each as the first eight bytes of the value and the
@@ -758,11 +940,15 @@ impl GlobalDictionary {
     /// The heads are kept because a reader searching this order wants a comparison it can make out
     /// of the index alone. What they buy there depends entirely on the column and is much less than
     /// it looks on the columns that cost the most, which [`sort_by_value`] measures.
-    fn ranked(&self) -> Vec<(u64, u32)> {
-        let count = self.offsets.len() - 1;
-        let mut codes = (0..count as u32).collect::<Vec<_>>();
-        sort_by_value(&mut codes, |code| self.bytes(code).unwrap_or_default());
-        codes.into_iter().map(|code| (head(self.bytes(code).unwrap_or_default()), code)).collect()
+    fn ranked(&self) -> Result<Vec<(u64, u32)>> {
+        let (flat, bases) = self.decoded()?;
+        let value = |code: u32| {
+            let (from, to) = Self::value_span(&self.ends, &bases, code as usize);
+            flat.get(from..to).unwrap_or_default()
+        };
+        let mut codes = (0..self.values() as u32).collect::<Vec<_>>();
+        sort_by_value(&mut codes, value);
+        Ok(codes.into_iter().map(|code| (head(value(code)), code)).collect())
     }
 
     fn observe(&mut self, code: u32, null: bool) -> Result<()> {
@@ -1332,13 +1518,13 @@ impl Writer {
     ) -> Result<ColumnStripe> {
         // Empty means nothing has been written through it yet, so this is the column's first stripe
         // and the only stripe the decision below is allowed to be made on.
-        let deciding = dictionary.as_ref().is_some_and(|held| held.offsets.len() == 1);
+        let deciding = dictionary.as_ref().is_some_and(|held| held.values() == 0);
         let stripe = Self::encode_pages(index, held, dictionary.as_mut())?;
         if !deciding {
             return Ok(stripe);
         }
         let rows: usize = held.iter().map(|pending| pending.chunk.len()).sum();
-        let distinct = dictionary.as_ref().map_or(0, |held| held.offsets.len() - 1);
+        let distinct = dictionary.as_ref().map_or(0, GlobalDictionary::values);
         if rows < DICTIONARY_DECIDE_ROWS
             || distinct.saturating_mul(10) <= rows.saturating_mul(DICTIONARY_DISTINCT_IN_TEN)
         {
@@ -1507,6 +1693,9 @@ impl Writer {
         let mut held = std::mem::take(&mut self.pending);
         let parts = held.len();
         let encoded = self.encode_columns(&held)?;
+        // Before a byte of the stripe is written, because the raw bytes this frees are the bytes the
+        // load peaks on and the threads it uses are idle between here and the next chunk arriving.
+        encode_ready(&mut self.dictionaries)?;
         let mut pages = Vec::with_capacity(width);
         let mut memberships = vec![None; width];
         let mut ranges = Vec::with_capacity(width);
@@ -1864,9 +2053,14 @@ impl Writer {
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
         self.table.frequencies = self.numeric_frequencies()?;
         let dictionaries = std::mem::take(&mut self.dictionaries);
-        let orders = rankings(&dictionaries)?;
-        for (index, (dictionary, order)) in dictionaries.into_iter().zip(orders).enumerate() {
-            let Some(dictionary) = dictionary else { continue };
+        // One column at a time, and every column's values dropped before the next column's are read
+        // back. Sorting the columns across threads is the obvious thing and was what this did, but
+        // sorting a column now means decoding it, and five ClickBench string columns decoded at once
+        // is the peak this change is about.
+        for (index, dictionary) in dictionaries.into_iter().enumerate() {
+            let Some(mut dictionary) = dictionary else { continue };
+            dictionary.finish_blocks()?;
+            let order = dictionary.ranked()?;
             // A code nothing counted is a code no non-null row of this column holds, which is the
             // empty string a null was written as and nothing else, because a code is only ever made
             // by a row asking for one.
@@ -2768,13 +2962,11 @@ fn rank_heads(block: &[u8]) -> Result<(u64, usize, &[u8])> {
 /// column, so the blocks of a column are within a factor of two of each other on every ClickBench
 /// string column, and a width a block would save a fraction of a bit and cost a byte a block plus
 /// the arithmetic that finds where a block starts.
-fn offset_width(offsets: &[u32]) -> usize {
-    let values = offsets.len() - 1;
-    let mut span = 0;
-    for first in (0..values).step_by(TEXT_PAYLOAD_VALUES) {
-        let last = (first + TEXT_PAYLOAD_VALUES).min(values);
-        span = span.max(offsets[last] - offsets[first]);
-    }
+fn offset_width(ends: &[u32]) -> usize {
+    // The ends are already relative to the block the value is in, so the last end of a block is that
+    // block's total and the largest end anywhere is the widest block. There is no subtraction left
+    // to do and no need to walk the blocks to find where one starts.
+    let span = ends.iter().copied().max().unwrap_or(0);
     (u32::BITS - span.leading_zeros()) as usize
 }
 
@@ -2787,14 +2979,13 @@ fn offset_bytes(values: usize, bits: usize) -> usize {
 }
 
 /// The end of every value within its payload block, packed a run at a time.
-fn encode_offsets(offsets: &[u32], bits: usize, out: &mut Vec<u8>) -> Result<()> {
-    let values = offsets.len() - 1;
+/// A run never straddles a block, because [`TEXT_OFFSET_RUN`] divides [`TEXT_PAYLOAD_VALUES`], which
+/// is what lets this be a walk of the ends rather than arithmetic against a per block base.
+fn encode_offsets(ends: &[u32], bits: usize, out: &mut Vec<u8>) -> Result<()> {
     let mut run = Vec::with_capacity(TEXT_OFFSET_RUN);
-    for first in (0..values).step_by(TEXT_OFFSET_RUN) {
-        let last = (first + TEXT_OFFSET_RUN).min(values);
-        let base = offsets[first / TEXT_PAYLOAD_VALUES * TEXT_PAYLOAD_VALUES];
+    for chunk in ends.chunks(TEXT_OFFSET_RUN) {
         run.clear();
-        run.extend((first..last).map(|value| u64::from(offsets[value + 1] - base)));
+        run.extend(chunk.iter().map(|&end| u64::from(end)));
         bitpack::pack_tail(&run, bits, out)
             .map_err(|_| invalid("global dictionary offsets do not pack"))?;
     }
@@ -6415,57 +6606,6 @@ fn head(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(word)
 }
 
-/// The sorted order of every global dictionary, one entry per column and empty where there is no
-/// dictionary.
-///
-/// One column's sort has nothing to do with another's, and a table like `hits` has fifteen string
-/// columns, so this runs across threads the way the numeric synopses above do. It is the only part
-/// of committing a file that is more than bookkeeping, and doing it serially would show up as a
-/// pause at the end of a load that thirty two threads had been busy with until then.
-fn rankings(dictionaries: &[Option<GlobalDictionary>]) -> Result<Vec<Vec<(u64, u32)>>> {
-    let present =
-        dictionaries.iter().enumerate().filter(|(_, held)| held.is_some()).map(|(at, _)| at);
-    let present = present.collect::<Vec<_>>();
-    let mut orders = vec![Vec::new(); dictionaries.len()];
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(MAX_FREQUENCY_WORKERS)
-        .min(present.len());
-    if workers <= 1 {
-        for at in present {
-            if let Some(dictionary) = &dictionaries[at] {
-                orders[at] = dictionary.ranked();
-            }
-        }
-        return Ok(orders);
-    }
-    let width = present.len().div_ceil(workers);
-    let pieces = std::thread::scope(|scope| {
-        present
-            .chunks(width)
-            .map(|columns| {
-                scope.spawn(|| {
-                    columns
-                        .iter()
-                        .filter_map(|&at| dictionaries[at].as_ref().map(|held| (at, held.ranked())))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| {
-                handle.join().map_err(|_| Error::internal("a dictionary sort worker panicked"))
-            })
-            .collect::<Result<Vec<_>>>()
-    })?;
-    for piece in pieces {
-        for (at, order) in piece {
-            orders[at] = order;
-        }
-    }
-    Ok(orders)
-}
-
 /// One column's dictionary as the three runs of bytes a file holds it in.
 ///
 /// `base` is where the index is going to land, which the caller knows because it is about to write
@@ -6483,18 +6623,18 @@ fn encode_global_dictionary(
     base: u64,
     scattered: bool,
 ) -> Result<EncodedDictionary> {
-    let values = dictionary.offsets.len() - 1;
+    let values = dictionary.values();
     if order.len() != values {
         return Err(invalid("global dictionary order does not cover its values"));
     }
     let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
-    let payload = encode_payload(&dictionary)?;
+    let payload = dictionary.blocks;
     if payload.len() != blocks {
         return Err(invalid("global dictionary payload is not the blocks it says it is"));
     }
     let (ranks, rank_ends) = encode_ranks(order, code_width(values))?;
     let rank_blocks = values.div_ceil(TEXT_RANK_BLOCK);
-    let offset_bits = offset_width(&dictionary.offsets);
+    let offset_bits = offset_width(&dictionary.ends);
     // Worked out rather than measured at the end, because the places written into the index below
     // are places in the file and the index is what stands between `base` and the first of them.
     let payload_words = if scattered { 3 } else { 2 };
@@ -6515,7 +6655,7 @@ fn encode_global_dictionary(
     );
     let flag = if scattered { DICTIONARY_SCATTERED } else { 0 };
     put_u32(&mut index, offset_bits as u32 | flag);
-    encode_offsets(&dictionary.offsets, offset_bits, &mut index)?;
+    encode_offsets(&dictionary.ends, offset_bits, &mut index)?;
     // Where each block is and how long it is, so a reader can find one. The stored blocks are
     // shorter than the decoded ones and by a different amount each, so their lengths are the one
     // thing the offsets above no longer say, and where they start is no longer arithmetic on the
@@ -6613,69 +6753,100 @@ fn payload_shapes() -> Vec<chooser::Settled> {
     .collect()
 }
 
-/// The payload as encoded blocks of [`TEXT_PAYLOAD_VALUES`] values each.
+/// Encodes every payload block that filled during the stripe just written, across threads.
 ///
-/// Across threads because this is the only part of committing a file that is real work rather than
-/// bookkeeping. The blocks are the same size and cost about the same, so an index each is enough of
-/// a queue and there is nothing to weight the way the numeric synopses are weighted.
-fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
-    let values = dictionary.offsets.len() - 1;
-    let blocks = values.div_ceil(TEXT_PAYLOAD_VALUES);
-    let run = |block: usize| {
-        let first = block * TEXT_PAYLOAD_VALUES;
-        let last = (first + TEXT_PAYLOAD_VALUES).min(values);
-        (first..last)
-            .map(|value| {
-                let from = dictionary.offsets[value] as usize;
-                let to = dictionary.offsets[value + 1] as usize;
-                &dictionary.payload[from..to]
-            })
-            .collect::<Vec<_>>()
-    };
-    // A dictionary small enough to be the sample is small enough to search in full, and searching
-    // it costs less than deciding not to.
-    let shape = (blocks > PAYLOAD_SAMPLE_BLOCKS).then(|| settle_shape(&run, blocks)).transpose()?;
-    let one = |block: usize| match &shape {
-        Some(shape) => string::encode_with(&run(block), shape),
-        None => string::encode(&run(block)),
+/// This is where the load's dictionary work happens, and where it happens matters more than it
+/// looks. It used to happen in [`Writer::close`], over every block of a column at once, which meant
+/// the raw bytes of every block had to still exist when the load ended. Doing it a block at a time
+/// inside the stripe encode instead was measured at 2.2 times the wall clock for the same user time:
+/// a stripe is a barrier the parquet reader waits on, one column's blocks are one thread, and two of
+/// `hits`'s five dictionary columns hold most of the distinct values, so the whole load ran at less
+/// than one core.
+///
+/// Here is neither. The stripe's columns have all been encoded and handed back by the time this
+/// runs, so every waiting block of every column is one flat queue and it fans out over all of them
+/// the way [`Writer::close`] used to fan out over one column's. The work and the parallelism are
+/// what they were. It happens sixty times during the load rather than once at the end of it, and the
+/// raw bytes go as it goes.
+fn encode_ready(dictionaries: &mut [Option<GlobalDictionary>]) -> Result<()> {
+    for dictionary in dictionaries.iter_mut().flatten() {
+        dictionary.settle()?;
+    }
+    // A column with no shape yet is a column with fewer blocks than the sample wants, so its blocks
+    // wait. There are at most `PAYLOAD_SAMPLE_BLOCKS` of them and they are about to be encoded one
+    // way or the other, and encoding them now would be encoding them without having looked at the
+    // column.
+    let jobs = dictionaries
+        .iter()
+        .enumerate()
+        .filter(|(_, held)| held.as_ref().is_some_and(|held| held.shape.is_some()))
+        .flat_map(|(column, held)| {
+            (0..held.as_ref().map_or(0, |held| held.waiting.len())).map(move |at| (column, at))
+        })
+        .collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let one = |column: usize, at: usize| -> Result<(usize, usize, Vec<u8>)> {
+        let held = dictionaries[column].as_ref().ok_or_else(|| Error::internal("no dictionary"))?;
+        let (block, bytes) = &held.waiting[at];
+        let values = held.slices(*block, bytes);
+        let shape = held.shape.as_ref().ok_or_else(|| Error::internal("no dictionary shape"))?;
+        Ok((column, at, string::encode_with(&values, shape)?))
     };
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(MAX_FREQUENCY_WORKERS)
-        .min(blocks);
-    if workers <= 1 {
-        return (0..blocks).map(one).collect();
-    }
-    let next = AtomicUsize::new(0);
-    let pieces = std::thread::scope(|scope| {
-        (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let block = next.fetch_add(1, Atomic::Relaxed);
-                        if block >= blocks {
-                            break;
+        .min(jobs.len());
+    let made = if workers <= 1 {
+        jobs.iter().map(|&(column, at)| one(column, at)).collect::<Result<Vec<_>>>()?
+    } else {
+        let next = AtomicUsize::new(0);
+        let jobs = &jobs;
+        let pieces = std::thread::scope(|scope| {
+            (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let job = next.fetch_add(1, Atomic::Relaxed);
+                            let Some(&(column, at)) = jobs.get(job) else { break };
+                            mine.push(one(column, at)?);
                         }
-                        mine.push((block, one(block)?));
-                    }
-                    Ok(mine)
+                        Ok(mine)
+                    })
                 })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| {
-                handle.join().map_err(|_| Error::internal("a dictionary encode worker panicked"))?
-            })
-            .collect::<Result<Vec<_>>>()
-    })?;
-    let mut payload = vec![Vec::new(); blocks];
-    for piece in pieces {
-        for (block, bytes) in piece {
-            payload[block] = bytes;
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| Error::internal("a dictionary encode worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        pieces.into_iter().flatten().collect()
+    };
+    let mut done: Vec<Vec<(usize, Vec<u8>)>> =
+        (0..dictionaries.len()).map(|_| Vec::new()).collect();
+    for (column, at, bytes) in made {
+        done[column].push((at, bytes));
+    }
+    for (column, mut made) in done.into_iter().enumerate() {
+        if made.is_empty() {
+            continue;
+        }
+        let Some(held) = dictionaries[column].as_mut() else { continue };
+        made.sort_by_key(|(at, _)| *at);
+        let waiting = std::mem::take(&mut held.waiting);
+        for ((block, _), (_, bytes)) in waiting.into_iter().zip(made) {
+            if held.blocks.len() != block {
+                return Err(Error::internal("a dictionary block was encoded out of order"));
+            }
+            held.blocks.push(bytes);
         }
     }
-    Ok(payload)
+    Ok(())
 }
 
 /// Which of [`payload_shapes`] comes out smallest over a sample of the blocks.
@@ -6684,19 +6855,14 @@ fn encode_payload(dictionary: &GlobalDictionary) -> Result<Vec<Vec<u8>>> {
 /// search moved up a level: over shapes of a column rather than over candidates of a chunk. The
 /// sample is spread across the dictionary so that the first and last blocks are both in it, because
 /// a dictionary written in first seen order has its common values at the front and its long tail at
-/// the back, and those do not compress alike.
-fn settle_shape<'a>(
-    run: &dyn Fn(usize) -> Vec<&'a [u8]>,
-    blocks: usize,
-) -> Result<chooser::Settled> {
-    let last = blocks - 1;
-    let sample = (0..PAYLOAD_SAMPLE_BLOCKS)
-        .map(|region| run(region * last / (PAYLOAD_SAMPLE_BLOCKS - 1)))
-        .collect::<Vec<_>>();
+/// the back, and those do not compress alike. Which blocks those are is
+/// [`GlobalDictionary::seal`]'s to decide, because by the time this is called the rest of them have
+/// been encoded and the raw bytes are gone.
+fn settle_shape(sample: &[Vec<&[u8]>]) -> Result<chooser::Settled> {
     let mut best: Option<(chooser::Settled, usize)> = None;
     for shape in payload_shapes() {
         let mut size = 0;
-        for block in &sample {
+        for block in sample {
             size += string::encode_with(block, &shape)?.len();
         }
         if best.as_ref().is_none_or(|(_, smallest)| size < *smallest) {
@@ -7331,6 +7497,20 @@ mod tests {
     fn path(label: &str) -> PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("time advances").as_nanos();
         std::env::temp_dir().join(format!("rudb-native-{label}-{}-{stamp}.rdb", std::process::id()))
+    }
+
+    /// Every value of a dictionary in code order, which the tests have no other way to ask for now
+    /// that a dictionary does not keep the bytes of the values it has seen.
+    ///
+    /// Only valid once `finish_blocks` has run, because until then the last part block is still raw.
+    fn dictionary_values(dictionary: &GlobalDictionary) -> Vec<Vec<u8>> {
+        let (flat, bases) = dictionary.decoded().expect("the blocks decode");
+        (0..dictionary.values())
+            .map(|code| {
+                let (from, to) = GlobalDictionary::value_span(&dictionary.ends, &bases, code);
+                flat[from..to].to_vec()
+            })
+            .collect()
     }
 
     /// The sections a test put in the table, which is every one the writer did not.
@@ -9997,7 +10177,8 @@ mod tests {
             for text in &spellings {
                 dictionary.code(text).expect("a code for every spelling");
             }
-            let order = dictionary.ranked();
+            dictionary.finish_blocks().expect("the last block encodes");
+            let order = dictionary.ranked().expect("a sorted order");
             let encoded =
                 encode_global_dictionary(dictionary, &order, 0, scattered).expect("an encoding");
             let mut bytes = encoded.index.clone();
@@ -10612,14 +10793,15 @@ mod tests {
         for value in &values {
             dictionary.code(value).expect("a code for every value");
         }
-        let ranked = dictionary.ranked();
+        dictionary.finish_blocks().expect("the last block encodes");
+        let ranked = dictionary.ranked().expect("a sorted order");
         assert_eq!(ranked.len(), values.len(), "one entry a distinct value");
 
+        let spellings = dictionary_values(&dictionary);
         let seen = ranked
             .iter()
             .map(|&(_, code)| {
-                String::from_utf8(dictionary.bytes(code).expect("a coded value").to_vec())
-                    .expect("text in, text out")
+                String::from_utf8(spellings[code as usize].clone()).expect("text in, text out")
             })
             .collect::<Vec<_>>();
         let mut wanted = values.clone();
@@ -10627,7 +10809,7 @@ mod tests {
         assert_eq!(seen, wanted, "the order is the order the bytes give");
 
         for &(carried, code) in &ranked {
-            let value = dictionary.bytes(code).expect("a coded value");
+            let value = &spellings[code as usize];
             assert_eq!(carried, head(value), "the head belongs to the value it is filed with");
         }
     }
@@ -10674,16 +10856,19 @@ mod tests {
     #[test]
     fn a_short_dictionary_sorts_without_a_bucketing_pass() {
         let empty = GlobalDictionary::new();
-        assert!(empty.ranked().is_empty(), "nothing in, nothing out");
+        assert!(empty.ranked().expect("an empty order").is_empty(), "nothing in, nothing out");
 
         let mut dictionary = GlobalDictionary::new();
         for value in ["pear", "apple", "", "apples", "app"] {
             dictionary.code(value).expect("a code for every value");
         }
+        dictionary.finish_blocks().expect("the one block encodes");
+        let spellings = dictionary_values(&dictionary);
         let seen = dictionary
             .ranked()
+            .expect("a sorted order")
             .iter()
-            .map(|&(_, code)| dictionary.bytes(code).expect("a coded value").to_vec())
+            .map(|&(_, code)| spellings[code as usize].clone())
             .collect::<Vec<_>>();
         let wanted: Vec<Vec<u8>> =
             [&b""[..], b"app", b"apple", b"apples", b"pear"].iter().map(|v| v.to_vec()).collect();
