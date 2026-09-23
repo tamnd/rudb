@@ -13616,7 +13616,7 @@ mod tests {
         let mut writer =
             Writer::create(&path, "items", vec![Field::required("id", LogicalType::BigInt)])
                 .expect("new file");
-        for part in values.chunks(122_880) {
+        for part in values.chunks(8_192) {
             let vector = Vector::flat(
                 LogicalType::BigInt,
                 Data::Int64(part.iter().map(|&v| v as i64).collect::<Vec<_>>().into()),
