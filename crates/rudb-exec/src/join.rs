@@ -97,7 +97,7 @@ use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 use crate::buffer::Buffered;
 use crate::expr::evaluate_all_in_time_zone;
 use crate::gather::{self, Gathering};
-use crate::lookup::{Lookup, MISS, Scratch};
+use crate::lookup::{Lookup, MISS, NONE, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::side::{Build, PAD, laid_out};
@@ -1027,6 +1027,10 @@ pub(crate) struct Probing {
     /// Once per chunk rather than once per row because the probe is a batch at a time. See
     /// [`Lookup::slots`], which is the whole argument.
     slots: Vec<usize>,
+    /// The first gathered row each driving row matches, [`NONE`] for none, one entry per slot.
+    ///
+    /// Read out of the table for the whole chunk at once. See [`Lookup::firsts`].
+    firsts: Vec<u32>,
     /// The buffers that lookup walks the chunk with, held here so that a chunk costs no allocation.
     scratch: Scratch,
     /// The gathered rows the current driving row matches, refilled per row from its chain.
@@ -1342,6 +1346,7 @@ impl Stream for Probe<'_> {
             left: None,
             keys: Vec::new(),
             slots: Vec::new(),
+            firsts: Vec::new(),
             scratch: Scratch::default(),
             chain: Vec::new(),
             cand: Candidates::default(),
@@ -1403,6 +1408,7 @@ impl Stream for Probe<'_> {
                         &mut local.slots,
                     );
                 }
+                built.index.firsts(&local.slots, &mut local.firsts);
                 left
             }
         };
@@ -1418,7 +1424,9 @@ impl Stream for Probe<'_> {
             // can be held across a push to the answer. They are separate fields and nothing reads
             // two of them at once, but a `local.cand` borrowed while `local.left_at` is written is
             // one borrow of the whole state twice over as far as the compiler is concerned.
-            let Probing { slots, chain, cand, left_at, right_at, row, hit, .. } = &mut *local;
+            let Probing { slots, firsts, chain, cand, left_at, right_at, row, hit, .. } =
+                &mut *local;
+            let single = built.index.single();
             // The two halves of the answer, one entry per output row. Nothing is built here but a
             // pair of numbers per pair of rows, and the columns are gathered at those numbers below.
             left_at.clear();
@@ -1430,10 +1438,17 @@ impl Stream for Probe<'_> {
                 let found: &[u32] = if residual.exprs.is_empty() {
                     // The chain the lookup above left for this row, which is one walk of a run of
                     // `u32` rather than a hash and a map lookup. An ordinary equi join answers out
-                    // of it directly and so costs no boxed row and no second pass at all.
-                    let slot = slots.get(*row).copied().unwrap_or(MISS);
-                    built.index.matches(slot, chain);
-                    chain
+                    // of it directly and so costs no boxed row and no second pass at all. Against a
+                    // table where every key has one row the chain is its first row alone, and that
+                    // was read for the whole chunk before this loop started.
+                    match firsts.get(*row) {
+                        None | Some(&NONE) => &[],
+                        Some(first) if single => std::slice::from_ref(first),
+                        Some(&first) => {
+                            built.index.chain_from(first, chain);
+                            chain
+                        }
+                    }
                 } else {
                     // A residual is answered for a batch of driving rows at a time and read back
                     // here a row at a time. The refill covers this row and as many after it as fit,
