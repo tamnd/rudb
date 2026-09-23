@@ -154,12 +154,38 @@ pub struct Insert {
     /// The rows to append. The output is the table's columns, in the table's order, with the
     /// table's types, so nothing between here and the append has a decision left to make.
     pub source: Plan,
-    /// Whether the rows are the whole table afterwards rather than rows to add to it, which is
-    /// what an `UPDATE` and a `DELETE` bind to.
-    pub replace: bool,
-    /// Whether the source has one more column after the table's, a flag saying which rows the
-    /// statement changed, which is how an `UPDATE` counts what it changed without keeping it.
-    pub flagged: bool,
+    /// Which of the three writes the source is for.
+    pub write: Write,
+    /// The `RETURNING` list, bound as a query over the table and run over the rows the statement
+    /// wrote in place of the table's own.
+    pub returning: Option<Box<Plan>>,
+}
+
+/// What an [`Insert`]'s source means for the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    /// The rows are added to the table.
+    Append,
+    /// The rows are the whole table afterwards, and one more column after the table's says which
+    /// of them the statement changed, so it can count them and return them.
+    Update,
+    /// The rows are the table as it was, and the column after the table's says which of them
+    /// the statement deletes. The table keeps the rest.
+    Delete,
+}
+
+/// The `RETURNING` query of a writing statement, bound over the table it writes.
+fn returning(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    query: Option<ast::QueryRef>,
+) -> Result<Option<Box<Plan>>> {
+    let Some(query) = query else { return Ok(None) };
+    let mut binder = Binder::with(catalog, parameters, session);
+    let (root, _) = binder.bind_query(ast, query)?;
+    Ok(Some(Box::new(finish(binder, root)?)))
 }
 
 /// Binds one parsed statement against a catalog.
@@ -687,20 +713,19 @@ fn insert(
     let names = binder.plan_mut().add_name_list(&names);
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
-    Ok(Bound::Insert(Insert {
-        name,
-        source: finish(binder, root)?,
-        replace: false,
-        flagged: false,
-    }))
+    let source = finish(binder, root)?;
+    let returning = returning(ast, catalog, parameters, session, written.returning)?;
+    Ok(Bound::Insert(Insert { name, source, write: Write::Append, returning }))
 }
 
 /// An `UPDATE` or a `DELETE`, bound to the query that produces every row the table has afterwards.
 ///
 /// The source the transform built is `SELECT *, condition, values... FROM table`. A row the
-/// condition holds for gets the new values in the named columns, or is left out for a `DELETE`, and
-/// every other row comes through as it was. A null condition is a row that did not match, which is
-/// what a searched `CASE` does with one, so the one expression covers both.
+/// condition holds for gets the new values in the named columns for an `UPDATE`, and every other
+/// row comes through as it was. A null condition is a row that did not match, which is what a
+/// searched `CASE` does with one, so the one expression covers both. After the table's columns
+/// comes the flag saying which rows matched, which are the rows an `UPDATE` changed and the rows a
+/// `DELETE` takes out.
 fn change(
     ast: &Ast,
     catalog: &Catalog,
@@ -735,7 +760,7 @@ fn change(
     }
 
     let mut binder = Binder::with(catalog, parameters, session);
-    let (mut root, scope) = binder.bind_query(ast, written.source)?;
+    let (root, scope) = binder.bind_query(ast, written.source)?;
     let width = fields.len();
     if scope.len() != width + 1 + targets.len() {
         return Err(Error::internal(format!(
@@ -749,14 +774,6 @@ fn change(
     };
     let hit = column(&mut binder, width);
     let hit = binder.checked_cast_to(hit, &LogicalType::Boolean, false)?;
-    if delete {
-        let keep = binder.add_constant(Value::Boolean(false));
-        let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then: keep }]);
-        let otherwise = Some(binder.add_constant(Value::Boolean(true)));
-        let predicate =
-            binder.plan_mut().add_expr(Expr::Case { arms, otherwise }, LogicalType::Boolean);
-        root = binder.plan_mut().add_node(Node::Filter { input: root, predicate });
-    }
     let mut exprs = Vec::with_capacity(width);
     let mut names = Vec::with_capacity(width);
     for (at, field) in fields.iter().enumerate() {
@@ -776,21 +793,20 @@ fn change(
         let interned = binder.plan_mut().intern(&field.name);
         names.push(interned);
     }
-    // A deleted row is not in the output at all, so the rows a `DELETE` removed are the ones the
-    // table lost, and only an `UPDATE` needs the flag to say which rows it changed.
-    if !delete {
-        let yes = binder.add_constant(Value::Boolean(true));
-        let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then: yes }]);
-        let otherwise = Some(binder.add_constant(Value::Boolean(false)));
-        exprs
-            .push(binder.plan_mut().add_expr(Expr::Case { arms, otherwise }, LogicalType::Boolean));
-        let interned = binder.plan_mut().intern("changed");
-        names.push(interned);
-    }
+    // The flag is true only where the condition is, so a row whose condition is null is left
+    // alone the way a `WHERE` leaves it out.
+    let yes = binder.add_constant(Value::Boolean(true));
+    let arms = binder.plan_mut().add_arms(&[Arm { when: hit, then: yes }]);
+    let otherwise = Some(binder.add_constant(Value::Boolean(false)));
+    exprs.push(binder.plan_mut().add_expr(Expr::Case { arms, otherwise }, LogicalType::Boolean));
+    let interned = binder.plan_mut().intern("changed");
+    names.push(interned);
     let exprs = binder.plan_mut().add_expr_list(&exprs);
     let names = binder.plan_mut().add_name_list(&names);
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
     let source = finish(binder, root)?;
-    Ok(Bound::Insert(Insert { name, source, replace: true, flagged: !delete }))
+    let returning = returning(ast, catalog, parameters, session, written.returning)?;
+    let write = if delete { Write::Delete } else { Write::Update };
+    Ok(Bound::Insert(Insert { name, source, write, returning }))
 }

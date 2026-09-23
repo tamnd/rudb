@@ -449,7 +449,7 @@ impl<'a> Transform<'a> {
             "DeleteStatement" => self.delete_statement(inner),
             "TruncateStatement" => {
                 let name = self.name_parts(self.find(inner, "BaseTableName"));
-                self.changed_rows(name, NONE, NONE, Vec::new(), true)
+                self.changed_rows(name, NONE, NONE, Vec::new(), None, true)
             }
             "SetStatement" => self.set_statement(inner),
             "ResetStatement" => self.reset_statement(inner),
@@ -999,7 +999,9 @@ impl<'a> Transform<'a> {
 
     /// `InsertStatement <- ... InsertTarget InsertColumnList? InsertValues ...`.
     ///
-    /// `ON CONFLICT`, `RETURNING`, `BY NAME`, `BY POSITION`, `OR REPLACE` and the rest of the
+    /// `RETURNING` is held as its own query, see [`Self::returning`].
+    ///
+    /// `ON CONFLICT`, `BY NAME`, `BY POSITION`, `OR REPLACE` and the rest of the
     /// clauses the grammar hangs off this are each a refusal, because every one of them changes
     /// what the statement means and none of them changes it in a way anything downstream would
     /// notice if it were dropped.
@@ -1007,7 +1009,11 @@ impl<'a> Transform<'a> {
         for kid in self.kids(node) {
             if matches!(
                 self.name(kid),
-                "InsertTarget" | "InsertColumnList" | "InsertValues" | "WithClause"
+                "InsertTarget"
+                    | "InsertColumnList"
+                    | "InsertValues"
+                    | "WithClause"
+                    | "ReturningClause"
             ) {
                 continue;
             }
@@ -1016,7 +1022,10 @@ impl<'a> Transform<'a> {
         if self.find(node, "WithClause") != NONE {
             return self.unsupported(self.find(node, "WithClause"));
         }
-        let name = self.name_parts(self.find(self.find(node, "InsertTarget"), "BaseTableName"));
+        let target = self.find(node, "InsertTarget");
+        let name = self.name_parts(self.find(target, "BaseTableName"));
+        let alias = self.find(target, "InsertAlias");
+        let alias = if alias == NONE { NONE } else { self.identifier(self.first(alias)) };
         let list = self.find(node, "InsertColumnList");
         let columns = if list == NONE {
             Slice::default()
@@ -1033,19 +1042,45 @@ impl<'a> Transform<'a> {
             return self.unsupported(inner);
         }
         let source = self.query(self.find(inner, "SelectStatementInternal"))?;
+        let returning = self.returning(node, name, alias)?;
         let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert { name, columns, source });
+        self.ast.inserts.push(Insert { name, columns, source, returning });
         Ok(Statement::Insert(index))
+    }
+
+    /// `ReturningClause <- 'RETURNING' TargetList`, as `SELECT list FROM table [AS alias]`, or
+    /// `None` when the statement has none.
+    fn returning(&mut self, node: u32, name: Slice, alias: StrRef) -> Result<Option<QueryRef>> {
+        let clause = self.find(node, "ReturningClause");
+        if clause == NONE {
+            return Ok(None);
+        }
+        let mut targets = Vec::new();
+        for kid in self.kids(self.find(clause, "TargetList")).collect::<Vec<_>>() {
+            targets.push(self.target(kid)?);
+        }
+        let targets = self.target_slice(targets);
+        let from = self.written_table(name, alias);
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        Ok(Some(self.push_query(Query::bare(QueryBody::Select(select)))))
+    }
+
+    /// A `FROM` of the one table a writing statement names.
+    fn written_table(&mut self, name: Slice, alias: StrRef) -> Slice {
+        let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let start = self.ast.source_lists.len() as u32;
+        self.ast.source_lists.push(source);
+        Slice { start, len: 1 }
     }
 
     /// `UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause FromClause?
     /// WhereClause? ReturningClause?`.
     ///
-    /// `WITH`, `FROM`, `RETURNING` and the `(a, b) = row` form are each a refusal for now, since
+    /// `WITH`, `FROM` and the `(a, b) = row` form are each a refusal for now, since
     /// every one of them changes which rows change or what comes back. A qualified name after `SET`
     /// is the pin's own refusal.
     fn update_statement(&mut self, node: u32) -> Result<Statement> {
-        for name in ["WithClause", "FromClause", "ReturningClause"] {
+        for name in ["WithClause", "FromClause"] {
             let clause = self.find(node, name);
             if clause != NONE {
                 return self.unsupported(clause);
@@ -1071,13 +1106,14 @@ impl<'a> Transform<'a> {
             sets.push((written, value));
         }
         let filter = self.find(node, "WhereClause");
-        self.changed_rows(name, alias, filter, sets, false)
+        let returning = self.returning(node, name, alias)?;
+        self.changed_rows(name, alias, filter, sets, returning, false)
     }
 
     /// `DeleteStatement <- WithClause? 'DELETE' 'FROM' TargetOptAlias DeleteUsingClause?
-    /// WhereClause? ReturningClause?`, with `WITH`, `USING` and `RETURNING` refused for now.
+    /// WhereClause? ReturningClause?`, with `WITH` and `USING` refused for now.
     fn delete_statement(&mut self, node: u32) -> Result<Statement> {
-        for name in ["WithClause", "DeleteUsingClause", "ReturningClause"] {
+        for name in ["WithClause", "DeleteUsingClause"] {
             let clause = self.find(node, name);
             if clause != NONE {
                 return self.unsupported(clause);
@@ -1088,7 +1124,8 @@ impl<'a> Transform<'a> {
         let alias = self.find(target, "ColId");
         let alias = if alias == NONE { NONE } else { self.identifier(alias) };
         let filter = self.find(node, "WhereClause");
-        self.changed_rows(name, alias, filter, Vec::new(), true)
+        let returning = self.returning(node, name, alias)?;
+        self.changed_rows(name, alias, filter, Vec::new(), returning, true)
     }
 
     /// The source an `UPDATE` or a `DELETE` is held with, which is `SELECT *, condition, values...
@@ -1099,6 +1136,7 @@ impl<'a> Transform<'a> {
         alias: StrRef,
         filter: u32,
         sets: Vec<(StrRef, ExprRef)>,
+        returning: Option<QueryRef>,
         delete: bool,
     ) -> Result<Statement> {
         let hit = if filter == NONE {
@@ -1116,15 +1154,12 @@ impl<'a> Transform<'a> {
             targets.push(Target { expr: value, alias: NONE });
         }
         let targets = self.target_slice(targets);
-        let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
-        let start = self.ast.source_lists.len() as u32;
-        self.ast.source_lists.push(source);
-        let from = Slice { start, len: 1 };
+        let from = self.written_table(name, alias);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         let source = self.push_query(Query::bare(QueryBody::Select(select)));
         let columns = self.part_slice(columns);
         let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert { name, columns, source });
+        self.ast.inserts.push(Insert { name, columns, source, returning });
         Ok(if delete { Statement::Delete(index) } else { Statement::Update(index) })
     }
 
@@ -3995,6 +4030,14 @@ mod tests {
         format!("VALUES {rows}")
     }
 
+    /// A writing statement written back out with its `RETURNING` query after it, if it has one.
+    fn show_returning(ast: &Ast, insert: &Insert, out: String) -> String {
+        match insert.returning {
+            Some(returning) => out + &format!(" RETURNING {}", show_query(ast, returning)),
+            None => out,
+        }
+    }
+
     /// One query written back out.
     fn show_query(ast: &Ast, index: QueryRef) -> String {
         let query = ast.query(index);
@@ -4186,12 +4229,13 @@ mod tests {
                     let columns = ast.name(insert.columns).collect::<Vec<_>>().join(", ");
                     out += &format!(" ({columns})");
                 }
-                out + &format!(" {}", show_query(&ast, insert.source))
+                out += &format!(" {}", show_query(&ast, insert.source));
+                show_returning(&ast, &insert, out)
             }
             Statement::Update(index) | Statement::Delete(index) => {
                 let change = ast.insert(index);
                 let columns = ast.name(change.columns).collect::<Vec<_>>().join(", ");
-                format!(
+                let out = format!(
                     "{} {} ({columns}) {}",
                     if matches!(ast.statements[0], Statement::Update(_)) {
                         "UPDATE"
@@ -4200,7 +4244,8 @@ mod tests {
                     },
                     ast.name_text(change.name),
                     show_query(&ast, change.source)
-                )
+                );
+                show_returning(&ast, &change, out)
             }
             Statement::Set(index) if ast.setting(index).pragma => {
                 format!("PRAGMA {}", ast.string(ast.setting(index).name))
@@ -4509,9 +4554,20 @@ mod tests {
     }
 
     #[test]
+    fn a_returning_list_is_held_as_a_query_over_the_table_it_writes() {
+        assert_eq!(
+            round_statement("INSERT INTO t AS x VALUES (1) RETURNING x.a, a + 1 AS b"),
+            "INSERT INTO t VALUES (1) RETURNING SELECT x.a, (a Add 1) AS b FROM t AS x"
+        );
+        let deleted = round_statement("DELETE FROM t WHERE a = 1 RETURNING *");
+        assert!(deleted.ends_with(" RETURNING SELECT * FROM t"), "{deleted}");
+        let updated = round_statement("UPDATE t SET a = 2 RETURNING a");
+        assert!(updated.ends_with(" RETURNING SELECT a FROM t"), "{updated}");
+    }
+
+    #[test]
     fn an_insert_clause_that_changes_the_answer_is_refused() {
         for query in [
-            "INSERT INTO t VALUES (1) RETURNING *",
             "INSERT OR REPLACE INTO t VALUES (1)",
             "INSERT INTO t BY NAME SELECT 1 AS a",
             "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",

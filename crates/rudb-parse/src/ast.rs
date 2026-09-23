@@ -255,6 +255,9 @@ pub struct Insert {
     pub columns: Slice,
     /// What produces the rows, which is a `VALUES` clause or any other query.
     pub source: QueryRef,
+    /// The `RETURNING` list, held as `SELECT list FROM table [AS alias]` and run over the rows the
+    /// statement wrote rather than over the table.
+    pub returning: Option<QueryRef>,
 }
 
 /// A `WITH name AS MATERIALIZED (query)`, which is run once and read wherever it is named.
