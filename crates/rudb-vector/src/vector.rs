@@ -656,6 +656,29 @@ pub trait TextSource: std::fmt::Debug + Send + Sync {
         body(first, self.bytes_at(first)?.unwrap_or_default())?;
         Ok(first + 1)
     }
+    /// Hands `body` the value at each of `indices`, in whatever order suits the source, with the
+    /// position in `indices` it belongs to.
+    ///
+    /// The whole vector twin of [`bytes_at`](Self::bytes_at), for a kernel that reads every row of
+    /// a vector once and writes something per row, which is what `lower`, `upper` and `substring`
+    /// do. Read a row at a time, a source that decodes a block to answer `bytes_at` has to keep
+    /// every block a row lands in for as long as the source lives, because the borrow it hands back
+    /// says so. Handed a whole vector of positions at once it can put them in block order, decode
+    /// each block once for the call and decide for itself whether that block is worth keeping.
+    ///
+    /// A position the source does not have gets the empty value, which is what a row at a time
+    /// read turns its missing value into. The default reads through `bytes_at` in the order given,
+    /// which is right for every source that keeps its values anyway.
+    fn visit_at(
+        &self,
+        indices: &[u32],
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        for (at, &index) in indices.iter().enumerate() {
+            body(at, self.bytes_at(index as usize)?.unwrap_or_default())?;
+        }
+        Ok(())
+    }
     /// Whether the payload block holding `first` might contain `literal` in any value.
     ///
     /// A false answer is a proof that every value in the block misses. A source without a stored
@@ -2483,35 +2506,42 @@ impl Vector {
     ///
     /// Whatever reading the lengths out of storage raises.
     pub fn try_bytes_lens(&self, into: &mut Vec<i64>) -> Result<bool> {
-        self.lens_through(into, |source, indices, into| source.bytes_lens_at(indices, into))
+        self.lens_through(into, false, |source, indices, into| source.bytes_lens_at(indices, into))
     }
 
     /// The character length of every row, in one call to whatever holds the text, when that is
     /// possible.
     ///
-    /// The same shapes and the same answer as [`Self::try_bytes_lens`], counting characters rather
-    /// than bytes, which is `length` where that one is `strlen`. It goes through
-    /// [`TextSource::chars_lens_at`] so that a source reading its text out of a file can keep the
-    /// counts rather than the text, which is the difference between a scan of `length` over a
-    /// stored column holding four bytes a distinct value and holding every distinct value decoded.
+    /// The same shapes as [`Self::try_bytes_lens`], counting characters rather than bytes, which is
+    /// `length` where that one is `strlen`. It goes through [`TextSource::chars_lens_at`] so that a
+    /// source reading its text out of a file can keep the counts rather than the text, which is the
+    /// difference between a scan of `length` over a stored column holding four bytes a distinct
+    /// value and holding every distinct value decoded.
+    ///
+    /// Unlike that one it answers a vector with nulls too, and a null row gets the count of
+    /// whatever its slot points at, so the caller masks the nulls itself. Declining a vector with
+    /// nulls sent `length` a row at a time through the bytes, which on a stored column is the path
+    /// that keeps every block it reads, so one null in a vector was enough to bring that back.
     ///
     /// # Errors
     ///
     /// Whatever reading the text out of storage raises.
     pub fn try_chars_lens(&self, into: &mut Vec<i64>) -> Result<bool> {
-        self.lens_through(into, |source, indices, into| source.chars_lens_at(indices, into))
+        self.lens_through(into, true, |source, indices, into| source.chars_lens_at(indices, into))
     }
 
     /// One call to `ask` for every row, over the source this vector reads its text from.
     ///
-    /// `false` for a vector with nulls or one whose text does not come from a [`TextSource`], for
-    /// the reasons [`Self::try_bytes_lens`] gives.
+    /// `false` for a vector whose text does not come from a [`TextSource`], and for a vector with
+    /// nulls unless `nulls` says the caller will mask them, for the reasons
+    /// [`Self::try_bytes_lens`] gives.
     fn lens_through(
         &self,
         into: &mut Vec<i64>,
+        nulls: bool,
         ask: impl Fn(&dyn TextSource, &[u32], &mut Vec<i64>) -> Result<()>,
     ) -> Result<bool> {
-        if !matches!(self.validity, Validity::AllValid) {
+        if !nulls && !matches!(self.validity, Validity::AllValid) {
             return Ok(false);
         }
         into.clear();
@@ -2532,6 +2562,54 @@ impl Vector {
             },
             _ => Ok(false),
         }
+    }
+
+    /// Hands `body` the bytes of every row that is not null, when the text is read from a
+    /// [`TextSource`], and answers whether it did.
+    ///
+    /// The rows come in whatever order the source reads them in, each with its row number, so a
+    /// caller that writes an answer per row has to put it back in row order itself. That is the
+    /// price of the source seeing the whole vector at once, which is what lets one that decodes its
+    /// text a block at a time decode each block once for the call rather than keep every block a
+    /// row lands in. See [`TextSource::visit_at`]. The shapes taken are the two a scan of a stored
+    /// string column hands out, the text itself and a dictionary of codes over it, and anything
+    /// else answers `false` and is read a row at a time through [`Self::try_bytes_at`], which is
+    /// right for every shape.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the text out of storage raises, and whatever `body` raises.
+    pub fn try_visit_text(&self, body: &mut dyn FnMut(usize, &[u8]) -> Result<()>) -> Result<bool> {
+        let (source, codes) = match &self.body {
+            Body::ExternalText { source } => (source, None),
+            Body::Dictionary { codes, values, .. } => match &values.body {
+                Body::ExternalText { source } if matches!(values.validity, Validity::AllValid) => {
+                    let Some(codes) = codes.get(..self.len) else { return Ok(false) };
+                    (source, Some(codes))
+                }
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        let Ok(len) = u32::try_from(self.len) else { return Ok(false) };
+        // The rows asked for, which are all of them unless some are null. A null row is left out
+        // rather than read, because a row at a time read answers it with no value at all.
+        let rows: Option<Vec<u32>> = match &self.validity {
+            Validity::AllValid => None,
+            Validity::AllInvalid => return Ok(true),
+            Validity::Mask(mask) => Some((0..len).filter(|&row| mask.get(row as usize)).collect()),
+        };
+        let indices = match (codes, &rows) {
+            (Some(codes), None) => Cow::Borrowed(codes),
+            (Some(codes), Some(rows)) => rows.iter().map(|&row| codes[row as usize]).collect(),
+            (None, None) => (0..len).collect(),
+            (None, Some(rows)) => Cow::Borrowed(rows.as_slice()),
+        };
+        source.visit_at(&indices, &mut |at, bytes| {
+            let row = rows.as_ref().map_or(at, |rows| rows[at] as usize);
+            body(row, bytes)
+        })?;
+        Ok(true)
     }
 
     /// How many ranks this vector's values have in sorted order, when whatever holds them knows.

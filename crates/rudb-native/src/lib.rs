@@ -4320,6 +4320,21 @@ struct NativeText {
     /// 97 MB with none, for the same processor time. A session that asks again pays the decode one
     /// more time and reads kept blocks from then on, under the same [`TEXT_KEEP_BUDGET`].
     swept: Vec<AtomicBool>,
+    /// How many blocks [`TextSource::visit_at`] has decoded and dropped because the column was
+    /// already holding its [`TEXT_KEEP_BUDGET`].
+    ///
+    /// A sweep reads the dictionary in order and touches a block once, so dropping what it reads
+    /// past the budget costs one decode a block and bounds the column. A visit reads a vector of
+    /// codes, and the codes of a scan land all over the dictionary: on ten million rows of
+    /// ClickBench each vector of two thousand `URL`s touches about a hundred and forty of its two
+    /// and a half thousand blocks, and so does the next one. A cache holding a tenth of the column
+    /// still misses half of those, and dropping every block past the budget would decode the
+    /// column hundreds of times over to answer one `lower(URL)`. So a visit drops past the budget
+    /// only until it has dropped as many blocks as the column has, which is what a read whose codes
+    /// are few or clustered never reaches, and keeps what it reads after that, the way a row at a
+    /// time read always did. That bounds what a visit can cost over the old read at one more decode
+    /// of the column.
+    visit_dropped: AtomicUsize,
     /// The boundaries this dictionary has already been searched for, by the value searched for.
     ///
     /// A search is the expensive thing this type does. It settles a probe on the stored head where
@@ -4698,6 +4713,43 @@ impl NativeText {
             return Err(invalid("global dictionary block decodes to the wrong length"));
         }
         Ok(bytes)
+    }
+
+    /// The block holding a value that a read hands over on loan, kept or decoded for the call.
+    ///
+    /// A block something already kept is read where it is. One nothing kept is kept the second
+    /// time a loaned read decodes it while the column is holding less than [`Self::keep_budget`],
+    /// and decoded into `decoded` and dropped with it otherwise, which is the policy
+    /// [`TextSource::sweep`] explains. `scattered` is a read by code rather than in order, which
+    /// stops dropping once it has dropped a column's worth of blocks, for the reason
+    /// [`Self::visit_dropped`] gives.
+    fn loaned_block<'a>(
+        &'a self,
+        block: usize,
+        decoded: &'a mut Vec<u8>,
+        scattered: bool,
+    ) -> Result<&'a [u8]> {
+        let kept = self.blocks.get(block).and_then(OnceLock::get);
+        if let Some(Ok(kept)) = kept {
+            return Ok(kept);
+        }
+        let again = kept.is_none()
+            && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
+        let keep = again
+            && (self.payload_kept.load(Atomic::Relaxed) < self.keep_budget
+                || (scattered && self.visit_dropped.load(Atomic::Relaxed) >= self.blocks.len()));
+        if keep {
+            let kept = self
+                .payload_block(block)?
+                .ok_or_else(|| invalid("global dictionary block is past the payload"))?;
+            self.payload_kept.fetch_add(kept.len(), Atomic::Relaxed);
+            return Ok(kept);
+        }
+        *decoded = self.decode_block(block)?;
+        if scattered && again {
+            self.visit_dropped.fetch_add(1, Atomic::Relaxed);
+        }
+        Ok(decoded)
     }
 
     /// How many single offset reads make [`Self::value_ends`] worth building.
@@ -5110,24 +5162,8 @@ impl TextSource for NativeText {
         }
         let block = first / TEXT_PAYLOAD_VALUES;
         let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
-        let decoded;
-        let kept = self.blocks.get(block).and_then(OnceLock::get);
-        let again = kept.is_none()
-            && self.swept.get(block).is_some_and(|swept| swept.swap(true, Atomic::Relaxed));
-        let bytes: &[u8] = match kept {
-            Some(Ok(kept)) => kept,
-            _ if again && self.payload_kept.load(Atomic::Relaxed) < self.keep_budget => {
-                let kept = self
-                    .payload_block(block)?
-                    .ok_or_else(|| invalid("global dictionary block is past the payload"))?;
-                self.payload_kept.fetch_add(kept.len(), Atomic::Relaxed);
-                kept
-            }
-            _ => {
-                decoded = self.decode_block(block)?;
-                &decoded
-            }
-        };
+        let mut decoded = Vec::new();
+        let bytes = self.loaned_block(block, &mut decoded, false)?;
         let ends = self.ends_within(first, last)?;
         if ends.len() != last - first {
             return Err(invalid("global dictionary offsets are short"));
@@ -5145,6 +5181,49 @@ impl TextSource for NativeText {
             start = end;
         }
         Ok(last)
+    }
+
+    /// The values at `indices` a block at a time, each block read once for the call.
+    ///
+    /// The positions are put in code order first, because the codes of a vector are in row order
+    /// and land all over the dictionary, and read in that order each block a vector touches would
+    /// be looked up once for every row in it. Whether a block is kept is
+    /// [`NativeText::loaned_block`]'s decision, which keeps at most the budget of this column
+    /// until the reads have shown they come back to the same blocks too often for dropping them to
+    /// be cheap.
+    fn visit_at(
+        &self,
+        indices: &[u32],
+        body: &mut dyn FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut order = (0..indices.len()).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&at| indices[at]);
+        let block_of = |at: usize| {
+            let index = indices[at] as usize;
+            (index < self.values).then_some(index / TEXT_PAYLOAD_VALUES)
+        };
+        let mut decoded = Vec::new();
+        let mut run = 0;
+        while run < order.len() {
+            let Some(block) = block_of(order[run]) else {
+                // Past the end is no value, and every position after this one is past it too.
+                for &at in &order[run..] {
+                    body(at, &[])?;
+                }
+                break;
+            };
+            let upto = run + order[run..].partition_point(|&at| block_of(at) == Some(block));
+            let bytes = self.loaned_block(block, &mut decoded, true)?;
+            for &at in &order[run..upto] {
+                let (start, end) = self.span_within(indices[at] as usize)?;
+                let value = bytes
+                    .get(start as usize..end as usize)
+                    .ok_or_else(|| invalid("global dictionary value is past its block"))?;
+                body(at, value)?;
+            }
+            run = upto;
+        }
+        Ok(())
     }
 
     /// Each block the indices land in, decoded once and dropped, or read where it is already kept.
@@ -11497,6 +11576,7 @@ fn open_global_dictionary(
             keep_budget,
             payload_kept: AtomicUsize::new(0),
             swept: (0..blocks).map(|_| AtomicBool::new(false)).collect(),
+            visit_dropped: AtomicUsize::new(0),
             searched: Mutex::new(HashMap::new()),
         }),
     )
@@ -15689,6 +15769,150 @@ mod tests {
         let mut again = Vec::new();
         assert!(dictionary.try_chars_lens(&mut again).expect("counted"));
         assert_eq!(again, lens, "the kept counts answer the second time");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// Writes one column of strings whose code is where they sit in `spellings`, and reopens it.
+    fn stored_spellings(label: &str, spellings: &[String]) -> (PathBuf, Reader) {
+        let path = path(label);
+        let values = spellings.iter().map(|text| Value::Varchar(text.clone())).collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in values.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("a part");
+        }
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        (path, reader)
+    }
+
+    /// Codes that go all over a dictionary of `len` values, and every seventh row null.
+    ///
+    /// The shape of a vector a scan hands out: its codes are in row order, which lands them in
+    /// every block of the dictionary in no order at all, so a read of the whole vector has to put
+    /// them in block order itself to read each block once.
+    fn scattered_rows(len: usize) -> (Vec<u32>, Vec<bool>) {
+        let codes = (0..len)
+            .map(|row| u32::try_from(row * 7_919 % len).expect("a small dictionary"))
+            .collect::<Vec<_>>();
+        let valid = (0..len).map(|row| row % 7 != 3).collect::<Vec<_>>();
+        (codes, valid)
+    }
+
+    /// `length` over a vector with nulls keeps the counts and not the blocks, the same as over one
+    /// without.
+    ///
+    /// The whole vector count used to be taken only when no row was null, and every other vector
+    /// went a row at a time through the bytes, which keeps every block it reads. A column with a
+    /// null in each vector was held decoded after one `length` over it.
+    #[test]
+    fn character_lengths_with_nulls_are_counted_without_keeping_the_dictionary_blocks() {
+        let spellings = (0..2_500)
+            .map(|index| format!("héllo {index:05} {}", "ü".repeat(index % 30)))
+            .collect::<Vec<_>>();
+        let (path, reader) = stored_spellings("character-lengths-nulls", &spellings);
+        let dictionary = reader.dictionary(0).expect("read").expect("a string column has one");
+        let (codes, valid) = scattered_rows(spellings.len());
+        let rows = Vector::dictionary_over(codes.clone(), Arc::clone(&dictionary))
+            .expect("every code is inside")
+            .with_validity(Validity::from_run(&valid));
+
+        let resting = dictionary.footprint();
+        let lens = rudb_kernels::call("length", &[&rows], &LogicalType::BigInt, None)
+            .expect("length reads");
+        let counted = dictionary.footprint() - resting;
+        let blocks = dictionary.len().div_ceil(TEXT_PAYLOAD_VALUES);
+        assert!(
+            counted <= blocks * TEXT_PAYLOAD_VALUES * size_of::<u32>(),
+            "length over a vector with nulls kept {counted} bytes, more than a count a value"
+        );
+        let expected = (0..rows.len())
+            .map(|row| match valid[row] {
+                true => Value::BigInt(
+                    i64::try_from(spellings[codes[row] as usize].chars().count()).expect("small"),
+                ),
+                false => Value::Null,
+            })
+            .collect::<Vec<_>>();
+        let answers = (0..lens.len()).map(|row| lens.value_at(row)).collect::<Vec<_>>();
+        assert_eq!(answers, expected, "a count of characters where a row has one, null elsewhere");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// `lower`, `upper` and `substring` read a stored dictionary a block at a time and keep none of
+    /// it while the column is at its budget, until reading without keeping stops being cheap.
+    ///
+    /// The three used to read a row at a time through the bytes, which keeps every block a row lands
+    /// in for as long as the table is open. They read the whole vector in one visit now, and the
+    /// dictionary here is opened with a budget of zero so that what a visit would keep under the
+    /// budget of a running database is what the test sees dropped. After a column's worth of blocks
+    /// has been decoded and dropped the visit keeps what it reads, which is what bounds its cost on
+    /// a scan whose codes keep coming back to every block, and the end of the test holds it to that.
+    #[test]
+    fn string_kernels_read_a_stored_dictionary_without_keeping_its_blocks() {
+        let spellings = (0..2_500)
+            .map(|index| format!("HéLLo {index:05} {}", "Üß".repeat(index % 30)))
+            .collect::<Vec<_>>();
+        let (path, reader) = stored_spellings("string-kernels", &spellings);
+        let page = reader.table.dictionaries[0].expect("a string column has one");
+        let starved =
+            open_global_dictionary(Arc::clone(&reader.file), page, &LogicalType::Varchar, 0)
+                .expect("a dictionary opens whatever it may keep");
+        let starved = Arc::new(starved);
+        let (codes, valid) = scattered_rows(spellings.len());
+        let rows = Vector::dictionary_over(codes.clone(), Arc::clone(&starved))
+            .expect("every code is inside")
+            .with_validity(Validity::from_run(&valid));
+        let expected = |each: &dyn Fn(&str) -> String| {
+            (0..rows.len())
+                .map(|row| match valid[row] {
+                    true => Value::Varchar(each(&spellings[codes[row] as usize])),
+                    false => Value::Null,
+                })
+                .collect::<Vec<_>>()
+        };
+        let answers =
+            |vector: &Vector| (0..vector.len()).map(|row| vector.value_at(row)).collect::<Vec<_>>();
+
+        // What a visit may add is the table of where every value ends, four bytes a value, which
+        // reading every value this often makes worth building. A block is tens of bytes a value.
+        let resting = starved.footprint();
+        let ends = spellings.len() * size_of::<u32>();
+        let lowered = rudb_kernels::call("lower", &[&rows], &LogicalType::Varchar, None)
+            .expect("lower reads");
+        assert_eq!(answers(&lowered), expected(&|text| text.to_lowercase()), "lower");
+        assert!(starved.footprint() <= resting + ends, "lower kept a block it read");
+
+        let start = Vector::constant(LogicalType::BigInt, Value::BigInt(3), rows.len());
+        let length = Vector::constant(LogicalType::BigInt, Value::BigInt(9), rows.len());
+        let cut =
+            rudb_kernels::call("substring", &[&rows, &start, &length], &LogicalType::Varchar, None)
+                .expect("substring reads");
+        let cut_of = |text: &str| text.chars().skip(2).take(9).collect::<String>();
+        assert_eq!(answers(&cut), expected(&cut_of), "substring");
+        assert!(starved.footprint() <= resting + ends, "substring kept a block it read");
+
+        // Every block has been read twice now and dropped the second time as well, which is a
+        // column's worth dropped for want of a budget, so the next visit keeps what it reads.
+        let raised = rudb_kernels::call("upper", &[&rows], &LogicalType::Varchar, None)
+            .expect("upper reads");
+        assert_eq!(answers(&raised), expected(&|text| text.to_uppercase()), "upper");
+        let payload = spellings.iter().map(String::len).sum::<usize>();
+        assert!(
+            starved.footprint() >= resting + payload,
+            "a visit that has dropped a column's worth of blocks keeps what it reads"
+        );
+        let again = rudb_kernels::call("upper", &[&rows], &LogicalType::Varchar, None)
+            .expect("upper reads kept blocks");
+        assert_eq!(answers(&again), answers(&raised), "the kept blocks answer the same");
         fs::remove_file(path).expect("remove scratch file");
     }
 

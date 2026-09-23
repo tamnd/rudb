@@ -535,6 +535,14 @@ fn cut_each<A: Fn(usize) -> usize>(
     base: Validity,
     rows: usize,
 ) -> Result<Option<Vector>> {
+    if let Text::Read(vector) = text {
+        let visited = visited_strings(vector, &base, rows, |value, into| {
+            into.push_str(text::cut(value, start, length));
+        })?;
+        if let Some(out) = visited {
+            return finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows));
+        }
+    }
     let out = try_each_string(rows, &base, |index, into| {
         into.push(text::cut(text.get(index)?, start, length));
         Ok(())
@@ -735,16 +743,28 @@ fn length_of<A: Fn(usize) -> usize>(
     // `bytes_of`. That matters more here than there: reading the bytes a row at a time makes a
     // stored dictionary decode each block a row lands in and keep it for as long as the table is
     // open, so a scan of `length` over a whole column held every distinct value of it decoded, 13.9
-    // GB for seven string columns of ClickBench. The source keeps the counts instead.
+    // GB for seven string columns of ClickBench. The source keeps the counts instead. Unlike
+    // `strlen` this takes a vector with nulls too, since a column with one null in every vector
+    // would otherwise be read the way that kept the blocks.
     let mut out = Vec::new();
     let whole = match text {
-        Text::Read(vector) if matches!(base, Validity::AllValid) => {
+        Text::Read(vector) if !matches!(base, Validity::AllInvalid) => {
             vector.try_chars_lens(&mut out)?
         }
         _ => false,
     };
-    if whole {
-        return finish(returns, Data::Int64(out.into()), Validity::AllValid);
+    if whole && out.len() == rows {
+        // A null row was counted along with the others, out of whatever its slot points at. The
+        // row at a time loop below leaves zero under a null, so this does too.
+        if let Validity::Mask(mask) = &base {
+            for (index, len) in out.iter_mut().enumerate() {
+                if !mask.get(index) {
+                    *len = 0;
+                }
+            }
+        }
+        let validity = if rows == 0 { Validity::AllValid } else { base.normalize(rows) };
+        return finish(returns, Data::Int64(out.into()), validity);
     }
     out.clear();
     out.resize(rows, 0);
@@ -810,6 +830,15 @@ fn fold_of<A: Fn(usize) -> usize>(
         return Ok(None);
     }
     let lowering = name == "lower";
+    if let Text::Read(vector) = text {
+        let visited = visited_strings(vector, &base, rows, |value, into| {
+            // The same string functions as the loop below, for the reason given there.
+            into.push_str(&if lowering { value.to_lowercase() } else { value.to_uppercase() });
+        })?;
+        if let Some(out) = visited {
+            return finish(returns, Data::Varlen(out), base.normalize(rows));
+        }
+    }
     let out = try_each_string(rows, &base, |index, into| {
         let value = text.get(index)?;
         // `str::to_lowercase` rather than folding the characters into a buffer that is reused
@@ -866,6 +895,50 @@ fn try_each_string(
         }
     }
     Ok(out)
+}
+
+/// [`try_each_string`] for a vector whose text is read out of storage, read in one visit.
+///
+/// Read a row at a time through [`Text::get`], a stored dictionary decodes the block each row lands
+/// in and keeps it for as long as the table is open, so a scan of `lower` over a whole column ended
+/// up holding the column decoded. [`Vector::try_visit_text`] hands the whole vector to the source
+/// instead, which reads each block once for the call and decides for itself what to keep. The rows
+/// come back in the source's order rather than in row order, so `each` writes each answer into one
+/// buffer for the vector and the column is built from that in row order afterwards.
+///
+/// `each` is handed the value as text, empty where it is not valid UTF-8 the way [`Text::get`]
+/// makes it, and appends its answer to the buffer. `None` is a vector the source cannot take whole,
+/// which the caller reads a row at a time as before.
+///
+/// # Errors
+///
+/// Whatever reading the text out of storage raises.
+fn visited_strings(
+    vector: &Vector,
+    base: &Validity,
+    rows: usize,
+    mut each: impl FnMut(&str, &mut String),
+) -> Result<Option<StringColumn>> {
+    if vector.len() != rows {
+        return Ok(None);
+    }
+    let mut answers = String::new();
+    let mut spans = vec![(0, 0); rows];
+    let visited = vector.try_visit_text(&mut |row, bytes| {
+        let from = answers.len();
+        each(std::str::from_utf8(bytes).unwrap_or_default(), &mut answers);
+        if let Some(span) = spans.get_mut(row) {
+            *span = (from, answers.len());
+        }
+        Ok(())
+    })?;
+    if !visited {
+        return Ok(None);
+    }
+    Ok(Some(each_string(rows, base, |row, into| {
+        let (from, to) = spans[row];
+        into.push(&answers[from..to]);
+    })))
 }
 
 /// A two argument call, for the functions with a loop.
