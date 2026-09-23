@@ -67,6 +67,11 @@ const MAX_DEPTH: u8 = 3;
 /// longer than nearly every run in a column worth run length encoding at all.
 const RUN: usize = 8;
 
+/// The average run length from which a run length chunk is decoded into reserved room rather than
+/// a zeroed one. Past it the zeroing is most of the writes, and below it the fixed width write of
+/// [`RUN`] is the cheaper loop.
+const LONG_RUN: usize = 64;
+
 /// What a chunk is encoded as. The discriminant is the tag byte in the serialized form and is part
 /// of the format, so the numbers are written down rather than left to the compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,9 +621,14 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
             if run_values.len() != run_lengths.len() {
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
-            // Room for one run past the end, so the write below never has to ask how much of its
-            // fixed width landed inside the chunk.
-            let mut values = vec![0; count + RUN];
+            // A chunk whose runs are long on average, the way a sorted column's are thousands of
+            // rows each, has every run appended into reserved room, so that each value is written
+            // once by the run it belongs to. Zeroing the chunk first was a second write of all of
+            // it. Short runs are cheaper the other way, with room for one run past the end so that
+            // the write below never has to ask how much of its fixed width landed inside the chunk,
+            // and appending those cost a few percent more on ClickBench 15, 17 and 31.
+            let long = run_values.len().saturating_mul(LONG_RUN) <= count;
+            let mut values = if long { Vec::with_capacity(count) } else { vec![0; count + RUN] };
             let mut at = 0usize;
             for (value, length) in run_values.into_iter().zip(run_lengths) {
                 let length = usize::try_from(length)
@@ -627,11 +637,15 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
                     .checked_add(length)
                     .filter(|end| *end <= count)
                     .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
-                let short =
-                    if length <= RUN { values[at..].first_chunk_mut::<RUN>() } else { None };
-                match short {
-                    Some(window) => window.fill(value),
-                    None => values[at..end].fill(value),
+                if long {
+                    values.resize(end, value);
+                } else {
+                    let short =
+                        if length <= RUN { values[at..].first_chunk_mut::<RUN>() } else { None };
+                    match short {
+                        Some(window) => window.fill(value),
+                        None => values[at..end].fill(value),
+                    }
                 }
                 at = end;
             }
