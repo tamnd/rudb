@@ -188,4 +188,4 @@ COPY (
 ) TO 'long.parquet' (FORMAT parquet, ROW_GROUP_SIZE 50000, COMPRESSION snappy);
 ```
 
-`small` is required in all but name and never null, and `word` is null on every fifth row, so the windows of the second column have to line the codes up across the nulls.
+`small` is never null and `word` is null on every fifth row, so the windows of the second column have to line the codes up across the nulls.
