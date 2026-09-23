@@ -440,7 +440,30 @@ fn coded(vector: &Vector, codes: &[u32], values: &Vector) -> Walked {
             // checked for nulls, and this one is a bit read instead of a second indirection.
             let validity = vector.validity();
             let nullable = validity.has_nulls(vector.len());
-            for (row, &code) in codes[..vector.len()].iter().enumerate() {
+            let codes = &codes[..vector.len()];
+            // Counted per entry first when the entries are no more than the rows, which is one
+            // increment a row where the gather was a widen, two compares and a wide add. A Parquet
+            // integer column reaches the writer in this form and every part of it comes through
+            // here. The ends and the total are the same ones either way.
+            if held.len() <= codes.len() {
+                let mut counts = vec![0_u32; held.len()];
+                for (row, &code) in codes.iter().enumerate() {
+                    if nullable && !validity.is_valid(row) {
+                        continue;
+                    }
+                    let Some(count) = counts.get_mut(code as usize) else { return wider(values) };
+                    *count += 1;
+                }
+                for (&value, &count) in held.iter().zip(&counts) {
+                    if count > 0 {
+                        let value = i128::from(value);
+                        widen(value, &mut low, &mut high);
+                        total += value * i128::from(count);
+                    }
+                }
+                return Walked::totalled(low, high, total);
+            }
+            for (row, &code) in codes.iter().enumerate() {
                 if nullable && !validity.is_valid(row) {
                     continue;
                 }
@@ -757,9 +780,9 @@ fn viewed(vector: &Vector, views: &[StringView], arena: &[u8]) -> (Option<Bound>
 #[cfg(test)]
 mod tests {
     use rudb_common::{LogicalType, Value};
-    use rudb_vector::{Chunk, Vector};
+    use rudb_vector::{Bitmap, Chunk, Validity, Vector};
 
-    use super::{Bound, Op, Probe, Zone};
+    use super::{Bound, Op, Probe, Range, Zone};
 
     /// A chunk of one `INTEGER` column holding `values`.
     fn chunk(values: &[i32]) -> Chunk {
@@ -957,6 +980,41 @@ mod tests {
         assert!(zone.skips(&probes), "a value in the dictionary that no row holds");
     }
 
+    /// Both ways through a dictionary, counted per entry and gathered per row, give the flat
+    /// column's range, with null rows, unused entries and negative values in it.
+    #[test]
+    fn a_dictionary_gives_the_range_its_flat_form_gives() {
+        let entries = [-40_i64, 7, 1 << 40, -3, 12, 0];
+        for rows in [2_usize, 5, 300] {
+            let codes = (0..rows as u32).map(|row| (row * 7 + 1) % 5).collect::<Vec<_>>();
+            let rows_of = |code: u32, row: usize| {
+                if row % 4 == 3 { Value::Null } else { Value::BigInt(entries[code as usize]) }
+            };
+            let flat =
+                codes.iter().enumerate().map(|(row, &code)| rows_of(code, row)).collect::<Vec<_>>();
+            let inner = Vector::from_values(
+                LogicalType::BigInt,
+                &entries.iter().map(|&entry| Value::BigInt(entry)).collect::<Vec<_>>(),
+            )
+            .expect("entries");
+            let mut mask = Bitmap::all_valid(rows);
+            for row in (0..rows).filter(|row| row % 4 == 3) {
+                mask.set(row, false);
+            }
+            let coded = Vector::dictionary(codes, inner)
+                .expect("a coded column")
+                .with_validity(Validity::Mask(mask));
+            let flat = Vector::from_values(LogicalType::BigInt, &flat).expect("a flat column");
+            let coded = Range::of(&coded);
+            let flat = Range::of(&flat);
+            assert_eq!(coded.low, flat.low, "{rows} rows");
+            assert_eq!(coded.high, flat.high, "{rows} rows");
+            assert_eq!(coded.sum, flat.sum, "{rows} rows");
+            assert_eq!(coded.nulls, flat.nulls, "{rows} rows");
+            assert!(coded.exact, "{rows} rows");
+        }
+    }
+
     /// A dictionary of something this cannot add up or compare in its own type falls back to the
     /// values, which is the bound it always was, and says it is a bound.
     #[test]
@@ -1045,7 +1103,7 @@ mod tests {
     }
 
     /// The range of one column of `values`, typed as `ty`.
-    fn only(ty: LogicalType, values: &[Value]) -> super::Range {
+    fn only(ty: LogicalType, values: &[Value]) -> Range {
         let vector = Vector::from_values(ty, values).expect("a column");
         let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
         zone.column(0).expect("one column").clone()
