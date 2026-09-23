@@ -75,7 +75,7 @@ const DISTINCT_COUNTS: &[u8; 8] = b"RUDBDC10";
 const INTEGER_EXTREMES: &[u8; 8] = b"RUDBEX10";
 const COMPLETE_FREQUENCIES: &[u8; 8] = b"RUDBFQ10";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
-const FORMAT: u32 = 28;
+const FORMAT: u32 = 29;
 
 /// Formats this build can open.
 ///
@@ -100,12 +100,14 @@ const FORMAT: u32 = 28;
 /// and the reader tells the two apart by whether the page has room left over for them.
 ///
 /// Format 28 adds per-payload-block substring signatures to global string dictionaries. Older
-/// files have no signatures and use the ordinary exact string filter.
+/// files have no signatures and use the ordinary exact string filter. Format 29 makes each
+/// signature four times as wide, which a dictionary says with [`DICTIONARY_WIDE_GRAMS`], and a
+/// format 28 file is read with the narrow ones it has.
 ///
 /// This is not a general compatibility promise. Seven formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
 /// carrying.
-const READABLE: &[u32] = &[22, 23, 24, 25, 26, 27, FORMAT];
+const READABLE: &[u32] = &[22, 23, 24, 25, 26, 27, 28, FORMAT];
 
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
@@ -458,28 +460,43 @@ fn checksum_tail(mut hash: u64, mut rest: &[u8]) -> u64 {
 /// directory can be checked without all of it being in memory at once. The four lanes take whole
 /// thirty two byte blocks, and a read that ends partway through one keeps the tail for the next.
 fn file_checksum(file: &File, offset: u64, length: usize) -> Result<u64> {
+    walk_checksummed(file, offset, length, DIRECTORY_WINDOW, |_| Ok(()))
+}
+
+/// Reads `length` bytes at `offset` a window at a time, hands each window to `each`, and answers
+/// the checksum of all of them.
+///
+/// `window` is a multiple of thirty two, so every window but the last is whole blocks of the hash
+/// and nothing has to be carried from one read to the next.
+fn walk_checksummed(
+    file: &File,
+    offset: u64,
+    length: usize,
+    window: usize,
+    mut each: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<u64> {
+    debug_assert!(window % 32 == 0 && window > 0, "a window is whole blocks of the hash");
     if length < 32 {
         let mut bytes = vec![0; length];
         read_at(file, offset, &mut bytes)?;
+        each(&bytes)?;
         return Ok(checksum(&bytes));
     }
     let mut lanes = [XXH_P1.wrapping_add(XXH_P2), XXH_P2, 0, 0_u64.wrapping_sub(XXH_P1)];
-    let mut buffer = vec![0; DIRECTORY_WINDOW.min(length)];
-    let mut kept = 0;
+    let mut buffer = vec![0; window.min(length)];
     let mut read = 0;
+    let (mut whole, mut filled) = (0, 0);
     while read < length {
-        let want = (buffer.len() - kept).min(length - read);
-        read_at(file, offset + read as u64, &mut buffer[kept..kept + want])?;
-        read += want;
-        let filled = kept + want;
-        let whole = filled / 32 * 32;
+        filled = buffer.len().min(length - read);
+        read_at(file, offset + read as u64, &mut buffer[..filled])?;
+        read += filled;
+        each(&buffer[..filled])?;
+        whole = filled / 32 * 32;
         for block in buffer[..whole].chunks_exact(32) {
             checksum_block(&mut lanes, block);
         }
-        buffer.copy_within(whole..filled, 0);
-        kept = filled - whole;
     }
-    Ok(finish_checksum(lanes, &buffer[..kept], length as u64))
+    Ok(finish_checksum(lanes, &buffer[whole..filled], length as u64))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3930,8 +3947,62 @@ struct NativeText {
 struct NativeGrams {
     start: u64,
     length: usize,
+    /// How long one block's signature is.
+    width: usize,
     hash: u64,
-    loaded: OnceLock<Result<Vec<u8>>>,
+    /// For each literal asked about lately, whether each block might hold it.
+    ///
+    /// The answer for every block at once, worked out by one pass over the signatures a window at a
+    /// time, rather than the signatures read in and kept. On ClickBench `URL` they are 21 MB for
+    /// ten million rows and a verdict is 2,650 flags, and a filter asks the same question of every
+    /// block, so the pass is paid once and what stays resident is the flags.
+    verdicts: Mutex<Vec<Verdict>>,
+}
+
+/// A literal and whether each block might hold it.
+type Verdict = (Vec<u8>, Arc<[bool]>);
+
+/// How many literals a column remembers the verdicts of.
+const GRAM_VERDICTS: usize = 8;
+
+impl NativeGrams {
+    /// Whether each block might hold `literal`, remembered or worked out now.
+    ///
+    /// The lock is held over the pass so that the threads of one scan, which all ask about the
+    /// same literal at the start, read the signatures once between them.
+    fn verdicts(&self, file: &File, literal: &[u8]) -> Result<Arc<[bool]>> {
+        let mut held = self.verdicts.lock().map_err(|_| invalid("a poisoned signature verdict"))?;
+        if let Some((_, verdict)) = held.iter().find(|(asked, _)| asked == literal) {
+            return Ok(Arc::clone(verdict));
+        }
+        let wanted = literal.windows(4).map(|gram| gram_bits(gram, self.width)).collect::<Vec<_>>();
+        let mut verdict = Vec::with_capacity(self.length / self.width);
+        let window = GRAM_WINDOW / self.width * self.width;
+        let hash = walk_checksummed(file, self.start, self.length, window, |bytes| {
+            verdict.extend(bytes.chunks(self.width).map(|bits| {
+                wanted
+                    .iter()
+                    .flatten()
+                    .all(|&bit| bits.get(bit / 8).is_some_and(|byte| byte & (1 << (bit % 8)) != 0))
+            }));
+            Ok(())
+        })?;
+        if hash != self.hash {
+            return Err(invalid("global dictionary substring signatures checksum differs"));
+        }
+        let verdict: Arc<[bool]> = verdict.into();
+        if held.len() >= GRAM_VERDICTS {
+            held.remove(0);
+        }
+        held.push((literal.to_vec(), Arc::clone(&verdict)));
+        Ok(verdict)
+    }
+
+    fn footprint(&self) -> usize {
+        self.verdicts.lock().map_or(0, |held| {
+            held.iter().map(|(asked, verdict)| asked.capacity() + verdict.len()).sum()
+        })
+    }
 }
 
 /// How many searched for values a column's dictionary remembers the boundary of.
@@ -3957,12 +4028,27 @@ const TEXT_SEARCH_MEMO: usize = 64;
 /// Going down to 512 gives up five to nine percent.
 const TEXT_PAYLOAD_VALUES: usize = 1024;
 
-/// Two KiB per payload block makes a four-byte substring a useful negative test without keeping a
-/// large lookup table. The load and file-size costs must pass the same end-to-end gate as queries.
-const TEXT_GRAM_BYTES: usize = 2048;
+/// Eight KiB per payload block, which is what makes a four-byte substring a useful negative test on
+/// a column of URLs.
+///
+/// Two KiB was the first answer and on ClickBench `URL` it proved almost nothing. A block of 1,024
+/// sorted URLs holds about seventeen thousand distinct four-byte grams, and at two bits each that
+/// set nine in ten of the sixteen thousand bits there were, so `LIKE '%google%'` passed most blocks
+/// it had no match in and decoded them. At eight KiB four bits in ten are set, and of the 2,650
+/// blocks of `URL` in ten million rows a needle that is in none of them passes 36. The signatures
+/// are not read into memory, see [`NativeGrams::verdicts`], so the width costs file and not
+/// resident memory.
+const TEXT_GRAM_BYTES: usize = 8192;
 
-/// A fast mixing step for exactly four bytes, shared by load and query.
-fn gram_bits(bytes: &[u8]) -> [usize; 2] {
+/// The signature width of a format 28 file, which is still read.
+const NARROW_GRAM_BYTES: usize = 2048;
+
+/// How much of a column's signatures a verdict reads at a time.
+const GRAM_WINDOW: usize = 256 << 10;
+
+/// A fast mixing step for exactly four bytes, shared by load and query, into a signature of
+/// `width` bytes.
+fn gram_bits(bytes: &[u8], width: usize) -> [usize; 2] {
     let original = u32::from_le_bytes(bytes.try_into().expect("a four-byte gram"));
     let mut first = original ^ (original >> 16);
     first = first.wrapping_mul(0x7feb_352d);
@@ -3970,7 +4056,7 @@ fn gram_bits(bytes: &[u8]) -> [usize; 2] {
     let mut second = original ^ (original >> 17);
     second = second.wrapping_mul(0x846c_a68b);
     second ^= second >> 16;
-    let mask = TEXT_GRAM_BYTES * 8 - 1;
+    let mask = width * 8 - 1;
     [(first as usize) & mask, (second as usize) & mask]
 }
 
@@ -4041,6 +4127,11 @@ const DICTIONARY_HEADER: usize = 16;
 const DICTIONARY_SCATTERED: u32 = 1 << 31;
 /// The dictionary index carries one four-byte substring signature per payload block.
 const DICTIONARY_GRAMS: u32 = 1 << 30;
+/// Each signature is [`TEXT_GRAM_BYTES`] long rather than the [`NARROW_GRAM_BYTES`] a format 28
+/// file wrote.
+const DICTIONARY_WIDE_GRAMS: u32 = 1 << 29;
+/// Every flag the width word of a dictionary can carry above the offset width.
+const DICTIONARY_FLAGS: u32 = DICTIONARY_SCATTERED | DICTIONARY_GRAMS | DICTIONARY_WIDE_GRAMS;
 
 /// How many entries of a dictionary's sorted order sit in one block that is read and checked as a
 /// unit.
@@ -4401,25 +4492,8 @@ impl TextSource for NativeText {
         if literal.len() < 4 || first >= self.values {
             return Ok(true);
         }
-        let bytes = grams
-            .loaded
-            .get_or_init(|| {
-                let mut bytes = vec![0; grams.length];
-                read_at(&self.file, grams.start, &mut bytes)?;
-                if checksum(&bytes) != grams.hash {
-                    return Err(invalid("global dictionary substring signatures checksum differs"));
-                }
-                Ok(bytes)
-            })
-            .as_ref()
-            .map_err(Clone::clone)?;
-        let block = first / TEXT_PAYLOAD_VALUES;
-        let Some(bits) = bytes.get(block * TEXT_GRAM_BYTES..(block + 1) * TEXT_GRAM_BYTES) else {
-            return Ok(true);
-        };
-        Ok(literal.windows(4).all(|gram| {
-            gram_bits(gram).into_iter().all(|bit| bits[bit / 8] & (1 << (bit % 8)) != 0)
-        }))
+        let verdict = grams.verdicts(&self.file, literal)?;
+        Ok(verdict.get(first / TEXT_PAYLOAD_VALUES).copied().unwrap_or(true))
     }
 
     fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
@@ -4701,12 +4775,7 @@ impl TextSource for NativeText {
             + self.hashes.capacity() * size_of::<u64>()
             + self.starts.capacity() * size_of::<u64>()
             + self.lengths.capacity() * size_of::<u64>()
-            + self
-                .grams
-                .as_ref()
-                .and_then(|grams| grams.loaded.get())
-                .and_then(|result| result.as_ref().ok())
-                .map_or(0, Vec::capacity)
+            + self.grams.as_ref().map_or(0, NativeGrams::footprint)
             + self
                 .blocks
                 .iter()
@@ -9977,7 +10046,9 @@ fn encode_global_dictionary(
         &mut index,
         u32::try_from(blocks).map_err(|_| invalid("global dictionary has too many blocks"))?,
     );
-    let flag = (if scattered { DICTIONARY_SCATTERED } else { 0 }) | DICTIONARY_GRAMS;
+    let flag = (if scattered { DICTIONARY_SCATTERED } else { 0 })
+        | DICTIONARY_GRAMS
+        | DICTIONARY_WIDE_GRAMS;
     put_u32(&mut index, offset_bits as u32 | flag);
     encode_offsets(&dictionary.ends, offset_bits, &mut index)?;
     // Where each block is and how long it is, so a reader can find one. The stored blocks are
@@ -10128,7 +10199,7 @@ fn block_grams(values: &[&[u8]]) -> Box<[u8; TEXT_GRAM_BYTES]> {
     let mut grams = Box::new([0_u8; TEXT_GRAM_BYTES]);
     for value in values {
         for gram in value.windows(4) {
-            for bit in gram_bits(gram) {
+            for bit in gram_bits(gram, TEXT_GRAM_BYTES) {
                 grams[bit / 8] |= 1 << (bit % 8);
             }
         }
@@ -10326,7 +10397,9 @@ fn open_global_dictionary(
     let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
     let scattered = width & DICTIONARY_SCATTERED != 0;
     let has_grams = width & DICTIONARY_GRAMS != 0;
-    let offset_bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
+    let gram_width =
+        if width & DICTIONARY_WIDE_GRAMS != 0 { TEXT_GRAM_BYTES } else { NARROW_GRAM_BYTES };
+    let offset_bits = (width & !DICTIONARY_FLAGS) as usize;
     if per_block != TEXT_PAYLOAD_VALUES {
         return Err(invalid("global dictionary block width differs"));
     }
@@ -10354,7 +10427,7 @@ fn open_global_dictionary(
         .ok_or_else(|| invalid("global dictionary block count overflow"))?;
     let gram_len = if has_grams {
         blocks
-            .checked_mul(TEXT_GRAM_BYTES)
+            .checked_mul(gram_width)
             .ok_or_else(|| invalid("global dictionary signature count overflow"))?
     } else {
         0
@@ -10405,8 +10478,9 @@ fn open_global_dictionary(
     let grams = gram_hash.map(|hash| NativeGrams {
         start: page.offset + body_len as u64,
         length: gram_len,
+        width: gram_width,
         hash,
-        loaded: OnceLock::new(),
+        verdicts: Mutex::new(Vec::new()),
     });
     let hashes = words.split_off(blocks * (payload_words - 1));
     let (starts, lengths) = if scattered {
@@ -11262,7 +11336,7 @@ mod tests {
         let count = u64::from(u32::from_le_bytes(header[0..4].try_into().expect("four bytes")));
         let blocks = u64::from(u32::from_le_bytes(header[8..12].try_into().expect("four bytes")));
         let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
-        let bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
+        let bits = (width & !DICTIONARY_FLAGS) as usize;
         let payload_words = if width & DICTIONARY_SCATTERED == 0 { 2 } else { 3 };
         let rank_blocks = count.div_ceil(TEXT_RANK_BLOCK as u64);
         DICTIONARY_HEADER as u64
@@ -13621,7 +13695,7 @@ mod tests {
         let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
         let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
         assert_ne!(width & DICTIONARY_SCATTERED, 0, "the blocks say where they are");
-        let bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
+        let bits = (width & !DICTIONARY_FLAGS) as usize;
         let mut start = [0; 8];
         let at = dictionary.offset + (DICTIONARY_HEADER + offset_bytes(count, bits)) as u64;
         read_at(&reader.file, at, &mut start).expect("the first block's start");
@@ -13758,7 +13832,7 @@ mod tests {
         let count = u32::from_le_bytes(header[0..4].try_into().expect("four bytes")) as usize;
         let blocks = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
         let width = u32::from_le_bytes(header[12..16].try_into().expect("four bytes"));
-        let bits = (width & !(DICTIONARY_SCATTERED | DICTIONARY_GRAMS)) as usize;
+        let bits = (width & !DICTIONARY_FLAGS) as usize;
         let mut place = [0; 16];
         let at = DICTIONARY_HEADER + offset_bytes(count, bits) + (blocks - 1) * 16;
         read_at(&reader.file, dictionary.offset + at as u64, &mut place).expect("its place");
@@ -14352,6 +14426,45 @@ mod tests {
             grown == 0 || grown == dictionary.len() * size_of::<u32>(),
             "a point read of a kept block decodes nothing, and {grown} bytes grew"
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn a_narrow_signature_of_an_older_file_answers_by_its_own_width() {
+        let path = path("narrow-substring-signature");
+        let blocks = [&b"https://google.com/"[..], b"https://example.org/", b"mail.google.com"];
+        let mut grams = Vec::new();
+        for text in blocks {
+            let mut bits = vec![0_u8; NARROW_GRAM_BYTES];
+            for gram in text.windows(4) {
+                for bit in gram_bits(gram, NARROW_GRAM_BYTES) {
+                    bits[bit / 8] |= 1 << (bit % 8);
+                }
+            }
+            grams.extend(bits);
+        }
+        fs::write(&path, &grams).expect("scratch file");
+        let file = File::open(&path).expect("open scratch file");
+        let signatures = NativeGrams {
+            start: 0,
+            length: grams.len(),
+            width: NARROW_GRAM_BYTES,
+            hash: checksum(&grams),
+            verdicts: Mutex::new(Vec::new()),
+        };
+        let verdict = signatures.verdicts(&file, b"google").expect("signatures read");
+        assert_eq!(&verdict[..], &[true, false, true], "one verdict a block, at the narrow width");
+        assert!(signatures.footprint() > 0, "a verdict is remembered");
+        let again = signatures.verdicts(&file, b"google").expect("remembered");
+        assert!(Arc::ptr_eq(&verdict, &again), "a second question about a literal reads nothing");
+
+        let damaged = NativeGrams {
+            hash: signatures.hash ^ 1,
+            verdicts: Mutex::new(Vec::new()),
+            ..signatures
+        };
+        let error = damaged.verdicts(&file, b"google").expect_err("a damaged region is refused");
+        assert!(error.to_string().contains("substring signatures checksum differs"), "{error}");
         fs::remove_file(path).expect("remove scratch file");
     }
 
