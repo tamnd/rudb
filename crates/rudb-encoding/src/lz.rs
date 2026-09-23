@@ -53,8 +53,20 @@ const SEGMENT: usize = 256 * 1024;
 /// lz4 landed on for the same reason.
 const MIN_MATCH: usize = 4;
 
-/// The shortest copy worth emitting, as the value the hash is taken over.
+/// The most bits of hash a chain head is picked by, which is the table a full segment gets.
 const HASH_BITS: u32 = 16;
+
+/// How many bits of hash a segment of `span` bytes picks its chain heads by.
+///
+/// At least twice as many heads as positions, up to [`HASH_BITS`]. The table has to be filled
+/// before a segment is matched, and a global dictionary block is about two kilobytes, so a table
+/// sized for a full segment was 256 KiB of stores to match 2 KiB of text, done again for every
+/// block and every shape tried on it. Every input of 32 KiB or more still gets the full table, so
+/// only the small ones can come out differently, and with twice the heads they have positions the
+/// chains are about as short as they were.
+fn table_bits(span: usize) -> u32 {
+    (usize::BITS - span.leading_zeros()).clamp(8, HASH_BITS)
+}
 
 /// How far back along one hash chain the search goes before it settles for what it has.
 ///
@@ -84,15 +96,16 @@ struct Raw {
 /// Splits `input` into literal runs and back references.
 pub(crate) fn tokens_of(input: &[u8]) -> Tokens<'_> {
     let mut raw = Raw::default();
-    let mut head = vec![u32::MAX; 1 << HASH_BITS];
     let span = SEGMENT.min(input.len()).max(1);
+    let bits = table_bits(span);
+    let mut head = vec![u32::MAX; 1 << bits];
     let mut prev = vec![u32::MAX; span];
 
     let mut start = 0;
     while start < input.len() {
         let end = (start + SEGMENT).min(input.len());
         head.fill(u32::MAX);
-        matches_in(input, start, end, &mut head, &mut prev, &mut raw);
+        matches_in(input, start, end, &mut head, &mut prev, &mut raw, bits);
         start = end;
     }
     Tokens {
@@ -110,6 +123,7 @@ fn matches_in(
     head: &mut [u32],
     prev: &mut [u32],
     raw: &mut Raw,
+    bits: u32,
 ) {
     let mut literal_start = start;
     let mut at = start;
@@ -117,14 +131,14 @@ fn matches_in(
         if at + MIN_MATCH > end {
             break;
         }
-        let key = hash(&input[at..at + MIN_MATCH]);
+        let key = hash(&input[at..at + MIN_MATCH], bits);
         let found = longest(input, at, end, head[key], prev, start);
-        insert(input, at, end, head, prev, start);
+        insert(input, at, end, head, prev, start, bits);
         match found {
             Some((length, offset)) => {
                 push(raw, (literal_start, at), length, offset);
                 for step in 1..length {
-                    insert(input, at + step, end, head, prev, start);
+                    insert(input, at + step, end, head, prev, start, bits);
                 }
                 at += length;
                 literal_start = at;
@@ -178,11 +192,19 @@ fn longest(
 }
 
 /// Puts `at` at the head of its chain, so later positions can match against it.
-fn insert(input: &[u8], at: usize, end: usize, head: &mut [u32], prev: &mut [u32], start: usize) {
+fn insert(
+    input: &[u8],
+    at: usize,
+    end: usize,
+    head: &mut [u32],
+    prev: &mut [u32],
+    start: usize,
+    bits: u32,
+) {
     if at + MIN_MATCH > end {
         return;
     }
-    let key = hash(&input[at..at + MIN_MATCH]);
+    let key = hash(&input[at..at + MIN_MATCH], bits);
     let slot = at - start;
     prev[slot] = head[key];
     head[key] = slot as u32;
@@ -311,9 +333,9 @@ pub(crate) fn replay(
     Ok(())
 }
 
-fn hash(bytes: &[u8]) -> usize {
+fn hash(bytes: &[u8], bits: u32) -> usize {
     let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    (word.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS)) as usize
+    (word.wrapping_mul(2_654_435_761) >> (32 - bits)) as usize
 }
 
 /// How many bytes `a` and `b` start with in common.
@@ -422,6 +444,40 @@ mod tests {
     }
 
     #[test]
+    fn a_table_sized_to_a_small_input_leaves_about_as_few_literals() {
+        fn literal_bytes(input: &[u8], bits: u32) -> usize {
+            let mut raw = Raw::default();
+            let mut head = vec![u32::MAX; 1 << bits];
+            let mut prev = vec![u32::MAX; input.len()];
+            matches_in(input, 0, input.len(), &mut head, &mut prev, &mut raw, bits);
+            raw.runs.iter().map(|(from, to)| to - from).sum()
+        }
+        for size in [300, 2_048, 9_000, 40_000] {
+            let mut input = Vec::new();
+            let mut n = 0_u64;
+            while input.len() < size {
+                n = n
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let path = ["news", "sport", "video", "search", "cars"][(n >> 60) as usize % 5];
+                input.extend_from_slice(
+                    format!("https://site{}.ru/{path}/{}?id={}", n >> 62, (n >> 40) % 97, n % 9973)
+                        .as_bytes(),
+                );
+            }
+            let full = literal_bytes(&input, HASH_BITS);
+            let sized = literal_bytes(&input, table_bits(input.len()));
+            assert!(
+                sized * 100 <= full * 102,
+                "{size} bytes: {sized} literal bytes against {full}"
+            );
+            if input.len() >= 1 << (HASH_BITS - 1) {
+                assert_eq!(table_bits(input.len()), HASH_BITS);
+            }
+        }
+    }
+
+    #[test]
     fn something_longer_than_a_segment_round_trips() {
         let mut input = Vec::new();
         while input.len() < SEGMENT * 2 + 1234 {
@@ -437,8 +493,10 @@ mod tests {
         // written was cut by it.
         fn by_bytes(input: &[u8]) -> (Vec<(usize, usize)>, Vec<i64>, Vec<i64>) {
             let mut raw = Raw::default();
-            let mut head = vec![u32::MAX; 1 << HASH_BITS];
-            let mut prev = vec![u32::MAX; SEGMENT.min(input.len()).max(1)];
+            let span = SEGMENT.min(input.len()).max(1);
+            let bits = table_bits(span);
+            let mut head = vec![u32::MAX; 1 << bits];
+            let mut prev = vec![u32::MAX; span];
             let mut start = 0;
             while start < input.len() {
                 let end = (start + SEGMENT).min(input.len());
@@ -446,7 +504,7 @@ mod tests {
                 let mut literal_start = start;
                 let mut at = start;
                 while at + MIN_MATCH <= end {
-                    let mut candidate = head[hash(&input[at..at + MIN_MATCH])];
+                    let mut candidate = head[hash(&input[at..at + MIN_MATCH], bits)];
                     let mut found: Option<(usize, usize)> = None;
                     let mut tries = 0;
                     while candidate != u32::MAX && tries < MAX_TRIES {
@@ -464,12 +522,12 @@ mod tests {
                         candidate = prev[candidate as usize];
                         tries += 1;
                     }
-                    insert(input, at, end, &mut head, &mut prev, start);
+                    insert(input, at, end, &mut head, &mut prev, start, bits);
                     match found {
                         Some((length, offset)) => {
                             push(&mut raw, (literal_start, at), length, offset);
                             for step in 1..length {
-                                insert(input, at + step, end, &mut head, &mut prev, start);
+                                insert(input, at + step, end, &mut head, &mut prev, start, bits);
                             }
                             at += length;
                             literal_start = at;
