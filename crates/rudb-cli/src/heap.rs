@@ -25,11 +25,58 @@
 //! time.
 
 use std::alloc::{GlobalAlloc, Layout};
+use std::ffi::{c_int, c_long};
 
 use libmimalloc_sys::{
     mi_free, mi_malloc, mi_malloc_aligned, mi_realloc, mi_realloc_aligned, mi_zalloc,
     mi_zalloc_aligned,
 };
+
+/// `mi_option_purge_delay` in mimalloc 2's `mimalloc.h`, the sixteenth entry of `mi_option_e`.
+const PURGE_DELAY: c_int = 15;
+
+// The two calls of mimalloc's option interface this needs. `libmimalloc-sys` declares them only
+// behind a feature that also pulls in a dependency, and they are in the library it links either
+// way, so they are declared here as they are in the header.
+#[allow(unsafe_code)]
+unsafe extern "C" {
+    fn mi_option_set(option: c_int, value: c_long);
+    #[cfg(test)]
+    fn mi_option_get(option: c_int) -> c_long;
+}
+
+/// Tells mimalloc to keep the memory a query frees rather than hand it back to the system.
+///
+/// By default mimalloc returns freed memory ten milliseconds after it is freed. A load frees and
+/// takes gigabytes over and over inside one statement: the sorted SF1 `lineitem` CTAS peaks at
+/// 2.3GB and mimalloc's own statistics show it purging 4.7GiB along the way, every byte of which
+/// is faulted back in when it is taken again. With the purge off that is 0, and over 21
+/// interleaved runs the median wall time was about 7 percent lower and the system time a seventh
+/// lower. A delay of a second did no better than the default, so it is off rather
+/// than delayed. The price is what the process holds after the load, 2248MB against 2099MB there,
+/// and the next statement takes from that before it asks the system for more. Setting
+/// `MIMALLOC_PURGE_DELAY` in the environment still decides, for a user who wants it back.
+pub(crate) fn keep_freed_memory() {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() {
+        return;
+    }
+    // SAFETY: an option is an integer mimalloc reads when it next decides whether to purge, and
+    // setting one is allowed at any time, including after the first allocation.
+    #[allow(unsafe_code)]
+    unsafe {
+        mi_option_set(PURGE_DELAY, -1);
+    }
+}
+
+/// The purge delay mimalloc is using, for the test that checks the option is the one meant.
+#[cfg(test)]
+fn purge_delay() -> c_long {
+    // SAFETY: reading an option has no precondition.
+    #[allow(unsafe_code)]
+    unsafe {
+        mi_option_get(PURGE_DELAY)
+    }
+}
 
 /// The alignment mimalloc gives a block without being asked, `MI_MAX_ALIGN_SIZE` in its header.
 const GIVEN: usize = 16;
@@ -102,7 +149,19 @@ unsafe impl GlobalAlloc for MiMalloc {
 
 #[cfg(test)]
 mod tests {
-    use super::{GIVEN, given};
+    use super::{GIVEN, given, keep_freed_memory, purge_delay};
+
+    /// The option set is the purge delay, which mimalloc 2 starts at ten milliseconds, and not some
+    /// other entry of the enum the constant could have drifted to.
+    #[test]
+    fn keeping_freed_memory_turns_the_purge_delay_off() {
+        if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() {
+            return;
+        }
+        assert_eq!(purge_delay(), 10, "mimalloc's own default");
+        keep_freed_memory();
+        assert_eq!(purge_delay(), -1);
+    }
 
     /// The alignments the engine actually asks for take the plain call, and the ones that would not
     /// be served by it do not.
