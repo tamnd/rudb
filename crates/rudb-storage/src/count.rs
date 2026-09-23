@@ -97,6 +97,8 @@
 //! handle, because that is what every column of every memory table gave it until now, and a
 //! distinct count that is wrong is one it has no defence against at all.
 
+use std::sync::Arc;
+
 use rudb_common::{LogicalType, Value};
 use rudb_encoding::sketch::{DEFAULT_K, Sketch, hash64, hash128};
 use rudb_vector::{Chunk, Data, Form, Vector};
@@ -124,6 +126,41 @@ struct Column {
     /// cause is a count that is too low, which is the direction that turns an estimate into a wrong
     /// plan rather than a cautious one. Once it is set the column answers nothing.
     blind: bool,
+    /// What the last dictionary this column read has been worked out to hold, kept for the chunks
+    /// after it that share the same one.
+    entries: Entries,
+}
+
+/// The hashes of one dictionary's entries and a count a code, kept across the chunks that share it.
+///
+/// A Parquet dictionary covers a whole column chunk, which is a few dozen of the chunks a scan hands
+/// up, and on `lineitem` a price or a key column has far more entries than a chunk has rows. Making
+/// a count an entry and walking it for every chunk cost more than counting the rows did, and each
+/// entry a row pointed at was built into a `Value` to be hashed. Now each entry is hashed once for
+/// all the chunks that share its dictionary, and only the entries some row pointed at are walked.
+#[derive(Debug, Clone, Default)]
+struct Entries {
+    /// The dictionary these are for, held so that its address stays its own while it is compared.
+    values: Option<Arc<Vector>>,
+    /// Each entry's hash, once some row has pointed at it.
+    hashes: Vec<Option<u64>>,
+    /// How many rows of the chunk being walked point at each entry, back to nothing after the walk.
+    seen: Vec<u64>,
+    /// The entries the chunk being walked pointed at, in the order it first did.
+    touched: Vec<u32>,
+}
+
+impl Entries {
+    /// Ready for a chunk over `values`, starting afresh when that is not the dictionary held.
+    fn over(&mut self, values: &Arc<Vector>) {
+        if self.values.as_ref().is_some_and(|held| Arc::ptr_eq(held, values)) {
+            return;
+        }
+        self.values = Some(Arc::clone(values));
+        self.hashes = vec![None; values.len()];
+        self.seen = vec![0; values.len()];
+        self.touched.clear();
+    }
 }
 
 impl Column {
@@ -135,6 +172,7 @@ impl Column {
             sketch: Sketch::new(DEFAULT_K).unwrap_or_else(|_| Sketch::of(&[])),
             tally: Tally::new(),
             blind: false,
+            entries: Entries::default(),
         }
     }
 
@@ -143,7 +181,8 @@ impl Column {
         if self.blind {
             return;
         }
-        if !walk(vector, &mut Sink::of(&mut self.sketch, &mut self.tally)) {
+        let mut sink = Sink::of(&mut self.sketch, &mut self.tally);
+        if !walk(vector, &mut self.entries, &mut sink) {
             self.blind();
         }
     }
@@ -199,6 +238,7 @@ impl Column {
         // up, because there is no sketch left for it to hand anything to.
         self.sketch = Sketch::of(&[]);
         self.tally.forget();
+        self.entries = Entries::default();
     }
 }
 
@@ -509,7 +549,7 @@ impl<'a> Sink<'a> {
 /// The caller has to treat a `false` as poisoning the whole column and not as skipping one chunk,
 /// because a sketch missing some of its rows counts too few distinct values and says nothing about
 /// having done so.
-fn walk(vector: &Vector, sink: &mut Sink<'_>) -> bool {
+fn walk(vector: &Vector, entries: &mut Entries, sink: &mut Sink<'_>) -> bool {
     match vector.form() {
         // One value repeated, so one hash for however many rows there are. A constant that is null
         // adds nothing, which is right: a distinct count does not count the null.
@@ -566,8 +606,8 @@ fn walk(vector: &Vector, sink: &mut Sink<'_>) -> bool {
             }
             None => false,
         },
-        Form::Dictionary => match vector.dictionary_parts() {
-            Some((codes, values)) => coded(vector, codes, values, sink),
+        Form::Dictionary => match vector.shared_dictionary_parts() {
+            Some((codes, values)) => coded(vector, codes, values, entries, sink),
             None => false,
         },
         // One hash a run rather than one a row, because every row of a run holds the same value and
@@ -633,39 +673,71 @@ fn walk(vector: &Vector, sink: &mut Sink<'_>) -> bool {
 /// A dictionary column, counted once per row and hashed once per dictionary entry.
 ///
 /// The rows are the cheap pass: an add into a slot of `seen` per row, with no hash and no value. The
-/// dictionary is walked afterwards and only for the entries some row pointed at, because the
-/// dictionary a Parquet reader hands over covers a whole column chunk and can hold far more values
-/// than the rows being counted. Hashing it whole would be the slower of the two exactly when the
-/// dictionary is doing its job, and adding every entry would count values no row of this table has.
-fn coded(vector: &Vector, codes: &[u32], values: &Vector, sink: &mut Sink<'_>) -> bool {
+/// entries are walked afterwards and only the ones some row pointed at, because the dictionary a
+/// Parquet reader hands over covers a whole column chunk and can hold far more values than the rows
+/// being counted. Hashing it whole would be the slower of the two exactly when the dictionary is
+/// doing its job, and adding every entry would count values no row of this table has.
+fn coded(
+    vector: &Vector,
+    codes: &[u32],
+    values: &Arc<Vector>,
+    entries: &mut Entries,
+    sink: &mut Sink<'_>,
+) -> bool {
     let validity = vector.validity();
     let nullable = validity.has_nulls(vector.len());
     let inner = values.validity();
-    let mut seen: Vec<u64> = vec![0; values.len()];
+    entries.over(values);
     for row in 0..vector.len() {
         if nullable && !validity.is_valid(row) {
             continue;
         }
         let Some(&code) = codes.get(row) else { return false };
-        let code = code as usize;
         // A code pointing at a null is a null row, however the vector's own mask reads, which is the
         // same rule `Vector::is_null_at` follows through a dictionary.
-        if !inner.is_valid(code) {
+        if !inner.is_valid(code as usize) {
             continue;
         }
-        let Some(slot) = seen.get_mut(code) else { return false };
+        let Some(slot) = entries.seen.get_mut(code as usize) else { return false };
+        if *slot == 0 {
+            entries.touched.push(code);
+        }
         *slot += 1;
     }
-    for (code, held) in seen.iter().enumerate() {
-        if *held == 0 {
-            continue;
-        }
-        match value_hash(values, code) {
-            Some(hash) => sink.add(hash, *held, || values.value_at(code)),
-            None => return false,
-        }
+    let Entries { hashes, seen, touched, .. } = entries;
+    for code in touched.drain(..) {
+        let code = code as usize;
+        let (Some(held), Some(hash)) = (seen.get_mut(code), hashes.get_mut(code)) else {
+            return false;
+        };
+        let held = std::mem::take(held);
+        let hash = match *hash {
+            Some(hash) => hash,
+            None => match entry_hash(values, code) {
+                Some(found) => *hash.insert(found),
+                None => return false,
+            },
+        };
+        sink.add(hash, held, || values.value_at(code));
     }
     true
+}
+
+/// The hash of one dictionary entry, read from the typed run under it when it has one.
+///
+/// The same rules [`flat`] follows a row at a time, so an entry hashes as the row holding it would
+/// have if the column had arrived flat. Values that are not flat go through [`value_hash`].
+fn entry_hash(values: &Vector, at: usize) -> Option<u64> {
+    match values.data() {
+        Some(Data::Bool(held)) => held.get(at).map(|&v| hash_signed(i128::from(v))),
+        Some(Data::Float32(held)) => held.get(at).map(|&v| hash_real(f64::from(v))),
+        Some(Data::Float64(held)) => held.get(at).map(|&v| hash_real(v)),
+        Some(Data::Varlen(_)) => values.bytes_at(at).map(hash64),
+        Some(data) => {
+            data.signed_at(at).map(hash_signed).or_else(|| data.unsigned_at(at).map(hash_unsigned))
+        }
+        None => value_hash(values, at),
+    }
 }
 
 /// A flat column, one pass over its typed run.
@@ -1077,6 +1149,61 @@ mod tests {
         assert_eq!(held(Vector::sequence(0, 1, 100)), Some(one));
         let repeated = Vector::constant(LogicalType::Integer, Value::Integer(7), 300);
         assert_eq!(held(repeated), Some(vec![(Value::Integer(7), 300)]));
+    }
+
+    /// Chunks that share one dictionary longer than any of them count as the same rows laid flat.
+    ///
+    /// The case the entries kept across chunks are for: the second chunk finds its hashes worked out
+    /// by the first, and neither may carry the other's counts or touch an entry no row points at.
+    #[test]
+    fn chunks_sharing_a_long_dictionary_count_as_their_rows_do() {
+        let tally = |chunks: &[Vector]| {
+            let mut counts = Counts::new(1);
+            for chunk in chunks {
+                counts.add(&Chunk::new(vec![chunk.clone()]).expect("a chunk"));
+            }
+            (counts.distinct(0), counts.frequencies(0))
+        };
+        let entries: Vec<i32> = (0..1000).map(|n| n * 7).collect();
+        let shared = std::sync::Arc::new(flat(&entries));
+        let first: Vec<u32> = vec![5, 9, 5, 700, 9, 5];
+        let second: Vec<u32> = vec![9, 42, 700, 42, 3];
+        let coded: Vec<Vector> = [&first, &second]
+            .iter()
+            .map(|codes| {
+                Vector::dictionary_over((*codes).clone(), std::sync::Arc::clone(&shared))
+                    .expect("a dictionary")
+            })
+            .collect();
+        let laid: Vec<Vector> = [&first, &second]
+            .iter()
+            .map(|codes| {
+                flat(&codes.iter().map(|&code| entries[code as usize]).collect::<Vec<_>>())
+            })
+            .collect();
+        let counted = tally(&coded);
+        assert_eq!(counted, tally(&laid));
+        assert_eq!(counted.0, Some((5, true)));
+
+        let words: Vec<Value> = (0..300).map(|n| Value::Varchar(format!("word {n}"))).collect();
+        let words = std::sync::Arc::new(
+            Vector::from_values(LogicalType::Varchar, &words).expect("a column"),
+        );
+        let coded: Vec<Vector> = [&first[..3], &second[..2]]
+            .iter()
+            .map(|codes| {
+                Vector::dictionary_over(codes.to_vec(), std::sync::Arc::clone(&words))
+                    .expect("a dictionary")
+            })
+            .collect();
+        let laid: Vec<Vector> = coded
+            .iter()
+            .map(|chunk| {
+                let values: Vec<Value> = (0..chunk.len()).map(|row| chunk.value_at(row)).collect();
+                Vector::from_values(LogicalType::Varchar, &values).expect("a column")
+            })
+            .collect();
+        assert_eq!(tally(&coded), tally(&laid));
     }
 
     /// A null takes no row of anybody's list, in the three places the mask is read differently.
