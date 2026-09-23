@@ -30,6 +30,7 @@ mod layers;
 mod linkjoin;
 mod native;
 mod parquet;
+mod profile;
 mod rids;
 mod rowloop;
 mod ruletable;
@@ -116,6 +117,11 @@ fn main() -> ExitCode {
         // The same corpus with the hash join forced as the control, which is claim C3 of
         // `spec/graph/09-measurement.md`: the link join against the choice it was preferred over.
         Some("linkjoin") => linkjoin::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // One of those queries, one of those two plans, run until a profiler has something to read.
+        // Separate from `linkjoin` because the pairing that makes that one trustworthy is the same
+        // thing that makes its profile unreadable: a run that alternated between two plans profiles
+        // both of them at once.
+        Some("profile") => profile::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         // The forty three ClickBench queries once per statistics rule with that rule off, which is
         // the per rule table `spec/stats/09-measurement.md` section 9.4 asks every milestone for.
         // The same idea as `sections` above with the other set of switches, and separate from it
@@ -227,6 +233,17 @@ fn usage() {
     println!("           keeps both of its timings and the verdict is read off the interval over");
     println!("           their differences, so ask for twenty repeats or more: a query whose");
     println!("           interval spans zero is reported unresolved however large its delta looks");
+    println!("  profile <dir> <query> [repeats] [link|hash] [cache bytes]  one of those queries,");
+    println!("           one of those two plans, run over and over so a profiler has something to");
+    println!(
+        "           read. run it twice, once per arm, under perf or whatever else is to hand,"
+    );
+    println!(
+        "           and the difference between the two profiles is the plan. the milliseconds"
+    );
+    println!("           it prints are not a comparison and are not paired: they are there so a");
+    println!("           disturbed run can be thrown away rather than explained, and linkjoin");
+    println!("           above is what answers which plan is faster");
     println!("  ablate <hits.parquet> [repeats]  the forty three ClickBench queries once with");
     println!("           every statistics rule on and once per rule with that rule off, which is");
     println!("           the per rule table of spec/stats/09-measurement.md section 9.4. the file");
