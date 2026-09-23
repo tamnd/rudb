@@ -9,12 +9,12 @@
 //! cast's to accept or refuse in its own words.
 //!
 //! What each parser takes was read off the cast rather than off DuckDB. A whole number is an
-//! optional `+` or `-` and up to eighteen digits, leading zeros and all, which the cast reads the
-//! same way; spaces, underscores, a point, an exponent and the `0x` spellings are left to it. A
-//! double is the characters of a plain decimal number handed to the same `str::parse` the cast ends
-//! in, with `inf`, `nan` and anything with a space or an underscore left to the cast. A boolean is
-//! one of the ten spellings the cast knows, in any case, without spaces. A date is exactly
-//! `YYYY-MM-DD`.
+//! optional `+` or `-` and up to twenty digits, leading zeros and all, that fit in 64 bits, which
+//! the cast reads the same way; spaces, underscores, a point, an exponent and the `0x` spellings
+//! are left to it, and so is a number too long or too big. A double is the characters of a plain
+//! decimal number handed to the same `str::parse` the cast ends in, with `inf`, `nan` and anything
+//! with a space or an underscore left to the cast. A boolean is one of the ten spellings the cast
+//! knows, in any case, without spaces. A date is exactly `YYYY-MM-DD`.
 
 use rudb_common::{Error, LogicalType, Result, Value, days_from_civil};
 use rudb_kernels::cast_value;
@@ -94,7 +94,7 @@ pub(crate) fn column(
             column,
             ty,
             refuse,
-            |raw| whole(raw).and_then(|x| u8::try_from(x).ok()),
+            |raw| natural(raw).and_then(|x| u8::try_from(x).ok()),
             |value| if let Value::UTinyInt(x) = value { Some(*x) } else { None },
             Data::UInt8,
         ),
@@ -103,7 +103,7 @@ pub(crate) fn column(
             column,
             ty,
             refuse,
-            |raw| whole(raw).and_then(|x| u16::try_from(x).ok()),
+            |raw| natural(raw).and_then(|x| u16::try_from(x).ok()),
             |value| if let Value::USmallInt(x) = value { Some(*x) } else { None },
             Data::UInt16,
         ),
@@ -112,7 +112,7 @@ pub(crate) fn column(
             column,
             ty,
             refuse,
-            |raw| whole(raw).and_then(|x| u32::try_from(x).ok()),
+            |raw| natural(raw).and_then(|x| u32::try_from(x).ok()),
             |value| if let Value::UInteger(x) = value { Some(*x) } else { None },
             Data::UInt32,
         ),
@@ -121,7 +121,7 @@ pub(crate) fn column(
             column,
             ty,
             refuse,
-            |raw| whole(raw).and_then(|x| u64::try_from(x).ok()),
+            natural,
             |value| if let Value::UBigInt(x) = value { Some(*x) } else { None },
             Data::UInt64,
         ),
@@ -258,28 +258,85 @@ fn cast(
     cast_value(&Value::Varchar(text.to_string()), ty, false).map_err(|_| refuse(&text, row))
 }
 
-/// A whole number written as an optional sign and up to eighteen digits.
+/// A whole number written as an optional sign and up to twenty digits, if it fits in an `i64`.
 ///
-/// Eighteen digits cannot overflow an `i64`, so there is no check in the loop, and a longer number
-/// is the cast's, which is also where one too big for the column's type goes.
+/// The cast reads the same text as the same number, at any length, so a number too long or too big
+/// for this is the cast's to read or refuse, and so is one too big for the column's type.
 fn whole(raw: &[u8]) -> Option<i64> {
-    let (negative, digits) = match raw {
+    let (negative, run) = signed(raw);
+    let magnitude = digits(run)?;
+    if negative { 0i64.checked_sub_unsigned(magnitude) } else { i64::try_from(magnitude).ok() }
+}
+
+/// A whole number that fits in a `u64`, written the way [`whole`] reads one.
+///
+/// A minus sign is taken in front of a zero and nothing else, because `-0` is a zero to the cast
+/// and every other negative number is out of range for an unsigned column.
+fn natural(raw: &[u8]) -> Option<u64> {
+    let (negative, run) = signed(raw);
+    let magnitude = digits(run)?;
+    (!negative || magnitude == 0).then_some(magnitude)
+}
+
+/// The sign in front of a number, if there is one, and the rest of it.
+fn signed(raw: &[u8]) -> (bool, &[u8]) {
+    match raw {
         [b'-', rest @ ..] => (true, rest),
         [b'+', rest @ ..] => (false, rest),
         _ => (false, raw),
-    };
-    if digits.is_empty() || digits.len() > 18 {
+    }
+}
+
+/// A run of one to twenty ASCII digits as a number, or `None` when it is empty, longer, has a byte
+/// in it that is not a digit, or is more than a `u64` holds.
+///
+/// The digits are read eight at a time, see [`eight`]. The first `len % 8` of them go in a word of
+/// their own with zeros in front, which do not change its value, and the rest are whole words. So
+/// a short number, which is most of them, is one word, and every step after it is a
+/// multiplication by the same ten to the eighth. Only a twenty digit number can overflow, and the
+/// checked arithmetic is what refuses it.
+fn digits(run: &[u8]) -> Option<u64> {
+    if run.is_empty() || run.len() > 20 {
         return None;
     }
-    let mut value = 0i64;
-    for &byte in digits {
-        let digit = byte.wrapping_sub(b'0');
-        if digit > 9 {
-            return None;
-        }
-        value = value * 10 + i64::from(digit);
+    let (head, words) = run.split_at(run.len() % 8);
+    let mut value = if head.is_empty() {
+        0
+    } else {
+        let mut padded = [b'0'; 8];
+        padded[8 - head.len()..].copy_from_slice(head);
+        eight(padded)?
+    };
+    for word in words.chunks_exact(8) {
+        let word = eight(word.try_into().ok()?)?;
+        value = value.checked_mul(100_000_000)?.checked_add(word)?;
     }
-    Some(if negative { -value } else { value })
+    Some(value)
+}
+
+/// Eight ASCII digits as the number they spell, or `None` when one of them is not a digit.
+///
+/// Loaded little endian, the first digit is the low byte. Taking `'0'` from every byte leaves each
+/// one at most 9 if it was a digit. A byte below `'0'` has its top bit set by the subtraction and a
+/// byte above `'9'` has it set by adding `0x46`, which carries into the top bit from `0x3a` up, so
+/// one mask over the two finds a byte that is not a digit anywhere in the word. A borrow or a carry
+/// crosses into the next byte only from a byte that fails on its own, so it cannot hide one.
+///
+/// Then three multiplications put the digits together, each one joining neighbours into a number
+/// twice as wide: every byte times ten plus the byte after it gives the pairs, every pair times a
+/// hundred plus the pair after it gives the fours, and every four times ten thousand plus the four
+/// after it gives all eight. The mask after each step keeps every other sum, because the ones in
+/// between join the end of one number to the start of the next.
+fn eight(bytes: [u8; 8]) -> Option<u64> {
+    let word = u64::from_le_bytes(bytes);
+    let low = word.wrapping_sub(0x3030_3030_3030_3030);
+    let high = word.wrapping_add(0x4646_4646_4646_4646);
+    if (low | high) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let pairs = (low.wrapping_mul((10 << 8) + 1) >> 8) & 0x00ff_00ff_00ff_00ff;
+    let fours = (pairs.wrapping_mul((100 << 16) + 1) >> 16) & 0x0000_ffff_0000_ffff;
+    Some(fours.wrapping_mul((10_000 << 32) + 1) >> 32)
 }
 
 /// A double written with nothing but digits, a point, signs and an exponent.
@@ -287,6 +344,10 @@ fn whole(raw: &[u8]) -> Option<i64> {
 /// Those are the bytes on which the cast's own reading comes down to `str::parse` with nothing
 /// trimmed and no separators taken out, so this is that call and gives the cast's answer. The
 /// common case of a short plain decimal is worked out directly first, see [`short_decimal`].
+///
+/// There is no float parser of our own behind this. `str::parse` is Eisel-Lemire in `core`, which
+/// already reads most doubles with one multiplication of 128 bits and falls back to big numbers
+/// only for the rare one that sits too close to halfway between two doubles to tell.
 fn real(raw: &[u8]) -> Option<f64> {
     if let Some(number) = short_decimal(raw) {
         return Some(number);
@@ -301,6 +362,17 @@ fn real(raw: &[u8]) -> Option<f64> {
     std::str::from_utf8(raw).ok()?.parse().ok()
 }
 
+/// The powers of ten a short decimal's digits can be shifted by.
+const TENS: [u64; 16] = {
+    let mut tens = [1; 16];
+    let mut at = 1;
+    while at < 16 {
+        tens[at] = tens[at - 1] * 10;
+        at += 1;
+    }
+    tens
+};
+
 /// The powers of ten a double holds exactly.
 const EXACT: [f64; 16] =
     [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15];
@@ -312,33 +384,24 @@ const EXACT: [f64; 16] =
 /// too, and a division of two exact doubles is rounded correctly, so the quotient is the double
 /// nearest the decimal. That is Clinger's fast path, and `str::parse` gives the double nearest the
 /// decimal as well, so the two agree without this having to do any of the work that makes parsing
-/// in general hard.
+/// in general hard. The digits either side of the point are read by [`digits`], which is the same
+/// eight at a time reading a whole number gets.
 fn short_decimal(raw: &[u8]) -> Option<f64> {
-    let (negative, rest) = match raw {
-        [b'-', rest @ ..] => (true, rest),
-        [b'+', rest @ ..] => (false, rest),
-        _ => (false, raw),
+    let (negative, rest) = signed(raw);
+    let (whole, fraction) = match rest.iter().position(|&byte| byte == b'.') {
+        Some(point) => (&rest[..point], &rest[point + 1..]),
+        None => (rest, &[][..]),
     };
-    let mut mantissa = 0u64;
-    let mut digits = 0usize;
-    let mut scale = 0usize;
-    let mut point = false;
-    for &byte in rest {
-        if byte == b'.' && !point {
-            point = true;
-            continue;
-        }
-        let digit = byte.wrapping_sub(b'0');
-        if digit > 9 || digits == 15 {
-            return None;
-        }
-        mantissa = mantissa * 10 + u64::from(digit);
-        digits += 1;
-        scale += usize::from(point);
-    }
-    if digits == 0 {
+    let scale = fraction.len();
+    if whole.len() + scale > 15 {
         return None;
     }
+    let mantissa = match (whole.is_empty(), fraction.is_empty()) {
+        (true, true) => return None,
+        (false, true) => digits(whole)?,
+        (true, false) => digits(fraction)?,
+        (false, false) => digits(whole)? * TENS[scale] + digits(fraction)?,
+    };
     #[expect(clippy::cast_precision_loss, reason = "fifteen digits are below 2^53 and exact")]
     let number = mantissa as f64 / EXACT[scale];
     Some(if negative { -number } else { number })
@@ -442,9 +505,27 @@ mod tests {
             "-999999999999999999",
             "9223372036854775807",
             "-9223372036854775808",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "+9223372036854775807",
+            "0009223372036854775807",
+            "0000000000000000001",
+            "-0000000000000000001",
+            "00000000000000000001",
+            "000000000000000000001",
+            "-00000000000000000000",
+            "1234567890123456789",
+            "-1234567890123456789",
             "9999999999999999999",
             "18446744073709551615",
+            "18446744073709551616",
+            "+18446744073709551615",
+            "-18446744073709551615",
             "99999999999999999999",
+            "12345678",
+            "123456789",
+            "1234567812345678",
+            "12345678123456789",
             "1.5",
             "-1.5",
             ".5",
@@ -527,17 +608,15 @@ mod tests {
                     }
                     LogicalType::BigInt => whole(raw).map(Value::BigInt),
                     LogicalType::UTinyInt => {
-                        whole(raw).and_then(|x| u8::try_from(x).ok()).map(Value::UTinyInt)
+                        natural(raw).and_then(|x| u8::try_from(x).ok()).map(Value::UTinyInt)
                     }
                     LogicalType::USmallInt => {
-                        whole(raw).and_then(|x| u16::try_from(x).ok()).map(Value::USmallInt)
+                        natural(raw).and_then(|x| u16::try_from(x).ok()).map(Value::USmallInt)
                     }
                     LogicalType::UInteger => {
-                        whole(raw).and_then(|x| u32::try_from(x).ok()).map(Value::UInteger)
+                        natural(raw).and_then(|x| u32::try_from(x).ok()).map(Value::UInteger)
                     }
-                    LogicalType::UBigInt => {
-                        whole(raw).and_then(|x| u64::try_from(x).ok()).map(Value::UBigInt)
-                    }
+                    LogicalType::UBigInt => natural(raw).map(Value::UBigInt),
                     LogicalType::Double => real(raw).map(Value::Double),
                     LogicalType::Float => real(raw).map(|x| Value::Float(narrow(x))),
                     LogicalType::Boolean => truth(raw).map(Value::Boolean),
@@ -603,6 +682,257 @@ mod tests {
                         assert!(slow.is_none(), "{text} is a date the parser turned down");
                     }
                 }
+            }
+        }
+    }
+
+    /// The whole number parser as it was before it read eight digits at a time, one digit to a
+    /// step and at most eighteen of them, kept as the reference the new one is held to.
+    fn whole_by_the_digit(raw: &[u8]) -> Option<i64> {
+        let (negative, digits) = match raw {
+            [b'-', rest @ ..] => (true, rest),
+            [b'+', rest @ ..] => (false, rest),
+            _ => (false, raw),
+        };
+        if digits.is_empty() || digits.len() > 18 {
+            return None;
+        }
+        let mut value = 0i64;
+        for &byte in digits {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value * 10 + i64::from(digit);
+        }
+        Some(if negative { -value } else { value })
+    }
+
+    /// The short decimal parser as it was before it read eight digits at a time.
+    fn short_decimal_by_the_digit(raw: &[u8]) -> Option<f64> {
+        let (negative, rest) = match raw {
+            [b'-', rest @ ..] => (true, rest),
+            [b'+', rest @ ..] => (false, rest),
+            _ => (false, raw),
+        };
+        let mut mantissa = 0u64;
+        let mut digits = 0usize;
+        let mut scale = 0usize;
+        let mut point = false;
+        for &byte in rest {
+            if byte == b'.' && !point {
+                point = true;
+                continue;
+            }
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 || digits == 15 {
+                return None;
+            }
+            mantissa = mantissa * 10 + u64::from(digit);
+            digits += 1;
+            scale += usize::from(point);
+        }
+        if digits == 0 {
+            return None;
+        }
+        let number = mantissa as f64 / EXACT[scale];
+        Some(if negative { -number } else { number })
+    }
+
+    /// What `str::parse` makes of the text, for a number of at most twenty digits after its sign.
+    ///
+    /// `parse` reads any number of leading zeros and the parsers here stop at twenty digits, so a
+    /// longer run is one they leave to the cast and is `None` here too.
+    fn parsed<T: std::str::FromStr>(raw: &[u8]) -> Option<T> {
+        let run = match raw {
+            [b'-' | b'+', rest @ ..] => rest,
+            _ => raw,
+        };
+        if run.len() > 20 {
+            return None;
+        }
+        std::str::from_utf8(raw).ok()?.parse().ok()
+    }
+
+    /// Holds every parser that reads digits to its reference on one text.
+    ///
+    /// `whole` is `str::parse::<i64>` and gives what the old parser gave wherever the old one gave
+    /// anything. `natural` is `str::parse::<u64>` with a negative zero read as zero, which the old
+    /// parser read it as. The short decimal is the old short decimal, to the bit.
+    fn check(raw: &[u8]) {
+        let signed = whole(raw);
+        assert_eq!(signed, parsed::<i64>(raw), "whole {:?}", String::from_utf8_lossy(raw));
+        if let Some(old) = whole_by_the_digit(raw) {
+            assert_eq!(
+                signed,
+                Some(old),
+                "whole against the old {:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        let unsigned = match raw {
+            [b'-', ..] => parsed::<i64>(raw).filter(|&x| x == 0).map(|_| 0),
+            _ => parsed::<u64>(raw),
+        };
+        assert_eq!(natural(raw), unsigned, "natural {:?}", String::from_utf8_lossy(raw));
+        assert_eq!(
+            short_decimal(raw).map(f64::to_bits),
+            short_decimal_by_the_digit(raw).map(f64::to_bits),
+            "short decimal {:?}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+
+    /// A small xorshift generator, so that the random cases are the same on every run.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> usize {
+            (self.next() % bound) as usize
+        }
+
+        fn digit(&mut self) -> u8 {
+            b'0' + self.below(10) as u8
+        }
+    }
+
+    /// Every byte value at every place in a word of digits, which is every way one byte can spoil
+    /// a word, and the word's value whenever none does.
+    #[test]
+    fn eight_digits_at_once_are_the_digits_one_at_a_time() {
+        let mut random = Xorshift(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..64 {
+            let mut bytes = [0u8; 8];
+            bytes.iter_mut().for_each(|byte| *byte = random.digit());
+            for at in 0..8 {
+                for byte in 0..=u8::MAX {
+                    let mut word = bytes;
+                    word[at] = byte;
+                    let expected = std::str::from_utf8(&word)
+                        .ok()
+                        .filter(|text| text.bytes().all(|b| b.is_ascii_digit()))
+                        .map(|text| text.parse::<u64>().expect("eight digits"));
+                    assert_eq!(eight(word), expected, "{word:?}");
+                }
+            }
+        }
+        assert_eq!(eight(*b"00000000"), Some(0));
+        assert_eq!(eight(*b"99999999"), Some(99_999_999));
+        assert_eq!(eight(*b"12345678"), Some(12_345_678));
+    }
+
+    /// Runs of every length from nothing to past the longest the parsers take, each with every
+    /// sign, as all nines, all zeros and random digits, and with every byte value put in at every
+    /// place.
+    #[test]
+    fn digits_of_every_length_read_as_parse_reads_them() {
+        let mut random = Xorshift(0x2545_f491_4f6c_dd1d);
+        for len in 0..=21 {
+            let nines = vec![b'9'; len];
+            let zeros = vec![b'0'; len];
+            let mut runs = vec![nines, zeros];
+            for _ in 0..32 {
+                runs.push((0..len).map(|_| random.digit()).collect());
+            }
+            for run in &runs {
+                for sign in [&b""[..], b"-", b"+", b"--", b"+-", b"-+", b"."] {
+                    let text = [sign, run].concat();
+                    check(&text);
+                    for at in 0..text.len() {
+                        for byte in 0..=u8::MAX {
+                            let mut spoiled = text.clone();
+                            spoiled[at] = byte;
+                            check(&spoiled);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The edges of every integer type, one either side of each, written plainly, with a plus and
+    /// with leading zeros.
+    #[test]
+    fn the_edges_of_every_integer_type_read_as_parse_reads_them() {
+        let edges: [(i128, i128); 8] = [
+            (i8::MIN.into(), i8::MAX.into()),
+            (i16::MIN.into(), i16::MAX.into()),
+            (i32::MIN.into(), i32::MAX.into()),
+            (i64::MIN.into(), i64::MAX.into()),
+            (0, u8::MAX.into()),
+            (0, u16::MAX.into()),
+            (0, u32::MAX.into()),
+            (0, u64::MAX.into()),
+        ];
+        for (low, high) in edges {
+            for edge in [low - 1, low, low + 1, high - 1, high, high + 1] {
+                let magnitude = edge.unsigned_abs();
+                let sign = if edge < 0 { "-" } else { "" };
+                for zeros in 0..4 {
+                    let pad = "0".repeat(zeros);
+                    check(format!("{sign}{pad}{magnitude}").as_bytes());
+                    if edge >= 0 {
+                        check(format!("+{pad}{magnitude}").as_bytes());
+                        check(format!("-{pad}{magnitude}").as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two million texts made mostly of digits with signs, points and other bytes mixed in at
+    /// random, which reach the cases the tests above list and the ones nobody thought to list.
+    #[test]
+    fn random_texts_read_as_the_references_read_them() {
+        const OTHER: &[u8] = b"+-.eE_x /:";
+        let mut random = Xorshift(0xdead_beef_cafe_f00d);
+        let mut text = Vec::with_capacity(24);
+        for _ in 0..2_000_000 {
+            text.clear();
+            let len = random.below(23);
+            let spoil = random.below(4);
+            match random.below(4) {
+                0 => text.push(b'-'),
+                1 => text.push(b'+'),
+                _ => {}
+            }
+            for _ in 0..len {
+                let roll = random.below(64);
+                text.push(match roll {
+                    0 if spoil > 0 => OTHER[random.below(OTHER.len() as u64)],
+                    1 if spoil > 1 => random.next() as u8,
+                    2 | 3 => b'.',
+                    _ => random.digit(),
+                });
+            }
+            check(&text);
+        }
+    }
+
+    /// Whole numbers of nineteen and twenty digits, which the old parser left to the cast and the
+    /// new one reads, read as the cast reads them.
+    #[test]
+    fn long_whole_numbers_are_the_numbers_the_cast_reads() {
+        let mut random = Xorshift(0x0123_4567_89ab_cdef);
+        for _ in 0..20_000 {
+            let len = 19 + random.below(2);
+            let mut text: String = (0..len).map(|_| char::from(random.digit())).collect();
+            if random.below(2) == 0 {
+                text.insert(0, '-');
+            }
+            let raw = text.as_bytes();
+            if let Some(fast) = whole(raw) {
+                assert_eq!(Some(Value::BigInt(fast)), cast_text(&text, &LogicalType::BigInt));
+            }
+            if let Some(fast) = natural(raw) {
+                assert_eq!(Some(Value::UBigInt(fast)), cast_text(&text, &LogicalType::UBigInt));
             }
         }
     }
