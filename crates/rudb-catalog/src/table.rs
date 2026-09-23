@@ -776,18 +776,43 @@ impl Rows {
     /// Reads only selected positions of one part and the requested columns.
     ///
     /// A native reader can avoid decoding a whole string page when an earlier predicate left only
-    /// a few positions. The other stores use their ordinary part read and gather the same rows.
+    /// a few positions, and it does not keep the stripe's pages, since a caller reading sparsely
+    /// reaches only a few parts of a stripe. The other stores use their ordinary part read and
+    /// gather the same rows.
     pub fn read_selected(&self, at: usize, columns: &[usize], positions: &[u32]) -> Result<Chunk> {
-        let part = match self {
-            Self::Native(reader) => reader.read_sparse(at, columns)?,
-            Self::Grown(reader, _) if at < reader.parts() => reader.read_sparse(at, columns)?,
-            Self::Memory(_) | Self::Grown(_, _) => self.read(at, columns)?,
-        };
-        let mut selected = Vec::with_capacity(part.width());
-        for column in 0..part.width() {
-            selected.push(part.column(column)?.gather(positions)?);
+        self.read_rows_of(at, columns, positions, false)
+    }
+
+    /// Reads the requested columns of one part at the rows `positions` names, which rise.
+    ///
+    /// For a scan that read some columns first and ran its filters over them, and now wants the
+    /// rest only for the rows it kept. Unlike [`Self::read_selected`] a native reader keeps the
+    /// stripe's pages, because the scan goes on to read the next part of the same stripe.
+    pub fn read_rows(&self, at: usize, columns: &[usize], positions: &[u32]) -> Result<Chunk> {
+        self.read_rows_of(at, columns, positions, true)
+    }
+
+    fn read_rows_of(
+        &self,
+        at: usize,
+        columns: &[usize],
+        positions: &[u32],
+        whole: bool,
+    ) -> Result<Chunk> {
+        match self {
+            Self::Native(reader) => reader.read_rows(at, columns, positions, whole),
+            Self::Grown(reader, _) if at < reader.parts() => {
+                reader.read_rows(at, columns, positions, whole)
+            }
+            Self::Memory(_) | Self::Grown(_, _) => {
+                let part = self.read(at, columns)?;
+                let mut selected = Vec::with_capacity(part.width());
+                for column in 0..part.width() {
+                    selected.push(part.column(column)?.gather(positions)?);
+                }
+                Chunk::with_rows(selected, positions.len())
+            }
         }
-        Chunk::with_rows(selected, positions.len())
     }
 
     /// Whether statistics prove this chunk cannot match.

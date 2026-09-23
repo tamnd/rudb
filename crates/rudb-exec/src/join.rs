@@ -2513,7 +2513,7 @@ fn side_of(plan: &Plan, expr: ExprRef, driving: &Schema, gathered: &Schema) -> O
 /// with a catch-all arm: a variant added later that holds expressions has to be added here too, and
 /// a match that compiles while quietly missing one would make a join key out of an expression whose
 /// columns nobody looked at.
-fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
+pub(crate) fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
     match *plan.expr(expr) {
         Expr::Column(binding) => found(binding),
         Expr::Constant(_) | Expr::LambdaParam(_) => {}
