@@ -57,11 +57,12 @@ mod distinct;
 pub mod graph;
 pub mod host;
 mod prepare;
+use prepare::Lent;
 pub mod section;
 pub mod stats;
 mod zones;
 
-pub use prepare::{Merged, Paged, Prepared, Preparer};
+pub use prepare::{Merged, Merger, Paged, Prepared, Preparer};
 pub use section::Section;
 pub use zones::{Common, Stripes, ascending, distincts};
 
@@ -1634,6 +1635,9 @@ pub struct Writer {
     /// [`stats::Gather`] for why the statistics are built here rather than by reading the file back
     /// once it is committed.
     gathers: Vec<Option<stats::Gather>>,
+    /// The dictionaries and the statistics while a [`Merger`] has them, which is from
+    /// [`Writer::merger`] until the table is closed. `dictionaries` and `gathers` are empty then.
+    lent: Option<Arc<Lent>>,
     pending: Vec<PendingChunk>,
     /// The tables already closed in this generation, in the order they were written.
     closed: Vec<Entry>,
@@ -1844,6 +1848,7 @@ impl Writer {
                 .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
                 .collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
+            lent: None,
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
@@ -1901,6 +1906,7 @@ impl Writer {
                 .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
                 .collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, 1)).collect(),
+            lent: None,
             table: Table {
                 name: name.into(),
                 dictionaries: vec![None; fields.len()],
@@ -2009,6 +2015,7 @@ impl Writer {
                 .map(|field| AtomicBool::new(field.ty == LogicalType::Varchar))
                 .collect(),
             gathers: fields.iter().map(|field| stats::Gather::new(&field.ty, generation)).collect(),
+            lent: None,
             table: Table {
                 name,
                 dictionaries: vec![None; fields.len()],
@@ -2227,6 +2234,9 @@ impl Writer {
     /// This is what keeps a load from holding its dictionaries' payload. The blocks land between
     /// stripes wherever the writer is, which is fine because the index says where each one is.
     fn place_blocks(&mut self) -> Result<()> {
+        if let Some(lent) = self.lent.clone() {
+            return self.place_lent_blocks(&lent);
+        }
         let mut dictionaries = std::mem::take(&mut self.dictionaries);
         let placed = dictionaries.iter_mut().flatten().try_for_each(|dictionary| {
             for block in std::mem::take(&mut dictionary.blocks) {
@@ -2242,6 +2252,39 @@ impl Writer {
         });
         self.dictionaries = dictionaries;
         placed
+    }
+
+    /// [`Writer::place_blocks`] while a [`Merger`] has the dictionaries.
+    ///
+    /// A column whose merge is running is passed over rather than waited for, because the writer's
+    /// lock is held here and a merge of `URL` can take tens of milliseconds. Its blocks go out with
+    /// a later stripe, or at the close.
+    fn place_lent_blocks(&mut self, lent: &Lent) -> Result<()> {
+        for column in lent.columns() {
+            let Ok(mut held) = column.try_lock() else { continue };
+            let Some(dictionary) = held.dictionary.as_mut() else { continue };
+            for block in std::mem::take(&mut dictionary.blocks) {
+                let start = self.at;
+                self.put(&block)?;
+                dictionary.placed.push(Placed {
+                    start,
+                    length: block.len() as u64,
+                    hash: checksum(&block),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the dictionaries and the statistics back from the [`Merger`] that has them.
+    ///
+    /// A merge that starts after this is refused, since whatever it merged would be lost.
+    fn reclaim(&mut self) -> Result<()> {
+        let Some(lent) = self.lent.take() else { return Ok(()) };
+        let (dictionaries, gathers) = lent.reclaim()?;
+        self.dictionaries = dictionaries;
+        self.gathers = gathers;
+        Ok(())
     }
 
     /// Writes the buffered parts as one stripe, each column's parts contiguous on disk.
@@ -2840,6 +2883,7 @@ impl Writer {
     ///
     /// If directory encoding or writing fails.
     fn close(&mut self) -> Result<Entry> {
+        self.reclaim()?;
         self.flush_pending()?;
         // The rest of a table is its statistics, its dictionaries and its directory. The dictionary
         // work is charged as its own stage, because ranking a global dictionary can be most of what

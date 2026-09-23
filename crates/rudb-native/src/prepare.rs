@@ -114,6 +114,9 @@ pub struct Merged {
     columns: Vec<Merge>,
     blocks: Vec<Unencoded>,
     profile: Option<Arc<LoadProfile>>,
+    /// Whether the rows are counted into the table yet. [`Writer::merge`] counts them, and a
+    /// [`Merger`] leaves them for [`Writer::write`], since it has no table to count them into.
+    counted: bool,
 }
 
 /// A stripe that has been through [`Merged::pages`] and is waiting for [`Writer::write`].
@@ -123,6 +126,7 @@ pub struct Paged {
     columns: Vec<ColumnStripe>,
     /// Encoded dictionary blocks, each with its column and block number.
     blocks: Vec<(usize, usize, EncodedBlock)>,
+    counted: bool,
 }
 
 /// What one job of [`Merged::pages`] built.
@@ -498,65 +502,267 @@ impl Preparer {
     }
 }
 
-/// One column of a stripe on its way through [`Writer::merge_held`], with the parts of the writer
-/// that column owns.
+/// Where one column's dictionary and statistics are while a stripe is merged into them.
+enum Slot<'a> {
+    /// In the writer, which the caller holds.
+    Owned(&'a mut Option<GlobalDictionary>, &'a mut Option<stats::Gather>),
+    /// Lent to a [`Merger`], behind the column's own lock.
+    Lent(&'a Mutex<LentColumn>, &'a Lent),
+}
+
+/// One column of a stripe on its way through [`merge_columns`].
 struct Step<'a> {
     index: usize,
     column: Column,
-    dictionary: &'a mut Option<GlobalDictionary>,
-    /// The column's statistics so far and the stripe's, when the column keeps statistics.
-    gather: Option<(&'a mut stats::Gather, stats::Gather)>,
+    slot: Slot<'a>,
+    /// The stripe's statistics for the column, when the column keeps them.
+    gather: Option<stats::Gather>,
 }
 
 impl Step<'_> {
     /// Roughly what the merge costs: a hash a distinct value when there is a global dictionary to
-    /// merge into, and next to nothing otherwise.
-    fn cost(&self) -> usize {
-        match (&self.column, self.dictionary.as_ref()) {
-            (Column::Coded(local), Some(_)) => local.values().saturating_add(1),
+    /// merge into, and next to nothing otherwise. Read off `coded` rather than the dictionary, so a
+    /// lent column does not have to be locked to be sorted.
+    fn cost(&self, coded: &[AtomicBool]) -> usize {
+        match &self.column {
+            Column::Coded(local) if coded[self.index].load(Atomic::Relaxed) => {
+                local.values().saturating_add(1)
+            }
             _ => 0,
         }
     }
 
     /// Merges the column, settles its dictionary's shape and hands out the blocks it filled.
     fn run(self, rows: usize, coded: &[AtomicBool]) -> Result<(usize, Merge, Vec<Unencoded>)> {
-        let Self { index, column, dictionary, gather } = self;
-        if let Some((mine, stripe)) = gather {
-            mine.absorb(stripe);
-        }
-        let merge = match (column, dictionary.as_mut()) {
-            (Column::Pages(stripe), None) => Merge::Pages(stripe),
-            (Column::Pages(_), Some(_)) => {
-                return Err(Error::internal(
-                    "a column with a global dictionary was prepared without one",
-                ));
+        let Self { index, column, slot, gather } = self;
+        match slot {
+            Slot::Owned(dictionary, mine) => {
+                merge_column(index, column, gather, dictionary, mine, rows, coded)
             }
-            (Column::Coded(local), None) => Merge::Plain(local),
-            (Column::Coded(local), Some(global)) => {
-                // Empty means nothing has been merged into it yet, so this is the column's first
-                // stripe and the only one the decision is allowed to be made on.
-                if global.values() == 0 && drops_dictionary(rows, local.values()) {
-                    *dictionary = None;
-                    coded[index].store(false, Atomic::Relaxed);
-                    Merge::Plain(local)
-                } else {
-                    let global = local.merge_into(global)?;
-                    Merge::Codes { parts: local.parts, global }
+            Slot::Lent(held, lent) => {
+                let mut held = held.lock().map_err(|_| Error::internal("a merge panicked"))?;
+                // Checked with the column locked, so a merge either finishes before the writer
+                // takes this column back or is refused.
+                if lent.reclaimed.load(Atomic::Acquire) {
+                    return Err(Error::internal("a stripe was merged after its table was closed"));
                 }
+                let LentColumn { dictionary, gather: mine } = &mut *held;
+                merge_column(index, column, gather, dictionary, mine, rows, coded)
             }
-        };
-        // Settled here rather than when the stripe is written, so that the blocks this merge
-        // filled go out with it already knowing their shape. A column still too small to settle
-        // one keeps its blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them,
-        // because encoding them now would be encoding them without having looked at the column.
-        let blocks = match dictionary {
-            Some(dictionary) => {
-                dictionary.settle()?;
-                dictionary.hand_out(index)
+        }
+    }
+}
+
+/// One column of [`merge_columns`].
+fn merge_column(
+    index: usize,
+    column: Column,
+    stripe: Option<stats::Gather>,
+    dictionary: &mut Option<GlobalDictionary>,
+    gather: &mut Option<stats::Gather>,
+    rows: usize,
+    coded: &[AtomicBool],
+) -> Result<(usize, Merge, Vec<Unencoded>)> {
+    if let (Some(mine), Some(stripe)) = (gather.as_mut(), stripe) {
+        mine.absorb(stripe);
+    }
+    let merge = match (column, dictionary.as_mut()) {
+        (Column::Pages(stripe), None) => Merge::Pages(stripe),
+        (Column::Pages(_), Some(_)) => {
+            return Err(Error::internal(
+                "a column with a global dictionary was prepared without one",
+            ));
+        }
+        (Column::Coded(local), None) => Merge::Plain(local),
+        (Column::Coded(local), Some(global)) => {
+            // Empty means nothing has been merged into it yet, so this is the column's first
+            // stripe and the only one the decision is allowed to be made on.
+            if global.values() == 0 && drops_dictionary(rows, local.values()) {
+                *dictionary = None;
+                coded[index].store(false, Atomic::Relaxed);
+                Merge::Plain(local)
+            } else {
+                let global = local.merge_into(global)?;
+                Merge::Codes { parts: local.parts, global }
             }
-            None => Vec::new(),
-        };
-        Ok((index, merge, blocks))
+        }
+    };
+    // Settled here rather than when the stripe is written, so that the blocks this merge filled go
+    // out with it already knowing their shape. A column still too small to settle one keeps its
+    // blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them, because encoding them
+    // now would be encoding them without having looked at the column.
+    let blocks = match dictionary {
+        Some(dictionary) => {
+            dictionary.settle()?;
+            dictionary.hand_out(index)
+        }
+        None => Vec::new(),
+    };
+    Ok((index, merge, blocks))
+}
+
+/// Merges every column of a stripe into the dictionaries and statistics in `slots`.
+///
+/// Every column is merged on its own, because nothing one column's merge reads or writes belongs to
+/// another: its statistics, its global dictionary and its flag in `coded`. So the columns are
+/// spread over threads, and a stripe takes as long as its slowest column rather than all of them.
+/// The answer is the same in any order, because a column's merge only depends on the stripes
+/// merged into that column before it.
+fn merge_columns(prepared: Prepared, slots: Vec<Slot<'_>>, coded: &[AtomicBool]) -> Result<Merged> {
+    let Prepared { parts, columns, gathers, profile, .. } = prepared;
+    let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
+    let rows: usize = parts.iter().map(|part| part.rows).sum();
+    let width = columns.len();
+    if slots.len() != width || gathers.len() != width {
+        return Err(Error::internal("a stripe was merged into a table of another width"));
+    }
+    let mut steps = columns
+        .into_iter()
+        .zip(gathers)
+        .zip(slots)
+        .enumerate()
+        .map(|(index, ((column, gather), slot))| Step { index, column, slot, gather })
+        .collect::<Vec<_>>();
+    // Taken from the back, so the biggest merges start first and the last one to finish is
+    // small, the same reason `fan_out` hands its jobs over cheapest first.
+    steps.sort_by_key(|step| step.cost(coded));
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_ENCODE_WORKERS)
+        .min(steps.iter().filter(|step| step.cost(coded) > 0).count())
+        .max(1);
+    let done = if workers <= 1 {
+        steps.into_iter().map(|step| step.run(rows, coded)).collect::<Result<Vec<_>>>()?
+    } else {
+        let queue = Mutex::new(steps);
+        let pieces = std::thread::scope(|scope| {
+            (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let taken = queue
+                                .lock()
+                                .map_err(|_| Error::internal("a merge worker panicked"))?
+                                .pop();
+                            let Some(step) = taken else { break };
+                            mine.push(step.run(rows, coded)?);
+                        }
+                        Ok(mine)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| Error::internal("a merge worker panicked"))?
+                })
+                .collect::<Result<Vec<Vec<_>>>>()
+        })?;
+        pieces.into_iter().flatten().collect()
+    };
+    let mut slots: Vec<Option<(Merge, Vec<Unencoded>)>> = (0..width).map(|_| None).collect();
+    for (index, merge, blocks) in done {
+        slots[index] = Some((merge, blocks));
+    }
+    let mut merged = Vec::with_capacity(width);
+    let mut blocks = Vec::new();
+    for slot in slots {
+        let (merge, handed) = slot.ok_or_else(|| Error::internal("a column was never merged"))?;
+        merged.push(merge);
+        blocks.extend(handed);
+    }
+    drop(timing);
+    Ok(Merged { parts, columns: merged, blocks, profile, counted: false })
+}
+
+/// The dictionaries and statistics of a table while a [`Merger`] has them, one lock a column.
+#[derive(Debug)]
+pub(crate) struct Lent {
+    columns: Box<[Mutex<LentColumn>]>,
+    /// Set when the writer takes them back, after which a merge is refused.
+    reclaimed: AtomicBool,
+}
+
+/// One column of [`Lent`].
+#[derive(Debug)]
+pub(crate) struct LentColumn {
+    pub(crate) dictionary: Option<GlobalDictionary>,
+    gather: Option<stats::Gather>,
+}
+
+impl Lent {
+    pub(crate) fn columns(&self) -> &[Mutex<LentColumn>] {
+        &self.columns
+    }
+
+    /// Puts encoded blocks back into their dictionaries, each under its own column's lock.
+    fn take_back(&self, blocks: Vec<(usize, usize, EncodedBlock)>) -> Result<()> {
+        for (column, at, block) in blocks {
+            self.columns
+                .get(column)
+                .ok_or_else(|| Error::internal("a dictionary block came back to no column"))?
+                .lock()
+                .map_err(|_| Error::internal("a merge panicked"))?
+                .dictionary
+                .as_mut()
+                .ok_or_else(|| Error::internal("a dictionary block came back to no dictionary"))?
+                .take_back(at, block)?;
+        }
+        Ok(())
+    }
+
+    /// Everything lent, handed back to the writer.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn reclaim(
+        &self,
+    ) -> Result<(Vec<Option<GlobalDictionary>>, Vec<Option<stats::Gather>>)> {
+        self.reclaimed.store(true, Atomic::Release);
+        let mut dictionaries = Vec::with_capacity(self.columns.len());
+        let mut gathers = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let mut held = column.lock().map_err(|_| Error::internal("a merge panicked"))?;
+            dictionaries.push(held.dictionary.take());
+            gathers.push(held.gather.take());
+        }
+        Ok((dictionaries, gathers))
+    }
+}
+
+/// Merges prepared stripes into a writer's dictionaries and statistics without the writer.
+///
+/// Handed out by [`Writer::merger`]. With it, a load that shares one writer between many threads
+/// holds the writer's lock only to write, and two stripes merge at once as long as they are on
+/// different columns. A stripe merged here is written with [`Writer::write`] as usual, and that is
+/// where its rows are counted in.
+#[derive(Debug, Clone)]
+pub struct Merger {
+    lent: Arc<Lent>,
+    types: Vec<LogicalType>,
+    coded: Arc<[AtomicBool]>,
+}
+
+impl Merger {
+    /// [`Writer::merge`], one column lock at a time instead of the writer.
+    ///
+    /// # Errors
+    ///
+    /// If the stripe was prepared for a table of other columns, or the table was closed.
+    pub fn merge(&self, prepared: Prepared) -> Result<Merged> {
+        if prepared.types != self.types {
+            return Err(invalid("a stripe was prepared for a table of other columns"));
+        }
+        let slots = self.lent.columns.iter().map(|column| Slot::Lent(column, &self.lent)).collect();
+        merge_columns(prepared, slots, &self.coded)
+    }
+
+    /// Puts a stripe's encoded dictionary blocks back, so that [`Writer::write`] does not wait on a
+    /// column's lock while it holds its own.
+    ///
+    /// # Errors
+    ///
+    /// If a block comes back to a column without a dictionary, or comes back twice.
+    pub fn give_back(&self, paged: &mut Paged) -> Result<()> {
+        self.lent.take_back(std::mem::take(&mut paged.blocks))
     }
 }
 
@@ -569,7 +775,7 @@ impl Merged {
     ///
     /// If a column or a block cannot be encoded or a page comes out larger than a page may be.
     pub fn pages(self) -> Result<Paged> {
-        let Self { parts, columns, blocks, profile } = self;
+        let Self { parts, columns, blocks, profile, counted } = self;
         let width = columns.len();
         // The blocks go first so that they are taken last. One block is a thousand values, which is
         // less than any column of a stripe, and small jobs at the end are what keeps the last
@@ -614,7 +820,7 @@ impl Merged {
                 _ => Err(Error::internal("a column was never encoded")),
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Paged { parts, columns, blocks: encoded })
+        Ok(Paged { parts, columns, blocks: encoded, counted })
     }
 }
 
@@ -696,73 +902,51 @@ impl Writer {
     /// fifths of that, while two thirds of the machine waited for it. The answer is the same in any
     /// order, because a column's merge only depends on the stripes merged into it before.
     pub(crate) fn merge_held(&mut self, prepared: Prepared) -> Result<Merged> {
-        let Prepared { parts, columns, gathers, profile, .. } = prepared;
-        let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
-        let rows: usize = parts.iter().map(|part| part.rows).sum();
-        let width = columns.len();
-        let coded = &self.coded;
-        let mut steps = columns
-            .into_iter()
-            .zip(gathers)
-            .zip(self.dictionaries.iter_mut().zip(self.gathers.iter_mut()))
-            .enumerate()
-            .map(|(index, ((column, stripe), (dictionary, mine)))| Step {
-                index,
-                column,
-                dictionary,
-                gather: mine.as_mut().zip(stripe),
-            })
-            .collect::<Vec<_>>();
-        // Taken from the back, so the biggest merges start first and the last one to finish is
-        // small, the same reason `fan_out` hands its jobs over cheapest first.
-        steps.sort_by_key(Step::cost);
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(MAX_ENCODE_WORKERS)
-            .min(steps.iter().filter(|step| step.cost() > 0).count())
-            .max(1);
-        let done = if workers <= 1 {
-            steps.into_iter().map(|step| step.run(rows, coded)).collect::<Result<Vec<_>>>()?
-        } else {
-            let queue = Mutex::new(steps);
-            let pieces = std::thread::scope(|scope| {
-                (0..workers)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            let mut mine = Vec::new();
-                            loop {
-                                let taken = queue
-                                    .lock()
-                                    .map_err(|_| Error::internal("a merge worker panicked"))?
-                                    .pop();
-                                let Some(step) = taken else { break };
-                                mine.push(step.run(rows, coded)?);
-                            }
-                            Ok(mine)
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|handle| {
-                        handle.join().map_err(|_| Error::internal("a merge worker panicked"))?
-                    })
-                    .collect::<Result<Vec<Vec<_>>>>()
-            })?;
-            pieces.into_iter().flatten().collect()
+        let slots = match &self.lent {
+            Some(lent) => lent.columns.iter().map(|column| Slot::Lent(column, lent)).collect(),
+            None => self
+                .dictionaries
+                .iter_mut()
+                .zip(self.gathers.iter_mut())
+                .map(|(dictionary, gather)| Slot::Owned(dictionary, gather))
+                .collect::<Vec<_>>(),
         };
-        let mut slots: Vec<Option<(Merge, Vec<Unencoded>)>> = (0..width).map(|_| None).collect();
-        for (index, merge, blocks) in done {
-            slots[index] = Some((merge, blocks));
-        }
-        let mut merged = Vec::with_capacity(width);
-        let mut blocks = Vec::new();
-        for slot in slots {
-            let (merge, handed) = slot.ok_or_else(|| Error::internal("a column was never merged"))?;
-            merged.push(merge);
-            blocks.extend(handed);
-        }
-        drop(timing);
-        Ok(Merged { parts, columns: merged, blocks, profile })
+        let mut merged = merge_columns(prepared, slots, &self.coded)?;
+        merged.counted = true;
+        Ok(merged)
+    }
+
+    /// Hands the dictionaries and the statistics to a [`Merger`], so that stripes can be merged
+    /// without this writer's lock.
+    ///
+    /// Whatever [`Writer::append_at`] left behind is written first, the same rule
+    /// [`Writer::merge`] has. The writer takes them back when the table is closed.
+    ///
+    /// # Errors
+    ///
+    /// If the buffered stripe cannot be written.
+    pub fn merger(&mut self) -> Result<Merger> {
+        self.flush_pending()?;
+        let lent = match &self.lent {
+            Some(lent) => Arc::clone(lent),
+            None => {
+                let lent = Arc::new(Lent {
+                    columns: std::mem::take(&mut self.dictionaries)
+                        .into_iter()
+                        .zip(std::mem::take(&mut self.gathers))
+                        .map(|(dictionary, gather)| Mutex::new(LentColumn { dictionary, gather }))
+                        .collect(),
+                    reclaimed: AtomicBool::new(false),
+                });
+                self.lent = Some(Arc::clone(&lent));
+                lent
+            }
+        };
+        Ok(Merger {
+            lent,
+            types: self.table.fields.iter().map(|field| field.ty.clone()).collect(),
+            coded: Arc::clone(&self.coded),
+        })
     }
 
     /// Writes a stripe whose pages are built.
@@ -775,13 +959,25 @@ impl Writer {
     }
 
     pub(crate) fn write_paged(&mut self, paged: Paged) -> Result<()> {
-        let Paged { parts, columns, blocks } = paged;
-        for (column, at, block) in blocks {
-            self.dictionaries
-                .get_mut(column)
-                .and_then(Option::as_mut)
-                .ok_or_else(|| Error::internal("a dictionary block came back to no dictionary"))?
-                .take_back(at, block)?;
+        let Paged { parts, columns, blocks, counted } = paged;
+        if !counted {
+            self.table.rows = parts
+                .iter()
+                .try_fold(self.table.rows, |rows, part| rows.checked_add(part.rows))
+                .ok_or_else(|| invalid("row count overflow"))?;
+        }
+        if let Some(lent) = &self.lent {
+            lent.take_back(blocks)?;
+        } else {
+            for (column, at, block) in blocks {
+                self.dictionaries
+                    .get_mut(column)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| {
+                        Error::internal("a dictionary block came back to no dictionary")
+                    })?
+                    .take_back(at, block)?;
+            }
         }
         if parts.is_empty() {
             return self.place_blocks();
@@ -932,6 +1128,76 @@ mod tests {
         }
         writer.finish().expect("commit");
         check(&path);
+        fs::remove_file(path).expect("remove");
+    }
+
+    /// Stripes merged through a [`Merger`] write the same bytes as the writer merging them itself,
+    /// and their rows are counted in when they are written.
+    #[test]
+    fn stripes_merged_through_a_merger_write_the_same_bytes_as_the_writer() {
+        let alone = path("alone-merger");
+        let mut writer = Writer::create(&alone, "t", fields()).expect("a file");
+        for run in runs() {
+            writer.append_stripe(run).expect("a stripe");
+        }
+        writer.finish().expect("commit");
+
+        let lent = path("lent");
+        let mut writer = Writer::create(&lent, "t", fields()).expect("a file");
+        let preparer = writer.preparer();
+        let merger = writer.merger().expect("a merger");
+        for run in runs() {
+            let merged = merger.merge(preparer.prepare(run).expect("prepared")).expect("merged");
+            let mut paged = merged.pages().expect("paged");
+            merger.give_back(&mut paged).expect("given back");
+            writer.write(paged).expect("written");
+        }
+        assert_eq!(writer.table.rows, 13 * PART);
+        writer.finish().expect("commit");
+
+        assert_eq!(fs::read(&alone).expect("read"), fs::read(&lent).expect("read"));
+        check(&lent);
+        fs::remove_file(alone).expect("remove");
+        fs::remove_file(lent).expect("remove");
+    }
+
+    /// Stripes merged on several threads at once through one [`Merger`] and written in whatever
+    /// order they finish read back as the rows they held.
+    #[test]
+    fn stripes_merged_on_several_threads_at_once_read_back() {
+        let path = path("merged-at-once");
+        let mut writer = Writer::create(&path, "t", fields()).expect("a file");
+        let preparer = writer.preparer();
+        let merger = writer.merger().expect("a merger");
+        let writer = Mutex::new(writer);
+        std::thread::scope(|scope| {
+            for run in runs() {
+                let (preparer, merger, writer) = (&preparer, &merger, &writer);
+                scope.spawn(move || {
+                    let merged =
+                        merger.merge(preparer.prepare(run).expect("prepared")).expect("merged");
+                    let mut paged = merged.pages().expect("paged");
+                    merger.give_back(&mut paged).expect("given back");
+                    writer.lock().expect("the writer").write(paged).expect("written");
+                });
+            }
+        });
+        writer.into_inner().expect("the writer").finish().expect("commit");
+        check(&path);
+        fs::remove_file(path).expect("remove");
+    }
+
+    /// A merge that comes after the table is closed is refused rather than merged into
+    /// dictionaries nothing will write.
+    #[test]
+    fn a_merge_after_the_table_is_closed_is_refused() {
+        let path = path("late");
+        let mut writer = Writer::create(&path, "t", fields()).expect("a file");
+        let preparer = writer.preparer();
+        let merger = writer.merger().expect("a merger");
+        writer.finish().expect("commit");
+        let prepared = preparer.prepare(stripe(0, 2)).expect("prepared");
+        assert!(merger.merge(prepared).is_err());
         fs::remove_file(path).expect("remove");
     }
 
