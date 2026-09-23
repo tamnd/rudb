@@ -1842,14 +1842,6 @@ impl StableLike {
         ((word >> shift) & 1 == 1).then(|| (word >> (shift + 1)) & 1 == 1)
     }
 
-    /// Decides one value, which is what a chunk too small to be a scan asks for.
-    fn decide_one(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
-        let held = like.holds_vector(&self.dictionary, code, characters)?;
-        let (index, shift) = Self::slot(code);
-        self.word(index)?.fetch_or((1 | u64::from(held) << 1) << shift, Ordering::Release);
-        Ok(())
-    }
-
     /// Decides every value of the group holding `code`, which reads one payload block in order.
     ///
     /// The walk goes through [`Vector::sweep_text`] rather than reading a value at a time, and that
@@ -1870,6 +1862,12 @@ impl StableLike {
     /// a scan hands each thread its own parts and the dictionary has seventeen thousand blocks, so
     /// the collision is rare, and what it costs when it happens is one block decoded twice rather
     /// than every block kept for the length of the query.
+    ///
+    /// A chunk too small to be a scan walks the group too. It used to read the one value it asked
+    /// about, and on a filter that leaves a few rows a chunk that is every chunk of the query, so the
+    /// blocks it kept added up to 237 MB of ClickBench q22. Deciding the rest of the block costs a
+    /// search per value on bytes already decoded, and a later chunk asking about them finds them
+    /// decided.
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
         let first = code / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
@@ -2061,7 +2059,6 @@ fn like_stable(
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {
         return like_vector_run(dictionary, codes, like, base, rows, returns);
     }
-    let bulk = rows >= LIKE_GROUP;
     let mut out = vec![false; rows];
     let mut characters = Vec::new();
     let validity = over_valid(rows, base, |index| {
@@ -2069,11 +2066,7 @@ fn like_stable(
         out[index] = match cache.peek(code) {
             Some(held) => held,
             None => {
-                if bulk {
-                    cache.decide_group(code, like, &mut characters)?;
-                } else {
-                    cache.decide_one(code, like, &mut characters)?;
-                }
+                cache.decide_group(code, like, &mut characters)?;
                 cache
                     .peek(code)
                     .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?
