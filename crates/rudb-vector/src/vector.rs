@@ -72,6 +72,22 @@ use crate::validity::Validity;
 /// overhead has stopped mattering and the working set has not started to.
 pub const VECTOR_SIZE: usize = 8192;
 
+/// Whether every one of `codes` is below `len`.
+///
+/// The obvious test is the largest code, and on the baseline x86-64 the release is built for that
+/// loop does not vectorize, because SSE2 has no unsigned 32 bit maximum. It was about half of
+/// `Vector::gather` on q01, where every filtered column asks it of the same positions. An `or` of
+/// every code is at least as large as each of them and does vectorize, so when it is below `len`
+/// every code is too. A filter's positions over a full chunk of 8192 rows always pass that way,
+/// since `len` is then a power of two. Anything the `or` cannot settle takes the maximum.
+pub(crate) fn below(codes: &[u32], len: usize) -> bool {
+    let Ok(len) = u32::try_from(len) else { return true };
+    if codes.is_empty() || codes.iter().fold(0, |bits, &code| bits | code) < len {
+        return true;
+    }
+    codes.iter().copied().fold(0, u32::max) < len
+}
+
 /// What the key field of a map's child struct is called.
 ///
 /// A map is stored as a list of two field structs, and these are the two names. They are DuckDB's, and
@@ -1178,8 +1194,8 @@ impl Vector {
     ///
     /// If any code is past the end of the value vector.
     pub fn dictionary_over(codes: Vec<u32>, values: Arc<Vector>) -> Result<Self> {
-        let highest = codes.iter().copied().fold(0, u32::max);
-        if !codes.is_empty() && highest as usize >= values.len() {
+        if !below(&codes, values.len()) {
+            let highest = codes.iter().copied().fold(0, u32::max);
             return Err(Error::internal(format!(
                 "dictionary code {highest} is past the end of a {} value dictionary",
                 values.len()
@@ -3007,7 +3023,8 @@ impl Vector {
         // its codes gathered and nothing else, and widening every position first was a pass and an
         // allocation per filtered chunk of `URL` on ClickBench 28.
         if let Body::Dictionary { codes, values, stable: true } = &self.body {
-            return self.stable_gathered(codes, values, indices, |index| index as usize);
+            let inside = below(indices, codes.len());
+            return self.stable_gathered(codes, values, indices, inside, |index| index as usize);
         }
         if let Some(gathered) = self.unpacked_at(indices) {
             return Ok(gathered);
@@ -3029,8 +3046,7 @@ impl Vector {
         if self.validity.has_nulls(self.len) {
             return None;
         }
-        // The largest position, because a maximum is a loop the compiler vectorizes.
-        if indices.iter().max().is_some_and(|&top| top as usize >= self.len) {
+        if !below(indices, self.len) {
             return None;
         }
         macro_rules! gathered {
@@ -3064,12 +3080,10 @@ impl Vector {
         codes: &Buffer<u32>,
         values: &Arc<Vector>,
         at: &[T],
+        inside: bool,
         index: impl Fn(T) -> usize,
     ) -> Result<Self> {
         let rows = at.len();
-        // The range is the largest position, because a maximum is a loop the compiler vectorizes
-        // and a search that can stop early is not.
-        let inside = at.iter().map(|&at| index(at)).max().is_none_or(|top| top < codes.len());
         // The ordinary case, a column with no nulls and a filter's rows all inside it, in one pass
         // for the range and one for the gather. Every code taken is one of this vector's codes,
         // which were range checked when it was built, so the result is not checked again the way
@@ -3130,8 +3144,7 @@ impl Vector {
         if self.validity.has_nulls(self.len) {
             return None;
         }
-        let highest = indices.iter().copied().fold(0, u32::max) as usize;
-        if !indices.is_empty() && highest >= self.len {
+        if !below(indices, self.len) {
             return None;
         }
         let packed = Packed { words, width: *width, base: *base, offset: *offset };
@@ -3174,7 +3187,8 @@ impl Vector {
         let rows = at.len();
         if forms_stay {
             if let Body::Dictionary { codes, values, stable: true } = &self.body {
-                return self.stable_gathered(codes, values, &at, |index| index);
+                let inside = at.iter().max().is_none_or(|&top| top < codes.len());
+                return self.stable_gathered(codes, values, &at, inside, |index| index);
             }
         }
         let (at, leaf) = self.resolve(at);
@@ -4488,7 +4502,7 @@ mod tests {
     use rudb_common::{Field, LogicalType, Value};
 
     use super::{
-        Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, NO_ROW, VECTOR_SIZE, Vector,
+        Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, NO_ROW, VECTOR_SIZE, Vector, below,
         packing_base,
     };
     use crate::buffer::Buffer;
@@ -4498,6 +4512,25 @@ mod tests {
 
     fn integers(values: &[i32]) -> Vector {
         Vector::flat(LogicalType::Integer, Data::Int32(values.to_vec().into())).unwrap()
+    }
+
+    #[test]
+    fn below_agrees_with_the_largest_code_whether_the_or_settles_it_or_not() {
+        let cases: [(&[u32], usize); 8] = [
+            (&[], 0),
+            (&[], 5),
+            (&[0, 1, 8191], 8192),
+            (&[0, 8192], 8192),
+            // The `or` of 4 and 1 is 5, which is not below 5, so these take the maximum.
+            (&[4, 1], 5),
+            (&[4, 5], 5),
+            (&[3, 4, 2], 5),
+            (&[7], 7),
+        ];
+        for (codes, len) in cases {
+            let expected = codes.iter().all(|&code| (code as usize) < len);
+            assert_eq!(below(codes, len), expected, "{codes:?} below {len}");
+        }
     }
 
     #[test]

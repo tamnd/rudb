@@ -212,11 +212,10 @@ impl Chunk {
     ///
     /// If the selection points past the end of the chunk.
     pub fn select(self, selection: &Selection) -> Result<Self> {
-        // The largest position rather than the first one out of range, because a maximum is a loop
-        // the compiler vectorizes and a search that can stop early is not, and every filtered chunk
-        // comes through here.
-        let top = selection.indices().iter().max().map(|&index| index as usize);
-        if let Some(bad) = top.filter(|&top| top >= self.rows) {
+        // See `below` for why this is not the largest position, and every filtered chunk comes
+        // through here.
+        if !crate::vector::below(selection.indices(), self.rows) {
+            let bad = selection.indices().iter().max().copied().unwrap_or_default();
             return Err(Error::internal(format!(
                 "a selection keeps row {bad} of a chunk that has {} rows",
                 self.rows
