@@ -379,8 +379,9 @@ impl Plan {
             span = merge_span(span, self.expr_span(reference));
         };
         match *expr {
-            Expr::Column(_) | Expr::Constant(_) => {}
+            Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => {}
             Expr::Cast { input, .. } => include(input),
+            Expr::Lambda { body, .. } => include(body),
             Expr::Compare { left, right, .. } => {
                 include(left);
                 include(right);
@@ -639,6 +640,71 @@ impl Plan {
         }
     }
 
+    /// Calls `found` for every lambda parameter one expression reads.
+    ///
+    /// The other half of [`Plan::read_columns`], which leaves parameters out because no operator
+    /// has to keep them. Whatever runs a lambda's body does have to, since a body inside another
+    /// body reads the outer one's parameters the way it reads a column.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn read_parameters(&self, reference: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
+        if let Expr::LambdaParam(binding) = *self.expr(reference) {
+            found(binding);
+        }
+        self.for_each_operand(reference, &mut |operand| self.read_parameters(operand, found));
+    }
+
+    /// Calls `visit` with every expression one expression is made of, one level down.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn for_each_operand(&self, reference: ExprRef, visit: &mut impl FnMut(ExprRef)) {
+        match *self.expr(reference) {
+            Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => {}
+            Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => visit(input),
+            Expr::Compare { left, right, .. } => {
+                visit(left);
+                visit(right);
+            }
+            Expr::Conjunction { children, .. } | Expr::Function { args: children, .. } => {
+                for &child in self.expr_list(children) {
+                    visit(child);
+                }
+            }
+            Expr::Aggregate { args, filter, .. } => {
+                for &arg in self.expr_list(args) {
+                    visit(arg);
+                }
+                if let Some(inner) = filter {
+                    visit(inner);
+                }
+            }
+            Expr::Window { args, filter, order, .. } => {
+                for &arg in self.expr_list(args) {
+                    visit(arg);
+                }
+                if let Some(inner) = filter {
+                    visit(inner);
+                }
+                for key in self.sort_key_list(order) {
+                    visit(key.expr);
+                }
+            }
+            Expr::Case { arms, otherwise } => {
+                for arm in self.arm_list(arms) {
+                    visit(arm.when);
+                    visit(arm.then);
+                }
+                if let Some(inner) = otherwise {
+                    visit(inner);
+                }
+            }
+        }
+    }
+
     /// Calls `found` for every column one expression reads, with the reference that reads it.
     ///
     /// The reference and not only the binding, because a caller that has to write one of these
@@ -655,8 +721,12 @@ impl Plan {
     pub fn read_columns(&self, reference: ExprRef, found: &mut impl FnMut(ExprRef, ColumnBinding)) {
         match *self.expr(reference) {
             Expr::Column(binding) => found(reference, binding),
-            Expr::Constant(_) => {}
+            // A parameter is not a column any operator produces, so nothing below has to keep one.
+            Expr::Constant(_) | Expr::LambdaParam(_) => {}
             Expr::Cast { input, .. } => self.read_columns(input, found),
+            // The body is read for every element of the list, and what it reads besides its own
+            // parameters are columns of the row the list is in, which the operator has to keep.
+            Expr::Lambda { body, .. } => self.read_columns(body, found),
             Expr::Compare { left, right, .. } => {
                 self.read_columns(left, found);
                 self.read_columns(right, found);
@@ -880,7 +950,8 @@ impl Plan {
             }
         };
         match *self.expr(reference) {
-            Expr::Column(_) => {}
+            Expr::Column(_) | Expr::LambdaParam(_) => {}
+            Expr::Lambda { body, .. } => backwards(body)?,
             Expr::Constant(value) => {
                 if value as usize >= self.values.len() {
                     return fail("names a constant that is not in the value table");
@@ -1326,8 +1397,10 @@ impl Plan {
                         .iter()
                         .any(|key| self.reaches_an_aggregate(key.expr))
             }
-            Expr::Column(_) | Expr::Constant(_) => false,
-            Expr::Cast { input, .. } => self.reaches_an_aggregate(input),
+            Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => false,
+            Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => {
+                self.reaches_an_aggregate(input)
+            }
             Expr::Compare { left, right, .. } => {
                 self.reaches_an_aggregate(left) || self.reaches_an_aggregate(right)
             }
@@ -1345,8 +1418,10 @@ impl Plan {
     fn reaches_a_window(&self, reference: ExprRef) -> bool {
         match *self.expr(reference) {
             Expr::Window { .. } => true,
-            Expr::Column(_) | Expr::Constant(_) => false,
-            Expr::Cast { input, .. } => self.reaches_a_window(input),
+            Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => false,
+            Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => {
+                self.reaches_a_window(input)
+            }
             Expr::Compare { left, right, .. } => {
                 self.reaches_a_window(left) || self.reaches_a_window(right)
             }

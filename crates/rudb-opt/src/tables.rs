@@ -120,8 +120,11 @@ impl Tables {
         let mut set = TableSet::new();
         match *plan.expr(expr) {
             Expr::Column(binding) => set.insert(binding.table),
-            Expr::Constant(_) => {}
-            Expr::Cast { input, .. } => set.extend(&self.of(plan, input)),
+            // A parameter's table is the lambda's and no operator produces it.
+            Expr::Constant(_) | Expr::LambdaParam(_) => {}
+            Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => {
+                set.extend(&self.of(plan, input));
+            }
             Expr::Compare { left, right, .. } => {
                 set.extend(&self.of(plan, left));
                 set.extend(&self.of(plan, right));

@@ -340,8 +340,9 @@ fn walk(plan: &Plan, expr: ExprRef, found: &mut Found) {
     }
     found.order.push(expr);
     match *plan.expr(expr) {
-        Expr::Column(_) | Expr::Constant(_) => {}
-        Expr::Cast { input, .. } => walk(plan, input, found),
+        Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => {}
+        // A body reads the columns it captures once per element, and they are read all the same.
+        Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => walk(plan, input, found),
         Expr::Compare { left, right, .. } => {
             walk(plan, left, found);
             walk(plan, right, found);

@@ -2309,8 +2309,9 @@ fn side_of(plan: &Plan, expr: ExprRef, driving: &Schema, gathered: &Schema) -> O
 fn columns(plan: &Plan, expr: ExprRef, found: &mut impl FnMut(ColumnBinding)) {
     match *plan.expr(expr) {
         Expr::Column(binding) => found(binding),
-        Expr::Constant(_) => {}
+        Expr::Constant(_) | Expr::LambdaParam(_) => {}
         Expr::Cast { input, .. } => columns(plan, input, found),
+        Expr::Lambda { body, .. } => columns(plan, body, found),
         Expr::Compare { left, right, .. } => {
             columns(plan, left, found);
             columns(plan, right, found);
