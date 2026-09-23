@@ -9952,7 +9952,14 @@ mod tests {
             .map(|code| dictionary.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a sweep answers what a point read answers");
-        assert_eq!(dictionary.footprint(), after, "a point read of a kept block decodes nothing");
+        // Two thousand five hundred point reads is past what makes the unpacked ends worth
+        // building, so they are the one thing that grows, by four bytes a value, and nothing of the
+        // payload does.
+        assert_eq!(
+            dictionary.footprint(),
+            after + dictionary.len() * size_of::<u32>(),
+            "a point read of a kept block decodes nothing"
+        );
         fs::remove_file(path).expect("remove scratch file");
     }
 
