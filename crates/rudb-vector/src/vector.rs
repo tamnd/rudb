@@ -3655,7 +3655,9 @@ fn run_of(data: &Data, at: usize, end: usize) -> Data {
                 // is in, and it is the whole of why a producer pages its payload: a page cut into
                 // chunk sized pieces used to copy every byte of every long string once per piece.
                 Data::Varlen(values) => {
-                    if let Some(shared) = values.viewing(at..end) {
+                    if let Some(shared) =
+                        values.window(at, end).or_else(|| values.viewing(at..end))
+                    {
                         return Data::Varlen(shared);
                     }
                     let views = values.views();

@@ -238,7 +238,7 @@ impl StringView {
 /// strings, position by position, which is the only definition that survives the seam.
 #[derive(Debug, Clone, Default, Eq)]
 pub struct StringColumn {
-    views: Vec<StringView>,
+    views: Buffer<StringView>,
     arena: Buffer<u8>,
 }
 
@@ -250,7 +250,7 @@ impl StringColumn {
     /// sixteen bytes a string and a column of long ones costs sixteen plus the bytes themselves.
     #[must_use]
     pub fn footprint(&self) -> usize {
-        self.views.capacity() * size_of::<StringView>() + self.arena.footprint()
+        self.views.footprint() + self.arena.footprint()
     }
 
     /// An empty column.
@@ -262,7 +262,7 @@ impl StringColumn {
     /// An empty column with room for `capacity` strings.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { views: Vec::with_capacity(capacity), arena: Buffer::new() }
+        Self { views: Buffer::with_capacity(capacity), arena: Buffer::new() }
     }
 
     /// A column with no strings in it yet, over an arena that already holds bytes.
@@ -282,7 +282,7 @@ impl StringColumn {
     /// buffer copies it, which is [`Buffer::to_mut`] and is the whole page.
     #[must_use]
     pub fn over(arena: Buffer<u8>) -> Self {
-        Self { views: Vec::new(), arena }
+        Self { views: Buffer::new(), arena }
     }
 
     /// This column with its arena held as a page, so that a copy of it does not copy the bytes.
@@ -293,7 +293,7 @@ impl StringColumn {
     /// reason.
     #[must_use]
     pub fn into_page(self) -> Self {
-        Self { views: self.views, arena: self.arena.into_page() }
+        Self { views: self.views.into_page(), arena: self.arena.into_page() }
     }
 
     /// A column from views that already point into `arena`.
@@ -305,7 +305,7 @@ impl StringColumn {
     /// is the empty string, and that is a wrong answer rather than an unsound one.
     #[must_use]
     pub fn from_parts(views: Vec<StringView>, arena: Buffer<u8>) -> Self {
-        Self { views, arena }
+        Self { views: Buffer::from_vec(views), arena }
     }
 
     /// The values at `at`, over this column's arena rather than over a copy of the bytes.
@@ -333,6 +333,39 @@ impl StringColumn {
             .map(|index| self.views.get(index).copied().unwrap_or_else(StringView::empty))
             .collect();
         Some(Self { views, arena: self.arena.clone() })
+    }
+
+    /// The strings from `from` to `to`, over this column's arena and its views.
+    ///
+    /// The cut [`Self::viewing`] makes for a run of rows rather than a set of them, and cheaper,
+    /// because a run of views is a window too. When the views are a page as well as the arena the
+    /// cut moves nothing at all, which is what a scan and a sorted load hand on: every chunk of a
+    /// column is a cut of it, and every one of those cuts used to copy sixteen bytes a row.
+    ///
+    /// `None` when the arena is this column's own, for the reason [`Self::viewing`] gives, and when
+    /// the run goes past the end, which is for the caller's padding path.
+    #[must_use]
+    pub fn window(&self, from: usize, to: usize) -> Option<Self> {
+        if !self.arena.is_shared() || from > to || to > self.views.len() {
+            return None;
+        }
+        Some(Self { views: self.views.slice(from, to - from), arena: self.arena.clone() })
+    }
+
+    /// Whether the views and the arena are both pages, so that a copy of the column copies neither.
+    #[must_use]
+    pub fn is_paged(&self) -> bool {
+        self.views.is_shared() && self.arena.is_shared()
+    }
+
+    /// This column and `next` as one, when both are windows of the same views over the same arena
+    /// and `next` starts where this one ends. See [`Buffer::joined`].
+    #[must_use]
+    pub fn joined(&self, next: &Self) -> Option<Self> {
+        if !self.arena.same_window(&next.arena) {
+            return None;
+        }
+        Some(Self { views: self.views.joined(&next.views)?, arena: self.arena.clone() })
     }
 
     /// How many strings are in the column.
@@ -418,7 +451,7 @@ impl StringColumn {
             None => None,
         };
         if let Some(base) = base {
-            self.views.extend(source.views.iter().map(|view| view.shifted(base)));
+            self.views.to_mut().extend(source.views.iter().map(|view| view.shifted(base)));
             return;
         }
         self.arena.reserve(live_bytes(source));
@@ -531,7 +564,7 @@ impl StringColumn {
     /// borrowed would have to clone every byte of the arena to hand one over.
     #[must_use]
     pub fn into_parts(self) -> (Vec<StringView>, Buffer<u8>) {
-        (self.views, self.arena)
+        (self.views.into_vec(), self.arena)
     }
 
     /// The bytes at `index`, or `None` past the end.
