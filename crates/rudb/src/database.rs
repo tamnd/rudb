@@ -114,6 +114,80 @@ fn native_nonzero_shape(ast: &Ast) -> Option<(&str, &str, &str)> {
     ))
 }
 
+fn native_column_aggregate<'a>(
+    ast: &'a Ast,
+    expr: ast::ExprRef,
+    function: &str,
+) -> Option<&'a str> {
+    use rudb_parse::NONE;
+    let ast::Expr::Function { name, args, distinct: false, filter: NONE } = ast.expr(expr) else {
+        return None;
+    };
+    if name.len != 1 || !ast.name(name).next()?.eq_ignore_ascii_case(function) {
+        return None;
+    }
+    let [argument] = ast.expr_list(args) else { return None };
+    let ast::Expr::Column { name } = ast.expr(*argument) else { return None };
+    (name.len == 1).then(|| ast.name(name).next()).flatten()
+}
+
+fn native_three_aggregate_shape(ast: &Ast) -> Option<(&str, &str, &str, [String; 3])> {
+    use ast::{Distinct, Expr, QueryBody, Source, Statement};
+    use rudb_parse::NONE;
+
+    let [Statement::Query(query_ref)] = ast.statements.as_slice() else { return None };
+    let query = ast.query(*query_ref);
+    if query.ctes.len != 0
+        || query.order_by.len != 0
+        || query.order_by_all
+        || query.limit != NONE
+        || query.offset != NONE
+        || query.limit_percent
+    {
+        return None;
+    }
+    let QueryBody::Select(select_ref) = query.body else { return None };
+    let select = ast.select(select_ref);
+    if select.distinct != Distinct::No
+        || select.filter != NONE
+        || select.group_by.len != 0
+        || select.group_by_all
+        || select.having != NONE
+    {
+        return None;
+    }
+    let [sum, count, average] = ast.target_list(select.targets) else { return None };
+    let sum_column = native_column_aggregate(ast, sum.expr, "sum")?;
+    let average_column = native_column_aggregate(ast, average.expr, "avg")?;
+    let Expr::Function { name, args, distinct: false, filter: NONE } = ast.expr(count.expr) else {
+        return None;
+    };
+    if name.len != 1 || !ast.name(name).next()?.eq_ignore_ascii_case("count") {
+        return None;
+    }
+    let [argument] = ast.expr_list(args) else { return None };
+    if !matches!(ast.expr(*argument), Expr::Star { qualifier, replacements } if qualifier.len == 0 && replacements.len == 0)
+    {
+        return None;
+    }
+    let [source] = ast.source_list(select.from) else { return None };
+    let Source::Table { name, alias: NONE, columns } = ast.source(*source) else { return None };
+    if name.len != 1 || columns.len != 0 {
+        return None;
+    }
+    let table = ast.name(name).next()?;
+    let names = [
+        if sum.alias == NONE { format!("sum({sum_column})") } else { ast.string(sum.alias).into() },
+        if count.alias == NONE { "count_star()".into() } else { ast.string(count.alias).into() },
+        if average.alias == NONE {
+            format!("avg({average_column})")
+        } else {
+            ast.string(average.alias).into()
+        },
+    ];
+    Some((table, sum_column, average_column, names))
+}
+
 /// An in process database.
 ///
 /// One catalog, held in memory, with no file behind it. `ATTACH` and the storage format are E2, and
@@ -238,11 +312,16 @@ fn runtime(config: &Config) -> Pool {
 }
 
 impl Database {
-    /// Answers a read-only, single-statement count directly from a certified native synopsis.
+    /// Answers supported read-only aggregates directly from certified native synopses.
     /// Other statements return `None` so the caller can use a regular database connection.
     pub fn query_native_once(path: &str, sql: &str) -> Result<Option<QueryResult>> {
         let ast = rudb_parse::parse_ast(sql)?;
-        let Some((table, column, name)) = native_nonzero_shape(&ast) else {
+        let nonzero = native_nonzero_shape(&ast);
+        let three = native_three_aggregate_shape(&ast);
+        let Some(table) = nonzero
+            .map(|(table, _, _)| table)
+            .or_else(|| three.as_ref().map(|(table, _, _, _)| *table))
+        else {
             return Ok(None);
         };
         let native = rudb_native::Catalog::open(path)?;
@@ -253,22 +332,68 @@ impl Database {
         else {
             return Ok(None);
         };
-        let Some(index) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+        if let Some((_, column, name)) = nonzero {
+            let Some(index) =
+                fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))
+            else {
+                return Ok(None);
+            };
+            let Some(count) = native.nonzero_count(stored_name, index)? else {
+                return Ok(None);
+            };
+            let Ok(count) = i64::try_from(count) else {
+                return Ok(None);
+            };
+            let vector = Vector::from_values(LogicalType::BigInt, &[Value::BigInt(count)])?;
+            let chunk = Chunk::new(vec![vector])?;
+            return Ok(Some(QueryResult::new(
+                vec![name.to_string()],
+                vec![LogicalType::BigInt],
+                vec![chunk],
+                Memory::unlimited().reservation(),
+            )));
+        }
+        let Some((_, sum_column, avg_column, names)) = three else {
+            return Ok(None);
+        };
+        let Some(sum_index) =
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case(sum_column))
         else {
             return Ok(None);
         };
-        let Some(count) = native.nonzero_count(stored_name, index)? else {
+        let Some(avg_index) =
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case(avg_column))
+        else {
             return Ok(None);
         };
-        let Ok(count) = i64::try_from(count) else {
+        let Some(sums) = native.aggregate_sums(stored_name, &[sum_index, avg_index])? else {
             return Ok(None);
         };
-        let value = Value::BigInt(count);
-        let vector = Vector::from_values(LogicalType::BigInt, &[value])?;
-        let chunk = Chunk::new(vec![vector])?;
+        let Ok(rows) = i64::try_from(sums.rows) else {
+            return Ok(None);
+        };
+        let (sum, sum_count) = sums.columns[0];
+        let (avg_sum, avg_count) = sums.columns[1];
+        let types = vec![LogicalType::HugeInt, LogicalType::BigInt, LogicalType::Double];
+        let values = [
+            if sum_count == 0 { Value::Null } else { Value::HugeInt(sum) },
+            Value::BigInt(rows),
+            if avg_count == 0 {
+                Value::Null
+            } else {
+                Value::Double(avg_sum as f64 / avg_count as f64)
+            },
+        ];
+        let vectors = types
+            .iter()
+            .cloned()
+            .zip(values)
+            .map(|(ty, value)| Vector::from_values(ty, &[value]))
+            .collect::<Result<Vec<_>>>()?;
+        let chunk = Chunk::new(vectors)?;
         Ok(Some(QueryResult::new(
-            vec![name.to_string()],
-            vec![LogicalType::BigInt],
+            names.into(),
+            types,
             vec![chunk],
             Memory::unlimited().reservation(),
         )))
@@ -2592,7 +2717,72 @@ mod tests {
 
     use rudb_io::{Filesystem, Op, OpenMode, SimFilesystem};
 
-    use super::{Database, native_nonzero_shape, publish};
+    use super::{Database, native_nonzero_shape, native_three_aggregate_shape, publish};
+
+    #[test]
+    fn cold_three_aggregate_shape_accepts_only_the_certified_query() {
+        let parsed = rudb_parse::parse_ast(
+            "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
+        )
+        .unwrap();
+        assert_eq!(
+            native_three_aggregate_shape(&parsed),
+            Some((
+                "hits",
+                "AdvEngineID",
+                "ResolutionWidth",
+                ["sum(AdvEngineID)".into(), "count_star()".into(), "avg(ResolutionWidth)".into()]
+            ))
+        );
+        for sql in [
+            "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits WHERE AdvEngineID > 0",
+            "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits LIMIT 1",
+            "SELECT SUM(DISTINCT AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
+            "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits GROUP BY RegionID",
+        ] {
+            let parsed = rudb_parse::parse_ast(sql).unwrap();
+            assert_eq!(native_three_aggregate_shape(&parsed), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cold_three_aggregate_answers_from_native_catalog() {
+        let path = std::env::temp_dir().join(format!("rudb-q3-{}.rdb", std::process::id()));
+        let name = path.to_str().unwrap();
+        let database = Database::open(name).unwrap();
+        database
+            .execute("CREATE TABLE hits (AdvEngineID SMALLINT, ResolutionWidth SMALLINT)")
+            .unwrap();
+        database.execute("INSERT INTO hits VALUES (1, 100), (NULL, 200), (3, NULL)").unwrap();
+        database
+            .execute("CREATE TABLE empty_hits (AdvEngineID SMALLINT, ResolutionWidth SMALLINT)")
+            .unwrap();
+        database
+            .execute("CREATE TABLE null_hits (AdvEngineID SMALLINT, ResolutionWidth SMALLINT)")
+            .unwrap();
+        database.execute("INSERT INTO null_hits VALUES (NULL, NULL)").unwrap();
+        drop(database);
+        let result = Database::query_native_once(
+            name,
+            "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result.rows().collect::<Vec<_>>(),
+            vec![vec![Value::HugeInt(4), Value::BigInt(3), Value::Double(150.0)]]
+        );
+        for (table, count) in [("empty_hits", 0), ("null_hits", 1)] {
+            let sql =
+                format!("SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM {table}");
+            let result = Database::query_native_once(name, &sql).unwrap().unwrap();
+            assert_eq!(
+                result.rows().collect::<Vec<_>>(),
+                vec![vec![Value::Null, Value::BigInt(count), Value::Null]]
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn cold_count_shape_accepts_only_the_certified_query() {
