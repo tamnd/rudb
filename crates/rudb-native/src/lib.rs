@@ -2925,7 +2925,9 @@ impl TextSource for NativeText {
         self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed);
         let Some(ends) = self.value_ends() else {
             for (slot, &index) in into.iter_mut().zip(indices) {
-                *slot = self.bytes_len_at(index as usize)?.map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX));
+                *slot = self
+                    .bytes_len_at(index as usize)?
+                    .map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX));
             }
             return Ok(());
         };
