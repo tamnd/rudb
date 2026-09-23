@@ -11,7 +11,7 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    Error, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, Value,
+    Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session, Value,
     is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
@@ -124,8 +124,14 @@ impl Binder<'_> {
             ast::Expr::QuantifiedSubquery { operand, op, query, all } => {
                 self.bind_quantified_subquery(ast, operand, op, query, all, scope)
             }
-            ast::Expr::Row { .. } => {
-                Err(Error::not_implemented("a row value outside of a VALUES clause".to_string()))
+            // A row is a struct whose fields have no names, which the pin calls a TUPLE.
+            ast::Expr::Row { items } => {
+                let written = ast.expr_list(items).to_vec();
+                let mut bound = Vec::with_capacity(written.len());
+                for value in written {
+                    bound.push(self.bind_expr(ast, value, scope)?);
+                }
+                self.pack_struct(&vec![String::new(); bound.len()], &bound)
             }
             // A lambda that got here is not the argument of a function that takes one, since that
             // function binds it itself. See `crate::lambda`.
@@ -623,6 +629,11 @@ impl Binder<'_> {
         }
         if let Some(aggregated) = self.list_aggregate(&written, &bound)? {
             return Ok(aggregated);
+        }
+        if rudb_catalog::same_name(&written, crate::structs::STRUCT_PACK) {
+            return Err(Error::binder(
+                "Need named argument for struct pack, e.g. STRUCT_PACK(a := b)",
+            ));
         }
         if let Some(field) = self.struct_field(&written, &bound)? {
             return Ok(field);
@@ -1214,6 +1225,19 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
 fn struct_members_meet(from: &LogicalType, to: &LogicalType) -> Result<()> {
     match (from, to) {
         (LogicalType::List(from), LogicalType::List(to)) => struct_members_meet(from, to),
+        (LogicalType::Struct(source), LogicalType::Struct(target))
+            if Field::unnamed(source) || Field::unnamed(target) =>
+        {
+            if source.len() != target.len() {
+                return Err(Error::mismatch_type(format!(
+                    "Type {from} does not match with {to}. Cannot cast STRUCTs of different size"
+                )));
+            }
+            for (one, field) in source.iter().zip(target) {
+                struct_members_meet(&one.ty, &field.ty)?;
+            }
+            Ok(())
+        }
         (LogicalType::Struct(source), LogicalType::Struct(target)) => {
             let mut matched = false;
             for field in target {

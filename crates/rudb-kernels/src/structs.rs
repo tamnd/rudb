@@ -20,14 +20,19 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Result
                 fields.iter().zip(args).map(|(field, arg)| (field.name.clone(), arg.clone()));
             Ok(Some(Value::Struct(packed.collect())))
         }
-        ("struct_extract", [input, Value::Varchar(key)]) => Ok(Some(match input {
-            Value::Struct(fields) => {
-                fields.iter().find(|(name, _)| name == key).map_or(Value::Null, |(_, v)| v.clone())
+        ("struct_extract", [input, key]) => Ok(Some(match (input, place(key)) {
+            (Value::Struct(fields), Some(at)) => {
+                fields.get(at).map_or(Value::Null, |(_, value)| value.clone())
             }
             _ => Value::Null,
         })),
         _ => Ok(None),
     }
+}
+
+/// The field a `struct_extract` key names, which the binder records as its place counted from one.
+fn place(key: &Value) -> Option<usize> {
+    key.as_i64().and_then(|at| usize::try_from(at).ok()).and_then(|at| at.checked_sub(1))
 }
 
 /// The vector path for both calls, or `None` to leave the call to the row path.
@@ -54,12 +59,12 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
             else {
                 return Ok(None);
             };
-            let Ok(Value::Varchar(key)) = key.as_ref().try_value_at(0) else {
+            let Some(at) = key.as_ref().try_value_at(0).ok().as_ref().and_then(place) else {
                 return Ok(None);
             };
-            let Some(at) = fields.iter().position(|field| field.name == key) else {
+            if at >= fields.len() {
                 return Ok(None);
-            };
+            }
             let child = &children[at];
             let child =
                 if child.form() == Form::Flat { (**child).clone() } else { child.flatten()? };
