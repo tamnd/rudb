@@ -2854,7 +2854,12 @@ impl Shared {
                 let writable =
                     self.inner.writable && !insert.name.temporary() && !self.transacting();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| {
-                    writable && insert.write == Write::Append && insert.returning.is_none()
+                    // A table with a key checks every row against the ones it holds, which the sink
+                    // does not, so it takes the path through the table.
+                    writable
+                        && insert.write == Write::Append
+                        && insert.returning.is_none()
+                        && catalog.table(&insert.name).is_ok_and(|table| table.keys().is_empty())
                 }) {
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
@@ -3480,6 +3485,9 @@ fn create_table(
         catalog.drop_table(&create.name)?;
     }
     catalog.create_table(create.name.clone(), create.columns)?;
+    if !create.keys.is_empty() {
+        catalog.table_mut(&create.name)?.set_keys(create.keys)?;
+    }
     if let Some(rows) = rows {
         catalog.table_mut(&create.name)?.append_all(rows.into_chunks(), budget.pool.threads())?;
     }

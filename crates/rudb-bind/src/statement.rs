@@ -101,6 +101,8 @@ pub struct CreateTable {
     pub if_not_exists: bool,
     /// Whether an existing table of that name is dropped first.
     pub or_replace: bool,
+    /// The primary key and the unique constraints, over the columns by place.
+    pub keys: Vec<rudb_catalog::Key>,
 }
 
 /// A bound `CREATE VIEW`.
@@ -310,7 +312,7 @@ fn create_table(
         catalog.resolve_for_create(&parts)?
     };
     let defs = ast.column_defs(written.columns);
-    let (columns, source) = if written.query == NONE {
+    let (mut columns, source) = if written.query == NONE {
         let mut columns = Vec::with_capacity(defs.len());
         for def in defs {
             let text = ast.string(def.ty);
@@ -351,12 +353,34 @@ fn create_table(
         (columns, Some(finish(binder, root)?))
     };
     duplicate_check(&columns)?;
+    let mut keys = Vec::new();
+    for (at, &names) in ast.name_list(written.keys).iter().enumerate() {
+        let mut places = Vec::new();
+        for wanted in ast.name(names) {
+            let Some(place) = columns.iter().position(|field| same_name(&field.name, wanted))
+            else {
+                return Err(Error::catalog(format!(
+                    "table \"{}\" does not have a column named \"{wanted}\"",
+                    name.table
+                )));
+            };
+            places.push(place);
+        }
+        let primary = at as u32 == written.primary;
+        if primary {
+            for &place in &places {
+                columns[place].not_null = true;
+            }
+        }
+        keys.push(rudb_catalog::Key { columns: places, primary });
+    }
     Ok(Bound::CreateTable(CreateTable {
         name,
         columns,
         source,
         if_not_exists: written.if_not_exists,
         or_replace: written.or_replace,
+        keys,
     }))
 }
 

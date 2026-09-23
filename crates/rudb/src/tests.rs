@@ -5582,7 +5582,7 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     // clause ignored, which is the rule the front end follows everywhere else.
     let db = scripted(&["CREATE TABLE t (a INTEGER)"]);
     for statement in [
-        "CREATE TABLE u (a INTEGER PRIMARY KEY)",
+        "CREATE TABLE u (a INTEGER CHECK (a > 0))",
         "INSERT INTO t (a, a) VALUES (1, 2)",
         "CREATE TABLE u (a INTEGER, a VARCHAR)",
     ] {
@@ -9319,4 +9319,73 @@ fn a_with_ahead_of_a_write_is_in_scope_for_all_of_it() {
         "y"
     );
     assert_eq!(answer("SELECT * FROM t ORDER BY a"), "5,cte;100,x");
+}
+
+#[test]
+fn a_key_refuses_a_write_that_would_repeat_it_the_way_the_pin_does() {
+    let db = scripted(&[
+        "CREATE TABLE t (i INTEGER PRIMARY KEY, s VARCHAR UNIQUE)",
+        "INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, NULL)",
+    ]);
+    for (statement, message) in [
+        (
+            "INSERT INTO t VALUES (4, 'b'), (4, 'c')",
+            "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"4\"",
+        ),
+        (
+            "INSERT INTO t VALUES (5, 'x'), (1, 'y')",
+            "Duplicate key \"i: 1\" violates primary key constraint.",
+        ),
+        ("INSERT INTO t VALUES (6, 'a')", "Duplicate key \"s: a\" violates unique constraint."),
+        ("INSERT INTO t VALUES (NULL, 'z')", "NOT NULL constraint failed: t.i"),
+        (
+            "UPDATE t SET i = 2 WHERE i = 1",
+            "Duplicate key \"i: 2\" violates primary key constraint.",
+        ),
+        (
+            "CREATE TABLE u (i INTEGER, PRIMARY KEY (k))",
+            "table \"u\" does not have a column named \"k\"",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    // Nothing a refused write touched is left behind, and a shift of every key is fine because it
+    // is the rows once the statement is done that are checked.
+    db.execute("UPDATE t SET i = i + 1").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'b'), (5, NULL)").unwrap();
+    assert_eq!(
+        db.query("SELECT i, s FROM t ORDER BY i").unwrap().rows().collect::<Vec<_>>(),
+        vec![
+            vec![Value::Integer(1), Value::Varchar("b".into())],
+            vec![Value::Integer(2), Value::Varchar("a".into())],
+            vec![Value::Integer(3), Value::Null],
+            vec![Value::Integer(4), Value::Null],
+            vec![Value::Integer(5), Value::Null],
+        ]
+    );
+    // A rolled back insert takes its keys with it.
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (9, 'q')").unwrap();
+    db.execute("ROLLBACK").unwrap();
+    db.execute("INSERT INTO t VALUES (9, 'q')").unwrap();
+    db.execute("CREATE TABLE u (a INTEGER, b INTEGER, c INTEGER, UNIQUE (a, b), PRIMARY KEY (b))")
+        .unwrap();
+    let described: Vec<Vec<Value>> =
+        db.query("SELECT \"null\", \"key\" FROM (DESCRIBE u)").unwrap().rows().collect();
+    let text = |value: &str| Value::Varchar(value.into());
+    assert_eq!(
+        described,
+        vec![
+            vec![text("YES"), text("UNI")],
+            vec![text("NO"), text("PRI")],
+            vec![text("YES"), Value::Null],
+        ]
+    );
+    // Through a query as well, for a column passed straight through and for nothing computed.
+    let described: Vec<Vec<Value>> = db
+        .query("SELECT \"key\" FROM (DESCRIBE SELECT c, b AS x, b + 0 FROM u WHERE a > 1)")
+        .unwrap()
+        .rows()
+        .collect();
+    assert_eq!(described, vec![vec![Value::Null], vec![text("PRI")], vec![Value::Null]]);
 }

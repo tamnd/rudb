@@ -14,6 +14,7 @@ use rudb_vector::{Chunk, Form, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
 use crate::held::Held;
+use crate::keys::{Key, Seen};
 use crate::name::{QualifiedName, same_name};
 
 /// Refuses a column list that names the same column twice.
@@ -969,6 +970,10 @@ pub struct Table {
     /// on it yet, which is the whole point: the declaration is what a checkpoint needs in order to
     /// not throw the order away, and the loader that honours it is the next piece.
     clustering: Option<Clustering>,
+    /// The primary key and the unique constraints, checked on every write.
+    keys: Vec<Key>,
+    /// The keys held for each of `keys`, built by the first write that needs them.
+    seen: Vec<Option<Seen>>,
 }
 
 impl Table {
@@ -990,6 +995,8 @@ impl Table {
             rows: Rows::Memory(MemoryTable::new(types)),
             oid: DETACHED,
             clustering: None,
+            keys: Vec::new(),
+            seen: Vec::new(),
         })
     }
 
@@ -1002,7 +1009,15 @@ impl Table {
         let columns = reader.table().fields().to_vec();
         duplicate_check(&columns)?;
         let clustering = reader.table().clustering().cloned();
-        Ok(Self { name, columns, rows: Rows::Native(reader), oid: DETACHED, clustering })
+        Ok(Self {
+            name,
+            columns,
+            rows: Rows::Native(reader),
+            oid: DETACHED,
+            clustering,
+            keys: Vec::new(),
+            seen: Vec::new(),
+        })
     }
 
     /// The number the catalog tables join on, and [`DETACHED`] for a table not in a catalog.
@@ -1228,6 +1243,9 @@ impl Table {
     /// program that catches one by its text is a program rudb has to not surprise.
     pub fn append(&mut self, chunk: Chunk) -> Result<()> {
         self.refuse_nulls(&chunk)?;
+        if !self.keys.is_empty() {
+            return self.append_all(vec![chunk], 1);
+        }
         self.rows.to_append()?.append(chunk)
     }
 
@@ -1243,7 +1261,10 @@ impl Table {
         for chunk in &chunks {
             self.refuse_nulls(chunk)?;
         }
-        self.rows.to_append()?.append_all(chunks, workers)
+        let seen = self.appended_keys(&chunks)?;
+        self.rows.to_append()?.append_all(chunks, workers)?;
+        self.hold_keys(seen);
+        Ok(())
     }
 
     /// Swaps every row of the table for these, which is how an `UPDATE` or a `DELETE` lands.
@@ -1259,11 +1280,78 @@ impl Table {
         for chunk in &chunks {
             self.refuse_nulls(chunk)?;
         }
+        let seen = self
+            .keys
+            .iter()
+            .map(|key| Seen::of(&chunks, key, &self.columns, true))
+            .collect::<Result<Vec<_>>>()?;
         let types = self.columns.iter().map(|field| field.ty.clone()).collect();
         let mut rows = MemoryTable::new(types);
         rows.append_all(chunks, workers)?;
         self.rows = Rows::Memory(rows);
+        self.hold_keys(seen);
         Ok(())
+    }
+
+    /// The primary key and the unique constraints.
+    #[must_use]
+    pub fn keys(&self) -> &[Key] {
+        &self.keys
+    }
+
+    /// Declares the table's keys, which makes the columns of a primary key `NOT NULL` as well.
+    ///
+    /// # Errors
+    ///
+    /// If a key names a column the table does not have, or if the rows already held break one.
+    pub fn set_keys(&mut self, keys: Vec<Key>) -> Result<()> {
+        for key in &keys {
+            for &column in &key.columns {
+                let Some(field) = self.columns.get_mut(column) else {
+                    return Err(Error::internal(format!("a key over column {column}")));
+                };
+                if key.primary {
+                    field.not_null = true;
+                }
+            }
+        }
+        self.keys = keys;
+        self.seen = vec![None; self.keys.len()];
+        let seen = self.appended_keys(&[])?;
+        self.hold_keys(seen);
+        Ok(())
+    }
+
+    /// The key sets the table holds once these rows are appended, or the refusal of the first key
+    /// they repeat. Builds the set of a key from the rows already held the first time it is asked.
+    fn appended_keys(&mut self, chunks: &[Chunk]) -> Result<Vec<Seen>> {
+        if self.keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sets = Vec::with_capacity(self.keys.len());
+        for at in 0..self.keys.len() {
+            let held = match &self.seen[at] {
+                Some(held) => held.clone(),
+                None => {
+                    let all: Vec<usize> = (0..self.columns.len()).collect();
+                    let mut stored = Vec::with_capacity(self.rows.chunk_count());
+                    for chunk in 0..self.rows.chunk_count() {
+                        stored.push(self.rows.read(chunk, &all)?);
+                    }
+                    let held = Seen::of(&stored, &self.keys[at], &self.columns, true)?;
+                    self.seen[at] = Some(held.clone());
+                    held
+                }
+            };
+            sets.push(held.with(chunks, &self.keys[at], &self.columns)?);
+        }
+        Ok(sets)
+    }
+
+    fn hold_keys(&mut self, seen: Vec<Seen>) {
+        if !seen.is_empty() {
+            self.seen = seen.into_iter().map(Some).collect();
+        }
     }
 
     /// Puts these rows where the table's are and hands back the ones it held, which is how a
@@ -1292,6 +1380,12 @@ impl Table {
     /// If a row is not as wide as the table, if a value will not convert to its column's type, or
     /// if a `NOT NULL` column is handed a null.
     pub fn append_rows(&mut self, rows: &[Vec<Value>]) -> Result<()> {
+        if !self.keys.is_empty() {
+            let mut staged = MemoryTable::new(self.types());
+            staged.append_rows(rows)?;
+            let chunks = (0..staged.chunk_count()).filter_map(|at| staged.chunk(at)).collect();
+            return self.append_all(chunks, 1);
+        }
         for row in rows {
             for (at, column) in self.columns.iter().enumerate() {
                 if column.not_null && row.get(at).is_some_and(Value::is_null) {

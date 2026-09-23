@@ -807,11 +807,14 @@ impl<'a> Transform<'a> {
         let if_not_exists = self.find(inner, "IfNotExists") != NONE;
         let definition = self.find(inner, "CreateTableDefinition");
         let body = self.first(definition);
+        let mut keys = Vec::new();
+        let mut primary = NONE;
         let (columns, query) = match self.name(body) {
-            "CreateColumnList" => (self.column_list(body)?, NONE),
+            "CreateColumnList" => (self.column_list(body, name, &mut keys, &mut primary)?, NONE),
             "CreateTableAs" => self.create_table_as(body)?,
             _ => return self.unsupported(body),
         };
+        let keys = self.name_list_slice(keys);
         let index = self.ast.create_tables.len() as u32;
         self.ast.create_tables.push(CreateTable {
             name,
@@ -820,6 +823,8 @@ impl<'a> Transform<'a> {
             if_not_exists,
             or_replace,
             temporary,
+            keys,
+            primary,
         });
         Ok(Statement::CreateTable(index))
     }
@@ -874,7 +879,13 @@ impl<'a> Transform<'a> {
     }
 
     /// `CreateColumnList <- Parens(CreateTableColumnList?) PartitionSortedOptions? WithList?`.
-    fn column_list(&mut self, node: u32) -> Result<Slice> {
+    fn column_list(
+        &mut self,
+        node: u32,
+        table: Slice,
+        keys: &mut Vec<Slice>,
+        primary: &mut u32,
+    ) -> Result<Slice> {
         for kid in self.kids(node) {
             if matches!(self.name(kid), "PartitionOptions" | "SortedOptions" | "WithList") {
                 return self.unsupported(kid);
@@ -889,20 +900,84 @@ impl<'a> Transform<'a> {
         let mut defs = Vec::new();
         for element in self.kids(list) {
             let inner = self.first(element);
-            if self.name(inner) != "CreateTableColumnDefinition" {
-                // A table level `PRIMARY KEY`, `UNIQUE`, `CHECK` or `FOREIGN KEY`. Constraints are
-                // not enforced anywhere yet and silently dropping one is a wrong answer waiting to
-                // happen, so it is refused instead.
-                return self.unsupported(inner);
+            if self.name(inner) == "CreateTableColumnDefinition" {
+                let (def, marks) = self.column_definition(self.first(inner))?;
+                for is_primary in marks {
+                    let names = self.part_slice(vec![def.name]);
+                    self.add_key(table, names, is_primary, keys, primary)?;
+                }
+                defs.push(def);
+                continue;
             }
-            defs.push(self.column_definition(self.first(inner))?);
+            // A table level constraint. `CHECK` and `FOREIGN KEY` are not enforced anywhere yet and
+            // silently dropping one is a wrong answer waiting to happen, so they are refused.
+            let mut found = Vec::new();
+            self.named_nodes(inner, "TopPrimaryKeyConstraint", &mut found);
+            let is_primary = !found.is_empty();
+            if !is_primary {
+                self.named_nodes(inner, "TopUniqueConstraint", &mut found);
+            }
+            let Some(&constraint) = found.first() else {
+                return self.unsupported(inner);
+            };
+            let mut found = Vec::new();
+            self.named_nodes(self.find(constraint, "ColumnIdList"), "ColId", &mut found);
+            let mut names: Vec<StrRef> = Vec::with_capacity(found.len());
+            for id in found {
+                let text = self.fold_identifier(self.text(id));
+                if names.iter().any(|&held| self.ast.string(held).eq_ignore_ascii_case(&text)) {
+                    return Err(Error::parser(format!(
+                        "column \"\"{text}\"\" appears twice in primary key constraint"
+                    )));
+                }
+                names.push(self.intern(&text));
+            }
+            let names = self.part_slice(names);
+            self.add_key(table, names, is_primary, keys, primary)?;
         }
         Ok(self.column_def_slice(defs))
     }
 
+    /// Every node under this one, itself included, with this rule name, in the order written.
+    fn named_nodes(&self, node: u32, rule: &str, out: &mut Vec<u32>) {
+        if node == NONE {
+            return;
+        }
+        if self.name(node) == rule {
+            out.push(node);
+            return;
+        }
+        for kid in self.kids(node) {
+            self.named_nodes(kid, rule, out);
+        }
+    }
+
+    /// One more key of a table, refused the way the pin refuses a second primary key.
+    fn add_key(
+        &mut self,
+        table: Slice,
+        names: Slice,
+        is_primary: bool,
+        keys: &mut Vec<Slice>,
+        primary: &mut u32,
+    ) -> Result<()> {
+        if is_primary {
+            if *primary != NONE {
+                let table = self.ast.name(table).last().unwrap_or_default().to_string();
+                return Err(Error::parser(format!(
+                    "table \"{table}\" has more than one primary key"
+                )));
+            }
+            *primary = keys.len() as u32;
+        }
+        keys.push(names);
+        Ok(())
+    }
+
     /// `ColumnDefinition <- DottedIdentifier Type? GeneratedColumn? ConstraintNameClause?
     /// ColumnConstraint*`.
-    fn column_definition(&mut self, node: u32) -> Result<ColumnDef> {
+    /// A column and the keys written on it, `true` for a primary key and `false` for a unique one.
+    fn column_definition(&mut self, node: u32) -> Result<(ColumnDef, Vec<bool>)> {
         let name = self.identifier(self.find(node, "DottedIdentifier"));
         let type_node = self.find(node, "Type");
         let ty = if type_node == NONE {
@@ -915,6 +990,7 @@ impl<'a> Transform<'a> {
             return self.unsupported(self.find(node, "GeneratedColumn"));
         }
         let mut not_null = false;
+        let mut keys = Vec::new();
         for kid in self.kids(node) {
             if self.name(kid) != "ColumnConstraint" {
                 continue;
@@ -924,10 +1000,12 @@ impl<'a> Transform<'a> {
                 "NotNullConstraint" => {
                     not_null = self.name(self.first(constraint)) == "NotNullColumnConstraint";
                 }
+                "PrimaryKeyConstraint" => keys.push(true),
+                "UniqueConstraint" => keys.push(false),
                 _ => return self.unsupported(constraint),
             }
         }
-        Ok(ColumnDef { name, ty, not_null })
+        Ok((ColumnDef { name, ty, not_null }, keys))
     }
 
     /// `CreateTableAs <- IdentifierList? PartitionSortedOptions? WithList? 'AS' Statement
@@ -4733,20 +4811,44 @@ mod tests {
     }
 
     #[test]
-    fn a_column_constraint_that_is_not_not_null_is_refused() {
-        // Nothing enforces a constraint yet. Accepting one and not enforcing it is the wrong
-        // answer, so `NOT NULL` is kept because the column already has a nullability and the rest
-        // are refused until there is somewhere to put them.
+    fn a_constraint_nothing_enforces_yet_is_refused() {
+        // Accepting a constraint and not enforcing it is the wrong answer, so only the ones the
+        // table checks are kept and the rest are refused until there is somewhere to put them.
         for query in [
-            "CREATE TABLE t (a INT PRIMARY KEY)",
-            "CREATE TABLE t (a INT UNIQUE)",
             "CREATE TABLE t (a INT CHECK (a > 0))",
             "CREATE TABLE t (a INT DEFAULT 1)",
             "CREATE TABLE t (a INT REFERENCES u (b))",
-            "CREATE TABLE t (a INT, PRIMARY KEY (a))",
+            "CREATE TABLE t (a INT, CHECK (a > 0))",
+            "CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES u (b))",
         ] {
             let error = parse_ast(query).unwrap_err().to_string();
             assert!(error.starts_with("Not implemented Error"), "{query} gave {error}");
+        }
+    }
+
+    #[test]
+    fn keys_are_held_in_the_order_written_with_the_primary_one_marked() {
+        let ast = parse_ast(
+            "CREATE TABLE t (a INT UNIQUE, b INT PRIMARY KEY, c INT, CONSTRAINT k UNIQUE (c, \"A\"))",
+        )
+        .unwrap();
+        let Statement::CreateTable(index) = ast.statements[0] else { panic!() };
+        let create = ast.create_table(index);
+        let keys: Vec<Vec<&str>> =
+            ast.name_list(create.keys).iter().map(|&names| ast.name(names).collect()).collect();
+        assert_eq!(keys, [vec!["a"], vec!["b"], vec!["c", "A"]]);
+        assert_eq!(create.primary, 1);
+        for (query, message) in [
+            (
+                "CREATE TABLE t (i INT PRIMARY KEY, PRIMARY KEY (i))",
+                "Parser Error: table \"t\" has more than one primary key",
+            ),
+            (
+                "CREATE TABLE t (i INT, UNIQUE (i, I))",
+                "Parser Error: column \"\"I\"\" appears twice in primary key constraint",
+            ),
+        ] {
+            assert_eq!(parse_ast(query).unwrap_err().to_string(), message);
         }
     }
 
