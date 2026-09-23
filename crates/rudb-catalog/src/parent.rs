@@ -58,36 +58,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{LogicalType, Result};
-use rudb_vector::{Form, Vector, concat};
+use rudb_common::{LogicalType, Result, Spread, serially};
+use rudb_vector::{Form, Vector, concat_on};
 
 use crate::table::Rows;
-
-/// Somewhere to run one piece of work per part, which is the thread lease of whoever is reading.
-///
-/// This crate is under the pipeline layer and has no threads to hand out, and reading a part of a
-/// column is the most parallel work there is: a part depends on no other part and nothing is written
-/// but that part's own slot. So a caller that does have threads passes them in as this, and a caller
-/// that does not gets [`serially`], which is what [`Parent::column`] uses.
-///
-/// The contract is that every index below `count` is run exactly once and that all of them have
-/// finished when this returns. How they are shared out is the caller's business, and the caller with
-/// threads does it off a counter rather than by dealing ranges in advance, because the parts of a
-/// real table are not the same size.
-pub type Spread<'a> = dyn Fn(usize, &(dyn Fn(usize) + Sync)) -> Result<()> + 'a;
-
-/// Every piece on the calling thread, in order.
-///
-/// # Errors
-///
-/// Never. The signature is [`Spread`]'s, and a caller with threads to lend has a thread that can
-/// panic and so has something to report.
-pub fn serially(count: usize, task: &(dyn Fn(usize) + Sync)) -> Result<()> {
-    for at in 0..count {
-        task(at);
-    }
-    Ok(())
-}
 
 /// The projected columns of one table, each held whole, each read at most once.
 ///
@@ -224,7 +198,11 @@ impl Parent {
         if over.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let Some(whole) = concat(ty, &pieces)? else {
+        // On the same threads, because laying the parts end to end is a copy of every byte of the
+        // column and it happens in the same place the reads do, with the pipeline stopped. On the
+        // string column of q12's parent projection it measured as large as the parallel part reads
+        // it follows, 18 to 73 ms against 27 to 84 ms.
+        let Some(whole) = concat_on(ty, &pieces, spread)? else {
             return Ok(None);
         };
         // Measured again on the result, because laying the pieces end to end is where a string

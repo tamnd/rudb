@@ -27,7 +27,7 @@ pub use catalog::{Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, 
 pub use held::Held;
 pub use mirror::{FileStamp, MIRROR_CATALOG};
 pub use name::{QualifiedName, same_name};
-pub use parent::{Parent, Spread, serially};
+pub use parent::Parent;
 pub use rudb_native::StoredPart;
 pub use system::{INFORMATION_SCHEMA, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG};
 pub use table::{Rows, Table, duplicate_check};
