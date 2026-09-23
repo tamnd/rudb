@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::time::Instant;
 
 use rudb_bind::{Bound, Parameters};
@@ -1375,6 +1377,9 @@ struct NativePlace {
     chunk: u64,
     held: Vec<((u64, u64), Chunk)>,
     started: Option<Span>,
+    /// The share of [`HELD_BYTES`] the stripe being gathered took when it started, given back once
+    /// its rows are encoded, or when the instance is dropped because the load failed.
+    share: Option<RowShare>,
     inside_wall: u64,
     inside_cpu: u64,
     rows: u64,
@@ -1419,6 +1424,91 @@ fn declared(
 /// GiB, so this is the middle one: the file size and query speed of a full stripe at half its peak.
 const GATHER_ROWS: usize = 131_072;
 
+/// What the rows the instances of one load are holding may come to between them, in bytes.
+///
+/// An instance holds a stripe of rows until it has gathered all of it and encoded it, and a stripe
+/// of `hits` is a hundred megabytes of rows. Thirty two instances each holding one was 3.4 GB
+/// resident on the 32 core box before the allocator kept anything, against the 2 GiB the whole
+/// load is meant to fit in. So an instance asks for a share of this before it starts a stripe and
+/// waits when there is not enough, which is `04-the-bulk-path.md` section 4.10's answer to a load
+/// that is short of memory: fewer workers at once, not an allocation that fails halfway. The
+/// instances that are running encode with the cores the waiting ones are not using, because a
+/// stripe's columns are spread over as many threads as there are cores free.
+const HELD_BYTES: usize = 1 << 30;
+
+/// How many stripes may start before any has finished and said how large a stripe is.
+const FIRST_STRIPES: usize = 8;
+
+/// The rows the instances of one load are holding, counted so that they stay under [`HELD_BYTES`].
+///
+/// A stripe is charged what the largest stripe so far came to, because its own size is not known
+/// until it has been gathered, and a table's stripes are close to one another in size. Until a
+/// stripe has finished there is nothing to go on, so the first ones are charged an even share of
+/// the budget between [`FIRST_STRIPES`].
+///
+/// An instance that holds no share never waits for one it could have given back itself, and one that
+/// holds a share never waits on one that does not, so the wait always ends.
+#[derive(Debug)]
+struct Gathering {
+    budget: usize,
+    counts: Mutex<GatheringCounts>,
+    freed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GatheringCounts {
+    charged: usize,
+    open: usize,
+    largest: usize,
+}
+
+impl Gathering {
+    fn new(budget: usize) -> Arc<Self> {
+        Arc::new(Self {
+            budget,
+            counts: Mutex::new(GatheringCounts::default()),
+            freed: Condvar::new(),
+        })
+    }
+
+    /// Waits until there is room for one more stripe, and charges it. A stripe is always let in
+    /// when no other is open, so a budget smaller than one stripe still loads, one stripe at a time.
+    fn share(self: &Arc<Self>) -> RowShare {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let charge =
+                if counts.largest == 0 { self.budget / FIRST_STRIPES } else { counts.largest };
+            if counts.open == 0 || counts.charged.saturating_add(charge) <= self.budget {
+                counts.open += 1;
+                counts.charged += charge;
+                return RowShare { gathering: Arc::clone(self), charge, gathered: 0 };
+            }
+            counts = self.freed.wait(counts).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// One stripe's charge against [`Gathering`], given back when it is dropped.
+#[derive(Debug)]
+struct RowShare {
+    gathering: Arc<Gathering>,
+    charge: usize,
+    /// What the stripe's rows came to, once they have all been gathered, so the next stripe is
+    /// charged what this one really cost. Zero for a stripe that never got that far.
+    gathered: usize,
+}
+
+impl Drop for RowShare {
+    fn drop(&mut self) {
+        let mut counts = self.gathering.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.open -= 1;
+        counts.charged -= self.charge;
+        counts.largest = counts.largest.max(self.gathered);
+        drop(counts);
+        self.gathering.freed.notify_all();
+    }
+}
+
 /// The root of a file-backed initial insert.
 #[derive(Debug)]
 struct NativeSink {
@@ -1435,6 +1525,7 @@ struct NativeSink {
     table: String,
     fields: Vec<Field>,
     profile: Arc<LoadProfile>,
+    gathering: Arc<Gathering>,
 }
 
 impl NativeSink {
@@ -1460,6 +1551,7 @@ impl NativeSink {
             table: name,
             fields,
             profile,
+            gathering: Gathering::new(HELD_BYTES),
         })
     }
 
@@ -1483,6 +1575,7 @@ impl NativeSink {
             table: name,
             fields,
             profile,
+            gathering: Gathering::new(HELD_BYTES),
         })
     }
 
@@ -1505,9 +1598,10 @@ impl NativeSink {
             return Ok(());
         }
         let parts = std::mem::take(&mut place.held);
-        place.bytes = parts
-            .iter()
-            .fold(place.bytes, |bytes, (_, chunk)| bytes.saturating_add(chunk.footprint() as u64));
+        let gathered =
+            parts.iter().fold(0_usize, |bytes, (_, chunk)| bytes.saturating_add(chunk.footprint()));
+        place.bytes = place.bytes.saturating_add(gathered as u64);
+        let mut share = place.share.take();
         // Once a stripe, so both clocks. The waits for the lock are write waits: they are the time
         // one instance spent while another was merging or writing its stripe, which is the cost of
         // the writer being one file behind one lock.
@@ -1517,6 +1611,12 @@ impl NativeSink {
         // what lets thirty two instances encode at once rather than one at a time.
         let inside = Span::start();
         let appended = self.preparer.prepare(parts).and_then(|prepared| {
+            // The rows are gone once the stripe is prepared, and what it carries on to the lock is
+            // its pages, so this is where its share goes back.
+            if let Some(share) = share.as_mut() {
+                share.gathered = gathered;
+            }
+            drop(share.take());
             let merged = self.locked(|writer| writer.merge(prepared))?;
             let paged = merged.pages()?;
             self.locked(|writer| writer.write(paged))
@@ -1575,6 +1675,14 @@ impl Sink for NativeSink {
             }
         }
         place.start();
+        if place.share.is_none() {
+            let waiting = Instant::now();
+            place.share = Some(self.gathering.share());
+            // Charged as a wait and taken off the instance's convert time, which is for the scan.
+            let waited = elapsed_ns(waiting);
+            self.profile.waited(Stage::Convert, waited);
+            place.inside_wall = place.inside_wall.saturating_add(waited);
+        }
         place.rows = place.rows.saturating_add(chunk.len() as u64);
         place.held.push(((place.morsel, place.chunk), chunk.clone()));
         place.chunk = place.chunk.saturating_add(1);
