@@ -100,6 +100,14 @@ const MAX_PAGE: usize = 256 * 1024 * 1024;
 const MAX_DIRECTORY: usize = 128 * 1024 * 1024;
 const FREQUENCIES_V2: &[u8; 8] = b"RUDBFQ2\0";
 const FREQUENCIES: &[u8; 8] = b"RUDBFQ3\0";
+/// Inline spellings for string entries in the bounded frequency synopsis.
+///
+/// A planner usually asks about one literal such as the empty string. Without this block it opens
+/// a multi-million-value global dictionary and visits the payload blocks of every retained entry
+/// merely to compare that literal with at most 512 heavy hitters. The spellings are already in
+/// memory while the writer sorts the dictionary, so storing this bounded copy makes planning a
+/// directory read and leaves the dictionary unopened.
+const FREQUENCY_TEXTS: &[u8; 8] = b"RUDBFT1\0";
 /// Exact leading counts for a bounded pair of dictionary-backed grouping keys.
 ///
 /// This is a separate optional directory block rather than another frequency format. Readers that
@@ -150,6 +158,11 @@ const FREQUENCY_ENTRIES: usize = 512;
 const FREQUENCY_BUILD_RANK: usize = 10;
 const FREQUENCY_ORDINALS: usize = 131_072;
 const MAX_PAIR_FREQUENCIES: usize = 1024;
+/// The most exact heavy-hitter text one column may copy into the directory.
+///
+/// A column with unusually large leading values keeps the old code-only synopsis instead. The
+/// optimization must never turn a valid load into a directory-size failure.
+const FREQUENCY_TEXT_BUDGET: usize = 1024 * 1024;
 /// The most threads the two per column passes at the end of a commit are spread over.
 ///
 /// A table like `hits` has ninety numeric columns, so on a machine with more cores than this the
@@ -699,6 +712,11 @@ pub struct Table {
     dictionary_payloads: Vec<u64>,
     frequencies: Vec<Option<Frequencies>>,
     pair_frequencies: Vec<PairFrequencySummary>,
+    /// String spellings aligned with each column's frequency entries.
+    ///
+    /// Empty for files written before `RUDBFT1`. A `None` entry is the null frequency entry; every
+    /// code entry in a column named by the block has its exact bytes here.
+    frequency_texts: Vec<Vec<Option<Vec<u8>>>>,
     /// How many distinct values each column holds, for the columns that know.
     ///
     /// A dictionary entry is made the first time a value is seen and nothing ever removes one, so
@@ -1036,6 +1054,9 @@ struct Placed {
     hash: u64,
 }
 
+/// Sorted `(head, code)` entries and the decoded bytes and block bases they were sorted over.
+type RankedDictionary = (Vec<(u64, u32)>, Vec<u8>, Vec<u64>);
+
 impl GlobalDictionary {
     fn new() -> Self {
         Self {
@@ -1247,7 +1268,7 @@ impl GlobalDictionary {
     /// The heads are kept because a reader searching this order wants a comparison it can make out
     /// of the index alone. What they buy there depends entirely on the column and is much less than
     /// it looks on the columns that cost the most, which [`sort_by_value`] measures.
-    fn ranked(&self, file: Option<&File>) -> Result<Vec<(u64, u32)>> {
+    fn ranked_with_values(&self, file: Option<&File>) -> Result<RankedDictionary> {
         let (flat, bases) = self.decoded(file)?;
         let value = |code: u32| {
             let (from, to) = Self::value_span(&self.ends, &bases, code as usize);
@@ -1255,7 +1276,13 @@ impl GlobalDictionary {
         };
         let mut codes = (0..self.values() as u32).collect::<Vec<_>>();
         sort_by_value(&mut codes, value);
-        Ok(codes.into_iter().map(|code| (head(value(code)), code)).collect())
+        let order = codes.into_iter().map(|code| (head(value(code)), code)).collect();
+        Ok((order, flat, bases))
+    }
+
+    #[cfg(test)]
+    fn ranked(&self, file: Option<&File>) -> Result<Vec<(u64, u32)>> {
+        self.ranked_with_values(file).map(|(order, _, _)| order)
     }
 
     fn observe(&mut self, code: u32, null: bool) -> Result<()> {
@@ -1497,6 +1524,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 pair_frequencies: Vec::new(),
+                frequency_texts: Vec::new(),
                 clustering: None,
                 generation,
                 sections: Vec::new(),
@@ -1548,6 +1576,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 pair_frequencies: Vec::new(),
+                frequency_texts: Vec::new(),
                 clustering: None,
                 generation: 1,
                 sections: Vec::new(),
@@ -1650,6 +1679,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 pair_frequencies: Vec::new(),
+                frequency_texts: Vec::new(),
                 clustering: None,
                 generation,
                 sections: Vec::new(),
@@ -2638,19 +2668,24 @@ impl Writer {
         self.table.pair_frequencies = self.pair_frequencies()?;
         let dictionaries = std::mem::take(&mut self.dictionaries);
         self.table.dictionary_payloads = vec![0; self.table.fields.len()];
+        self.table.frequency_texts = vec![Vec::new(); self.table.fields.len()];
         // One column at a time, and every column's values dropped before the next column's are read
         // back. Sorting the columns across threads is the obvious thing and was what this did, but
         // sorting a column now means decoding it, and five ClickBench string columns decoded at once
         // is the peak this change is about.
         for (index, dictionary) in dictionaries.into_iter().enumerate() {
             let Some(dictionary) = dictionary else { continue };
-            let order = dictionary.ranked(Some(&self.file))?;
+            let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
             // A code nothing counted is a code no non-null row of this column holds, which is the
             // empty string a null was written as and nothing else, because a code is only ever made
             // by a row asking for one.
             self.table.distincts[index] =
                 Some(dictionary.counts.iter().filter(|count| **count != 0).count() as u64);
-            self.table.frequencies[index] = Some(Frequencies::Held(code_frequency(&dictionary)));
+            let (frequencies, texts) = code_frequency(&dictionary, &flat, &bases)?;
+            self.table.frequencies[index] = Some(Frequencies::Held(frequencies));
+            self.table.frequency_texts[index] = texts;
+            drop(flat);
+            drop(bases);
             let encoded = encode_global_dictionary(&dictionary, &order, &dictionary.placed, true)?;
             drop(order);
             let offset = self.at;
@@ -4665,7 +4700,15 @@ impl Reader {
         ty: &LogicalType,
         entries: &[FrequencyEntry],
     ) -> Result<Vec<(Value, u64)>> {
-        let dictionary = if *ty == LogicalType::Varchar { self.dictionary(column)? } else { None };
+        let stored_texts = self.table.frequency_texts.get(column).filter(|texts| !texts.is_empty());
+        if stored_texts.is_some_and(|texts| texts.len() != entries.len()) {
+            return Err(invalid("frequency text count differs from its synopsis"));
+        }
+        let dictionary = if *ty == LogicalType::Varchar && stored_texts.is_none() {
+            self.dictionary(column)?
+        } else {
+            None
+        };
         let mut codes = entries
             .iter()
             .filter_map(|entry| match entry.value {
@@ -4680,9 +4723,14 @@ impl Reader {
             _ => Vec::new(),
         };
         let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
+        for (entry_at, entry) in entries.iter().enumerate() {
             let value = match entry.value {
-                FrequencyValue::Null => Value::Null,
+                FrequencyValue::Null => {
+                    if stored_texts.and_then(|texts| texts[entry_at].as_ref()).is_some() {
+                        return Err(invalid("a null frequency entry has text"));
+                    }
+                    Value::Null
+                }
                 FrequencyValue::Integer(value) => match *ty {
                     LogicalType::TinyInt => Value::TinyInt(
                         i8::try_from(value)
@@ -4727,13 +4775,20 @@ impl Reader {
                     _ => return Err(invalid("integer frequency belongs to another type")),
                 },
                 FrequencyValue::Code(code) => {
-                    if dictionary.is_none() {
-                        return Err(invalid("frequency code has no dictionary"));
+                    if let Some(text) = stored_texts.and_then(|texts| texts[entry_at].as_ref()) {
+                        Value::Varchar(
+                            String::from_utf8(text.clone())
+                                .map_err(|_| invalid("frequency text is not UTF-8"))?,
+                        )
+                    } else {
+                        if dictionary.is_none() {
+                            return Err(invalid("frequency code has no dictionary or stored text"));
+                        }
+                        let at = codes
+                            .binary_search(&(code as usize))
+                            .map_err(|_| invalid("frequency code was not among the codes read"))?;
+                        texts[at].clone()
                     }
-                    let at = codes
-                        .binary_search(&(code as usize))
-                        .map_err(|_| invalid("frequency code was not among the codes read"))?;
-                    texts[at].clone()
                 }
             };
             out.push((value, entry.count));
@@ -5676,7 +5731,11 @@ fn keep_most_frequent(entries: &mut Vec<FrequencyEntry>) -> u64 {
     omitted_max
 }
 
-fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
+fn code_frequency(
+    dictionary: &GlobalDictionary,
+    flat: &[u8],
+    bases: &[u64],
+) -> Result<(FrequencySummary, Vec<Option<Vec<u8>>>)> {
     let mut entries = dictionary
         .counts
         .iter()
@@ -5688,7 +5747,36 @@ fn code_frequency(dictionary: &GlobalDictionary) -> FrequencySummary {
         entries.push(FrequencyEntry { value: FrequencyValue::Null, count: dictionary.nulls });
     }
     let omitted_max = keep_most_frequent(&mut entries);
-    FrequencySummary { entries, omitted_max, ordinals: Vec::new(), ordinal_entries: Vec::new() }
+    let mut spans = Vec::with_capacity(entries.len());
+    let mut text_bytes = 0_usize;
+    for entry in &entries {
+        let span = match entry.value {
+            FrequencyValue::Code(code) => {
+                let span = GlobalDictionary::value_span(&dictionary.ends, bases, code as usize);
+                let bytes = flat
+                    .get(span.0..span.1)
+                    .ok_or_else(|| invalid("a frequency code is outside its dictionary"))?;
+                text_bytes = text_bytes.saturating_add(bytes.len());
+                Some(span)
+            }
+            FrequencyValue::Null | FrequencyValue::Integer(_) => None,
+        };
+        spans.push(span);
+    }
+    let texts = if text_bytes > FREQUENCY_TEXT_BUDGET {
+        Vec::new()
+    } else {
+        spans.into_iter().map(|span| span.map(|(from, to)| flat[from..to].to_vec())).collect()
+    };
+    Ok((
+        FrequencySummary {
+            entries,
+            omitted_max,
+            ordinals: Vec::new(),
+            ordinal_entries: Vec::new(),
+        },
+        texts,
+    ))
 }
 
 fn encode_directory(table: &Table) -> Result<Vec<u8>> {
@@ -5890,6 +5978,43 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                     }
                 }
                 put_u64(&mut out, entry.count);
+            }
+        }
+    }
+    let text_columns = table.frequency_texts.iter().filter(|texts| !texts.is_empty()).count();
+    if text_columns != 0 {
+        out.extend_from_slice(FREQUENCY_TEXTS);
+        put_u16(
+            &mut out,
+            u16::try_from(text_columns)
+                .map_err(|_| invalid("too many string frequency columns"))?,
+        );
+        for (column, texts) in table.frequency_texts.iter().enumerate() {
+            if texts.is_empty() {
+                continue;
+            }
+            put_u16(
+                &mut out,
+                u16::try_from(column).map_err(|_| invalid("frequency text column overflows"))?,
+            );
+            put_u16(
+                &mut out,
+                u16::try_from(texts.len())
+                    .map_err(|_| invalid("too many frequency text entries"))?,
+            );
+            for text in texts {
+                match text {
+                    None => out.push(0),
+                    Some(text) => {
+                        out.push(1);
+                        put_u32(
+                            &mut out,
+                            u32::try_from(text.len())
+                                .map_err(|_| invalid("frequency text is too long"))?,
+                        );
+                        out.extend_from_slice(text);
+                    }
+                }
             }
         }
     }
@@ -6591,6 +6716,8 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut sections = Vec::new();
     let mut pair_frequencies = Vec::new();
     let mut seen_pair_frequencies = false;
+    let mut frequency_texts = vec![Vec::new(); width];
+    let mut seen_frequency_texts = false;
     let mut seen_sections = false;
     let mut dictionary_payloads = Vec::new();
     let mut seen_payloads = false;
@@ -6659,6 +6786,46 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                     return Err(invalid("pair frequency entries are not descending"));
                 }
                 pair_frequencies.push(PairFrequencySummary { first, second, entries, omitted_max });
+            }
+        } else if &tag == FREQUENCY_TEXTS {
+            if seen_frequency_texts {
+                return Err(invalid("directory names two frequency text blocks"));
+            }
+            seen_frequency_texts = true;
+            let columns = cur.u16()? as usize;
+            if columns > width {
+                return Err(invalid("frequency text column count exceeds the schema"));
+            }
+            for _ in 0..columns {
+                let column = cur.u16()? as usize;
+                if !frequency_texts.get(column).is_some_and(Vec::is_empty) {
+                    return Err(invalid("frequency text column is repeated or out of range"));
+                }
+                if !matches!(fields.get(column), Some(field) if field.ty == LogicalType::Varchar)
+                    || dictionaries.get(column).copied().flatten().is_none()
+                    || frequencies.get(column).and_then(Option::as_ref).is_none()
+                {
+                    return Err(invalid("frequency texts belong to a non-string synopsis"));
+                }
+                let count = cur.u16()? as usize;
+                if count == 0 || count != entry_counts[column] {
+                    return Err(invalid("frequency text count differs from its synopsis"));
+                }
+                let mut texts = Vec::with_capacity(count);
+                for _ in 0..count {
+                    texts.push(match cur.u8()? {
+                        0 => None,
+                        1 => {
+                            let length = cur.u32()? as usize;
+                            let bytes = cur.take(length)?.to_vec();
+                            std::str::from_utf8(&bytes)
+                                .map_err(|_| invalid("frequency text is not UTF-8"))?;
+                            Some(bytes)
+                        }
+                        _ => return Err(invalid("frequency text tag differs")),
+                    });
+                }
+                frequency_texts[column] = texts;
             }
         } else if &tag == CLUSTERING {
             if clustering.is_some() {
@@ -6740,6 +6907,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         distincts,
         frequencies,
         pair_frequencies,
+        frequency_texts,
         clustering,
         generation,
         sections,
@@ -8986,6 +9154,49 @@ mod tests {
         fs::remove_file(&path).expect("clean up");
     }
 
+    #[test]
+    fn string_frequency_estimates_do_not_open_the_global_dictionary() {
+        let path = path("string_frequencies_for_the_planner");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        let rows = Chunk::new(vec![
+            Vector::from_values(
+                LogicalType::Varchar,
+                &[
+                    Value::Varchar(String::new()),
+                    Value::Varchar("alpha".into()),
+                    Value::Varchar(String::new()),
+                    Value::Varchar("beta".into()),
+                    Value::Varchar(String::new()),
+                ],
+            )
+            .expect("strings"),
+        ])
+        .expect("one column");
+        writer.append(&rows).expect("the only part");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        assert_eq!(reader.reads().dictionaries, 0, "open reads only the directory");
+        let common = Common::new(reader.clone());
+        let column = common.column("text").expect("the file has that column");
+        assert_eq!(
+            common.rows_with(column, &Bound::Bytes(Vec::new())),
+            Stat::exact(3, Provenance::FrequencySynopsis)
+        );
+        assert_eq!(
+            common.rows_with(column, &Bound::Bytes(b"missing".to_vec())),
+            Stat::exact(0, Provenance::FrequencySynopsis)
+        );
+        assert_eq!(
+            reader.reads().dictionaries,
+            0,
+            "the bounded spellings answer without opening the dictionary index"
+        );
+        fs::remove_file(&path).expect("clean up");
+    }
+
     /// A table directory with nothing in it but a name and one column, for the section tests.
     ///
     /// The section table is orthogonal to everything else in a directory, so the tests that pin it
@@ -9001,6 +9212,7 @@ mod tests {
             distincts: vec![None],
             frequencies: vec![None],
             pair_frequencies: Vec::new(),
+            frequency_texts: Vec::new(),
             clustering: None,
             generation: 1,
             sections,
@@ -11922,6 +12134,7 @@ mod tests {
             distincts: vec![None],
             frequencies: vec![None],
             pair_frequencies: Vec::new(),
+            frequency_texts: Vec::new(),
             clustering: None,
             generation: 1,
             sections: Vec::new(),
