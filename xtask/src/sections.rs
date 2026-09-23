@@ -314,12 +314,12 @@ fn answer(database: &Database, sql: &str, on: bool) -> (Result<Vec<String>, Stri
 /// Counted off the plan text, which is what section 6.7 put the word there for. A count and not a
 /// yes or no, because a query that reads one link out of five joins and a query that reads all five
 /// are different amounts of evidence and the table should say which one this was.
-fn link_joins(database: &Database, sql: &str) -> usize {
+pub(crate) fn link_joins(database: &Database, sql: &str) -> usize {
     plan(database, sql).matches("LinkJoin").count()
 }
 
 /// The plan text with the sections on, or nothing if the query does not plan.
-fn plan(database: &Database, sql: &str) -> String {
+pub(crate) fn plan(database: &Database, sql: &str) -> String {
     if database.execute("SET graph_sections = 'on'").is_err() {
         return String::new();
     }
@@ -331,7 +331,7 @@ fn plan(database: &Database, sql: &str) -> String {
 }
 
 /// The eight tables out of the directory, the relationships declared, and the whole thing written.
-fn load(data: &Path, path: &Path, cache: Option<u64>) -> Result<Database, String> {
+pub(crate) fn load(data: &Path, path: &Path, cache: Option<u64>) -> Result<Database, String> {
     let database =
         Database::open(path.to_str().ok_or("the scratch path is not UTF-8")?).map_err(say)?;
     for table in TABLES {
@@ -360,7 +360,7 @@ fn load(data: &Path, path: &Path, cache: Option<u64>) -> Result<Database, String
 }
 
 /// The queries, in file order, as `name` and `sql`.
-fn queries(root: &Path) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn queries(root: &Path) -> Result<Vec<(String, String)>, String> {
     let path = root.join("crates").join("rudb").join("testdata").join("tpch.sql");
     let text =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -387,7 +387,7 @@ fn queries(root: &Path) -> Result<Vec<(String, String)>, String> {
 }
 
 /// A scratch file beside the other temporary files, named so two runs at once do not collide.
-fn scratch() -> PathBuf {
+pub(crate) fn scratch() -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
@@ -395,6 +395,6 @@ fn scratch() -> PathBuf {
 }
 
 /// An engine error as a line.
-fn say(error: rudb_common::Error) -> String {
+pub(crate) fn say(error: rudb_common::Error) -> String {
     error.to_string()
 }

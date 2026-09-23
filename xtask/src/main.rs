@@ -27,6 +27,7 @@ mod graph;
 mod io;
 mod kernels;
 mod layers;
+mod linkjoin;
 mod native;
 mod parquet;
 mod rids;
@@ -112,6 +113,9 @@ fn main() -> ExitCode {
         // with a setting flipped, and the reference is the run that reads nothing the graph layer
         // wrote.
         Some("sections") => sections::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
+        // The same corpus with the hash join forced as the control, which is claim C3 of
+        // `spec/graph/09-measurement.md`: the link join against the choice it was preferred over.
+        Some("linkjoin") => linkjoin::run(&root(), &std::env::args().skip(2).collect::<Vec<_>>()),
         // The forty three ClickBench queries once per statistics rule with that rule off, which is
         // the per rule table `spec/stats/09-measurement.md` section 9.4 asks every milestone for.
         // The same idea as `sections` above with the other set of switches, and separate from it
@@ -205,6 +209,15 @@ fn usage() {
     println!("           a green over a run where the layer never fired is a green that says");
     println!("           nothing, and the cache bytes is how a scale factor small enough to");
     println!("           generate quickly is pushed off the crossover of section 6.4");
+    println!("  linkjoin <dir> [repeats]  the same twenty two queries with the link join and then");
+    println!(
+        "           with `disabled_optimizers = 'link_join'` forcing the hash join, per query,"
+    );
+    println!("           which is claim C3 of spec/graph/09-measurement.md. only the queries that");
+    println!(
+        "           planned a link join are evidence, and the ones that did not are timed too"
+    );
+    println!("           because between them they say what the machine was doing meanwhile");
     println!("  ablate <hits.parquet> [repeats]  the forty three ClickBench queries once with");
     println!("           every statistics rule on and once per rule with that rule off, which is");
     println!("           the per rule table of spec/stats/09-measurement.md section 9.4. the file");
