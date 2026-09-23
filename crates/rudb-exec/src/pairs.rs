@@ -236,6 +236,11 @@ impl Run {
         }
         self.rows.truncate(kept);
         self.validity.truncate(kept);
+        // A run that folded away less than a quarter would fill again within a few pushes and be
+        // walked again, so it grows instead, and the next compaction waits for twice as many.
+        if kept * 4 > len * 3 {
+            self.rows.reserve(len);
+        }
     }
 
     fn valid_at(&self, row: usize) -> bool {
