@@ -322,6 +322,24 @@ impl Data {
         }
     }
 
+    /// The signed integers at the rows `at` names among the first `len`, widened to `i64`,
+    /// appended to `out`.
+    ///
+    /// The gathered form of [`Self::signed_block`], for the rows a filter kept. Widening the whole
+    /// run and then picking the kept rows out of it is a pass over every row and a second over the
+    /// kept ones, where this is the one pass. `false`, leaving `out` as it found it, where
+    /// [`Self::signed_block`] says `false`, and for a row that is not among the first `len`.
+    #[must_use]
+    pub fn signed_gather(&self, len: usize, at: &[u32], out: &mut Vec<i64>) -> bool {
+        match self {
+            Self::Int8(v) => gather_widened(v.as_slice(), len, at, out),
+            Self::Int16(v) => gather_widened(v.as_slice(), len, at, out),
+            Self::Int32(v) => gather_widened(v.as_slice(), len, at, out),
+            Self::Int64(v) => gather_widened(v.as_slice(), len, at, out),
+            _ => false,
+        }
+    }
+
     /// An unsigned integer at `index`, widened.
     #[must_use]
     pub fn unsigned_at(&self, index: usize) -> Option<u128> {
@@ -2596,6 +2614,20 @@ impl Vector {
         }
     }
 
+    /// The rows `at` names, read as signed integers, widened and written into `out`.
+    ///
+    /// The gathered form of [`Self::signed_block`] for a flat vector, which is what a filter's
+    /// selection over a flat integer column wants. `false`, with `out` cleared, for every other
+    /// form and for a row past the end, and the caller then goes the way it went before.
+    #[must_use]
+    pub fn signed_gather(&self, at: &[u32], out: &mut Vec<i64>) -> bool {
+        out.clear();
+        match &self.body {
+            Body::Flat(data) => data.signed_gather(self.len, at, out),
+            _ => false,
+        }
+    }
+
     /// Every signed value in order, widened to `i64`, written into `out`.
     ///
     /// The bulk form of [`Self::signed_at`], for a caller that is going to read the whole vector
@@ -3619,6 +3651,24 @@ fn widen<T: Copy + Into<i64>>(run: &[T], len: usize, out: &mut Vec<i64>) -> bool
         }
         None => false,
     }
+}
+
+/// The rows `at` of the first `len` of `run`, widened, appended to `out`. The range is checked
+/// with a maximum first, because a maximum vectorizes and a check on every read would not.
+fn gather_widened<T: Copy + Into<i64>>(
+    run: &[T],
+    len: usize,
+    at: &[u32],
+    out: &mut Vec<i64>,
+) -> bool {
+    let Some(run) = run.get(..len) else {
+        return false;
+    };
+    if at.iter().max().is_some_and(|&top| top as usize >= run.len()) {
+        return false;
+    }
+    out.extend(at.iter().map(|&row| run[row as usize].into()));
+    true
 }
 
 /// One holder's share of a part that several vectors are reading at the same time.
@@ -5702,6 +5752,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The gathered form reads what the row at a time accessor reads at the rows it is given, and
+    /// refuses a row past the end and a vector that is not flat, leaving nothing behind.
+    #[test]
+    fn a_gather_of_signed_integers_holds_what_the_row_at_a_time_accessor_hands_back() {
+        let mut out = Vec::new();
+        let at = [0, 2, 2, 3];
+        let shapes = [
+            integers(&[7, -3, 0, 2]),
+            Vector::flat(LogicalType::Integer, Data::Int32(vec![5, -6, 7, -8].into())).unwrap(),
+            Vector::flat(LogicalType::TinyInt, Data::Int8(vec![-128, 127, 1, 0].into())).unwrap(),
+        ];
+        for column in &shapes {
+            assert!(column.signed_gather(&at, &mut out), "{:?} is gathered", column.logical_type());
+            let wanted: Vec<i64> = at
+                .iter()
+                .map(|&row| i64::try_from(column.signed_at(row as usize).unwrap()).unwrap())
+                .collect();
+            assert_eq!(out, wanted);
+        }
+        let short = integers(&[1, 2, 3]);
+        assert!(!short.signed_gather(&at, &mut out), "row 3 is past the end");
+        assert!(out.is_empty());
+        assert!(!Vector::sequence(100, 5, 4).signed_gather(&at, &mut out));
+        assert!(integers(&[1]).signed_gather(&[], &mut out) && out.is_empty());
     }
 
     /// What the block form will not answer for, where the caller reads the vector a row at a time
