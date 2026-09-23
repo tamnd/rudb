@@ -498,6 +498,68 @@ impl Preparer {
     }
 }
 
+/// One column of a stripe on its way through [`Writer::merge_held`], with the parts of the writer
+/// that column owns.
+struct Step<'a> {
+    index: usize,
+    column: Column,
+    dictionary: &'a mut Option<GlobalDictionary>,
+    /// The column's statistics so far and the stripe's, when the column keeps statistics.
+    gather: Option<(&'a mut stats::Gather, stats::Gather)>,
+}
+
+impl Step<'_> {
+    /// Roughly what the merge costs: a hash a distinct value when there is a global dictionary to
+    /// merge into, and next to nothing otherwise.
+    fn cost(&self) -> usize {
+        match (&self.column, self.dictionary.as_ref()) {
+            (Column::Coded(local), Some(_)) => local.values().saturating_add(1),
+            _ => 0,
+        }
+    }
+
+    /// Merges the column, settles its dictionary's shape and hands out the blocks it filled.
+    fn run(self, rows: usize, coded: &[AtomicBool]) -> Result<(usize, Merge, Vec<Unencoded>)> {
+        let Self { index, column, dictionary, gather } = self;
+        if let Some((mine, stripe)) = gather {
+            mine.absorb(stripe);
+        }
+        let merge = match (column, dictionary.as_mut()) {
+            (Column::Pages(stripe), None) => Merge::Pages(stripe),
+            (Column::Pages(_), Some(_)) => {
+                return Err(Error::internal(
+                    "a column with a global dictionary was prepared without one",
+                ));
+            }
+            (Column::Coded(local), None) => Merge::Plain(local),
+            (Column::Coded(local), Some(global)) => {
+                // Empty means nothing has been merged into it yet, so this is the column's first
+                // stripe and the only one the decision is allowed to be made on.
+                if global.values() == 0 && drops_dictionary(rows, local.values()) {
+                    *dictionary = None;
+                    coded[index].store(false, Atomic::Relaxed);
+                    Merge::Plain(local)
+                } else {
+                    let global = local.merge_into(global)?;
+                    Merge::Codes { parts: local.parts, global }
+                }
+            }
+        };
+        // Settled here rather than when the stripe is written, so that the blocks this merge
+        // filled go out with it already knowing their shape. A column still too small to settle
+        // one keeps its blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them,
+        // because encoding them now would be encoding them without having looked at the column.
+        let blocks = match dictionary {
+            Some(dictionary) => {
+                dictionary.settle()?;
+                dictionary.hand_out(index)
+            }
+            None => Vec::new(),
+        };
+        Ok((index, merge, blocks))
+    }
+}
+
 impl Merged {
     /// Builds the pages the merge left to build, which is every column coded against a global
     /// dictionary and every column that lost one after the stripe was prepared, and encodes the
@@ -626,50 +688,78 @@ impl Writer {
     }
 
     /// [`Writer::merge`] for a stripe whose rows are already counted in.
+    ///
+    /// Every column is merged on its own, because nothing one column's merge reads or writes
+    /// belongs to another: its statistics, its global dictionary and its flag in `coded`. So the
+    /// columns are spread over threads, and the lock is held for the slowest column rather than for
+    /// all of them. On ClickBench `hits` the lock was busy 98% of a load and the merge was four
+    /// fifths of that, while two thirds of the machine waited for it. The answer is the same in any
+    /// order, because a column's merge only depends on the stripes merged into it before.
     pub(crate) fn merge_held(&mut self, prepared: Prepared) -> Result<Merged> {
         let Prepared { parts, columns, gathers, profile, .. } = prepared;
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
-        for (mine, stripe) in self.gathers.iter_mut().zip(gathers) {
-            if let (Some(mine), Some(stripe)) = (mine, stripe) {
-                mine.absorb(stripe);
-            }
-        }
         let rows: usize = parts.iter().map(|part| part.rows).sum();
-        let mut merged = Vec::with_capacity(columns.len());
-        for (index, column) in columns.into_iter().enumerate() {
-            let dictionary = &mut self.dictionaries[index];
-            merged.push(match (column, dictionary.as_mut()) {
-                (Column::Pages(stripe), None) => Merge::Pages(stripe),
-                (Column::Pages(_), Some(_)) => {
-                    return Err(Error::internal(
-                        "a column with a global dictionary was prepared without one",
-                    ));
-                }
-                (Column::Coded(local), None) => Merge::Plain(local),
-                (Column::Coded(local), Some(global)) => {
-                    // Empty means nothing has been merged into it yet, so this is the column's
-                    // first stripe and the only one the decision is allowed to be made on.
-                    if global.values() == 0 && drops_dictionary(rows, local.values()) {
-                        *dictionary = None;
-                        self.coded[index].store(false, Atomic::Relaxed);
-                        Merge::Plain(local)
-                    } else {
-                        let global = local.merge_into(global)?;
-                        Merge::Codes { parts: local.parts, global }
-                    }
-                }
-            });
+        let width = columns.len();
+        let coded = &self.coded;
+        let mut steps = columns
+            .into_iter()
+            .zip(gathers)
+            .zip(self.dictionaries.iter_mut().zip(self.gathers.iter_mut()))
+            .enumerate()
+            .map(|(index, ((column, stripe), (dictionary, mine)))| Step {
+                index,
+                column,
+                dictionary,
+                gather: mine.as_mut().zip(stripe),
+            })
+            .collect::<Vec<_>>();
+        // Taken from the back, so the biggest merges start first and the last one to finish is
+        // small, the same reason `fan_out` hands its jobs over cheapest first.
+        steps.sort_by_key(Step::cost);
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_ENCODE_WORKERS)
+            .min(steps.iter().filter(|step| step.cost() > 0).count())
+            .max(1);
+        let done = if workers <= 1 {
+            steps.into_iter().map(|step| step.run(rows, coded)).collect::<Result<Vec<_>>>()?
+        } else {
+            let queue = Mutex::new(steps);
+            let pieces = std::thread::scope(|scope| {
+                (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut mine = Vec::new();
+                            loop {
+                                let taken = queue
+                                    .lock()
+                                    .map_err(|_| Error::internal("a merge worker panicked"))?
+                                    .pop();
+                                let Some(step) = taken else { break };
+                                mine.push(step.run(rows, coded)?);
+                            }
+                            Ok(mine)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().map_err(|_| Error::internal("a merge worker panicked"))?
+                    })
+                    .collect::<Result<Vec<Vec<_>>>>()
+            })?;
+            pieces.into_iter().flatten().collect()
+        };
+        let mut slots: Vec<Option<(Merge, Vec<Unencoded>)>> = (0..width).map(|_| None).collect();
+        for (index, merge, blocks) in done {
+            slots[index] = Some((merge, blocks));
         }
-        // Settled here rather than when the stripe is written, so that the blocks this merge filled
-        // go out with it already knowing their shape. A column still too small to settle one keeps
-        // its blocks until it can, which is at most `PAYLOAD_SAMPLE_BLOCKS` of them, because
-        // encoding them now would be encoding them without having looked at the column.
+        let mut merged = Vec::with_capacity(width);
         let mut blocks = Vec::new();
-        for (index, dictionary) in self.dictionaries.iter_mut().enumerate() {
-            if let Some(dictionary) = dictionary {
-                dictionary.settle()?;
-                blocks.extend(dictionary.hand_out(index));
-            }
+        for slot in slots {
+            let (merge, handed) = slot.ok_or_else(|| Error::internal("a column was never merged"))?;
+            merged.push(merge);
+            blocks.extend(handed);
         }
         drop(timing);
         Ok(Merged { parts, columns: merged, blocks, profile })
