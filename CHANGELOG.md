@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.9
+
+A patch release of six pull requests, five of them on the sorted load of SF1 `lineitem` and one on memory for string statistics. The native directory format goes from 26 to 27, in #1398. This build reads 22 through 27, so it opens every file the last few releases wrote, but 0.4.8 does not read a file written by this one. The storage format version is unchanged at 9.
+
+The sort sink writes its normalized keys a column at a time with a typed loop per layout, in #1396, where it had asked every key column for a `Value` a row. Each thread sorts its own rows as it hands them over and the finish merges the sorted runs by splitters on every thread, in #1400, so the sort overlaps the scan and has no single threaded first cut. When the order is a few long ascending runs of the input, which a sort by ship month over rows in order key order is, the columns are written through the inverse of the order rather than read through it, in #1404, which reads each column once front to back instead of spending a cache line on every value. The zone ends of a string column held as views are found from the four byte prefixes in the views, in #1403, so the append reads the bytes only when a prefix ties. On the sorted SF1 `lineitem` CTAS at full width, #1400 took a busy machine from 1.46 to 1.61 s down to 1.25 to 1.28 s, #1403 took 30 to 45 ms off, and #1404 took the best of nine runs from 0.71 s to 0.63 s.
+
+The load writes each dictionary block into the file as soon as it is encoded, in #1398, so it no longer holds every encoded block until the table closes. Peak memory for the five dictionary columns of `hits` at eight million rows went down about a third. Reading a string frequency synopsis visits the dictionary blocks it needs once and keeps none of them, in #1397, which takes ClickBench q13 at ten million rows from 28 MiB to 18 MiB.
+
+Two approaches on the same load were measured and not merged, and the reasons are on #1380 and #1401: packing the payload into rows in the sink, and copying a string column a chunk at a time or pointing its views into many arenas.
+
 ## 0.4.8
 
 A patch release of twenty one pull requests. Most of it is speed: the TPC-H hash kernels and join probe, and the sort and append at the end of a load. Beside that are the first two pieces of the G5 semi join reduction and more of the D4 list surface. No format changes. The native directory format stays at 26 and the storage format version at 9, so this build and 0.4.7 read each other's files.
