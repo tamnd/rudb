@@ -464,10 +464,10 @@ fn a_grouped_count_over_a_complete_synopsis_keeps_the_null_group_the_rows_would(
 }
 
 #[test]
-fn a_numeric_column_has_no_dictionary_so_its_distinct_values_are_still_counted() {
+fn a_numeric_column_has_no_dictionary_and_its_distinct_values_are_counted_by_the_writer() {
     let pair = Pair::new("numeric", "SELECT i % 7 AS n FROM range(5000) r(i)");
     assert_eq!(pair.agree("SELECT COUNT(DISTINCT n) FROM t"), Value::BigInt(7));
-    assert!(!pair.summarised("SELECT COUNT(DISTINCT n) FROM t"), "a numeric column was summarised");
+    assert!(pair.summarised("SELECT COUNT(DISTINCT n) FROM t"), "the rows were grouped anyway");
 }
 
 #[test]
@@ -571,4 +571,25 @@ fn a_table_in_memory_reads_its_rows_for_what_a_zone_map_does_not_hold() {
     // asserting beside the two above so that the line between them is drawn by a test.
     assert!(pair.in_memory("SELECT MIN(s), MAX(s) FROM t"), "the strings were walked");
     assert_eq!(pair.agree("SELECT MAX(s) FROM t"), Value::Varchar("v9".to_owned()));
+}
+
+#[test]
+fn an_integer_columns_distinct_count_is_read_out_of_the_directory() {
+    // The numeric twin of the string count above, which document 31 found level with DuckDB while
+    // the string one was 165 times ahead. The writer counts the values on the frequency pass it
+    // already makes, so the file answers without the rows. The values cover what the set has to
+    // get right: a zero, which it keeps apart from its empty slots, negatives, which arrive as
+    // their two's complement bits, nulls, which are not a value, and enough distinct ones that the
+    // table in memory has outgrown its sketch and has to count the rows, so it is a real oracle.
+    let select = "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE (i % 7001) - 3500 END AS n, \
+         (i % 37)::SMALLINT AS s, i * 1000000007 AS w FROM range(40000) r(i)";
+    let pair = Pair::new("intdistinct", select);
+    for (query, wanted) in [
+        ("SELECT COUNT(DISTINCT n) FROM t", 7001),
+        ("SELECT COUNT(DISTINCT s) FROM t", 37),
+        ("SELECT COUNT(DISTINCT w) FROM t", 40000),
+    ] {
+        assert!(pair.summarised(query), "{query} read the rows");
+        assert_eq!(pair.agree(query), Value::BigInt(wanted), "{query} counted wrong");
+    }
 }
