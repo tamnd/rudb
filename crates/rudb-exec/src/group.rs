@@ -1421,6 +1421,7 @@ impl<'a> Aggregate<'a> {
             // group, which is the whole point of holding them here.
             coded_on: Vec::new(),
             coded_places: Vec::new(),
+            coded_values: Vec::new(),
             coded_map: Vec::new(),
             missing: Vec::new(),
             same: Vec::new(),
@@ -1475,6 +1476,7 @@ impl<'a> Aggregate<'a> {
             walk,
             coded_on,
             coded_places,
+            coded_values,
             coded_map,
             missing,
             same,
@@ -1525,7 +1527,7 @@ impl<'a> Aggregate<'a> {
             coded_on.clear();
             None
         } else {
-            crate::table::coded(keys, *length)
+            crate::table::coded_within(keys, *length, coded_on, Some(coded_values))
         };
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
@@ -3331,6 +3333,8 @@ pub(crate) struct Building {
     coded_map: Vec<usize>,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
     coded_places: Vec<usize>,
+    /// The values of each integer key column the map reads by value, widened, one run per column.
+    coded_values: Vec<Vec<i64>>,
     /// The rows of the last chunk the map had no slot for, in row order.
     missing: Vec<usize>,
     /// One flag per row of the last chunk, true where the row's key is the key of the row before.

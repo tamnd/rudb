@@ -832,6 +832,24 @@ enum Places<'a> {
         /// The run those rows are read out of.
         packed: Packed<'a>,
     },
+    /// An integer column read by its value, as the distance from the bottom of a window.
+    ///
+    /// The form for an integer key that has no small places of its own. `CounterID` takes four
+    /// thousand values between 17 and 262,029, which packs at eighteen bits, and that is too wide
+    /// for [`Self::Bits`] once a second column could multiply it. After a filter it is not packed at
+    /// all but copied out flat, and a flat column has nothing to read a place out of. Its values
+    /// still fall inside a window a quarter of a million wide, and a value minus the bottom of that
+    /// window is a place in the same way a code is.
+    ///
+    /// The window is the caller's rather than the page's, which is the other half of it. A page
+    /// packs against its own base, so a map held by base and width is thrown away at every page,
+    /// while a window is kept for as long as the chunks keep landing inside it.
+    Values {
+        /// This chunk's value per row, widened, and cut to the rows being asked about.
+        values: &'a [i64],
+        /// The value that takes place zero.
+        low: i64,
+    },
 }
 
 /// What a direct map's places were built from, so a chunk under different ones rebuilds it.
@@ -846,6 +864,8 @@ pub(crate) enum Origin {
     Dictionary(Arc<Vector>),
     /// A packed run's base and width, which are all a code needs in order to mean a value.
     Bits(i128, u32),
+    /// The bottom of a window of values and how many places it takes, the null place included.
+    Window(i64, usize),
 }
 
 /// One key column of a chunk, read as places into a map of every combination.
@@ -911,6 +931,16 @@ impl CodedColumn<'_> {
                         *place += code * stride;
                     }
                 }
+                Places::Values { values, low } => {
+                    for (row, place) in into.iter_mut().enumerate() {
+                        let code = if column.is_null_at(row) {
+                            nothing
+                        } else {
+                            values[row].wrapping_sub(low) as u64 as usize
+                        };
+                        *place += code * stride;
+                    }
+                }
             }
             return;
         }
@@ -928,6 +958,11 @@ impl CodedColumn<'_> {
             Places::CodedBits { at, packed } => {
                 for (row, place) in into.iter_mut().enumerate() {
                     *place += packed.code(at[row] as usize) as usize * stride;
+                }
+            }
+            Places::Values { values, low } => {
+                for (place, &value) in into.iter_mut().zip(values) {
+                    *place += value.wrapping_sub(low) as u64 as usize * stride;
                 }
             }
         }
@@ -991,6 +1026,9 @@ impl<'a> Coded<'a> {
                     Some(Origin::Bits(base, width)),
                     Places::Bits { packed } | Places::CodedBits { packed, .. },
                 ) => *base == packed.base() && *width == packed.width(),
+                (Some(Origin::Window(bottom, span)), Places::Values { low, .. }) => {
+                    *bottom == low && *span == column.nothing + 1
+                }
                 _ => false,
             };
             if !same {
@@ -1010,6 +1048,7 @@ impl<'a> Coded<'a> {
                 Places::Bits { packed } | Places::CodedBits { packed, .. } => {
                     Origin::Bits(packed.base(), packed.width())
                 }
+                Places::Values { low, .. } => Origin::Window(low, column.nothing + 1),
             });
         }
     }
@@ -1023,17 +1062,75 @@ impl<'a> Coded<'a> {
 /// anything builds, and the pass that rules it out is a run of `u32` against a constant, which is
 /// cheaper than being wrong about it once: a code out of range would index the map as some other
 /// combination and answer a group that is not the row's own.
+///
+/// This one reads only the forms that carry places of their own. [`coded_within`] also reads an
+/// integer column by its value, which needs somewhere to put the values and the windows the map
+/// was last built on.
+#[cfg(test)]
 pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
+    coded_within(keys, rows, &[], None)
+}
+
+/// [`coded`], and an integer column with no places of its own read by its value against a window.
+///
+/// `held` is what the map beside the caller was last built on, so that a column read by value keeps
+/// the window it had for as long as its chunks land inside it and the map lives on. `values` is
+/// where those columns are widened into, one run per key column, kept by the caller so that it is
+/// not allocated once a chunk. Without it a column read by value is refused the way [`coded`]
+/// refuses it.
+pub(crate) fn coded_within<'a>(
+    keys: &'a [Vector],
+    rows: usize,
+    held: &[Origin],
+    values: Option<&'a mut Vec<Vec<i64>>>,
+) -> Option<Coded<'a>> {
     if keys.is_empty() || keys.len() > KEYS {
         return None;
     }
     // One column's places are the values it holds and several columns' places are their product,
     // which is why the two get different room. See [`WIDE_COMBOS`].
     let room = if keys.len() == 1 { WIDE_COMBOS } else { COMBOS };
+    // The columns with places of their own first, because what they take out of the room is what
+    // a window is allowed to be.
+    let mut found = [None; KEYS];
+    let mut taken: usize = 1;
+    let mut wanting = 0;
+    for (at, key) in keys.iter().enumerate() {
+        match places_of(key, rows, room) {
+            Some(read) => {
+                taken = taken.checked_mul(read.1).filter(|&taken| taken <= room)?;
+                found[at] = Some(read);
+            }
+            None => wanting += 1,
+        }
+    }
+    let mut windows = [None; KEYS];
+    let values: &'a [Vec<i64>] = if wanting == 0 {
+        &[]
+    } else {
+        let values = values?;
+        values.resize_with(keys.len(), Vec::new);
+        for (at, key) in keys.iter().enumerate() {
+            if found[at].is_some() {
+                continue;
+            }
+            let window =
+                window_of(key, rows, held.get(at), room / taken, wanting == 1, &mut values[at])?;
+            taken = taken.checked_mul(window.1).filter(|&taken| taken <= room)?;
+            windows[at] = Some(window);
+        }
+        values
+    };
     let mut columns = [None; KEYS];
     let mut combos: usize = 1;
     for (at, key) in keys.iter().enumerate() {
-        let (places, span, nullable) = places_of(key, rows, room)?;
+        let (places, span, nullable) = match (found[at], windows[at]) {
+            (Some(read), _) => read,
+            (None, Some((low, span, nullable))) => {
+                (Places::Values { values: values.get(at)?.get(..rows)?, low }, span, nullable)
+            }
+            (None, None) => return None,
+        };
         if combos.checked_mul(span)? > room {
             return None;
         }
@@ -1048,6 +1145,106 @@ pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
         combos *= span;
     }
     Some(Coded { columns, combos })
+}
+
+/// Widens an integer key column into `into` and settles the window its values are placed against.
+///
+/// The bottom of the window, how many places it takes with the null place counted, and whether a
+/// row of the column can be null, or `None` for a column that is not an integer in a form that
+/// widens as a block, or whose values spread wider than `limit` places.
+///
+/// The window `held` came from is kept whenever the chunk lands inside it, since a new window is a
+/// new map and a new map is every value probed again. A chunk that reaches outside it gets a window
+/// that takes the old one in as well when the two fit together, so that a key whose chunks wander
+/// around one range settles on a window covering all of it after a rebuild or two, rather than
+/// moving with every chunk. And when the column is the only one read this way, the window is made
+/// twice as wide as it has to be, so that a chunk reaching a little past the last one lands inside.
+fn window_of(
+    key: &Vector,
+    rows: usize,
+    held: Option<&Origin>,
+    limit: usize,
+    alone: bool,
+    into: &mut Vec<i64>,
+) -> Option<(i64, usize, bool)> {
+    if !signed_rows(key, rows, into) {
+        return None;
+    }
+    let nullable = !key.none_null();
+    let (mut lowest, mut highest) = (i64::MAX, i64::MIN);
+    if nullable {
+        for (row, &value) in into.iter().enumerate() {
+            if !key.is_null_at(row) {
+                lowest = lowest.min(value);
+                highest = highest.max(value);
+            }
+        }
+    } else {
+        for &value in into.iter() {
+            lowest = lowest.min(value);
+            highest = highest.max(value);
+        }
+    }
+    let kept = match held {
+        Some(&Origin::Window(low, span)) => Some((low, span)),
+        _ => None,
+    };
+    // The places the values can take, being all of them but the one a null takes.
+    let most = i128::try_from(limit.checked_sub(1)?).ok()?;
+    let top_of = |low: i64, span: usize| i128::from(low) + span as i128 - 2;
+    if let Some((low, span)) = kept {
+        // A chunk of nothing but nulls lands in any window at all.
+        if lowest > highest
+            || (lowest >= low && i128::from(highest) <= top_of(low, span) && span <= limit)
+        {
+            return Some((low, span, nullable));
+        }
+    }
+    if lowest > highest {
+        return Some((0, 2, nullable));
+    }
+    let (mut bottom, mut top) = (i128::from(lowest), i128::from(highest));
+    if let Some((low, span)) = kept {
+        let (wider_bottom, wider_top) = (bottom.min(i128::from(low)), top.max(top_of(low, span)));
+        if wider_top - wider_bottom < most {
+            (bottom, top) = (wider_bottom, wider_top);
+        }
+    }
+    let width = top - bottom + 1;
+    if width > most {
+        return None;
+    }
+    let wanted = if alone { (width * 2).max(1024).min(most) } else { width };
+    let low = i64::try_from(bottom - (wanted - width) / 2)
+        .or_else(|_| i64::try_from(bottom))
+        .ok()?;
+    Some((low, usize::try_from(wanted).ok()?.checked_add(1)?, nullable))
+}
+
+/// The first `rows` values of an integer key column, widened to `i64`, into `into`.
+///
+/// The forms [`Vector::signed_block`] hands over as a block, and a filtered packed run, which is a
+/// packed code per row the filter kept. `false` for anything else, which is read the long way.
+fn signed_rows(key: &Vector, rows: usize, into: &mut Vec<i64>) -> bool {
+    if let Some((at, values)) = key.dictionary_parts() {
+        let (Some(packed), Some(at)) = (values.packed_parts(), at.get(..rows)) else {
+            return false;
+        };
+        let Ok(base) = i64::try_from(packed.base()) else {
+            return false;
+        };
+        if at.iter().any(|&code| code as usize >= values.len()) {
+            return false;
+        }
+        into.clear();
+        into.extend(at.iter().map(|&row| base.wrapping_add(packed.code(row as usize) as i64)));
+        return true;
+    }
+    if key.len() < rows || !key.signed_block(into) {
+        return false;
+    }
+    into.truncate(rows);
+    true
 }
 
 /// One key column read as places, with how many it can take and whether a row of it can be null.
@@ -3666,6 +3863,102 @@ mod tests {
         let later = coded(&second, 2).expect("codes");
         assert!(!later.same_as(&held), "a dictionary built again is not the one the map holds");
         assert!(coded(&[], 0).is_none(), "no key columns are no codes");
+    }
+
+    /// A flat column of integers, the shape a filter leaves when it copies the rows it kept out.
+    fn integers(values: &[Option<i32>]) -> Vector {
+        let values: Vec<Value> =
+            values.iter().map(|value| value.map_or(Value::Null, Value::Integer)).collect();
+        flat(LogicalType::Integer, &values)
+    }
+
+    /// A flat column is read by its value once there is somewhere to widen it into, which is the
+    /// shape `CounterID` arrives in after `URL <> ''` has copied out the rows it kept.
+    #[test]
+    fn a_flat_column_is_read_by_its_value_against_a_window() {
+        let keys = [integers(&[Some(62), Some(1_000), Some(62), Some(-5)])];
+        let mut values = Vec::new();
+        let coded = coded_within(&keys, 4, &[], Some(&mut values)).expect("read by value");
+        let places = placed(&coded, 4);
+        assert_eq!(places[0], places[2], "one value is one place");
+        assert_eq!(places.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+        assert!(places.iter().all(|&place| place < coded.combos() - 1), "no value takes the null place");
+        assert_eq!(places[1] - places[3], 1_005, "a place is the value less the bottom of the window");
+    }
+
+    /// The window outlives the chunk. The next chunk inside it keeps the map, one reaching past it
+    /// gets a window that takes the old one in, and the map is only rebuilt for the second.
+    #[test]
+    fn a_window_is_kept_for_as_long_as_the_chunks_land_inside_it() {
+        let mut values = Vec::new();
+        let first = [integers(&[Some(100), Some(200)])];
+        let mut held = Vec::new();
+        coded_within(&first, 2, &[], Some(&mut values)).expect("read by value").hold(&mut held);
+
+        let inside = [integers(&[Some(150), Some(101)])];
+        let again = coded_within(&inside, 2, &held, Some(&mut values)).expect("read by value");
+        assert!(again.same_as(&held), "a chunk inside the window keeps the map");
+
+        let past = [integers(&[Some(90_000), Some(100)])];
+        let wider = coded_within(&past, 2, &held, Some(&mut values)).expect("read by value");
+        assert!(!wider.same_as(&held), "a chunk past the window builds a new one");
+        let mut grown = Vec::new();
+        wider.hold(&mut grown);
+        let back = [integers(&[Some(200), Some(90_000)])];
+        assert!(
+            coded_within(&back, 2, &grown, Some(&mut values)).expect("read by value").same_as(&grown),
+            "and the new one still covers where the old one was"
+        );
+    }
+
+    /// Every null row takes the one place past the values, and a chunk of nothing but nulls keeps
+    /// whatever window there was.
+    #[test]
+    fn a_null_row_read_by_value_takes_the_place_past_the_window() {
+        let mut values = Vec::new();
+        let keys = [integers(&[Some(7), None, Some(9), None])];
+        let coded = coded_within(&keys, 4, &[], Some(&mut values)).expect("read by value");
+        let places = placed(&coded, 4);
+        assert_eq!(places[1], coded.combos() - 1);
+        assert_eq!(places[3], coded.combos() - 1);
+        assert_eq!(places[2] - places[0], 2);
+        let mut held = Vec::new();
+        coded.hold(&mut held);
+        let nothing = [integers(&[None, None])];
+        let over = coded_within(&nothing, 2, &held, Some(&mut values)).expect("read by value");
+        assert!(over.same_as(&held));
+        assert_eq!(placed(&over, 2), [coded.combos() - 1; 2]);
+    }
+
+    /// Values further apart than the map allows are hashed, and so is a pair of columns whose
+    /// windows multiply past the small bound.
+    #[test]
+    fn values_spread_wider_than_the_map_allows_are_refused() {
+        let mut values = Vec::new();
+        let wide = [integers(&[Some(0), Some(WIDE_COMBOS as i32)])];
+        assert!(coded_within(&wide, 2, &[], Some(&mut values)).is_none());
+        let fits = [integers(&[Some(0), Some(WIDE_COMBOS as i32 - 2)])];
+        assert!(coded_within(&fits, 2, &[], Some(&mut values)).is_some());
+        let pair = [integers(&[Some(0), Some(100)]), integers(&[Some(0), Some(100)])];
+        assert!(coded_within(&pair, 2, &[], Some(&mut values)).is_none());
+        let small = [integers(&[Some(0), Some(10)]), integers(&[Some(0), Some(10)])];
+        let coded = coded_within(&small, 2, &[], Some(&mut values)).expect("a product of 144");
+        let places = placed(&coded, 2);
+        assert_ne!(places[0], places[1]);
+    }
+
+    /// A filtered packed column too wide for its own places is read by value too, through the
+    /// codes the filter kept.
+    #[test]
+    fn a_filtered_packed_column_too_wide_for_places_is_read_by_value() {
+        let page = packed_numbers(&[17, 262_029, 62, 62], 18, 17);
+        let kept = [Vector::dictionary(vec![2, 1, 3], page).expect("the rows a filter kept")];
+        assert!(coded(&kept, 3).is_none(), "eighteen bits is too wide for places");
+        let mut values = Vec::new();
+        let coded = coded_within(&kept, 3, &[], Some(&mut values)).expect("read by value");
+        let places = placed(&coded, 3);
+        assert_eq!(places[0], places[2]);
+        assert_eq!(places[1] - places[0], 262_029 - 62);
     }
 
     /// Which rows `repeats` marks, asked with a threshold low enough that nothing is dropped for
