@@ -45,6 +45,7 @@ use rudb_vector::{Assembly, Chunk, Selection, Vector};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::lambda::{Lambda, lambda_call};
 use crate::ordering::Ordering;
 use crate::schema::Schema;
 use crate::written::written;
@@ -192,6 +193,19 @@ enum Step {
         /// How to answer it as codes, for the shape that can be. Absent means read the values.
         blend: Option<Blend>,
     },
+    /// A call to a function that takes a lambda, whose body is a prepared expression of its own.
+    ///
+    /// Nested for the reason a case's branches are: the body does not run over the chunk, it runs
+    /// over a chunk with a row per element that [`Lambda`] builds, and a step in the outer array has
+    /// no way to say that.
+    Lambda {
+        /// The list's step.
+        list: usize,
+        /// The layout of what the body runs over and what to do with its answers.
+        runner: Box<Lambda>,
+        /// The body, prepared against the runner's schema.
+        body: Box<Prepared>,
+    },
 }
 
 /// One `WHEN`/`THEN` pair of a prepared [`Step::Case`].
@@ -314,8 +328,18 @@ impl Prepared {
     /// Uses the zone of the session that owns this prepared expression.
     #[must_use]
     pub fn in_session(mut self, session: &Session) -> Self {
-        self.time_zone = session.session_time_zone();
+        self.set_time_zone(session.session_time_zone());
         self
+    }
+
+    /// Sets the zone here and in every lambda body, which is prepared before the session is known.
+    fn set_time_zone(&mut self, time_zone: SessionTimeZone) {
+        self.time_zone = time_zone;
+        for step in &mut self.steps {
+            if let Step::Lambda { body, .. } = step {
+                body.set_time_zone(time_zone);
+            }
+        }
     }
 
     /// Which step is the last to read each step, computed once when the expression is prepared.
@@ -341,6 +365,7 @@ impl Prepared {
             // A case's branches are arrays of their own and read nothing out of this one.
             Step::Column(_) | Step::Constant(_) | Step::Case { .. } => {}
             Step::Cast { input, .. } | Step::InSet { input, .. } => visit(*input),
+            Step::Lambda { list, .. } => visit(*list),
             Step::Compare { left, right, .. } => {
                 visit(*left);
                 visit(*right);
@@ -685,6 +710,9 @@ impl Prepared {
             // not look inside. Charging for the arms alone understates it and says the right thing
             // about the order, which is that a `CASE` is not what you want in front.
             Step::Case { arms, .. } => 4.0 * arms.len() as f64,
+            // A run of the body per element, which is several a row, and a list to take apart and
+            // put back together around it.
+            Step::Lambda { .. } => 16.0,
         }
     }
 
@@ -790,6 +818,13 @@ impl Prepared {
             }
             Step::Case { arms, otherwise, blend } => {
                 Some(self.case(chunk, arms, otherwise.as_ref(), blend.as_ref(), ty)?)
+            }
+            Step::Lambda { list, runner, body } => {
+                let list = self.operand(*list, chunk, slots)?;
+                let mut scratch = body.scratch();
+                Some(runner.run(list, chunk, &mut |inner| {
+                    body.evaluate_one(inner, &mut scratch).cloned()
+                })?)
             }
         };
         Ok(produced)
@@ -993,6 +1028,35 @@ impl Prepared {
                         Step::Conjunction { op: connective(op), start, len }
                     }
                 }
+            }
+            Expr::Function { name, args } if lambda_call(plan, args).is_some() => {
+                let Some((list, lambda)) = lambda_call(plan, args) else {
+                    return Err(Error::internal("a lambda call without a lambda"));
+                };
+                let Expr::Lambda { body, .. } = *plan.expr(lambda) else {
+                    return Err(Error::internal("a lambda call without a lambda"));
+                };
+                let runner = Lambda::new(plan, plan.string(name), list, lambda, schema)?;
+                let body = Self::one(plan, body, runner.schema())?;
+                Step::Lambda {
+                    list: self.push(plan, list, schema)?,
+                    runner: Box::new(runner),
+                    body: Box::new(body),
+                }
+            }
+            Expr::LambdaParam(binding) => {
+                let position = schema.position_of(binding).ok_or_else(|| {
+                    Error::internal(format!(
+                        "lambda parameter @{}.{} is not in the schema its body was given",
+                        binding.table, binding.column
+                    ))
+                })?;
+                Step::Column(position)
+            }
+            Expr::Lambda { .. } => {
+                return Err(Error::internal(
+                    "a lambda was evaluated outside the function that takes it",
+                ));
             }
             Expr::Function { name, args } => {
                 let (start, len) = self.push_list(plan, plan.expr_list(args), schema)?;

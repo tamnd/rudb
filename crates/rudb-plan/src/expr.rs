@@ -137,6 +137,28 @@ pub enum Expr {
         /// The `ELSE`, if there is one. Absent means null.
         otherwise: Option<ExprRef>,
     },
+    /// A function written inline, which is only ever an argument of a function that takes one,
+    /// such as the second argument of `list_transform`.
+    ///
+    /// Its parameters are bound as the columns of a table of their own, numbered the way an
+    /// operator's output is, and read with [`Expr::LambdaParam`]. The type recorded for it is its
+    /// body's, since there is no type for a function and the one its caller needs is the body's.
+    Lambda {
+        /// The table index its parameters are bound under.
+        table: u32,
+        /// The parameters as they were written, into the name list pool, which is what an error
+        /// message quotes a body with.
+        params: Slice,
+        /// What it computes from them.
+        body: ExprRef,
+    },
+    /// One parameter of an enclosing [`Expr::Lambda`].
+    ///
+    /// Not an [`Expr::Column`], although the body reads it the same way when it runs, because no
+    /// operator produces it. A pass that moves, prunes or renumbers columns has to be able to tell
+    /// one apart from a column without knowing which lambda it is inside, and a variant of its own
+    /// is what lets it.
+    LambdaParam(ColumnBinding),
 }
 
 /// One `WHEN`/`THEN` pair of a [`Expr::Case`].

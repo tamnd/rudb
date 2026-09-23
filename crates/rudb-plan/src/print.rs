@@ -304,6 +304,20 @@ fn write_form<W: Write>(plan: &Plan, out: &mut W, expr: ExprRef) -> fmt::Result 
     match *plan.expr(expr) {
         Expr::Column(binding) => write!(out, "#{}.{}", binding.table, binding.column),
         Expr::Constant(value) => write_value(out, plan.value(value)),
+        // A parameter is written apart from a column, since the two are bound differently and the
+        // reader has to rebuild the one that was printed.
+        Expr::LambdaParam(binding) => write!(out, "@{}.{}", binding.table, binding.column),
+        Expr::Lambda { table, params, body } => {
+            write!(out, "LAMBDA #{table}(")?;
+            for (position, &name) in plan.name_list(params).iter().enumerate() {
+                if position > 0 {
+                    out.write_str(", ")?;
+                }
+                write_identifier(out, plan.string(name))?;
+            }
+            out.write_str("): ")?;
+            write_expr(plan, out, body)
+        }
         Expr::Cast { input, try_cast } => {
             out.write_str(if try_cast { "TRY_CAST(" } else { "CAST(" })?;
             write_expr(plan, out, input)?;

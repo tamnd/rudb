@@ -95,6 +95,7 @@ mod group_mixed;
 mod join;
 mod key;
 mod keywords;
+mod lambda;
 mod lateral;
 mod linkjoin;
 mod links;

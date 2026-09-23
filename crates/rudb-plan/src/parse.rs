@@ -866,8 +866,28 @@ fn read_form(plan: &mut Plan, c: &mut Cursor<'_>) -> Result<Form> {
         let column = read_number(c)?;
         return Ok(Form::Done(Expr::Column(ColumnBinding::new(table, column))));
     }
+    if c.eat("@") {
+        let table = read_number(c)?;
+        c.expect(".")?;
+        let column = read_number(c)?;
+        return Ok(Form::Done(Expr::LambdaParam(ColumnBinding::new(table, column))));
+    }
     if c.eat("(") {
         return read_bracketed(plan, c).map(Form::Done);
+    }
+    if c.eat_word("LAMBDA") {
+        c.expect("#")?;
+        let table = read_number(c)?;
+        c.expect("(")?;
+        let mut names = vec![read_name(plan, c)?];
+        while c.eat_space_then(",") {
+            names.push(read_name(plan, c)?);
+        }
+        c.expect(")")?;
+        c.expect(":")?;
+        let params = plan.add_name_list(&names);
+        let body = read_expr(plan, c)?;
+        return Ok(Form::Done(Expr::Lambda { table, params, body }));
     }
     if c.eat_word("CASE") {
         return read_case(plan, c).map(Form::Done);

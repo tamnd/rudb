@@ -1369,8 +1369,10 @@ fn find_column_expr(plan: &Plan, expr: ExprRef, wanted: ColumnBinding) -> Option
         return Some(expr);
     }
     match *plan.expr(expr) {
-        Expr::Column(_) | Expr::Constant(_) => None,
-        Expr::Cast { input, .. } => find_column_expr(plan, input, wanted),
+        Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => None,
+        Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => {
+            find_column_expr(plan, input, wanted)
+        }
         Expr::Compare { left, right, .. } => {
             find_column_expr(plan, left, wanted).or_else(|| find_column_expr(plan, right, wanted))
         }
