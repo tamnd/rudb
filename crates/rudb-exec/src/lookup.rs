@@ -31,6 +31,15 @@
 //! the last, so its chains are in the order the side holds them whatever the other partitions are
 //! doing beside it.
 //!
+//! # Keys that index
+//!
+//! A join on one integer key whose gathered keys sit close together, which is a join against a
+//! primary key in nearly every schema, needs no table at all. The key less the smallest key is a
+//! place in `head`, so the probe is a subtraction, a bounds check and a load, with no hash to take
+//! and no stored key to compare, and the build is one pass over the side. The slot a probe hands
+//! out is that place, and everything past the slot, the chains, the single key test and the
+//! gathers, is the same code for both. See [`Lookup::build`].
+//!
 //! # Nulls
 //!
 //! `NULL = NULL` is null and not true, so a row whose key holds a null in a column the join
@@ -50,6 +59,14 @@ use crate::table::{BATCH, Probe, Table, Walk};
 
 /// The end of a chain, and the row a slot with nothing in it points at.
 pub(crate) const NONE: u32 = u32::MAX;
+
+/// How many places in `head` a key may take in the direct form, at most, for each gathered row.
+///
+/// `head` is four bytes a place and the build keeps a tail beside it, so at four places a row the
+/// two cost thirty two bytes a gathered row, which is about what the hash table costs for one row
+/// of a single integer key with its hash and bucket. TPC-H's order keys are one in four of the
+/// values they span, and every other key it joins on is dense.
+const PLACES: u64 = 4;
 
 /// Below this many rows a side is built on one thread.
 ///
@@ -92,6 +109,11 @@ pub(crate) struct Lookup {
     /// How many gathered rows are in the table, which is not how many went past it: a row whose key
     /// holds a rejected null is neither stored nor counted.
     kept: usize,
+    /// How many distinct keys the table holds.
+    distinct: usize,
+    /// The smallest key, when the key is its own place in `head` and there are no partitions. See
+    /// the module documentation.
+    low: Option<i64>,
 }
 
 impl Lookup {
@@ -156,8 +178,6 @@ impl Lookup {
         if rows == 0 || keys.is_empty() {
             return Ok(Self::default());
         }
-        let mut hashes = Vec::new();
-        crate::table::hash(keys, rows, &mut hashes, crate::table::Across::TwoInputs);
         let mut keyed = Vec::new();
         which_are_keyed(keys, rows, nulls, &mut keyed);
         if let Some(allowed) = allowed {
@@ -165,6 +185,11 @@ impl Lookup {
                 *keyed = *keyed && allowed;
             }
         }
+        if let Some(direct) = Self::direct(keys, rows, nulls, &keyed, threads, cancel)? {
+            return Ok(direct);
+        }
+        let mut hashes = Vec::new();
+        crate::table::hash(keys, rows, &mut hashes, crate::table::Across::TwoInputs);
 
         let bits = split_into(rows, threads.degree());
         let count = 1usize << bits;
@@ -185,7 +210,98 @@ impl Lookup {
             head.extend(mine);
             kept += held;
         }
-        Ok(Self { parts, bits, head, next, kept })
+        let distinct = head.len();
+        Ok(Self { parts, bits, head, next, kept, distinct, low: None })
+    }
+
+    /// The direct form, when the key is one integer column compared with `=` and its keyed values
+    /// span at most [`PLACES`] places a gathered row. `None` for anything else.
+    ///
+    /// One pass for the range and one to thread the chains, both in row order, so a key's rows come
+    /// out of its chain in the order the side holds them, as they do from the table. A side of
+    /// [`SPLIT`] rows or more is dealt first into partitions that each own a run of places, the
+    /// way the table deals by the top bits of the hash, so each thread fills its own part of
+    /// `head` and the only array they share is `next`, where each writes the rows it owns.
+    fn direct(
+        keys: &[Vector],
+        rows: usize,
+        nulls: &[bool],
+        keyed: &[bool],
+        threads: &Lease<'_>,
+        cancel: &Cancel,
+    ) -> Result<Option<Self>> {
+        let ([key], [false]) = (keys, nulls) else { return Ok(None) };
+        if !integer(key.logical_type()) {
+            return Ok(None);
+        }
+        let mut block = Vec::new();
+        if !key.signed_block(&mut block) || block.len() < rows {
+            return Ok(None);
+        }
+        let (mut low, mut high) = (i64::MAX, i64::MIN);
+        for (&value, &keyed) in block[..rows].iter().zip(keyed) {
+            if keyed {
+                low = low.min(value);
+                high = high.max(value);
+            }
+        }
+        if low > high {
+            return Ok(None);
+        }
+        let Ok(places) = u64::try_from(i128::from(high) - i128::from(low) + 1) else {
+            return Ok(None);
+        };
+        if places > (rows as u64).saturating_mul(PLACES) || places >= u64::from(NONE) {
+            return Ok(None);
+        }
+        cancel.check()?;
+        let places = places as usize;
+        let place_of = |row: usize| block[row].wrapping_sub(low) as usize;
+        let next: Vec<AtomicU32> = (0..rows).map(|_| AtomicU32::new(NONE)).collect();
+        let count = 1usize << split_into(rows, threads.degree());
+        let run = places.div_ceil(count);
+        let mut starts = vec![0; count + 1];
+        for row in (0..rows).filter(|&row| keyed[row]) {
+            starts[place_of(row) / run + 1] += 1;
+        }
+        for part in 0..count {
+            starts[part + 1] += starts[part];
+        }
+        let mut at = starts.clone();
+        let mut dealt = vec![0; starts[count]];
+        for row in (0..rows).filter(|&row| keyed[row]) {
+            let part = place_of(row) / run;
+            dealt[at[part]] = row;
+            at[part] += 1;
+        }
+        let one = |part: usize| -> Result<(Vec<u32>, usize)> {
+            let base = part * run;
+            let len = run.min(places.saturating_sub(base));
+            let mut head = vec![NONE; len];
+            let mut tail = vec![NONE; len];
+            let mut distinct = 0;
+            for &row in &dealt[starts[part]..starts[part + 1]] {
+                let place = place_of(row) - base;
+                let at = row as u32;
+                if tail[place] == NONE {
+                    head[place] = at;
+                    distinct += 1;
+                } else {
+                    next[tail[place] as usize].store(at, Ordering::Relaxed);
+                }
+                tail[place] = at;
+            }
+            Ok((head, distinct))
+        };
+        let filled = in_parallel(threads, count, threads.degree(), "join index partition", one)?;
+        let mut head = Vec::with_capacity(places);
+        let mut distinct = 0;
+        for (mine, held) in filled {
+            head.extend(mine);
+            distinct += held;
+        }
+        let kept = dealt.len();
+        Ok(Some(Self { parts: Vec::new(), bits: 0, head, next, kept, distinct, low: Some(low) }))
     }
 
     /// Whether there is anything at all to look up.
@@ -230,6 +346,10 @@ impl Lookup {
     ) {
         into.clear();
         into.resize(rows, MISS);
+        if let Some(low) = self.low {
+            self.places(low, keys, rows, nulls, scratch, into);
+            return;
+        }
         if rows == 0 || self.parts.is_empty() {
             return;
         }
@@ -260,6 +380,40 @@ impl Lookup {
         for (row, &keyed) in scratch.keyed.iter().enumerate().take(rows) {
             if !keyed {
                 into[row] = MISS;
+            }
+        }
+    }
+
+    /// The same, for the direct form, where a key's slot is its place in `head` and a key outside
+    /// the range or on a place nobody holds is a miss.
+    fn places(
+        &self,
+        low: i64,
+        keys: &[Vector],
+        rows: usize,
+        nulls: &[bool],
+        scratch: &mut Scratch,
+        into: &mut [usize],
+    ) {
+        let [key] = keys else { return };
+        which_are_keyed(keys, rows, nulls, &mut scratch.keyed);
+        let places = self.head.len() as u64;
+        let hit = |value: i64| {
+            let place = value.wrapping_sub(low) as u64;
+            (place < places && self.head[place as usize] != NONE).then_some(place as usize)
+        };
+        if key.signed_block(&mut scratch.block) && scratch.block.len() >= rows {
+            for (row, &value) in scratch.block[..rows].iter().enumerate() {
+                if scratch.keyed[row] {
+                    into[row] = hit(value).unwrap_or(MISS);
+                }
+            }
+            return;
+        }
+        for (row, slot) in into.iter_mut().enumerate().take(rows) {
+            if scratch.keyed[row] {
+                let value = key.signed_at(row).and_then(|value| i64::try_from(value).ok());
+                *slot = value.and_then(hit).unwrap_or(MISS);
             }
         }
     }
@@ -306,7 +460,7 @@ impl Lookup {
     /// read [`Lookup::next`]. That read is a miss into an array as long as the gathered side, taken
     /// once per driving row only to find the end of a chain that has already ended.
     pub(crate) fn single(&self) -> bool {
-        self.head.len() == self.kept
+        self.distinct == self.kept
     }
 
     /// The first gathered row of each slot in `slots`, [`NONE`] for a [`MISS`].
@@ -477,6 +631,16 @@ pub(crate) struct Scratch {
     by_part: Vec<Vec<usize>>,
     /// What one batch of one of those lists found, by place in the batch.
     found: Vec<usize>,
+    /// The chunk's keys widened, for the direct form.
+    block: Vec<i64>,
+}
+
+/// Whether a key of this type is a signed integer the direct form can use as a place.
+fn integer(logical: &LogicalType) -> bool {
+    matches!(
+        logical,
+        LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer | LogicalType::BigInt
+    )
 }
 
 /// Which rows have a key at all, which is every row until a rejected null says otherwise.
@@ -677,32 +841,69 @@ mod tests {
         assert_eq!(split_into(SPLIT, 6), 3, "rounded up to a power of two");
     }
 
-    /// The one that matters, over enough rows to be split for real. Every key's rows still come out
-    /// in the order the side holds them, which is the thing several threads filling several tables
-    /// could break and the thing a failing join test would show as a reordered diff.
-    #[test]
-    fn a_side_built_in_partitions_answers_the_same_as_one_built_whole() {
-        let values: Vec<Option<i32>> = (0..SPLIT as i32 + 1_000).map(|row| Some(row % 7)).collect();
-        let pool = Pool::new(4);
-        let lookup = built_by(&values, &[false], &pool.lease(4));
-        assert!(lookup.parts.len() > 1, "a side this long is split");
+    /// Every key's rows, driven by the keys `0..9` times `spread`, in the order the side holds them,
+    /// and a miss for a key the side does not hold.
+    fn answers_in_order(lookup: &Lookup, values: &[Option<i32>], spread: i32) {
         let mut scratch = Scratch::default();
         let mut slots = Vec::new();
-        let driving: Vec<Option<i32>> = (0..9).map(Some).collect();
+        let driving: Vec<Option<i32>> = (-1..9).map(|key| Some(key * spread)).collect();
         lookup.slots(&[column(&driving)], driving.len(), &[false], &mut scratch, &mut slots);
         let mut chain = Vec::new();
-        for (key, &slot) in slots.iter().enumerate() {
-            let key = i32::try_from(key).expect("nine of them");
+        for (&key, &slot) in driving.iter().zip(&slots) {
             let wanted: Vec<u32> = (0..values.len())
-                .filter(|&row| values[row] == Some(key))
+                .filter(|&row| values[row] == key)
                 .map(|row| u32::try_from(row).expect("a side this long"))
                 .collect();
             if wanted.is_empty() {
-                assert_eq!(slot, MISS, "key {key} is not in the side");
+                assert_eq!(slot, MISS, "key {key:?} is not in the side");
                 continue;
             }
             lookup.matches(slot, &mut chain);
-            assert_eq!(chain, wanted, "key {key} came out in the wrong order");
+            assert_eq!(chain, wanted, "key {key:?} came out in the wrong order");
         }
+    }
+
+    /// The one that matters, over enough rows to be split for real. Every key's rows still come out
+    /// in the order the side holds them, which is the thing several threads filling several tables
+    /// could break and the thing a failing join test would show as a reordered diff. The keys are
+    /// spread far apart so that the side takes the table rather than the direct form.
+    #[test]
+    fn a_side_built_in_partitions_answers_the_same_as_one_built_whole() {
+        let spread = 1_000_003;
+        let values: Vec<Option<i32>> =
+            (0..SPLIT as i32 + 1_000).map(|row| Some(row % 7 * spread)).collect();
+        let pool = Pool::new(4);
+        let lookup = built_by(&values, &[false], &pool.lease(4));
+        assert!(lookup.low.is_none(), "keys this far apart take the table");
+        assert!(lookup.parts.len() > 1, "a side this long is split");
+        answers_in_order(&lookup, &values, spread);
+    }
+
+    /// The direct form over enough rows to be split, with repeats, gaps and nulls. Each partition
+    /// owns a run of places, and a key's rows still come out in the order the side holds them.
+    #[test]
+    fn a_direct_side_built_in_partitions_answers_in_order() {
+        let values: Vec<Option<i32>> = (0..SPLIT as i32 + 1_000)
+            .map(|row| (row % 11 != 5).then_some(row % 13 % 9))
+            .filter(|value| *value != Some(4))
+            .collect();
+        let pool = Pool::new(4);
+        let lookup = built_by(&values, &[false], &pool.lease(4));
+        assert_eq!(lookup.low, Some(0), "keys this close index the head");
+        assert!(lookup.parts.is_empty());
+        answers_in_order(&lookup, &values, 1);
+        assert!(!lookup.single(), "each key has many rows");
+    }
+
+    /// One row a key, the shape of a join against a primary key, starting away from zero. Every key
+    /// is its row, a key just past either end is a miss, and the table says each chain is one long.
+    #[test]
+    fn a_direct_side_of_distinct_keys_is_single_and_misses_past_its_ends() {
+        let values: Vec<Option<i32>> = (0..100).map(|row| Some(1_000 - row * 2)).collect();
+        let lookup = built(&values);
+        assert_eq!(lookup.low, Some(802));
+        assert!(lookup.single());
+        let found = found(&lookup, &[Some(1_000), Some(802), Some(801), Some(1_002), Some(999)]);
+        assert_eq!(found, [vec![0], vec![99], vec![], vec![], vec![]]);
     }
 }
