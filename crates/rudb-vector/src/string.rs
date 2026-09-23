@@ -399,13 +399,15 @@ impl StringColumn {
         let key = Arenas::key(source);
         let base = match arenas.placed.get(&key) {
             Some(&base) => Some(base),
-            None if Arenas::mostly_read(source.arena.len(), arenas.live(source)) => {
-                let base = self.arena.len() as u64;
-                self.arena.extend_from_slice(source.arena());
-                arenas.placed.insert(key, base);
-                Some(base)
-            }
-            None => None,
+            None => match arenas.counted(source) {
+                Some(live) if Arenas::mostly_read(source.arena.len(), live) => {
+                    let base = self.arena.len() as u64;
+                    self.arena.extend_from_slice(source.arena());
+                    arenas.placed.insert(key, base);
+                    Some(base)
+                }
+                _ => None,
+            },
         };
         if let Some(base) = base {
             self.views.extend(source.views.iter().map(|view| view.shifted(base)));
@@ -586,9 +588,22 @@ impl StringColumn {
 ///
 /// Counted over every column before any of them is laid, because whether an arena is worth
 /// copying whole depends on how much of it all the columns cut from it read, and the first cut
-/// alone reads a sliver. An arena is known by where its bytes are and how many there are, which
-/// tells two arenas apart for as long as the columns holding them are alive, and they are alive for
-/// the whole of a lay.
+/// alone reads a sliver. An arena is known by where its bytes are and how many there are.
+///
+/// An address only tells two arenas apart while both of them are alive, so the one thing this must
+/// never do is remember an address that is about to be freed. That is why nothing but a counted
+/// arena is ever copied whole and recorded: counting happens over the columns the caller is holding
+/// for the whole of the lay, and two live allocations cannot sit at the same address, so a key in
+/// `placed` always means the arena it was taken from.
+///
+/// A column built on the way past does not get that treatment. Flattening a dictionary, or a run of
+/// views, builds a column that is laid and then dropped before the next one is built, and the
+/// allocator is free to hand the same bytes back for it. Recording one of those meant the next
+/// column to land on the address was given a base worked out for somebody else's bytes, and its
+/// views were shifted by it without its own arena ever being copied in. What came back was strings
+/// of the right length read from the wrong place, so a group key came out as the tail of one value
+/// followed by the head of the next. That is #1413, which took TPC-H q16 at SF1 about half the time
+/// it ran.
 #[derive(Debug, Default)]
 pub(crate) struct Arenas {
     live: HashMap<(usize, usize), usize>,
@@ -618,9 +633,14 @@ impl Arenas {
         (column.arena.as_ptr() as usize, column.arena.len())
     }
 
-    /// The bytes of `column`'s arena read by every column counted, or by `column` if it was not.
-    fn live(&self, column: &StringColumn) -> usize {
-        self.live.get(&Self::key(column)).copied().unwrap_or_else(|| live_bytes(column))
+    /// The bytes of `column`'s arena read by every column counted, for an arena that was counted.
+    ///
+    /// `None` says nobody counted this arena, which is the answer that keeps its address out of
+    /// `placed`. Answering with `column`'s own live bytes instead, which is what this used to do,
+    /// made a column built on the way past look like an arena that is entirely read, so every one of
+    /// them was copied whole and recorded. See the note on the type.
+    fn counted(&self, column: &StringColumn) -> Option<usize> {
+        self.live.get(&Self::key(column)).copied()
     }
 }
 
@@ -720,6 +740,38 @@ mod tests {
         sparse.push_column(&second, &mut alone);
         assert_eq!(sparse.arena(), strings[2].as_bytes(), "a sliver of a page is copied alone");
         assert_eq!(sparse.get(0), Some(strings[2]));
+    }
+
+    /// An arena nobody counted is laid a string at a time and its address is not written down.
+    ///
+    /// The address of a column that was built to be laid and then dropped says nothing about which
+    /// bytes are there once it has been, so remembering it hands the next column to land on it a
+    /// base belonging to somebody else. #1413.
+    #[test]
+    fn an_arena_that_nobody_counted_is_not_remembered_by_its_address() {
+        let text = "a string built on the way past, well over the inline limit";
+        let built = StringColumn::from_iter([text]);
+        let mut laid = StringColumn::new();
+        let mut arenas = Arenas::default();
+        laid.push_column(&built, &mut arenas);
+        assert!(arenas.placed.is_empty(), "an uncounted arena was recorded by its address");
+        assert_eq!(laid.get(0), Some(text));
+    }
+
+    /// And an arena that was counted still is, so the lay of a page is still one copy of the page.
+    ///
+    /// The other half of the rule above. Without this the fix for #1413 would read as though the
+    /// whole point of [`Arenas`] had been switched off.
+    #[test]
+    fn an_arena_that_was_counted_is_still_copied_whole() {
+        let text = "a string on a page the caller holds, well over the inline limit";
+        let page = StringColumn::from_iter([text]);
+        let mut laid = StringColumn::new();
+        let mut arenas = Arenas::default();
+        arenas.count(&page);
+        laid.push_column(&page, &mut arenas);
+        assert_eq!(arenas.placed.len(), 1, "a counted arena is copied whole and written down");
+        assert_eq!(laid.get(0), Some(text));
     }
 
     #[test]
