@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_vector::{Data, Form, Validity, Vector};
+use rudb_vector::{Data, Form, Live, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
 use crate::peel::{Found, Peel, search};
@@ -63,9 +63,10 @@ pub struct Members {
 struct Sought {
     /// The dictionary these codes are in, recognised by pointer the way a peel does it.
     dictionary: Arc<Vector>,
-    /// The codes the list's values sit at, and no entry at all for a value the dictionary does not
-    /// hold, since no row can be that value.
-    codes: Vec<u32>,
+    /// Whether each code of the dictionary is one of the list's values, so a row costs one load
+    /// rather than a walk along the codes the list sits at. A value the dictionary does not hold
+    /// marks nothing, since no row can be that value.
+    hits: Vec<bool>,
 }
 
 /// The set itself, in the one layout per kind of value that hashes the way SQL compares.
@@ -128,7 +129,7 @@ impl Members {
         Some(Self { held, has_null, negated, sought: OnceLock::new(), peel: Peel::default() })
     }
 
-    /// The codes this list's values sit at in `column`'s dictionary, or `None` when there is no
+    /// Which codes of `column`'s dictionary hold one of this list's values, or `None` when there is no
     /// sorted order to find them with.
     ///
     /// This is the whole of what a sorted dictionary buys an `IN`. The list is a handful of
@@ -139,15 +140,19 @@ impl Members {
     ///
     /// Text only, because the search is over bytes. A list of numbers against a dictionary is left
     /// to the loop below, which reads the codes' values as a run and is already one lookup a row.
-    fn sought(&self, column: &Vector) -> Option<Result<&[u32]>> {
+    fn sought(&self, column: &Vector) -> Option<Result<&[bool]>> {
         let Held::Text(set) = &self.held else { return None };
         let (_, dictionary) = column.shared_dictionary_parts()?;
         if self.sought.get().is_none() {
             let ranks = dictionary.ranks()?;
-            let mut codes = Vec::with_capacity(set.len());
+            let mut hits = vec![false; dictionary.len()];
             for text in set {
                 match search(dictionary, ranks, text.as_bytes()) {
-                    Ok(Found::At(code)) => codes.push(code),
+                    Ok(Found::At(code)) => {
+                        if let Some(hit) = hits.get_mut(code as usize) {
+                            *hit = true;
+                        }
+                    }
                     Ok(Found::Absent) => {}
                     // Returned rather than remembered, so a caller that retries gets the error
                     // again rather than a wrong answer cached from a half finished search.
@@ -156,12 +161,12 @@ impl Members {
             }
             // Two threads that get here at once do the same searches and set the same codes, and
             // the one that loses the race drops its own copy of them.
-            let _ = self.sought.set(Sought { dictionary: Arc::clone(dictionary), codes });
+            let _ = self.sought.set(Sought { dictionary: Arc::clone(dictionary), hits });
         }
         // Read back what is actually there rather than what this call built, and check it belongs
         // to the dictionary in hand, which is what declines a second column at the same node.
         let memo = self.sought.get()?;
-        Arc::ptr_eq(&memo.dictionary, dictionary).then_some(Ok(memo.codes.as_slice()))
+        Arc::ptr_eq(&memo.dictionary, dictionary).then_some(Ok(memo.hits.as_slice()))
     }
 
     /// Whether the value at `code` of `dictionary` is in the list, for the memo to remember.
@@ -237,7 +242,7 @@ pub fn in_set(input: &Vector, members: &Members, returns: &LogicalType) -> Resul
                 })?;
                 if codes.len() >= rows {
                     return answer(rows, &base, members, returns, |index| {
-                        found.contains(&codes[index])
+                        found.get(codes[index] as usize).copied().unwrap_or(false)
                     });
                 }
             }
@@ -381,6 +386,12 @@ fn answer(
     returns: &LogicalType,
     found: impl Fn(usize) -> bool,
 ) -> Result<Vector> {
+    // Nothing null in the column and nothing null in the list, which is nearly every `IN` there is.
+    // Every row then has an answer, so there is no second run of flags to fill and pack.
+    if base.live() == Live::All && !members.has_null {
+        let out: Vec<bool> = (0..rows).map(|index| found(index) != members.negated).collect();
+        return Vector::flat(returns.clone(), Data::Bool(out.into()));
+    }
     let mut out = vec![false; rows];
     let mut live = vec![false; rows];
     for index in 0..rows {
@@ -675,6 +686,30 @@ mod tests {
         let holed_flat =
             flat.with_validity(rudb_vector::Validity::from_run(&[true, false, true, true, false]));
         assert_eq!(over(&holed, &list, false), over(&holed_flat, &list, false));
+    }
+
+    /// No null in the column and none in the list, which is the path that writes only the answer.
+    /// Every row has one, so what comes back carries no mask for a filter above it to walk.
+    #[test]
+    fn a_column_and_a_list_with_no_null_in_either_answer_every_row() {
+        let (column, flat, _) = filed(&["AIR", "MAIL", "SHIP"], vec![0, 1, 2, 1, 0]);
+        let list = [Value::Varchar("MAIL".into()), Value::Varchar("SHIP".into())];
+        for negated in [false, true] {
+            let members = Members::of(&list, negated).expect("this list folds");
+            for input in [&column, &flat] {
+                let answer =
+                    in_set(input, &members, &LogicalType::Boolean).expect("the lookup runs");
+                assert_eq!(
+                    answer.validity().live(),
+                    rudb_vector::Live::All,
+                    "a row came back null"
+                );
+                let read: Vec<Value> = (0..5).map(|row| answer.value_at(row)).collect();
+                let want =
+                    [false, true, true, true, false].map(|hit| Value::Boolean(hit != negated));
+                assert_eq!(read, want);
+            }
+        }
     }
 
     #[test]
