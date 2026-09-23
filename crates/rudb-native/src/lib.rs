@@ -1317,6 +1317,11 @@ impl GlobalDictionary {
     /// has left too many, which is what keeps the kept blocks spread evenly over however much of the
     /// column exists rather than bunched at whichever end was cheap to remember.
     fn seal(&mut self) {
+        let t = std::time::Instant::now();
+        self.seal_inner();
+        probe_add(8, t);
+    }
+    fn seal_inner(&mut self) {
         let at = self.ends.len().div_ceil(TEXT_PAYLOAD_VALUES) - 1;
         let bytes = std::mem::take(&mut self.filling);
         let mut grams = [0_u8; TEXT_GRAM_BYTES];
@@ -9662,7 +9667,7 @@ fn synced(file: &File, profile: Option<&LoadProfile>) -> Result<()> {
     Ok(())
 }
 
-pub static PROBE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+pub static PROBE: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 pub fn probe_add(slot: usize, since: std::time::Instant) {
     PROBE[slot].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 }

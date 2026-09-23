@@ -599,11 +599,13 @@ impl Writer {
     fn merge_held_inner(&mut self, prepared: Prepared) -> Result<Merged> {
         let Prepared { parts, columns, gathers, profile, .. } = prepared;
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
+        let t = std::time::Instant::now();
         for (mine, stripe) in self.gathers.iter_mut().zip(gathers) {
             if let (Some(mine), Some(stripe)) = (mine, stripe) {
                 mine.absorb(stripe);
             }
         }
+        crate::probe_add(6, t);
         let rows: usize = parts.iter().map(|part| part.rows).sum();
         let mut merged = Vec::with_capacity(columns.len());
         for (index, column) in columns.into_iter().enumerate() {
@@ -624,7 +626,9 @@ impl Writer {
                         self.coded[index].store(false, Atomic::Relaxed);
                         Merge::Plain(local)
                     } else {
+                        let t = std::time::Instant::now();
                         let global = local.merge_into(global)?;
+                        crate::probe_add(7, t);
                         Merge::Codes { parts: local.parts, global }
                     }
                 }
