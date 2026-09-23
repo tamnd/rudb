@@ -25,6 +25,7 @@ use crate::connection::{Connection, single};
 use crate::prepared::Prepared;
 use crate::result::QueryResult;
 use crate::settings::Settings;
+use crate::upsert;
 
 /// The name that means no file, which is DuckDB's spelling and SQLite's before it.
 const MEMORY: &str = ":memory:";
@@ -3099,20 +3100,25 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let workers = self.inner.pool.threads();
-                let table = catalog.table_mut(&insert.name)?;
                 let chunks = result.into_chunks();
                 let wanted = insert.returning.is_some();
                 let (count, written) = match insert.write {
+                    Write::Append if insert.conflict.is_some() => {
+                        let conflict = insert.conflict.take().expect("asked just above");
+                        let name = insert.name.clone();
+                        let place = (cancel, &seams, &session);
+                        self.upsert(sql, &mut catalog, place, &name, conflict, chunks)?
+                    }
                     Write::Append => {
                         let added = chunks.iter().map(Chunk::len).sum();
                         let written = if wanted { chunks.clone() } else { Vec::new() };
-                        table.append_all(chunks, workers)?;
+                        catalog.table_mut(&insert.name)?.append_all(chunks, workers)?;
                         (added, written)
                     }
                     Write::Update | Write::Delete => {
                         let delete = insert.write == Write::Delete;
                         let (kept, changed, count) = split(chunks, delete, wanted)?;
-                        table.replace_all(kept, workers)?;
+                        catalog.table_mut(&insert.name)?.replace_all(kept, workers)?;
                         (count, changed)
                     }
                 };
@@ -3139,6 +3145,114 @@ impl Shared {
                 answer
             }
         }
+    }
+}
+
+impl Shared {
+    /// Writes the rows of an `INSERT` that says what to do with a key the table already holds, and
+    /// answers how many rows it inserted or updated and which, the updated ones first, which is the
+    /// count and the order the pin gives.
+    ///
+    /// A `DO UPDATE` works its values out with a plan that reads the table and `excluded`. For the
+    /// length of that plan the table holds just the rows that clash and a temporary table holds the
+    /// new rows they clash with, one of each per clash and in the same order, so the plan pairs them
+    /// by place. Both go back to how they were whether the plan ran or not.
+    fn upsert(
+        &self,
+        sql: &str,
+        catalog: &mut Catalog,
+        (cancel, seams, session): (&Cancel, &rudb_seam::Settings, &Session),
+        name: &QualifiedName,
+        conflict: rudb_bind::Conflict,
+        chunks: Vec<Chunk>,
+    ) -> Result<(usize, Vec<Chunk>)> {
+        let workers = self.inner.pool.threads();
+        let table = catalog.table(name)?;
+        let types = table.types();
+        let fields = table.columns().to_vec();
+        let keys = table.keys().to_vec();
+        let all: Vec<usize> = (0..fields.len()).collect();
+        let mut stored = Vec::with_capacity(table.rows().chunk_count());
+        for at in 0..table.rows().chunk_count() {
+            stored.push(table.rows().read(at, &all)?);
+        }
+        let mut held = upsert::rows_of(&stored);
+        let new = upsert::rows_of(&chunks);
+        let arrivals = upsert::arrivals(&keys, conflict.key, &held, &new);
+        let mut added = Vec::new();
+        let mut clashes = Vec::new();
+        for (row, arrival) in new.into_iter().zip(&arrivals) {
+            match arrival {
+                upsert::Arrival::New => added.push(row),
+                upsert::Arrival::Held(at) => clashes.push((*at, row)),
+                upsert::Arrival::Dropped => {}
+            }
+        }
+        let mut updated = Vec::new();
+        match conflict.action {
+            rudb_bind::ConflictAction::Nothing => {}
+            rudb_bind::ConflictAction::Replace(columns) => {
+                for (at, row) in clashes {
+                    for &column in &columns {
+                        held[at][column] = row[column].clone();
+                    }
+                    updated.push(at);
+                }
+            }
+            rudb_bind::ConflictAction::Update { columns, mut plan } if !clashes.is_empty() => {
+                let matched: Vec<Vec<Value>> =
+                    clashes.iter().map(|(at, _)| held[*at].clone()).collect();
+                let incoming: Vec<Vec<Value>> =
+                    clashes.iter().map(|(_, row)| row.clone()).collect();
+                let excluded = QualifiedName::excluded();
+                let loose =
+                    fields.iter().map(|field| Field { not_null: false, ..field.clone() }).collect();
+                catalog.create_table(excluded.clone(), loose)?;
+                let answer = (|| {
+                    let rows = upsert::chunks_of(&types, &incoming)?;
+                    catalog.table_mut(&excluded)?.append_all(rows, workers)?;
+                    let rows = upsert::chunks_of(&types, &matched)?;
+                    let before = catalog.table_mut(name)?.stand_in(rows, workers)?;
+                    let answer = (|| {
+                        let context = self.optimizer(catalog)?;
+                        rudb_opt::optimize_with(&mut plan, &context)?;
+                        let under = Under::new(
+                            self.budget(),
+                            context.facts(),
+                            seams,
+                            session,
+                            Rows::ForACaller,
+                        );
+                        run(sql, &plan, catalog, cancel, under)
+                    })();
+                    catalog.table_mut(name)?.put_back(before);
+                    answer
+                })();
+                catalog.drop_table(&excluded)?;
+                let values = upsert::rows_of(&answer?.into_chunks());
+                for ((at, _), row) in clashes.iter().zip(&values) {
+                    if row.last() != Some(&Value::Boolean(true)) {
+                        continue;
+                    }
+                    for (&column, value) in columns.iter().zip(row) {
+                        held[*at][column] = value.clone();
+                    }
+                    updated.push(*at);
+                }
+            }
+            rudb_bind::ConflictAction::Update { .. } => {}
+        }
+        let count = updated.len() + added.len();
+        let mut written: Vec<Vec<Value>> = updated.iter().map(|&at| held[at].clone()).collect();
+        written.extend(added.iter().cloned());
+        let table = catalog.table_mut(name)?;
+        if updated.is_empty() {
+            table.append_all(upsert::chunks_of(&types, &added)?, workers)?;
+        } else {
+            held.extend(added);
+            table.replace_all(upsert::chunks_of(&types, &held)?, workers)?;
+        }
+        Ok((count, upsert::chunks_of(&types, &written)?))
     }
 }
 

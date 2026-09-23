@@ -40,35 +40,56 @@ pub(crate) struct Seen(Arc<HashSet<Box<[u8]>>>);
 fn encode(chunk: &Chunk, key: &Key, row: usize, out: &mut Vec<u8>) -> Result<bool> {
     out.clear();
     for &column in &key.columns {
-        let value = chunk.column(column)?.value_at(row);
-        match value {
-            Value::Null => return Ok(false),
-            Value::Varchar(text) => {
-                out.push(b's');
-                out.extend_from_slice(&(text.len() as u64).to_le_bytes());
-                out.extend_from_slice(text.as_bytes());
-            }
-            Value::Integer(v) => {
-                out.push(b'i');
-                out.extend_from_slice(&i64::from(v).to_le_bytes());
-            }
-            Value::BigInt(v) => {
-                out.push(b'i');
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            // A float key is equal to itself whatever sign its zero has, which is what the pin's
-            // comparison says too.
-            Value::Double(0.0) => out.extend_from_slice(b"d0"),
-            Value::Float(0.0) => out.extend_from_slice(b"d0"),
-            other => {
-                let text = format!("{other:?}");
-                out.push(b'v');
-                out.extend_from_slice(&(text.len() as u64).to_le_bytes());
-                out.extend_from_slice(text.as_bytes());
-            }
+        if !push(&chunk.column(column)?.value_at(row), out) {
+            return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// One column of a key onto the end of its encoding, or false for a null.
+fn push(value: &Value, out: &mut Vec<u8>) -> bool {
+    match value {
+        Value::Null => return false,
+        Value::Varchar(text) => {
+            out.push(b's');
+            out.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+        Value::Integer(v) => {
+            out.push(b'i');
+            out.extend_from_slice(&i64::from(*v).to_le_bytes());
+        }
+        Value::BigInt(v) => {
+            out.push(b'i');
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        // A float key is equal to itself whatever sign its zero has, which is what the pin's
+        // comparison says too.
+        Value::Double(0.0) | Value::Float(0.0) => out.extend_from_slice(b"d0"),
+        other => {
+            let text = format!("{other:?}");
+            out.push(b'v');
+            out.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+    true
+}
+
+impl Key {
+    /// The key of a row given as all of its values, or `None` when a column of it is null. Two rows
+    /// have the same key exactly when this is the same for both.
+    #[must_use]
+    pub fn of_row(&self, row: &[Value]) -> Option<Box<[u8]>> {
+        let mut out = Vec::new();
+        for &column in &self.columns {
+            if !push(&row[column], &mut out) {
+                return None;
+            }
+        }
+        Some(out.into_boxed_slice())
+    }
 }
 
 /// `a: 1, b: x`, the way the pin names a key that is already there.

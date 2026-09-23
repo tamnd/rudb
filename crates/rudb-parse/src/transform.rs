@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, ColumnDef, CreateTable, CreateView, Cte, Distinct, DropTable, Expr,
-    ExprRef, Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody,
-    QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement,
-    StrRef, Target, Transaction, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec,
-    WindowUnit,
+    Ast, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, CreateTable, CreateView, Cte,
+    Distinct, DropTable, Expr, ExprRef, Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem,
+    Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice,
+    Source, SourceRef, Statement, StrRef, Target, Transaction, UnaryOp, WindowBound, WindowExclude,
+    WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -1079,10 +1079,9 @@ impl<'a> Transform<'a> {
     ///
     /// `RETURNING` is held as its own query, see [`Self::returning`].
     ///
-    /// `ON CONFLICT`, `BY NAME`, `BY POSITION`, `OR REPLACE` and the rest of the
-    /// clauses the grammar hangs off this are each a refusal, because every one of them changes
-    /// what the statement means and none of them changes it in a way anything downstream would
-    /// notice if it were dropped.
+    /// `BY NAME`, `BY POSITION` and `DEFAULT VALUES` are each a refusal, because every one of them
+    /// changes what the statement means and none of them changes it in a way anything downstream
+    /// would notice if it were dropped.
     fn insert_statement(&mut self, node: u32) -> Result<Statement> {
         for kid in self.kids(node) {
             if matches!(
@@ -1092,6 +1091,8 @@ impl<'a> Transform<'a> {
                     | "InsertValues"
                     | "WithClause"
                     | "ReturningClause"
+                    | "OrAction"
+                    | "OnConflictClause"
             ) {
                 continue;
             }
@@ -1118,9 +1119,90 @@ impl<'a> Transform<'a> {
         }
         let source = self.query(self.find(inner, "SelectStatementInternal"))?;
         let returning = self.returning(node, name, alias)?;
+        let conflict = self.conflict(node, name, alias)?;
         let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert { name, columns, source, returning });
+        self.ast.inserts.push(Insert { name, columns, source, returning, conflict });
         Ok(Statement::Insert(index))
+    }
+
+    /// `OrAction <- InsertOrReplace / InsertOrIgnore` and `OnConflictClause <- 'ON' 'CONFLICT'
+    /// OnConflictTarget? OnConflictAction`, or `None` when the statement has neither.
+    fn conflict(&mut self, node: u32, name: Slice, alias: StrRef) -> Result<Option<Conflict>> {
+        let or = self.find(node, "OrAction");
+        if or != NONE {
+            let action = match self.name(self.first(or)) {
+                "InsertOrReplace" => ConflictAction::Replace,
+                _ => ConflictAction::Nothing,
+            };
+            return Ok(Some(Conflict { target: Slice::default(), action }));
+        }
+        let clause = self.find(node, "OnConflictClause");
+        if clause == NONE {
+            return Ok(None);
+        }
+        let mut target = Slice::default();
+        let written = self.find(clause, "OnConflictTarget");
+        if written != NONE {
+            let inner = self.first(written);
+            if self.name(inner) != "OnConflictExpressionTarget" {
+                return self.unsupported(inner);
+            }
+            if self.find(inner, "WhereClause") != NONE {
+                return Err(Error::binder(
+                    "ON CONFLICT WHERE clause is only supported in DO UPDATE SET ... WHERE ...\nThe \
+                     WHERE clause after the conflict columns is used for partial indexes which \
+                     are not supported.",
+                ));
+            }
+            let mut found = Vec::new();
+            self.named_nodes(self.find(inner, "ColumnIdList"), "ColId", &mut found);
+            let names = found
+                .into_iter()
+                .map(|id| {
+                    let text = self.fold_identifier(self.text(id));
+                    self.intern(&text)
+                })
+                .collect();
+            target = self.part_slice(names);
+        }
+        let action = self.first(self.find(clause, "OnConflictAction"));
+        if self.name(action) == "OnConflictNothing" {
+            return Ok(Some(Conflict { target, action: ConflictAction::Nothing }));
+        }
+        let sets = self.set_clause(self.find(action, "UpdateSetClause"))?;
+        let filter = self.find(action, "WhereClause");
+        let condition = if filter == NONE {
+            self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
+        } else {
+            self.expr(self.find(filter, "Expression"))?
+        };
+        let mut targets = Vec::with_capacity(sets.len() + 1);
+        let mut columns = Vec::with_capacity(sets.len());
+        for (column, value) in sets {
+            columns.push(column);
+            targets.push(Target { expr: value, alias: NONE });
+        }
+        targets.push(Target { expr: condition, alias: NONE });
+        let targets = self.target_slice(targets);
+        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let excluded = self.intern("excluded");
+        let right =
+            self.push_source(Source::Table { name, alias: excluded, columns: Slice::default() });
+        let joined = self.push_source(Source::Join {
+            left,
+            right,
+            kind: JoinKind::Positional,
+            natural: false,
+            on: NONE,
+            using: Slice::default(),
+        });
+        let start = self.ast.source_lists.len() as u32;
+        self.ast.source_lists.push(joined);
+        let from = Slice { start, len: 1 };
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        let query = self.push_query(Query::bare(QueryBody::Select(select)));
+        let columns = self.part_slice(columns);
+        Ok(Some(Conflict { target, action: ConflictAction::Update { columns, query } }))
     }
 
     /// `ReturningClause <- 'RETURNING' TargetList`, as `SELECT list FROM table [AS alias]`, or
@@ -1169,7 +1251,11 @@ impl<'a> Transform<'a> {
         ) = (once.is_empty(), &statement)
         {
             let insert = self.ast.inserts[*index as usize];
-            for query in std::iter::once(insert.source).chain(insert.returning) {
+            let update = match insert.conflict.map(|conflict| conflict.action) {
+                Some(ConflictAction::Update { query, .. }) => Some(query),
+                _ => None,
+            };
+            for query in std::iter::once(insert.source).chain(insert.returning).chain(update) {
                 // Outermost first, so the statement's own come ahead of any the query wrote.
                 let own = self.ast.queries[query as usize].ctes;
                 let mut all = once.clone();
@@ -1190,10 +1276,15 @@ impl<'a> Transform<'a> {
         let name = self.name_parts(self.find(target, "BaseTableName"));
         let alias = self.find(target, "UpdateAlias");
         let alias = if alias == NONE { NONE } else { self.identifier(alias) };
-        let set = self.first(self.find(node, "UpdateSetClause"));
+        let sets = self.set_clause(self.find(node, "UpdateSetClause"))?;
+        self.changed_rows(node, name, alias, sets, false)
+    }
+
+    /// `UpdateSetClause`, as the columns it sets and the value each one gets.
+    fn set_clause(&mut self, node: u32) -> Result<Vec<(StrRef, ExprRef)>> {
+        let set = self.first(node);
         if self.name(set) == "UpdateSetTuple" {
-            let sets = self.set_tuple(set)?;
-            return self.changed_rows(node, name, alias, sets, false);
+            return self.set_tuple(set);
         }
         let mut sets = Vec::new();
         for element in self.kids(set).collect::<Vec<_>>() {
@@ -1206,7 +1297,7 @@ impl<'a> Transform<'a> {
             let value = self.expr(self.find(element, "Expression"))?;
             sets.push((written, value));
         }
-        self.changed_rows(node, name, alias, sets, false)
+        Ok(sets)
     }
 
     /// `UpdateSetTuple <- Parens(List(ColumnName)) '=' Expression`.
@@ -1383,7 +1474,7 @@ impl<'a> Transform<'a> {
         delete: bool,
     ) -> Statement {
         let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert { name, columns, source, returning });
+        self.ast.inserts.push(Insert { name, columns, source, returning, conflict: None });
         if delete { Statement::Delete(index) } else { Statement::Update(index) }
     }
 
@@ -4800,9 +4891,8 @@ mod tests {
     #[test]
     fn an_insert_clause_that_changes_the_answer_is_refused() {
         for query in [
-            "INSERT OR REPLACE INTO t VALUES (1)",
             "INSERT INTO t BY NAME SELECT 1 AS a",
-            "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+            "INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT c DO NOTHING",
             "INSERT INTO t DEFAULT VALUES",
         ] {
             let error = parse_ast(query).unwrap_err().to_string();

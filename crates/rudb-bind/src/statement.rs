@@ -161,6 +161,35 @@ pub struct Insert {
     /// The `RETURNING` list, bound as a query over the table and run over the rows the statement
     /// wrote in place of the table's own.
     pub returning: Option<Box<Plan>>,
+    /// What an append does with a row whose key the table already holds.
+    pub conflict: Option<Conflict>,
+}
+
+/// A bound `ON CONFLICT`, `INSERT OR REPLACE` or `INSERT OR IGNORE`.
+#[derive(Debug)]
+pub struct Conflict {
+    /// Which of the table's keys a clash is on, or `None` for any of them.
+    pub key: Option<usize>,
+    /// What happens to a row that clashes.
+    pub action: ConflictAction,
+}
+
+/// What happens to a row whose key the table already holds.
+#[derive(Debug)]
+pub enum ConflictAction {
+    /// The row is dropped.
+    Nothing,
+    /// The held row takes the new row's values in these columns.
+    Replace(Vec<usize>),
+    /// The held row takes the values the plan works out in these columns. The plan reads the held
+    /// rows as the table and the new rows as [`QualifiedName::excluded`], one of each per row it
+    /// answers, and after a value for each column answers whether the row is updated at all.
+    Update {
+        /// The columns that are set, by place in the table.
+        columns: Vec<usize>,
+        /// The query that works the values out.
+        plan: Box<Plan>,
+    },
 }
 
 /// What an [`Insert`]'s source means for the table.
@@ -339,7 +368,7 @@ fn create_table(
             // renames a prefix, so only this direction is an error.
             return Err(Error::binder("Target table has more colum names than query result."));
         }
-        let mut columns = Vec::with_capacity(scope.len());
+        let mut columns = Vec::with_capacity(scope.columns.len());
         for (at, column) in scope.columns.iter().enumerate() {
             let named = match defs.get(at) {
                 Some(def) => ast.string(def.name).to_string(),
@@ -739,7 +768,114 @@ fn insert(
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
     let source = finish(binder, root)?;
     let returning = returning(ast, catalog, parameters, session, written.returning)?;
-    Ok(Bound::Insert(Insert { name, source, write: Write::Append, returning }))
+    let conflict = match written.conflict {
+        Some(conflict) => {
+            Some(bind_conflict(ast, catalog, parameters, session, &name, &targets, conflict)?)
+        }
+        None => None,
+    };
+    Ok(Bound::Insert(Insert { name, source, write: Write::Append, returning, conflict }))
+}
+
+/// Which key an `ON CONFLICT` is about and what it does, refused the way the pin refuses one that
+/// names no key or leaves which key open when that matters.
+fn bind_conflict(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    name: &QualifiedName,
+    targets: &[usize],
+    conflict: ast::Conflict,
+) -> Result<Conflict> {
+    let table = catalog.table(name)?;
+    let fields = table.columns();
+    let keys = table.keys();
+    let key = if conflict.target.is_empty() {
+        if keys.is_empty() {
+            return Err(Error::binder(
+                "There are no UNIQUE/PRIMARY KEY constraints that refer to this table, specify ON \
+                 CONFLICT columns manually",
+            ));
+        }
+        match conflict.action {
+            ast::ConflictAction::Nothing => None,
+            _ if keys.len() > 1 => {
+                return Err(Error::binder(
+                    "Conflict target has to be provided for a DO UPDATE operation when the table \
+                     has multiple UNIQUE/PRIMARY KEY constraints",
+                ));
+            }
+            _ => Some(0),
+        }
+    } else {
+        let mut wanted = Vec::new();
+        for column in ast.name(conflict.target) {
+            let Some(at) = fields.iter().position(|field| same_name(&field.name, column)) else {
+                return Err(Error::binder(format!(
+                    "Table \"{}\" does not have a column with name \"{column}\"",
+                    name.table
+                )));
+            };
+            wanted.push(at);
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let found = keys.iter().position(|key| {
+            let mut held = key.columns.clone();
+            held.sort_unstable();
+            held == wanted
+        });
+        let Some(found) = found else {
+            return Err(Error::binder(
+                "The specified columns as conflict target are not referenced by a UNIQUE/PRIMARY \
+                 KEY CONSTRAINT or INDEX",
+            ));
+        };
+        Some(found)
+    };
+    let action = match conflict.action {
+        ast::ConflictAction::Nothing => ConflictAction::Nothing,
+        ast::ConflictAction::Replace => ConflictAction::Replace(targets.to_vec()),
+        ast::ConflictAction::Update { columns: written, query } => {
+            let mut columns = Vec::new();
+            for column in ast.name(written) {
+                let Some(at) = fields.iter().position(|field| same_name(&field.name, column))
+                else {
+                    return Err(Error::binder(format!(
+                        "Referenced update column {column} not found in table!"
+                    )));
+                };
+                if columns.contains(&at) {
+                    return Err(Error::binder(format!(
+                        "Multiple assignments to same column \"\"{column}\"\""
+                    )));
+                }
+                columns.push(at);
+            }
+            let mut binder = Binder::with(catalog, parameters, session);
+            binder.upsert = true;
+            let (root, scope) = binder.bind_query(ast, query)?;
+            // Each value is cast to its column's type here, so the write only has to place it,
+            // and the condition is cast to a boolean, so the write only has to test it.
+            let mut exprs = Vec::with_capacity(scope.columns.len());
+            let mut names = Vec::with_capacity(scope.columns.len());
+            for (at, column) in scope.columns.iter().enumerate() {
+                let expr =
+                    binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
+                let ty = columns.get(at).map_or(LogicalType::Boolean, |&to| fields[to].ty.clone());
+                exprs.push(binder.checked_cast_to(expr, &ty, false)?);
+                names.push(binder.plan_mut().intern(&column.name));
+            }
+            let exprs = binder.plan_mut().add_expr_list(&exprs);
+            let names = binder.plan_mut().add_name_list(&names);
+            let index = binder.fresh_index();
+            let root =
+                binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+            ConflictAction::Update { columns, plan: Box::new(finish(binder, root)?) }
+        }
+    };
+    Ok(Conflict { key, action })
 }
 
 /// An `UPDATE` or a `DELETE`, bound to the query that produces every row the table has afterwards.
@@ -832,5 +968,5 @@ fn change(
     let source = finish(binder, root)?;
     let returning = returning(ast, catalog, parameters, session, written.returning)?;
     let write = if delete { Write::Delete } else { Write::Update };
-    Ok(Bound::Insert(Insert { name, source, write, returning }))
+    Ok(Bound::Insert(Insert { name, source, write, returning, conflict: None }))
 }

@@ -256,6 +256,9 @@ pub(crate) struct Binder<'a> {
     /// A grouped block may need stored column order to close groups while it scans. Other queries
     /// leave the summaries in the file instead of reading every column's section while binding.
     want_ascending: bool,
+    /// Whether this binds the query of an `ON CONFLICT DO UPDATE`, whose `excluded` reads the new
+    /// rows rather than the table.
+    pub(crate) upsert: bool,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
     /// Set while an aggregate's `FILTER` is being bound, which is refused its own aggregate.
@@ -324,6 +327,7 @@ impl<'a> Binder<'a> {
             current_span: Span::new(0, 0),
             aggregation: None,
             want_ascending: false,
+            upsert: false,
             in_aggregate: false,
             in_filter: false,
             windows: Vec::new(),
@@ -593,6 +597,7 @@ impl<'a> Binder<'a> {
             ty: LogicalType::Varchar,
             not_null: false,
             key: None,
+            qualified: false,
             also: None,
         });
         Ok((node, scope))
@@ -658,6 +663,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: false,
                 key: None,
+                qualified: false,
                 also: None,
             });
         }
@@ -767,6 +773,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: false,
                 key: None,
+                qualified: false,
                 also: None,
             });
         }
@@ -818,6 +825,7 @@ impl<'a> Binder<'a> {
                 // column that refuses nulls on one side and takes them on the other takes them.
                 not_null: false,
                 key: None,
+                qualified: false,
                 also: None,
             });
         }
@@ -955,6 +963,7 @@ impl<'a> Binder<'a> {
                 ty: self.plan.expr_type(*expr).clone(),
                 not_null: self.passes_through(*expr, &input),
                 key: self.key_through(*expr, &input),
+                qualified: false,
                 also: None,
             });
         }
@@ -1051,6 +1060,7 @@ impl<'a> Binder<'a> {
                 ty,
                 not_null: output.columns[at].not_null,
                 key: output.columns[at].key,
+                qualified: false,
                 also: None,
             });
         }
@@ -1807,6 +1817,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: field.not_null,
                 key: None,
+                qualified: false,
                 also: None,
             });
         }
@@ -1855,6 +1866,9 @@ impl<'a> Binder<'a> {
     ) -> Result<(NodeRef, Scope)> {
         let table = self.catalog.table(resolved)?;
         let fields: Vec<Field> = table.columns().to_vec();
+        // The new rows of an `ON CONFLICT DO UPDATE`, which the write puts in a table of their own
+        // before it runs the query. Nothing the table knows about its own rows holds for them.
+        let excluded = self.upsert && same_name(&label, "excluded");
         // `PRI` for a column of the primary key and `UNI` for one of a unique key, the primary key
         // winning where a column is in both.
         let mut marks = vec![None; fields.len()];
@@ -1875,6 +1889,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: field.not_null,
                 key: marks[at],
+                qualified: excluded,
                 also: None,
             });
         }
@@ -1882,6 +1897,7 @@ impl<'a> Binder<'a> {
             let names: Vec<&str> = ast.name(columns).collect();
             scope.rename(&names, &label)?;
         }
+        let resolved = if excluded { &QualifiedName::excluded() } else { resolved };
         let catalog_name = self.plan.intern(&resolved.catalog);
         let schema = self.plan.intern(&resolved.schema);
         let table_name = self.plan.intern(&resolved.table);
@@ -1891,16 +1907,18 @@ impl<'a> Binder<'a> {
         // footer is. A table with nothing to say records nothing and the estimate falls back to the
         // constants it used before, which is what every table did until the file had a directory
         // worth asking.
-        if let Some(zones) = table.rows().zones() {
+        if let Some(zones) = table.rows().zones().filter(|_| !excluded) {
             self.plan.set_zones(index, zones);
         }
-        if let Some(frequencies) = table.frequencies() {
+        if let Some(frequencies) = table.frequencies().filter(|_| !excluded) {
             self.plan.set_frequencies(index, frequencies);
         }
         for (column, distinct) in table.distincts() {
-            self.plan.measure_distinct(index, &column, distinct);
+            if !excluded {
+                self.plan.measure_distinct(index, &column, distinct);
+            }
         }
-        if self.want_ascending {
+        if self.want_ascending && !excluded {
             for column in table.ascending() {
                 self.plan.mark_ascending(index, &column);
             }
@@ -2222,6 +2240,7 @@ impl<'a> Binder<'a> {
                 ty: field.ty.clone(),
                 not_null: false,
                 key: None,
+                qualified: false,
                 also: None,
             });
         }
@@ -2535,6 +2554,7 @@ impl<'a> Binder<'a> {
                 // cannot be null. The reference binary answers YES for every column of a Parquet.
                 not_null: false,
                 key: None,
+                qualified: false,
                 also: None,
             });
         }

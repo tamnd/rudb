@@ -263,6 +263,35 @@ pub struct Insert {
     /// The `RETURNING` list, held as `SELECT list FROM table [AS alias]` and run over the rows the
     /// statement wrote rather than over the table.
     pub returning: Option<QueryRef>,
+    /// What an `INSERT` does with a row whose key the table already holds, when it said.
+    pub conflict: Option<Conflict>,
+}
+
+/// `ON CONFLICT`, `INSERT OR REPLACE` or `INSERT OR IGNORE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Conflict {
+    /// The columns of the key the statement named, as a run of parts, empty when it named none.
+    pub target: Slice,
+    /// What happens to a row that clashes.
+    pub action: ConflictAction,
+}
+
+/// What happens to a row whose key is already held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAction {
+    /// `DO NOTHING` or `OR IGNORE`: the row is dropped.
+    Nothing,
+    /// `OR REPLACE`: the held row takes the new row's values in the columns the statement wrote.
+    Replace,
+    /// `DO UPDATE SET`, held as `SELECT values..., condition FROM table AS alias POSITIONAL JOIN
+    /// table AS excluded`, which the write runs with the held rows on the left and the new rows on
+    /// the right.
+    Update {
+        /// The columns that are set, as a run of parts, one for each value.
+        columns: Slice,
+        /// The query that works out the values and whether the row is updated at all.
+        query: QueryRef,
+    },
 }
 
 /// A `WITH name AS MATERIALIZED (query)`, which is run once and read wherever it is named.

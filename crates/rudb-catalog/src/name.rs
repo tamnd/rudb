@@ -32,6 +32,12 @@ pub struct QualifiedName {
 }
 
 impl QualifiedName {
+    /// Where an `ON CONFLICT DO UPDATE` keeps the new rows it reads as `excluded` while it runs.
+    #[must_use]
+    pub fn excluded() -> Self {
+        Self::new(crate::TEMP_CATALOG, crate::DEFAULT_SCHEMA, "__rudb_excluded")
+    }
+
     /// A name from its three parts.
     pub fn new(
         catalog: impl Into<String>,
