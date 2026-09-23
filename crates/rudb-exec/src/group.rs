@@ -1549,8 +1549,10 @@ impl<'a> Aggregate<'a> {
             coded_on.clear();
         }
         // Hashed unless the map answered the whole chunk, which is the ordinary case once the first
-        // rows of a row group have been through.
-        if !alone && direct.as_ref().is_none_or(|_| !missing.is_empty()) {
+        // rows of a row group have been through. A key read by value is not hashed here either,
+        // because the rows that missed are hashed one at a time below and they are a few dozen.
+        let one_at_a_time = prehashed.is_none() && direct.as_ref().is_some_and(|codes| codes.by_value());
+        if !alone && !one_at_a_time && direct.as_ref().is_none_or(|_| !missing.is_empty()) {
             match prehashed {
                 Some(prehashed) => {
                     hashes.clear();
@@ -1567,7 +1569,7 @@ impl<'a> Aggregate<'a> {
         // The rows the map had nothing for, which are the first row of each combination and no
         // others. They go through the probe and the insert every row used to go through, and what
         // comes back is written into the map so that the rest of the row group skips both.
-        if direct.is_some() {
+        if let Some(codes) = &direct {
             for &row in missing.iter() {
                 let index = coded_places[row];
                 // Two rows of one chunk can be the first two of one combination, and the first of
@@ -1576,7 +1578,8 @@ impl<'a> Aggregate<'a> {
                     slots[row] = coded_map[index];
                     continue;
                 }
-                let bucket = match table.probe(hashes[row], keys, row) {
+                let hash = if one_at_a_time { codes.hash_of(row) } else { hashes[row] };
+                let bucket = match table.probe(hash, keys, row) {
                     Probe::Found(slot) => {
                         slots[row] = slot;
                         coded_map[index] = slot;
@@ -1587,7 +1590,7 @@ impl<'a> Aggregate<'a> {
                 if self.max_groups.is_some_and(|limit| table.len() >= limit) {
                     continue;
                 }
-                slots[row] = table.insert(bucket, hashes[row], keys, row)?;
+                slots[row] = table.insert(bucket, hash, keys, row)?;
                 coded_map[index] = slots[row];
                 *groups = table.len();
                 self.fresh(states, counts, compact)?;

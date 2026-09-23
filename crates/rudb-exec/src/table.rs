@@ -1004,6 +1004,31 @@ impl<'a> Coded<'a> {
         self.combos
     }
 
+    /// Whether every key column is read by its value, so that [`Self::hash_of`] can answer a row.
+    pub(crate) fn by_value(&self) -> bool {
+        self.columns.iter().flatten().all(|column| matches!(column.places, Places::Values { .. }))
+    }
+
+    /// The hash [`hash`] gives `row`, worked out for that row alone.
+    ///
+    /// Only for a key [`Self::by_value`] says is read by value, which is a narrow integer in every
+    /// column, and for those [`hash`] folds each value in as its own word whatever form it came in.
+    /// So the caller can hash the rows that miss the map rather than every row of the chunk. On
+    /// `CounterID`, which arrives sorted, most chunks bring a few dozen values the map has not seen,
+    /// and hashing the whole of each such chunk was a sixth of what the group by cost.
+    pub(crate) fn hash_of(&self, row: usize) -> u64 {
+        let mut state = 0;
+        for column in self.columns.iter().flatten() {
+            let word = match column.places {
+                _ if column.nullable && column.column.is_null_at(row) => NOTHING,
+                Places::Values { values, .. } => values[row] as u64,
+                _ => NOTHING,
+            };
+            state = mix(state, word);
+        }
+        spread(state)
+    }
+
     /// Fills `places` with the index in the map of each row's key, one pass per key column.
     pub(crate) fn places(&self, rows: usize, places: &mut Vec<usize>) {
         places.clear();
@@ -1226,6 +1251,15 @@ fn window_of(
 /// The forms [`Vector::signed_block`] hands over as a block, and a filtered packed run, which is a
 /// packed code per row the filter kept. `false` for anything else, which is read the long way.
 fn signed_rows(key: &Vector, rows: usize, into: &mut Vec<i64>) -> bool {
+    // A value [`hash`] folds in as two words, which [`Coded::hash_of`] would fold in as one.
+    let wide = match key.logical_type() {
+        rudb_common::LogicalType::HugeInt | rudb_common::LogicalType::UHugeInt => true,
+        rudb_common::LogicalType::Decimal { width, .. } => wide_decimal(*width),
+        _ => false,
+    };
+    if wide {
+        return false;
+    }
     if let Some((at, values)) = key.dictionary_parts() {
         let (Some(packed), Some(at)) = (values.packed_parts(), at.get(..rows)) else {
             return false;
@@ -3960,6 +3994,31 @@ mod tests {
         let places = placed(&coded, 3);
         assert_eq!(places[0], places[2]);
         assert_eq!(places[1] - places[0], 262_029 - 62);
+    }
+
+    /// A row hashed on its own is the row hashed with its chunk, which is what lets a probe of one
+    /// find the groups the other put in the table.
+    #[test]
+    fn a_row_hashed_by_value_is_the_row_hashed_with_its_chunk() {
+        let page = packed_numbers(&[17, 262_029, 62, 62, -4], 18, -4);
+        let forms: Vec<Vec<Vector>> = vec![
+            vec![integers(&[Some(62), None, Some(-7), Some(62)])],
+            vec![packed_numbers(&[3, 900, 3, 70_000], 17, 3)],
+            vec![Vector::dictionary(vec![4, 1, 2, 3], page).expect("the rows a filter kept")],
+            vec![
+                integers(&[Some(1), Some(2), None, Some(1)]),
+                integers(&[Some(5), None, Some(5), Some(9)]),
+            ],
+        ];
+        for keys in &forms {
+            let mut values = Vec::new();
+            let coded = coded_within(keys, 4, &[], Some(&mut values)).expect("read by value");
+            assert!(coded.by_value());
+            let mut whole = Vec::new();
+            hash(keys, 4, &mut whole, Across::OneInput);
+            let alone: Vec<u64> = (0..4).map(|row| coded.hash_of(row)).collect();
+            assert_eq!(alone, whole, "{keys:?}");
+        }
     }
 
     /// Which rows `repeats` marks, asked with a threshold low enough that nothing is dropped for
