@@ -724,7 +724,7 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             // The copies point back into the bytes already replayed, which is the buffer the values
             // are going into, so the replay is the decode and there is nothing to cut up after it.
             let mut flat = Flat::with_capacity(count, total);
-            replay_literals(reader, &lengths, &offsets, &mut flat.bytes)?;
+            replay_literals(reader, &lengths, &offsets, total, &mut flat.bytes)?;
             if flat.bytes.len() != total {
                 return Err(Error::internal(format!(
                     "a matched chunk rebuilt {} bytes where its lengths add up to {total}",
@@ -765,6 +765,12 @@ impl Compressed<'_> {
     ///
     /// If there is no such run, if it runs off the end of the payload, or if it does not decompress.
     fn run_into(&self, index: usize, at: &mut usize, out: &mut Vec<u8>) -> Result<()> {
+        self.table.decompress(self.run(index, at)?, out)
+    }
+
+    /// The compressed bytes of run `index`, with `at` saying where the run starts and left where
+    /// the next one does.
+    fn run(&self, index: usize, at: &mut usize) -> Result<&[u8]> {
         let length = *self
             .lengths
             .get(index)
@@ -777,7 +783,7 @@ impl Compressed<'_> {
             .get(*at..end)
             .ok_or_else(|| Error::internal("a compressed run is past the end of its chunk"))?;
         *at = end;
-        self.table.decompress(run, out)
+        Ok(run)
     }
 }
 
@@ -822,23 +828,124 @@ fn replay_literals(
     reader: &mut Reader<'_>,
     lengths: &[i64],
     offsets: &[i64],
+    total: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     if reader.rest().first() == Some(&Kind::Fsst.tag()) {
         reader.u8()?;
         let runs = reader.u32()? as usize;
         let compressed = read_compressed(reader, runs)?;
-        let mut at = 0;
-        return lz::replay(
-            runs,
-            |index, into| compressed.run_into(index, &mut at, into),
-            lengths,
-            offsets,
-            out,
-        );
+        return replay_in_place(&compressed, lengths, offsets, total, out);
     }
     let literals = decode_chunk(reader)?;
     lz::rebuild_into(&literals, lengths, offsets, out)
+}
+
+/// Room past the end of a replay, for the stores that write whole words past where a value ends.
+///
+/// A symbol is stored as eight bytes and a copy as sixteen at a time, and each is followed by a
+/// step of the cursor to where the bytes it meant end. What lands past that is written over by
+/// whatever comes next, or cut off at the end.
+const REPLAY_SLACK: usize = 16;
+
+/// [`lz::replay`] over compressed literal runs, into a buffer made the length of the output first.
+///
+/// The output length is known before a byte is decoded, because the chunk stores the length of
+/// every value. So the buffer is sized once and written through a cursor, and a symbol or a copy is
+/// a fixed width store rather than a push that checks capacity and moves a length. The copies were
+/// the reason: on ClickBench `URL` a block of a thousand values replays about eight thousand seven
+/// hundred of them, most of them a few tens of bytes, and each one was a call into `memmove`.
+///
+/// # Errors
+///
+/// As [`lz::replay`], and if the tokens build more than `total` bytes.
+fn replay_in_place(
+    compressed: &Compressed<'_>,
+    lengths: &[i64],
+    offsets: &[i64],
+    total: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let runs = compressed.lengths.len();
+    if runs != lengths.len() || lengths.len() != offsets.len() {
+        return Err(Error::internal(format!(
+            "a matched chunk has {runs} literal runs, {} lengths and {} offsets",
+            lengths.len(),
+            offsets.len()
+        )));
+    }
+    let base = out.len();
+    let room = total
+        .checked_add(REPLAY_SLACK)
+        .ok_or_else(|| Error::internal("a string chunk longer than memory"))?;
+    out.resize(base + room, 0);
+    let mut read = 0;
+    let mut at = base;
+    for (index, (&length, &offset)) in lengths.iter().zip(offsets).enumerate() {
+        at = compressed.table.decompress_at(compressed.run(index, &mut read)?, out, at)?;
+        let length =
+            usize::try_from(length).map_err(|_| Error::internal("a negative copy length"))?;
+        if length == 0 {
+            continue;
+        }
+        let offset =
+            usize::try_from(offset).map_err(|_| Error::internal("a negative copy offset"))?;
+        at = copy_back(out, base, at, offset, length)?;
+    }
+    if at > base + total {
+        return Err(Error::internal(format!(
+            "a matched chunk rebuilt {} bytes where its lengths add up to {total}",
+            at - base
+        )));
+    }
+    out.truncate(at);
+    Ok(())
+}
+
+/// Copies `length` bytes from `offset` back to `at`, handing back where the copy ends.
+///
+/// Sixteen bytes at a time where the copy starts at least sixteen bytes back, since then no store
+/// reads a byte it has not been given yet, and eight at a time where it starts eight back. Nearer
+/// than that the copy is repeating a short run and goes a byte at a time, the way it always did.
+/// The whole width stores need room past the end of the copy, and a copy near the end of the buffer
+/// that does not have it goes a byte at a time too.
+fn copy_back(
+    out: &mut [u8],
+    base: usize,
+    at: usize,
+    offset: usize,
+    length: usize,
+) -> Result<usize> {
+    if offset == 0 || offset > at - base {
+        return Err(Error::internal(format!(
+            "a copy reaches {offset} bytes back into {} bytes of output",
+            at - base
+        )));
+    }
+    let end = at
+        .checked_add(length)
+        .filter(|&end| end <= out.len())
+        .ok_or_else(|| Error::internal("a matched chunk rebuilds more than its lengths say"))?;
+    let from = at - offset;
+    let wide = end + REPLAY_SLACK <= out.len();
+    if wide && offset >= 16 {
+        let mut step = 0;
+        while step < length {
+            out.copy_within(from + step..from + step + 16, at + step);
+            step += 16;
+        }
+    } else if wide && offset >= 8 {
+        let mut step = 0;
+        while step < length {
+            out.copy_within(from + step..from + step + 8, at + step);
+            step += 8;
+        }
+    } else {
+        for step in 0..length {
+            out[at + step] = out[from + step];
+        }
+    }
+    Ok(end)
 }
 
 fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
@@ -1286,6 +1393,29 @@ mod tests {
 
         let buffered = describe(&round_trip(&keyed(urls(300)))).unwrap();
         assert!(buffered.starts_with("LZ(") && buffered.contains(", PLAIN("), "{buffered}");
+    }
+
+    #[test]
+    fn a_copy_back_writes_what_a_byte_at_a_time_copy_writes_at_every_distance() {
+        // The wide stores read bytes the same copy wrote a step earlier once the copy is longer
+        // than its distance, so every distance either side of eight and sixteen is checked against
+        // the plain loop, at lengths that end short of, on and past a whole store.
+        let seed: Vec<u8> = (0..40u8).map(|byte| byte.wrapping_mul(37).wrapping_add(11)).collect();
+        for offset in 1..=seed.len() {
+            for length in 1..=50 {
+                let mut wanted = seed.clone();
+                for _ in 0..length {
+                    wanted.push(wanted[wanted.len() - offset]);
+                }
+                let mut out = seed.clone();
+                out.resize(seed.len() + length + REPLAY_SLACK, 0);
+                let end = copy_back(&mut out, 0, seed.len(), offset, length).unwrap();
+                assert_eq!(&out[..end], wanted.as_slice(), "offset {offset} length {length}");
+            }
+        }
+        let mut short = vec![1, 2, 3, 0];
+        assert!(copy_back(&mut short, 0, 3, 1, 2).is_err(), "past the end of the buffer");
+        assert!(copy_back(&mut short, 0, 3, 4, 1).is_err(), "further back than the output");
     }
 
     #[test]
