@@ -1960,8 +1960,9 @@ impl Writer {
             sieves: Vec::with_capacity(columns.len()),
             ranges: Vec::with_capacity(columns.len()),
         };
+        let mut remembered = Remembered::default();
         for &column in columns {
-            let bytes = encode(column)?;
+            let bytes = encode(column, &mut remembered)?;
             if bytes.len() > MAX_PAGE {
                 return Err(invalid("column page exceeds the configured bound"));
             }
@@ -7296,6 +7297,7 @@ fn cascaded(
     flat: &Vector,
     ty: &LogicalType,
     packed: Option<&Packed<'_>>,
+    remembered: &mut Remembered,
 ) -> Result<Option<Vec<u8>>> {
     let (Some(width), Some(data)) = (plain_width(ty), flat.data()) else { return Ok(None) };
     let Some(values) = widened(data) else { return Ok(None) };
@@ -7305,8 +7307,69 @@ fn cascaded(
         Some(packed) => plain.min(21 + size_of_val(packed.words())),
         None => plain,
     };
-    let out = integer::encode_with(&values, &Fixed)?;
+    let out = match remembered.shaped(&values)? {
+        Some(out) => out,
+        None => remembered.search(&values)?,
+    };
     Ok((out.len() < best).then_some(out))
+}
+
+/// What the search found on the last part of a column it was asked about, so the parts after it
+/// can be encoded the same way without asking again.
+///
+/// The parts of one column in one stripe are the same column a few thousand rows further on, and
+/// they nearly always come out the same shape. On the 10m ClickBench load the integer cascade was
+/// 28 percent of the load's CPU, and most of that was the search encoding candidates it then threw
+/// away: [`Fixed`] offers up to six at the top and three at each level under it.
+///
+/// A part is searched again when its shape no longer applies, when the shape costs more than a
+/// tenth more a row than it did on the part it was found on, and every [`RESEARCH_EVERY`] parts
+/// whatever happens, because a column that got cheaper under its old shape may have got cheaper
+/// still under another one and nothing else would notice. What a remembered shape can cost is size
+/// and never correctness, since a shape that applies decodes.
+#[derive(Debug, Default)]
+struct Remembered {
+    shape: Option<integer::Shape>,
+    /// The bytes and rows of the part the shape was found on.
+    bytes: usize,
+    rows: usize,
+    /// How many parts have used the shape since it was found.
+    since: usize,
+}
+
+/// How many parts may use a remembered shape before one is searched again regardless.
+const RESEARCH_EVERY: usize = 16;
+
+impl Remembered {
+    /// `values` in the remembered shape, or `None` when they should be searched instead.
+    fn shaped(&mut self, values: &[i64]) -> Result<Option<Vec<u8>>> {
+        let Some(shape) = &self.shape else { return Ok(None) };
+        if self.since >= RESEARCH_EVERY || values.is_empty() {
+            return Ok(None);
+        }
+        let Some(out) = integer::encode_shaped(values, shape)? else { return Ok(None) };
+        // Within a tenth of the bytes a row the search got, in integers so a part of one row
+        // against one of thousands is not a question of rounding.
+        let fits = out.len().saturating_mul(self.rows).saturating_mul(10)
+            <= self.bytes.saturating_mul(values.len()).saturating_mul(11);
+        if !fits {
+            return Ok(None);
+        }
+        self.since += 1;
+        Ok(Some(out))
+    }
+
+    /// `values` searched, with what the search found remembered for the parts after them.
+    fn search(&mut self, values: &[i64]) -> Result<Vec<u8>> {
+        let out = integer::encode_with(values, &Fixed)?;
+        *self = Self {
+            shape: Some(integer::shape_of(&out)?),
+            bytes: out.len(),
+            rows: values.len(),
+            since: 0,
+        };
+        Ok(out)
+    }
 }
 
 /// A part's dictionary codes through the integer cascade, or `None` when the cascade did not pay.
@@ -7417,7 +7480,7 @@ fn coded_page(codes: &[u32], validity: &[u8]) -> Result<Vec<u8>> {
 
 /// One part of one column as a page, for every column that is not coded against a global
 /// dictionary. Those are built by [`coded_page`] from codes [`prepare`] handed out.
-fn encode(vector: &Vector) -> Result<Vec<u8>> {
+fn encode(vector: &Vector, remembered: &mut Remembered) -> Result<Vec<u8>> {
     let ty = vector.logical_type();
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
@@ -7433,7 +7496,8 @@ fn encode(vector: &Vector) -> Result<Vec<u8>> {
     // Only where nothing else has claimed the page, which is the plain integer case. A packed part
     // is still on the table because the cascade has to beat it too: the bit pack takes a part only
     // when it halves it, so a column that shrinks by a third was coming out whole.
-    let cascade = if dictionary.is_none() { cascaded(&flat, ty, packed.as_ref())? } else { None };
+    let cascade =
+        if dictionary.is_none() { cascaded(&flat, ty, packed.as_ref(), remembered)? } else { None };
     out.push(if cascade.is_some() {
         5
     } else if dictionary.is_some() {
@@ -9101,6 +9165,45 @@ mod tests {
         assert_eq!(checksum(b""), 0xef46_db37_51d8_e999);
         assert_eq!(checksum(b"a"), 0xd24e_c4f1_a98c_6e5b);
         assert_eq!(checksum(b"abc"), 0x44bc_2cf5_ad77_0999);
+    }
+
+    #[test]
+    fn a_remembered_shape_is_used_until_it_stops_paying() {
+        let climbing = |from: i64| (from..from + 2048).map(|at| at * 1000).collect::<Vec<_>>();
+        let mut remembered = Remembered::default();
+        assert_eq!(
+            remembered.shaped(&climbing(0)).expect("encode"),
+            None,
+            "nothing to remember yet"
+        );
+        let searched = remembered.search(&climbing(0)).expect("encode");
+        let shape = remembered.shape.clone().expect("a shape");
+        for part in 1..=RESEARCH_EVERY as i64 {
+            let values = climbing(part * 2048);
+            let out = remembered.shaped(&values).expect("encode").expect("the same shape pays");
+            assert_eq!(integer::decode(&out).expect("decode"), values);
+            assert_eq!(out.len(), searched.len(), "the same shape on the same kind of part");
+        }
+        assert_eq!(
+            remembered.shaped(&climbing(99_999)).expect("encode"),
+            None,
+            "searched again after {RESEARCH_EVERY} parts"
+        );
+
+        // Noise costs far more a row under the shape found on a climbing column, so it is searched.
+        remembered.search(&climbing(0)).expect("encode");
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let noise = (0..2048)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 20) as i64
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remembered.shaped(&noise).expect("encode"), None);
+        remembered.search(&noise).expect("encode");
+        assert_ne!(remembered.shape, Some(shape), "the noise found a shape of its own");
     }
 
     #[test]

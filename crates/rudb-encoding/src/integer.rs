@@ -225,7 +225,7 @@ pub fn describe_prefix(bytes: &[u8]) -> Result<(String, usize)> {
 pub fn candidate_sizes(values: &[i64]) -> Result<Vec<(Kind, usize)>> {
     let mut sizes = Vec::new();
     for kind in candidates(values, 0) {
-        if let Some(bytes) = encode_as(kind, values, 0, &EXHAUSTIVE)? {
+        if let Some(bytes) = encode_as(kind, values, 0, Inner::Search(&EXHAUSTIVE))? {
             sizes.push((kind, bytes.len()));
         }
     }
@@ -254,7 +254,7 @@ pub fn offered(values: &[i64]) -> Vec<Kind> {
 ///
 /// As [`encode`].
 pub fn encode_only(kind: Kind, values: &[i64]) -> Result<Option<Vec<u8>>> {
-    encode_as(kind, values, 0, &EXHAUSTIVE)
+    encode_as(kind, values, 0, Inner::Search(&EXHAUSTIVE))
 }
 
 /// How big one candidate comes out, which is all a sampling chooser needs from it.
@@ -262,7 +262,7 @@ pub fn encode_only(kind: Kind, values: &[i64]) -> Result<Option<Vec<u8>>> {
 /// The bytes are thrown away, so this says nothing [`encode_only`] does not. It is `pub(crate)` and
 /// separate so that the sampler in [`crate::chooser`] is not handing back buffers it will not read.
 pub(crate) fn size_as(kind: Kind, values: &[i64], depth: u8) -> Result<Option<usize>> {
-    Ok(encode_as(kind, values, depth, &EXHAUSTIVE)?.map(|bytes| bytes.len()))
+    Ok(encode_as(kind, values, depth, Inner::Search(&EXHAUSTIVE))?.map(|bytes| bytes.len()))
 }
 
 /// The cascade a chunk was encoded as, as a line of text like `DICT(PACKED, PACKED)`.
@@ -275,11 +275,77 @@ pub fn describe(bytes: &[u8]) -> Result<String> {
     describe_chunk(&mut reader)
 }
 
+/// The cascade a chunk was encoded as, kind by kind, without the numbers.
+///
+/// A column's next chunk usually wants what its last one got. A timestamp column that came out as
+/// deltas bit packed comes out that way chunk after chunk, and a search that finds so every time
+/// spends most of an encode on candidates it throws away. A shape is what the search found, taken
+/// out of the bytes it wrote with [`shape_of`], so that [`encode_shaped`] can go straight to it on
+/// the next chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shape {
+    kind: Kind,
+    inner: Vec<Shape>,
+}
+
+impl Shape {
+    /// What the outermost level is.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+}
+
+/// The shape of a chunk written by [`encode`] or [`encode_with`].
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn shape_of(bytes: &[u8]) -> Result<Shape> {
+    let mut reader = Reader::new(bytes);
+    shape_chunk(&mut reader)
+}
+
+/// A chunk encoded the way `shape` says at every level, with no search at any of them.
+///
+/// `None` when some level of the shape does not apply to these values: a constant over values that
+/// differ, deltas that do not fit, or a stride the values do not have. The caller searches then. A
+/// shape that applies always decodes, since each level is the same `encode_as` the search runs and
+/// only the choice of kind is taken from the shape, but it can come out larger than a search would
+/// have, which is for the caller to notice.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_shaped(values: &[i64], shape: &Shape) -> Result<Option<Vec<u8>>> {
+    encode_as(shape.kind, values, 0, Inner::Shaped(&shape.inner))
+}
+
+/// How the chunks inside a chunk are encoded: searched afresh, or as a shape already says.
+#[derive(Clone, Copy)]
+enum Inner<'a> {
+    Search(&'a dyn Chooser),
+    Shaped(&'a [Shape]),
+}
+
+impl Inner<'_> {
+    /// The `index`th chunk inside a chunk at `depth`, or `None` when its shape does not apply.
+    fn encode(self, index: usize, values: &[i64], depth: u8) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Search(chooser) => encode_at(values, depth + 1, chooser).map(Some),
+            Self::Shaped(shapes) => match shapes.get(index) {
+                Some(shape) => encode_as(shape.kind, values, depth + 1, Self::Shaped(&shape.inner)),
+                None => Ok(None),
+            },
+        }
+    }
+}
+
 fn encode_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
     let offered = candidates(values, depth);
     let mut best: Option<Vec<u8>> = None;
     for kind in chooser.narrow_integers(values, &offered, depth) {
-        let Some(bytes) = encode_as(kind, values, depth, chooser)? else {
+        let Some(bytes) = encode_as(kind, values, depth, Inner::Search(chooser))? else {
             continue;
         };
         if best.as_ref().is_none_or(|current| bytes.len() < current.len()) {
@@ -333,12 +399,7 @@ fn candidates(values: &[i64], depth: u8) -> Vec<Kind> {
 
 /// `None` when the encoding does not apply to this input, which the caller treats as a candidate
 /// that did not run rather than as a failure.
-fn encode_as(
-    kind: Kind,
-    values: &[i64],
-    depth: u8,
-    chooser: &dyn Chooser,
-) -> Result<Option<Vec<u8>>> {
+fn encode_as(kind: Kind, values: &[i64], depth: u8, inner: Inner<'_>) -> Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     put_u8(&mut out, kind.tag());
     put_u32(&mut out, u32::try_from(values.len()).map_err(|_| too_long(values.len()))?);
@@ -361,15 +422,18 @@ fn encode_as(
                 return Ok(None);
             };
             put_i64(&mut out, *first);
-            out.extend_from_slice(&encode_at(&deltas, depth + 1, chooser)?);
+            let Some(deltas) = inner.encode(0, &deltas, depth)? else { return Ok(None) };
+            out.extend_from_slice(&deltas);
         }
         Kind::Rle => {
             let (run_values, run_lengths) = runs(values);
             if run_values.is_empty() {
                 return Ok(None);
             }
-            out.extend_from_slice(&encode_at(&run_values, depth + 1, chooser)?);
-            out.extend_from_slice(&encode_at(&run_lengths, depth + 1, chooser)?);
+            let Some(run_values) = inner.encode(0, &run_values, depth)? else { return Ok(None) };
+            let Some(run_lengths) = inner.encode(1, &run_lengths, depth)? else { return Ok(None) };
+            out.extend_from_slice(&run_values);
+            out.extend_from_slice(&run_lengths);
         }
         Kind::Dict => {
             let dictionary = distinct_values(values);
@@ -377,8 +441,10 @@ fn encode_as(
                 return Ok(None);
             }
             let codes = codes_over(values, &dictionary);
-            out.extend_from_slice(&encode_at(&dictionary, depth + 1, chooser)?);
-            out.extend_from_slice(&encode_at(&codes, depth + 1, chooser)?);
+            let Some(dictionary) = inner.encode(0, &dictionary, depth)? else { return Ok(None) };
+            let Some(codes) = inner.encode(1, &codes, depth)? else { return Ok(None) };
+            out.extend_from_slice(&dictionary);
+            out.extend_from_slice(&codes);
         }
         Kind::Sparse => {
             let Some((value, _)) = spread_of(values).1 else {
@@ -397,8 +463,10 @@ fn encode_as(
                 &mut out,
                 u32::try_from(positions.len()).map_err(|_| too_long(positions.len()))?,
             );
-            out.extend_from_slice(&encode_at(&positions, depth + 1, chooser)?);
-            out.extend_from_slice(&encode_at(&exceptions, depth + 1, chooser)?);
+            let Some(positions) = inner.encode(0, &positions, depth)? else { return Ok(None) };
+            let Some(exceptions) = inner.encode(1, &exceptions, depth)? else { return Ok(None) };
+            out.extend_from_slice(&positions);
+            out.extend_from_slice(&exceptions);
         }
         Kind::Strided => {
             let (Some(base), Some(stride)) = (values.iter().min().copied(), stride_of(values))
@@ -419,7 +487,8 @@ fn encode_as(
             }
             put_i64(&mut out, base);
             put_u64(&mut out, stride);
-            out.extend_from_slice(&encode_at(&steps, depth + 1, chooser)?);
+            let Some(steps) = inner.encode(0, &steps, depth)? else { return Ok(None) };
+            out.extend_from_slice(&steps);
         }
     }
     Ok(Some(out))
@@ -884,6 +953,49 @@ fn describe_chunk(reader: &mut Reader<'_>) -> Result<String> {
     })
 }
 
+/// What [`describe_chunk`] walks, kept as kinds rather than turned into text.
+fn shape_chunk(reader: &mut Reader<'_>) -> Result<Shape> {
+    let kind = Kind::from_tag(reader.u8()?)?;
+    let count = reader.u32()? as usize;
+    let inner = match kind {
+        Kind::Constant => {
+            reader.i64()?;
+            Vec::new()
+        }
+        Kind::Packed => {
+            let mut seen = 0;
+            while seen < count {
+                reader.i64()?;
+                let width = reader.u8()? as usize;
+                let wanted = (count - seen).min(VALUES);
+                if wanted == VALUES {
+                    reader.bytes(bitpack::packed_len::<u64>(width) * 8)?;
+                } else {
+                    reader.bytes(bitpack::tail_len(wanted, width))?;
+                }
+                seen += wanted;
+            }
+            Vec::new()
+        }
+        Kind::Delta => {
+            reader.i64()?;
+            vec![shape_chunk(reader)?]
+        }
+        Kind::Rle | Kind::Dict => vec![shape_chunk(reader)?, shape_chunk(reader)?],
+        Kind::Sparse => {
+            reader.i64()?;
+            reader.u32()?;
+            vec![shape_chunk(reader)?, shape_chunk(reader)?]
+        }
+        Kind::Strided => {
+            reader.i64()?;
+            reader.u64()?;
+            vec![shape_chunk(reader)?]
+        }
+    };
+    Ok(Shape { kind, inner })
+}
+
 /// The step every value of the chunk is a whole number of, or `None` when there is not one worth
 /// having.
 ///
@@ -1182,6 +1294,67 @@ mod tests {
             }
             assert_eq!(smallest.as_deref(), Some(chosen.as_slice()), "{}", values.len());
         }
+    }
+
+    /// Columns of each shape the search arrives at, so that a shape test sees every kind.
+    fn shaped_columns() -> Vec<Vec<i64>> {
+        let mut random = Random::new();
+        let noise: Vec<i64> = (0..3000).map(|_| (random.next() % 5000) as i64).collect();
+        let runs: Vec<i64> = (0..3000).map(|index: i64| index / 100).collect();
+        let climbing: Vec<i64> = (0..3000).map(|index| 1_700_000_000 + index * 3).collect();
+        let seconds: Vec<i64> = (0..3000)
+            .map(|_| 1_374_000_000_000_000 + (random.next() % 86_400) as i64 * 1_000_000)
+            .collect();
+        let mostly: Vec<i64> =
+            (0..3000).map(|index| if index % 97 == 0 { index } else { -4 }).collect();
+        let few: Vec<i64> =
+            (0..3000).map(|_| [3, 900, 17, 40_000][(random.next() % 4) as usize]).collect();
+        vec![noise, runs, climbing, seconds, mostly, few, vec![7; 300], vec![5], Vec::new()]
+    }
+
+    #[test]
+    fn a_chunk_encoded_to_its_own_shape_is_the_chunk_the_search_wrote() {
+        let mut kinds = Vec::new();
+        for values in shaped_columns() {
+            let searched = encode(&values).unwrap();
+            let shape = shape_of(&searched).unwrap();
+            kinds.push(shape.kind());
+            let shaped = encode_shaped(&values, &shape).unwrap().expect("its own shape applies");
+            assert_eq!(shaped, searched, "{}", describe(&searched).unwrap());
+        }
+        for kind in [
+            Kind::Constant,
+            Kind::Packed,
+            Kind::Delta,
+            Kind::Rle,
+            Kind::Dict,
+            Kind::Sparse,
+            Kind::Strided,
+        ] {
+            assert!(kinds.contains(&kind), "no column came out as {kind:?}: {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn a_shape_from_one_chunk_decodes_on_another_or_says_it_does_not_apply() {
+        let columns = shaped_columns();
+        let mut applied = 0;
+        let mut refused = 0;
+        for from in &columns {
+            let shape = shape_of(&encode(from).unwrap()).unwrap();
+            for values in &columns {
+                match encode_shaped(values, &shape).unwrap() {
+                    Some(bytes) => {
+                        assert_eq!(&decode(&bytes).unwrap(), values, "{shape:?}");
+                        applied += 1;
+                    }
+                    None => refused += 1,
+                }
+            }
+        }
+        assert!(applied > 0 && refused > 0, "{applied} applied and {refused} refused");
+        let constant = shape_of(&encode(&[7; 300]).unwrap()).unwrap();
+        assert_eq!(encode_shaped(&[1, 2], &constant).unwrap(), None);
     }
 
     #[test]
