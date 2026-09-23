@@ -93,3 +93,35 @@ fn a_sort_that_does_not_fit_spills_and_answers_the_same_thing() {
         "the spilled sort is in the same order as the one that fitted"
     );
 }
+
+/// A long string column sorted on several threads, where it is laid in ranges of rows a thread
+/// each, answers what it answers laid whole on one thread.
+///
+/// The key puts the rows in seven runs, which is the shape a sort writes through the inverse, and
+/// 800,000 rows is enough for the comment to be split into three ranges. The strings are long ones
+/// in an arena, short ones inside their views and nulls, and each says which row it belongs to, so
+/// a string that ended up on the wrong row or with the wrong bytes shows up as well as a wrong order.
+#[test]
+fn a_string_column_laid_in_ranges_matches_one_laid_whole() {
+    let sorted = "CREATE TABLE s AS SELECT r, CASE WHEN r % 97 = 0 THEN NULL WHEN r % 5 = 0 \
+                  THEN CAST(r AS VARCHAR) ELSE 'a string long enough to leave its view ' || r END \
+                  AS c FROM range(800000) AS t(r) ORDER BY r % 7, r";
+    let digest = "SELECT sum(pos * r) FROM (SELECT r, row_number() OVER () AS pos FROM s)";
+    let wrong = "SELECT count(*) FROM s WHERE c IS DISTINCT FROM (CASE WHEN r % 97 = 0 THEN NULL \
+                 WHEN r % 5 = 0 THEN CAST(r AS VARCHAR) \
+                 ELSE 'a string long enough to leave its view ' || r END)";
+
+    let split = Database::new();
+    split.execute("SET threads=4").expect("sets the thread count");
+    split.execute(sorted).expect("sorts on four threads");
+    let whole = Database::new();
+    whole.execute("SET threads=1").expect("sets the thread count");
+    whole.execute(sorted).expect("sorts on one thread");
+
+    assert_eq!(split.value(wrong).expect("reads").to_string(), "0", "every string on its row");
+    assert_eq!(
+        split.value(digest).expect("reads").to_string(),
+        whole.value(digest).expect("reads").to_string(),
+        "the same order either way"
+    );
+}
