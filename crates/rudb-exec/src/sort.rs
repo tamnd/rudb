@@ -27,7 +27,7 @@
 //! Not in the sort. The chunks are kept as they arrived and a row is a chunk and a row in it, so
 //! what the comparator moves is the keys and two pairs of numbers rather than a copy of every
 //! column. The columns are moved once at the end, by [`lay`], which lays each column's pieces end
-//! to end and reads them back in sorted order with [`interleave`], a typed copy per physical layout.
+//! to end and reads them back in sorted order with [`interleave`](rudb_vector::interleave), a typed copy per physical layout.
 //!
 //! This used to hold a `Vec<Value>` of the whole row per row. Sorting lineitem at SF1 on three
 //! keys cost 197 billion instructions that way, of which most were the allocator: sixteen columns
@@ -109,7 +109,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
-use rudb_vector::{Chunk, VECTOR_SIZE, Vector, interleave};
+use rudb_vector::{Chunk, VECTOR_SIZE, Vector, interleave_placed};
 
 use crate::merged::{ORDER, Sorted, order_of, ordering};
 use crate::normal::{self, Normal};
@@ -657,8 +657,10 @@ impl Sink for Sort {
         let taken = rows.footprint();
         drop(rows);
         give(&mut charged, taken);
+        let inverse = placed(&order, threads)?;
+        let order = Placing { order: &order, inverse: inverse.as_deref() };
         let mut held = self.held.lock().map_err(poisoned)?;
-        let out = gathered(&self.types, chunks, &order, total, &mut held, &mut charged, threads)?;
+        let out = gathered(&self.types, chunks, order, total, &mut held, &mut charged, threads)?;
         self.out.hold(out)?;
         Ok(())
     }
@@ -867,7 +869,7 @@ fn give(charged: &mut Vec<Reservation>, mut bytes: u64) {
 ///
 /// This is where the sort stops being row shaped. The order is a permutation of the rows that
 /// arrived, so what each column needs is for its values to be written out in that order, and
-/// [`interleave`] is exactly that: the pieces are laid end to end and read back through the order,
+/// [`interleave`](rudb_vector::interleave) is exactly that: the pieces are laid end to end and read back through the order,
 /// one typed copy per physical layout rather than a `Value` a field. A string moves as sixteen
 /// bytes of view over an arena its bytes were copied into once.
 ///
@@ -900,7 +902,7 @@ fn lay(
         return Ok(());
     }
     for (ty, pieces) in types.iter().zip(transposed(types, chunks)?) {
-        let (whole, given) = column(ty, pieces, order)?;
+        let (whole, given) = column(ty, pieces, Placing { order, inverse: None })?;
         give(charged, given);
         each(&whole)?;
     }
@@ -921,9 +923,57 @@ fn transposed(types: &[LogicalType], chunks: Vec<Chunk>) -> Result<Vec<Vec<Vecto
     Ok(pieces)
 }
 
+/// Where every row of the answer comes from, and where every row laid goes when that is known.
+#[derive(Clone, Copy)]
+struct Placing<'a> {
+    order: &'a [usize],
+    inverse: Option<&'a [u32]>,
+}
+
+/// The most ascending runs an order can be made of for the columns to be written through its
+/// inverse rather than read through it.
+///
+/// Writing a column through the inverse reads it front to back and writes a stream per run, so it
+/// wins while every run's stream stays in cache and loses once the runs are a few rows each. In a
+/// standalone test of twelve columns on twelve threads over six million rows it was three times
+/// faster at 84 runs and at 8,000, even at 64,000, and slower at a million.
+const PLACED_RUNS: usize = 16 * 1024;
+
+/// The place in the answer of every row laid, when `order` is made of few enough ascending runs
+/// for writing through it to be the cheaper way round, see [`interleave_placed`].
+///
+/// The runs are the shape a sort by a coarse key over rows that arrived in the order of a finer
+/// one has. SF1 `lineitem` sorted by ship month arrives in order key order, so the answer is 84
+/// runs, one a month, and consecutive rows of the answer are about 84 rows apart in the input.
+///
+/// Turned round a range of rows laid per thread, each thread reading all of `order` and keeping
+/// the places of its own range. That reads `order` once a thread, which is cheap next to writing
+/// the places in random order into one shared run, and it keeps every write in memory the thread
+/// owns.
+fn placed(order: &[usize], threads: &Lease<'_>) -> Result<Option<Vec<u32>>> {
+    let runs = 1 + order.windows(2).filter(|pair| pair[1] < pair[0]).count();
+    if runs > PLACED_RUNS || u32::try_from(order.len()).is_err() {
+        return Ok(None);
+    }
+    let rows = order.len();
+    let per = rows.div_ceil(threads.degree().max(1)).max(1);
+    let parts =
+        in_parallel(threads, rows.div_ceil(per), threads.degree(), "turned order", |part| {
+            let first = part * per;
+            let mut out = vec![0u32; per.min(rows - first)];
+            for (at, &row) in order.iter().enumerate() {
+                if let Some(slot) = row.checked_sub(first).and_then(|offset| out.get_mut(offset)) {
+                    *slot = at as u32;
+                }
+            }
+            Ok(out)
+        })?;
+    Ok(Some(parts.concat()))
+}
+
 /// One column laid in sorted order, and how many bytes of input dropping its pieces gave back.
-fn column(ty: &LogicalType, pieces: Vec<Vector>, order: &[usize]) -> Result<(Vector, u64)> {
-    let whole = interleave(ty, &pieces, order)?.into_pages();
+fn column(ty: &LogicalType, pieces: Vec<Vector>, order: Placing<'_>) -> Result<(Vector, u64)> {
+    let whole = interleave_placed(ty, &pieces, order.order, order.inverse)?.into_pages();
     let given = pieces.iter().map(Vector::footprint).sum::<usize>();
     drop(pieces);
     Ok((whole, u64::try_from(given).unwrap_or(u64::MAX)))
@@ -944,7 +994,7 @@ fn column(ty: &LogicalType, pieces: Vec<Vector>, order: &[usize]) -> Result<(Vec
 fn gathered(
     types: &[LogicalType],
     chunks: Vec<Chunk>,
-    order: &[usize],
+    order: Placing<'_>,
     rows: usize,
     held: &mut Reservation,
     charged: &mut Vec<Reservation>,

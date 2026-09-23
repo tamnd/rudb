@@ -3645,6 +3645,44 @@ fn run_of(data: &Data, at: usize, end: usize) -> Data {
     crate::for_each_layout!(fixed, run)
 }
 
+/// The values of `data` written to the places `inverse` gives them, the other way round from
+/// [`copy_of`]: value `n` lands at `inverse[n]`.
+///
+/// `inverse` is a permutation of the positions of `data` and the answer is as long as it. A place
+/// past the end is dropped rather than trusted, and a place nobody wrote keeps the zero, the same
+/// zero a gather writes for a position that resolved to nowhere. Strings are turned back into
+/// positions and gathered, because their one caller moves the views itself and never sends them.
+pub(crate) fn placed_of(data: &Data, inverse: &[u32]) -> Data {
+    macro_rules! placed {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    let mut out: Vec<$native> = vec![$zero; inverse.len()];
+                    for (value, &to) in values.as_slice().iter().zip(inverse) {
+                        if let Some(slot) = out.get_mut(to as usize) {
+                            *slot = *value;
+                        }
+                    }
+                    Data::$variant(Buffer::from_vec(out))
+                })+
+                Data::Empty => Data::Empty,
+                // Turned back round into positions and gathered, so a caller that does hand this
+                // strings gets the right answer rather than a missing arm.
+                Data::Varlen(_) => {
+                    let mut at = vec![NOWHERE; inverse.len()];
+                    for (row, &to) in inverse.iter().enumerate() {
+                        if let Some(slot) = at.get_mut(to as usize) {
+                            *slot = row;
+                        }
+                    }
+                    copy_of(data, &at)
+                }
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, placed)
+}
+
 pub(crate) fn copy_of(data: &Data, at: &[usize]) -> Data {
     macro_rules! copied {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
