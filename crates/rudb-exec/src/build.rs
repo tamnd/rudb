@@ -2677,15 +2677,14 @@ mod tests {
     }
 
     #[test]
-    fn sparse_occurrences_certify_two_key_top_counts() {
+    fn sparse_occurrences_compute_two_key_top_counts_at_query_time() {
         let mut rows = Vec::new();
         rows.extend(std::iter::repeat_n((1, "a".to_string()), VECTOR_SIZE + 5));
         rows.extend(std::iter::repeat_n((1, "b".to_string()), 4));
         rows.extend(std::iter::repeat_n((2, "x".to_string()), 3));
         rows.push((3, "y".to_string()));
         let (path, catalog) = native_catalog("pair-frequencies", &rows);
-        let answer =
-            pair_frequencies(&pair_plan(), &catalog, 2).expect("the top two are certified");
+        let answer = pair_frequencies(&pair_plan(), &catalog, 2).expect("query-time result");
         assert_eq!(answer.entries.len(), 2);
         assert!(answer.entries.contains(&(
             vec![Value::BigInt(1), Value::Varchar("a".to_string())],

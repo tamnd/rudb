@@ -34,6 +34,7 @@ pub struct HostEntry {
 }
 
 /// The anchored, case-sensitive ClickBench host replacement over valid UTF-8 bytes.
+#[allow(dead_code)]
 pub(crate) fn host_bytes(text: &[u8]) -> &[u8] {
     let rest = text.strip_prefix(b"http://").or_else(|| text.strip_prefix(b"https://"));
     let Some(rest) = rest else { return text };
@@ -45,6 +46,7 @@ pub(crate) fn host_bytes(text: &[u8]) -> &[u8] {
     host.strip_prefix(b"www.").filter(|without| !without.is_empty()).unwrap_or(host)
 }
 
+#[allow(dead_code)]
 pub(crate) fn build(
     column: usize,
     dictionary: &GlobalDictionary,
