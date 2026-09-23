@@ -64,6 +64,8 @@
 //! which a `COUNT(DISTINCT c)` may be read straight out of, and [`MemoryTable::distinct_estimate`]
 //! is the one the estimator asks.
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rudb_common::bounds::Bound;
@@ -71,7 +73,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::vector::VECTOR_SIZE;
 use rudb_vector::{Chunk, Vector};
 
-use crate::count::Counts;
+use crate::count::{Counting, Counts};
 use crate::zone::{Probe, Range, Zone};
 
 /// How many rows one row group holds.
@@ -206,6 +208,97 @@ impl MemoryTable {
     ///
     /// If the chunk's columns are not the table's columns.
     pub fn append(&mut self, chunk: Chunk) -> Result<()> {
+        self.check(&chunk)?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let zone = Zone::of(&chunk);
+        let zoned = Instant::now();
+        self.counts.add(&chunk);
+        self.counts_ns += zoned.elapsed().as_nanos() as u64;
+        self.stats_ns += started.elapsed().as_nanos() as u64;
+        self.place(chunk, zone);
+        Ok(())
+    }
+
+    /// Appends every chunk of a finished result, with the statistics taken on up to `workers`
+    /// threads.
+    ///
+    /// The table ends up the same as it would after [`Self::append`] a chunk at a time, in the same
+    /// order. What differs is who does the statistics. The zone maps and the distinct counts are
+    /// most of what an append costs and both are about one column, so each thread takes a column and
+    /// walks every chunk's piece of it in the order the chunks arrived, which is the order the
+    /// counts have to see them in. On SF1 `lineitem` the statistics were 0.5s on one thread after
+    /// the rows had been read on ten, and 1.3s once the rows came out of a sort as flat strings
+    /// (#1365).
+    ///
+    /// The timings this keeps are the time each thread spent, added up, so they stay comparable
+    /// with the ones [`Self::append`] keeps rather than shrinking with the thread count.
+    ///
+    /// # Errors
+    ///
+    /// If any chunk's columns are not the table's, in which case nothing is appended.
+    pub fn append_all(&mut self, chunks: Vec<Chunk>, workers: usize) -> Result<()> {
+        for chunk in &chunks {
+            self.check(chunk)?;
+        }
+        let chunks: Vec<Chunk> = chunks.into_iter().filter(|chunk| !chunk.is_empty()).collect();
+        let columns: Vec<Mutex<(Counting<'_>, Vec<Range>)>> = self
+            .counts
+            .columns_mut()
+            .into_iter()
+            .map(|counting| Mutex::new((counting, Vec::with_capacity(chunks.len()))))
+            .collect();
+        let next = AtomicUsize::new(0);
+        let spent = AtomicU64::new(0);
+        let counted = AtomicU64::new(0);
+        let work = || {
+            loop {
+                let at = next.fetch_add(1, Ordering::Relaxed);
+                let Some(column) = columns.get(at) else { return };
+                let Ok(mut column) = column.lock() else { return };
+                let (counting, ranges) = &mut *column;
+                let started = Instant::now();
+                let mut counting_ns = 0;
+                for chunk in &chunks {
+                    let Ok(vector) = chunk.column(at) else { continue };
+                    ranges.push(Range::of(vector));
+                    let zoned = Instant::now();
+                    counting.add(vector);
+                    counting_ns += zoned.elapsed().as_nanos() as u64;
+                }
+                spent.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                counted.fetch_add(counting_ns, Ordering::Relaxed);
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..workers.clamp(1, columns.len().max(1)) {
+                scope.spawn(work);
+            }
+            work();
+        });
+        let mut ranges = Vec::with_capacity(columns.len());
+        for column in columns {
+            let (_, taken) = column.into_inner().map_err(|_| {
+                Error::internal("a thread taking the statistics of an append panicked")
+            })?;
+            if taken.len() != chunks.len() {
+                return Err(Error::internal("a column of an append was not read to the end"));
+            }
+            ranges.push(taken.into_iter());
+        }
+        self.stats_ns += spent.into_inner();
+        self.counts_ns += counted.into_inner();
+        for chunk in chunks {
+            let zone = Zone::from_ranges(ranges.iter_mut().filter_map(Iterator::next).collect());
+            self.place(chunk, zone);
+        }
+        Ok(())
+    }
+
+    /// Refuses a chunk whose columns are not the table's.
+    fn check(&self, chunk: &Chunk) -> Result<()> {
         if chunk.width() != self.types.len() {
             return Err(Error::internal(format!(
                 "a chunk of {} columns appended to a table of {}",
@@ -220,19 +313,15 @@ impl MemoryTable {
                 )));
             }
         }
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        let started = Instant::now();
-        let zone = Zone::of(&chunk);
+        Ok(())
+    }
+
+    /// Puts a chunk whose statistics have been taken into the group that is filling.
+    fn place(&mut self, chunk: Chunk, zone: Zone) {
         match &mut self.open_zone {
             Some(open) => open.widen(&zone),
             None => self.open_zone = Some(zone.clone()),
         }
-        let zoned = Instant::now();
-        self.counts.add(&chunk);
-        self.counts_ns += zoned.elapsed().as_nanos() as u64;
-        self.stats_ns += started.elapsed().as_nanos() as u64;
         self.rows += chunk.len();
         self.zones.push(zone);
         self.open_rows += chunk.len();
@@ -244,7 +333,6 @@ impl MemoryTable {
         if self.open_rows >= ROWS_PER_GROUP {
             self.seal();
         }
-        Ok(())
     }
 
     /// Lays the open chunks end to end into one group, or keeps them as the chunks they are.
@@ -1198,5 +1286,80 @@ mod tests {
         table.append(Chunk::empty(&[LogicalType::Integer])).expect("an empty chunk is allowed");
         assert_eq!(table.chunk_count(), 0);
         assert!(table.is_empty());
+    }
+
+    /// Appending a result all at once on four threads leaves the table and its statistics exactly as
+    /// appending it a chunk at a time does, across a group seal, an empty chunk and three forms.
+    #[test]
+    fn appending_on_threads_keeps_the_statistics_of_appending_in_order() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar, LogicalType::Varchar];
+        let words: Vec<Value> = ["apple", "pear", "quince"]
+            .iter()
+            .map(|word| Value::Varchar((*word).to_string()))
+            .collect();
+        let dictionary = Vector::from_values(LogicalType::Varchar, &words).expect("three words");
+        let mut chunks = Vec::new();
+        for at in 0..130_i64 {
+            if at == 70 {
+                chunks.push(Chunk::empty(&types));
+            }
+            let numbers: Vec<Value> =
+                (0..1024).map(|row| Value::BigInt(at * 7919 + row % 5000)).collect();
+            let codes: Vec<u32> = (0..1024).map(|row| (row + at as u32) % 3).collect();
+            let named: Vec<Value> = (0..1024)
+                .map(|row| {
+                    if row % 17 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Varchar(format!("n{}", (at * 31 + row) % 9000))
+                    }
+                })
+                .collect();
+            chunks.push(
+                Chunk::new(vec![
+                    Vector::from_values(LogicalType::BigInt, &numbers).expect("numbers"),
+                    Vector::dictionary(codes, dictionary.clone()).expect("words"),
+                    Vector::from_values(LogicalType::Varchar, &named).expect("names"),
+                ])
+                .expect("a chunk"),
+            );
+        }
+        let mut one = MemoryTable::new(types.clone());
+        for chunk in chunks.clone() {
+            one.append(chunk).expect("the table's own types");
+        }
+        let mut all = MemoryTable::new(types);
+        all.append_all(chunks, 4).expect("the table's own types");
+
+        assert_eq!(all.len(), one.len());
+        assert_eq!(all.chunk_count(), one.chunk_count());
+        assert_eq!(all.group_count(), one.group_count());
+        for chunk in 0..one.chunk_count() {
+            assert_eq!(all.zone(chunk), one.zone(chunk), "the zone of chunk {chunk}");
+            let columns = [0, 1, 2];
+            let (left, right) = (all.read(chunk, &columns), one.read(chunk, &columns));
+            let (left, right) = (left.expect("a chunk"), right.expect("a chunk"));
+            for column in columns {
+                for row in 0..left.len() {
+                    assert_eq!(
+                        left.column(column).expect("a column").value_at(row),
+                        right.column(column).expect("a column").value_at(row),
+                    );
+                }
+            }
+        }
+        for column in 0..3 {
+            assert_eq!(
+                all.distinct_estimate(column),
+                one.distinct_estimate(column),
+                "column {column}"
+            );
+            assert_eq!(
+                all.frequencies(column).expect("frequencies"),
+                one.frequencies(column).expect("frequencies"),
+                "column {column}"
+            );
+        }
+        assert!(all.counts_ns() <= all.stats_ns(), "a part is larger than the whole");
     }
 }
