@@ -1266,6 +1266,25 @@ impl Table {
         Ok(())
     }
 
+    /// Puts these rows where the table's are and hands back the ones it held, which is how a
+    /// `RETURNING` list is run over the rows a statement wrote by the same plan that reads the
+    /// table. The caller puts the held rows back with [`Self::put_back`].
+    ///
+    /// # Errors
+    ///
+    /// If a chunk does not fit the table's columns.
+    pub fn stand_in(&mut self, chunks: Vec<Chunk>, workers: usize) -> Result<Rows> {
+        let types = self.columns.iter().map(|field| field.ty.clone()).collect();
+        let mut rows = MemoryTable::new(types);
+        rows.append_all(chunks, workers)?;
+        Ok(std::mem::replace(&mut self.rows, Rows::Memory(rows)))
+    }
+
+    /// The rows [`Self::stand_in`] handed back, in their place again.
+    pub fn put_back(&mut self, rows: Rows) {
+        self.rows = rows;
+    }
+
     /// Adds rows of single values, refusing a null in a column that said it would not have one.
     ///
     /// # Errors

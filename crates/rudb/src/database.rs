@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
-use rudb_bind::{Bound, Parameters};
+use rudb_bind::{Bound, Parameters, Write};
 use rudb_catalog::{Catalog, Entry, QualifiedName, View};
 use rudb_common::stat::Provenance;
 use rudb_common::{
@@ -18,7 +18,7 @@ use rudb_native::graph::Edge;
 use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_plan::{Expr, Node, Plan};
-use rudb_vector::{Chunk, Form, Vector};
+use rudb_vector::{Chunk, Form, Selection, Vector};
 
 use crate::config::Config;
 use crate::connection::{Connection, single};
@@ -1898,19 +1898,41 @@ fn appended(
     Ok(true)
 }
 
-/// How many rows an `UPDATE` changed, read off the flag column it put after the table's columns,
-/// and the chunks with that column taken off so what is stored is only the table.
-fn unflag(chunks: &mut [Chunk]) -> Result<usize> {
-    let mut changed = 0;
-    for chunk in chunks.iter_mut() {
+/// The rows an `UPDATE` or a `DELETE` source produced, split by the flag column after the table's.
+///
+/// The first half is what the table holds afterwards, which is every row for an `UPDATE` and the
+/// unflagged ones for a `DELETE`. The second is the flagged rows, the ones the statement changed or
+/// took out, and it is only built when a `RETURNING` list wants them. The count is how many were
+/// flagged either way. The flag column is taken off both.
+fn split(
+    chunks: Vec<Chunk>,
+    delete: bool,
+    wanted: bool,
+) -> Result<(Vec<Chunk>, Vec<Chunk>, usize)> {
+    let mut kept = Vec::with_capacity(chunks.len());
+    let mut changed = Vec::new();
+    let mut count = 0;
+    for chunk in chunks {
         let width = chunk.width().saturating_sub(1);
-        changed += (0..chunk.len())
-            .filter(|&row| chunk.value_at(row, width) == Value::Boolean(true))
-            .count();
-        let kept: Vec<usize> = (0..width).collect();
-        *chunk = std::mem::replace(chunk, Chunk::empty(&[])).project(&kept)?;
+        let hit = Selection::from_predicate(chunk.len(), |row| {
+            chunk.value_at(row, width) == Value::Boolean(true)
+        });
+        count += hit.len();
+        let columns: Vec<usize> = (0..width).collect();
+        let chunk = chunk.project(&columns)?;
+        if wanted && !hit.is_empty() {
+            changed.push(chunk.clone().select(&hit)?);
+        }
+        if delete {
+            let rest = hit.complement(chunk.len());
+            if !rest.is_empty() {
+                kept.push(chunk.select(&rest)?);
+            }
+        } else {
+            kept.push(chunk);
+        }
     }
-    Ok(changed)
+    Ok((kept, changed, count))
 }
 
 /// Whether a table can be written straight into the file as its own generation.
@@ -2966,8 +2988,9 @@ impl Shared {
                 // never sees, and a read only database writes no file at all.
                 let writable =
                     self.inner.writable && !insert.name.temporary() && !self.transacting();
-                if let Some(path) = self.inner.path.as_ref().filter(|_| writable && !insert.replace)
-                {
+                if let Some(path) = self.inner.path.as_ref().filter(|_| {
+                    writable && insert.write == Write::Append && insert.returning.is_none()
+                }) {
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
                     // the way, which is the difference between loading a table and having to fit
@@ -3020,18 +3043,43 @@ impl Shared {
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let workers = self.inner.pool.threads();
                 let table = catalog.table_mut(&insert.name)?;
-                let before = table.rows().len();
-                let mut chunks = result.into_chunks();
-                let flagged = if insert.flagged { Some(unflag(&mut chunks)?) } else { None };
-                let changed = if insert.replace {
-                    table.replace_all(chunks, workers)?;
-                    flagged.unwrap_or_else(|| before.saturating_sub(table.rows().len()))
-                } else {
-                    let added = chunks.iter().map(Chunk::len).sum();
-                    table.append_all(chunks, workers)?;
-                    added
+                let chunks = result.into_chunks();
+                let wanted = insert.returning.is_some();
+                let (count, written) = match insert.write {
+                    Write::Append => {
+                        let added = chunks.iter().map(Chunk::len).sum();
+                        let written = if wanted { chunks.clone() } else { Vec::new() };
+                        table.append_all(chunks, workers)?;
+                        (added, written)
+                    }
+                    Write::Update | Write::Delete => {
+                        let delete = insert.write == Write::Delete;
+                        let (kept, changed, count) = split(chunks, delete, wanted)?;
+                        table.replace_all(kept, workers)?;
+                        (count, changed)
+                    }
                 };
-                QueryResult::changed(changed)
+                let Some(mut returning) = insert.returning else {
+                    return QueryResult::changed(count);
+                };
+                // The list is a query over the table, so for the length of it the table holds the
+                // rows the statement wrote and nothing else, and then gets its own back whether
+                // the query ran or not.
+                let held = catalog.table_mut(&insert.name)?.stand_in(written, workers)?;
+                let answer = (|| {
+                    let context = self.optimizer(&catalog)?;
+                    rudb_opt::optimize_with(&mut returning, &context)?;
+                    let under = Under::new(
+                        self.budget(),
+                        context.facts(),
+                        &seams,
+                        &session,
+                        Rows::ForACaller,
+                    );
+                    run(sql, &returning, &catalog, cancel, under)
+                })();
+                catalog.table_mut(&insert.name)?.put_back(held);
+                answer
             }
         }
     }

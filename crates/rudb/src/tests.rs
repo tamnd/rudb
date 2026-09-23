@@ -5583,7 +5583,6 @@ fn a_statement_that_writes_something_the_answer_would_depend_on_is_refused() {
     let db = scripted(&["CREATE TABLE t (a INTEGER)"]);
     for statement in [
         "CREATE TABLE u (a INTEGER PRIMARY KEY)",
-        "INSERT INTO t VALUES (1) RETURNING a",
         "INSERT INTO t (a, a) VALUES (1, 2)",
         "CREATE TABLE u (a INTEGER, a VARCHAR)",
     ] {
@@ -9167,4 +9166,28 @@ fn a_write_answers_with_the_count_of_rows_it_wrote_the_way_the_pin_does() {
     assert_eq!(count("DELETE FROM t WHERE a = 2"), 1);
     assert_eq!(count("DELETE FROM t"), 2);
     assert!(db.query("SELECT 1").unwrap().changes().is_none());
+}
+
+#[test]
+fn returning_answers_with_the_rows_the_statement_wrote_the_way_the_pin_does() {
+    let db = Database::new();
+    let answer = |sql: &str| {
+        let result = db.execute(sql).unwrap();
+        assert!(result.changes().is_none(), "{sql} answered with a count");
+        (0..result.len())
+            .map(|row| {
+                (0..result.width()).map(|at| result.text_at(row, at)).collect::<Vec<_>>().join(",")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    db.execute("CREATE TABLE t (a INTEGER, b VARCHAR)").unwrap();
+    assert_eq!(answer("INSERT INTO t VALUES (1, 'x'), (2, 'y') RETURNING *"), "1,x;2,y");
+    assert_eq!(answer("INSERT INTO t AS n VALUES (3, 'z') RETURNING n.a * 10, b"), "30,z");
+    assert_eq!(answer("UPDATE t SET b = 'q' WHERE a >= 2 RETURNING a, b"), "2,q;3,q");
+    assert_eq!(answer("UPDATE t SET a = a WHERE a > 5 RETURNING a"), "");
+    assert_eq!(answer("DELETE FROM t WHERE a = 2 RETURNING b, a"), "q,2");
+    assert_eq!(answer("SELECT count(*), sum(a) FROM t"), "2,4");
+    assert_eq!(answer("DELETE FROM t RETURNING count(*)"), "2");
+    assert_eq!(answer("SELECT count(*) FROM t"), "0");
 }
