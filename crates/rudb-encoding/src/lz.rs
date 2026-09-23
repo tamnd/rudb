@@ -153,6 +153,20 @@ fn longest(
         if position >= at {
             break;
         }
+        // Only a longer copy replaces the one in hand, and a copy longer than `had` has to agree at
+        // byte `had`. Most candidates on a long chain do not, so one byte turns them away before
+        // the full compare. Nothing can be longer than what is left of the segment, so a copy that
+        // reaches the end stops the walk.
+        if let Some((had, _)) = best {
+            if at + had >= end {
+                break;
+            }
+            if input[position + had] != input[at + had] {
+                candidate = prev[candidate as usize];
+                tries += 1;
+                continue;
+            }
+        }
         let length = shared(&input[position..end], &input[at..end]);
         if length >= MIN_MATCH && best.is_none_or(|(had, _)| length > had) {
             best = Some((length, at - position));
@@ -302,9 +316,23 @@ fn hash(bytes: &[u8]) -> usize {
     (word.wrapping_mul(2_654_435_761) >> (32 - HASH_BITS)) as usize
 }
 
+/// How many bytes `a` and `b` start with in common.
+///
+/// Eight bytes at a time, because the copies in sorted text run to tens of bytes and this compare
+/// was the hottest loop of a load: a dictionary of URLs spends most of its encode here.
 fn shared(a: &[u8], b: &[u8]) -> usize {
     let cap = a.len().min(b.len());
     let mut n = 0;
+    for (left, right) in a[..cap].chunks_exact(8).zip(b[..cap].chunks_exact(8)) {
+        let left = u64::from_le_bytes(left.try_into().expect("chunks_exact(8) gives eight bytes"));
+        let right =
+            u64::from_le_bytes(right.try_into().expect("chunks_exact(8) gives eight bytes"));
+        let differ = left ^ right;
+        if differ != 0 {
+            return n + (differ.trailing_zeros() / 8) as usize;
+        }
+        n += 8;
+    }
     while n < cap && a[n] == b[n] {
         n += 1;
     }
@@ -400,6 +428,87 @@ mod tests {
             input.extend_from_slice(b"http://example.com/some/path?query=value&more=stuff ");
         }
         round_trip(&input);
+    }
+
+    #[test]
+    fn the_word_compare_finds_the_same_copies_as_a_byte_compare() {
+        // The matcher as it was before `shared` compared words and `longest` turned candidates
+        // away on one byte, kept to show the tokens have not moved, since every chunk a load has
+        // written was cut by it.
+        fn by_bytes(input: &[u8]) -> (Vec<(usize, usize)>, Vec<i64>, Vec<i64>) {
+            let mut raw = Raw::default();
+            let mut head = vec![u32::MAX; 1 << HASH_BITS];
+            let mut prev = vec![u32::MAX; SEGMENT.min(input.len()).max(1)];
+            let mut start = 0;
+            while start < input.len() {
+                let end = (start + SEGMENT).min(input.len());
+                head.fill(u32::MAX);
+                let mut literal_start = start;
+                let mut at = start;
+                while at + MIN_MATCH <= end {
+                    let mut candidate = head[hash(&input[at..at + MIN_MATCH])];
+                    let mut found: Option<(usize, usize)> = None;
+                    let mut tries = 0;
+                    while candidate != u32::MAX && tries < MAX_TRIES {
+                        let position = start + candidate as usize;
+                        if position >= at {
+                            break;
+                        }
+                        let mut length = 0;
+                        while at + length < end && input[position + length] == input[at + length] {
+                            length += 1;
+                        }
+                        if length >= MIN_MATCH && found.is_none_or(|(had, _)| length > had) {
+                            found = Some((length, at - position));
+                        }
+                        candidate = prev[candidate as usize];
+                        tries += 1;
+                    }
+                    insert(input, at, end, &mut head, &mut prev, start);
+                    match found {
+                        Some((length, offset)) => {
+                            push(&mut raw, (literal_start, at), length, offset);
+                            for step in 1..length {
+                                insert(input, at + step, end, &mut head, &mut prev, start);
+                            }
+                            at += length;
+                            literal_start = at;
+                        }
+                        None => at += 1,
+                    }
+                }
+                if literal_start < end {
+                    push(&mut raw, (literal_start, end), 0, 0);
+                }
+                start = end;
+            }
+            (raw.runs, raw.lengths, raw.offsets)
+        }
+
+        let mut urls = Vec::new();
+        for n in 0..9000 {
+            urls.extend_from_slice(
+                format!("http://example.com/a/b/{}/{n}?q={}\n", n % 37, n * 7).as_bytes(),
+            );
+        }
+        let mut noise = Vec::new();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..300_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            noise.push(b"abcab"[(state % 5) as usize]);
+        }
+        let inputs: [&[u8]; 6] =
+            [b"", b"abcabcabcabcabcabcabcx", &[b'z'; 5000], &urls, &noise, &urls[..SEGMENT + 17]];
+        for input in inputs {
+            let tokens = tokens_of(input);
+            let (runs, lengths, offsets) = by_bytes(input);
+            let literals: Vec<&[u8]> = runs.iter().map(|(from, to)| &input[*from..*to]).collect();
+            assert_eq!(tokens.literals, literals);
+            assert_eq!(tokens.lengths, lengths);
+            assert_eq!(tokens.offsets, offsets);
+        }
     }
 
     #[test]
