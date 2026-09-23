@@ -344,17 +344,6 @@ impl EncodedCountRuns {
     }
 }
 
-impl FixedRuns {
-    /// The run the rest fold into, and how many records every run holds between them. See
-    /// [`EncodedCountRuns::seed`].
-    fn seed(&mut self) -> (FixedPartition, usize) {
-        let total = self.runs.iter().map(|run| run.rows.len()).sum();
-        let widest = widest_run(self.runs.iter().map(|run| run.rows.len()));
-        let seed = widest.map(|at| self.runs.swap_remove(at)).unwrap_or_default();
-        (seed, total)
-    }
-}
-
 /// Which of these runs holds the most records, or `None` when there are no runs at all.
 fn widest_run(lengths: impl Iterator<Item = usize>) -> Option<usize> {
     lengths.enumerate().max_by_key(|&(_, rows)| rows).map(|(at, _)| at)
@@ -5335,6 +5324,24 @@ fn fixed_slot(
     }
 }
 
+/// How many records one split of a fixed radix partition is sized to hold.
+///
+/// A radix partition of ClickBench 33 is 156 thousand groups, one per row, and its table is two
+/// megabytes of buckets over two and a half of records, so on eight threads at once nearly every
+/// probe was a miss out of the last level cache and the probe was half of the query. Splitting the
+/// partition again by more bits of the hash, and folding one split at a time, leaves a table of a
+/// hundred and twenty eight kilobytes over two hundred and fifty six of records, which stays in the
+/// core's own cache for the whole fold. The split is one more pass over sixteen byte records, read
+/// and written in order.
+const FIXED_SPLIT_ROWS: usize = 16_384;
+
+/// Which split of `splits` a fixed record belongs to, by bits of its hash that neither the radix
+/// partition, the bucket tag nor a table this small reads.
+#[inline]
+fn fixed_split(hash: u64, splits: usize) -> usize {
+    (hash >> 40) as usize & (splits - 1)
+}
+
 fn fixed_partition(
     runs: &mut FixedRuns,
     keys: &[LogicalType; 2],
@@ -5343,61 +5350,47 @@ fn fixed_partition(
     memory: &Memory,
 ) -> Result<Part> {
     let reserving = stage::Timing::start(Stage::Reserve);
-    let (mut partition, total) = runs.seed();
-    let capacity = total.saturating_mul(2).max(64).next_power_of_two();
+    let total: usize = runs.runs.iter().map(|run| run.rows.len()).sum();
+    let splits = (total / FIXED_SPLIT_ROWS).max(1).next_power_of_two();
+    let share = total.div_ceil(splits);
+    let share = (share + share.isqrt() * 4).min(total);
+    let capacity = share.saturating_mul(2).max(64).next_power_of_two();
     let mut working = memory.reservation();
-    let room = total.saturating_sub(partition.rows.len());
     working.grow(width_of(
         capacity * size_of::<u32>()
-            + total * size_of::<CompactNumeric>()
-            + room * size_of::<FixedRecord>(),
+            + share * size_of::<CompactNumeric>()
+            + total * size_of::<FixedRecord>(),
     ))?;
-    let mut buckets = vec![EMPTY_SLOT; capacity];
-    let mut states: Vec<CompactNumeric> = Vec::with_capacity(total);
-    let mut overflow = HashMap::new();
-    partition.rows.reserve(room);
+    let mut parts: Vec<FixedPartition> = (0..splits)
+        .map(|_| FixedPartition { rows: Vec::with_capacity(share), validity: Vec::new() })
+        .collect();
     reserving.stop(0);
-    let timing = stage::Timing::start(Stage::Fold);
-    let seeded = partition.rows.len();
-    let all_valid = partition.validity.is_empty();
-    for source in 0..seeded {
-        let row = partition.rows[source];
-        let valid = if all_valid { FixedRecord::ALL } else { partition.validity[source] };
-        let slot = match fixed_slot(&buckets, &partition, row, valid) {
-            Ok(slot) => slot,
-            Err(bucket) => {
-                let slot = states.len();
-                buckets[bucket] = bucket_for(
-                    slot,
-                    fixed_hash(row, valid),
-                    "a fixed radix partition is too large",
-                )?;
-                partition.rows[slot] = row;
-                if !all_valid {
-                    partition.validity[slot] = valid;
-                }
-                states.push(CompactNumeric::default());
-                slot
-            }
-        };
-        states[slot].add(
-            slot,
-            (valid & FixedRecord::SUM != 0).then_some(row.sum),
-            (valid & FixedRecord::MEAN != 0).then_some(row.mean),
-            &mut overflow,
-        )?;
-    }
-    partition.rows.truncate(states.len());
-    if !all_valid {
-        partition.validity.truncate(states.len());
-    }
-    timing.stop(0);
-    // Every other instance's run, folded into that table, which is the merge half of the close.
     let timing = stage::Timing::start(Stage::Merge);
     for run in std::mem::take(&mut runs.runs) {
         let all_valid = run.validity.is_empty();
         for (source, &row) in run.rows.iter().enumerate() {
             let valid = if all_valid { FixedRecord::ALL } else { run.validity[source] };
+            parts[fixed_split(fixed_hash(row, valid), splits)].push(row, valid);
+        }
+    }
+    timing.stop(0);
+    let timing = stage::Timing::start(Stage::Fold);
+    let mut buckets: Vec<u32> = Vec::with_capacity(capacity);
+    let mut states: Vec<CompactNumeric> = Vec::with_capacity(share);
+    let mut output: Vec<(i64, Vec<Value>)> = Vec::new();
+    for mut partition in parts {
+        let rows = partition.rows.len();
+        let capacity = rows.saturating_mul(2).max(64).next_power_of_two();
+        buckets.clear();
+        buckets.resize(capacity, EMPTY_SLOT);
+        states.clear();
+        let mut overflow = HashMap::new();
+        let all_valid = partition.validity.is_empty();
+        // The groups are compacted into the front of the split's own records, which is safe
+        // because a new group's slot is never past the record that opened it.
+        for source in 0..rows {
+            let row = partition.rows[source];
+            let valid = if all_valid { FixedRecord::ALL } else { partition.validity[source] };
             let slot = match fixed_slot(&buckets, &partition, row, valid) {
                 Ok(slot) => slot,
                 Err(bucket) => {
@@ -5407,7 +5400,10 @@ fn fixed_partition(
                         fixed_hash(row, valid),
                         "a fixed radix partition is too large",
                     )?;
-                    partition.push(row, valid);
+                    partition.rows[slot] = row;
+                    if !all_valid {
+                        partition.validity[slot] = valid;
+                    }
                     states.push(CompactNumeric::default());
                     slot
                 }
@@ -5419,42 +5415,44 @@ fn fixed_partition(
                 &mut overflow,
             )?;
         }
-    }
-    // Read again because a run past the first can have been what gave this partition its first null.
-    let all_valid = partition.validity.is_empty();
-    timing.stop(0);
-    let timing = stage::Timing::start(Stage::Emit);
-    let mut best: Vec<usize> = Vec::with_capacity(bound.min(states.len()));
-    for slot in 0..states.len() {
-        let at = best.partition_point(|&kept| states[kept].count() >= states[slot].count());
-        if at < bound {
-            best.insert(at, slot);
-            best.truncate(bound);
+        let mut best: Vec<usize> = Vec::with_capacity(bound.min(states.len()));
+        for slot in 0..states.len() {
+            let at = best.partition_point(|&kept| states[kept].count() >= states[slot].count());
+            if at < bound {
+                best.insert(at, slot);
+                best.truncate(bound);
+            }
+        }
+        for slot in best {
+            let key = partition.rows[slot];
+            let valid = if all_valid { FixedRecord::ALL } else { partition.validity[slot] };
+            let state = &states[slot];
+            let (sum, mean) = state.totals(slot, &overflow);
+            output.push((
+                state.count(),
+                vec![
+                    if valid & FixedRecord::FIRST != 0 {
+                        signed_value(&keys[0], key.first)?
+                    } else {
+                        Value::Null
+                    },
+                    if valid & FixedRecord::SECOND != 0 {
+                        signed_value(&keys[1], i64::from(key.second))?
+                    } else {
+                        Value::Null
+                    },
+                    Value::BigInt(state.count()),
+                    Accumulator::exact_sum(sum, state.sum_seen(), &calls[1].returns).finish()?,
+                    Accumulator::exact_avg(mean, state.mean_count, &calls[2].returns).finish()?,
+                ],
+            ));
         }
     }
-    best.sort_unstable();
-    let mut output = Vec::with_capacity(best.len());
-    for slot in best {
-        let key = partition.rows[slot];
-        let valid = if all_valid { FixedRecord::ALL } else { partition.validity[slot] };
-        let state = &states[slot];
-        let (sum, mean) = state.totals(slot, &overflow);
-        output.push(vec![
-            if valid & FixedRecord::FIRST != 0 {
-                signed_value(&keys[0], key.first)?
-            } else {
-                Value::Null
-            },
-            if valid & FixedRecord::SECOND != 0 {
-                signed_value(&keys[1], i64::from(key.second))?
-            } else {
-                Value::Null
-            },
-            Value::BigInt(state.count()),
-            Accumulator::exact_sum(sum, state.sum_seen(), &calls[1].returns).finish()?,
-            Accumulator::exact_avg(mean, state.mean_count, &calls[2].returns).finish()?,
-        ]);
-    }
+    timing.stop(0);
+    let timing = stage::Timing::start(Stage::Emit);
+    output.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+    output.truncate(bound);
+    let output = output.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
     let mut held = memory.reservation();
     let types = [
         keys[0].clone(),
@@ -7314,6 +7312,64 @@ mod tests {
             ]
         );
         assert_eq!(size_of::<FixedRecord>(), 16);
+    }
+
+    #[test]
+    fn a_fixed_partition_split_for_cache_keeps_the_largest_groups_of_every_split() {
+        // Enough groups for eight splits, each key seen once or more across two runs, so that the
+        // largest groups land in different splits and a group's rows come from both runs.
+        let groups = super::FIXED_SPLIT_ROWS as i64 * 8;
+        let row = |first: i64| FixedRecord { first, second: (first % 7) as i32, sum: 1, mean: 2 };
+        let (mut early, mut late) = (FixedPartition::default(), FixedPartition::default());
+        for first in 0..groups {
+            let times = if first % 5_000 == 0 { 3 + first / 5_000 } else { 1 };
+            for time in 0..times {
+                let into = if time % 2 == 0 { &mut early } else { &mut late };
+                into.push(row(first), FixedRecord::ALL);
+            }
+        }
+        let call = |name: &str, returns| Call {
+            name: name.into(),
+            args: Vec::new(),
+            distinct: false,
+            filter: None,
+            returns,
+            affine: None,
+        };
+        let calls = [
+            call("count_star", LogicalType::BigInt),
+            call("sum", LogicalType::HugeInt),
+            call("avg", LogicalType::Double),
+        ];
+        let part = fixed_partition(
+            &mut FixedRuns { runs: vec![early, late] },
+            &[LogicalType::BigInt, LogicalType::Integer],
+            4,
+            &calls,
+            &Memory::unlimited(),
+        )
+        .expect("the fixed partition");
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for chunk in part.chunks {
+            for row in 0..chunk.len() {
+                rows.push((0..chunk.width()).map(|column| chunk.value_at(row, column)).collect());
+            }
+        }
+        let largest = groups / 5_000 * 5_000;
+        let expected = (0..4)
+            .map(|step| {
+                let first = largest - step * 5_000;
+                let times = 3 + first / 5_000;
+                vec![
+                    Value::BigInt(first),
+                    Value::Integer((first % 7) as i32),
+                    Value::BigInt(times),
+                    Value::HugeInt(i128::from(times)),
+                    Value::Double(2.0),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected, "the four largest groups, largest first");
     }
 
     #[test]
