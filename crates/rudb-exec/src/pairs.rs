@@ -374,6 +374,29 @@ pub(crate) fn scatter_seeded(
     partitions[(pair_hash >> shift) as usize].push(Record { user, group, pair_hash }, valid);
 }
 
+/// The pair the previous row scattered, so that a row repeating it is dropped before it is hashed.
+///
+/// A repeat can never be a new pair, and on data laid out the way ClickBench is it is most of them:
+/// the file is sorted on the counter, the date and the user, so a user's clicks sit next to each
+/// other, and 84 percent of the ten million rows of `COUNT(DISTINCT UserID) GROUP BY RegionID` carry
+/// the same pair as the row before. Every one of those used to be hashed, pushed into a run and
+/// then thrown away by the compaction or the finishing pass.
+#[derive(Debug, Default)]
+pub(crate) struct Repeat(Option<(i32, bool, i64)>);
+
+impl Repeat {
+    /// Whether this pair differs from the previous one, which it then becomes.
+    #[inline]
+    pub(crate) fn fresh(&mut self, group: i32, valid: bool, user: i64) -> bool {
+        let pair = Some((group, valid, user));
+        if self.0 == pair {
+            return false;
+        }
+        self.0 = pair;
+        true
+    }
+}
+
 /// The shift that [`scatter`] wants, which is however many bits it takes to index [`PARTITIONS`].
 pub(crate) fn shift() -> u32 {
     u32::BITS - PARTITIONS.ilog2()
@@ -654,8 +677,9 @@ fn poisoned<T>(_: T) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHUNK, COMPACT_FROM, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs,
-        folded, group_hash, group_seed, merged, mix, scatter, scatter_seeded, shift, spread, used,
+        CHUNK, COMPACT_FROM, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Repeat, Run,
+        distinct_pairs, folded, group_hash, group_seed, merged, mix, scatter, scatter_seeded,
+        shift, spread, used,
     };
 
     /// The fan out the finishing pass picks, and that what it drops is merged rather than lost.
@@ -786,5 +810,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_pair_is_only_a_repeat_of_the_one_right_before_it() {
+        let mut repeat = Repeat::default();
+        assert!(repeat.fresh(0, true, 7));
+        assert!(!repeat.fresh(0, true, 7));
+        assert!(repeat.fresh(0, false, 7), "a null group is not group zero");
+        assert!(repeat.fresh(1, true, 7));
+        assert!(repeat.fresh(0, true, 7), "only the previous pair is remembered");
     }
 }

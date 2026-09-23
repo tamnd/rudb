@@ -30,7 +30,7 @@ use rudb_vector::{Chunk, Vector};
 
 use crate::group::signed_value;
 use crate::pairs::{
-    self, Counted, Grouped, Held, PARTITIONS, Run, distinct_pairs, in_parallel, scatter,
+    self, Counted, Grouped, Held, PARTITIONS, Repeat, Run, distinct_pairs, in_parallel, scatter,
 };
 use crate::rows;
 use crate::signed::SignedBlock;
@@ -368,18 +368,24 @@ impl Exchange {
         };
         let before = local.partitions.iter().map(Run::footprint).sum::<usize>();
         let shift = pairs::shift();
+        let mut repeat = Repeat::default();
         if !nulled {
             match group_nulls {
                 None => {
                     for (row, &user) in held_user.iter().enumerate() {
-                        scatter(&mut local.partitions, shift, reader.at(row), true, user);
+                        let group = reader.at(row);
+                        if repeat.fresh(group, true, user) {
+                            scatter(&mut local.partitions, shift, group, true, user);
+                        }
                     }
                 }
                 Some(nulls) => {
                     for (row, &user) in held_user.iter().enumerate() {
                         let valid = !nulls.is_null_at(row);
                         let group = if valid { reader.at(row) } else { 0 };
-                        scatter(&mut local.partitions, shift, group, valid, user);
+                        if repeat.fresh(group, valid, user) {
+                            scatter(&mut local.partitions, shift, group, valid, user);
+                        }
                     }
                 }
             }
@@ -390,7 +396,9 @@ impl Exchange {
                 }
                 let valid = group_nulls.is_none_or(|nulls| !nulls.is_null_at(row));
                 let group = if valid { reader.at(row) } else { 0 };
-                scatter(&mut local.partitions, shift, group, valid, held);
+                if repeat.fresh(group, valid, held) {
+                    scatter(&mut local.partitions, shift, group, valid, held);
+                }
             }
         }
         let after = local.partitions.iter().map(Run::footprint).sum::<usize>();
