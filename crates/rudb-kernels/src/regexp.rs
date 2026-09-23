@@ -12,24 +12,23 @@
 //! in `scalar`, which is correct and counts itself in the kernel table.
 //!
 //! The text side reads a flat column or a dictionary. A dictionary that outlives the chunk runs
-//! `regexp_replace` once per distinct value through [`StableReplace`], and any other dictionary
-//! still runs the machine once per row.
+//! `regexp_replace` once per distinct value through [`StableReplace`] and answers with a dictionary
+//! of its own, and any other dictionary still runs the machine once per row.
 //!
 //! The number is 2,719,020 distinct in 8,682,923 rows at ClickBench scale, so running the machine
-//! per entry is 3.19 times less matching. Most of the leverage is not in this file, though. An
-//! output that carries the codes instead of the strings hands the operator above an integer key,
-//! and `GROUP BY` on that column costs 0.28 seconds against 4.5 for the same grouping done on the
-//! strings this currently returns. Measured in `spec/storage-v3/18`, where query 29 is 35% of the
-//! suite. What that asks for is not local to `regexp_replace`: it is that a function which is
-//! constant on a dictionary entry should be allowed to say so, and return a dictionary.
+//! per entry is 3.19 times less matching. Most of the leverage is in what comes back, though. An
+//! answer that carries codes instead of strings hands the operator above an integer key, and
+//! `GROUP BY` on that column costs 0.28 seconds against 4.5 for the same grouping done on the
+//! strings, measured in `spec/storage-v3/18`, where query 29 is 35% of the suite.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_regex::{Options, Regex, Rewrite};
-use rudb_vector::{Data, StringColumn, Vector};
+use rudb_vector::{Data, StringColumn, TextSource, Validity, Vector};
 
 use crate::number::integral;
 use crate::scalar::{finish, over_valid};
@@ -104,7 +103,7 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
             // longest value in the column once and then stays there.
             let mut buffer = String::new();
             let mut out = StringColumn::with_capacity(rows);
-            let validity = over_valid(rows, base, |index| {
+            let validity = over_strings(rows, base, &mut out, |index, out| {
                 if call.host {
                     out.push_bytes(host_bytes(source.get_bytes(index)?));
                     return Ok(());
@@ -119,7 +118,7 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
         }
         ("regexp_extract", LogicalType::Varchar) => {
             let mut out = StringColumn::with_capacity(rows);
-            let validity = over_valid(rows, base, |index| {
+            let validity = over_strings(rows, base, &mut out, |index, out| {
                 out.push(call.regex.extract(source.get(index)?, call.group).unwrap_or_default());
                 Ok(())
             })?;
@@ -187,59 +186,113 @@ impl Call {
     /// What `regexp_replace` gives for `text`, which is a piece of `text` for the host extraction
     /// and the contents of `buffer` otherwise.
     fn replaced<'t>(&self, text: &'t [u8], buffer: &'t mut String) -> Result<&'t [u8]> {
-        if self.host {
-            return Ok(host_bytes(text));
-        }
-        let text = std::str::from_utf8(text)
-            .map_err(|_| Error::internal("a VARCHAR value that is not UTF-8"))?;
-        buffer.clear();
-        self.regex.replace_into(buffer, text, &self.rewrite, self.global);
-        Ok(buffer.as_bytes())
+        replace_one(&self.regex, &self.rewrite, self.global, self.host, text, buffer)
     }
+}
+
+/// Runs `body` at every row that is not null and leaves an empty string at every row that is.
+///
+/// [`over_valid`] skips a null row outright, which suits an answer written in place and not strings
+/// pushed one after another: every answer after the first null used to land one row early, and the
+/// column came out shorter than the chunk.
+fn over_strings(
+    rows: usize,
+    base: Validity,
+    out: &mut StringColumn,
+    mut body: impl FnMut(usize, &mut StringColumn) -> Result<()>,
+) -> Result<Validity> {
+    let validity = over_valid(rows, base, |index| {
+        while out.len() < index {
+            out.push("");
+        }
+        body(index, out)
+    })?;
+    while out.len() < rows {
+        out.push("");
+    }
+    Ok(validity)
+}
+
+/// What `regexp_replace` gives for one value, apart from the call so the memo can hold a copy.
+fn replace_one<'t>(
+    regex: &Regex,
+    rewrite: &Rewrite,
+    global: bool,
+    host: bool,
+    text: &'t [u8],
+    buffer: &'t mut String,
+) -> Result<&'t [u8]> {
+    if host {
+        return Ok(host_bytes(text));
+    }
+    let text = std::str::from_utf8(text)
+        .map_err(|_| Error::internal("a VARCHAR value that is not UTF-8"))?;
+    buffer.clear();
+    regex.replace_into(buffer, text, rewrite, global);
+    Ok(buffer.as_bytes())
 }
 
 /// How many dictionary values one decision of the replace memo covers, which is what the native
 /// format puts in a payload block, for the reason the `LIKE` memo in `scalar` gives.
 const REPLACE_GROUP: usize = 1024;
 
-/// How many bytes of replaced text the memo keeps before it stops taking more.
-///
-/// A replacement that keeps most of each value, over a dictionary of tens of millions, would
-/// otherwise hold a second copy of the whole dictionary for the length of the query. Past this the
-/// groups nobody has decided yet are answered a row at a time, the way every row used to be.
-const REPLACE_BUDGET: usize = 256 << 20;
+/// How many locks the replaced texts seen so far are spread over, so threads deciding different
+/// groups at once rarely wait on each other.
+const REPLACE_SHARDS: usize = 64;
 
-/// `regexp_replace` answered once per distinct value of a dictionary that outlives the chunk.
+/// `regexp_replace` answered once per distinct value of a dictionary that outlives the chunk, and
+/// answered as a dictionary.
 ///
 /// ClickBench q29 runs the pattern over 8.7 million `Referer` rows that hold 2.7 million distinct
-/// values. A row at a time that is 3.2 times the matching and 3.2 times the decompression, and the
-/// reader that hands out one value at a time keeps every payload block it decoded, which was most of
-/// the half gigabyte the query held. The memo decides a group of values with one sweep of its block
-/// and keeps only what the replacement gave.
+/// values and about a hundred thousand distinct hosts. A row at a time that is 3.2 times the
+/// matching and the decompression, and handing back the hosts as strings leaves the `GROUP BY`
+/// above to hash and compare 8.7 million of them.
 ///
-/// Two threads can decide the same group at once. Both reach the same strings, the first to finish
-/// keeps its column and the other drops its own, so the race costs a block decoded twice and never
-/// a wrong answer.
+/// So each value is replaced once, and the answer is a code: the first value of the dictionary
+/// found to replace to the same text. Two rows with the same answer then carry the same code and
+/// two with different answers different ones, which is what a stable dictionary promises the
+/// operators above, and they group on the integers. The codes point into [`ReplacedText`], which
+/// reads the answer back out of the memo, so the promise holds for as long as the call does.
+///
+/// A call answers every chunk over its dictionary this way from the first one on. It cannot fall
+/// back to strings part way, because a group by hashes a stable dictionary by its codes and would
+/// then hold the same key twice.
 #[derive(Debug)]
 struct StableReplace {
+    memo: Arc<Memo>,
+    /// The dictionary the codes this hands out point into, one for the life of the call.
+    values: Option<Arc<Vector>>,
+}
+
+/// The replaced values of a dictionary, decided a group at a time.
+///
+/// Two threads can decide the same group at once. Both look every answer up in the same table, so
+/// they reach the same codes, the first to finish keeps its group and the other drops its own.
+#[derive(Debug)]
+struct Memo {
     dictionary: Arc<Vector>,
+    regex: Regex,
+    rewrite: Rewrite,
+    global: bool,
+    host: bool,
     groups: Vec<OnceLock<Replaced>>,
-    /// Bytes of replaced text kept so far, across every group.
+    /// Each distinct answer seen so far and the first value that gave it.
+    firsts: Vec<Mutex<HashMap<Box<[u8]>, u32>>>,
+    /// Bytes held so far, across every group and every answer.
     kept: AtomicUsize,
 }
 
-/// The replaced values of one group, end to end, and where each one ends.
-///
-/// Exactly as long as what they hold rather than a [`StringColumn`], whose views and doubling cost
-/// twice the bytes of the hosts q29 keeps, which put the memo for all of `Referer` past its budget.
+/// One group of values: the code standing for each one's answer, and the answers of the values
+/// that are their own code, end to end.
 #[derive(Debug)]
 struct Replaced {
+    firsts: Box<[u32]>,
     ends: Box<[u32]>,
     bytes: Box<[u8]>,
 }
 
 impl Replaced {
-    /// The value at `index` within the group.
+    /// The answer at `index` within the group, which is empty unless that value is its own code.
     fn get(&self, index: usize) -> &[u8] {
         let start = if index == 0 { 0 } else { self.ends[index - 1] as usize };
         let end = self.ends.get(index).map_or(start, |&end| end as usize);
@@ -247,32 +300,45 @@ impl Replaced {
     }
 
     fn footprint(&self) -> usize {
-        self.ends.len() * 4 + self.bytes.len()
+        self.firsts.len() * 4 + self.ends.len() * 4 + self.bytes.len()
     }
 }
 
-impl StableReplace {
-    /// The replaced values of the group holding `code`, deciding it first where nothing has, or
-    /// `None` where it is undecided and the memo is already as large as it may grow.
-    fn group(&self, code: usize, call: &Call, buffer: &mut String) -> Result<Option<&Replaced>> {
+impl Memo {
+    /// The group holding `code`, deciding it first where nothing has.
+    fn group(&self, code: usize) -> Result<&Replaced> {
         let slot = self
             .groups
             .get(code / REPLACE_GROUP)
             .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
         if let Some(done) = slot.get() {
-            return Ok(Some(done));
-        }
-        if self.kept.load(Ordering::Relaxed) > REPLACE_BUDGET {
-            return Ok(None);
+            return Ok(done);
         }
         let first = code / REPLACE_GROUP * REPLACE_GROUP;
         let last = (first + REPLACE_GROUP).min(self.dictionary.len());
+        let mut buffer = String::new();
+        let mut firsts = Vec::with_capacity(last - first);
         let mut ends = Vec::with_capacity(last - first);
         let mut bytes = Vec::new();
+        let mut added = 0;
         let mut at = first;
         while at < last {
             let stopped = self.dictionary.sweep_text(at, last, &mut |_, text: &[u8]| {
-                bytes.extend_from_slice(call.replaced(text, buffer)?);
+                let own = u32::try_from(first + firsts.len())
+                    .map_err(|_| Error::internal("a dictionary past four billion values"))?;
+                let answer = replace_one(
+                    &self.regex,
+                    &self.rewrite,
+                    self.global,
+                    self.host,
+                    text,
+                    &mut buffer,
+                )?;
+                let found = self.first_of(answer, own, &mut added)?;
+                if found == own {
+                    bytes.extend_from_slice(answer);
+                }
+                firsts.push(found);
                 ends.push(
                     u32::try_from(bytes.len())
                         .map_err(|_| Error::internal("a replaced group past four gigabytes"))?,
@@ -284,12 +350,70 @@ impl StableReplace {
             }
             at = stopped;
         }
-        let out = Replaced { ends: ends.into_boxed_slice(), bytes: bytes.into_boxed_slice() };
-        let bytes = out.footprint();
+        let out = Replaced {
+            firsts: firsts.into_boxed_slice(),
+            ends: ends.into_boxed_slice(),
+            bytes: bytes.into_boxed_slice(),
+        };
+        let held = out.footprint();
         if slot.set(out).is_ok() {
-            self.kept.fetch_add(bytes, Ordering::Relaxed);
+            self.kept.fetch_add(held, Ordering::Relaxed);
         }
-        Ok(slot.get())
+        self.kept.fetch_add(added, Ordering::Relaxed);
+        slot.get().ok_or_else(|| Error::internal("a replaced group was set and is not there"))
+    }
+
+    /// The code standing for `answer`, which is `own` when no value before it gave that answer.
+    fn first_of(&self, answer: &[u8], own: u32, added: &mut usize) -> Result<u32> {
+        let spread = answer.iter().fold(0xcbf2_9ce4_8422_2325_u64, |state, &byte| {
+            (state ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let shard = &self.firsts[(spread >> 32) as usize % REPLACE_SHARDS];
+        let mut seen =
+            shard.lock().map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
+        if let Some(&found) = seen.get(answer) {
+            return Ok(found);
+        }
+        seen.insert(answer.into(), own);
+        *added += answer.len() + 32;
+        Ok(own)
+    }
+
+    /// The code standing for the answer of the value at `code`.
+    fn first(&self, code: usize) -> Result<u32> {
+        Ok(self.group(code)?.firsts[code % REPLACE_GROUP])
+    }
+
+    /// The answer of the value at `code`.
+    fn answer(&self, code: usize) -> Result<&[u8]> {
+        let first = self.first(code)? as usize;
+        Ok(self.group(first)?.get(first % REPLACE_GROUP))
+    }
+}
+
+/// The answers of a replace memo, as the text a dictionary's codes point into.
+///
+/// Every position reads, not only the codes the call handed out, so a kernel that walks the whole
+/// dictionary gets the answers it would have got from strings.
+#[derive(Debug)]
+struct ReplacedText {
+    memo: Arc<Memo>,
+}
+
+impl TextSource for ReplacedText {
+    fn len(&self) -> usize {
+        self.memo.dictionary.len()
+    }
+
+    fn bytes_at(&self, index: usize) -> Result<Option<&[u8]>> {
+        if index >= self.len() {
+            return Ok(None);
+        }
+        self.memo.answer(index).map(Some)
+    }
+
+    fn footprint(&self) -> usize {
+        self.memo.kept.load(Ordering::Relaxed)
     }
 }
 
@@ -298,33 +422,54 @@ fn replace_stable(
     call: &Call,
     dictionary: &Arc<Vector>,
     codes: &[u32],
-    base: rudb_vector::Validity,
+    base: Validity,
     returns: &LogicalType,
     rows: usize,
 ) -> Result<Option<Vector>> {
-    let memo = call.stable.get_or_init(|| StableReplace {
-        dictionary: Arc::clone(dictionary),
-        groups: (0..dictionary.len().div_ceil(REPLACE_GROUP)).map(|_| OnceLock::new()).collect(),
-        kept: AtomicUsize::new(0),
+    let stable = call.stable.get_or_init(|| {
+        let memo = Arc::new(Memo {
+            dictionary: Arc::clone(dictionary),
+            regex: call.regex.clone(),
+            rewrite: call.rewrite.clone(),
+            global: call.global,
+            host: call.host,
+            groups: (0..dictionary.len().div_ceil(REPLACE_GROUP))
+                .map(|_| OnceLock::new())
+                .collect(),
+            firsts: (0..REPLACE_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            kept: AtomicUsize::new(0),
+        });
+        let source = Arc::new(ReplacedText { memo: Arc::clone(&memo) });
+        let values = (!dictionary.is_empty())
+            .then(|| Vector::external_text(LogicalType::Varchar, source).ok().map(Arc::new))
+            .flatten();
+        StableReplace { memo, values }
     });
-    let shared = Arc::ptr_eq(&memo.dictionary, dictionary);
+    if let (true, Some(values), LogicalType::Varchar) =
+        (Arc::ptr_eq(&stable.memo.dictionary, dictionary), &stable.values, returns)
+    {
+        let mut out = vec![0u32; rows];
+        let validity = over_valid(rows, base, |index| {
+            let code = *codes
+                .get(index)
+                .ok_or_else(|| Error::internal("a dictionary vector is shorter than its rows"))?;
+            out[index] = stable.memo.first(code as usize)?;
+            Ok(())
+        })?;
+        let vector = Vector::stable_dictionary_validated(out, Arc::clone(values), None)?;
+        return Ok(Some(vector.with_validity(validity)));
+    }
+    // A dictionary other than the one the memo was built over, which one call over one column
+    // never sees, is answered a row at a time.
     let mut buffer = String::new();
     let mut out = StringColumn::with_capacity(rows);
-    let validity = over_valid(rows, base, |index| {
+    let validity = over_strings(rows, base, &mut out, |index, out| {
         let code = *codes
             .get(index)
             .ok_or_else(|| Error::internal("a dictionary vector is shorter than its rows"))?
             as usize;
-        let decided = if shared { memo.group(code, call, &mut buffer)? } else { None };
-        match decided {
-            Some(group) => {
-                out.push_bytes(group.get(code % REPLACE_GROUP));
-            }
-            None => {
-                let text = dictionary.try_bytes_at(code)?.unwrap_or_default();
-                out.push_bytes(call.replaced(text, &mut buffer)?);
-            }
-        }
+        let text = dictionary.try_bytes_at(code)?.unwrap_or_default();
+        out.push_bytes(call.replaced(text, &mut buffer)?);
         Ok(())
     })?;
     finish(returns, Data::Varlen(out), validity)
@@ -542,6 +687,23 @@ mod tests {
                 let (want, got) = (answer(&flat), answer(&column));
                 for row in 0..rows {
                     assert_eq!(got.value_at(row), want.value_at(row), "{pattern}, row {row}");
+                }
+                // Over the dictionary the memo was built on, the answer is a dictionary whose codes
+                // agree exactly when the answers do, which is what grouping on them relies on.
+                if Arc::ptr_eq(held, &dictionary) {
+                    let (codes, _) = got.stable_dictionary_parts().expect("answered as codes");
+                    for one in 0..rows {
+                        for other in (0..rows).step_by(7) {
+                            if got.is_null_at(one) || got.is_null_at(other) {
+                                continue;
+                            }
+                            assert_eq!(
+                                codes[one] == codes[other],
+                                got.value_at(one) == got.value_at(other),
+                                "{pattern}, rows {one} and {other}"
+                            );
+                        }
+                    }
                 }
             }
         }
