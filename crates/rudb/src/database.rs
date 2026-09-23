@@ -14,7 +14,7 @@ use rudb_common::{
 };
 use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
 use rudb_native::graph::Edge;
-use rudb_parse::ast::Ast;
+use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_plan::{Expr, Node, Plan};
 use rudb_vector::{Chunk, Form, Vector};
@@ -1252,8 +1252,8 @@ impl Shared {
         run(sql, &plan, &catalog, cancel, under).map(Some)
     }
 
-    fn remember_native_count(&self, sql: &str, plan: &Plan, catalog: &Catalog) {
-        if !is_native_count(plan, catalog) {
+    fn remember_native_count(&self, sql: &str, ast: &Ast, plan: &Plan, catalog: &Catalog) {
+        if !is_native_count(ast, plan, catalog) {
             return;
         }
         *self.inner.native_count_plan.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -1290,7 +1290,7 @@ impl Shared {
         match bound {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
-                self.remember_native_count(sql, &plan, &catalog);
+                self.remember_native_count(sql, &ast, &plan, &catalog);
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
@@ -1650,7 +1650,7 @@ impl Shared {
             Bound::Query(mut plan) => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
                 if parameters.is_empty() {
-                    self.remember_native_count(sql, &plan, &catalog);
+                    self.remember_native_count(sql, ast, &plan, &catalog);
                 }
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
@@ -2044,9 +2044,9 @@ impl<'a> Under<'a> {
     }
 }
 
-/// Only a single, unfiltered `count_star` over one immutable native table can use this cache.
-/// The projection may rename the count, but may not compute anything from it.
-fn is_native_count(plan: &Plan, catalog: &Catalog) -> bool {
+/// A single count over one immutable native table can use the cache. A filter is accepted only
+/// when its written form has no calls whose value could change between statements.
+fn is_native_count(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
     let Node::Project { input, exprs, .. } = *plan.node(plan.root()) else { return false };
     let [projected] = plan.expr_list(exprs) else { return false };
     let &Expr::Column(projected) = plan.expr(*projected) else { return false };
@@ -2064,16 +2064,57 @@ fn is_native_count(plan: &Plan, catalog: &Catalog) -> bool {
     if plan.string(name) != "count_star" || !plan.expr_list(args).is_empty() {
         return false;
     }
+    let filtered = matches!(plan.node(input), Node::Filter { .. });
+    let input = match *plan.node(input) {
+        Node::Filter { input, .. } if simple_literal_filter(ast) => input,
+        Node::Filter { .. } => return false,
+        _ => input,
+    };
     let Node::Get { catalog: source_catalog, schema, table, columns, .. } = *plan.node(input)
     else {
         return false;
     };
-    if !plan.field_list(columns).is_empty() {
+    if !filtered && !plan.field_list(columns).is_empty() {
         return false;
     }
     let source =
         QualifiedName::new(plan.string(source_catalog), plan.string(schema), plan.string(table));
     catalog.table(&source).is_ok_and(|table| table.rows().is_native())
+}
+
+/// The filtered count case is intentionally narrower than all deterministic predicates. Checking
+/// the written expression keeps a binder-folded `now()` or `random()` out of a reused plan.
+fn simple_literal_filter(ast: &Ast) -> bool {
+    let [ast::Statement::Query(reference)] = ast.statements.as_slice() else { return false };
+    let query = ast.query(*reference);
+    if !query.ctes.is_empty()
+        || !query.order_by.is_empty()
+        || query.order_by_all
+        || query.limit != rudb_parse::NONE
+        || query.offset != rudb_parse::NONE
+    {
+        return false;
+    }
+    let ast::QueryBody::Select(reference) = query.body else { return false };
+    let select = ast.select(reference);
+    if select.distinct != ast::Distinct::No
+        || !select.group_by.is_empty()
+        || select.group_by_all
+        || select.filter == rudb_parse::NONE
+        || select.having != rudb_parse::NONE
+    {
+        return false;
+    }
+    let [source] = ast.source_list(select.from) else { return false };
+    if !matches!(ast.source(*source), ast::Source::Table { .. }) {
+        return false;
+    }
+    let ast::Expr::Binary { op: ast::BinaryOp::NotEq, left, right } = ast.expr(select.filter)
+    else {
+        return false;
+    };
+    matches!(ast.expr(left), ast::Expr::Column { .. })
+        && matches!(ast.expr(right), ast::Expr::Literal { kind: ast::LiteralKind::Number, .. })
 }
 
 fn run(

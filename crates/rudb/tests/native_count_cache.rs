@@ -27,6 +27,14 @@ fn a_native_row_count_reuses_its_plan_until_the_table_or_settings_change() {
     assert_eq!(second.value_at(0, 0), Value::BigInt(2));
     assert_eq!(second.metrics().expect("metrics").timing.bind_ns, 0);
 
+    let nonzero = "SELECT COUNT(*) FROM hits WHERE i <> 0";
+    let first_nonzero = database.execute(nonzero).expect("first filtered count");
+    assert_eq!(first_nonzero.value_at(0, 0), Value::BigInt(2));
+    assert!(first_nonzero.metrics().expect("metrics").timing.bind_ns > 0);
+    let repeated_nonzero = database.execute(nonzero).expect("repeated filtered count");
+    assert_eq!(repeated_nonzero.value_at(0, 0), Value::BigInt(2));
+    assert_eq!(repeated_nonzero.metrics().expect("metrics").timing.bind_ns, 0);
+
     let filtered = "SELECT COUNT(*) FROM hits WHERE i > 1";
     for _ in 0..2 {
         let answer = database.execute(filtered).expect("filtered count");
@@ -35,7 +43,7 @@ fn a_native_row_count_reuses_its_plan_until_the_table_or_settings_change() {
     }
 
     database.execute("SET default_order = 'DESC'").expect("change a setting");
-    let after_setting = database.query(sql).expect("count after setting");
+    let after_setting = database.query(nonzero).expect("count after setting");
     assert_eq!(after_setting.value_at(0, 0), Value::BigInt(2));
     assert!(after_setting.metrics().expect("metrics").timing.bind_ns > 0);
 
@@ -46,6 +54,9 @@ fn a_native_row_count_reuses_its_plan_until_the_table_or_settings_change() {
     let grown_again = database.execute(sql).expect("count the grown table again");
     assert_eq!(grown_again.value_at(0, 0), Value::BigInt(3));
     assert!(grown_again.metrics().expect("metrics").timing.bind_ns > 0);
+    let grown_nonzero = database.execute(nonzero).expect("count nonzero values in the grown table");
+    assert_eq!(grown_nonzero.value_at(0, 0), Value::BigInt(3));
+    assert!(grown_nonzero.metrics().expect("metrics").timing.bind_ns > 0);
     database.close().expect("close the file");
     std::fs::remove_file(path).expect("remove the fixture");
 }

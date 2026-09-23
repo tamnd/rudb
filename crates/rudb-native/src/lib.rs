@@ -3019,6 +3019,10 @@ pub struct Reader {
     /// Each column's frequency synopsis as values, the first time anything asks for it. See
     /// [`Reader::decode_frequencies`].
     frequency_values: Arc<Vec<OnceLock<Synopsis>>>,
+    /// Stored frequency sections are decoded once per open table. A small directory can hold the
+    /// summary inline, but a larger one otherwise rereads and decodes the same section on every
+    /// plan and every summary-backed aggregate.
+    frequency_summaries: Arc<Vec<OnceLock<Arc<FrequencySummary>>>>,
     /// How many global dictionaries have been opened. A scan of a dictionary column should open its
     /// dictionary once however many workers it has, and the test that says so is the only thing
     /// keeping it that way.
@@ -4265,6 +4269,7 @@ impl Reader {
             dictionaries: Arc::new(dictionaries),
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
             frequency_values: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
+            frequency_summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
             part_ranges: Arc::new(part_ranges),
@@ -4607,6 +4612,13 @@ impl Reader {
             None | Some(None) => None,
             Some(Some(Frequencies::Held(summary))) => Some(Cow::Borrowed(summary)),
             Some(Some(Frequencies::Stored { span, values })) => {
+                let slot = self
+                    .frequency_summaries
+                    .get(column)
+                    .ok_or_else(|| invalid("frequency column index out of range"))?;
+                if let Some(summary) = slot.get() {
+                    return Ok(Some(Cow::Borrowed(summary.as_ref())));
+                }
                 let field = self
                     .table
                     .fields
@@ -4616,7 +4628,9 @@ impl Reader {
                 read_at(&self.file, span.offset, &mut bytes)?;
                 let summary =
                     decode_summary(&mut Cursor::new(&bytes), field, self.table.rows, *values)?;
-                Some(Cow::Owned(summary.ok_or_else(|| invalid("a stored synopsis is missing"))?))
+                let summary = summary.ok_or_else(|| invalid("a stored synopsis is missing"))?;
+                let _ = slot.set(Arc::new(summary));
+                Some(Cow::Borrowed(slot.get().expect("the decoded summary was stored").as_ref()))
             }
         })
     }
@@ -11872,7 +11886,12 @@ mod tests {
             assert!(stored >= 2, "only {stored} synopses were left in the file");
         }
         let reader = catalog.table("items").expect("the table");
+        assert!(reader.frequency_summaries[1].get().is_none());
         assert!(reader.top_frequencies(1, 1).expect("a readable synopsis").is_some());
+        let first = reader.frequency_summaries[1].get().expect("decoded synopsis");
+        let clone = reader.clone();
+        assert!(clone.top_frequencies(1, 1).expect("cached synopsis").is_some());
+        assert!(Arc::ptr_eq(first, clone.frequency_summaries[1].get().expect("same synopsis")));
         fs::remove_file(path).expect("remove scratch file");
     }
 
