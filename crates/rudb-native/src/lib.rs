@@ -51,6 +51,7 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
+mod distinct;
 pub mod graph;
 pub mod section;
 pub mod stats;
@@ -1823,7 +1824,12 @@ impl Writer {
     /// Finds exact heavy hitters without keeping a hash table for every numeric column while the
     /// load is live. The pages are already in the target file, so one column at a time uses a
     /// bounded Misra-Gries candidate table and then recounts only those candidates.
-    fn numeric_frequency(&self, column: usize) -> Result<Option<FrequencySummary>> {
+    ///
+    /// The first of those passes also counts the column's distinct values exactly, up to the cap in
+    /// [`distinct`], which is the number a string column gets from its dictionary. It comes back
+    /// beside the summary because a column whose heavy hitters cannot be proved can still have been
+    /// counted.
+    fn numeric_frequency(&self, column: usize) -> Result<(Option<FrequencySummary>, Option<u64>)> {
         let ty = &self.table.fields[column].ty;
         if !matches!(
             ty,
@@ -1838,11 +1844,16 @@ impl Writer {
                 | LogicalType::Date
                 | LogicalType::Timestamp
         ) {
-            return Ok(None);
+            return Ok((None, None));
         }
         let mut candidates: HashMap<FrequencyValue, u32> = HashMap::new();
         let mut decrements = 0_u64;
+        let mut distinct = distinct::ExactDistinct::new();
         self.visit_numeric(column, |_, value| {
+            // The low sixty four bits, which is every bit any integer column stores.
+            if let FrequencyValue::Integer(value) = value {
+                distinct.insert(value as u64);
+            }
             if let Some(count) = candidates.get_mut(&value) {
                 *count = count.saturating_add(1);
             } else if candidates.len() < FREQUENCY_CANDIDATES {
@@ -1869,7 +1880,7 @@ impl Writer {
             if lower.len() < FREQUENCY_BUILD_RANK
                 || u64::from(lower[FREQUENCY_BUILD_RANK - 1]) <= decrements
             {
-                return Ok(None);
+                return Ok((None, distinct.count()));
             }
             let mut exact =
                 candidates.into_keys().map(|value| (value, 0_u64)).collect::<HashMap<_, _>>();
@@ -1895,7 +1906,7 @@ impl Writer {
             .map(|(value, count)| FrequencyEntry { value, count })
             .collect::<Vec<_>>();
         let omitted_max = keep_most_frequent(&mut entries).max(decrements);
-        Ok(Some(FrequencySummary { entries, omitted_max, ordinals }))
+        Ok((Some(FrequencySummary { entries, omitted_max, ordinals }), distinct.count()))
     }
 
     fn visit_numeric(
@@ -1954,7 +1965,7 @@ impl Writer {
     /// of a `TINYINT` through the decode, and a run of them sits together in a schema the way it
     /// sits together in `hits`, so a worker that was handed the wrong six columns finishes long
     /// after one that was handed the right six and the whole phase waits for it.
-    fn numeric_frequencies(&self) -> Result<Vec<Option<FrequencySummary>>> {
+    fn numeric_frequencies(&self) -> Result<Vec<(Option<FrequencySummary>, Option<u64>)>> {
         let mut columns = self
             .table
             .fields
@@ -1982,7 +1993,7 @@ impl Writer {
             .min(MAX_FREQUENCY_WORKERS)
             .min(columns.len());
         if workers <= 1 {
-            let mut frequencies = vec![None; self.table.fields.len()];
+            let mut frequencies = vec![(None, None); self.table.fields.len()];
             for column in columns {
                 frequencies[column] = self.numeric_frequency(column)?;
             }
@@ -2017,7 +2028,7 @@ impl Writer {
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
-        let mut frequencies = vec![None; self.table.fields.len()];
+        let mut frequencies = vec![(None, None); self.table.fields.len()];
         for piece in pieces {
             for (column, summary) in piece {
                 frequencies[column] = summary;
@@ -2051,7 +2062,9 @@ impl Writer {
             previous = Some(*last);
         }
         self.table.stripes = stripes.into_iter().map(|(_, stripe)| stripe).collect();
-        self.table.frequencies = self.numeric_frequencies()?;
+        let (frequencies, distincts) = self.numeric_frequencies()?.into_iter().unzip();
+        self.table.frequencies = frequencies;
+        self.table.distincts = distincts;
         let dictionaries = std::mem::take(&mut self.dictionaries);
         // One column at a time, and every column's values dropped before the next column's are read
         // back. Sorting the columns across threads is the obvious thing and was what this did, but
@@ -4004,8 +4017,10 @@ impl Reader {
     /// that number. This reads it rather than the size of the dictionary, which also means the
     /// dictionary page is not opened to answer.
     ///
-    /// `None` for a column the file has no dictionary for, which is every column that is not a
-    /// string. A sketch would answer that approximately and SQL asked for the exact number.
+    /// An integer column has no dictionary, and its count comes from the set the writer keeps on its
+    /// numeric frequency pass instead, which is exact up to a cap. `None` for a column past that cap
+    /// and for every column that is neither, where a sketch would answer approximately and SQL asked
+    /// for the exact number.
     ///
     /// # Errors
     ///

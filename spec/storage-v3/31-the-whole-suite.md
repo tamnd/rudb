@@ -137,6 +137,23 @@ Third, the load, which is 1.6 times DuckDB's processor. It is the one cost every
 
 Not the middle group. Eighteen queries at parity are eighteen queries where both engines read the same bytes, and document 30's argument is that no amount of work on the scan makes that ten times.
 
+## The first item, built
+
+The writer now keeps the set. `rudb-native/src/distinct.rs` holds each integer column's values as their sixty four bits in a flat table with linear probing, filled on the frequency pass the writer already made, capped at 2^25 slots so a near unique column gives up rather than holding a gigabyte, and the count goes into the directory slot a string column's dictionary count already used. The format did not change.
+
+The same ten million rows, loaded and run again:
+
+| | before | after | DuckDB |
+| --- | ---: | ---: | ---: |
+| q5 processor | 1.20 s | 0.01 s | 1.23 s |
+| q5 peak | 153.4 MiB | 13.0 MiB | 107.9 MiB |
+| load processor | 698.2 s | 745.0 s | 440.5 s |
+| file | 1,069 MiB | 1,071 MiB | 1,866 MiB |
+
+q5 goes from level to 123 times on processor and 8.3 times on memory, and it does not clear both axes, for the reason the section on the memory floor gives: DuckDB answers it in 107.9 MiB and rudb cannot go below 12.8. The load pays 7 percent more processor for it, and the file 1.7 MB.
+
+The other forty two moved by what the host's load moved them by, in both directions, and their answers are the ones they were apart from ties at the limit. The suite total went from 63.4 to 54.7 seconds, most of that noise. Three of forty three still clear both axes. The change is worth recording as the kind of change that works, a number the writer can afford and the competitor's format has no place for, and as a measurement of how little one such number moves a target stated over the whole suite.
+
 ## What this does not claim
 
 It does not claim the target is met. Three of forty three queries clear both axes, in the native quadrant, at one scale. The Parquet quadrant is not measured here and document 25's arithmetic still stands in it.

@@ -1285,8 +1285,9 @@ impl Shared {
             let rows = u64::try_from(table.rows().len()).unwrap_or(u64::MAX);
             facts.record(&name.catalog, &name.schema, &name.table, rows);
             // Where a distinct count comes from here, which is a property of the table and not of
-            // the column. A file counts the entries of a dictionary and a table in memory reads the
-            // sketch `rudb-storage`'s `count.rs` built as the rows arrived.
+            // the column. A file counts the entries of a dictionary, or for an integer column the set
+            // its writer kept on the frequency pass, and a table in memory reads the sketch
+            // `rudb-storage`'s `count.rs` built as the rows arrived.
             // Named the long way round because this file has a `Rows` of its own, which is the
             // shape a result set comes back in and has nothing to do with where a table keeps its
             // rows.
