@@ -224,7 +224,7 @@ pub fn describe_prefix(bytes: &[u8]) -> Result<(String, usize)> {
 /// As [`encode`].
 pub fn candidate_sizes(values: &[i64]) -> Result<Vec<(Kind, usize)>> {
     let mut sizes = Vec::new();
-    for kind in candidates(values, 0) {
+    for kind in candidates(values, 0, &EXHAUSTIVE) {
         if let Some(bytes) = encode_as(kind, values, 0, &EXHAUSTIVE)? {
             sizes.push((kind, bytes.len()));
         }
@@ -240,7 +240,7 @@ pub fn candidate_sizes(values: &[i64]) -> Result<Vec<(Kind, usize)>> {
 /// finding that out.
 #[must_use]
 pub fn offered(values: &[i64]) -> Vec<Kind> {
-    candidates(values, 0)
+    candidates(values, 0, &EXHAUSTIVE)
 }
 
 /// One candidate on its own, which is what the chooser calls once per entry in [`offered`].
@@ -276,7 +276,7 @@ pub fn describe(bytes: &[u8]) -> Result<String> {
 }
 
 fn encode_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>> {
-    let offered = candidates(values, depth);
+    let offered = candidates(values, depth, chooser);
     let mut best: Option<Vec<u8>> = None;
     for kind in chooser.narrow_integers(values, &offered, depth) {
         let Some(bytes) = encode_as(kind, values, depth, chooser)? else {
@@ -297,7 +297,11 @@ fn encode_at(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u8>
 /// expressed at all, or is provably larger than `Packed` on the same data, so that the exhaustive
 /// chooser does not spend a dictionary build on a column of 100,000 distinct values to discover
 /// what its distinct count already said.
-fn candidates(values: &[i64], depth: u8) -> Vec<Kind> {
+///
+/// A kind the chooser says it will never keep is not tested for at all. The test for a dictionary
+/// sorts a copy of the chunk, and this runs at every level of the cascade, so a chooser that never
+/// keeps a dictionary was paying for a sort per level to find out something it would ignore.
+fn candidates(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Vec<Kind> {
     let mut kinds = vec![Kind::Packed];
     if depth >= MAX_DEPTH || values.is_empty() {
         return kinds;
@@ -306,26 +310,22 @@ fn candidates(values: &[i64], depth: u8) -> Vec<Kind> {
         // Nothing else can beat 13 bytes, so this is the whole answer rather than a candidate.
         return vec![Kind::Constant];
     }
-    if values.len() >= 2 && deltas_fit(values) {
+    let considered = |kind| chooser.considers_integer(kind, depth);
+    if considered(Kind::Delta) && values.len() >= 2 && deltas_fit(values) {
         kinds.push(Kind::Delta);
     }
-    if run_count(values) * 4 <= values.len() * 3 {
+    if considered(Kind::Rle) && run_count(values) * 4 <= values.len() * 3 {
         kinds.push(Kind::Rle);
     }
-    // One sort answers both of the remaining questions. It used to be two, because the distinct
-    // count and the most frequent value were asked for separately and each one sorted its own copy
-    // of the chunk and threw it away.
-    let (distinct, dominant) = spread_of(values);
-    if distinct * 2 <= values.len() {
+    if considered(Kind::Dict) && spread_of(values).0 * 2 <= values.len() {
         kinds.push(Kind::Dict);
     }
-    // Written as a match rather than as a chained `if let` because the minimum supported Rust
-    // version is 1.85 and let chains landed in 1.88.
-    match dominant {
-        Some((_, count)) if count * 10 >= values.len() * 8 => kinds.push(Kind::Sparse),
-        _ => {}
+    if considered(Kind::Sparse)
+        && majority(values).is_some_and(|(_, count)| count * 10 >= values.len() * 8)
+    {
+        kinds.push(Kind::Sparse);
     }
-    if stride_of(values).is_some() {
+    if considered(Kind::Strided) && stride_of(values).is_some() {
         kinds.push(Kind::Strided);
     }
     kinds
@@ -381,7 +381,10 @@ fn encode_as(
             out.extend_from_slice(&encode_at(&codes, depth + 1, chooser)?);
         }
         Kind::Sparse => {
-            let Some((value, _)) = spread_of(values).1 else {
+            // The majority is the most frequent value whenever there is one, and a chunk the search
+            // offers this for always has one. `encode_only` can ask about any chunk, so the sort is
+            // still there for a chunk with no majority.
+            let Some((value, _)) = majority(values).or_else(|| spread_of(values).1) else {
                 return Ok(None);
             };
             let mut positions = Vec::new();
@@ -1038,6 +1041,30 @@ fn spread_of(values: &[i64]) -> (usize, Option<(i64, usize)>) {
     (distinct, best)
 }
 
+/// The value more than half of the chunk holds, and how many times, found in two passes without
+/// sorting anything.
+///
+/// This is the vote that keeps one candidate and a lead: a value that holds more than half the
+/// chunk outlasts every other value put together, so it is the candidate left at the end, and the
+/// second pass checks that the candidate really does hold more than half. When it does it is the
+/// value [`spread_of`] would name as the most frequent, since a value over half the chunk has no tie.
+fn majority(values: &[i64]) -> Option<(i64, usize)> {
+    let mut candidate = *values.first()?;
+    let mut lead = 0usize;
+    for value in values {
+        if lead == 0 {
+            candidate = *value;
+            lead = 1;
+        } else if *value == candidate {
+            lead += 1;
+        } else {
+            lead -= 1;
+        }
+    }
+    let count = values.iter().filter(|value| **value == candidate).count();
+    (count * 2 > values.len()).then_some((candidate, count))
+}
+
 /// The distinct values in sorted order, for the same reason the string dictionary is sorted: an
 /// ordered dictionary turns a range predicate into a code range rather than a code set.
 fn distinct_values(values: &[i64]) -> Vec<i64> {
@@ -1149,6 +1176,27 @@ mod tests {
         // A tie goes to the value that sorts first, which is arbitrary but has to be stable,
         // because Sparse writes the dominant value into the chunk and the size depends on it.
         assert_eq!(spread_of(&[4i64, 4, 8, 8]), (2, Some((4, 2))));
+    }
+
+    #[test]
+    fn the_majority_is_the_most_frequent_value_whenever_there_is_one() {
+        let chunks: Vec<Vec<i64>> = vec![
+            vec![],
+            vec![3],
+            vec![1, 2],
+            vec![1, 1, 2],
+            vec![2, 1, 1],
+            vec![4, 4, 8, 8],
+            vec![7, 1, 7, 2, 7, 3, 7],
+            vec![1, 2, 3, 9, 9, 9, 9],
+            (0..1000).map(|index| if index % 5 == 0 { index } else { -4 }).collect(),
+            (0..1000).map(|index| index % 3).collect(),
+        ];
+        for chunk in chunks {
+            let (_, dominant) = spread_of(&chunk);
+            let expected = dominant.filter(|(_, count)| count * 2 > chunk.len());
+            assert_eq!(majority(&chunk), expected, "{chunk:?}");
+        }
     }
 
     #[test]
@@ -1472,7 +1520,7 @@ mod tests {
                 *value = index as i64;
             }
         }
-        let applicable = candidates(&values, 0);
+        let applicable = candidates(&values, 0, &EXHAUSTIVE);
         assert!(applicable.len() >= 4, "{applicable:?}");
         for kind in applicable {
             let bytes = encode_only(kind, &values).unwrap().unwrap();
