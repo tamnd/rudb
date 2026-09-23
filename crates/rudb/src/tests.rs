@@ -9191,3 +9191,31 @@ fn returning_answers_with_the_rows_the_statement_wrote_the_way_the_pin_does() {
     assert_eq!(answer("DELETE FROM t RETURNING count(*)"), "2");
     assert_eq!(answer("SELECT count(*) FROM t"), "0");
 }
+
+#[test]
+fn update_from_and_delete_using_change_each_row_once_however_many_rows_match_it() {
+    let db = Database::new();
+    let answer = |sql: &str| {
+        let result = db.execute(sql).unwrap();
+        (0..result.len())
+            .map(|row| {
+                (0..result.width()).map(|at| result.text_at(row, at)).collect::<Vec<_>>().join(",")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    db.execute("CREATE TABLE t (id INTEGER, v INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0), (2, 0), (3, 0)").unwrap();
+    db.execute("CREATE TABLE s (id INTEGER, v INTEGER)").unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10), (1, 10), (2, 20)").unwrap();
+    assert_eq!(answer("UPDATE t SET v = s.v + t.v FROM s WHERE t.id = s.id"), "2");
+    assert_eq!(answer("SELECT * FROM t"), "1,10;2,20;3,0");
+    assert_eq!(
+        answer("UPDATE t AS x SET v = -1 FROM s AS y WHERE x.id = y.id AND y.v > 15 RETURNING *"),
+        "2,-1"
+    );
+    assert_eq!(answer("DELETE FROM t USING s WHERE t.id = s.id RETURNING id"), "1;2");
+    assert_eq!(answer("SELECT * FROM t"), "3,0");
+    assert_eq!(answer("DELETE FROM t USING s"), "1");
+    assert_eq!(answer("SELECT count(*) FROM t"), "0");
+}
