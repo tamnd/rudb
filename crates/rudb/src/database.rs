@@ -1906,7 +1906,8 @@ impl Sink for NativeSink {
 
     fn combine(&self, mut local: Self::Local) -> Result<()> {
         let handed = self.hand_over(&mut local);
-        if let Some(started) = local.started.take() {
+        eprintln!("PROBE {} {}", "combined", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                if let Some(started) = local.started.take() {
             let (wall, cpu) = started.stop();
             self.profile.charge(
                 Stage::Convert,
@@ -1919,7 +1920,8 @@ impl Sink for NativeSink {
     }
 
     fn finalize(&self, _threads: &Lease<'_>) -> Result<()> {
-        let writer = self
+        eprintln!("PROBE {} {}", "finalize", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                let writer = self
             .writer
             .lock()
             .map_err(|_| Error::internal("native writer panicked"))?
@@ -1934,6 +1936,7 @@ impl Sink for NativeSink {
             let _timing = self.profile.span(Stage::Publish);
             publish(&RealFilesystem::new(), temporary, &self.target)
         };
+        eprintln!("PROBE {} {}", "published", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         self.profile.finish();
         renamed
     }

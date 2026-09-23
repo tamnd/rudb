@@ -2901,6 +2901,7 @@ impl Writer {
     ///
     /// If directory encoding or writing fails.
     fn close(&mut self) -> Result<Entry> {
+        eprintln!("PROBE close-start {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         self.reclaim()?;
         self.flush_pending()?;
         // The rest of a table is its statistics, its dictionaries and its directory. The dictionary
@@ -2925,8 +2926,12 @@ impl Writer {
         drop(timing);
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Dictionary));
         let placing = self.at;
+        eprintln!("PROBE pre-finishdict {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         finish_dictionaries(&mut self.dictionaries)?;
+        eprintln!("PROBE pre-place {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         self.place_blocks()?;
+        eprintln!("PROBE post-place {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        
         // The numeric frequencies and the global dictionaries read what is already written and
         // write nothing, so they run at the same time. Each was most of a second on `hits` with the
         // other waiting for it, and neither keeps every core busy on its own: the frequencies are
@@ -2943,7 +2948,10 @@ impl Writer {
                     .into_iter()
                     .map(|held| held.map(Frequencies::Held))
                     .collect::<Vec<_>>();
+                eprintln!("PROBE numeric-done {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
                 let pairs = this.pair_frequencies(&frequencies)?;
+                eprintln!("PROBE pairs-done {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                
                 Ok::<_, Error>((frequencies, distincts, pairs))
             });
             let closed = this
@@ -2955,6 +2963,7 @@ impl Writer {
                 })
                 .map(Option::transpose)
                 .collect::<Result<Vec<_>>>();
+            eprintln!("PROBE dicts-done {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
             let numeric =
                 numeric.join().map_err(|_| Error::internal("the native frequency thread panicked"));
             (numeric, closed)
@@ -2998,7 +3007,10 @@ impl Writer {
         drop(timing);
         let timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let placed = self.at - placing;
+        eprintln!("PROBE pre-stats {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         self.write_stats()?;
+        eprintln!("PROBE post-stats {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        
         let directory = encode_directory(&self.table)?;
         if directory.len() > MAX_DIRECTORY {
             return Err(invalid("directory exceeds the configured bound"));
@@ -3040,7 +3052,9 @@ impl Writer {
         index: usize,
         dictionary: &GlobalDictionary,
     ) -> Result<ClosedDictionary> {
+        let t0 = std::time::Instant::now();
         let (order, flat, bases) = dictionary.ranked_with_values(Some(&self.file))?;
+        let t1 = t0.elapsed().as_millis();
         // A code nothing counted is a code no non-null row of this column holds, which is the
         // empty string a null was written as and nothing else, because a code is only ever made by
         // a row asking for one.
@@ -3059,6 +3073,7 @@ impl Writer {
             .iter()
             .try_fold(0_u64, |sum, place| sum.checked_add(place.length))
             .ok_or_else(|| invalid("global dictionary payload overflow"))?;
+        eprintln!("PROBE dict {} {} ranked {} total {} n {}", index, self.table.fields[index].name, t1, t0.elapsed().as_millis(), dictionary.counts.len());
         Ok(ClosedDictionary { distinct, frequencies, texts, hosts, encoded, payload })
     }
 
@@ -3141,7 +3156,8 @@ impl Writer {
     /// If directory encoding, writing, or syncing fails.
     pub fn finish(mut self) -> Result<Table> {
         let entry = self.close()?;
-        let profile = self.profile.take();
+        eprintln!("PROBE closed {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                let profile = self.profile.take();
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
         tables.push(entry);
@@ -3157,7 +3173,9 @@ impl Writer {
         // Every page and every table directory is on the disk before anything points at them. The
         // slot write below is what makes this generation the one a reader picks, so the order of
         // these two syncs is the whole of the commit.
+        eprintln!("PROBE pre-sync1 {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         synced(&self.file, profile.as_deref())?;
+        eprintln!("PROBE post-sync1 {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         let slot = Slot {
             offset,
             length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
@@ -3170,6 +3188,7 @@ impl Writer {
         // generation before this is still intact and still valid until this write lands.
         write_at(&self.file, slot_offset(self.generation), &slot.bytes())?;
         synced(&self.file, profile.as_deref())?;
+        eprintln!("PROBE post-sync2 {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
         Ok(self.table)
     }
 
