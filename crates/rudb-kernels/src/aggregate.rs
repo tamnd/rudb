@@ -3207,13 +3207,13 @@ mod tests {
     /// right on one vector and wrong on the query, and the slots change between them so no group
     /// sees the same rows twice.
     ///
-    /// It runs twice, at five groups and at more than [`super::FEW`], because those are two different
+    /// It runs twice, at five groups and at more than [`FEW`], because those are two different
     /// loops: the first adds a chunk up per group before it touches a state, and the second reaches
     /// the state of every row.
     #[test]
     fn every_aggregate_scattered_into_groups_agrees_with_one_accumulator_per_group() {
         scattered_into(5, 0x5eed_ca11_ab1e_0061);
-        scattered_into(super::FEW + 3, 0x5eed_ca11_ab1e_0062);
+        scattered_into(FEW + 3, 0x5eed_ca11_ab1e_0062);
     }
 
     fn scattered_into(groups: usize, seed: u64) {
