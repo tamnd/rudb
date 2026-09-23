@@ -159,9 +159,18 @@ pub(crate) struct Run {
     pub(crate) validity: Vec<bool>,
 }
 
+/// How long a run gets before a full one is deduplicated rather than grown.
+///
+/// Small enough that the table the deduplication builds sits in cache, and large enough that a run
+/// of a query with few rows never pays for it at all.
+const COMPACT_FROM: usize = 4_096;
+
 impl Run {
     #[inline]
     pub(crate) fn push(&mut self, row: Record, valid: bool) {
+        if self.rows.len() == self.rows.capacity() && self.rows.len() >= COMPACT_FROM {
+            self.compact();
+        }
         self.rows.push(row);
         if self.validity.is_empty() {
             if valid {
@@ -175,6 +184,58 @@ impl Run {
             self.validity = vec![true; self.rows.len() - 1];
         }
         self.validity.push(valid);
+    }
+
+    /// Throws away the rows that repeat a pair already in the run, keeping the first of each.
+    ///
+    /// A run used to keep every row until the finishing pass deduplicated them, so a grouped
+    /// distinct count held sixteen bytes for every row it read. `COUNT(DISTINCT UserID) GROUP BY
+    /// RegionID` on ten million rows has a million and a half distinct pairs, and it held three
+    /// hundred megabytes against DuckDB's hundred and fifty, nearly all of it rows the finishing
+    /// pass was going to throw away. Deduplicating a run when it is full, rather than doubling it,
+    /// keeps what it holds near the pairs it has seen instead of the rows.
+    ///
+    /// It only ever runs when the vector is full, so it costs a pass over what the run holds once
+    /// per capacity. When it frees less than half, the vector doubles on the push after it, which
+    /// is what it would have done anyway, and the next pass waits for the new capacity, so a run of
+    /// pairs that never repeat pays for a deduplication once per doubling and no more.
+    #[cold]
+    #[inline(never)]
+    fn compact(&mut self) {
+        let len = self.rows.len();
+        let capacity = len.saturating_mul(2).next_power_of_two();
+        let mask = capacity - 1;
+        let mut buckets = vec![EMPTY; capacity];
+        let all_valid = self.validity.is_empty();
+        let mut kept = 0;
+        for at in 0..len {
+            let row = self.rows[at];
+            let valid = all_valid || self.validity[at];
+            let mut slot = row.pair_hash as usize & mask;
+            loop {
+                let held = buckets[slot];
+                if held == EMPTY {
+                    // `kept` is at most `at`, so the row lands on a slot this loop has already read.
+                    buckets[slot] = kept as u32;
+                    self.rows[kept] = row;
+                    if !all_valid {
+                        self.validity[kept] = valid;
+                    }
+                    kept += 1;
+                    break;
+                }
+                let other = self.rows[held as usize];
+                if other.user == row.user
+                    && other.group == row.group
+                    && (all_valid || self.validity[held as usize] == valid)
+                {
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+        self.rows.truncate(kept);
+        self.validity.truncate(kept);
     }
 
     fn valid_at(&self, row: usize) -> bool {
@@ -521,8 +582,8 @@ fn poisoned<T>(_: T) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs, folded, group_hash,
-        group_seed, merged, scatter, scatter_seeded, shift, used,
+        COMPACT_FROM, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Run, distinct_pairs, folded,
+        group_hash, group_seed, merged, mix, scatter, scatter_seeded, shift, spread, used,
     };
 
     /// The fan out the finishing pass picks, and that what it drops is merged rather than lost.
@@ -563,6 +624,27 @@ mod tests {
         assert_eq!(run.validity, [false, true]);
         assert!(!run.valid_at(0));
         assert!(run.valid_at(1));
+    }
+
+    /// A run that fills up with repeats keeps one row per pair, keeps its capacity, and keeps the
+    /// validity of each row it kept lined up with the row.
+    #[test]
+    fn a_full_run_throws_away_the_pairs_it_already_has() {
+        let mut run = Run::default();
+        for round in 0..(COMPACT_FROM * 4) {
+            let user = (round % 100) as i64;
+            let valid = round % 3 != 0;
+            let seed = group_seed(7, valid);
+            let pair_hash = folded(spread(mix(seed, user as u64)));
+            run.push(Record { user, group: 7, pair_hash }, valid);
+        }
+        assert!(run.rows.capacity() <= COMPACT_FROM * 2, "grew to {}", run.rows.capacity());
+        let mut partition = Held { runs: vec![run] };
+        let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
+            .expect("a pair partition");
+        assert_eq!(counted.splits[0].len(), 200);
+        let nulls = counted.splits[0].iter().filter(|pair| !pair.valid).count();
+        assert_eq!(nulls, 100);
     }
 
     /// The null group and the group whose key really is zero are two groups, not one.
