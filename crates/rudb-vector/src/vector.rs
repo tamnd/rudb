@@ -2472,8 +2472,10 @@ impl Vector {
                 }
             }
             Body::Dictionary { codes, values, .. } => {
-                for &code in codes.iter() {
-                    values.try_bytes_at(code as usize)?;
+                if values.reaches_storage() {
+                    for &code in codes.iter() {
+                        values.try_bytes_at(code as usize)?;
+                    }
                 }
             }
             Body::Runs { values, .. } | Body::Gathered { source: values, .. } => {
@@ -2488,6 +2490,23 @@ impl Vector {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Whether any value of this vector is read from storage when it is asked for.
+    ///
+    /// A dictionary over values already in memory has nothing that can fail to read, and checking
+    /// it a code at a time cost the thread that drains a query about a fifth of a sorted table
+    /// copy for no answer at all.
+    fn reaches_storage(&self) -> bool {
+        match &self.body {
+            Body::ExternalText { .. } => true,
+            Body::Dictionary { values, .. }
+            | Body::Runs { values, .. }
+            | Body::Gathered { source: values, .. } => values.reaches_storage(),
+            Body::Nested { child, .. } => child.reaches_storage(),
+            Body::Fields { children } => children.iter().any(|child| child.reaches_storage()),
+            _ => false,
+        }
     }
 
     /// The signed integer at `index`, widened, read without building a [`Value`].
