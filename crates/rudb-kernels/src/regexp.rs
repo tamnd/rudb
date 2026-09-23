@@ -11,14 +11,12 @@
 //! could not have hoisted anyway. A call where it does vary falls through to the row at a time path
 //! in `scalar`, which is correct and counts itself in the kernel table.
 //!
-//! The text side reads a flat column or a dictionary. A dictionary still runs the machine once per
-//! row rather than once per distinct value, which is the obvious next thing to do here and is worth
-//! a number before it is worth writing: the column this is measured on, `Referer`, has enough
-//! distinct values that the dictionary form may never appear on it.
+//! The text side reads a flat column or a dictionary. A dictionary that outlives the chunk runs
+//! `regexp_replace` once per distinct value through [`StableReplace`], and any other dictionary
+//! still runs the machine once per row.
 //!
 //! The number is 2,719,020 distinct in 8,682,923 rows at ClickBench scale, so running the machine
-//! per entry is 3.19 times less matching, which on its own reads as a modest win and is why this
-//! was left alone. That reading is too low, because most of the leverage is not in this file. An
+//! per entry is 3.19 times less matching. Most of the leverage is not in this file, though. An
 //! output that carries the codes instead of the strings hands the operator above an integer key,
 //! and `GROUP BY` on that column costs 0.28 seconds against 4.5 for the same grouping done on the
 //! strings this currently returns. Measured in `spec/storage-v3/18`, where query 29 is 35% of the
@@ -26,6 +24,8 @@
 //! constant on a dictionary entry should be allowed to say so, and return a dictionary.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_regex::{Options, Regex, Rewrite};
@@ -95,6 +95,11 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     let base = nulls_of(text);
     match (name, returns) {
         ("regexp_replace", LogicalType::Varchar) => {
+            if let (Some(call), Some((codes, dictionary))) =
+                (prepared, text.stable_dictionary_parts())
+            {
+                return replace_stable(call, dictionary, codes, base, returns, rows);
+            }
             // One buffer for the whole vector rather than a fresh `String` per row. It grows to the
             // longest value in the column once and then stays there.
             let mut buffer = String::new();
@@ -174,6 +179,155 @@ pub(crate) struct Call {
     group: usize,
     /// The fixed host extraction used by ClickBench q29.
     host: bool,
+    /// What `regexp_replace` gave for the values of a dictionary that outlives the chunk.
+    stable: OnceLock<StableReplace>,
+}
+
+impl Call {
+    /// What `regexp_replace` gives for `text`, which is a piece of `text` for the host extraction
+    /// and the contents of `buffer` otherwise.
+    fn replaced<'t>(&self, text: &'t [u8], buffer: &'t mut String) -> Result<&'t [u8]> {
+        if self.host {
+            return Ok(host_bytes(text));
+        }
+        let text = std::str::from_utf8(text)
+            .map_err(|_| Error::internal("a VARCHAR value that is not UTF-8"))?;
+        buffer.clear();
+        self.regex.replace_into(buffer, text, &self.rewrite, self.global);
+        Ok(buffer.as_bytes())
+    }
+}
+
+/// How many dictionary values one decision of the replace memo covers, which is what the native
+/// format puts in a payload block, for the reason the `LIKE` memo in `scalar` gives.
+const REPLACE_GROUP: usize = 1024;
+
+/// How many bytes of replaced text the memo keeps before it stops taking more.
+///
+/// A replacement that keeps most of each value, over a dictionary of tens of millions, would
+/// otherwise hold a second copy of the whole dictionary for the length of the query. Past this the
+/// groups nobody has decided yet are answered a row at a time, the way every row used to be.
+const REPLACE_BUDGET: usize = 256 << 20;
+
+/// `regexp_replace` answered once per distinct value of a dictionary that outlives the chunk.
+///
+/// ClickBench q29 runs the pattern over 8.7 million `Referer` rows that hold 2.7 million distinct
+/// values. A row at a time that is 3.2 times the matching and 3.2 times the decompression, and the
+/// reader that hands out one value at a time keeps every payload block it decoded, which was most of
+/// the half gigabyte the query held. The memo decides a group of values with one sweep of its block
+/// and keeps only what the replacement gave.
+///
+/// Two threads can decide the same group at once. Both reach the same strings, the first to finish
+/// keeps its column and the other drops its own, so the race costs a block decoded twice and never
+/// a wrong answer.
+#[derive(Debug)]
+struct StableReplace {
+    dictionary: Arc<Vector>,
+    groups: Vec<OnceLock<Replaced>>,
+    /// Bytes of replaced text kept so far, across every group.
+    kept: AtomicUsize,
+}
+
+/// The replaced values of one group, end to end, and where each one ends.
+///
+/// Exactly as long as what they hold rather than a [`StringColumn`], whose views and doubling cost
+/// twice the bytes of the hosts q29 keeps, which put the memo for all of `Referer` past its budget.
+#[derive(Debug)]
+struct Replaced {
+    ends: Box<[u32]>,
+    bytes: Box<[u8]>,
+}
+
+impl Replaced {
+    /// The value at `index` within the group.
+    fn get(&self, index: usize) -> &[u8] {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] as usize };
+        let end = self.ends.get(index).map_or(start, |&end| end as usize);
+        self.bytes.get(start..end).unwrap_or_default()
+    }
+
+    fn footprint(&self) -> usize {
+        self.ends.len() * 4 + self.bytes.len()
+    }
+}
+
+impl StableReplace {
+    /// The replaced values of the group holding `code`, deciding it first where nothing has, or
+    /// `None` where it is undecided and the memo is already as large as it may grow.
+    fn group(&self, code: usize, call: &Call, buffer: &mut String) -> Result<Option<&Replaced>> {
+        let slot = self
+            .groups
+            .get(code / REPLACE_GROUP)
+            .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
+        if let Some(done) = slot.get() {
+            return Ok(Some(done));
+        }
+        if self.kept.load(Ordering::Relaxed) > REPLACE_BUDGET {
+            return Ok(None);
+        }
+        let first = code / REPLACE_GROUP * REPLACE_GROUP;
+        let last = (first + REPLACE_GROUP).min(self.dictionary.len());
+        let mut ends = Vec::with_capacity(last - first);
+        let mut bytes = Vec::new();
+        let mut at = first;
+        while at < last {
+            let stopped = self.dictionary.sweep_text(at, last, &mut |_, text: &[u8]| {
+                bytes.extend_from_slice(call.replaced(text, buffer)?);
+                ends.push(
+                    u32::try_from(bytes.len())
+                        .map_err(|_| Error::internal("a replaced group past four gigabytes"))?,
+                );
+                Ok(())
+            })?;
+            if stopped <= at {
+                return Err(Error::internal("a dictionary sweep did not move"));
+            }
+            at = stopped;
+        }
+        let out = Replaced { ends: ends.into_boxed_slice(), bytes: bytes.into_boxed_slice() };
+        let bytes = out.footprint();
+        if slot.set(out).is_ok() {
+            self.kept.fetch_add(bytes, Ordering::Relaxed);
+        }
+        Ok(slot.get())
+    }
+}
+
+/// The `regexp_replace` loop over a stable dictionary, through the memo on `call`.
+fn replace_stable(
+    call: &Call,
+    dictionary: &Arc<Vector>,
+    codes: &[u32],
+    base: rudb_vector::Validity,
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let memo = call.stable.get_or_init(|| StableReplace {
+        dictionary: Arc::clone(dictionary),
+        groups: (0..dictionary.len().div_ceil(REPLACE_GROUP)).map(|_| OnceLock::new()).collect(),
+        kept: AtomicUsize::new(0),
+    });
+    let shared = Arc::ptr_eq(&memo.dictionary, dictionary);
+    let mut buffer = String::new();
+    let mut out = StringColumn::with_capacity(rows);
+    let validity = over_valid(rows, base, |index| {
+        let code = *codes
+            .get(index)
+            .ok_or_else(|| Error::internal("a dictionary vector is shorter than its rows"))?
+            as usize;
+        let decided = if shared { memo.group(code, call, &mut buffer)? } else { None };
+        match decided {
+            Some(group) => {
+                out.push_bytes(group.get(code % REPLACE_GROUP));
+            }
+            None => {
+                let text = dictionary.try_bytes_at(code)?.unwrap_or_default();
+                out.push_bytes(call.replaced(text, &mut buffer)?);
+            }
+        }
+        Ok(())
+    })?;
+    finish(returns, Data::Varlen(out), validity)
 }
 
 impl Call {
@@ -240,7 +394,14 @@ impl Call {
             && spelling.is_empty();
         let regex = Regex::with_options(pattern, options)?;
         let rewrite = Rewrite::new(replacement, regex.groups());
-        Ok(Some(Self { regex, rewrite, global: options.global, group, host }))
+        Ok(Some(Self {
+            regex,
+            rewrite,
+            global: options.global,
+            group,
+            host,
+            stable: OnceLock::new(),
+        }))
     }
 }
 
@@ -333,7 +494,58 @@ impl<'a> Source<'a> {
 mod tests {
     use rudb_common::Value;
 
-    use super::{Call, host, value};
+    use std::sync::Arc;
+
+    use rudb_common::LogicalType;
+    use rudb_vector::Vector;
+
+    use super::{Call, host, value, vectorized};
+
+    /// The memo over a dictionary that outlives the chunk answers what the flat loop answers, on the
+    /// fixed host pattern and on a general one, for a chunk that fills it, a chunk that reads it
+    /// back, and a dictionary it was not built for.
+    #[test]
+    fn a_replace_over_a_stable_dictionary_agrees_with_the_flat_loop() {
+        let values: Vec<Value> = (0..2_500)
+            .map(|index| match index % 5 {
+                0 => Value::Null,
+                1 => Value::Varchar(format!("http://www.site{index}.ru/page")),
+                2 => Value::Varchar(format!("https://host{}.com/a/b", index % 17)),
+                3 => Value::Varchar(String::new()),
+                _ => Value::Varchar(format!("plain {index} foo")),
+            })
+            .collect();
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
+        let other = Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
+        let patterns = [("^https?://(?:www\\.)?([^/]+)/.*$", "\\1"), ("o+", "0")];
+        for (pattern, replacement) in patterns {
+            let constants = [Value::Varchar(pattern.into()), Value::Varchar(replacement.into())];
+            let call = Call::read("regexp_replace", &constants.iter().collect::<Vec<_>>())
+                .expect("compiles")
+                .expect("a shape this file handles");
+            for (rows, step, held) in
+                [(2_000_usize, 991, &dictionary), (2_000, 991, &dictionary), (64, 37, &other)]
+            {
+                let codes: Vec<u32> =
+                    (0..rows).map(|row| ((row * step) % values.len()) as u32).collect();
+                let picked: Vec<Value> =
+                    codes.iter().map(|&code| values[code as usize].clone()).collect();
+                let flat = Vector::from_values(LogicalType::Varchar, &picked).expect("builds");
+                let column =
+                    Vector::stable_dictionary(codes, Arc::clone(held)).expect("codes are in range");
+                let answer = |text: &Vector| {
+                    vectorized("regexp_replace", Some(&call), &[text], &LogicalType::Varchar, rows)
+                        .expect("the call is written")
+                        .expect("text in this form has a loop")
+                };
+                let (want, got) = (answer(&flat), answer(&column));
+                for row in 0..rows {
+                    assert_eq!(got.value_at(row), want.value_at(row), "{pattern}, row {row}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn clickbench_host_extraction_keeps_the_regex_boundaries() {
