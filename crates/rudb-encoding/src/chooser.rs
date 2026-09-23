@@ -344,6 +344,19 @@ impl Chooser for Settled {
         }
     }
 
+    fn considers_integer(&self, kind: integer::Kind, depth: u8) -> bool {
+        // `Packed` applies to every chunk the search offers anything else on, so a level settled on
+        // it keeps nothing else and the tests for the other kinds are thrown away unread. A global
+        // dictionary block settles its integers on `Packed`, and its lengths, prefixes and token
+        // arrays each ran those tests, a sorted copy for the dictionary one among them, on every
+        // block. Any other settled kind may not be offered, and then the level is searched, so it
+        // has to say yes to everything.
+        match self.integers.get(depth as usize) {
+            Some(integer::Kind::Packed) => kind == integer::Kind::Packed,
+            _ => true,
+        }
+    }
+
     fn symbols(&self, depth: u8) -> Option<&SymbolTable> {
         self.symbols.as_ref().filter(|(at, _)| *at == depth).map(|(_, table)| &**table)
     }
@@ -493,8 +506,72 @@ pub(crate) fn sample<T: Copy>(values: &[T], window: usize, regions: usize) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{Chooser, EXHAUSTIVE, Replay, Sampled, sample};
+    use super::{Chooser, EXHAUSTIVE, Replay, Sampled, Settled, sample};
     use crate::{integer, string};
+
+    /// A settled shape that tests for every kind, which is what [`Settled`] did before it said
+    /// which kinds it could never keep.
+    #[derive(Debug)]
+    struct TestsEverything<'a>(&'a Settled);
+
+    impl Chooser for TestsEverything<'_> {
+        fn name(&self) -> &'static str {
+            "tests everything"
+        }
+
+        fn narrow_strings(
+            &self,
+            values: &[&[u8]],
+            offered: &[string::Kind],
+            depth: u8,
+        ) -> Vec<string::Kind> {
+            self.0.narrow_strings(values, offered, depth)
+        }
+
+        fn narrow_integers(
+            &self,
+            values: &[i64],
+            offered: &[integer::Kind],
+            depth: u8,
+        ) -> Vec<integer::Kind> {
+            self.0.narrow_integers(values, offered, depth)
+        }
+    }
+
+    /// A shape settled on `Packed` writes the same bytes whether or not the other kinds are tested
+    /// for, over integers of every shape and over strings whose lengths, prefixes and tokens are
+    /// integer arrays under it.
+    #[test]
+    fn a_shape_settled_on_packed_writes_what_testing_everything_wrote() {
+        for values in shaped_columns() {
+            let settled = Settled::new(Vec::new(), vec![integer::Kind::Packed]);
+            let quick = integer::encode_with(&values, &settled).unwrap();
+            let full = integer::encode_with(&values, &TestsEverything(&settled)).unwrap();
+            assert_eq!(quick, full, "{}", integer::describe(&full).unwrap());
+        }
+        let texts = (0..2048)
+            .map(|row| match row % 5 {
+                0 => format!("https://example.com/item/{row}"),
+                1 => format!("https://example.com/item/{}", row / 7),
+                2 => String::new(),
+                3 => "same".repeat(row % 11),
+                _ => format!("{:x}", row * 2_654_435_761_usize),
+            })
+            .collect::<Vec<_>>();
+        let values = texts.iter().map(|text| text.as_bytes()).collect::<Vec<_>>();
+        for strings in [
+            vec![string::Kind::Front, string::Kind::Lz],
+            vec![string::Kind::Lz, string::Kind::Fsst],
+            vec![string::Kind::Lz, string::Kind::Plain],
+            vec![string::Kind::Fsst],
+            vec![string::Kind::Plain],
+        ] {
+            let settled = Settled::new(strings, vec![integer::Kind::Packed]);
+            let quick = string::encode_with(&values, &settled).unwrap();
+            let full = string::encode_with(&values, &TestsEverything(&settled)).unwrap();
+            assert_eq!(quick, full, "{:?}", settled.strings());
+        }
+    }
 
     /// Columns of the shapes a writer meets: a climbing timestamp, runs, one value with exceptions,
     /// a stride, noise, and a short tail.
