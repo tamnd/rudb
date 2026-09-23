@@ -6,6 +6,14 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.10
+
+A patch release of two pull requests, both on the sorted load of SF1 `lineitem`. No format changes. The native directory format stays at 27 and the storage format version at 9, so this build and 0.4.9 read each other's files.
+
+A dictionary string column written through the inverse of the sort order now writes its codes that way too, in #1407, where #1404 had left it pulling each four byte code through the order. The four dictionary columns of the sorted SF1 CTAS gather in 17 to 47 ms each instead of 57 to 103 ms. A sorted string column reserves its whole arena before laying the pieces, in #1408, rather than growing it by doubling, which had copied the 183MB of comments again at every step. That lay went from 111 to 146 ms to 62 to 120 ms.
+
+Writing long strings straight into an arena in output order was measured and not merged, and the reasons are on #1408.
+
 ## 0.4.9
 
 A patch release of six pull requests, five of them on the sorted load of SF1 `lineitem` and one on memory for string statistics. The native directory format goes from 26 to 27, in #1398. This build reads 22 through 27, so it opens every file the last few releases wrote, but 0.4.8 does not read a file written by this one. The storage format version is unchanged at 9.
