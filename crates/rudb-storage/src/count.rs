@@ -63,7 +63,9 @@
 //! hash for a whole chunk. A run length column is one hash per run. A dictionary column hashes each
 //! dictionary entry at most once and then adds a `u64` per row, which is the same argument
 //! `zone::coded` makes for reading a dictionary through its codes rather than over its values. A bit
-//! packed column is a shift and a mask. Only a flat column and a string column pay a hash a row, and
+//! packed column is a shift and a mask. A flat signed column whose chunk holds a range no wider than
+//! its rows, which is a date, a quantity or a small decimal, adds a slot a row and a hash a value, see
+//! `narrow`. Only the other flat columns and a string column pay a hash a row, and
 //! [`Sketch::add_hash`] returns on a comparison for every value above the threshold, which after the
 //! first few thousand rows is nearly all of them.
 //!
@@ -695,6 +697,9 @@ fn flat(vector: &Vector, data: &Data, sink: &mut Sink<'_>) -> bool {
             match data {
                 $(Data::$variant(held) => {
                     let held: &[$native] = held;
+                    if narrow(held, vector, sink) {
+                        return true;
+                    }
                     return pass!(|row: usize| held.get(row).map(|&v| hash_signed(i128::from(v))));
                 })+
                 _ => {}
@@ -727,6 +732,57 @@ fn flat(vector: &Vector, data: &Data, sink: &mut Sink<'_>) -> bool {
         _ => false,
     }
 }
+
+/// A signed column whose values fall in a range no wider than its rows, counted into an array.
+///
+/// A quantity, a line number, a date or a price with two decimals is a column of this kind in most
+/// chunks, and the hash a row is most of what counting it costs. So the rows are counted into a slot
+/// per value in the range, and each value that some row holds is hashed once and handed on with its
+/// rows. The values go on in the order they first arrived, and the tally keeps its list in that
+/// order, so what the sketch and the tally end up holding is the same as a hash a row leaves.
+///
+/// `false` for a chunk too short or too wide for this, which the caller counts a row at a time.
+fn narrow<T: Copy + Ord + Into<i128>>(held: &[T], vector: &Vector, sink: &mut Sink<'_>) -> bool {
+    let rows = vector.len().min(held.len());
+    let Some(held) = held.get(..rows) else { return false };
+    let Some(&start) = held.first() else { return false };
+    let (low, high) =
+        held.iter().fold((start, start), |(low, high), &value| (low.min(value), high.max(value)));
+    let low: i128 = low.into();
+    let span = high.into() - low;
+    if rows < NARROW_ROWS || span >= rows as i128 {
+        return false;
+    }
+    let validity = vector.validity();
+    let nullable = validity.has_nulls(vector.len());
+    #[expect(clippy::cast_sign_loss, reason = "the span is below the rows, which is a usize")]
+    let mut seen = vec![0u32; span as usize + 1];
+    let mut first = Vec::new();
+    for (row, &value) in held.iter().enumerate() {
+        if nullable && !validity.is_valid(row) {
+            continue;
+        }
+        #[expect(clippy::cast_sign_loss, reason = "every value is at least the lowest")]
+        let Some(slot) = seen.get_mut((value.into() - low) as usize) else { return false };
+        if *slot == 0 {
+            first.push(row);
+        }
+        *slot += 1;
+    }
+    for row in first {
+        // Every row in `first` was read out of `held` above, so this always finds it. A `false`
+        // here would have the caller count again the values already handed on.
+        let Some(&value) = held.get(row) else { continue };
+        let value: i128 = value.into();
+        #[expect(clippy::cast_sign_loss, reason = "every value is at least the lowest")]
+        let rows = seen.get((value - low) as usize).copied().unwrap_or(0);
+        sink.add(hash_signed(value), u64::from(rows), || vector.value_at(row));
+    }
+    true
+}
+
+/// The fewest rows a chunk has for [`narrow`] to count it, below which the array is not worth it.
+const NARROW_ROWS: usize = 64;
 
 /// One value of a vector, read as a `Value` and hashed by the rule.
 ///
@@ -923,6 +979,41 @@ mod tests {
         let held = [Value::Interval { months: 1, days: 0, micros: 0 }];
         let vector = Vector::from_values(LogicalType::Interval, &held).expect("a column");
         assert_eq!(sketched(vector), None);
+    }
+
+    /// A column narrow enough to be counted into an array leaves what a hash a row leaves.
+    ///
+    /// The same rows are counted as one chunk, which is long enough for the array, and as chunks of
+    /// forty, which are not. The list has to come out in the same order with the same counts, which
+    /// is the part the array could get wrong, and that includes a range wide enough for the tally to
+    /// give up partway through a chunk.
+    #[test]
+    fn a_narrow_range_counted_into_an_array_matches_a_hash_a_row() {
+        for (values, wide) in [(41_i64, false), (900, true)] {
+            let held: Vec<Value> =
+                (0..1000_i64)
+                    .map(|n| {
+                        if n % 7 == 3 {
+                            Value::Null
+                        } else {
+                            Value::BigInt((n * 7919) % values - 20)
+                        }
+                    })
+                    .collect();
+            let mut whole = Counts::new(1);
+            let vector = Vector::from_values(LogicalType::BigInt, &held).expect("a column");
+            assert_eq!(vector.form(), Form::Flat);
+            whole.add(&Chunk::new(vec![vector]).expect("a chunk"));
+            let mut pieces = Counts::new(1);
+            for part in held.chunks(40) {
+                let vector = Vector::from_values(LogicalType::BigInt, part).expect("a column");
+                pieces.add(&Chunk::new(vec![vector]).expect("a chunk"));
+            }
+            assert_eq!(whole.distinct(0), pieces.distinct(0));
+            assert_eq!(whole.frequencies(0), pieces.frequencies(0));
+            assert_eq!(whole.frequencies(0).is_none(), wide, "the tally gave up where it should");
+            assert_eq!(whole.sketch(0), pieces.sketch(0));
+        }
     }
 
     /// The property the module doc promises: the form is how the rows are written down and the
