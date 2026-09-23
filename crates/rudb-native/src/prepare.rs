@@ -182,6 +182,8 @@ struct Local {
     counts: Vec<u64>,
     nulls: u64,
     parts: Vec<LocalPart>,
+    /// Whether the column is a blob rather than a varchar, for building its rows back.
+    blob: bool,
 }
 
 /// One part of one column coded against its stripe's dictionary.
@@ -204,6 +206,7 @@ impl Local {
         let mut mapped = None;
         for pending in held {
             let column = pending.chunk.column(index)?;
+            local.blob = column.logical_type() == &LogicalType::Blob;
             if let Some(codes) = local.code_dictionary(column, &mut mapped)? {
                 let mut validity = Vec::new();
                 push_validity(&mut validity, column);
@@ -320,8 +323,8 @@ impl Local {
                     }
                     _ => return Err(Error::internal("a coded part has no validity")),
                 };
-                Ok(Vector::flat(LogicalType::Varchar, Data::Varlen(column))?
-                    .with_validity(validity))
+                let ty = if self.blob { LogicalType::Blob } else { LogicalType::Varchar };
+                Ok(Vector::flat(ty, Data::Varlen(column))?.with_validity(validity))
             })
             .collect()
     }
