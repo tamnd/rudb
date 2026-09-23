@@ -397,17 +397,25 @@ impl StringColumn {
     pub(crate) fn push_column(&mut self, source: &Self, arenas: &mut Arenas) {
         self.views.reserve(source.views.len());
         let key = Arenas::key(source);
+        // An arena nobody counted is still worth one copy when it is mostly read, and a column built
+        // to be laid and then dropped is entirely read, so this is the usual answer for one of those.
+        // What it does not get is a line in `placed`, because the address it would be filed under is
+        // about to go back to the allocator. See the note on [`Arenas`].
+        let (live, share) = match arenas.counted(source) {
+            Some(live) => (live, true),
+            None => (live_bytes(source), false),
+        };
         let base = match arenas.placed.get(&key) {
             Some(&base) => Some(base),
-            None => match arenas.counted(source) {
-                Some(live) if Arenas::mostly_read(source.arena.len(), live) => {
-                    let base = self.arena.len() as u64;
-                    self.arena.extend_from_slice(source.arena());
+            None if Arenas::mostly_read(source.arena.len(), live) => {
+                let base = self.arena.len() as u64;
+                self.arena.extend_from_slice(source.arena());
+                if share {
                     arenas.placed.insert(key, base);
-                    Some(base)
                 }
-                _ => None,
-            },
+                Some(base)
+            }
+            None => None,
         };
         if let Some(base) = base {
             self.views.extend(source.views.iter().map(|view| view.shifted(base)));
@@ -591,19 +599,26 @@ impl StringColumn {
 /// alone reads a sliver. An arena is known by where its bytes are and how many there are.
 ///
 /// An address only tells two arenas apart while both of them are alive, so the one thing this must
-/// never do is remember an address that is about to be freed. That is why nothing but a counted
-/// arena is ever copied whole and recorded: counting happens over the columns the caller is holding
-/// for the whole of the lay, and two live allocations cannot sit at the same address, so a key in
-/// `placed` always means the arena it was taken from.
+/// never do is remember an address that is about to be freed. Only a counted arena is recorded:
+/// counting happens over the columns the caller is holding for the whole of the lay, and two live
+/// allocations cannot sit at the same address, so a key in `placed` always means the arena it was
+/// taken from.
 ///
-/// A column built on the way past does not get that treatment. Flattening a dictionary, or a run of
-/// views, builds a column that is laid and then dropped before the next one is built, and the
+/// A column built on the way past is the one that is not recorded. Flattening a dictionary, or a run
+/// of views, builds a column that is laid and then dropped before the next one is built, and the
 /// allocator is free to hand the same bytes back for it. Recording one of those meant the next
 /// column to land on the address was given a base worked out for somebody else's bytes, and its
 /// views were shifted by it without its own arena ever being copied in. What came back was strings
 /// of the right length read from the wrong place, so a group key came out as the tail of one value
 /// followed by the head of the next. That is #1413, which took TPC-H q16 at SF1 about half the time
 /// it ran.
+///
+/// Not recorded is not the same as not copied. Such a column is still laid in one copy of its arena
+/// when it is mostly read, which it always is, since a column that was just built holds exactly the
+/// bytes its views point at. Only the sharing goes, and there was never anything to share: each of
+/// those columns has an arena of its own and the next one is a different arena that happens to be at
+/// the same address. Laying them a string at a time instead is what cost 300ms on the six million
+/// SF1 `lineitem` comments, which is the whole reason the copy is here.
 #[derive(Debug, Default)]
 pub(crate) struct Arenas {
     live: HashMap<(usize, usize), usize>,
@@ -756,6 +771,27 @@ mod tests {
         laid.push_column(&built, &mut arenas);
         assert!(arenas.placed.is_empty(), "an uncounted arena was recorded by its address");
         assert_eq!(laid.get(0), Some(text));
+    }
+
+    /// Not being recorded does not mean being laid a string at a time.
+    ///
+    /// Two views over the same bytes is what tells the two apart: one copy of the arena lays those
+    /// bytes once and a string at a time lays them twice. The column here is one nobody counted, so
+    /// it is the case #1413 made suspicious, and it still gets its one copy.
+    #[test]
+    fn an_arena_that_nobody_counted_is_still_laid_in_one_copy() {
+        let text = "a string two views point at, well over the inline limit";
+        let page = Arc::new(text.as_bytes().to_vec());
+        let mut twice = StringColumn::over(Buffer::from_arc(Arc::clone(&page)));
+        twice.push_in_place(0, text.len()).expect("inside the page");
+        twice.push_in_place(0, text.len()).expect("inside the page");
+        let mut laid = StringColumn::new();
+        let mut arenas = Arenas::default();
+        laid.push_column(&twice, &mut arenas);
+        assert!(arenas.placed.is_empty(), "an uncounted arena was recorded by its address");
+        assert_eq!(laid.arena().len(), text.len(), "the arena was laid once and not once a view");
+        assert_eq!(laid.get(0), Some(text));
+        assert_eq!(laid.get(1), Some(text));
     }
 
     /// And an arena that was counted still is, so the lay of a page is still one copy of the page.
