@@ -154,6 +154,16 @@ q5 goes from level to 123 times on processor and 8.3 times on memory, and it doe
 
 The other forty two moved by what the host's load moved them by, in both directions, and their answers are the ones they were apart from ties at the limit. The suite total went from 63.4 to 54.7 seconds, most of that noise. Three of forty three still clear both axes. The change is worth recording as the kind of change that works, a number the writer can afford and the competitor's format has no place for, and as a measurement of how little one such number moves a target stated over the whole suite.
 
+## The second item, tried and not kept
+
+q9, q10 and q23 keep their grouped distinct pairs in `rudb-exec/src/pairs.rs`, where every row becomes a sixteen byte record in one of sixty four radix partitions per scan thread and duplicates are removed only when the partitions are finished. That is why q9 holds 253.9 MiB for about one and a half million users: the memory follows the ten million rows, not the pairs.
+
+The obvious fix is to have each thread's partition sort itself and drop repeats whenever it doubles. It was built and measured on three million rows shaped like the real column, 450,000 users seen about six and a half times each: the peak went from 127 to between 117 and 125 MiB and the processor time doubled, 0.04 to 0.08 seconds, with the same answers. On three million distinct users there was nothing to drop and it cost half again.
+
+The reason is arithmetic, not tuning. A pair seen six times over the whole table, dealt across ten threads and sixty four partitions, turns up in any one thread's partition less than once on average, so the thread that holds a record almost never holds its duplicate. Repeats only meet where the threads' partitions meet, at the finish. A fix that saves memory has to deduplicate in a structure the threads share, or change what a record costs, and neither is the local change it looked like.
+
+It also cannot reach the target on this query. DuckDB's peak on q9 is 137.3 MiB, so ten times less is 13.7 MiB, one megabyte over the process floor, and no representation of a million and a half pairs fits in one megabyte. The grouped distinct queries are worth making no longer behind, and that is the whole of what they can give.
+
 ## What this does not claim
 
 It does not claim the target is met. Three of forty three queries clear both axes, in the native quadrant, at one scale. The Parquet quadrant is not measured here and document 25's arithmetic still stands in it.
