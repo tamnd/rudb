@@ -6,10 +6,11 @@ use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value};
 use rudb_native::{
-    Common, FrequencyOccurrences, FrequencyPrefix, Reader as NativeReader, StoredPart, Stripes,
+    Common, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts, Reader as NativeReader,
+    StoredPart, Stripes,
 };
 use rudb_storage::{MemoryTable, Probe};
-use rudb_vector::{Chunk, Form, Vector};
+use rudb_vector::{Chunk, Form, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
 use crate::held::Held;
@@ -63,6 +64,19 @@ pub enum Rows {
     /// disagree about and the honest answer is to write it again.
     Grown(NativeReader, MemoryTable),
 }
+
+/// Two columns fetched at sparse native row ordinals without materializing their string values.
+#[derive(Debug)]
+pub struct StablePairCodes {
+    /// Signed values from the first column, with nulls in place.
+    pub first: Vec<Option<i128>>,
+    /// Stable dictionary codes from the second column, with nulls in place.
+    pub second: Vec<Option<u32>>,
+    /// The one table-wide dictionary those codes name.
+    pub dictionary: Arc<Vector>,
+}
+
+type StableCodes = (Vec<Option<u32>>, Arc<Vector>);
 
 impl Rows {
     /// The rows to append to, turning a committed file into one that has rows in memory beside it.
@@ -281,6 +295,156 @@ impl Rows {
         }
     }
 
+    /// Exact certified leading counts for a native numeric/string grouping pair.
+    pub fn top_pair_frequencies(
+        &self,
+        first: usize,
+        second: usize,
+        top: usize,
+    ) -> Result<Option<PairFrequencyCounts>> {
+        match self {
+            Self::Native(reader) => reader.top_pair_frequencies(first, second, top),
+            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
+        }
+    }
+
+    /// Reads a signed column and a stable-dictionary column at sorted native row ordinals.
+    ///
+    /// Unlike [`Self::rows_at`], this may answer more than one vector of positions. It returns raw
+    /// values and codes rather than manufacturing an oversized chunk, resolves the part locations
+    /// once for the whole request, and lets the two independent columns read in parallel.
+    pub fn stable_pair_codes_at(
+        &self,
+        first: usize,
+        second: usize,
+        ordinals: &[u64],
+    ) -> Result<Option<StablePairCodes>> {
+        let Self::Native(reader) = self else { return Ok(None) };
+        let (locations, dense) = Self::native_locations(reader, ordinals)?;
+        let (first, coded) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| Self::read_native_signed(reader, first, &locations, dense));
+            let coded = scope.spawn(|| Self::read_native_codes(reader, second, &locations, dense));
+            let first = first
+                .join()
+                .map_err(|_| Error::internal("a signed sparse-fetch worker panicked"))??;
+            let coded = coded
+                .join()
+                .map_err(|_| Error::internal("a code sparse-fetch worker panicked"))??;
+            Ok::<_, Error>((first, coded))
+        })?;
+        let Some((second, dictionary)) = coded else { return Ok(None) };
+        Ok(Some(StablePairCodes { first, second, dictionary }))
+    }
+
+    /// Reads one stable-dictionary column at sorted native row ordinals without its string values.
+    pub fn stable_codes_at(&self, column: usize, ordinals: &[u64]) -> Result<Option<StableCodes>> {
+        let Self::Native(reader) = self else { return Ok(None) };
+        let (locations, dense) = Self::native_locations(reader, ordinals)?;
+        Self::read_native_codes(reader, column, &locations, dense)
+    }
+
+    fn native_locations(
+        reader: &NativeReader,
+        ordinals: &[u64],
+    ) -> Result<(Vec<(usize, usize)>, bool)> {
+        let mut ends = Vec::with_capacity(reader.parts());
+        let mut end = 0_usize;
+        for part in 0..reader.parts() {
+            end = end.saturating_add(reader.part_rows(part));
+            ends.push(end);
+        }
+        let mut locations = Vec::with_capacity(ordinals.len());
+        for &ordinal in ordinals {
+            let ordinal = usize::try_from(ordinal)
+                .map_err(|_| Error::internal("row ordinal does not fit this platform"))?;
+            let part = ends.partition_point(|&end| end <= ordinal);
+            if part == ends.len() {
+                return Err(Error::internal("row ordinal is past the table"));
+            }
+            let start = part.checked_sub(1).map_or(0, |before| ends[before]);
+            locations.push((part, ordinal - start));
+        }
+        let distinct = locations
+            .iter()
+            .enumerate()
+            .filter(|&(at, location)| at == 0 || locations[at - 1].0 != location.0)
+            .count();
+        let dense = distinct.saturating_mul(8) >= reader.parts();
+        Ok((locations, dense))
+    }
+
+    fn read_native_signed(
+        reader: &NativeReader,
+        column: usize,
+        locations: &[(usize, usize)],
+        dense: bool,
+    ) -> Result<Vec<Option<i128>>> {
+        let mut values = Vec::with_capacity(locations.len());
+        let mut from = 0;
+        while from < locations.len() {
+            let part = locations[from].0;
+            let mut upto = from + 1;
+            while upto < locations.len() && locations[upto].0 == part {
+                upto += 1;
+            }
+            let held = if dense {
+                reader.read(part, &[column])?
+            } else {
+                reader.read_sparse(part, &[column])?
+            };
+            let vector = held.column(0)?;
+            for &(_, row) in &locations[from..upto] {
+                if vector.is_null_at(row) {
+                    values.push(None);
+                } else {
+                    values.push(Some(vector.signed_at(row).ok_or_else(|| {
+                        Error::internal("a signed sparse-fetch value has no signed representation")
+                    })?));
+                }
+            }
+            from = upto;
+        }
+        Ok(values)
+    }
+
+    fn read_native_codes(
+        reader: &NativeReader,
+        column: usize,
+        locations: &[(usize, usize)],
+        dense: bool,
+    ) -> Result<Option<StableCodes>> {
+        let mut codes = Vec::with_capacity(locations.len());
+        let mut dictionary = None;
+        let mut from = 0;
+        while from < locations.len() {
+            let part = locations[from].0;
+            let mut upto = from + 1;
+            while upto < locations.len() && locations[upto].0 == part {
+                upto += 1;
+            }
+            let held = if dense {
+                reader.read(part, &[column])?
+            } else {
+                reader.read_sparse(part, &[column])?
+            };
+            let vector = held.column(0)?;
+            let Some((part_codes, values)) = vector.stable_dictionary_parts() else {
+                return Ok(None);
+            };
+            if dictionary.as_ref().is_some_and(|held| !Arc::ptr_eq(held, values)) {
+                return Ok(None);
+            }
+            if dictionary.is_none() {
+                dictionary = Some(Arc::clone(values));
+            }
+            for &(_, row) in &locations[from..upto] {
+                codes.push((!vector.is_null_at(row)).then(|| part_codes[row]));
+            }
+            from = upto;
+        }
+        Ok(dictionary.map(|dictionary| (codes, dictionary)))
+    }
+
     /// Number of rows in one independently readable chunk.
     pub fn chunk_len(&self, at: usize) -> Result<usize> {
         Ok(match self {
@@ -398,7 +562,14 @@ impl Rows {
         let dense = distinct.saturating_mul(8) >= reader.parts();
         const MIN_COLUMNS_PER_WORKER: usize = 16;
         const MAX_WORKERS: usize = 8;
-        let workers = columns.len().div_ceil(MIN_COLUMNS_PER_WORKER).min(MAX_WORKERS);
+        // A wide fetch amortizes a worker over its columns. A narrow fetch over a full vector of
+        // scattered rows amortizes it over the parts each column has to read instead, and keeping
+        // two such columns on one worker made a certified pair lookup twice as serial as its data.
+        let workers = if locations.len() >= VECTOR_SIZE / 2 {
+            columns.len().min(MAX_WORKERS)
+        } else {
+            columns.len().div_ceil(MIN_COLUMNS_PER_WORKER).min(MAX_WORKERS)
+        };
         if workers <= 1 {
             let vectors = Self::read_native_columns(reader, columns, types, &locations, dense)?;
             return Chunk::with_rows(vectors, ordinals.len());
@@ -438,7 +609,7 @@ impl Rows {
         locations: &[(usize, usize)],
         dense: bool,
     ) -> Result<Vec<Vector>> {
-        let mut values = vec![Vec::with_capacity(locations.len()); columns.len()];
+        let mut pieces = (0..columns.len()).map(|_| Vec::new()).collect::<Vec<Vec<Vector>>>();
         let mut from = 0;
         while from < locations.len() {
             let part = locations[from].0;
@@ -451,17 +622,31 @@ impl Rows {
             } else {
                 reader.read_sparse(part, columns)?
             };
-            for &(_, row) in &locations[from..upto] {
-                for (at, values) in values.iter_mut().enumerate() {
-                    values.push(held.value_at(row, at));
-                }
+            let selected = locations[from..upto]
+                .iter()
+                .map(|&(_, row)| {
+                    u32::try_from(row)
+                        .map_err(|_| Error::internal("a row within a part exceeds u32"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (at, pieces) in pieces.iter_mut().enumerate() {
+                pieces.push(held.column(at)?.gather(&selected)?);
             }
             from = upto;
         }
-        values
+        pieces
             .into_iter()
             .zip(types)
-            .map(|(values, ty)| Vector::from_values(ty.clone(), &values))
+            .map(|(pieces, ty)| {
+                if let Some(vector) = concat(ty, &pieces)? {
+                    return Ok(vector);
+                }
+                let values = pieces
+                    .iter()
+                    .flat_map(|piece| (0..piece.len()).map(|row| piece.value_at(row)))
+                    .collect::<Vec<_>>();
+                Vector::from_values(ty.clone(), &values)
+            })
             .collect()
     }
 
