@@ -1109,20 +1109,58 @@ impl Table {
         let columns = reader.table().fields().to_vec();
         duplicate_check(&columns)?;
         let clustering = reader.table().clustering().cloned();
+        let (keys, foreign) = restored(&name, reader.table().constraints());
         Ok(Self {
             name,
             columns,
             rows: Rows::Native(reader),
             oid: DETACHED,
             clustering,
-            keys: Vec::new(),
-            seen: Vec::new(),
+            // Not read into sets here. A key's set is built from the rows the first time a write
+            // asks for it, so opening a file of a hundred million keyed rows reads none of them.
+            seen: vec![None; keys.len()],
+            keys,
             indexes: Vec::new(),
             defaults: Vec::new(),
             checks: Vec::new(),
-            foreign: Vec::new(),
+            foreign,
             sequences: Vec::new(),
         })
+    }
+
+    /// The keys and foreign keys in the form the file stores them, for a checkpoint to write.
+    ///
+    /// # Errors
+    ///
+    /// If a key names a column past what a file can. A foreign key into another schema is left out,
+    /// since a file of one schema has no way to name it.
+    pub fn stored_constraints(&self) -> Result<rudb_native::Constraints> {
+        let places = |columns: &[usize]| {
+            columns
+                .iter()
+                .map(|&column| u16::try_from(column))
+                .collect::<std::result::Result<Vec<u16>, _>>()
+                .map_err(|_| Error::internal("a key over a column past what a file can name"))
+        };
+        let mut stored = rudb_native::Constraints::default();
+        for key in &self.keys {
+            stored.keys.push((places(&key.columns)?, key.primary));
+        }
+        for foreign in &self.foreign {
+            // A file of one schema has no way to name a table in another, and a checkpoint that
+            // refused would lose every row to keep one declaration, so this one is left out.
+            if !same_name(&foreign.table.schema, &self.name.schema)
+                || !same_name(&foreign.table.catalog, &self.name.catalog)
+            {
+                continue;
+            }
+            stored.foreign.push(rudb_native::StoredForeign {
+                columns: places(&foreign.columns)?,
+                table: foreign.table.table.clone(),
+                referenced: places(&foreign.referenced)?,
+            });
+        }
+        Ok(stored)
     }
 
     /// The number the catalog tables join on, and [`DETACHED`] for a table not in a catalog.
@@ -1765,6 +1803,32 @@ impl Table {
     fn null_in(&self, column: &str) -> Error {
         Error::constraint(format!("NOT NULL constraint failed: {}.{}", self.name.table, column))
     }
+}
+
+/// The keys and foreign keys a table opened from a file was created with.
+///
+/// A foreign key's table is named in the file by name alone and is in the same schema as the table
+/// holding it, so the rest of its name is this table's.
+fn restored(
+    name: &QualifiedName,
+    stored: &rudb_native::Constraints,
+) -> (Vec<Key>, Vec<ForeignKey>) {
+    let places = |columns: &[u16]| columns.iter().map(|&column| usize::from(column)).collect();
+    let keys = stored
+        .keys
+        .iter()
+        .map(|(columns, primary)| Key { columns: places(columns), primary: *primary })
+        .collect();
+    let foreign = stored
+        .foreign
+        .iter()
+        .map(|foreign| ForeignKey {
+            columns: places(&foreign.columns),
+            table: QualifiedName { table: foreign.table.clone(), ..name.clone() },
+            referenced: places(&foreign.referenced),
+        })
+        .collect();
+    (keys, foreign)
 }
 
 #[cfg(test)]

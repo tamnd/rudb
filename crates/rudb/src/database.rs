@@ -1739,6 +1739,10 @@ fn persist(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) ->
         if let Some(clustering) = table.clustering() {
             open = open.declare(clustering.clone())?;
         }
+        let constraints = table.stored_constraints()?;
+        if !constraints.is_empty() {
+            open = open.constrain(constraints)?;
+        }
         for at in 0..table.rows().chunk_count() {
             open.append(&table.rows().read(at, &columns)?)?;
         }
@@ -2036,6 +2040,10 @@ fn appended(
         // need it said again.
         if let Some(clustering) = table.clustering() {
             open = open.declare(clustering.clone())?;
+        }
+        let constraints = table.stored_constraints()?;
+        if !constraints.is_empty() {
+            open = open.constrain(constraints)?;
         }
         for at in 0..table.rows().chunk_count() {
             open.append(&table.rows().read(at, &columns)?)?;
