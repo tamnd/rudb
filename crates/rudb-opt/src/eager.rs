@@ -79,6 +79,7 @@ use std::collections::HashMap;
 use rudb_common::{LogicalType, Result, Value};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 
+use crate::estimate::{self, Facts};
 use crate::pass::{Context, Pass};
 use crate::walk;
 
@@ -91,16 +92,16 @@ impl Pass for EagerAggregation {
         "eager_aggregation"
     }
 
-    fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
-        push(plan);
+    fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
+        push(plan, context.facts());
         Ok(())
     }
 }
 
 /// Rewrites every aggregate in `plan` that this applies to.
-pub fn push(plan: &mut Plan) {
+pub fn push(plan: &mut Plan, stats: &Facts) {
     let mut moved = false;
-    let root = walk::restack(plan, plan.root(), &mut moved, &mut split);
+    let root = walk::restack(plan, plan.root(), &mut moved, &mut |plan, at| split(plan, at, stats));
     if moved {
         plan.set_root(root);
     }
@@ -116,7 +117,7 @@ enum Step {
 }
 
 /// The two stage form of `at` when it is an aggregate this applies to.
-fn split(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
+fn split(plan: &mut Plan, at: NodeRef, stats: &Facts) -> Option<NodeRef> {
     let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else { return None };
     let calls = plan.expr_list(aggregates).to_vec();
     if calls.is_empty() || !calls.iter().all(|&call| movable(plan, call)) {
@@ -157,7 +158,7 @@ fn split(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
                 padded |= kind == JoinKind::Left && below == right;
                 let scan = matches!(plan.node(beside), Node::Get { .. });
                 if let Some(kept) =
-                    scan.then(|| worth(plan, &path, &keys, below, &side, &other)).flatten()
+                    scan.then(|| worth(plan, &path, &keys, below, &side, &other, stats)).flatten()
                 {
                     let staged = Staged { below, kept, padded };
                     return Some(rewrite(plan, &path, staged, index, &keys, &calls));
@@ -202,6 +203,7 @@ fn worth(
     below: NodeRef,
     side: &[(ColumnBinding, LogicalType)],
     other: &[(ColumnBinding, LogicalType)],
+    stats: &Facts,
 ) -> Option<Vec<(ColumnBinding, LogicalType)>> {
     if matches!(plan.node(below), Node::Aggregate { .. }) {
         return None;
@@ -235,34 +237,30 @@ fn worth(
         ty.is_integer() || ty.is_temporal() || matches!(ty, LogicalType::Decimal { .. })
     };
     let fits = !kept.is_empty() && kept.iter().all(|(_, ty)| narrow(ty));
-    (fits && (wide || shrinks(plan, below, &kept))).then_some(kept)
+    (fits && (wide || shrinks(plan, below, &kept, stats))).then_some(kept)
 }
 
 /// How many times fewer rows B has to come out with once grouped by K before that alone is worth
 /// the partial aggregate.
 const SHRINK: u64 = 4;
 
-/// Whether grouping B by `kept` leaves at most one row in [`SHRINK`], by what the file says.
+/// Whether grouping B by `kept` leaves at most one row in [`SHRINK`], by what was counted.
 ///
-/// Only for a B that is one scan under filters, whose row count and whose distinct count for every
-/// column of K were measured. The groups are taken as the product of those counts, capped at the
-/// rows, which is the most there can be. The filters are not counted, because a filter that drops
-/// rows drops groups with them and the ratio the scan had is the best there is to go on.
-fn shrinks(plan: &Plan, below: NodeRef, kept: &[(ColumnBinding, LogicalType)]) -> bool {
-    let mut here = below;
-    while let Node::Filter { input, .. } = *plan.node(here) {
-        here = input;
-    }
-    let Node::Get { index, columns, .. } = *plan.node(here) else { return false };
-    let Some(&rows) = plan.measured(index).value() else { return false };
-    let fields = plan.field_list(columns);
+/// The rows are B's before its filters, and the groups are the product of the distinct counts of
+/// the columns of K, capped at those rows, which is the most there can be. Every column of K has to
+/// have been counted, by the file or by the catalog, since a count that fell back to the table's
+/// rows would say nothing here. The filters are not counted, because a filter that drops rows drops
+/// groups with them and the ratio the scan had is the best there is to go on.
+fn shrinks(
+    plan: &Plan,
+    below: NodeRef,
+    kept: &[(ColumnBinding, LogicalType)],
+    stats: &Facts,
+) -> bool {
+    let Some(&rows) = estimate::unfiltered(plan, below, stats).value() else { return false };
     let mut groups: u64 = 1;
     for (binding, _) in kept {
-        if binding.table != index {
-            return false;
-        }
-        let Some(field) = fields.get(binding.column as usize) else { return false };
-        let Some(&distinct) = plan.distinct_measured(index, &field.name).value() else {
+        let Some(&distinct) = estimate::stated(plan, *binding, stats).value() else {
             return false;
         };
         groups = groups.saturating_mul(distinct);
@@ -386,19 +384,20 @@ fn rebind(
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::{Provenance, Stat};
+    use rudb_common::Provenance;
     use rudb_plan::Plan;
 
     use super::push;
+    use crate::estimate::Facts;
 
     /// What the plan a text prints looks like once the pass has run over it, twice.
     fn pushed(text: &str) -> String {
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
-        push(&mut plan);
+        push(&mut plan, &Facts::new());
         plan.validate().unwrap_or_else(|error| panic!("{text} did not stay valid: {error}"));
         let once = plan.to_string();
-        push(&mut plan);
+        push(&mut plan, &Facts::new());
         assert_eq!(plan.to_string(), once, "a second run moved the plan again");
         once
     }
@@ -462,18 +461,19 @@ mod tests {
         "      Get memory.main.o AS o #1 [c::BIGINT, key::BIGINT]\n",
     );
 
-    /// `PADDED` with the scan of `o` measured at `rows` rows and `distinct` values of `c`.
-    fn padded(rows: u64, distinct: u64) -> Plan {
-        let mut plan = Plan::parse(PADDED).expect("parses");
-        plan.measure(1, Stat::exact(rows, Provenance::RowCount));
-        plan.measure_distinct(1, "c", Stat::exact(distinct, Provenance::Dictionary));
-        plan
+    /// What the catalog would say about `o` in `PADDED`: `rows` rows and `distinct` values of `c`.
+    fn counted(rows: u64, distinct: u64) -> Facts {
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "o", rows);
+        facts.record_distinct("memory", "main", "o", "c", distinct, Provenance::Dictionary);
+        facts
     }
 
     #[test]
     fn a_count_below_the_padded_side_of_a_left_join_reads_coalesce_above_it() {
-        let mut plan = padded(1_500_000, 100_000);
-        push(&mut plan);
+        let stats = counted(1_500_000, 100_000);
+        let mut plan = Plan::parse(PADDED).expect("parses");
+        push(&mut plan, &stats);
         plan.validate().expect("valid");
         assert_eq!(
             plan.to_string(),
@@ -487,7 +487,7 @@ mod tests {
             )
         );
         let once = plan.to_string();
-        push(&mut plan);
+        push(&mut plan, &stats);
         assert_eq!(plan.to_string(), once, "a second run moved the plan again");
     }
 
@@ -498,8 +498,8 @@ mod tests {
         for (rows, distinct, moves) in
             [(1_500_000, 100_000, true), (400, 100, true), (400, 101, false)]
         {
-            let mut plan = padded(rows, distinct);
-            push(&mut plan);
+            let mut plan = Plan::parse(PADDED).expect("parses");
+            push(&mut plan, &counted(rows, distinct));
             assert_eq!(plan.to_string() != PADDED, moves, "{rows} rows over {distinct} values");
         }
         assert_eq!(pushed(PADDED), PADDED, "nothing measured");
