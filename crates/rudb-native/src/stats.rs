@@ -55,7 +55,7 @@ use rudb_common::{LogicalType, Result, Value};
 use rudb_encoding::sketch::{DEFAULT_K, Sketch};
 use rudb_stats::{Order, STRIPE_K, Sketches, Summary, sketches::HEADER_BYTES as SKETCH_HEADER};
 use rudb_storage::count::{Counts, countable};
-use rudb_vector::{Data, Form, Validity, Vector};
+use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 
 use crate::section::{self, Attachment};
 use crate::{Catalog, Reader, invalid};
@@ -350,6 +350,7 @@ impl Pass {
                     })+
                     Data::Float64(held) => self.scan_reals(rows, validity, held),
                     Data::Float32(held) => self.scan_reals(rows, validity, held),
+                    Data::Varlen(held) => self.scan_strings(rows, validity, held),
                     _ => false,
                 }
             };
@@ -391,6 +392,64 @@ impl Pass {
                 last: Bound::Real(spread.last),
             }),
         });
+        true
+    }
+
+    /// One vector of a flat string column, compared against itself and then folded in once.
+    ///
+    /// [`Self::bytes_value`] compares every row with the row before it and with all four ends, and
+    /// copies it in as the previous row, which on a `lineitem` load from CSV was about 3% of the
+    /// load's cycles in `memcmp`. Within a vector the row before is still a borrow, so nothing is
+    /// copied, and a row is only compared with the end it can move: one above the row before it
+    /// cannot be the lowest yet, and one below cannot be the highest. The vector's own ends go
+    /// through [`Self::fold`] once, which is the only place they are copied.
+    fn scan_strings(&mut self, rows: usize, validity: &Validity, held: &StringColumn) -> bool {
+        if held.len() < rows {
+            return false;
+        }
+        let nullable = validity.has_nulls(rows);
+        let mut out = Reduced::empty(rows as u64);
+        let mut ends: Option<(&[u8], &[u8], &[u8])> = None;
+        let mut last: &[u8] = &[];
+        // row at a time: the ascents, the descents and which end a row can move are all about the
+        // row before it. The bytes are borrowed out of the column and no `Value` is built.
+        for row in 0..rows {
+            if nullable && !validity.is_valid(row) {
+                out.nulls += 1;
+                continue;
+            }
+            let Some(bytes) = held.bytes(row) else { return false };
+            let width = bytes.len() as u64;
+            out.bytes = out.bytes.saturating_add(width);
+            out.widest = out.widest.max(width);
+            match &mut ends {
+                None => ends = Some((bytes, bytes, bytes)),
+                Some((low, high, _)) => match bytes.cmp(last) {
+                    Ordering::Greater => {
+                        out.ascents += 1;
+                        if bytes > *high {
+                            *high = bytes;
+                        }
+                    }
+                    Ordering::Less => {
+                        out.descents += 1;
+                        if bytes < *low {
+                            *low = bytes;
+                        }
+                    }
+                    Ordering::Equal => {}
+                },
+            }
+            last = bytes;
+            out.values += 1;
+        }
+        out.ends = ends.map(|(low, high, first)| Ends {
+            low: Bound::Bytes(low.to_vec()),
+            high: Bound::Bytes(high.to_vec()),
+            first: Bound::Bytes(first.to_vec()),
+            last: Bound::Bytes(last.to_vec()),
+        });
+        self.fold(out);
         true
     }
 
@@ -1774,10 +1833,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let flat = drive(ty, &held, |pass, vector| {
-                    assert!(pass.scan_flat(vector) || *ty == LogicalType::Varchar, "{label} {ty}");
-                    if *ty == LogicalType::Varchar {
-                        pass.scan_rows(vector);
-                    }
+                    assert!(pass.scan_flat(vector), "{label} {ty}");
                 });
                 let dictionary = drive(ty, &coded, |pass, vector| {
                     assert!(pass.scan_dictionary(vector), "{label} {ty} is dictionary coded");
@@ -1891,6 +1947,51 @@ mod tests {
                     "{label} {ty}"
                 );
                 assert_eq!(fell_back, usize::from(label.contains("NaN")), "{label} {ty}");
+            }
+        }
+    }
+
+    /// A string column read a vector at a time says what it says a row at a time.
+    #[test]
+    fn a_string_column_a_vector_at_a_time_says_what_it_says_a_row_at_a_time() {
+        let word = |at: i64| format!("w{:03}", at);
+        let shapes: [(&str, Vec<Option<String>>); 6] = [
+            ("ascending", (0..500).map(|at| Some(word(at))).collect()),
+            ("descending", (0..500).rev().map(|at| Some(word(at))).collect()),
+            ("shuffled", (0..500).map(|at| Some(word(at * 307 % 500))).collect()),
+            ("repeated", (0..500).map(|at| Some(word(at / 7 % 5))).collect()),
+            ("prefixes", (0..500).map(|at| Some("ab".repeat(1 + at % 9))).collect()),
+            (
+                "every third null",
+                (0..500).map(|at| (at % 3 != 0).then(|| word(at * 13 % 500))).collect(),
+            ),
+        ];
+        for ty in [LogicalType::Varchar] {
+            for (label, values) in &shapes {
+                let held = values
+                    .chunks(60)
+                    .map(|part| {
+                        let values = part
+                            .iter()
+                            .map(|value| value.clone().map_or(Value::Null, Value::Varchar))
+                            .collect::<Vec<_>>();
+                        Vector::from_values(ty.clone(), &values).expect("values")
+                    })
+                    .collect::<Vec<_>>();
+                let mut fell_back = 0;
+                let flat = drive(&ty, &held, |pass, vector| {
+                    if !pass.scan_flat(vector) {
+                        fell_back += 1;
+                        pass.scan_rows(vector);
+                    }
+                });
+                let rows = drive(&ty, &held, Pass::scan_rows);
+                assert_eq!(
+                    format!("{:?}", flat.summary),
+                    format!("{:?}", rows.summary),
+                    "{label} {ty}"
+                );
+                assert_eq!(fell_back, 0, "{label} {ty}");
             }
         }
     }
