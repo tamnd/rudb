@@ -54,7 +54,7 @@ use rudb_vector::{Data, Form, StringColumn, Validity, Vector};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::aggregate::Accumulator;
+use crate::aggregate::{Accumulator, divide_mean, exactly};
 use crate::cast;
 use crate::compare::{self, Comparison};
 use crate::datetime::{self, Count, Part};
@@ -964,6 +964,9 @@ fn binary(
     if name == "__rudb_stamp_seconds" {
         return stamp_seconds_of(left, right, returns);
     }
+    if name == "__rudb_mean" {
+        return mean_of(left, right, returns, rows);
+    }
     if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
         return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
     }
@@ -1119,6 +1122,60 @@ fn stamp_seconds_of(
     let opened = opened_integer(count)?;
     let count = opened.as_ref().unwrap_or(count);
     by_form!(stamp, count, stamp_seconds_runs, stamp, count, returns)
+}
+
+/// `__rudb_mean(total, count)`, an average put back together from a `sum` and a `count` of the same
+/// argument.
+///
+/// The optimizer writes `avg(x)` this way when the same aggregate already adds `x` up, so that the
+/// column is added up once rather than twice. The answer is null where the total is, which is where
+/// the count is zero, and otherwise the division [`divide_mean`] does for `avg` itself, so the two
+/// agree to the bit. `None` for a side in a form other than flat, which the value path answers.
+fn mean_of(
+    total: &Vector,
+    count: &Vector,
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    let Some(scale) = mean_scale(total.logical_type()) else { return Ok(None) };
+    let (Some(Data::Int128(totals)), Some(Data::Int64(counts))) = (total.data(), count.data())
+    else {
+        return Ok(None);
+    };
+    if returns != &LogicalType::Double || totals.len() < rows || counts.len() < rows {
+        return Ok(None);
+    }
+    let (total_nulls, count_nulls) = (nulls_of(total), nulls_of(count));
+    let mut valid = vec![true; rows];
+    let mut answers = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let seen = counts[row];
+        if seen > 0 && total_nulls.is_valid(row) && count_nulls.is_valid(row) {
+            answers.push(divide_mean(exactly(totals[row]), seen, scale));
+        } else {
+            valid[row] = false;
+            answers.push(0.0);
+        }
+    }
+    finish(returns, Data::Float64(answers.into()), Validity::from_run(&valid))
+}
+
+/// Where the point goes in a total `__rudb_mean` divides, or `None` for a type it does not take.
+fn mean_scale(ty: &LogicalType) -> Option<u8> {
+    match ty {
+        LogicalType::HugeInt => Some(0),
+        LogicalType::Decimal { scale, .. } => Some(*scale),
+        _ => None,
+    }
+}
+
+/// The unscaled total in one value of a `sum`, or `None` for a null.
+fn mean_total(value: &Value) -> Option<i128> {
+    match *value {
+        Value::HugeInt(total) => Some(total),
+        Value::Decimal { unscaled, .. } => Some(unscaled),
+        _ => None,
+    }
 }
 
 /// An integer side opened into flat values when it is in a form [`by_form!`] has no arm for, which
@@ -2904,6 +2961,16 @@ pub fn call_values(
             )));
         };
         return stamp_seconds(*stamp, count).map(Value::Timestamp);
+    }
+    if let ("__rudb_mean", [total, count]) = (name, args) {
+        let (Some(total), Some(scale)) = (mean_total(total), mean_scale(&total.logical_type()))
+        else {
+            return Ok(Value::Null);
+        };
+        return Ok(match count.as_i64() {
+            Some(seen) if seen > 0 => Value::Double(divide_mean(exactly(total), seen, scale)),
+            _ => Value::Null,
+        });
     }
     if name == "coalesce" {
         let found = args.iter().find(|value| !value.is_null());

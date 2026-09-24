@@ -861,19 +861,7 @@ impl Accumulator {
                     return Some(Answer::Null);
                 }
                 let total = if *exact { exactly(*total) } else { mean_real(*total) };
-                // One division, by the count and the scale together. Where the column was a decimal
-                // the total is the sum of the integers it stores, so the point has still to go back,
-                // and dividing by the count and then by a hundred rounds twice where dividing by a
-                // hundred times the count rounds once. That last digit is what duckdb answers with,
-                // and on the eight cells of TPC-H query 1 where the two orders differ the single
-                // division is the one that agrees with it. A power of ten is exact as a double well
-                // past any scale a decimal can declare, so the product is exact too.
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "the count of rows in one group is well inside the exact range"
-                )]
-                let divisor = *seen as f64 * pow10(*scale) as f64;
-                Some(Answer::Real(total / divisor))
+                Some(Answer::Real(divide_mean(total, *seen, *scale)))
             }
             State::Scaled { total, seen, .. } => {
                 Some(if *seen { Answer::Whole(*total) } else { Answer::Null })
@@ -2490,13 +2478,33 @@ fn mark(value: &Value, scale: u8) -> Option<i128> {
     }
 }
 
+/// An average from an exact total of `seen` values stored at `scale`, the way `avg` finishes one.
+///
+/// One division, by the count and the scale together. Where the column was a decimal the total is
+/// the sum of the integers it stores, so the point has still to go back, and dividing by the count
+/// and then by a hundred rounds twice where dividing by a hundred times the count rounds once. That
+/// last digit is what duckdb answers with, and on the eight cells of TPC-H query 1 where the two
+/// orders differ the single division is the one that agrees with it. A power of ten is exact as a
+/// double well past any scale a decimal can declare, so the product is exact too.
+///
+/// `__rudb_mean` in the scalar kernels calls this as well, for an `avg` the optimizer has split into
+/// a `sum` and a `count`, so that the two ways of reaching an average reach the same bits.
+pub(crate) fn divide_mean(total: f64, seen: i64, scale: u8) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the count of rows in one group is well inside the exact range"
+    )]
+    let divisor = seen as f64 * pow10(scale) as f64;
+    total / divisor
+}
+
 /// An exact total as the double a mean divides, which is the one rounding `avg` over whole numbers
 /// is allowed to do and is where duckdb does it too.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a total past 2^53 rounding once here is the definition of a double result"
 )]
-fn exactly(total: i128) -> f64 {
+pub(crate) fn exactly(total: i128) -> f64 {
     total as f64
 }
 
