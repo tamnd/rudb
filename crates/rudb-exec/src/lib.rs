@@ -112,6 +112,7 @@ mod normal;
 mod ordering;
 mod pairs;
 mod percent;
+mod places;
 mod prepared;
 mod query;
 mod register;

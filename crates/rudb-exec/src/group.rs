@@ -46,12 +46,13 @@ use crate::group_mixed;
 use crate::group_ranged;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
 use crate::pairs::{self, together};
+use crate::places::Places;
 use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::signed::SignedBlock;
 use crate::spill::{Reader, Spill};
-use crate::table::{Origin, Probe, Table, UNSEEN, Walk, held_at, slot_at};
+use crate::table::{Origin, Probe, Table, Walk, held_at, slot_at};
 
 /// One aggregate call, taken apart once when the operator is built.
 #[derive(Debug, Clone)]
@@ -2290,7 +2291,7 @@ impl<'a> Aggregate<'a> {
             slot_runs: Vec::new(),
             coded_spent: 0,
             coded_read: 0,
-            coded_map: Vec::new(),
+            coded_map: Places::default(),
             same: Vec::new(),
             leaders: Vec::new(),
             leader_slots: Vec::new(),
@@ -2312,7 +2313,7 @@ impl<'a> Aggregate<'a> {
             .and_then(|(low, values)| crate::table::seeded_window(&types, low, values));
         if let Some((low, places)) = window {
             local.coded_on.push(Origin::Window(low, places));
-            local.coded_map.resize(places, UNSEEN);
+            local.coded_map = Places::seeded(places);
         }
         if self.alone {
             local.groups = 1;
@@ -2456,15 +2457,8 @@ impl<'a> Aggregate<'a> {
                     // of the old map to the last of the new one. A sorted `CounterID` grows its
                     // window a dozen times a query, and clearing the whole map for each was a
                     // second write of every place the map had, and a probe of every group again.
-                    Some(span) => {
-                        let null = std::mem::replace(&mut coded_map[span - 1], UNSEEN);
-                        coded_map.resize(codes.combos(), UNSEEN);
-                        coded_map[codes.combos() - 1] = null;
-                    }
-                    None => {
-                        coded_map.clear();
-                        coded_map.resize(codes.combos(), UNSEEN);
-                    }
+                    Some(span) => coded_map.widen(span, codes.combos()),
+                    None => coded_map.reset(codes.combos()),
                 }
             }
             // A row the map has nothing for goes through the probe and the insert every row used to
@@ -2526,7 +2520,7 @@ impl<'a> Aggregate<'a> {
                     let mut slot = slot_at(coded_map[place]);
                     if slot == NOWHERE {
                         slot = resolve(start)?;
-                        coded_map[place] = held_at(slot);
+                        coded_map.set(place, held_at(slot));
                     }
                     *run = (slot, end);
                     start = end;
@@ -2553,7 +2547,7 @@ impl<'a> Aggregate<'a> {
                     }
                     let slot = resolve(row)?;
                     slots[row] = slot;
-                    coded_map[coded_places[row]] = held_at(slot);
+                    coded_map.set(coded_places[row], held_at(slot));
                     row += 1;
                 }
             }
@@ -4894,8 +4888,9 @@ pub(crate) struct Building {
     /// Empty when the last chunk was not one the direct map could answer, so the map is rebuilt
     /// rather than read. See [`Coded`](crate::table::Coded).
     coded_on: Vec<Origin>,
-    /// One slot per combination of codes, or [`UNSEEN`] where that combination has not been seen.
-    coded_map: Vec<u32>,
+    /// One slot per combination of codes, or [`UNSEEN`](crate::table::UNSEEN) where that
+    /// combination has not been seen.
+    coded_map: Places,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
     coded_places: Vec<usize>,
     /// The values of each integer key column the map reads by value, widened, and their runs.
