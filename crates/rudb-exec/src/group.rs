@@ -3313,30 +3313,53 @@ impl<'a> Aggregate<'a> {
         into: &mut Building,
     ) -> Result<u64> {
         let mut aside = 0;
-        // row at a time: the keys came out a column at a time above, so what is left per group is
-        // one probe and the accumulators behind it, which is 2g (#61).
-        for &slot in slots {
-            let row = slot - start;
-            let hash = source.hash_of(slot);
-            let target = match into.table.probe(hash, keys, row) {
-                Probe::Found(target) => target,
-                Probe::Vacant(bucket) => {
-                    // The same cap the fold applies, for the same reason: a limit above an
-                    // unordered group by only ever looks at so many groups, and one that is dropped
-                    // here would have been dropped there.
-                    if self.max_groups.is_some_and(|limit| into.table.len() >= limit) {
+        // The groups are looked up a batch at a time, the way the fold looks up rows, so that the
+        // misses of a batch are all outstanding at once and the match on the key's form is settled
+        // once per batch rather than once per group. Looked up one at a time, the merge on
+        // ClickBench 41 at eight threads cost more than the fold that built the tables, about three
+        // hundred cycles a group against seventy a row. Only the groups the batch did not find go
+        // through the probe and the insert, in order, as the fold's pending rows do.
+        let rows: Vec<usize> = slots.iter().map(|&slot| slot - start).collect();
+        let length = rows.iter().max().map_or(0, |&row| row + 1);
+        let hashes: Vec<u64> = (start..start + length).map(|slot| source.hash_of(slot)).collect();
+        let mut targets = vec![usize::MAX; rows.len()];
+        let mut walk = Walk::default();
+        for from in (0..rows.len()).step_by(crate::table::BATCH) {
+            let upto = (from + crate::table::BATCH).min(rows.len());
+            into.table.probe_these(
+                &hashes,
+                keys,
+                &rows[from..upto],
+                &mut targets[from..upto],
+                &mut walk,
+            );
+            for &place in walk.pending() {
+                let row = rows[from + place];
+                let bucket = match into.table.probe(hashes[row], keys, row) {
+                    Probe::Found(target) => {
+                        targets[from + place] = target;
                         continue;
                     }
-                    let target = into.table.insert(bucket, hash, keys, row)?;
-                    into.groups = into.table.len();
-                    self.fresh(&mut into.states, &mut into.counts, &mut into.compact)?;
-                    if self.sets {
-                        self.fresh_seen(&mut into.seen);
-                    }
-                    target
+                    Probe::Vacant(bucket) => bucket,
+                };
+                // The same cap the fold applies, for the same reason: a limit above an unordered
+                // group by only ever looks at so many groups, and one that is dropped here would
+                // have been dropped there.
+                if self.max_groups.is_some_and(|limit| into.table.len() >= limit) {
+                    continue;
                 }
-            };
-            aside += merge_slot(coming, slot, target, into)?;
+                targets[from + place] = into.table.insert(bucket, hashes[row], keys, row)?;
+                into.groups = into.table.len();
+                self.fresh(&mut into.states, &mut into.counts, &mut into.compact)?;
+                if self.sets {
+                    self.fresh_seen(&mut into.seen);
+                }
+            }
+        }
+        for (&slot, &target) in slots.iter().zip(&targets) {
+            if target != usize::MAX {
+                aside += merge_slot(coming, slot, target, into)?;
+            }
         }
         Ok(aside)
     }
