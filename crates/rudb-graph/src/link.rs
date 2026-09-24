@@ -202,6 +202,18 @@ impl Link {
         self.linked
     }
 
+    /// The bits of the monotone form, one run of ones per parent in `rid` order and a zero after
+    /// each, or `None` for the packed form.
+    ///
+    /// For a push that wants whole parents at a time rather than one child at a time, see
+    /// [`crate::rids::Rids::forward`].
+    pub(crate) fn runs(&self) -> Option<&BitVector> {
+        match &self.body {
+            Body::Monotone { vector } => Some(vector),
+            Body::Packed { .. } => None,
+        }
+    }
+
     /// Bytes the body costs, not counting the header.
     #[must_use]
     pub fn bytes(&self) -> usize {
