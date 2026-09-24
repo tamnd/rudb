@@ -713,16 +713,19 @@ impl Catalog {
         }
         self.changed();
         self.database_mut(catalog)?.schemas.retain(|held| !same_name(&held.name, name));
-        // A path entry for a schema that is gone would send every bare name to nowhere, and the
-        // pin goes back to `main` when the schema it was in is dropped.
-        let search = std::mem::take(&mut self.search);
-        self.search = search
-            .into_iter()
-            .filter(|entry| {
-                let (held, schema) = self.searched(entry);
-                !(same_name(&held, catalog) && same_name(&schema, name))
-            })
-            .collect();
+        // Dropping the schema the session is in sends it back to the `main` of the database it
+        // is in, which is the one `USE` last named, and the pin does nothing to a later entry of
+        // the path that pointed at the dropped schema.
+        let current = self.search.first().map(|entry| self.searched(entry));
+        if let Some((held, schema)) = current {
+            if same_name(&held, catalog) && same_name(&schema, name) {
+                // The pin writes the path back as a bare `main` rather than clearing it, so the
+                // setting reads `main` where a session that never set it reads empty.
+                let catalog = if same_name(&held, &self.default_catalog) { String::new() } else { held };
+                self.search =
+                    vec![crate::SearchEntry { catalog, schema: DEFAULT_SCHEMA.to_string() }];
+            }
+        }
         Ok(())
     }
 

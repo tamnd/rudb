@@ -10369,3 +10369,35 @@ fn attach_and_detach_answer_the_way_the_pin_does() {
     let err = db.execute("CHECKPOINT db1").unwrap_err().to_string();
     assert_eq!(err, "Binder Error: Database \"db1\" not found");
 }
+
+#[test]
+fn a_script_of_several_statements_runs_them_all_and_answers_with_the_last() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t (i INTEGER); INSERT INTO t VALUES (1), (2);").unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM t"), vec![vec![Value::BigInt(2)]]);
+    assert_eq!(
+        rows(&db, "INSERT INTO t VALUES (3); SELECT sum(i) FROM t;"),
+        vec![vec![Value::HugeInt(6)]]
+    );
+    let err =
+        db.execute("INSERT INTO t VALUES (4); SELECT * FROM nowhere; INSERT INTO t VALUES (5)");
+    assert!(err.unwrap_err().to_string().contains("nowhere"));
+    assert_eq!(rows(&db, "SELECT count(*) FROM t"), vec![vec![Value::BigInt(4)]]);
+    assert_eq!(rows(&db, "SELECT ';' AS s;"), vec![vec![Value::Varchar(";".into())]]);
+}
+
+#[test]
+fn dropping_the_schema_the_session_is_in_goes_back_to_main_of_the_same_database() {
+    let db = Database::new();
+    db.execute("ATTACH ':memory:' AS nd; USE nd; CREATE SCHEMA s; USE nd.s; DROP SCHEMA nd.s").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT current_database(), current_schema()"),
+        vec![vec![Value::Varchar("nd".into()), Value::Varchar("main".into())]]
+    );
+    db.execute("DETACH memory").unwrap();
+    db.execute("CREATE SCHEMA a; CREATE SCHEMA b; SET search_path = 'a,b'; DROP SCHEMA b").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('search_path')"),
+        vec![vec![Value::Varchar("nd.a,nd.b".into())]]
+    );
+}
