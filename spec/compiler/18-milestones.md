@@ -174,7 +174,7 @@ This is the milestone the folder exists for. If it misses, document 20 lists wha
 **Exit.** Three things:
 
 1. A measurement deciding the LLVM question. If LLVM beats `clif` by more than 10% of execution time on SF100 pipelines long enough to amortize its compile time, it ships behind the feature. Otherwise the crate is deleted, per document 08.
-2. `auto` as the default, which requires the C1–C11 gates holding at once on the release candidate.
+2. `auto` as the default, which requires the C1 to C11 gates holding at once on the release candidate.
 3. A published report comparing against DuckDB on JOB, TPC-H, ClickBench and TPC-DS, with the refusal rate and compile share shown alongside the ratios.
 
 ## 18.15 The order, and what could reorder it

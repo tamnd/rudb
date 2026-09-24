@@ -1,8 +1,6 @@
 # B. Compiler backends and low-latency JIT techniques (research notes, 2026-09-24)
 
-Scope: backends for rudb's query-compiling engine (Rust, DuckDB-compatible, target ~10x DuckDB on
-ClickBench/TPC-H/JOB/TPC-C). Dev box Apple M4 (AArch64, macOS/Mach-O); servers x86-64 (c6a Zen3/Zen4,
-c7i Sapphire Rapids) and Graviton (Neoverse V1/V2). Both ISAs are first-class.
+Scope: backends for rudb's query-compiling engine (Rust, DuckDB-compatible, target ~10x DuckDB on ClickBench/TPC-H/JOB/TPC-C). Dev box Apple M4 (AArch64, macOS/Mach-O); servers x86-64 (c6a Zen3/Zen4, c7i Sapphire Rapids) and Graviton (Neoverse V1/V2). Both ISAs are first-class.
 
 Conventions:
 - Numbers are copied from the cited source. "[snippet]" = only seen in a search-result snippet, not verified in full text.

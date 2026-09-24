@@ -1,7 +1,6 @@
 # C. Join processing and join-heavy workloads (JOB-centric), state of 2026
 
-Research notes for the rudb compiled-execution-engine spec. Target: roughly 10x DuckDB on JOB (113 queries, IMDB),
-with CEB, TPC-H and TPC-DS as secondary targets. Compiled 2026-09-24.
+Research notes for the rudb compiled-execution-engine spec. Target: roughly 10x DuckDB on JOB (113 queries, IMDB), with CEB, TPC-H and TPC-DS as secondary targets. Compiled 2026-09-24.
 
 Conventions:
 - Every number carries its source URL. "[snippet]" means the fact was seen only in a search-result snippet and the
