@@ -244,6 +244,19 @@ impl<K: Sink> Sink for Watched<K> {
         progress
     }
 
+    /// Passed through, because the inner sink is the one that can keep the chunk rather than copy
+    /// it, and measured like `sink`.
+    fn sink_taking(&self, chunk: &mut Chunk, local: &mut Self::Local) -> Result<Progress> {
+        let taken = rows(chunk);
+        let measure = Measure::start(&self.counters);
+        let progress = self.inner.sink_taking(chunk, local);
+        measure.stop(&self.counters);
+        if progress.is_ok() {
+            self.counters.took(taken);
+        }
+        progress
+    }
+
     /// Measured, because merging one thread's state into the global one is work and on an aggregate
     /// it is a lot of it.
     fn combine(&self, local: Self::Local) -> Result<()> {
