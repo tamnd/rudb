@@ -2856,6 +2856,7 @@ impl Writer {
         &self,
         column: usize,
         counted: bool,
+        dense: Option<(u64, usize)>,
     ) -> Result<(Option<FrequencySummary>, Option<u64>)> {
         let signed = match self.table.fields[column].ty {
             LogicalType::TinyInt
@@ -2902,7 +2903,7 @@ impl Writer {
         // rows holding it, which is its distinct count and its frequencies from one read of its
         // pages. Only a column past the set's cap goes through the candidate table.
         let exact = match (&tallied, counted) {
-            (None, true) => self.exact_frequency(column, signed)?,
+            (None, true) => self.exact_frequency(column, signed, dense)?,
             _ => None,
         };
         let (mut entries, decrements, distinct_count) = match (tallied, exact) {
@@ -3033,6 +3034,24 @@ impl Writer {
         ))
     }
 
+    /// The bits of a column's lowest value and how many values its range holds, when counting it in
+    /// a [`distinct::DenseCounts`] would take no more memory than the set it would otherwise be
+    /// charged, or a mebibyte, whichever is more.
+    ///
+    /// Only for a column the statistics saw every row of, since otherwise its ends may not be its
+    /// ends, and a table of fewer than `u32::MAX` rows, so that a count fits in its slot.
+    fn dense_range(&self, gather: &stats::Gather, set: usize) -> Option<(u64, usize)> {
+        let rows = self.table.rows;
+        if gather.rows() != rows as u64 || u32::try_from(rows).is_err() {
+            return None;
+        }
+        let (low, high) = gather.span()?;
+        let len = usize::try_from(high.checked_sub(low)?.checked_add(1)?).ok()?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bits = low as u64;
+        (len.checked_mul(size_of::<u32>())? <= set.max(1 << 20)).then_some((bits, len))
+    }
+
     /// Counts every value of an integer column and the rows holding it, and hands back the
     /// frequency entries worth keeping beside the distinct count, or nothing for a column with more
     /// values than [`distinct::ExactCounts`] keeps.
@@ -3050,25 +3069,65 @@ impl Writer {
         &self,
         column: usize,
         signed: bool,
+        dense: Option<(u64, usize)>,
     ) -> Result<Option<(Option<Vec<FrequencyEntry>>, u64)>> {
+        // A column whose ends are close together is counted in a flat array. A value outside the
+        // ends it was given, which would be a bug in the statistics, sends it to the set instead.
+        if let Some((low, len)) = dense {
+            let mut counts = distinct::DenseCounts::new(low, len);
+            let nulls =
+                self.count_numeric(column, signed, |bits, times| counts.insert(bits, times))?;
+            if let Some(distinct) = counts.count() {
+                let Some(distinct) = distinct else { return Ok(None) };
+                return Ok(Some(self.frequent_entries(signed, distinct, nulls, |visit| {
+                    counts.visit(visit);
+                })));
+            }
+        }
         let mut set = distinct::ExactCounts::new();
+        let nulls = self.count_numeric(column, signed, |bits, times| set.insert(bits, times))?;
+        let Some(distinct) = set.count() else {
+            return Ok(None);
+        };
+        Ok(Some(self.frequent_entries(signed, distinct, nulls, |visit| {
+            set.visit(visit);
+        })))
+    }
+
+    /// Hands every run of equal non-null values in an integer column to `add` as its bits and its
+    /// length, and answers how many rows were null.
+    fn count_numeric(
+        &self,
+        column: usize,
+        signed: bool,
+        mut add: impl FnMut(u64, u32),
+    ) -> Result<u64> {
         let mut nulls = 0_u64;
         let mut run = Run::default();
-        let mut add = |bits: Option<u64>, times: u32| match bits {
-            Some(bits) => set.insert(bits, times),
+        let mut take = |bits: Option<u64>, times: u32| match bits {
+            Some(bits) => add(bits, times),
             None => nulls += u64::from(times),
         };
         self.visit_numeric(column, signed, |_, bits| {
             if let Some((bits, times)) = run.push(bits) {
-                add(bits, times);
+                take(bits, times);
             }
         })?;
         if let Some((bits, times)) = run.take() {
-            add(bits, times);
+            take(bits, times);
         }
-        let Some(distinct) = set.count() else {
-            return Ok(None);
-        };
+        Ok(nulls)
+    }
+
+    /// The frequency entries worth keeping out of a column's exact counts, which `visit` hands over
+    /// as bits and rows once for each call it gets. See [`Self::exact_frequency`] for the rule.
+    fn frequent_entries(
+        &self,
+        signed: bool,
+        distinct: u64,
+        nulls: u64,
+        mut visit: impl FnMut(&mut dyn FnMut(u64, u64)),
+    ) -> (Option<Vec<FrequencyEntry>>, u64) {
         // The commonest counts, one more than the entries kept so that the first left out is here.
         let mut top = std::collections::BinaryHeap::with_capacity(FREQUENCY_ENTRIES + 2);
         let mut rank = |count: u64| {
@@ -3079,7 +3138,7 @@ impl Writer {
                 top.push(Reverse(count));
             }
         };
-        set.visit(|_, count| rank(count));
+        visit(&mut |_, count| rank(count));
         if nulls != 0 {
             rank(nulls);
         }
@@ -3088,12 +3147,12 @@ impl Writer {
         if values > FREQUENCY_CANDIDATES as u64 {
             let bound = self.table.rows as u64 / (FREQUENCY_CANDIDATES as u64 + 1);
             if top.get(FREQUENCY_BUILD_RANK - 1).is_none_or(|&Reverse(count)| count <= bound) {
-                return Ok(Some((None, distinct)));
+                return (None, distinct);
             }
         }
         let least = top.get(FREQUENCY_ENTRIES).map_or(0, |&Reverse(count)| count);
         let mut entries = Vec::with_capacity(FREQUENCY_ENTRIES + 1);
-        set.visit(|bits, count| {
+        visit(&mut |bits, count| {
             if count >= least {
                 entries.push(FrequencyEntry { value: integer_value(bits, signed), count });
             }
@@ -3101,7 +3160,7 @@ impl Writer {
         if nulls != 0 && nulls >= least {
             entries.push(FrequencyEntry { value: FrequencyValue::Null, count: nulls });
         }
-        Ok(Some((Some(entries), distinct)))
+        (Some(entries), distinct)
     }
 
     /// Hands every row of an integer column to `visit` as its ordinal and its sixty four bits, or
@@ -3480,13 +3539,15 @@ impl Writer {
         &self,
     ) -> Result<(Vec<(Option<FrequencySummary>, Option<u64>)>, Vec<Option<ClosedDictionary>>)> {
         let numeric = self.numeric_columns().into_iter().map(|column| {
-            let estimate =
-                self.gathers.get(column).and_then(Option::as_ref).and_then(stats::Gather::distinct);
+            let gather = self.gathers.get(column).and_then(Option::as_ref);
+            let estimate = gather.and_then(stats::Gather::distinct);
             let counted = !estimate.is_some_and(distinct::beyond);
             let set =
                 if counted { distinct::bytes_for(estimate.unwrap_or(f64::INFINITY)) } else { 0 };
+            let dense = gather.filter(|_| counted).and_then(|gather| self.dense_range(gather, set));
+            let set = dense.map_or(set, |(_, len)| len * size_of::<u32>());
             let cost = self.table.rows.saturating_mul(weight(&self.table.fields[column].ty));
-            (Closing::Numeric { column, counted }, NUMERIC_CLOSE_BYTES + set, cost)
+            (Closing::Numeric { column, counted, dense }, NUMERIC_CLOSE_BYTES + set, cost)
         });
         let dictionaries =
             self.dictionaries.iter().enumerate().filter_map(|(index, dictionary)| {
@@ -3503,9 +3564,9 @@ impl Writer {
         let run = |job: Closing<'_>, bytes: usize| -> Result<Closed> {
             let _holding = profile.map(|profile| profile.holding(bytes as u64));
             match job {
-                Closing::Numeric { column, counted } => {
+                Closing::Numeric { column, counted, dense } => {
                     let _timing = profile.map(|profile| profile.span(Stage::Publish));
-                    Ok(Closed::Numeric(column, self.numeric_frequency(column, counted)?))
+                    Ok(Closed::Numeric(column, self.numeric_frequency(column, counted, dense)?))
                 }
                 Closing::Dictionary { index, dictionary } => {
                     let _timing = profile.map(|profile| profile.span(Stage::Dictionary));
@@ -10896,10 +10957,12 @@ impl<T> Drop for Room<'_, T> {
 
 /// One column's work at the end of a load, as [`Writer::close_columns`] schedules it.
 enum Closing<'a> {
-    /// A numeric column's frequencies, and whether to count its distinct values exactly.
+    /// A numeric column's frequencies, whether to count its distinct values exactly, and the
+    /// range to count them in a flat array when it is short enough.
     Numeric {
         column: usize,
         counted: bool,
+        dense: Option<(u64, usize)>,
     },
     Dictionary {
         index: usize,

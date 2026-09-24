@@ -315,6 +315,62 @@ fn place(slots: &mut [u64], slot: u64) {
     slots[at] = slot;
 }
 
+/// The same counts for a column whose values all sit in a short range, one `u32` per value in it.
+///
+/// A column's statistics already hold its lowest and highest value, and on most integer columns the
+/// range between them is not much wider than the number of values: dates, line numbers, and keys
+/// into a smaller table. Counting those by `value - low` into a flat array is a load and a store a
+/// row, where the set above is a hash, a buffer and then a probe. On a `lineitem` load the set was
+/// about 6% of the load's cycles.
+///
+/// The offset is taken on the sixty four bits the close keys values by, so it is the same sum for a
+/// signed column and an unsigned one. A value outside the range, which a column whose ends were
+/// read correctly does not have, marks the count as unusable and the caller counts again with
+/// [`ExactCounts`] rather than trusting it.
+#[derive(Debug)]
+pub(crate) struct DenseCounts {
+    low: u64,
+    counts: Vec<u32>,
+    outside: bool,
+}
+
+impl DenseCounts {
+    /// Counts for `len` values starting at the one whose bits are `low`.
+    pub(crate) fn new(low: u64, len: usize) -> Self {
+        Self { low, counts: vec![0; len], outside: false }
+    }
+
+    /// Adds `times` rows of one value's bits.
+    ///
+    /// The caller only builds one of these for a table of fewer than `u32::MAX` rows, so a count
+    /// cannot overflow.
+    pub(crate) fn insert(&mut self, value: u64, times: u32) {
+        let at = value.wrapping_sub(self.low);
+        match usize::try_from(at).ok().and_then(|at| self.counts.get_mut(at)) {
+            Some(count) => *count += times,
+            None => self.outside = true,
+        }
+    }
+
+    /// The count of distinct values, `Some(None)` for a column past the cap [`ExactCounts`] has, and
+    /// `None` when a value fell outside the range and the counts cannot be used.
+    pub(crate) fn count(&self) -> Option<Option<u64>> {
+        if self.outside {
+            return None;
+        }
+        let distinct = self.counts.iter().filter(|&&count| count != 0).count();
+        Some((distinct <= MAX_DISTINCT).then_some(distinct as u64))
+    }
+
+    /// Hands every value and the rows holding it to `visit`, in the order of their bits above
+    /// `low`.
+    pub(crate) fn visit(&self, mut visit: impl FnMut(u64, u64)) {
+        for (at, &count) in self.counts.iter().enumerate().filter(|(_, count)| **count != 0) {
+            visit(self.low.wrapping_add(at as u64), u64::from(count));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +379,25 @@ mod tests {
         let mut counts = HashMap::new();
         assert!(set.visit(|value, count| assert!(counts.insert(value, count).is_none())));
         counts
+    }
+
+    #[test]
+    fn dense_counts_agree_with_the_set_and_notice_a_value_outside() {
+        let low = (-40_i64) as u64;
+        let mut dense = DenseCounts::new(low, 100);
+        let mut set = ExactCounts::new();
+        for at in 0..10_000_i64 {
+            let value = (at * 37 % 97 - 40) as u64;
+            let times = u32::try_from(at % 3 + 1).expect("small");
+            dense.insert(value, times);
+            set.insert(value, times);
+        }
+        assert_eq!(dense.count(), Some(set.count()));
+        let mut counts = HashMap::new();
+        dense.visit(|value, count| assert!(counts.insert(value, count).is_none()));
+        assert_eq!(counts, counted(&mut set));
+        dense.insert(60, 1);
+        assert_eq!(dense.count(), None);
     }
 
     #[test]
