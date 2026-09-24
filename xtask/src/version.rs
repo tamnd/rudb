@@ -57,13 +57,25 @@ pub(crate) fn set(root: &Path, wanted: Option<&str>) -> Result<(), String> {
     if header != 1 {
         return Err(format!("expected one workspace version line, found {header}"));
     }
-    let crates = std::fs::read_dir(root.join("crates"))
+    let dirs: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("crates"))
         .map_err(|e| format!("could not list crates: {e}"))?
-        .filter(|entry| entry.as_ref().is_ok_and(|e| e.path().is_dir()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()).filter(|path| path.is_dir()))
+        .collect();
+    let crates = dirs.len();
+    // A crate that is never published, such as the `rudb-projection` tool, is not a dependency of
+    // any other and so has no pin. It still takes the workspace version and so still moves in the
+    // lock file.
+    let published = dirs
+        .iter()
+        .filter(|dir| {
+            std::fs::read_to_string(dir.join("Cargo.toml")).map_or(true, |manifest| {
+                !manifest.lines().any(|line| line.trim() == "publish = false")
+            })
+        })
         .count();
-    if pins != crates {
+    if pins != published {
         return Err(format!(
-            "there are {crates} crates but only {pins} dependency pins at ={current}, \
+            "there are {published} published crates but {pins} dependency pins at ={current}, \
              so the manifest and the tree disagree"
         ));
     }
