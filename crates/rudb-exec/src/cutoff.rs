@@ -130,6 +130,17 @@ impl Cutoff {
         });
     }
 
+    /// The column of scan `index` the ordering is on and which way it runs, before any instance has
+    /// said anything. `None` when this was never armed or is about some other scan.
+    ///
+    /// What the scan asks while it cuts its morsels, to hand out first the parts most likely to hold
+    /// the rows the top N wants, so that the cutoff is tight after a few parts rather than after the
+    /// scan has walked a stretch of the file in whatever order it was written.
+    pub(crate) fn ordered(&self, index: u32) -> Option<(usize, Op)> {
+        let &(binding, op) = self.about.get()?;
+        (binding.table == index).then_some((binding.column as usize, op))
+    }
+
     /// The test a scan of `index` should measure its parts against right now.
     ///
     /// `None` until this was armed, the column it is about is one of this scan's and some instance

@@ -7476,6 +7476,17 @@ impl Reader {
             .is_some_and(rule)
     }
 
+    /// The stored range of one column over one part, the part's own where its stripe kept one and
+    /// the stripe's where it did not, which is wider but still holds every row of the part.
+    #[must_use]
+    pub fn part_range(&self, part: usize, column: usize) -> Option<Range> {
+        let place = self.places.get(part).copied()?;
+        let own = self
+            .stripe_part_ranges(place.stripe as usize, column)
+            .and_then(|ranges| ranges.get(place.part as usize));
+        own.or_else(|| self.table.stripes.get(place.stripe as usize)?.zone.column(column)).cloned()
+    }
+
     /// The half of [`Self::ruled_by`] that reads nothing, asked about a whole stripe.
     #[must_use]
     pub fn stripe_ruled_by(

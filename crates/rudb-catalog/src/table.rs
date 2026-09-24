@@ -857,6 +857,23 @@ impl Rows {
         }
     }
 
+    /// The stored range of one table column over chunk `at`, or `None` where nothing was stored.
+    #[must_use]
+    pub fn range_of(&self, at: usize, column: usize) -> Option<Range> {
+        let memory = |rows: &MemoryTable, at| rows.zone(at)?.column(column).cloned();
+        match self {
+            Self::Memory(rows) => memory(rows, at),
+            Self::Native(reader) => reader.part_range(at, column),
+            Self::Grown(reader, rows) => {
+                if at < reader.parts() {
+                    reader.part_range(at, column)
+                } else {
+                    memory(rows, at - reader.parts())
+                }
+            }
+        }
+    }
+
     /// Whether `rule` rules out chunk `at` from what the stored range of one table column says.
     ///
     /// For a test that is not a [`Probe`], which today is a join's build side keys as a set. A chunk
