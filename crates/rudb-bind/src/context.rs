@@ -31,13 +31,13 @@
 //! whether anything at all answers to the name before this module is reached, rather than the fold
 //! being what happens when resolution fails.
 //!
-//! `current_schemas`, `current_query` and `version` are not here. The first returns a list, the
-//! second is the one name in this family the pin marks VOLATILE and it needs the statement text
-//! threaded down to the binder, and the third is a question about what rudb should call itself that
-//! is worth answering on its own.
+//! `current_schemas` takes an argument and returns a list, so it has a function of its own below.
+//! `current_query` and `version` are not here. The first is the one name in this family the pin
+//! marks VOLATILE and it needs the statement text threaded down to the binder, and the second is a
+//! question about what rudb should call itself that is worth answering on its own.
 
-use rudb_common::Value;
-use rudb_plan::ExprRef;
+use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_plan::{Expr, ExprRef};
 
 use crate::binder::Binder;
 
@@ -144,6 +144,32 @@ impl Binder<'_> {
             Context::User => Value::Varchar(USER.to_string()),
         };
         self.plan_mut().add_constant(value)
+    }
+
+    /// `current_schemas(include_implicit)`, folded to the list of schemas on the search path.
+    ///
+    /// The argument has to be a constant, which is the pin's rule and its sentence. A null argument
+    /// is a null list and anything but a boolean falls through to the table.
+    pub(crate) fn current_schemas(&mut self, argument: ExprRef) -> Result<Option<ExprRef>> {
+        let list = LogicalType::list(LogicalType::Varchar);
+        let Expr::Constant(held) = *self.plan().expr(argument) else {
+            return Err(Error::binder(
+                "The \"include_implicit\" argument in function \"current_schemas\" must be a \
+                 constant expression",
+            )
+            .with_span(self.plan().expr_span(argument)));
+        };
+        let implicit = match self.plan().value(held) {
+            Value::Null => {
+                let reference = self.plan_mut().add_value(Value::Null);
+                return Ok(Some(self.add_expr(Expr::Constant(reference), list)));
+            }
+            Value::Boolean(implicit) => *implicit,
+            _ => return Ok(None),
+        };
+        let values =
+            self.catalog().search_schemas(implicit).into_iter().map(Value::Varchar).collect();
+        Ok(Some(self.add_constant(Value::List { element: LogicalType::Varchar, values })))
     }
 
     /// The session-local date used as the first argument of one-argument `age`.

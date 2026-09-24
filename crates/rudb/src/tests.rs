@@ -10104,3 +10104,47 @@ fn duckdb_constraints_lists_them_the_way_the_pin_does() {
         ["FOREIGN KEY|[z]", "CHECK|[x, y, x]", "NOT NULL|[w]"]
     );
 }
+
+/// `SET schema`, `SET search_path` and `USE` move where a bare name is created and looked for, and
+/// read back the way the pin prints them.
+#[test]
+fn set_schema_and_search_path_follow_the_pin() {
+    let db = scripted(&["CREATE SCHEMA s1", "CREATE SCHEMA s2"]);
+    let values = |sql: &str| -> Vec<String> {
+        db.query(sql)
+            .unwrap()
+            .rows()
+            .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    let path = "SELECT current_schema(), current_setting('search_path'), current_schemas(false)";
+    let error = db.execute("SET schema = 'nope'").unwrap_err().to_string();
+    assert!(error.contains("SET schema: No catalog + schema named \"nope\" found."), "{error}");
+    db.execute("SET schema = s1").unwrap();
+    db.execute("CREATE TABLE t1(a INT)").unwrap();
+    db.execute("CREATE TABLE p(id INT PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE f(id INT REFERENCES p(id))").unwrap();
+    assert_eq!(values(path), ["s1|s1|[s1]"]);
+    db.execute("SET search_path = 's2,s1'").unwrap();
+    db.execute("CREATE TABLE t2(a INT)").unwrap();
+    assert_eq!(values(path), ["s2|s2,s1|[s2, s1]"]);
+    assert_eq!(values("SELECT count(*) FROM t1"), ["0"]);
+    assert_eq!(
+        values("SELECT schema_name, table_name FROM duckdb_tables() ORDER BY ALL"),
+        ["s1|f", "s1|p", "s1|t1", "s2|t2"]
+    );
+    assert_eq!(
+        values("SELECT constraint_text FROM duckdb_constraints() WHERE table_name = 'f'"),
+        ["FOREIGN KEY (id) REFERENCES s1.p(id)"]
+    );
+    db.execute("USE memory.s1").unwrap();
+    assert_eq!(values(path), ["s1|memory.s1|[s1]"]);
+    assert_eq!(values("SELECT current_schemas(true)"), ["[main, s1, main, main, pg_catalog]"]);
+    let error = db.execute("USE system").unwrap_err().to_string();
+    assert!(error.contains("cannot be set to internal schema \"system\""), "{error}");
+    db.execute("RESET search_path").unwrap();
+    assert_eq!(values(path), ["main||[]"]);
+    db.execute("USE s2").unwrap();
+    db.execute("DROP SCHEMA s2 CASCADE").unwrap();
+    assert_eq!(values("SELECT current_schema()"), ["main"]);
+}

@@ -324,6 +324,15 @@ impl Settings {
                 Some(value) => rules.set_named(name, switch_of(value)?),
             };
         }
+        if let Some(one) = search_setting(name) {
+            // The search path lives on the catalog, because that is what reads it for every name,
+            // and [`crate::Database::setting`] reads it back from there.
+            match value {
+                None => catalog.reset_search_path(),
+                Some(value) => catalog.set_search_path(&text_of(value), one)?,
+            }
+            return Ok(());
+        }
         let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));
         };
@@ -927,6 +936,18 @@ fn is_links(name: &str) -> bool {
         return false;
     }
     Session::is_links_setting(name)
+}
+
+/// For `schema` and `search_path`, whether the setting takes one schema rather than a list, and
+/// `None` for any other name.
+pub(crate) fn search_setting(name: &str) -> Option<bool> {
+    if name.eq_ignore_ascii_case("schema") {
+        Some(true)
+    } else if name.eq_ignore_ascii_case("search_path") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Whether this name is the row order declaration setting.

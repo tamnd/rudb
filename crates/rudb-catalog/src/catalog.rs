@@ -216,6 +216,8 @@ pub struct Catalog {
     databases: Vec<Database>,
     default_catalog: String,
     default_schema: String,
+    /// The search path as `SET schema`, `SET search_path` or `USE` left it, empty for none.
+    search: Vec<crate::SearchEntry>,
     /// Which version of the contents this is, counted from one.
     ///
     /// Anything that can change what a query would read moves it on, which is every method here
@@ -277,6 +279,7 @@ impl Catalog {
             ],
             default_catalog: DEFAULT_CATALOG.to_string(),
             default_schema: DEFAULT_SCHEMA.to_string(),
+            search: Vec::new(),
             next,
             generation: 1,
             mirrors: Vec::new(),
@@ -326,16 +329,113 @@ impl Catalog {
         oid
     }
 
-    /// The catalog an unqualified name resolves in.
+    /// The catalog an unqualified name resolves in, which is the first entry of the search path's
+    /// when one is set.
     #[must_use]
     pub fn default_catalog(&self) -> &str {
-        &self.default_catalog
+        match self.search.first() {
+            Some(entry) if !entry.catalog.is_empty() => &entry.catalog,
+            _ => &self.default_catalog,
+        }
     }
 
-    /// The schema an unqualified name resolves in.
+    /// The schema an unqualified name resolves in, which is the first entry of the search path's
+    /// when one is set.
     #[must_use]
     pub fn default_schema(&self) -> &str {
-        &self.default_schema
+        self.search.first().map_or(&self.default_schema, |entry| &entry.schema)
+    }
+
+    /// The search path the way `current_setting('search_path')` writes it, empty when none is set.
+    #[must_use]
+    pub fn search_path(&self) -> String {
+        self.search.iter().map(crate::SearchEntry::text).collect::<Vec<_>>().join(",")
+    }
+
+    /// The schemas on the search path, which `current_schemas` lists. Only the ones that were set
+    /// unless `implicit` is, and then `temp.main` before them and the default database's `main`,
+    /// `system.main` and `system.pg_catalog` after them.
+    #[must_use]
+    pub fn search_schemas(&self, implicit: bool) -> Vec<String> {
+        let set = self.search.iter().map(|entry| entry.schema.clone());
+        if !implicit {
+            return set.collect();
+        }
+        let mut schemas = vec!["main".to_string()];
+        schemas.extend(set);
+        schemas.extend(["main", "main", "pg_catalog"].map(String::from));
+        schemas
+    }
+
+    /// Takes a `SET schema`, when `one` is set, or a `SET search_path`, with the pin's checks: each
+    /// entry has to name a schema that is there, or for a lone name a database, which stands for
+    /// its `main`. A lone schema is taken to be in the database the path already starts in.
+    ///
+    /// # Errors
+    ///
+    /// For text the path cannot be read out of, for an entry that names nothing, and for a
+    /// `SET schema` into `temp` or `system`.
+    pub fn set_search_path(&mut self, text: &str, one: bool) -> Result<()> {
+        let set = if one { "SET schema" } else { "SET search_path" };
+        let mut entries = if one {
+            vec![crate::search::parse_one(text)?]
+        } else {
+            crate::search::parse_list(text)?
+        };
+        let first = self.search.first().map(|entry| entry.catalog.clone()).unwrap_or_default();
+        for entry in &mut entries {
+            let catalog =
+                if entry.catalog.is_empty() { self.default_catalog() } else { &entry.catalog };
+            if let Ok(schema) = self.schema(catalog, &entry.schema) {
+                entry.schema = schema.name.clone();
+                if entry.catalog.is_empty() {
+                    entry.catalog.clone_from(&first);
+                }
+                continue;
+            }
+            if entry.catalog.is_empty() {
+                if let Ok(database) = self.database(&entry.schema) {
+                    if let Some(main) = database.schemas.first() {
+                        entry.catalog = database.name.clone();
+                        entry.schema = main.name.clone();
+                        continue;
+                    }
+                }
+            }
+            return Err(Error::catalog(format!(
+                "{set}: No catalog + schema named \"{}\" found.",
+                entry.text()
+            )));
+        }
+        if one {
+            if let Some(entry) = entries.first() {
+                if same_name(&entry.catalog, TEMP_CATALOG)
+                    || same_name(&entry.catalog, SYSTEM_CATALOG)
+                {
+                    return Err(Error::catalog(format!(
+                        "{set} cannot be set to internal schema \"{}\"",
+                        entry.catalog
+                    )));
+                }
+            }
+        }
+        self.search = entries;
+        Ok(())
+    }
+
+    /// Clears the search path, which is what `RESET schema` and `RESET search_path` both do.
+    pub fn reset_search_path(&mut self) {
+        self.search.clear();
+    }
+
+    /// Where a search path entry points, with the default database filled in.
+    fn searched(&self, entry: &crate::SearchEntry) -> (String, String) {
+        let catalog = if entry.catalog.is_empty() {
+            self.default_catalog.clone()
+        } else {
+            entry.catalog.clone()
+        };
+        (catalog, entry.schema.clone())
     }
 
     /// The attached databases.
@@ -378,7 +478,7 @@ impl Catalog {
     pub fn schema_name(&self, parts: &[&str]) -> Result<(String, String)> {
         let not_one = |part: &str| Error::catalog(format!("\"{part}\" is not a catalog or schema"));
         match parts {
-            [schema] => Ok((self.default_catalog.clone(), (*schema).to_string())),
+            [schema] => Ok((self.default_catalog().to_string(), (*schema).to_string())),
             [catalog, schema] => match self.database(catalog) {
                 Ok(database) => Ok((database.name.clone(), (*schema).to_string())),
                 Err(_) => Err(not_one(catalog)),
@@ -491,6 +591,16 @@ impl Catalog {
         }
         self.changed();
         self.database_mut(catalog)?.schemas.retain(|held| !same_name(&held.name, name));
+        // A path entry for a schema that is gone would send every bare name to nowhere, and the
+        // pin goes back to `main` when the schema it was in is dropped.
+        let search = std::mem::take(&mut self.search);
+        self.search = search
+            .into_iter()
+            .filter(|entry| {
+                let (held, schema) = self.searched(entry);
+                !(same_name(&held, catalog) && same_name(&schema, name))
+            })
+            .collect();
         Ok(())
     }
 
@@ -1416,16 +1526,42 @@ impl Catalog {
     /// [`Catalog::resolve_for_create_temporary`].
     fn written(&self, parts: &[&str]) -> Result<Vec<QualifiedName>> {
         match parts {
-            [table] => Ok(vec![
-                QualifiedName::new(&self.default_catalog, &self.default_schema, *table),
-                QualifiedName::new(SYSTEM_CATALOG, DEFAULT_SCHEMA, *table),
-                QualifiedName::new(SYSTEM_CATALOG, PG_CATALOG, *table),
-            ]),
-            [first, table] => Ok(vec![
-                QualifiedName::new(&self.default_catalog, *first, *table),
-                QualifiedName::new(*first, &self.default_schema, *table),
-                QualifiedName::new(SYSTEM_CATALOG, *first, *table),
-            ]),
+            [table] => {
+                // The pin's order: the path, then the default database's `main`, then the two
+                // schemas of `system`.
+                let mut readings: Vec<QualifiedName> = self
+                    .search
+                    .iter()
+                    .map(|entry| {
+                        let (catalog, schema) = self.searched(entry);
+                        QualifiedName::new(catalog, schema, *table)
+                    })
+                    .collect();
+                readings.push(QualifiedName::new(
+                    &self.default_catalog,
+                    &self.default_schema,
+                    *table,
+                ));
+                readings.push(QualifiedName::new(SYSTEM_CATALOG, DEFAULT_SCHEMA, *table));
+                readings.push(QualifiedName::new(SYSTEM_CATALOG, PG_CATALOG, *table));
+                Ok(readings)
+            }
+            [first, table] => {
+                // A database named on its own is read in the schema the path has for it, and in
+                // its `main` when the path has none.
+                let schema = self
+                    .search
+                    .iter()
+                    .find(|entry| same_name(&self.searched(entry).0, first))
+                    .map_or(self.default_schema.as_str(), |entry| entry.schema.as_str());
+                let mut readings = vec![QualifiedName::new(self.default_catalog(), *first, *table)];
+                if !same_name(self.default_catalog(), &self.default_catalog) {
+                    readings.push(QualifiedName::new(&self.default_catalog, *first, *table));
+                }
+                readings.push(QualifiedName::new(*first, schema, *table));
+                readings.push(QualifiedName::new(SYSTEM_CATALOG, *first, *table));
+                Ok(readings)
+            }
             [catalog, schema, table] => Ok(vec![QualifiedName::new(*catalog, *schema, *table)]),
             _ => Err(Error::catalog(format!(
                 "a name of {} parts, and a table name has one, two or three",

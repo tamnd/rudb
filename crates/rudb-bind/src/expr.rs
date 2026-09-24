@@ -41,11 +41,15 @@ const LIST_MACROS: &[(&str, &str, usize, bool)] = &[
 impl Binder<'_> {
     /// Binds the value of a `SET`, which is an expression over nothing.
     ///
-    /// An empty scope, so a bare word is a column that does not resolve rather than a setting value
-    /// spelled without quotes. `SET disabled_optimizers = expression_rewriter` is a name nobody
-    /// declared and saying so is better than guessing which of the two was meant.
+    /// A bare word is the text of its last name part rather than a column, the way the pin reads
+    /// `SET schema = s1` and `SET disabled_optimizers = expression_rewriter`.
     pub(crate) fn bind_setting_value(&mut self, ast: &Ast, expr: ast::ExprRef) -> Result<ExprRef> {
         self.clause = "SET statement";
+        if let ast::Expr::Column { name } = ast.expr(expr) {
+            if let Some(last) = ast.name(name).last() {
+                return Ok(self.add_constant(Value::Varchar(last.to_string())));
+            }
+        }
         self.bind_expr(ast, expr, &Scope::empty())
     }
 
@@ -681,6 +685,11 @@ impl Binder<'_> {
                 return Ok(folded);
             }
         }
+        if rudb_catalog::same_name(&written, "current_schemas") && bound.len() == 1 {
+            if let Some(folded) = self.current_schemas(bound[0])? {
+                return Ok(folded);
+            }
+        }
         // The session context functions are the third group the binder answers, and they fold for
         // the reason the pin marks them `CONSISTENT_WITHIN_QUERY`: the answer is settled when the
         // statement starts and no row changes it. A call with arguments is not one of these and
@@ -1062,6 +1071,16 @@ impl Binder<'_> {
         let Expr::Constant(held) = *self.plan().expr(argument) else { return Ok(None) };
         let Value::Varchar(name) = self.plan().value(held) else { return Ok(None) };
         let name = name.clone();
+        // The search path is on the catalog rather than in the session, because the catalog is
+        // what reads it for every name.
+        if name.eq_ignore_ascii_case("schema") {
+            let schema = self.catalog().default_schema().to_string();
+            return Ok(Some(self.add_constant(Value::Varchar(schema))));
+        }
+        if name.eq_ignore_ascii_case("search_path") {
+            let path = self.catalog().search_path();
+            return Ok(Some(self.add_constant(Value::Varchar(path))));
+        }
         let Some(known) = rudb_functions::setting_named(&name) else {
             let value = self
                 .beyond(&name)?
