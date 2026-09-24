@@ -331,8 +331,9 @@ fn scan_pages(
     let mut rows = 0_u64;
     let mut first = None;
     let mut last = None;
+    let mut bytes = Vec::with_capacity(PAGE_BYTES);
     for (relative, extent) in extents.iter().enumerate() {
-        let bytes = reader.extent(extent)?;
+        reader.extent_into(extent, &mut bytes)?;
         let prefix = if first_index + relative == 0 { header } else { 0 };
         if bytes.len() != PAGE_BYTES || prefix + PAGE_HEADER > PAGE_BYTES {
             return Err(invalid("run projection page length differs"));
