@@ -189,11 +189,87 @@ fn finish_page(
 }
 
 #[derive(Debug)]
-struct Scan {
+pub struct RunProjectionPart {
     counts: Vec<u64>,
     rows: u64,
     first: Option<i64>,
     last: Option<i64>,
+}
+
+#[derive(Debug)]
+pub struct RunProjectionScan<'a> {
+    reader: &'a Reader,
+    extents: Vec<section::Extent>,
+    first_page: Vec<u8>,
+    dictionary: Vec<i32>,
+    rows: u64,
+    header: usize,
+    code_bytes: usize,
+}
+
+impl RunProjectionScan<'_> {
+    #[must_use]
+    pub fn pages(&self) -> usize {
+        self.extents.len()
+    }
+
+    /// Scan one disjoint range of whole pages on an engine worker.
+    pub fn partition(&self, part: usize, parts: usize) -> Result<RunProjectionPart> {
+        if parts == 0 || part >= parts || parts > self.pages() {
+            return Err(invalid("run projection partition is outside its pages"));
+        }
+        let begin = self.pages() * part / parts;
+        let end = self.pages() * (part + 1) / parts;
+        scan_pages(
+            self.reader,
+            &self.extents[begin..end],
+            begin,
+            self.header,
+            self.dictionary.len(),
+            self.code_bytes,
+            (begin == 0).then(|| self.first_page.clone()),
+        )
+    }
+
+    /// Merge page ranges in their stored order and verify the complete row count.
+    pub fn finish(
+        &self,
+        scans: impl IntoIterator<Item = RunProjectionPart>,
+        limit: usize,
+    ) -> Result<Vec<(i32, u64)>> {
+        let mut totals = vec![0_u64; self.dictionary.len()];
+        let mut total_rows = 0_u64;
+        let mut previous_last = None;
+        for scan in scans {
+            if let Some(first) = scan.first {
+                if previous_last.is_some_and(|previous| first <= previous) {
+                    return Err(invalid("run projection page order differs"));
+                }
+                previous_last = scan.last;
+            }
+            total_rows = total_rows
+                .checked_add(scan.rows)
+                .ok_or_else(|| invalid("run projection row count overflow"))?;
+            for (total, value) in totals.iter_mut().zip(scan.counts) {
+                *total = total
+                    .checked_add(value)
+                    .ok_or_else(|| invalid("run projection count overflow"))?;
+            }
+        }
+        if total_rows != self.rows {
+            return Err(invalid("run projection decoded row count differs"));
+        }
+        let mut ranked = self
+            .dictionary
+            .iter()
+            .copied()
+            .zip(totals)
+            .filter(|(_, count)| *count != 0)
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        Ok(ranked)
+    }
 }
 
 impl Reader {
@@ -248,6 +324,56 @@ impl Reader {
         limit: usize,
         workers: usize,
     ) -> Result<Option<Vec<(i32, u64)>>> {
+        let Some(scan) = self.run_projection_scan(order, covered)? else {
+            return Ok(None);
+        };
+        let workers = workers.clamp(1, 8).min(scan.pages());
+        let parts = if workers == 1 {
+            let mut scan = scan;
+            let first_page = std::mem::take(&mut scan.first_page);
+            let part = scan_pages(
+                scan.reader,
+                &scan.extents,
+                0,
+                scan.header,
+                scan.dictionary.len(),
+                scan.code_bytes,
+                Some(first_page),
+            )?;
+            return Ok(Some(scan.finish([part], limit)?));
+        } else {
+            std::thread::scope(|scope| -> Result<Vec<RunProjectionPart>> {
+                let handles = (0..workers)
+                    .map(|part| {
+                        let scan = &scan;
+                        scope.spawn(move || scan.partition(part, workers))
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().map_err(|_| invalid("run projection worker panicked"))?
+                    })
+                    .collect()
+            })?
+        };
+        Ok(Some(scan.finish(parts, limit)?))
+    }
+
+    /// Open and validate a row-preserving projection for independently scheduled page scans.
+    ///
+    /// # Errors
+    ///
+    /// If the projection directory or payload is damaged.
+    ///
+    /// # Panics
+    ///
+    /// Fixed-width header decoding assumes the lengths checked immediately before it.
+    pub fn run_projection_scan(
+        &self,
+        order: usize,
+        covered: usize,
+    ) -> Result<Option<RunProjectionScan<'_>>> {
         let wanted = id(order, covered)?;
         let Some(section) = self.table().sections().iter().find(|section| {
             section.kind == *section::RUN_PROJECTION
@@ -301,57 +427,15 @@ impl Reader {
                 return Err(invalid("run projection pages are not contiguous"));
             }
         }
-        let workers = workers.clamp(1, 8).min(pages);
-        let scans = if workers == 1 {
-            vec![scan_pages(self, &extents, 0, header, size, code_bytes, Some(first_page))?]
-        } else {
-            std::thread::scope(|scope| -> Result<Vec<Scan>> {
-                let mut handles = Vec::with_capacity(workers);
-                let mut first_page = Some(first_page);
-                for worker in 0..workers {
-                    let begin = pages * worker / workers;
-                    let end = pages * (worker + 1) / workers;
-                    let extent_slice = &extents[begin..end];
-                    let initial = if begin == 0 { first_page.take() } else { None };
-                    handles.push(scope.spawn(move || {
-                        scan_pages(self, extent_slice, begin, header, size, code_bytes, initial)
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle.join().map_err(|_| invalid("run projection worker panicked"))?
-                    })
-                    .collect()
-            })?
-        };
-        let mut totals = vec![0_u64; size];
-        let mut total_rows = 0_u64;
-        let mut previous_last = None;
-        for scan in scans {
-            if let Some(first) = scan.first {
-                if previous_last.is_some_and(|previous| first <= previous) {
-                    return Err(invalid("run projection page order differs"));
-                }
-                previous_last = scan.last;
-            }
-            total_rows = total_rows
-                .checked_add(scan.rows)
-                .ok_or_else(|| invalid("run projection row count overflow"))?;
-            for (total, value) in totals.iter_mut().zip(scan.counts) {
-                *total = total
-                    .checked_add(value)
-                    .ok_or_else(|| invalid("run projection count overflow"))?;
-            }
-        }
-        if total_rows != rows {
-            return Err(invalid("run projection decoded row count differs"));
-        }
-        let mut ranked =
-            dictionary.into_iter().zip(totals).filter(|(_, count)| *count != 0).collect::<Vec<_>>();
-        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        ranked.truncate(limit);
-        Ok(Some(ranked))
+        Ok(Some(RunProjectionScan {
+            reader: self,
+            extents,
+            first_page,
+            dictionary,
+            rows,
+            header,
+            code_bytes,
+        }))
     }
 }
 
@@ -363,7 +447,7 @@ fn scan_pages(
     dictionary: usize,
     code_bytes: usize,
     initial: Option<Vec<u8>>,
-) -> Result<Scan> {
+) -> Result<RunProjectionPart> {
     let mut marks = vec![0_u32; dictionary];
     let mut counts = vec![0_u64; dictionary];
     let mut epoch = 0_u32;
@@ -475,7 +559,7 @@ fn scan_pages(
             .checked_add(page_rows)
             .ok_or_else(|| invalid("run projection row count overflow"))?;
     }
-    Ok(Scan { counts, rows, first, last })
+    Ok(RunProjectionPart { counts, rows, first, last })
 }
 
 #[cfg(test)]
@@ -549,6 +633,45 @@ mod tests {
         assert_eq!(
             reader.grouped_distinct_run_projection(0, 1, 300).expect("valid projection"),
             Some(expected),
+        );
+        std::fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn run_projection_page_partitions_merge_exact_distinct_counts() {
+        let at = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("rudb-run-projection-pages-{}-{at}.rdb", std::process::id()));
+        let fields = vec![
+            Field::required("user", LogicalType::BigInt),
+            Field::required("region", LogicalType::Integer),
+        ];
+        let mut writer = Writer::create(&path, "events", fields).expect("create native file");
+        for batch in 0..150 {
+            let users = (0..1000)
+                .map(|row| Value::BigInt(i64::from(batch * 500 + row / 2)))
+                .collect::<Vec<_>>();
+            let regions = (0..1000).map(|row| Value::Integer(row % 2 + 1)).collect::<Vec<_>>();
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::BigInt, &users).expect("users"),
+                        Vector::from_values(LogicalType::Integer, &regions).expect("regions"),
+                    ])
+                    .expect("matching columns"),
+                )
+                .expect("append rows");
+        }
+        writer.finish().expect("commit native file");
+        build_run_projection(&path, "events", "user", "region").expect("build run projection");
+        let reader = Catalog::open(&path).expect("catalog").table("events").expect("table");
+        let scan = reader.run_projection_scan(0, 1).expect("open projection").expect("projection");
+        assert!(scan.pages() > 1);
+        let left = scan.partition(0, 2).expect("left pages");
+        let right = scan.partition(1, 2).expect("right pages");
+        assert_eq!(
+            scan.finish([left, right], usize::MAX).expect("merge pages"),
+            vec![(1, 75_000), (2, 75_000)]
         );
         std::fs::remove_file(path).expect("remove scratch file");
     }

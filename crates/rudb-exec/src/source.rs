@@ -23,7 +23,7 @@ use rudb_functions::{
 use rudb_graph::Rids;
 use rudb_kernels::{Stepping, cast, moment_steps};
 use rudb_metrics::Counters;
-use rudb_native::Reader as NativeReader;
+use rudb_native::{Reader as NativeReader, RunProjectionPart, RunProjectionScan};
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
 use rudb_plan::{ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
@@ -185,7 +185,17 @@ pub(crate) struct ProjectionDistinct<'a> {
     covered: usize,
     schema: Schema,
     handout: Handout,
-    output: Mutex<(Option<Vec<Chunk>>, usize)>,
+    partitions: AtomicUsize,
+    scanner: Mutex<Option<Arc<RunProjectionScan<'a>>>>,
+    output: Mutex<ProjectionOutput>,
+}
+
+#[derive(Debug, Default)]
+struct ProjectionOutput {
+    parts: Vec<Option<RunProjectionPart>>,
+    finished: usize,
+    chunks: Option<Vec<Chunk>>,
+    next: usize,
 }
 
 impl<'a> ProjectionDistinct<'a> {
@@ -200,27 +210,60 @@ impl<'a> ProjectionDistinct<'a> {
             order,
             covered,
             schema,
-            handout: Handout::new(1),
-            output: Mutex::new((None, 0)),
+            handout: Handout::new(8),
+            partitions: AtomicUsize::new(1),
+            scanner: Mutex::new(None),
+            output: Mutex::new(ProjectionOutput::default()),
         }
+    }
+
+    fn chunks(&self, rows: Vec<(i32, u64)>) -> Result<Vec<Chunk>> {
+        let group_type = self.schema.types()[0].clone();
+        let entries = rows
+            .into_iter()
+            .map(|(group, count)| {
+                let value = match group_type {
+                    LogicalType::TinyInt => Value::TinyInt(
+                        i8::try_from(group)
+                            .map_err(|_| Error::internal("a projection group exceeds TINYINT"))?,
+                    ),
+                    LogicalType::SmallInt => Value::SmallInt(
+                        i16::try_from(group)
+                            .map_err(|_| Error::internal("a projection group exceeds SMALLINT"))?,
+                    ),
+                    LogicalType::Integer => Value::Integer(group),
+                    _ => return Err(Error::internal("a projection group has an unsupported type")),
+                };
+                Ok((vec![value], count))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Frequencies::grouped(self.schema.clone(), entries)?.chunks)
     }
 }
 
 impl Source for ProjectionDistinct<'_> {
     fn morsel(&self) -> Option<Morsel> {
-        self.handout.take()
+        self.handout.take().filter(|morsel| {
+            usize::try_from(morsel.index()).unwrap_or(usize::MAX)
+                < self.partitions.load(Ordering::Relaxed)
+        })
     }
 
-    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
-        Some(1)
+    fn morsels(&self, threads: usize, _weight: usize) -> Option<usize> {
+        // Smaller projections stay on one worker. Larger ones divide whole pages among the
+        // workers already leased by the engine, without a private thread pool.
+        let rows = self.reader.table().rows();
+        // One projection page cannot hold 524,288 covered codes, even at one byte per code.
+        // This keeps the requested partition count at or below the stored page count.
+        let partitions = threads.clamp(1, 8).min(rows.div_ceil(1 << 19).max(1));
+        self.partitions.store(partitions, Ordering::Relaxed);
+        Some(partitions)
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let mut held =
             self.output.lock().map_err(|_| Error::internal("projection output lock poisoned"))?;
-        if held.0.is_none() {
-            // One engine worker owns this morsel, so the native scan runs on that worker rather
-            // than opening another thread pool outside the query's lease.
+        if held.chunks.is_none() && self.partitions.load(Ordering::Relaxed) == 1 {
             let rows = self
                 .reader
                 .grouped_distinct_run_projection_with_workers(
@@ -230,40 +273,61 @@ impl Source for ProjectionDistinct<'_> {
                     1,
                 )?
                 .ok_or_else(|| Error::internal("a selected covering projection disappeared"))?;
-            let group_type = self.schema.types()[0].clone();
-            let entries = rows
-                .into_iter()
-                .map(|(group, count)| {
-                    let value = match group_type {
-                        LogicalType::TinyInt => {
-                            Value::TinyInt(i8::try_from(group).map_err(|_| {
-                                Error::internal("a projection group exceeds TINYINT")
-                            })?)
-                        }
-                        LogicalType::SmallInt => {
-                            Value::SmallInt(i16::try_from(group).map_err(|_| {
-                                Error::internal("a projection group exceeds SMALLINT")
-                            })?)
-                        }
-                        LogicalType::Integer => Value::Integer(group),
-                        _ => {
-                            return Err(Error::internal(
-                                "a projection group has an unsupported type",
-                            ));
-                        }
-                    };
-                    Ok((vec![value], count))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            held.0 = Some(Frequencies::grouped(self.schema.clone(), entries)?.chunks);
+            held.chunks = Some(self.chunks(rows)?);
         }
-        let chunks = held.0.as_ref().expect("projection output was initialized");
+        if held.chunks.is_none() && held.parts.get(position(morsel)).is_none_or(Option::is_none) {
+            drop(held);
+            let scanner = {
+                let mut slot = self
+                    .scanner
+                    .lock()
+                    .map_err(|_| Error::internal("projection scanner lock poisoned"))?;
+                if slot.is_none() {
+                    *slot = Some(Arc::new(
+                        self.reader.run_projection_scan(self.order, self.covered)?.ok_or_else(
+                            || Error::internal("a selected covering projection disappeared"),
+                        )?,
+                    ));
+                }
+                Arc::clone(slot.as_ref().expect("projection scanner initialized"))
+            };
+            let partitions = self.partitions.load(Ordering::Relaxed).min(scanner.pages());
+            let part = position(morsel);
+            if part >= partitions {
+                *out = Chunk::empty(&self.schema.types());
+                morsel.advance(1);
+                return Ok(Progress::Done);
+            }
+            let scanned = scanner.partition(part, partitions)?;
+            held = self
+                .output
+                .lock()
+                .map_err(|_| Error::internal("projection output lock poisoned"))?;
+            if held.parts.is_empty() {
+                held.parts.resize_with(partitions, || None);
+            }
+            held.parts[part] = Some(scanned);
+            held.finished += 1;
+            if held.finished < partitions {
+                *out = Chunk::empty(&self.schema.types());
+                morsel.advance(1);
+                return Ok(Progress::Done);
+            }
+            let parts = held
+                .parts
+                .iter_mut()
+                .map(|part| part.take().expect("all parts finished"))
+                .collect::<Vec<_>>();
+            let rows = scanner.finish(parts, usize::MAX)?;
+            held.chunks = Some(self.chunks(rows)?);
+        }
+        let chunks = held.chunks.as_ref().expect("projection output was initialized");
         let total = chunks.len();
-        let next = chunks.get(held.1).cloned();
+        let next = chunks.get(held.next).cloned();
         if let Some(chunk) = next {
             *out = chunk;
-            held.1 += 1;
-            if held.1 < total {
+            held.next += 1;
+            if held.next < total {
                 return Ok(Progress::More);
             }
         } else {
