@@ -710,7 +710,7 @@ thread_local! {
 fn reduce(reduced: Option<(&Rids, u64)>, chunk: &mut Chunk) -> Result<()> {
     let Some((rows, first)) = reduced else { return Ok(()) };
     let len = chunk.len();
-    let kept = Selection::from_predicate(len, |row| rows.contains(first + row as u64));
+    let kept = Selection::from_indices(rows.offsets_in(first, len));
     if kept.len() == len {
         return Ok(());
     }
