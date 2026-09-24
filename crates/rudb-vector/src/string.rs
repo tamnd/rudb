@@ -15,6 +15,7 @@
 //! the kind of decision that gets remeasured rather than argued about, and it is tracked as an
 //! issue so that M3 measures it instead of inheriting it.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use rudb_common::{Error, Result};
@@ -190,6 +191,25 @@ impl StringView {
         ]) as usize
     }
 
+    /// The byte order of two strings when the views alone decide it, and `None` when the bytes in
+    /// the arena have to be read.
+    ///
+    /// Two inline strings always decide: the payloads are zero padded, and padding keeps byte order
+    /// because a string that runs out at a byte where the other has a zero still sorts first, which
+    /// the length settles when the padded payloads are the same. The same argument makes two
+    /// different prefixes decide for any pair. What is left is two strings with the same four bytes
+    /// in front and at least one of them long, and that is the one case that needs the arena.
+    #[must_use]
+    #[inline]
+    pub fn known_order(&self, other: &Self) -> Option<Ordering> {
+        if self.is_inline() && other.is_inline() {
+            let order = padded(&self.payload).cmp(&padded(&other.payload));
+            return Some(order.then(self.length.cmp(&other.length)));
+        }
+        let (left, right) = (u32::from_be_bytes(self.prefix()), u32::from_be_bytes(other.prefix()));
+        if left == right { None } else { Some(left.cmp(&right)) }
+    }
+
     /// Whether these two views are definitely different, answered from the view alone.
     ///
     /// A `false` here means the payloads have to be compared. A `true` means they do not, which on
@@ -198,6 +218,14 @@ impl StringView {
     pub fn definitely_differs(&self, other: &Self) -> bool {
         self.length != other.length || self.prefix() != other.prefix()
     }
+}
+
+/// A payload as one number whose order is the byte order of the twelve bytes.
+#[inline]
+fn padded(payload: &[u8; 12]) -> u128 {
+    let mut wide = [0u8; 16];
+    wide[..12].copy_from_slice(payload);
+    u128::from_be_bytes(wide)
 }
 
 /// A column of strings: the views, and the one arena the long ones live in.
@@ -796,6 +824,45 @@ mod tests {
 
     use super::{Arenas, INLINE_LIMIT, StringColumn, StringView};
     use crate::buffer::Buffer;
+
+    #[test]
+    fn an_order_the_views_decide_is_the_byte_order_and_only_a_shared_prefix_is_left_open() {
+        // Zero bytes, strings that are a prefix of each other, and both sides of the inline limit,
+        // which is where padding could have put two strings in the wrong order.
+        let strings: [&[u8]; 14] = [
+            b"",
+            b"\0",
+            b"a",
+            b"a\0",
+            b"a\0\0",
+            b"ab",
+            b"abc",
+            b"abcd",
+            b"abcd\0",
+            b"abcdefghijkl",
+            b"abcdefghijkl\0",
+            b"abcdefghijklm",
+            b"abce",
+            b"b the long one past twelve bytes",
+        ];
+        let mut column = StringColumn::new();
+        for bytes in strings {
+            column.push_bytes(bytes);
+        }
+        let views = column.views();
+        for (left, a) in strings.iter().enumerate() {
+            for (right, b) in strings.iter().enumerate() {
+                let known = views[left].known_order(&views[right]);
+                let (a_long, b_long) = (a.len() > INLINE_LIMIT, b.len() > INLINE_LIMIT);
+                if let Some(order) = known {
+                    assert_eq!(order, a.cmp(b), "{a:?} against {b:?}");
+                } else {
+                    assert!(a_long || b_long, "{a:?} against {b:?} are both inline");
+                    assert_eq!(a.get(..4), b.get(..4), "{a:?} against {b:?}");
+                }
+            }
+        }
+    }
 
     /// The seam, used the way layer three will use it. The page arrives whole, each string is
     /// recorded where it already is, and the arena at the end is the page byte for byte, including

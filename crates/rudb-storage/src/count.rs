@@ -811,8 +811,9 @@ fn flat(vector: &Vector, data: &Data, sink: &mut Sink<'_>) -> bool {
         Data::Bool(held) => pass!(|row: usize| held.get(row).map(|&v| hash_signed(i128::from(v)))),
         Data::Float32(held) => pass!(|row: usize| held.get(row).map(|&v| hash_real(f64::from(v)))),
         Data::Float64(held) => pass!(|row: usize| held.get(row).map(|&v| hash_real(v))),
-        // A string arrives here as views into the arena, which `bytes_at` is the reader for.
-        Data::Varlen(_) => pass!(|row: usize| vector.bytes_at(row).map(hash64)),
+        // A string arrives here as views into the arena. The column is read directly rather than
+        // through `Vector::bytes_at`, which asks the form and the validity again for every row.
+        Data::Varlen(held) => pass!(|row: usize| held.bytes(row).map(hash64)),
         // An interval and an empty column. Neither has a canonical pattern written down above, and
         // inventing one here rather than in `hash_value` is how the two stop agreeing.
         _ => false,
