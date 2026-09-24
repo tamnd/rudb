@@ -407,51 +407,67 @@ impl Pass {
     /// cannot be the lowest yet, and one below cannot be the highest. The vector's own ends go
     /// through [`Self::fold`] once, which is the only place they are copied.
     fn scan_strings(&mut self, rows: usize, validity: &Validity, held: &StringColumn) -> bool {
-        if held.len() < rows {
-            return false;
-        }
+        let Some(views) = held.views().get(..rows) else { return false };
         let nullable = validity.has_nulls(rows);
         let mut out = Reduced::empty(rows as u64);
-        let mut ends: Option<(&[u8], &[u8], &[u8])> = None;
-        let mut last: &[u8] = &[];
-        // row at a time: the ascents, the descents and which end a row can move are all about the
-        // row before it. The bytes are borrowed out of the column and no `Value` is built.
-        for row in 0..rows {
+        // Rows rather than bytes, so that a comparison can be settled from the two views. Most are:
+        // an inline string is all in its view, and a long one has its first four bytes there. The
+        // arena is read for a tie on those four bytes and for the four ends at the bottom, and the
+        // rest of what the loop wants, the width, is in the view as well.
+        let order = |left: usize, right: usize| match views[left].known_order(&views[right]) {
+            Some(order) => Some(order),
+            None => Some(held.bytes(left)?.cmp(held.bytes(right)?)),
+        };
+        let mut ends: Option<(usize, usize, usize)> = None;
+        let mut last = 0;
+        for (row, view) in views.iter().enumerate() {
             if nullable && !validity.is_valid(row) {
                 out.nulls += 1;
                 continue;
             }
-            let Some(bytes) = held.bytes(row) else { return false };
-            let width = bytes.len() as u64;
+            let width = view.len() as u64;
             out.bytes = out.bytes.saturating_add(width);
             out.widest = out.widest.max(width);
             match &mut ends {
-                None => ends = Some((bytes, bytes, bytes)),
-                Some((low, high, _)) => match bytes.cmp(last) {
-                    Ordering::Greater => {
-                        out.ascents += 1;
-                        if bytes > *high {
-                            *high = bytes;
+                None => ends = Some((row, row, row)),
+                Some((low, high, _)) => {
+                    let Some(step) = order(row, last) else { return false };
+                    match step {
+                        Ordering::Greater => {
+                            out.ascents += 1;
+                            let Some(above) = order(row, *high) else { return false };
+                            if above == Ordering::Greater {
+                                *high = row;
+                            }
                         }
-                    }
-                    Ordering::Less => {
-                        out.descents += 1;
-                        if bytes < *low {
-                            *low = bytes;
+                        Ordering::Less => {
+                            out.descents += 1;
+                            let Some(below) = order(row, *low) else { return false };
+                            if below == Ordering::Less {
+                                *low = row;
+                            }
                         }
+                        Ordering::Equal => {}
                     }
-                    Ordering::Equal => {}
-                },
+                }
             }
-            last = bytes;
+            last = row;
             out.values += 1;
         }
-        out.ends = ends.map(|(low, high, first)| Ends {
-            low: Bound::Bytes(low.to_vec()),
-            high: Bound::Bytes(high.to_vec()),
-            first: Bound::Bytes(first.to_vec()),
-            last: Bound::Bytes(last.to_vec()),
-        });
+        if let Some((low, high, first)) = ends {
+            let bytes = |row: usize| held.bytes(row).map(<[u8]>::to_vec);
+            let (Some(low), Some(high), Some(first), Some(last)) =
+                (bytes(low), bytes(high), bytes(first), bytes(last))
+            else {
+                return false;
+            };
+            out.ends = Some(Ends {
+                low: Bound::Bytes(low),
+                high: Bound::Bytes(high),
+                first: Bound::Bytes(first),
+                last: Bound::Bytes(last),
+            });
+        }
         self.fold(out);
         true
     }
@@ -2008,12 +2024,18 @@ mod tests {
     #[test]
     fn a_string_column_a_vector_at_a_time_says_what_it_says_a_row_at_a_time() {
         let word = |at: i64| format!("w{:03}", at);
-        let shapes: [(&str, Vec<Option<String>>); 6] = [
+        let shapes: [(&str, Vec<Option<String>>); 7] = [
             ("ascending", (0..500).map(|at| Some(word(at))).collect()),
             ("descending", (0..500).rev().map(|at| Some(word(at))).collect()),
             ("shuffled", (0..500).map(|at| Some(word(at * 307 % 500))).collect()),
             ("repeated", (0..500).map(|at| Some(word(at / 7 % 5))).collect()),
             ("prefixes", (0..500).map(|at| Some("ab".repeat(1 + at % 9))).collect()),
+            (
+                "long with one prefix",
+                (0..500)
+                    .map(|at| Some(format!("same {:03} past the inline limit", at * 307 % 500)))
+                    .collect(),
+            ),
             (
                 "every third null",
                 (0..500).map(|at| (at % 3 != 0).then(|| word(at * 13 % 500))).collect(),
