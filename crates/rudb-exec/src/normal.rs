@@ -31,9 +31,11 @@
 //!
 //! # What does not go in a key
 //!
-//! A type with no fixed width, which is `VARCHAR` and `BLOB`. A key of those is a prefix and a
-//! tiebreak against the real value, and that is a second design rather than a longer buffer. So a
-//! sort with a string key takes the old path, whole, rather than normalizing the keys around it.
+//! A type with no fixed width, which is `VARCHAR` and `BLOB`, as the value itself. What goes in
+//! instead is the string's rank among the strings of its key, which orders the way the bytes do and
+//! fits in four, but is only known once every row is in, so [`ranked_layout`] is a second layout
+//! the sort writes at the end rather than a wider [`layout`]. A list that does not fit even then
+//! takes the old path, whole, rather than normalizing the keys around it.
 //!
 //! A `FLOAT` or a `DOUBLE`, for a different reason. The IEEE total order that makes floats memcmp
 //! comparable separates -0.0 from 0.0 and orders NaNs by their payload, and DuckDB's order does
@@ -72,6 +74,35 @@ pub(crate) type Normal = [u8; WIDTH];
 /// `None` for a key of a type with no fixed width order, and for a list that is wider than
 /// [`WIDTH`] all together. Either way the caller keeps the `Value` path, which handles everything.
 pub(crate) fn layout(types: &[LogicalType]) -> Option<Vec<usize>> {
+    fitted(types, wide)
+}
+
+/// How wide each key encodes when every string key is written as its rank among the strings of
+/// the sort, and whether it is one of those, or `None` when the list still has no normalized form.
+///
+/// A string orders by its bytes, so where it falls among the other strings of the same key is all
+/// the sort needs of it, and that is a number that fits in four bytes. The number is only known
+/// once every row is in, which is why this is a second layout rather than a wider [`layout`]: the
+/// caller keeps the key columns until then and writes the keys after. A `NULL` is the tag, the same
+/// as for any other key.
+pub(crate) fn ranked_layout(types: &[LogicalType]) -> Option<Vec<(usize, bool)>> {
+    let widths = fitted(types, |ty| if ranked(ty) { Some(RANK) } else { wide(ty) })?;
+    Some(widths.into_iter().zip(types).map(|(wide, ty)| (wide, ranked(ty))).collect())
+}
+
+/// Whether a key of this type is written as its rank, which is a type ordered by its bytes alone.
+pub(crate) fn ranked(ty: &LogicalType) -> bool {
+    matches!(ty, LogicalType::Varchar | LogicalType::Blob)
+}
+
+/// How many bytes a rank takes, the tag included.
+const RANK: usize = 1 + size_of::<u32>();
+
+/// Each type's width under `wide`, or `None` when one has none or they do not fit in [`WIDTH`].
+fn fitted(
+    types: &[LogicalType],
+    wide: impl Fn(&LogicalType) -> Option<usize>,
+) -> Option<Vec<usize>> {
     let mut widths = Vec::with_capacity(types.len());
     let mut total = 0;
     for ty in types {
