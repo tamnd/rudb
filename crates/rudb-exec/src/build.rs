@@ -1559,7 +1559,7 @@ impl<'a> Building<'a, '_> {
                     TableFunction::RudbWriteMetrics => write_metrics(plan, index, columns)?,
                     TableFunction::RudbCodecMetrics => codec_metrics(plan, index, columns)?,
                     TableFunction::DuckdbKeywords => keywords(plan, index, columns)?,
-                    TableFunction::DuckdbTypes => typenames(plan, index, columns)?,
+                    TableFunction::DuckdbTypes => typenames(self.catalog, plan, index, columns)?,
                     TableFunction::DuckdbFunctions => functionnames(plan, index, columns)?,
                     TableFunction::DuckdbSettings => {
                         settingnames(self.session, plan, index, columns)?

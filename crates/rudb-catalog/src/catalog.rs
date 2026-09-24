@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use rudb_common::sequence::Counter;
-use rudb_common::{Error, Field, Result};
+use rudb_common::{Error, Field, LogicalType, Result};
 
 use crate::name::{QualifiedName, same_name};
 use crate::system::{
@@ -138,6 +138,46 @@ impl Sequence {
     }
 }
 
+/// A type `CREATE TYPE` made, which is another name for the type it was made from.
+///
+/// The name is read once, when a column or a cast is bound, and what is kept there is the type it
+/// stood for. So a table does not depend on the type its column was declared with, and the pin
+/// agrees: dropping the type leaves the table and its `DESCRIBE` as they were. A type made from
+/// another one does depend on it, which is what [`UserType::uses`] is for.
+#[derive(Debug, Clone)]
+pub struct UserType {
+    name: QualifiedName,
+    oid: i64,
+    ty: LogicalType,
+    uses: Vec<QualifiedName>,
+}
+
+impl UserType {
+    /// Its full name.
+    #[must_use]
+    pub fn name(&self) -> &QualifiedName {
+        &self.name
+    }
+
+    /// The number the catalog tables join on.
+    #[must_use]
+    pub fn oid(&self) -> i64 {
+        self.oid
+    }
+
+    /// The type it stands for.
+    #[must_use]
+    pub fn ty(&self) -> &LogicalType {
+        &self.ty
+    }
+
+    /// The other made types its definition named, which it cannot outlive.
+    #[must_use]
+    pub fn uses(&self) -> &[QualifiedName] {
+        &self.uses
+    }
+}
+
 /// One schema.
 #[derive(Debug, Clone)]
 pub struct Schema {
@@ -145,6 +185,7 @@ pub struct Schema {
     tables: Vec<Table>,
     views: Vec<View>,
     sequences: Vec<Sequence>,
+    types: Vec<UserType>,
     oid: i64,
 }
 
@@ -156,6 +197,7 @@ impl Schema {
             tables: Vec::new(),
             views: Vec::new(),
             sequences: Vec::new(),
+            types: Vec::new(),
             oid,
         }
     }
@@ -548,7 +590,8 @@ impl Catalog {
         if !cascade
             && (!schema.tables.is_empty()
                 || !schema.views.is_empty()
-                || !schema.sequences.is_empty())
+                || !schema.sequences.is_empty()
+                || !schema.types.is_empty())
         {
             let mut message = format!(
                 "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
@@ -572,6 +615,12 @@ impl Catalog {
                 message += &format!(
                     "sequence \"{}\" depends on schema \"{}\".\n",
                     sequence.name.table, schema.name
+                );
+            }
+            for made in schema.types.iter().rev() {
+                message += &format!(
+                    "type \"{}\" depends on schema \"{}\".\n",
+                    made.name.table, schema.name
                 );
             }
             message += "Use DROP...CASCADE to drop all dependents.";
@@ -857,6 +906,124 @@ impl Catalog {
             .ok_or_else(|| {
                 Error::catalog(format!("Sequence with name {} does not exist!", name.table))
             })
+    }
+
+    /// Makes a type that stands for `ty` under `name`, with the pin's refusals: a name a built in
+    /// type has or one that is taken, unless `if_not_exists` or `replace` was asked for. `uses` are
+    /// the other made types `ty` was read through.
+    ///
+    /// # Errors
+    ///
+    /// If the schema is missing, if the name is taken and neither flag says what to do, or if a
+    /// type being replaced has another type made from it.
+    pub fn create_type(
+        &mut self,
+        name: QualifiedName,
+        ty: LogicalType,
+        uses: Vec<QualifiedName>,
+        replace: bool,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        self.changed();
+        let oid = self.stamp();
+        let taken = || Error::catalog(format!("Type with name \"{}\" already exists!", name.table));
+        if LogicalType::parse(&name.table).is_ok() {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(taken());
+        }
+        let held = self
+            .schema(&name.catalog, &name.schema)?
+            .types
+            .iter()
+            .any(|held| same_name(&held.name.table, &name.table));
+        if held {
+            if if_not_exists {
+                return Ok(());
+            }
+            if !replace {
+                return Err(taken());
+            }
+            self.type_dependents(&name)?;
+            self.schema_mut(&name.catalog, &name.schema)?
+                .types
+                .retain(|held| !same_name(&held.name.table, &name.table));
+        }
+        self.schema_mut(&name.catalog, &name.schema)?.types.push(UserType { name, oid, ty, uses });
+        Ok(())
+    }
+
+    /// The made type a written name stands for, read the way a table name is read and the
+    /// temporary schema first, and `None` when there is none.
+    #[must_use]
+    pub fn resolve_type(&self, parts: &[&str]) -> Option<&UserType> {
+        if parts.is_empty() || parts.len() > 3 {
+            return None;
+        }
+        for candidate in self.candidates(parts).ok()? {
+            if let Ok(schema) = self.schema(&candidate.catalog, &candidate.schema) {
+                let found =
+                    schema.types.iter().find(|held| same_name(&held.name.table, &candidate.table));
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+
+    /// Drops a made type, and with `cascade` every type made from it, all the way down.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such type, or if another type was made from it and `cascade` was not asked
+    /// for.
+    pub fn drop_type(&mut self, name: &QualifiedName, cascade: bool) -> Result<()> {
+        if !cascade {
+            self.type_dependents(name)?;
+        }
+        self.changed();
+        let mut gone = vec![name.clone()];
+        while let Some(next) = gone.pop() {
+            let dependents: Vec<QualifiedName> = self
+                .types()
+                .filter(|held| held.uses.contains(&next))
+                .map(|held| held.name.clone())
+                .collect();
+            gone.extend(dependents);
+            self.schema_mut(&next.catalog, &next.schema)?
+                .types
+                .retain(|held| !same_name(&held.name.table, &next.table));
+        }
+        Ok(())
+    }
+
+    /// Refuses when another made type was read through this one, in the pin's sentence.
+    fn type_dependents(&self, name: &QualifiedName) -> Result<()> {
+        let dependents: Vec<&UserType> =
+            self.types().filter(|held| held.uses.contains(name)).collect();
+        if dependents.is_empty() {
+            return Ok(());
+        }
+        let mut message = format!(
+            "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
+            name.table
+        );
+        for held in dependents {
+            message +=
+                &format!("type \"{}\" depends on type \"{}\".\n", held.name.table, name.table);
+        }
+        message += "Use DROP...CASCADE to drop all dependents.";
+        Err(Error::dependency(message))
+    }
+
+    /// Every made type in every database, in the order they were made within each schema.
+    pub fn types(&self) -> impl Iterator<Item = &UserType> {
+        self.databases
+            .iter()
+            .flat_map(|database| database.schemas.iter())
+            .flat_map(|schema| schema.types.iter())
     }
 
     /// Every sequence in every database, in the order they were made within each schema.

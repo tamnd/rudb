@@ -853,6 +853,25 @@ impl<'a> Transform<'a> {
                 Ok(self.schema_statement(schema))
             }
             "CreateSequenceStmt" => self.create_sequence_statement(inner, or_replace, temporary),
+            "CreateTypeStmt" => {
+                // `CreateType <- EnumSelectType / EnumStringLiteralList / CreateTypeFromType`, and
+                // only the last of the three is a type this engine has.
+                let made = self.first(self.find(inner, "CreateType"));
+                if self.name(made) != "CreateTypeFromType" {
+                    return self.unsupported(made);
+                }
+                let text = self.text(self.first(made)).to_string();
+                let made = crate::ast::TypeDef {
+                    name: self.name_parts(self.find(inner, "QualifiedName")),
+                    drop: false,
+                    quiet: self.find(inner, "IfNotExists") != NONE,
+                    or_replace,
+                    temporary,
+                    cascade: false,
+                    ty: self.intern(&text),
+                };
+                Ok(self.type_statement(made))
+            }
             "CreateIndexStmt" => self.create_index_statement(inner, or_replace, temporary),
             _ => self.unsupported(inner),
         }
@@ -1374,6 +1393,12 @@ impl<'a> Transform<'a> {
         Statement::Alter(index)
     }
 
+    fn type_statement(&mut self, made: crate::ast::TypeDef) -> Statement {
+        let index = self.ast.types.len() as u32;
+        self.ast.types.push(made);
+        Statement::Type(index)
+    }
+
     fn sequence_statement(&mut self, sequence: crate::ast::Sequence) -> Statement {
         let index = self.ast.sequences.len() as u32;
         self.ast.sequences.push(sequence);
@@ -1797,6 +1822,23 @@ impl<'a> Transform<'a> {
                 owner: Slice::default(),
             };
             return Ok(self.sequence_statement(sequence));
+        }
+        if self.name(inner) == "DropType" {
+            let names: Vec<u32> =
+                self.kids(inner).filter(|&kid| self.name(kid) == "QualifiedTypeName").collect();
+            let [name] = names[..] else {
+                return Err(Error::not_implemented("Can only drop one object at a time"));
+            };
+            let made = crate::ast::TypeDef {
+                name: self.name_parts(name),
+                drop: true,
+                quiet: self.find(inner, "IfExists") != NONE,
+                or_replace: false,
+                temporary: false,
+                cascade,
+                ty: NONE,
+            };
+            return Ok(self.type_statement(made));
         }
         if self.name(inner) == "DropIndex" {
             let names: Vec<u32> =
@@ -5411,6 +5453,28 @@ mod tests {
                     ast.name_text(index.table),
                     index.elements.len
                 )
+            }
+            Statement::Type(index) => {
+                let made = ast.type_def(index);
+                let mut out = if made.drop { "DROP" } else { "CREATE" }.to_string();
+                if made.or_replace {
+                    out += " OR REPLACE";
+                }
+                if made.temporary {
+                    out += " TEMPORARY";
+                }
+                out += " TYPE";
+                if made.quiet {
+                    out += if made.drop { " IF EXISTS" } else { " IF NOT EXISTS" };
+                }
+                out += &format!(" {}", ast.name_text(made.name));
+                if !made.drop {
+                    out += &format!(" AS {}", ast.string(made.ty));
+                }
+                if made.cascade {
+                    out += " CASCADE";
+                }
+                out
             }
             Statement::Sequence(index) => {
                 let sequence = ast.sequence(index);

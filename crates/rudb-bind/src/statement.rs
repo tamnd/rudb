@@ -45,6 +45,8 @@ pub enum Bound {
     Schema(SchemaChange),
     /// `CREATE SEQUENCE` or `DROP SEQUENCE`.
     Sequence(SequenceChange),
+    /// `CREATE TYPE` or `DROP TYPE`.
+    Type(TypeChange),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(Alter),
     /// `CREATE INDEX` or `DROP INDEX`.
@@ -194,6 +196,23 @@ pub struct SequenceChange {
     /// The table or view an `ALTER SEQUENCE ... OWNED BY` gives the sequence to, which makes this
     /// an alter rather than a create.
     pub owner: Option<QualifiedName>,
+}
+
+/// A bound `CREATE TYPE` or `DROP TYPE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeChange {
+    /// The full name. `None` for a `DROP TYPE IF EXISTS` of one that is not there.
+    pub name: Option<QualifiedName>,
+    /// What a create makes the name stand for, and `None` on a drop.
+    pub ty: Option<LogicalType>,
+    /// The made types a create read its type through, which it will depend on.
+    pub uses: Vec<QualifiedName>,
+    /// Whether a create over a type that is there does nothing.
+    pub if_not_exists: bool,
+    /// Whether a create replaces a type that is there.
+    pub or_replace: bool,
+    /// Whether a drop takes the types made from this one with it.
+    pub cascade: bool,
 }
 
 /// A bound `ALTER TABLE` or `ALTER VIEW`.
@@ -437,6 +456,36 @@ fn bind_one(
                 owner,
             }))
         }
+        ast::Statement::Type(index) => {
+            let written = ast.type_def(index);
+            let parts: Vec<&str> = ast.name(written.name).collect();
+            let (name, ty, uses) = if written.drop {
+                let name = catalog.resolve_type(&parts).map(|made| made.name().clone());
+                if name.is_none() && !written.quiet {
+                    return Err(Error::catalog(format!(
+                        "Type with name {} does not exist!",
+                        parts.last().copied().unwrap_or_default()
+                    )));
+                }
+                (name, None, Vec::new())
+            } else {
+                let name = if written.temporary {
+                    catalog.resolve_for_create_temporary(&parts)?
+                } else {
+                    catalog.resolve_for_create(&parts)?
+                };
+                let (ty, uses) = written_type(catalog, ast.string(written.ty))?;
+                (Some(name), Some(ty), uses)
+            };
+            Ok(Bound::Type(TypeChange {
+                name,
+                ty,
+                uses,
+                if_not_exists: written.quiet,
+                or_replace: written.or_replace,
+                cascade: written.cascade,
+            }))
+        }
         ast::Statement::Alter(index) => alter(ast, catalog, parameters, session, index),
         ast::Statement::Index(index) => create_index(ast, catalog, parameters, session, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
@@ -466,6 +515,27 @@ pub fn bind_statement_sql(sql: &str, catalog: &Catalog) -> Result<Bound> {
 }
 
 /// Roots a binder's plan and checks it.
+/// A written type, with any name `CREATE TYPE` made read through `catalog`, and the made types it
+/// was read through, which a type made from this one depends on.
+pub(crate) fn written_type(
+    catalog: &Catalog,
+    text: &str,
+) -> Result<(LogicalType, Vec<QualifiedName>)> {
+    let mut uses = Vec::new();
+    let ty = LogicalType::parse_with(text, &mut |parts| {
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let made = catalog.resolve_type(&parts)?;
+        uses.push(made.name().clone());
+        Some(made.ty().clone())
+    })?;
+    Ok((ty, uses))
+}
+
+/// [`written_type`] for a caller that only wants the type.
+pub(crate) fn read_type(catalog: &Catalog, text: &str) -> Result<LogicalType> {
+    written_type(catalog, text).map(|(ty, _)| ty)
+}
+
 fn finish(binder: Binder<'_>, root: rudb_plan::NodeRef) -> Result<Plan> {
     let mut plan = binder.into_plan();
     plan.set_root(root);
@@ -498,7 +568,7 @@ fn create_table(
                     ast.string(def.name)
                 )));
             }
-            let ty = LogicalType::parse(text)?;
+            let ty = read_type(catalog, text)?;
             let column = ast.string(def.name);
             columns.push(if def.not_null {
                 Field::required(column, ty)
@@ -890,7 +960,7 @@ fn alter(
             if quiet && place(column.name).is_some() {
                 return nothing(Some(name));
             }
-            let ty = LogicalType::parse(ast.string(column.ty))?;
+            let ty = read_type(catalog, ast.string(column.ty))?;
             let field = Field {
                 not_null: column.not_null,
                 ..Field::new(ast.string(column.name), ty.clone())
@@ -979,7 +1049,7 @@ fn alter(
                 ));
             }
             let mut target =
-                if ty == NONE { None } else { Some(LogicalType::parse(ast.string(ty))?) };
+                if ty == NONE { None } else { Some(read_type(catalog, ast.string(ty))?) };
             rewrite = Some(table_rewrite(
                 ast,
                 (catalog, parameters, session),

@@ -29,7 +29,7 @@ pub mod view;
 
 pub use alter::Alteration;
 pub use catalog::{
-    Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema, Sequence,
+    Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema, Sequence, UserType,
 };
 pub use held::Held;
 pub use index::Index;

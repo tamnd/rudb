@@ -65,6 +65,8 @@ pub type DropTableRef = u32;
 pub type SchemaRef = u32;
 /// Index into [`Ast::sequences`].
 pub type SequenceRef = u32;
+/// Index into [`Ast::types`].
+pub type TypeRef = u32;
 /// Index into [`Ast::alters`].
 pub type AlterRef = u32;
 /// Index into [`Ast::indexes`].
@@ -95,6 +97,8 @@ pub enum Statement {
     Schema(SchemaRef),
     /// `CREATE SEQUENCE` or `DROP SEQUENCE`.
     Sequence(SequenceRef),
+    /// `CREATE TYPE` or `DROP TYPE`.
+    Type(TypeRef),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(AlterRef),
     /// `CREATE INDEX` or `DROP INDEX`.
@@ -336,6 +340,25 @@ pub struct Sequence {
     /// The table or view an `ALTER SEQUENCE ... OWNED BY` names, as a run of parts, and empty for
     /// anything else. An alter is a statement that is neither a drop nor has this empty.
     pub owner: Slice,
+}
+
+/// `CREATE TYPE name AS type` or `DROP TYPE name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeDef {
+    /// The name, as a run of parts, outermost first.
+    pub name: Slice,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Whether `IF NOT EXISTS` was written on a create or `IF EXISTS` on a drop.
+    pub quiet: bool,
+    /// Whether `OR REPLACE` was written, which only a create can have.
+    pub or_replace: bool,
+    /// Whether `TEMP` or `TEMPORARY` was written, which only a create can have.
+    pub temporary: bool,
+    /// Whether `CASCADE` was written, which only a drop can have.
+    pub cascade: bool,
+    /// The type the name stands for, as it was written, and `NONE` on a drop.
+    pub ty: StrRef,
 }
 
 /// `CREATE [UNIQUE] INDEX name ON table (elements)` or `DROP INDEX name`.
@@ -1308,6 +1331,8 @@ pub struct Ast {
     pub schemas: Vec<Schema>,
     /// The `CREATE SEQUENCE` and `DROP SEQUENCE` arena.
     pub sequences: Vec<Sequence>,
+    /// The `CREATE TYPE` and `DROP TYPE` arena.
+    pub types: Vec<TypeDef>,
     /// The `ALTER TABLE` and `ALTER VIEW` arena.
     pub alters: Vec<Alter>,
     /// The `CREATE INDEX` and `DROP INDEX` arena.
@@ -1456,6 +1481,12 @@ impl Ast {
     /// One `CREATE SEQUENCE` or `DROP SEQUENCE`.
     pub fn sequence(&self, index: SequenceRef) -> Sequence {
         self.sequences[index as usize]
+    }
+
+    /// One `CREATE TYPE` or `DROP TYPE`.
+    #[must_use]
+    pub fn type_def(&self, index: TypeRef) -> TypeDef {
+        self.types[index as usize]
     }
 
     /// The `CREATE INDEX` or `DROP INDEX` at an index.

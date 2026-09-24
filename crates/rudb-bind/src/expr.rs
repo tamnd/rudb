@@ -110,7 +110,7 @@ impl Binder<'_> {
             }
             ast::Expr::Cast { operand, ty, try_cast } => {
                 let input = self.bind_expr(ast, operand, scope)?;
-                let target = LogicalType::parse(ast.string(ty))?;
+                let target = crate::statement::read_type(self.catalog(), ast.string(ty))?;
                 self.checked_cast_to(input, &target, try_cast)
             }
             ast::Expr::Case { operand, arms, otherwise } => {
