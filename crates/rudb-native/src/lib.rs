@@ -6869,6 +6869,13 @@ impl Reader {
     ///
     /// If the extent points outside the file, or its bytes do not checksum.
     pub fn extent(&self, of: &section::Extent) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.extent_into(of, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Read a verified extent into a caller-owned buffer so repeated extents can reuse its pages.
+    fn extent_into(&self, of: &section::Extent, bytes: &mut Vec<u8>) -> Result<()> {
         let end = of
             .offset
             .checked_add(u64::from(of.length))
@@ -6876,12 +6883,12 @@ impl Reader {
         if of.offset < HEADER || end > self.size {
             return Err(invalid("an extent is outside the file"));
         }
-        let mut bytes = vec![0; of.length as usize];
-        read_at(&self.file, of.offset, &mut bytes)?;
-        if checksum(&bytes) != of.hash {
+        bytes.resize(of.length as usize, 0);
+        read_at(&self.file, of.offset, bytes)?;
+        if checksum(bytes) != of.hash {
             return Err(invalid("an extent does not checksum"));
         }
-        Ok(bytes)
+        Ok(())
     }
 
     /// Reads a whole section's payload, every extent of it, in order.
