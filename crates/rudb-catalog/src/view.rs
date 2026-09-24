@@ -73,6 +73,11 @@ impl View {
         self.oid
     }
 
+    /// Gives it another name in the same schema, which is what `RENAME TO` does.
+    pub(crate) fn rename(&mut self, to: &str) {
+        self.name.table = to.to_string();
+    }
+
     /// Stamps the oid, which only [`crate::Catalog::create_view`] does.
     pub(crate) fn stamp(&mut self, oid: i64) {
         self.oid = oid;

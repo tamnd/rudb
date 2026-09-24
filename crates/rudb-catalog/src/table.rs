@@ -1576,6 +1576,145 @@ impl Table {
         Ok(())
     }
 
+    /// Makes one change to the table, and with `rows` swaps every row for these, which is the
+    /// table as it reads after the change.
+    ///
+    /// Called on a copy by [`crate::Catalog::alter`], so a refusal part way leaves the table as it
+    /// was. The rows of a table read out of a file are brought into memory for a change to its name
+    /// or its columns, since the file says the old ones and the next checkpoint writes it again.
+    ///
+    /// # Errors
+    ///
+    /// The pin's refusals: a name that is taken, the last column, a column a key or a foreign key
+    /// needs, a null in a column that is now `NOT NULL`, and a key the new rows repeat.
+    pub(crate) fn alter(
+        &mut self,
+        alteration: crate::Alteration,
+        rows: Option<Vec<Chunk>>,
+        workers: usize,
+    ) -> Result<()> {
+        use crate::Alteration;
+        let taken = |columns: &[Field], name: &str| {
+            if columns.iter().any(|held| same_name(&held.name, name)) {
+                return Err(Error::catalog(format!("Column with name \"{name}\" already exists!")));
+            }
+            Ok(())
+        };
+        self.defaults.resize(self.columns.len(), None);
+        let mut moved = true;
+        match alteration {
+            Alteration::Rename(to) => self.name.table = to,
+            Alteration::RenameColumn { column, to, checks } => {
+                taken(&self.columns, &to)?;
+                self.columns[column].name = to;
+                self.checks = checks;
+            }
+            Alteration::AddColumn { field, default, sequences } => {
+                taken(&self.columns, &field.name)?;
+                self.columns.push(field);
+                self.defaults.push(default);
+                self.depend_on(sequences);
+            }
+            Alteration::DropColumn { column, checks } => {
+                if self.columns.len() == 1 {
+                    return Err(Error::catalog(
+                        "Cannot drop column: table only has one column remaining!",
+                    ));
+                }
+                let name = self.columns[column].name.clone();
+                for key in &self.keys {
+                    if !key.columns.contains(&column) {
+                        continue;
+                    }
+                    if key.columns.len() == 1 {
+                        return Err(Error::catalog(format!(
+                            "Cannot drop column \"{name}\" because there is a UNIQUE constraint that \
+                             depends on it"
+                        )));
+                    }
+                    let names: Vec<&str> =
+                        key.columns.iter().map(|&at| self.columns[at].name.as_str()).collect();
+                    return Err(Error::catalog(format!(
+                        "Cannot drop column \"{name}\" because it is referenced in unique \
+                         constraint UNIQUE({})",
+                        names.join(", ")
+                    )));
+                }
+                if self.foreign.iter().any(|foreign| foreign.columns.contains(&column)) {
+                    return Err(Error::catalog(format!(
+                        "Cannot drop column \"{name}\" because there is a FOREIGN KEY constraint \
+                         that depends on it"
+                    )));
+                }
+                let shift = |at: &mut usize| {
+                    if *at > column {
+                        *at -= 1;
+                    }
+                };
+                for key in &mut self.keys {
+                    key.columns.iter_mut().for_each(shift);
+                }
+                for foreign in &mut self.foreign {
+                    foreign.columns.iter_mut().for_each(shift);
+                }
+                self.columns.remove(column);
+                self.defaults.remove(column);
+                self.checks = checks;
+                self.clustering = None;
+            }
+            Alteration::Default { column, default, sequences } => {
+                self.defaults[column] = default;
+                self.depend_on(sequences);
+                moved = false;
+            }
+            Alteration::NotNull { column, set: false } => {
+                if self.keys.iter().any(|key| key.primary && key.columns.contains(&column)) {
+                    return Err(Error::catalog(format!(
+                        "column \"{}\" is in a primary key",
+                        self.columns[column].name
+                    )));
+                }
+                self.columns[column].not_null = false;
+                moved = false;
+            }
+            Alteration::NotNull { column, set: true } => {
+                self.columns[column].not_null = true;
+                let all: Vec<usize> = (0..self.columns.len()).collect();
+                for at in 0..self.rows.chunk_count() {
+                    self.refuse_nulls(&self.rows.read(at, &all)?)?;
+                }
+                moved = false;
+            }
+            Alteration::Type { column, ty } => {
+                self.columns[column].ty = ty;
+                self.clustering = None;
+            }
+        }
+        let rows = match rows {
+            Some(rows) => rows,
+            None if moved && !matches!(self.rows, Rows::Memory(_)) => {
+                let all: Vec<usize> = (0..self.columns.len()).collect();
+                let mut held = Vec::with_capacity(self.rows.chunk_count());
+                for at in 0..self.rows.chunk_count() {
+                    held.push(self.rows.read(at, &all)?);
+                }
+                held
+            }
+            None => return Ok(()),
+        };
+        self.seen = vec![None; self.keys.len()];
+        self.replace_all(rows, workers)
+    }
+
+    /// Adds sequences a default now uses to the ones the table depends on.
+    fn depend_on(&mut self, sequences: Vec<QualifiedName>) {
+        for name in sequences {
+            if !self.sequences.contains(&name) {
+                self.sequences.push(name);
+            }
+        }
+    }
+
     /// The error DuckDB raises when a null reaches a column that refuses them.
     fn null_in(&self, column: &str) -> Error {
         Error::constraint(format!("NOT NULL constraint failed: {}.{}", self.name.table, column))

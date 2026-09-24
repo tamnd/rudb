@@ -9840,3 +9840,154 @@ fn a_sequence_owned_by_a_table_goes_with_it() {
     db.execute("DROP SEQUENCE other CASCADE").unwrap();
     assert!(refusal(&db, "SELECT * FROM u").contains("Table with name u does not exist"));
 }
+
+#[test]
+fn alter_table_changes_a_table_the_way_the_pin_does() {
+    let db = scripted(&[
+        "CREATE TABLE u (a INT PRIMARY KEY, b INT CHECK (b > 0), c VARCHAR)",
+        "INSERT INTO u VALUES (1, 10, 'x'), (2, 20, NULL)",
+    ]);
+    let values = |sql: &str| -> Vec<String> {
+        db.query(sql)
+            .unwrap()
+            .rows()
+            .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    db.execute("ALTER TABLE u ADD COLUMN d INT DEFAULT 7").unwrap();
+    db.execute("ALTER TABLE u ADD COLUMN IF NOT EXISTS d INT").unwrap();
+    db.execute("ALTER TABLE u ADD e DOUBLE").unwrap();
+    assert_eq!(values("SELECT a, d, e FROM u ORDER BY a"), ["1|7|NULL", "2|7|NULL"]);
+    db.execute("INSERT INTO u (a, b) VALUES (3, 30)").unwrap();
+    assert_eq!(values("SELECT d FROM u WHERE a = 3"), ["7"]);
+    db.execute("ALTER TABLE u RENAME COLUMN b TO bb").unwrap();
+    assert!(
+        refusal(&db, "INSERT INTO u (a, bb) VALUES (4, -1)").contains("CHECK constraint failed")
+    );
+    db.execute("ALTER TABLE u DROP COLUMN e").unwrap();
+    db.execute("ALTER TABLE u DROP COLUMN IF EXISTS zz").unwrap();
+    db.execute("ALTER TABLE u DROP COLUMN bb").unwrap();
+    db.execute("INSERT INTO u (a) VALUES (4)").unwrap();
+    assert_eq!(values("SELECT a FROM u ORDER BY a"), ["1", "2", "3", "4"]);
+    db.execute("ALTER TABLE u ALTER COLUMN d TYPE VARCHAR").unwrap();
+    db.execute("ALTER TABLE u ALTER d SET DEFAULT 'q'").unwrap();
+    db.execute("INSERT INTO u (a) VALUES (5)").unwrap();
+    assert_eq!(values("SELECT d FROM u WHERE a = 5"), ["q"]);
+    db.execute("ALTER TABLE u ALTER COLUMN d TYPE INT USING length(d)").unwrap();
+    assert_eq!(values("SELECT sum(d) FROM u"), ["5"]);
+    db.execute("ALTER TABLE u ALTER d DROP DEFAULT").unwrap();
+    db.execute("INSERT INTO u (a) VALUES (6)").unwrap();
+    assert_eq!(values("SELECT d FROM u WHERE a = 6"), ["NULL"]);
+    assert!(
+        refusal(&db, "ALTER TABLE u ALTER d SET NOT NULL")
+            .contains("NOT NULL constraint failed: u.d")
+    );
+    db.execute("ALTER TABLE u ALTER c DROP NOT NULL").unwrap();
+    assert!(
+        refusal(&db, "ALTER TABLE u ALTER a DROP NOT NULL")
+            .contains("column \"a\" is in a primary key")
+    );
+    db.execute("ALTER TABLE u RENAME TO w").unwrap();
+    db.execute("ALTER TABLE IF EXISTS u RENAME TO z").unwrap();
+    assert_eq!(values("SELECT count(*) FROM w"), ["6"]);
+    for (statement, message) in [
+        ("ALTER TABLE u ADD COLUMN q INT", "Table with name u does not exist!"),
+        ("ALTER TABLE w DROP COLUMN zz", "Table \"w\" does not have a column with name \"zz\""),
+        ("ALTER TABLE w ADD COLUMN c INT", "Column with name \"c\" already exists!"),
+        ("ALTER TABLE w RENAME COLUMN c TO d", "Column with name \"d\" already exists!"),
+        ("ALTER TABLE w DROP COLUMN a", "because there is a UNIQUE constraint that depends on it"),
+        ("ALTER TABLE w ALTER a TYPE BIGINT", "has a UNIQUE or PRIMARY KEY constraint specified"),
+        (
+            "ALTER TABLE w ADD COLUMN IF NOT EXISTS n INT NOT NULL",
+            "with IF NOT EXISTS is not supported",
+        ),
+        ("ALTER TABLE w ADD COLUMN n INT NOT NULL", "NOT NULL constraint failed: w.n"),
+        ("ALTER TABLE w DROP CONSTRAINT k", "No support for that ALTER TABLE option yet!"),
+    ] {
+        assert!(
+            refusal(&db, statement).contains(message),
+            "{statement}: {}",
+            refusal(&db, statement)
+        );
+    }
+    db.execute("CREATE TABLE one (x INT)").unwrap();
+    assert!(
+        refusal(&db, "ALTER TABLE one DROP COLUMN x").contains("only has one column remaining")
+    );
+    assert!(
+        refusal(&db, "ALTER TABLE one RENAME TO w")
+            .contains("another entry with this name already exists")
+    );
+    db.execute("CREATE VIEW v AS SELECT 1 AS x").unwrap();
+    db.execute("ALTER VIEW v RENAME TO vv").unwrap();
+    db.execute("ALTER TABLE vv RENAME TO v2").unwrap();
+    assert!(
+        refusal(&db, "ALTER TABLE v2 ADD COLUMN y INT")
+            .contains("Can only modify view with ALTER VIEW statement")
+    );
+    assert!(
+        refusal(&db, "ALTER VIEW w RENAME TO z")
+            .contains("Can only modify table with ALTER TABLE statement")
+    );
+    assert_eq!(values("SELECT x FROM v2"), ["1"]);
+}
+
+#[test]
+fn a_table_another_table_references_refuses_most_alters() {
+    let db = scripted(&[
+        "CREATE TABLE p (a INT PRIMARY KEY, b INT)",
+        "CREATE TABLE f (x INT REFERENCES p(a), y INT)",
+    ]);
+    db.execute("ALTER TABLE p ADD COLUMN c INT").unwrap();
+    db.execute("ALTER TABLE p ALTER b SET DEFAULT 3").unwrap();
+    for statement in [
+        "ALTER TABLE p RENAME TO q",
+        "ALTER TABLE p DROP COLUMN b",
+        "ALTER TABLE p ALTER b SET NOT NULL",
+    ] {
+        assert!(
+            refusal(&db, statement)
+                .contains("Cannot alter entry \"p\" because there are entries that depend on it."),
+            "{statement}"
+        );
+    }
+    for statement in ["ALTER TABLE p RENAME COLUMN a TO aa", "ALTER TABLE f RENAME COLUMN x TO xx"]
+    {
+        assert!(
+            refusal(&db, statement)
+                .contains("because this is involved in the foreign key constraint"),
+            "{statement}"
+        );
+    }
+    db.execute("ALTER TABLE f RENAME COLUMN y TO yy").unwrap();
+    for (kind, statement) in [
+        ("PRIMARY KEY", "ALTER TABLE f ADD COLUMN z INT PRIMARY KEY"),
+        ("CHECK", "ALTER TABLE f ADD COLUMN z INT CHECK (z > 0)"),
+        ("FOREIGN KEY", "ALTER TABLE f ADD COLUMN z INT REFERENCES p(a)"),
+    ] {
+        let message = format!("Adding columns with {kind} constraints is not supported yet");
+        assert!(refusal(&db, statement).contains(&message), "{statement}");
+    }
+    let dropped = refusal(&db, "ALTER TABLE f DROP COLUMN x");
+    assert!(dropped.contains("FOREIGN KEY constraint that depends on it"), "{dropped}");
+}
+
+#[test]
+fn a_float_cast_to_a_whole_number_rounds_half_to_even_and_a_decimal_does_not() {
+    let db = Database::new();
+    let answer = rows(
+        &db,
+        "SELECT CAST(2.5::DOUBLE AS BIGINT), CAST(3.5::DOUBLE AS BIGINT), \
+         CAST(-2.5::DOUBLE AS BIGINT), CAST(2.5 AS BIGINT), CAST(2.5::FLOAT AS INT)",
+    );
+    assert_eq!(
+        answer,
+        vec![vec![
+            Value::BigInt(2),
+            Value::BigInt(4),
+            Value::BigInt(-2),
+            Value::BigInt(3),
+            Value::Integer(2)
+        ]]
+    );
+}

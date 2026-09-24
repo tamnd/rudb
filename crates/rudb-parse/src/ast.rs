@@ -65,6 +65,8 @@ pub type DropTableRef = u32;
 pub type SchemaRef = u32;
 /// Index into [`Ast::sequences`].
 pub type SequenceRef = u32;
+/// Index into [`Ast::alters`].
+pub type AlterRef = u32;
 /// An index into `Ast::inserts`.
 pub type InsertRef = u32;
 /// An index into `Ast::settings`.
@@ -91,6 +93,8 @@ pub enum Statement {
     Schema(SchemaRef),
     /// `CREATE SEQUENCE` or `DROP SEQUENCE`.
     Sequence(SequenceRef),
+    /// `ALTER TABLE` or `ALTER VIEW`.
+    Alter(AlterRef),
     /// `INSERT INTO`.
     Insert(InsertRef),
     /// `UPDATE`, held as an [`Insert`] whose columns are the ones `SET` names and whose source is
@@ -312,6 +316,78 @@ pub struct Sequence {
     /// The table or view an `ALTER SEQUENCE ... OWNED BY` names, as a run of parts, and empty for
     /// anything else. An alter is a statement that is neither a drop nor has this empty.
     pub owner: Slice,
+}
+
+/// `ALTER TABLE name action` or `ALTER VIEW name RENAME TO other`.
+///
+/// One action a statement, because the pin refuses a list of them in the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Alter {
+    /// The table or view, as a run of parts, outermost first.
+    pub name: Slice,
+    /// Whether `IF EXISTS` was written, which makes a missing table no error.
+    pub quiet: bool,
+    /// Whether this is `ALTER VIEW` rather than `ALTER TABLE`.
+    pub view: bool,
+    /// What it does.
+    pub action: AlterAction,
+}
+
+/// What one `ALTER TABLE` does. A column is named as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterAction {
+    /// `RENAME TO name`.
+    Rename {
+        /// The new name.
+        to: StrRef,
+    },
+    /// `RENAME COLUMN column TO name`.
+    RenameColumn {
+        /// The column.
+        column: StrRef,
+        /// The new name.
+        to: StrRef,
+    },
+    /// `ADD COLUMN definition`, where only the type, `NOT NULL` and `DEFAULT` count, since the pin
+    /// drops every other constraint written on an added column.
+    AddColumn {
+        /// The column as written.
+        column: ColumnDef,
+        /// Whether `IF NOT EXISTS` was written.
+        quiet: bool,
+    },
+    /// `DROP COLUMN column`.
+    DropColumn {
+        /// The column.
+        column: StrRef,
+        /// Whether `IF EXISTS` was written.
+        quiet: bool,
+    },
+    /// `ALTER COLUMN column SET DEFAULT expression`, or `DROP DEFAULT` when the expression is
+    /// `NONE`.
+    Default {
+        /// The column.
+        column: StrRef,
+        /// The new default.
+        default: ExprRef,
+    },
+    /// `ALTER COLUMN column SET NOT NULL` or `DROP NOT NULL`.
+    NotNull {
+        /// The column.
+        column: StrRef,
+        /// Whether it is `SET`.
+        set: bool,
+    },
+    /// `ALTER COLUMN column SET DATA TYPE type USING expression`, either of which can be left out,
+    /// though not both. `NONE` for a missing one.
+    Type {
+        /// The column.
+        column: StrRef,
+        /// The type as written.
+        ty: StrRef,
+        /// The expression the new values are worked out by.
+        using: ExprRef,
+    },
 }
 
 /// `INSERT INTO name (columns) query`.
@@ -1189,6 +1265,8 @@ pub struct Ast {
     pub schemas: Vec<Schema>,
     /// The `CREATE SEQUENCE` and `DROP SEQUENCE` arena.
     pub sequences: Vec<Sequence>,
+    /// The `ALTER TABLE` and `ALTER VIEW` arena.
+    pub alters: Vec<Alter>,
     /// The `INSERT` arena.
     pub inserts: Vec<Insert>,
     /// The `SET` and `RESET` arena.
@@ -1333,6 +1411,11 @@ impl Ast {
     /// One `CREATE SEQUENCE` or `DROP SEQUENCE`.
     pub fn sequence(&self, index: SequenceRef) -> Sequence {
         self.sequences[index as usize]
+    }
+
+    /// One `ALTER TABLE` or `ALTER VIEW`.
+    pub fn alter(&self, index: AlterRef) -> Alter {
+        self.alters[index as usize]
     }
 
     /// One `INSERT`.

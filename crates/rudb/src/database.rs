@@ -3039,6 +3039,7 @@ impl Shared {
                 | Bound::DropTable(_)
                 | Bound::Schema(_)
                 | Bound::Sequence(_)
+                | Bound::Alter(_)
                 | Bound::Insert(_)
         );
         if writes && self.open().as_ref().is_some_and(|open| open.read_only) {
@@ -3233,6 +3234,25 @@ impl Shared {
                 }
                 let counter = rudb_common::sequence::Counter::register(&name.table, change.options);
                 catalog.create_sequence(name, counter, change.or_replace, change.if_not_exists)?;
+                Ok(QueryResult::empty())
+            }
+            Bound::Alter(alter) => {
+                let (Some(name), Some(alteration)) = (alter.name, alter.alteration) else {
+                    return Ok(QueryResult::empty());
+                };
+                let rows = match alter.rewrite {
+                    Some(mut plan) => {
+                        let ((), optimize_ns) =
+                            timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                        let facts = context.facts();
+                        let under =
+                            Under::new(self.budget(), facts, &seams, &session, Rows::ForATable)
+                                .after(Planning { parse_ns, bind_ns, optimize_ns });
+                        Some(run(sql, &plan, &catalog, cancel, under)?.into_chunks())
+                    }
+                    None => None,
+                };
+                catalog.alter(&name, alteration, rows, self.inner.pool.threads())?;
                 Ok(QueryResult::empty())
             }
             Bound::Insert(mut insert) => {

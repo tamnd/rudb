@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alter;
 pub mod catalog;
 pub mod held;
 pub mod keys;
@@ -24,6 +25,7 @@ pub mod system;
 pub mod table;
 pub mod view;
 
+pub use alter::Alteration;
 pub use catalog::{
     Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema, Sequence,
 };
