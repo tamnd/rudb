@@ -197,6 +197,18 @@ struct Scan {
 }
 
 impl Reader {
+    /// Whether a current row-preserving projection covers these columns.
+    ///
+    /// The payload is validated when it is read, not during this directory lookup.
+    pub fn has_run_projection(&self, order: usize, covered: usize) -> Result<bool> {
+        let wanted = id(order, covered)?;
+        Ok(self.table().sections().iter().any(|section| {
+            section.kind == *section::RUN_PROJECTION
+                && section.id == wanted
+                && section.usable(self.table().generation())
+        }))
+    }
+
     /// Count exact distinct order values by covered value from a current run projection.
     ///
     /// Returns `None` if no current matching section exists. Every covered code is read when
@@ -214,6 +226,27 @@ impl Reader {
         order: usize,
         covered: usize,
         limit: usize,
+    ) -> Result<Option<Vec<(i32, u64)>>> {
+        let workers = std::thread::available_parallelism().map_or(1, usize::from);
+        self.grouped_distinct_run_projection_with_workers(order, covered, limit, workers)
+    }
+
+    /// Evaluate a grouped distinct count from source rows with a bounded number of workers.
+    /// This is the entry point for the SQL operator, whose parallelism is set by the engine.
+    ///
+    /// # Errors
+    ///
+    /// If the projection directory or payload is damaged.
+    ///
+    /// # Panics
+    ///
+    /// Fixed-width header decoding assumes the lengths checked immediately before it.
+    pub fn grouped_distinct_run_projection_with_workers(
+        &self,
+        order: usize,
+        covered: usize,
+        limit: usize,
+        workers: usize,
     ) -> Result<Option<Vec<(i32, u64)>>> {
         let wanted = id(order, covered)?;
         let Some(section) = self.table().sections().iter().find(|section| {
@@ -268,25 +301,30 @@ impl Reader {
                 return Err(invalid("run projection pages are not contiguous"));
             }
         }
-        drop(first_page);
-        let workers = std::thread::available_parallelism().map_or(1, usize::from).min(8).min(pages);
-        let scans = std::thread::scope(|scope| -> Result<Vec<Scan>> {
-            let mut handles = Vec::with_capacity(workers);
-            for worker in 0..workers {
-                let begin = pages * worker / workers;
-                let end = pages * (worker + 1) / workers;
-                let extent_slice = &extents[begin..end];
-                handles.push(scope.spawn(move || {
-                    scan_pages(self, extent_slice, begin, header, size, code_bytes)
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().map_err(|_| invalid("run projection worker panicked"))?
-                })
-                .collect()
-        })?;
+        let workers = workers.clamp(1, 8).min(pages);
+        let scans = if workers == 1 {
+            vec![scan_pages(self, &extents, 0, header, size, code_bytes, Some(first_page))?]
+        } else {
+            std::thread::scope(|scope| -> Result<Vec<Scan>> {
+                let mut handles = Vec::with_capacity(workers);
+                let mut first_page = Some(first_page);
+                for worker in 0..workers {
+                    let begin = pages * worker / workers;
+                    let end = pages * (worker + 1) / workers;
+                    let extent_slice = &extents[begin..end];
+                    let initial = if begin == 0 { first_page.take() } else { None };
+                    handles.push(scope.spawn(move || {
+                        scan_pages(self, extent_slice, begin, header, size, code_bytes, initial)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().map_err(|_| invalid("run projection worker panicked"))?
+                    })
+                    .collect()
+            })?
+        };
         let mut totals = vec![0_u64; size];
         let mut total_rows = 0_u64;
         let mut previous_last = None;
@@ -324,6 +362,7 @@ fn scan_pages(
     header: usize,
     dictionary: usize,
     code_bytes: usize,
+    initial: Option<Vec<u8>>,
 ) -> Result<Scan> {
     let mut marks = vec![0_u32; dictionary];
     let mut counts = vec![0_u64; dictionary];
@@ -331,9 +370,12 @@ fn scan_pages(
     let mut rows = 0_u64;
     let mut first = None;
     let mut last = None;
-    let mut bytes = Vec::with_capacity(PAGE_BYTES);
+    let reused_first = initial.is_some();
+    let mut bytes = initial.unwrap_or_else(|| Vec::with_capacity(PAGE_BYTES));
     for (relative, extent) in extents.iter().enumerate() {
-        reader.extent_into(extent, &mut bytes)?;
+        if !reused_first || relative != 0 {
+            reader.extent_into(extent, &mut bytes)?;
+        }
         let prefix = if first_index + relative == 0 { header } else { 0 };
         if bytes.len() != PAGE_BYTES || prefix + PAGE_HEADER > PAGE_BYTES {
             return Err(invalid("run projection page length differs"));
