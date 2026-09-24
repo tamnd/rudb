@@ -284,24 +284,28 @@ struct Memo {
 }
 
 /// One group of values: the code standing for each one's answer, and the answers of the values
-/// that are their own code, end to end.
+/// that are their own code, with where in the group each of those sits.
+///
+/// An answer is the one the table of answers seen so far holds, shared rather than copied. On q29
+/// the answers come to 37 MB, and a copy here as well as the one the table looks them up by was
+/// that much again.
 #[derive(Debug)]
 struct Replaced {
     firsts: Box<[u32]>,
-    ends: Box<[u32]>,
-    bytes: Box<[u8]>,
+    owns: Box<[u16]>,
+    answers: Box<[Arc<[u8]>]>,
 }
 
 impl Replaced {
     /// The answer at `index` within the group, which is empty unless that value is its own code.
     fn get(&self, index: usize) -> &[u8] {
-        let start = if index == 0 { 0 } else { self.ends[index - 1] as usize };
-        let end = self.ends.get(index).map_or(start, |&end| end as usize);
-        self.bytes.get(start..end).unwrap_or_default()
+        let Ok(index) = u16::try_from(index) else { return &[] };
+        self.owns.binary_search(&index).map_or(&[], |at| &self.answers[at])
     }
 
     fn footprint(&self) -> usize {
-        self.firsts.len() * 4 + self.ends.len() * 4 + self.bytes.len()
+        self.firsts.len() * size_of::<u32>()
+            + self.owns.len() * (size_of::<u16>() + size_of::<Arc<[u8]>>())
     }
 }
 
@@ -319,8 +323,8 @@ impl Memo {
         let last = (first + REPLACE_GROUP).min(self.dictionary.len());
         let mut buffer = String::new();
         let mut firsts = Vec::with_capacity(last - first);
-        let mut ends = Vec::with_capacity(last - first);
-        let mut bytes = Vec::new();
+        let mut owns = Vec::new();
+        let mut answers = Vec::new();
         let mut added = 0;
         let mut previous = Vec::new();
         let mut previous_found = None;
@@ -342,21 +346,21 @@ impl Memo {
                 let found = match previous_found {
                     Some(found) if previous.as_slice() == answer => found,
                     _ => {
-                        let found = self.first_of(answer, own, &mut added)?;
+                        let (found, shared) = self.first_of(answer, own, &mut added)?;
+                        if let Some(shared) = shared {
+                            owns.push(
+                                u16::try_from(firsts.len())
+                                    .map_err(|_| Error::internal("a replaced group too large"))?,
+                            );
+                            answers.push(shared);
+                        }
                         previous.clear();
                         previous.extend_from_slice(answer);
                         previous_found = Some(found);
                         found
                     }
                 };
-                if found == own {
-                    bytes.extend_from_slice(answer);
-                }
                 firsts.push(found);
-                ends.push(
-                    u32::try_from(bytes.len())
-                        .map_err(|_| Error::internal("a replaced group past four gigabytes"))?,
-                );
                 Ok(())
             })?;
             if stopped <= at {
@@ -366,8 +370,8 @@ impl Memo {
         }
         let out = Replaced {
             firsts: firsts.into_boxed_slice(),
-            ends: ends.into_boxed_slice(),
-            bytes: bytes.into_boxed_slice(),
+            owns: owns.into_boxed_slice(),
+            answers: answers.into_boxed_slice(),
         };
         let held = out.footprint();
         if slot.set(out).is_ok() {
@@ -377,19 +381,29 @@ impl Memo {
         slot.get().ok_or_else(|| Error::internal("a replaced group was set and is not there"))
     }
 
-    /// The code standing for `answer`, which is `own` when no value before it gave that answer.
-    fn first_of(&self, answer: &[u8], own: u32, added: &mut usize) -> Result<u32> {
+    /// The code standing for `answer`, which is `own` when no value before it gave that answer, and
+    /// the answer as the table holds it when it is `own`.
+    ///
+    /// A thread deciding a group another has decided already finds its own values in the table
+    /// under their own codes, and takes the same shared answers the first one did.
+    fn first_of(
+        &self,
+        answer: &[u8],
+        own: u32,
+        added: &mut usize,
+    ) -> Result<(u32, Option<Arc<[u8]>>)> {
         let mut words = Words::default();
         answer.hash(&mut words);
         let shard = &self.firsts[(words.finish() >> 32) as usize % REPLACE_SHARDS];
         let mut seen =
             shard.lock().map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
-        if let Some(&found) = seen.get(answer) {
-            return Ok(found);
+        if let Some((held, &found)) = seen.get_key_value(answer) {
+            return Ok((found, (found == own).then(|| Arc::clone(held))));
         }
-        seen.insert(answer.into(), own);
-        *added += answer.len() + 32;
-        Ok(own)
+        let held: Arc<[u8]> = answer.into();
+        seen.insert(Arc::clone(&held), own);
+        *added += answer.len() + 48;
+        Ok((own, Some(held)))
     }
 
     /// The code standing for the answer of the value at `code`.
@@ -405,7 +419,7 @@ impl Memo {
 }
 
 /// The answers one shard has seen, each with the code of the first value that gave it.
-type Seen = HashMap<Box<[u8]>, u32, BuildHasherDefault<Words>>;
+type Seen = HashMap<Arc<[u8]>, u32, BuildHasherDefault<Words>>;
 
 /// A hash over a word at a time, for the replace memo's table of answers.
 ///
