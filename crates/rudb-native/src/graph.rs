@@ -1289,9 +1289,12 @@ mod tests {
         link
     }
 
+    /// One row of a two column key, either half of which may be null.
+    type Pair = (Option<i64>, Option<i64>);
+
     /// A two column table of these pairs, a thousand rows to a part.
-    fn pairs_into(mut writer: Writer, rows: &[(Option<i64>, Option<i64>)]) {
-        let values = |pick: fn(&(Option<i64>, Option<i64>)) -> Option<i64>, part: &[_]| {
+    fn pairs_into(mut writer: Writer, rows: &[Pair]) {
+        let values = |pick: fn(&Pair) -> Option<i64>, part: &[Pair]| {
             let values = part
                 .iter()
                 .map(|row| pick(row).map_or(Value::Null, Value::BigInt))
