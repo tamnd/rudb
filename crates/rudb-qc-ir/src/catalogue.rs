@@ -47,27 +47,26 @@ macro_rules! proxies {
 }
 
 proxies! {
-    // Strings.
+    // Strings. A `ptr` first argument is a handle on an object the runtime built for the query
+    // before it started: a compiled pattern, a regular expression and its rewrite.
     "str_promote" (Ptr, Str16) -> Str16, mayfail;
     "str_eq" (Str16, Str16) -> I1, pure;
     "str_cmp" (Str16, Str16) -> I32, pure;
     "str_hash" (Str16, I64) -> I64, pure;
     "str_like" (Ptr, Str16) -> I1, pure;
-    "str_ilike" (Ptr, Str16) -> I1, pure;
-    "str_contains" (Ptr, Str16) -> I1, pure;
     "str_regex" (Ptr, Str16) -> I1, pure;
-    "str_regex_replace" (Ptr, Ptr, Str16) -> Str16, mayfail;
-    "str_lower" (Ptr, Str16) -> Str16, mayfail;
-    "str_upper" (Ptr, Str16) -> Str16, mayfail;
-    "str_substr" (Ptr, Str16, I64, I64) -> Str16, mayfail;
+    "str_regex_replace" (Ptr, Str16) -> Str16, mayfail;
+    "str_lower" (Str16) -> Str16, mayfail;
+    "str_upper" (Str16) -> Str16, mayfail;
     "str_length" (Str16) -> I64, pure;
-    "str_concat" (Ptr, Str16, Str16) -> Str16, mayfail;
-    // Hash tables and aggregation state.
-    "ht_grow" (Ptr, Ptr) -> Void, mayfail, effect;
+    "str_concat" (Str16, Str16) -> Str16, mayfail;
+    // Hash tables and aggregation state. The first argument is the handle of the table or the
+    // distinct set, the second the group row `ht_insert` returned.
     "ht_insert" (Ptr, Ptr, I64) -> Ptr, mayfail, effect;
-    "agg_flush" (Ptr, Ptr) -> Void, mayfail, effect;
-    "agg_distinct" (Ptr, Ptr, I64, Str16) -> Void, mayfail, effect;
-    "sink_row" (Ptr, Ptr) -> Ptr, mayfail, effect;
+    "agg_distinct" (Ptr, Ptr, Str16) -> Void, mayfail, effect;
+    "agg_distinct_int" (Ptr, Ptr, I128) -> Void, mayfail, effect;
+    "agg_min_str" (Ptr, Str16) -> Void, mayfail, effect;
+    "agg_max_str" (Ptr, Str16) -> Void, mayfail, effect;
     // Decimals and dates.
     "i128_div" (I128, I128) -> I128, mayfail, pure;
     "date_trunc_minute" (I64) -> I64, pure;
@@ -91,8 +90,8 @@ mod tests {
         for (i, p) in CATALOGUE.iter().enumerate() {
             assert_eq!(proxy(p.name), Some(i as u32), "{} is listed twice", p.name);
         }
-        let grow = CATALOGUE[proxy("ht_grow").unwrap() as usize];
-        assert!(grow.mayfail && grow.effect && !grow.pure);
+        let insert = CATALOGUE[proxy("ht_insert").unwrap() as usize];
+        assert!(insert.mayfail && insert.effect && !insert.pure);
         let eq = CATALOGUE[proxy("str_eq").unwrap() as usize];
         assert!(eq.pure && !eq.mayfail && !eq.effect);
     }

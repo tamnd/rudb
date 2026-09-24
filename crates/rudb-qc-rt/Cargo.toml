@@ -1,0 +1,23 @@
+[package]
+name = "rudb-qc-rt"
+description = "The query compiler's runtime: the pipeline ABI, strings, hash tables and the functions compiled code calls."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+memchr.workspace = true
+rudb-common.workspace = true
+rudb-qc-interp.workspace = true
+rudb-qc-ir.workspace = true
+rudb-regex.workspace = true
+
+[lints]
+workspace = true
