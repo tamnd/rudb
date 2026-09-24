@@ -99,7 +99,8 @@ fn extent(at: &[u32]) -> Option<(u32, u32)> {
 /// every code is at least as large as each of them and does vectorize, so when it is below `len`
 /// every code is too. A filter's positions over a full chunk of 8192 rows always pass that way,
 /// since `len` is then a power of two. Anything the `or` cannot settle takes the maximum.
-pub(crate) fn below(codes: &[u32], len: usize) -> bool {
+#[must_use]
+pub fn below(codes: &[u32], len: usize) -> bool {
     let Ok(len) = u32::try_from(len) else { return true };
     if codes.is_empty() || codes.iter().fold(0, |bits, &code| bits | code) < len {
         return true;
@@ -3962,7 +3963,8 @@ fn gather_widened<T: Copy + Into<i64>>(
     let Some(run) = run.get(..len) else {
         return false;
     };
-    if at.iter().max().is_some_and(|&top| top as usize >= run.len()) {
+    // See `below`: the largest of `at` is a scalar loop here and was three quarters of this.
+    if !below(at, run.len()) {
         return false;
     }
     out.extend(at.iter().map(|&row| run[row as usize].into()));
