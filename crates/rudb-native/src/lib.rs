@@ -63,7 +63,7 @@ pub mod section;
 pub mod stats;
 mod zones;
 
-pub use prepare::{DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepared, Preparer};
+pub use prepare::{Building, DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepared, Preparer};
 pub use projection::build_sorted_projection;
 pub use section::Section;
 pub use zones::{Common, Stripes, ascending, distincts};
@@ -2039,7 +2039,7 @@ impl Part {
 /// Indexed by part, so a stripe is a column of these and the write loop reads down one of them.
 /// That is also the order the loop wanted: `flush_pending` walks a column at a time and lays its
 /// parts next to each other, and it used to reach across a row of parts to do it.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ColumnStripe {
     pages: Vec<Vec<u8>>,
     codes: Vec<Option<Vec<u32>>>,
@@ -2609,31 +2609,42 @@ impl Writer {
         };
         let mut settling = Settling::default();
         for &column in columns {
-            let bytes = encode(column, &mut settling)?;
-            if bytes.len() > MAX_PAGE {
-                return Err(invalid("column page exceeds the configured bound"));
-            }
-            // The range is built first because the sieve reads it rather than walking the column a
-            // second time to find out how wide it is.
-            let range = Range::of(column);
-            // A sieve at least as large as the part it indexes is not written. A reader reads the
-            // sieve to decide whether to read the part, so when the sieve is the larger of the two
-            // it has already spent more than the read it is trying to avoid, and that holds even if
-            // it rejects every time. It is a necessary condition rather than the whole rule, which
-            // is that a sieve pays when its bytes are under the rejection rate times the part's,
-            // but the rejection rate depends on what a query probes for and the writer does not
-            // know that. The necessary half needs two numbers that are both in hand here.
-            //
-            // A column with a global dictionary gets none, because it already has an exact
-            // membership index per stripe. Those do not come through here. See [`prepare`].
-            let sieve =
-                Sieve::of(column, &range, SIEVE_BUDGET).filter(|sieve| sieve.len() < bytes.len());
-            stripe.pages.push(bytes);
-            stripe.codes.push(None);
-            stripe.sieves.push(sieve);
-            stripe.ranges.push(range);
+            Self::encode_page(&mut stripe, &mut settling, column)?;
         }
         Ok(stripe)
+    }
+
+    /// One more part of a column with no global dictionary as a page, after the ones already in
+    /// `stripe`. The parts have to come in order, since `settling` carries from one to the next.
+    fn encode_page(
+        stripe: &mut ColumnStripe,
+        settling: &mut Settling,
+        column: &Vector,
+    ) -> Result<()> {
+        let bytes = encode(column, settling)?;
+        if bytes.len() > MAX_PAGE {
+            return Err(invalid("column page exceeds the configured bound"));
+        }
+        // The range is built first because the sieve reads it rather than walking the column a
+        // second time to find out how wide it is.
+        let range = Range::of(column);
+        // A sieve at least as large as the part it indexes is not written. A reader reads the
+        // sieve to decide whether to read the part, so when the sieve is the larger of the two
+        // it has already spent more than the read it is trying to avoid, and that holds even if
+        // it rejects every time. It is a necessary condition rather than the whole rule, which
+        // is that a sieve pays when its bytes are under the rejection rate times the part's,
+        // but the rejection rate depends on what a query probes for and the writer does not
+        // know that. The necessary half needs two numbers that are both in hand here.
+        //
+        // A column with a global dictionary gets none, because it already has an exact
+        // membership index per stripe. Those do not come through here. See [`prepare`].
+        let sieve =
+            Sieve::of(column, &range, SIEVE_BUDGET).filter(|sieve| sieve.len() < bytes.len());
+        stripe.pages.push(bytes);
+        stripe.codes.push(None);
+        stripe.sieves.push(sieve);
+        stripe.ranges.push(range);
+        Ok(())
     }
 
     /// Writes every encoded dictionary block that is not in the file yet and forgets its bytes.

@@ -1183,18 +1183,24 @@ impl Gather {
         countable(ty).then(|| Self { pass: Pass::new(ty, generation), counts: Counts::new(1) })
     }
 
-    /// Folds one whole stripe of this column, in part order.
+    /// Opens a stripe of this column, whose parts come to [`Gather::part`] in part order until
+    /// [`Gather::close_stripe`].
     ///
-    /// A stripe at a time and not a part at a time, because the stripe is the unit the pass opens
-    /// and closes its ends over and a caller that fed it parts would have to know that. The key is
-    /// where the stripe goes once the writer sorts its stripes, which need not be the order they
-    /// reach this in.
-    pub(crate) fn stripe<'a>(&mut self, key: (u64, u64), parts: impl Iterator<Item = &'a Vector>) {
+    /// The stripe is the unit the pass opens and closes its ends over, so a caller says where one
+    /// starts and stops. The key is where the stripe goes once the writer sorts its stripes, which
+    /// need not be the order they reach this in.
+    pub(crate) fn open_stripe(&mut self, key: (u64, u64)) {
         self.pass.open_stripe(key);
-        for vector in parts {
-            self.counts.add_column(0, vector);
-            self.pass.scan(vector);
-        }
+    }
+
+    /// Takes one part of the stripe that is open, in order.
+    pub(crate) fn part(&mut self, vector: &Vector) {
+        self.counts.add_column(0, vector);
+        self.pass.scan(vector);
+    }
+
+    /// Ends the stripe that is open.
+    pub(crate) fn close_stripe(&mut self) {
         self.pass.close_stripe();
     }
 

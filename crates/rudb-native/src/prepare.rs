@@ -54,8 +54,8 @@ use rudb_vector::{Bitmap, Chunk, Data, StringColumn, Validity, Vector};
 use super::{
     ColumnStripe, DICTIONARY_CHECK_SEED, DICTIONARY_DECIDE_ROWS, DICTIONARY_DISTINCT_IN_TEN,
     EncodedBlock, GlobalDictionary, MAX_ENCODE_WORKERS, MAX_PAGE, Part, PendingChunk, STRIPE_PARTS,
-    Spread, Unencoded, Writer, checksum, coded_page, invalid, push_validity, seeded_checksum,
-    stats, unique_codes, weight,
+    Settling, Spread, Unencoded, Writer, checksum, coded_page, invalid, push_validity,
+    seeded_checksum, stats, unique_codes, weight,
 };
 
 /// How many stripes are being prepared or paged right now, across every writer in the process.
@@ -264,54 +264,72 @@ struct LocalPart {
 }
 
 impl Local {
-    /// One column of a stripe, coded.
-    ///
-    /// A null row is coded as the empty string and counted as a null rather than against it, which
-    /// is what the writer has always done with one. The code is never read, since the page's
-    /// validity says the row is null, and giving it one keeps the page one code a row.
+    /// One column of a stripe, coded in one go.
+    #[cfg(test)]
     fn code_column(index: usize, held: &[PendingChunk]) -> Result<Self> {
         let mut local = Self::default();
         let mut mapped = None;
         for pending in held {
-            let column = pending.chunk.column(index)?;
-            local.blob = column.logical_type() == &LogicalType::Blob;
-            if let Some(codes) = local.code_dictionary(column, &mut mapped)? {
-                let mut validity = Vec::new();
-                push_validity(&mut validity, column);
-                local.parts.push(LocalPart { codes, validity, range: Range::of(column) });
-                continue;
-            }
-            // flatten: the page is one code a row whatever form the rows came in.
-            let flat = column.flatten()?;
-            let mut codes = Vec::with_capacity(flat.len());
-            let mut last = None;
-            for row in 0..flat.len() {
-                // bytes_at rather than text_at: the rows were checked for UTF-8 when they came in,
-                // and checking every one again cost more than coding it.
-                let text = flat.bytes_at(row).unwrap_or(b"");
-                // A repeat of the row before is common enough on a sorted table to be worth a
-                // comparison before a hash, and the comparison fails on its first bytes when not.
-                let code = match last {
-                    Some(code) if local.value(code) == text => code,
-                    _ => local.code(text)?,
-                };
-                last = Some(code);
-                if flat.is_null_at(row) {
-                    local.nulls += 1;
-                } else {
-                    local.counts[code as usize] += 1;
-                }
-                codes.push(code);
-            }
-            let mut validity = Vec::new();
-            push_validity(&mut validity, &flat);
-            local.parts.push(LocalPart { codes, validity, range: Range::of(column) });
+            local.code_part(pending.chunk.column(index)?, &mut mapped)?;
         }
+        local.done();
+        Ok(local)
+    }
+
+    /// One more part of a column of a stripe, coded.
+    ///
+    /// A null row is coded as the empty string and counted as a null rather than against it, which
+    /// is what the writer has always done with one. The code is never read, since the page's
+    /// validity says the row is null, and giving it one keeps the page one code a row.
+    ///
+    /// The parts come to [`Local::code_part`] one at a time, in order, and [`Local::done`] ends the
+    /// column, so a stripe can be coded as its parts arrive rather than once they are all held.
+    fn code_part(
+        &mut self,
+        column: &Vector,
+        mapped: &mut Option<(Arc<Vector>, Vec<u32>)>,
+    ) -> Result<()> {
+        self.blob = column.logical_type() == &LogicalType::Blob;
+        if let Some(codes) = self.code_dictionary(column, mapped)? {
+            let mut validity = Vec::new();
+            push_validity(&mut validity, column);
+            self.parts.push(LocalPart { codes, validity, range: Range::of(column) });
+            return Ok(());
+        }
+        // flatten: the page is one code a row whatever form the rows came in.
+        let flat = column.flatten()?;
+        let mut codes = Vec::with_capacity(flat.len());
+        let mut last = None;
+        for row in 0..flat.len() {
+            // bytes_at rather than text_at: the rows were checked for UTF-8 when they came in,
+            // and checking every one again cost more than coding it.
+            let text = flat.bytes_at(row).unwrap_or(b"");
+            // A repeat of the row before is common enough on a sorted table to be worth a
+            // comparison before a hash, and the comparison fails on its first bytes when not.
+            let code = match last {
+                Some(code) if self.value(code) == text => code,
+                _ => self.code(text)?,
+            };
+            last = Some(code);
+            if flat.is_null_at(row) {
+                self.nulls += 1;
+            } else {
+                self.counts[code as usize] += 1;
+            }
+            codes.push(code);
+        }
+        let mut validity = Vec::new();
+        push_validity(&mut validity, &flat);
+        self.parts.push(LocalPart { codes, validity, range: Range::of(column) });
+        Ok(())
+    }
+
+    /// Ends a column once its last part is coded.
+    fn done(&mut self) {
         // Only the coding needs to find a value by its bytes, and on a column of URLs the table
         // that does it is as large as the codes.
-        local.first = HashMap::default();
-        local.next = Vec::new();
-        Ok(local)
+        self.first = HashMap::default();
+        self.next = Vec::new();
     }
 
     /// Codes a part that came in as codes into a dictionary of its own, which is how a Parquet page
@@ -347,7 +365,7 @@ impl Local {
         let mut coded = Vec::with_capacity(codes.len());
         for (row, &code) in codes.iter().enumerate() {
             if !every && !column.validity().is_valid(row) {
-                // Coded as the empty string and counted as a null, as `code_column` does.
+                // Coded as the empty string and counted as a null, as `code_part` does.
                 let code = self.code(b"")?;
                 self.nulls += 1;
                 coded.push(code);
@@ -555,23 +573,6 @@ fn fan_out<T: Send>(
     Ok(pieces.into_iter().flatten().collect())
 }
 
-/// One column of every part of a stripe.
-fn column_of(held: &[PendingChunk], index: usize) -> Result<Vec<&Vector>> {
-    held.iter().map(|pending| pending.chunk.column(index)).collect()
-}
-
-/// Puts what [`fan_out`] handed back in column order.
-fn in_order<T>(width: usize, done: Vec<(usize, T)>) -> Result<Vec<T>> {
-    let mut slots: Vec<Option<T>> = (0..width).map(|_| None).collect();
-    for (index, one) in done {
-        slots[index] = Some(one);
-    }
-    slots
-        .into_iter()
-        .map(|slot| slot.ok_or_else(|| Error::internal("a column was never encoded")))
-        .collect()
-}
-
 impl Preparer {
     /// Encodes a run of chunks as one stripe, as far as it can be without the writer.
     ///
@@ -612,41 +613,203 @@ impl Preparer {
     }
 
     pub(crate) fn prepare_held(&self, held: Vec<PendingChunk>) -> Result<Prepared> {
+        let mut building = self.start();
+        self.feed_held(&mut building, held)?;
+        self.finish(building)
+    }
+
+    /// Starts a stripe that will be handed over a few parts at a time.
+    ///
+    /// [`Preparer::prepare`] takes a stripe whole, which means a caller holds every part of it
+    /// decoded until the last one arrives, and every load instance holds one. Here each batch is
+    /// encoded as it comes and let go, so what an instance holds is one batch of rows and what it
+    /// has built from the batches before. The stripe comes out the same: the parts of a column go through
+    /// the same steps in the same order, only with the rows of later parts not yet in memory.
+    ///
+    /// Whether a column is coded against its global dictionary is read here, once, so every part of
+    /// the stripe is encoded the same way even if the column is demoted while it is being built.
+    /// A stripe that ends up coded against a dictionary its column no longer has is encoded again
+    /// plainly at the merge, which is what happens to a stripe prepared whole at the same moment.
+    #[must_use]
+    pub fn start(&self) -> Building {
+        let columns = (0..self.types.len())
+            .map(|index| {
+                let body = if self.coded[index].load(Atomic::Relaxed) {
+                    Body::Coded(Local::default(), None)
+                } else {
+                    Body::Pages(ColumnStripe::default(), Settling::default())
+                };
+                let gather = stats::Gather::new(&self.types[index], 0);
+                Mutex::new(Growing { body, gather })
+            })
+            .collect();
+        Building { parts: Vec::new(), columns }
+    }
+
+    /// Encodes the next few parts of a stripe that was started with [`Preparer::start`].
+    ///
+    /// The same rules as [`Preparer::prepare`]: the orders come in source order, an empty chunk is
+    /// dropped, and the stripe holds no more than [`STRIPE_PARTS`] in all.
+    ///
+    /// # Errors
+    ///
+    /// If the stripe would hold too many parts, a chunk's columns are not the table's, or one cannot
+    /// be encoded.
+    pub fn feed(&self, building: &mut Building, parts: Vec<((u64, u64), Chunk)>) -> Result<()> {
+        if building.parts.len().saturating_add(parts.len()) > STRIPE_PARTS {
+            return Err(invalid("a stripe was handed more parts than it holds"));
+        }
+        let held = parts
+            .into_iter()
+            .filter(|(_, chunk)| !chunk.is_empty())
+            .map(|(order, chunk)| PendingChunk { order, chunk })
+            .collect::<Vec<_>>();
+        for pending in &held {
+            self.fits(&pending.chunk)?;
+        }
+        self.feed_held(building, held)
+    }
+
+    fn feed_held(&self, building: &mut Building, held: Vec<PendingChunk>) -> Result<()> {
+        if held.is_empty() {
+            return Ok(());
+        }
         let width = self.types.len();
+        // The stripe's key is its first part's order, and its statistics open with it.
+        let opening = building.parts.is_empty();
         let key = held.first().map_or((0, 0), |pending| pending.order);
         let share = Share::take(width, held.len());
         let mut jobs = (0..width).collect::<Vec<_>>();
         jobs.sort_by_key(|&index| weight(&self.types[index]));
-        let done = fan_out(jobs, share.0, self.profile.as_deref(), |index| {
-            // The statistics on the thread that is already walking the column, and in the same
-            // step, because the rows are in memory once and this is the moment they are.
-            let gather = stats::Gather::new(&self.types[index], 0)
-                .filter(|_| !held.is_empty())
-                .map(|mut gather| {
-                    gather.stripe(
-                        key,
-                        held.iter().filter_map(|pending| pending.chunk.column(index).ok()),
-                    );
-                    gather
-                });
-            let column = if self.coded[index].load(Atomic::Relaxed) {
-                Column::Coded(Local::code_column(index, &held)?)
-            } else {
-                Column::Pages(Writer::encode_pages(&column_of(&held, index)?)?)
-            };
-            Ok((column, gather))
+        let columns = &building.columns;
+        fan_out(jobs, share.0, self.profile.as_deref(), |index| {
+            let mut growing = columns[index]
+                .lock()
+                .map_err(|_| Error::internal("a native encode worker panicked"))?;
+            let Growing { body, gather } = &mut *growing;
+            if matches!(body, Body::Coded(..)) && !self.coded[index].load(Atomic::Relaxed) {
+                body.plain()?;
+            }
+            if let Some(gather) = gather.as_mut() {
+                // The statistics on the thread that is already walking the column, and in the same
+                // step, because the rows are in memory once and this is the moment they are.
+                if opening {
+                    gather.open_stripe(key);
+                }
+                for pending in &held {
+                    gather.part(pending.chunk.column(index)?);
+                }
+            }
+            match body {
+                Body::Coded(local, mapped) => {
+                    for pending in &held {
+                        local.code_part(pending.chunk.column(index)?, mapped)?;
+                    }
+                }
+                Body::Pages(stripe, settling) => {
+                    for pending in &held {
+                        Writer::encode_page(stripe, settling, pending.chunk.column(index)?)?;
+                    }
+                }
+            }
+            Ok(())
         })?;
         drop(share);
-        let (columns, gathers) = in_order(width, done)?.into_iter().unzip();
-        let parts = held.iter().map(Part::of).collect();
-        drop(held);
+        building.parts.extend(held.iter().map(Part::of));
+        Ok(())
+    }
+
+    /// Ends a stripe that was started with [`Preparer::start`], ready for the merge.
+    ///
+    /// # Errors
+    ///
+    /// If a column's worker panicked.
+    pub fn finish(&self, building: Building) -> Result<Prepared> {
+        let empty = building.parts.is_empty();
+        let (columns, gathers) = building
+            .columns
+            .into_iter()
+            .map(|growing| {
+                let Growing { body, gather } = growing
+                    .into_inner()
+                    .map_err(|_| Error::internal("a native encode worker panicked"))?;
+                let column = match body {
+                    Body::Coded(mut local, _) => {
+                        local.done();
+                        Column::Coded(local)
+                    }
+                    Body::Pages(stripe, _) => Column::Pages(stripe),
+                };
+                // A stripe of no parts has no statistics, rather than an empty stripe of them.
+                let gather = gather.filter(|_| !empty).map(|mut gather| {
+                    gather.close_stripe();
+                    gather
+                });
+                Ok((column, gather))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
         Ok(Prepared {
-            parts,
+            parts: building.parts,
             types: self.types.clone(),
             columns,
             gathers,
             profile: self.profile.clone(),
         })
+    }
+}
+
+/// A stripe that [`Preparer::start`] began and [`Preparer::feed`] is adding parts to.
+#[derive(Debug)]
+pub struct Building {
+    parts: Vec<Part>,
+    /// Behind a lock each so a column can be handed to whichever worker takes it. Only one does
+    /// at a time, so the locks are never waited on.
+    columns: Vec<Mutex<Growing>>,
+}
+
+impl Building {
+    /// How many parts the stripe holds so far.
+    #[must_use]
+    pub fn parts(&self) -> usize {
+        self.parts.len()
+    }
+}
+
+/// One column of a stripe that is being built.
+#[derive(Debug)]
+struct Growing {
+    body: Body,
+    gather: Option<stats::Gather>,
+}
+
+/// What one column of a stripe being built has come to so far.
+#[derive(Debug)]
+enum Body {
+    /// Pages, with what the parts so far have settled on.
+    Pages(ColumnStripe, Settling),
+    /// Codes against the stripe's own dictionary, with the Parquet dictionary the last part came
+    /// in, as [`Local::code_dictionary`] keeps it.
+    Coded(Local, Option<(Arc<Vector>, Vec<u32>)>),
+}
+
+impl Body {
+    /// Turns a column coded against its dictionary into pages, for a column that lost its
+    /// dictionary while the stripe was being built.
+    ///
+    /// The merge would encode the whole stripe again plainly once it saw the column had none. Doing
+    /// it here, on the parts coded so far, means the parts still to come are encoded once. A load
+    /// starts every stripe it has in flight before the first one reaches the merge and decides.
+    fn plain(&mut self) -> Result<()> {
+        let Self::Coded(local, _) = self else { return Ok(()) };
+        let mut stripe = ColumnStripe::default();
+        let mut settling = Settling::default();
+        for rows in local.rows()? {
+            Writer::encode_page(&mut stripe, &mut settling, &rows)?;
+        }
+        *self = Self::Pages(stripe, settling);
+        Ok(())
     }
 }
 
@@ -1413,6 +1576,102 @@ mod tests {
         check(&lent);
         fs::remove_file(alone).expect("remove");
         fs::remove_file(lent).expect("remove");
+    }
+
+    /// A stripe fed a few parts at a time, with an empty batch and an empty chunk among them,
+    /// writes the same bytes as the same stripe prepared whole.
+    #[test]
+    fn stripes_fed_in_batches_write_the_same_bytes_as_prepared_whole() {
+        let whole = path("whole");
+        let mut writer = Writer::create(&whole, "t", fields()).expect("a file");
+        for run in runs() {
+            writer.append_stripe(run).expect("a stripe");
+        }
+        writer.finish().expect("commit");
+
+        let fed = path("fed");
+        let mut writer = Writer::create(&fed, "t", fields()).expect("a file");
+        let preparer = writer.preparer();
+        let merger = writer.merger().expect("a merger");
+        let nothing = Chunk::new(
+            fields()
+                .iter()
+                .map(|field| Vector::from_values(field.ty.clone(), &[]).expect("a column"))
+                .collect(),
+        )
+        .expect("a chunk");
+        for mut run in runs() {
+            let mut building = preparer.start();
+            preparer.feed(&mut building, Vec::new()).expect("fed nothing");
+            while !run.is_empty() {
+                let rest = run.split_off(2.min(run.len()));
+                let mut batch = std::mem::replace(&mut run, rest);
+                batch.push(((u64::MAX, 0), nothing.clone()));
+                preparer.feed(&mut building, batch).expect("fed");
+            }
+            let merged =
+                merger.merge(preparer.finish(building).expect("finished")).expect("merged");
+            let mut paged = merged.pages().expect("paged");
+            merger.give_back(&mut paged).expect("given back");
+            writer.write(paged).expect("written");
+        }
+        writer.finish().expect("commit");
+
+        assert_eq!(fs::read(&whole).expect("read"), fs::read(&fed).expect("read"));
+        check(&fed);
+        fs::remove_file(whole).expect("remove");
+        fs::remove_file(fed).expect("remove");
+    }
+
+    /// A stripe started while `note` still had its dictionary, which the first stripe's merge then
+    /// dropped, encodes the rest of `note` as pages and reads back.
+    #[test]
+    fn a_column_dropped_while_its_stripe_is_built_turns_to_pages() {
+        let path = path("dropped-while-built");
+        let mut writer = Writer::create(&path, "t", fields()).expect("a file");
+        let preparer = writer.preparer();
+        let merger = writer.merger().expect("a merger");
+        let write = |writer: &mut Writer, building: Building| {
+            let merged =
+                merger.merge(preparer.finish(building).expect("finished")).expect("merged");
+            let mut paged = merged.pages().expect("paged");
+            merger.give_back(&mut paged).expect("given back");
+            writer.write(paged).expect("written");
+        };
+        let mut runs = runs().into_iter();
+        let mut first = preparer.start();
+        let mut second = preparer.start();
+        let mut later = runs.next().expect("a run");
+        preparer.feed(&mut second, later.drain(..2).collect()).expect("fed");
+        preparer.feed(&mut first, runs.next().expect("a run")).expect("fed");
+        write(&mut writer, first);
+        let note = |building: &Building| {
+            matches!(building.columns[2].lock().expect("unpoisoned").body, Body::Pages(..))
+        };
+        assert!(!note(&second), "still coded until it is fed again");
+        preparer.feed(&mut second, later).expect("fed");
+        assert!(note(&second), "turned to pages once fed after the drop");
+        write(&mut writer, second);
+        let mut last = preparer.start();
+        preparer.feed(&mut last, runs.next().expect("a run")).expect("fed");
+        write(&mut writer, last);
+        writer.finish().expect("commit");
+        check(&path);
+        fs::remove_file(path).expect("remove");
+    }
+
+    /// A stripe is held to [`STRIPE_PARTS`] across all its batches, not only within one.
+    #[test]
+    fn a_stripe_fed_more_parts_than_it_holds_is_refused() {
+        let path = path("overfed");
+        let writer = Writer::create(&path, "t", fields()).expect("a file");
+        let preparer = writer.preparer();
+        let mut building = preparer.start();
+        preparer.feed(&mut building, stripe(0, STRIPE_PARTS - 1)).expect("fed");
+        assert_eq!(building.parts(), STRIPE_PARTS - 1);
+        assert!(preparer.feed(&mut building, stripe(STRIPE_PARTS, 2)).is_err());
+        drop(writer);
+        let _ = fs::remove_file(path);
     }
 
     /// Stripes merged on several threads at once through one [`Merger`] and written in whatever
