@@ -27,7 +27,7 @@ use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
 use rudb_plan::{ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
-use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Vector};
 
 use crate::cutoff::Cutoff;
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
@@ -900,9 +900,10 @@ impl<'a> Scan<'a> {
 
     /// Narrows a chunk to the rows a filter kept, leaving out the columns nothing reads afterwards.
     ///
-    /// A packed column only the pushed filter read is taken out before narrowing and comes back as a
-    /// null constant of the kept length, unless a runtime filter from a join reads it next.
-    /// Narrowing a packed column unpacks it at every kept row, which is the work this saves.
+    /// A column only the pushed filter read is taken out before narrowing and comes back as a null
+    /// constant of the kept length, unless a runtime filter from a join reads it next. Narrowing a
+    /// packed column unpacks it at every kept row, and a string column wrapped in the selection is
+    /// copied out string by string by the first join that gathers it, which is the work this saves.
     fn narrow_read_columns(
         &self,
         how: &dyn Compaction,
@@ -917,14 +918,6 @@ impl<'a> Scan<'a> {
             let sifting = sideways.sifting(self.index).map(|(key, _)| key);
             unread.retain(|&at| domain != Some(at) && sifting != Some(at));
         }
-        // Only the columns narrowing would unpack. Any other column is narrowed by wrapping it in
-        // the selection, which costs nothing to leave in, and a null constant in its place measured
-        // five percent more instructions on q13, where the column is the order comment.
-        unread.retain(|&at| {
-            chunk.columns().get(at).is_some_and(|column| {
-                column.form() == Form::BitPacked || column.stable_dictionary_parts().is_some()
-            })
-        });
         if unread.is_empty() {
             return narrow(how, chunk, kept, gauge);
         }

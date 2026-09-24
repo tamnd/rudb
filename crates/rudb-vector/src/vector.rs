@@ -3218,6 +3218,16 @@ impl Vector {
             let inside = below(indices, codes.len());
             return self.stable_gathered(codes, values, indices, inside, |index| index as usize);
         }
+        // A constant gathered is the same constant at the new length, as long as every position is
+        // a row of it or the value is null anyway. A join's probe gathers every column of its driving
+        // side, and a scan hands up a null constant for a column only its filter read.
+        if let Body::Constant(value) = &self.body {
+            let null = value.is_null() && matches!(self.validity, Validity::AllInvalid);
+            let valid = matches!(self.validity, Validity::AllValid) && !value.is_null();
+            if null || (valid && below(indices, self.len)) {
+                return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), indices.len()));
+            }
+        }
         if let Some(gathered) = self.unpacked_at(indices) {
             return Ok(gathered);
         }
