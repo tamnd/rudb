@@ -61,7 +61,8 @@ const LAYOUT: u8 = 1;
 /// `children`, `parents`, `linked`, then the four bytes that say what shape the rest is.
 pub const HEADER_BYTES: usize = 32;
 
-/// The three counts a forward link's header holds. See [`Link::counts`].
+/// The three counts a forward link's header holds and the form of the body behind them. See
+/// [`Link::counts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Counts {
     /// Rows in the child table.
@@ -70,6 +71,8 @@ pub struct Counts {
     pub parents: u64,
     /// Children that found a parent.
     pub linked: u64,
+    /// Which form the body behind it takes.
+    pub form: Form,
 }
 
 /// Which physical form a forward link took.
@@ -424,7 +427,7 @@ impl Link {
         if bytes.len() < HEADER_BYTES {
             return Err(malformed("a forward link payload is shorter than its header"));
         }
-        Form::from_tag(bytes[24])?;
+        let form = Form::from_tag(bytes[24])?;
         if bytes[26] != LAYOUT {
             return Err(malformed(format!(
                 "forward link layout {} is not one this build knows",
@@ -435,6 +438,7 @@ impl Link {
             children: number(&bytes[0..8])?,
             parents: number(&bytes[8..16])?,
             linked: number(&bytes[16..24])?,
+            form,
         })
     }
 
@@ -446,8 +450,7 @@ impl Link {
     /// know, or holds a body that is not the size its header implies. Every one of those is a
     /// section to drop rather than a query to fail, by section 3.1.
     pub fn read(bytes: &[u8]) -> Result<Self> {
-        let Counts { children, parents, linked } = Self::counts(bytes)?;
-        let form = Form::from_tag(bytes[24])?;
+        let Counts { children, parents, linked, form } = Self::counts(bytes)?;
         let width = bytes[25] as usize;
         let rest = &bytes[HEADER_BYTES..];
         let body = match form {
@@ -581,7 +584,12 @@ mod tests {
         let counts = Link::counts(&bytes[..HEADER_BYTES]).expect("the header alone");
         assert_eq!(
             counts,
-            Counts { children: built.children(), parents: built.parents(), linked: built.linked() }
+            Counts {
+                children: built.children(),
+                parents: built.parents(),
+                linked: built.linked(),
+                form: built.form()
+            }
         );
         assert_eq!(read.form(), built.form(), "the form survives the round trip");
         assert_eq!(read.children(), built.children());

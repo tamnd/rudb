@@ -1931,7 +1931,13 @@ impl<'a> Building<'a, '_> {
             None => aggregate,
         };
         // Whether the key arrives in ascending order, where the planner could say so.
-        let aggregate = if self.plan.clustered(index) { aggregate.clustered() } else { aggregate };
+        let aggregate = if self.plan.grouped(index) {
+            aggregate.grouped()
+        } else if self.plan.clustered(index) {
+            aggregate.clustered()
+        } else {
+            aggregate
+        };
         let aggregate = match bound.top_counts {
             Some((bound, call)) => aggregate.top_counts(bound, call),
             None => aggregate,

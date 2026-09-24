@@ -389,6 +389,9 @@ pub(crate) struct Aggregate<'a> {
     /// moved past is finished and can skip the table. `rudb_opt`'s `cluster` pass is where it comes
     /// from, and [`interior`] checks every chunk before believing it.
     clustered: bool,
+    /// Whether the promise behind `clustered` is that each key is one run rather than that the key
+    /// goes up, so [`interior`] does not refuse a chunk for going down.
+    grouped: bool,
     /// The groups a pushed down limit keeps, agreed once and used by every instance.
     agreed: Mutex<Option<Agreed>>,
     /// Whether [`Agreed::keys`] is filled in, so the fold can ask without taking the lock.
@@ -1381,6 +1384,7 @@ impl<'a> Aggregate<'a> {
             span: None,
             ends: None,
             clustered: false,
+            grouped: false,
             agreed: Mutex::new(None),
             settled: AtomicBool::new(false),
             by_vector,
@@ -1458,6 +1462,14 @@ impl<'a> Aggregate<'a> {
     /// Closes a group as soon as its key is behind the rows, from `rudb_opt`'s `cluster` pass.
     pub(crate) fn clustered(mut self) -> Self {
         self.clustered = true;
+        self
+    }
+
+    /// Closes groups on the promise that each key is one run of rows, in any order, from the same
+    /// pass when a monotone link rather than the key's order is the proof.
+    pub(crate) fn grouped(mut self) -> Self {
+        self.clustered = true;
+        self.grouped = true;
         self
     }
 
@@ -4831,18 +4843,28 @@ fn integers(flat: &Vector, rows: usize) -> Option<Vec<i64>> {
 /// is only closed out of a chunk that is sorted, and a table that is sorted puts every row of a key
 /// strictly inside a sorted chunk inside that chunk. Two runs or fewer have nothing strictly inside.
 ///
+/// `grouped` is the other promise, that each value's rows are one run in whatever order the runs
+/// come, which a monotone link proves. A run with a different value on both sides of it inside the
+/// chunk is then its whole group, filtered or not, because a row of it anywhere else would have to
+/// sit beyond one of those neighbours. Nothing here can check that promise, so the chunk is not
+/// asked to go up.
+///
 /// The forms are the ones [`crate::table::repeats`] compares exactly, in the order it tries them,
 /// because the fold finds the runs with it and a run it split would be one group closed twice.
-fn interior(key: &Vector, rows: usize) -> Option<(usize, usize)> {
+fn interior(key: &Vector, rows: usize, grouped: bool) -> Option<(usize, usize)> {
     if rows < 3 || key.validity().has_nulls(rows) {
         return None;
     }
-    fn bounds<T: PartialOrd>(rows: usize, at: impl Fn(usize) -> T) -> Option<(usize, usize)> {
+    fn bounds<T: PartialOrd>(
+        rows: usize,
+        grouped: bool,
+        at: impl Fn(usize) -> T,
+    ) -> Option<(usize, usize)> {
         let (mut from, mut to) = (0, 0);
         let mut before = at(0);
         for row in 1..rows {
             let value = at(row);
-            if value < before {
+            if value < before && !grouped {
                 return None;
             }
             if value != before {
@@ -4861,12 +4883,12 @@ fn interior(key: &Vector, rows: usize) -> Option<(usize, usize)> {
             if values.len() < rows {
                 return None;
             }
-            bounds(rows, |row| values[row])
+            bounds(rows, grouped, |row| values[row])
         }};
     }
     // A packed code is the value less the frame's base, so codes are in the order the values are.
     if let Some(packed) = key.packed_parts() {
-        return bounds(rows, |row| packed.code(row));
+        return bounds(rows, grouped, |row| packed.code(row));
     }
     match key.data()? {
         Data::Int8(values) => flat!(values),
@@ -5680,7 +5702,7 @@ impl Sink for Aggregate<'_> {
         // other instance holds. The two ends are cut before anything is folded, so a vector that
         // cannot be cut leaves the whole chunk to the ordinary path.
         if self.closes() {
-            if let Some((from, to)) = interior(&rows.keys[0], rows.rows) {
+            if let Some((from, to)) = interior(&rows.keys[0], rows.rows, self.grouped) {
                 if let (Ok(head), Ok(tail)) = (rows.slice(0, from), rows.slice(to, rows.rows - to))
                 {
                     if self.closes_by_run() {
@@ -7508,7 +7530,7 @@ mod tests {
         Distinct, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, FixedPartition,
         FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, RUN_BLOCK, Share,
         Signed, WINDOW_RATE, WINDOW_SLACK, bigint_distinct_partition, encoded_count_partition,
-        fixed_partition, slot_runs_of, spread_runs, spread_slots,
+        fixed_partition, interior, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -9032,5 +9054,20 @@ mod tests {
         assert!(Share::Passing.before_the_split());
         assert!(!Share::Partition.before_the_split());
         assert!(!Share::Local.before_the_split());
+    }
+
+    #[test]
+    fn a_grouped_key_closes_its_inner_runs_whichever_way_they_go() {
+        // Orders in date order: each order's lines together, the order keys going up and down.
+        let values = [9, 9, 4, 4, 4, 7, 2, 2, 5].map(Value::BigInt);
+        let key = Vector::from_values(LogicalType::BigInt, &values).expect("keys");
+        assert_eq!(interior(&key, values.len(), false), None, "ascending refuses it");
+        assert_eq!(
+            interior(&key, values.len(), true),
+            Some((2, 8)),
+            "grouped closes 4, 7 and 2, and leaves 9 and 5 to the table"
+        );
+        let two = Vector::from_values(LogicalType::BigInt, &values[..5]).expect("keys");
+        assert_eq!(interior(&two, 5, true), None, "two runs have nothing strictly inside");
     }
 }

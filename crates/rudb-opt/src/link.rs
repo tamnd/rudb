@@ -167,6 +167,14 @@ pub struct Linked {
     /// way as any other and read the same way, so the only thing that changes here is how many
     /// equalities a join has to hold for it to be this relationship.
     pub second: Option<(String, String)>,
+    /// Whether the stored link is the monotone form: the children are in their parents' row order,
+    /// so the rows of each parent are one run of children.
+    ///
+    /// With [`Self::exactly_one`] that proves the child column is grouped, each of its values one
+    /// contiguous run, which is what closes the groups of an aggregate over it on a table that is
+    /// not stored in the order of that column. See `../../spec/graph/12-the-order-the-suite-asks-for.md`
+    /// section 12.5.
+    pub monotone: bool,
 }
 
 impl Linked {
@@ -213,6 +221,7 @@ impl Linked {
             total: false,
             unique: false,
             second: None,
+            monotone: false,
         }
     }
 
@@ -220,6 +229,20 @@ impl Linked {
     #[must_use]
     pub fn keyed(self) -> Self {
         Self { unique: true, ..self }
+    }
+
+    /// The same relationship with its stored link in the monotone form.
+    #[must_use]
+    pub fn monotone(self) -> Self {
+        Self { monotone: true, ..self }
+    }
+
+    /// Whether the file proves every value of the child column is one run of rows: a link every
+    /// child row followed to exactly one parent, over a key of one column, stored in the form that
+    /// only a child in its parents' order takes.
+    #[must_use]
+    pub fn groups_child(&self) -> bool {
+        self.exactly_one() && self.monotone && self.second.is_none()
     }
 
     /// The same relationship over a second pair of key columns.
