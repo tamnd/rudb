@@ -67,7 +67,7 @@ mod zones;
 
 pub use prepare::{Building, DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepared, Preparer};
 pub use projection::build_sorted_projection;
-pub use run_projection::build_run_projection;
+pub use run_projection::{RunProjectionPart, RunProjectionScan, build_run_projection};
 pub use section::Section;
 pub use zones::{Common, Stripes, ascending, distincts, widths};
 
