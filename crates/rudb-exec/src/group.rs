@@ -6594,9 +6594,9 @@ fn dense_partition(
         sorted.sort_unstable();
         sorted.chunk_by(|left, right| left == right).map(|run| (run[0], run.len() as i64)).collect()
     } else if u32::try_from(rows).is_ok() {
-        dense_counts::<u32>(&partition.runs, width, number)
+        dense_counts::<u32>(&partition.runs, width, number, bound)
     } else {
-        dense_counts::<i64>(&partition.runs, width, number)
+        dense_counts::<i64>(&partition.runs, width, number, bound)
     };
     // Under a TopN on the count only the `bound` largest groups of the partition can reach it, and
     // building the rest into chunks is most of the finish: ClickBench 34 groups ten million rows of
@@ -6640,7 +6640,16 @@ fn dense_partition(
 /// is every partition of a file under four billion rows, and it halves the array: `URL` on
 /// ClickBench is seven million codes, so it is 14 MB against 28 for each of the four partitions
 /// finishing at once.
-fn dense_counts<C>(runs: &[Blocks<u32>], width: usize, number: usize) -> Vec<(u32, i64)>
+///
+/// Under a `bound` only the largest counts come back, picked out of the array where it lies. Every
+/// group was listed first and cut down after, and on ClickBench 34 that list was a million sixteen
+/// byte pairs a partition grown by doubling, a third of the page faults of the query for ten rows.
+fn dense_counts<C>(
+    runs: &[Blocks<u32>],
+    width: usize,
+    number: usize,
+    bound: Option<usize>,
+) -> Vec<(u32, i64)>
 where
     C: Copy + Default + PartialEq + std::ops::AddAssign + From<u8> + Into<i64>,
 {
@@ -6652,11 +6661,20 @@ where
             }
         }
     }
+    let code = |slot: usize| (slot * DENSE_PARTITIONS + number) as u32;
+    if let Some(bound) = bound {
+        // Largest first and in slot order among equals, which is code order, and a zero only
+        // when fewer groups than the bound were seen, so those are dropped after.
+        let mut best = largest(width, bound, |slot| dense[slot].into());
+        best.retain(|&slot| dense[slot] != C::default());
+        best.sort_unstable();
+        return best.into_iter().map(|slot| (code(slot), dense[slot].into())).collect();
+    }
     dense
         .iter()
         .enumerate()
         .filter(|(_, count)| **count != C::default())
-        .map(|(slot, &count)| ((slot * DENSE_PARTITIONS + number) as u32, count.into()))
+        .map(|(slot, &count)| (code(slot), count.into()))
         .collect()
 }
 
