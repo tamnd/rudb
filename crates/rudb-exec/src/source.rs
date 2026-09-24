@@ -8,7 +8,7 @@
 //! numbers and not rows.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,10 +24,10 @@ use rudb_kernels::{Stepping, cast, moment_steps};
 use rudb_metrics::Counters;
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
-use rudb_plan::{ConjunctionOp, Expr, ExprRef, Plan, Slice};
+use rudb_plan::{ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
 use rudb_storage::Probe;
-use rudb_vector::{Chunk, Data, Selection, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Vector};
 
 use crate::cutoff::Cutoff;
 use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
@@ -296,7 +296,6 @@ pub(crate) struct Scan<'a> {
     /// workers it will face and so the one moment it can decide how finely to cut.
     spread: OnceLock<Spread>,
     skipped: AtomicUsize,
-    /// Whether the runtime filter has been earning the hash it costs.
     /// The projected string columns the pushed filter does not read, by their place in the
     /// projection, which are read after the filters have run and only for the rows they kept. See
     /// [`Self::read_deferring`].
@@ -305,6 +304,15 @@ pub(crate) struct Scan<'a> {
     /// measured keeping most rows, since then the string columns are read nearly whole anyway and
     /// the second read is a cost with nothing to show for it.
     deferring: Paying,
+    /// The projected columns only the pushed filter reads, by their place in the projection.
+    ///
+    /// Empty unless the operator the filter came from is an aggregate or a projection, since those
+    /// are the only ones that name every column they read and hide the scan's columns from
+    /// everything above them. A column here is left out when a filter narrows a chunk and comes
+    /// back as a null constant. On TPC-H q01 that is the ship date, which the filter reads to keep
+    /// 98 percent of lineitem and nothing reads again, and narrowing unpacked it for every row.
+    unread: Vec<usize>,
+    /// Whether the runtime filter has been earning the hash it costs.
     paying: Paying,
     /// What the pushed filter keeps, which decides whether a Bloom filter runs ahead of it.
     passed: Paying,
@@ -364,6 +372,67 @@ impl Paying {
 /// A test names a column of the projection and a zone names a column of the table, so the move
 /// happens once here rather than at every chunk. A test on a column that is somehow not projected is
 /// dropped, which costs a chunk that gets read.
+/// Which of a scan's columns the operators over the filter at `filter` read, by place.
+///
+/// The walk goes up from the filter until it reaches an aggregate or a projection, noting every
+/// column each operator on the way reads. Those two produce columns of their own, so nothing above
+/// them sees the scan's columns. Filters, inner and outer joins, cross products, sorts and plain
+/// limits only pass the columns they were given on, so what they read is all they read. Anything
+/// else ends the walk with nothing, and so does the top of the plan: a set operation or a
+/// `DISTINCT` compares whole rows, a dependent join lets the other side read this one, and the
+/// root hands every column it has to the caller, none of which shows up as an expression.
+fn read_above(plan: &Plan, filter: NodeRef, schema: &Schema) -> Option<Vec<bool>> {
+    let mut parents: HashMap<NodeRef, Vec<NodeRef>> = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![plan.root()];
+    while let Some(at) = stack.pop() {
+        if !seen.insert(at) {
+            continue;
+        }
+        for child in plan.node(at).children().into_iter().flatten() {
+            parents.entry(child).or_default().push(at);
+            stack.push(child);
+        }
+    }
+    let mut above = vec![false; schema.types().len()];
+    let mut read = |expr: ExprRef| {
+        crate::join::columns(plan, expr, &mut |binding| {
+            if let Some(place) = schema.position_of(binding) {
+                above[place] = true;
+            }
+        });
+    };
+    let mut here = filter;
+    loop {
+        let [parent] = parents.get(&here)?.as_slice() else { return None };
+        match *plan.node(*parent) {
+            Node::Aggregate { groups, aggregates, .. } => {
+                for slice in [groups, aggregates] {
+                    plan.expr_list(slice).iter().for_each(|&expr| read(expr));
+                }
+                break;
+            }
+            Node::Project { exprs, .. } => {
+                plan.expr_list(exprs).iter().for_each(|&expr| read(expr));
+                break;
+            }
+            Node::Filter { predicate, .. } => read(predicate),
+            Node::Join { conditions, .. } => {
+                plan.expr_list(conditions).iter().for_each(|&expr| read(expr));
+            }
+            Node::CrossProduct { .. } => {}
+            Node::Sort { keys, .. } | Node::TopN { keys, .. } => {
+                plan.sort_key_list(keys).iter().for_each(|key| read(key.expr));
+            }
+            Node::Limit { count, offset, .. }
+                if count.read().is_none() && offset.read().is_none() => {}
+            _ => return None,
+        }
+        here = *parent;
+    }
+    Some(above)
+}
+
 fn onto(columns: &[Option<usize>], tests: Vec<(usize, Op, Bound)>) -> Vec<Probe> {
     tests
         .into_iter()
@@ -391,7 +460,7 @@ fn onto(columns: &[Option<usize>], tests: Vec<(usize, Op, Bound)>) -> Vec<Probe>
 pub(crate) struct Pushdown {
     /// The filter node this came from, which is still in the plan and is what the compaction gain
     /// function counts the passes above.
-    pub(crate) node: rudb_plan::NodeRef,
+    pub(crate) node: NodeRef,
     pub(crate) predicate: ExprRef,
     /// The conjuncts, read as tests, in the numbering of what the scan produces.
     pub(crate) tests: Vec<(usize, Op, Bound)>,
@@ -724,6 +793,15 @@ impl<'a> Scan<'a> {
         let deferred = (0..columns.len())
             .filter(|&at| columns[at].is_some() && !read[at] && types[at] == LogicalType::Varchar)
             .collect();
+        let unread = pushdown
+            .as_ref()
+            .and_then(|pushdown| read_above(plan, pushdown.node, &schema))
+            .map(|above| {
+                (0..columns.len())
+                    .filter(|&at| columns[at].is_some() && read[at] && !above[at])
+                    .collect()
+            })
+            .unwrap_or_default();
         let pushed = pushdown
             .map(|pushdown| Pushed::new(plan, &schema, &columns, pushdown, seams, session))
             .transpose()?;
@@ -747,6 +825,7 @@ impl<'a> Scan<'a> {
             counters: None,
             deferred,
             deferring: Paying::default(),
+            unread,
             paying: Paying::default(),
             passed: Paying::default(),
         })
@@ -798,9 +877,70 @@ impl<'a> Scan<'a> {
             kept = Selection::from_indices(held);
         }
         if kept.len() != chunk.len() {
-            narrow(pushed.compaction, chunk, &kept, &mut working.gauge)?;
+            self.narrow_read_columns(pushed.compaction, chunk, &kept, &mut working.gauge)?;
         }
         pushed.give(slot, working);
+        Ok(())
+    }
+
+    /// Narrows a chunk to the rows a filter kept, leaving out the columns nothing reads afterwards.
+    ///
+    /// A packed column only the pushed filter read is taken out before narrowing and comes back as a
+    /// null constant of the kept length, unless a runtime filter from a join reads it next.
+    /// Narrowing a packed column unpacks it at every kept row, which is the work this saves.
+    fn narrow_read_columns(
+        &self,
+        how: &dyn Compaction,
+        chunk: &mut Chunk,
+        kept: &Selection,
+        gauge: &mut Gauge,
+    ) -> Result<()> {
+        let mut unread = self.unread.clone();
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        for sideways in joins {
+            let domain = sideways.domain(self.index).map(|(key, _)| key);
+            let sifting = sideways.sifting(self.index).map(|(key, _)| key);
+            unread.retain(|&at| domain != Some(at) && sifting != Some(at));
+        }
+        // Only the columns narrowing would unpack. Any other column is narrowed by wrapping it in
+        // the selection, which costs nothing to leave in, and a null constant in its place measured
+        // five percent more instructions on q13, where the column is the order comment.
+        unread.retain(|&at| {
+            chunk.columns().get(at).is_some_and(|column| {
+                column.form() == Form::BitPacked || column.stable_dictionary_parts().is_some()
+            })
+        });
+        if unread.is_empty() {
+            return narrow(how, chunk, kept, gauge);
+        }
+        let rows = chunk.len();
+        let types = chunk.types();
+        let mut columns: Vec<Option<Vector>> = std::mem::replace(chunk, Chunk::empty(&[]))
+            .into_columns()
+            .into_iter()
+            .map(Some)
+            .collect();
+        let live: Vec<Vector> = columns
+            .iter_mut()
+            .enumerate()
+            .filter(|(at, _)| !unread.contains(at))
+            .filter_map(|(_, column)| column.take())
+            .collect();
+        let mut part = Chunk::with_rows(live, rows)?;
+        narrow(how, &mut part, kept, gauge)?;
+        let len = part.len();
+        let mut live = part.into_columns().into_iter();
+        let mut out = Vec::with_capacity(columns.len());
+        for (at, ty) in types.into_iter().enumerate() {
+            if unread.contains(&at) {
+                out.push(Vector::constant(ty, Value::Null, len));
+            } else {
+                out.push(
+                    live.next().ok_or_else(|| Error::internal("a narrowed column went missing"))?,
+                );
+            }
+        }
+        *chunk = Chunk::with_rows(out, len)?;
         Ok(())
     }
 
@@ -3417,6 +3557,7 @@ mod tests {
             counters: None,
             deferred: Vec::new(),
             deferring: Paying::default(),
+            unread: Vec::new(),
             paying: Paying::default(),
             passed: Paying::default(),
         }
