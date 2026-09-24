@@ -10203,7 +10203,8 @@ fn cascaded(
 /// the part before had kept.
 const SEARCH_EVERY: usize = 16;
 
-/// What the parts of one column in one stripe have settled on in the integer cascade.
+/// What the parts of one column in one stripe have settled on in the integer cascade, and the
+/// symbol table its text pages compress against.
 ///
 /// One of these per column per stripe, used in part order, so what a part comes out as depends on
 /// the stripe and not on which thread wrote it or on how many there were.
@@ -10214,9 +10215,54 @@ struct Settling {
     shape: Option<Shape>,
     /// Parts replayed since that search.
     since: usize,
+    /// The FSST table of the last text page that trained one. See [`Settling::text`].
+    symbols: Option<Symbols>,
+}
+
+/// A table trained on one text page, with what that page came to and how many pages have used it
+/// since.
+#[derive(Debug)]
+struct Symbols {
+    shape: chooser::Settled,
+    /// The trained page compressed and plain, in bytes, which is the ratio a later page is held to.
+    /// Zero compressed when the table came out empty.
+    len: usize,
+    payload: usize,
+    since: usize,
 }
 
 impl Settling {
+    /// A text page as one FSST chunk, against the table an earlier page of the stripe trained where
+    /// there is one.
+    ///
+    /// The same rule as [`Self::encode`]: the table is used for [`SEARCH_EVERY`] pages and is kept
+    /// while a page comes out no more than a quarter bigger a byte than the page it was trained on.
+    /// Past that the page trains a table of its own and the pages after it use that one. Every page
+    /// still carries the table it was compressed with, so nothing a reader does changes.
+    fn text(&mut self, values: &[&[u8]], payload: usize) -> Result<Option<Vec<u8>>> {
+        if let Some(symbols) = self.symbols.as_mut().filter(|symbols| symbols.since < SEARCH_EVERY)
+        {
+            let out = string::encode_fsst(values, &symbols.shape)?;
+            // An empty table stays empty for the pages after, which are the same kind of text.
+            let held = match &out {
+                None => symbols.len == 0,
+                Some(out) => {
+                    (out.len() as u128) * (symbols.payload as u128) * 4
+                        <= (symbols.len as u128) * (payload as u128) * 5
+                }
+            };
+            if held {
+                symbols.since += 1;
+                return Ok(out);
+            }
+        }
+        let shape = string::fsst_shape(values);
+        let out = string::encode_fsst(values, &shape)?;
+        let len = out.as_ref().map_or(0, Vec::len);
+        self.symbols = Some(Symbols { shape, len, payload: payload.max(1), since: 0 });
+        Ok(out)
+    }
+
     /// A part's integers through the cascade, replaying the settled shape where there is one.
     ///
     /// The replay is kept when it held and came out no more than a quarter bigger a row than the
@@ -10298,7 +10344,10 @@ struct Shape {
 ///
 /// Taken only when it comes out smaller than the raw form, so a page of incompressible values pays
 /// nothing at read time for having been offered.
-fn text_compressed(flat: &Vector) -> Result<Option<Vec<u8>>> {
+///
+/// The symbol table is trained once for several pages of the stripe rather than once a page. See
+/// [`Settling::text`].
+fn text_compressed(flat: &Vector, settling: &mut Settling) -> Result<Option<Vec<u8>>> {
     let mut values: Vec<&[u8]> = Vec::with_capacity(flat.len());
     let mut payload = 0_usize;
     for row in 0..flat.len() {
@@ -10310,7 +10359,7 @@ fn text_compressed(flat: &Vector) -> Result<Option<Vec<u8>>> {
     }
     // What codec 0 writes for a varchar page: an offset a row and one more, then the payload.
     let plain = (flat.len() + 1).saturating_mul(4).saturating_add(payload);
-    let Some(out) = string::encode_only(string::Kind::Fsst, &values)? else {
+    let Some(out) = settling.text(&values, payload)? else {
         return Ok(None);
     };
     Ok((out.len() < plain).then_some(out))
@@ -10377,8 +10426,11 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
     let flat = vector.flatten()?;
     let mut out = Vec::new();
     let dictionary = if coded_type(ty) { string_dictionary(&flat)? } else { None };
-    let compressed_text =
-        if dictionary.is_none() && coded_type(ty) { text_compressed(&flat)? } else { None };
+    let compressed_text = if dictionary.is_none() && coded_type(ty) {
+        text_compressed(&flat, settling)?
+    } else {
+        None
+    };
     let packed_vector = if dictionary.is_none() { Some(flat.bit_packed()?) } else { None };
     let packed = packed_vector.as_ref().and_then(Vector::packed_parts);
     // Only where nothing else has claimed the page, which is the plain integer case. A packed part
@@ -12326,6 +12378,39 @@ mod tests {
                 .collect();
             let searched = integer::encode_with(&values, &Fixed).unwrap();
             assert_eq!(settling.encode(&values).unwrap(), searched, "part {part}");
+        }
+    }
+
+    /// Text pages compressed against a table an earlier page trained read back as they went in, and
+    /// a page of different text trains a table of its own rather than coming out as big as the
+    /// earlier table would make it.
+    #[test]
+    fn text_pages_share_a_table_until_the_text_changes() {
+        let words = ["carefully", "final", "deposits", "sleep", "furiously", "quickly", "among"];
+        let english: Vec<Vec<u8>> = (0..1024)
+            .map(|row: usize| {
+                let pick = |at: usize| words[(row * 7 + at * 3) % words.len()];
+                format!("{} {} {} the {}", pick(0), pick(1), pick(2), pick(3)).into_bytes()
+            })
+            .collect();
+        let digits: Vec<Vec<u8>> =
+            (0..1024_u64).map(|row| format!("{:020}", row * 7_919_993).into_bytes()).collect();
+        let mut settling = Settling::default();
+        for page in 0..8 {
+            let values: Vec<&[u8]> =
+                if page < 4 { &english } else { &digits }.iter().map(Vec::as_slice).collect();
+            let payload = values.iter().map(|value| value.len()).sum();
+            let out = settling.text(&values, payload).unwrap().unwrap();
+            assert_eq!(string::decode(&out).unwrap(), values, "page {page}");
+            let alone = string::encode_only(string::Kind::Fsst, &values).unwrap().unwrap();
+            assert!(
+                out.len() * 4 <= alone.len() * 5,
+                "page {page}: {} against {}",
+                out.len(),
+                alone.len()
+            );
+            let since = settling.symbols.as_ref().unwrap().since;
+            assert_eq!(since, page % 4, "page {page}");
         }
     }
 
