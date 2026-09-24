@@ -1861,7 +1861,7 @@ impl<'a> Aggregate<'a> {
             // group, which is the whole point of holding them here.
             coded_on: Vec::new(),
             coded_places: Vec::new(),
-            coded_values: Vec::new(),
+            coded_values: crate::table::Widened::default(),
             slot_runs: Vec::new(),
             coded_spent: 0,
             coded_read: 0,
@@ -4303,8 +4303,8 @@ pub(crate) struct Building {
     coded_map: Vec<usize>,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
     coded_places: Vec<usize>,
-    /// The values of each integer key column the map reads by value, widened, one run per column.
-    coded_values: Vec<Vec<i64>>,
+    /// The values of each integer key column the map reads by value, widened, and their runs.
+    coded_values: crate::table::Widened,
     /// The last chunk's slots cut into runs of one slot, each its slot and the row it ends before,
     /// when they came in runs long enough to fold a run at a time.
     slot_runs: Vec<(usize, usize)>,
