@@ -597,13 +597,23 @@ fn one_call(at: usize) -> u64 {
 /// Cuts a chunk's slots into runs of one slot, each given as its slot and the row it ends before,
 /// when they come in runs long enough for the `users` calls that will read them to pay for the pass.
 ///
-/// One pass, and most of it sixteen slots at a time: a block that holds nothing but the slot of
-/// the run it is in is an or of sixteen differences the compiler does as a few vector
-/// instructions, and only a block where the slot changes is walked a row at a time. The first
-/// version counted the changes before cutting and did both a row at a time, and at twenty
-/// instructions a row it cost more than the counting loop it was there to replace. A chunk of keys
-/// in no order is given up on as soon as it has more runs than it is allowed. `false`, with `into`
-/// empty, for a chunk that is not worth it.
+/// One pass, a block of [`RUN_BLOCK`] slots at a time, and no branch on any row. A row starts a run
+/// where its slot differs from the slot before it, which is a compare per row and nothing carried from
+/// one row to the next, so the block's starts are gathered into a mask of one bit a row and the runs
+/// are read off it by counting its trailing zeroes. A run that ends before row `at` has the slot row
+/// `at - 1` holds, so the mask alone says both numbers a run is and the walk never tracks which slot it
+/// is in.
+///
+/// Per row a branch is what this used to cost. The version before it or'd sixteen differences against
+/// the slot of the run it was in and walked a row at a time only where that or came out non zero, which
+/// reads well and does nothing on a chunk like q01's: runs of 2.81 rows change slot in every block
+/// there is, so the or never once skipped a block and every row paid a compare the branch predictor
+/// cannot call, a third of them taken. It was 16 percent of the fold on q01 and most of that was the
+/// mispredict.
+///
+/// A chunk of keys in no order is given up on as soon as it has more runs than it is allowed, checked
+/// once a block against the bits the mask has set rather than once a run. `false`, with `into` empty,
+/// for a chunk that is not worth it.
 ///
 /// The budget is [`RUN_ROWS`] rows a run for each call that will read the runs, because the pass is
 /// paid once a chunk however many read it and each one that does saves a pass of its own. q01 reads
@@ -612,32 +622,39 @@ fn one_call(at: usize) -> u64 {
 /// #1633.
 fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>, users: usize) -> bool {
     into.clear();
-    let Some(&first) = slots.first() else {
+    let Some(&last) = slots.last() else {
         return false;
     };
     let most = slots.len().saturating_mul(users) / RUN_ROWS;
-    let mut current = first;
-    let mut row = 0;
+    // Room for every run the budget allows, since a chunk cannot hold more runs than it has rows, so
+    // the push below grows nothing and the walk is the compare and the store it looks like.
+    into.reserve(most.min(slots.len()) + 1);
+    let mut row = 1;
     while row < slots.len() {
-        let end = (row + 16).min(slots.len());
+        let end = (row + RUN_BLOCK).min(slots.len());
         let block = &slots[row..end];
-        if block.iter().fold(0, |differ, &slot| differ | (slot ^ current)) != 0 {
-            for (at, &slot) in block.iter().enumerate() {
-                if slot != current {
-                    if into.len() >= most {
-                        into.clear();
-                        return false;
-                    }
-                    into.push((current, row + at));
-                    current = slot;
-                }
-            }
+        let prior = &slots[row - 1..end - 1];
+        let mut starts = 0_u64;
+        for (at, (&slot, &before)) in block.iter().zip(prior).enumerate() {
+            starts |= u64::from(slot != before) << at;
+        }
+        if into.len() + starts.count_ones() as usize > most {
+            into.clear();
+            return false;
+        }
+        while starts != 0 {
+            let at = starts.trailing_zeros() as usize;
+            starts &= starts - 1;
+            into.push((prior[at], row + at));
         }
         row = end;
     }
-    into.push((current, slots.len()));
+    into.push((last, slots.len()));
     true
 }
+
+/// How many slots [`slot_runs_of`] reads a mask of starts over, which is one bit a row of a `u64`.
+const RUN_BLOCK: usize = 64;
 
 /// How many rows a run of one slot has to hold on average, per call that will read the runs, for
 /// [`slot_runs_of`] to cut a chunk into runs, which is where folding a run at once costs less than
@@ -7404,8 +7421,8 @@ mod tests {
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
         Distinct, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, FixedPartition,
-        FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed,
-        WINDOW_RATE, WINDOW_SLACK, bigint_distinct_partition, encoded_count_partition,
+        FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, RUN_BLOCK, Share,
+        Signed, WINDOW_RATE, WINDOW_SLACK, bigint_distinct_partition, encoded_count_partition,
         fixed_partition, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
@@ -7493,6 +7510,31 @@ mod tests {
         // No call reading them is a chunk nobody would pay the pass for.
         assert!(!slot_runs_of(&scattered, &mut runs, 0));
         assert!(runs.is_empty());
+    }
+
+    /// A run that ends exactly where a block of the mask does, and one that ends one row either side
+    /// of it, since the mask reads a row against the row before it and those three are where the bit
+    /// for a start and the slot the run it ends carries come from different blocks.
+    #[test]
+    fn runs_ending_on_the_edge_of_a_block_are_cut_where_they_end() {
+        for first in [RUN_BLOCK - 1, RUN_BLOCK, RUN_BLOCK + 1] {
+            let lengths = [(3, first), (8, 1), (3, RUN_BLOCK * 2), (5, 2)];
+            let slots: Vec<usize> = lengths
+                .iter()
+                .flat_map(|&(slot, length)| std::iter::repeat_n(slot, length))
+                .collect();
+            let mut runs = Vec::new();
+            assert!(slot_runs_of(&slots, &mut runs, 8), "gave up on runs ending at {first}");
+            let mut end = 0;
+            let expected: Vec<(usize, usize)> = lengths
+                .iter()
+                .map(|&(slot, length)| {
+                    end += length;
+                    (slot, end)
+                })
+                .collect();
+            assert_eq!(runs, expected, "the runs ending at {first} were cut wrong");
+        }
     }
 
     #[test]
