@@ -2474,7 +2474,6 @@ impl<'a> Aggregate<'a> {
                         slot = resolve(start)?;
                         coded_map[place] = slot;
                     }
-                    slots.resize(end, slot);
                     *run = (slot, end);
                     start = end;
                 }
@@ -2507,7 +2506,8 @@ impl<'a> Aggregate<'a> {
         } else {
             coded_on.clear();
         }
-        if slots.len() != *length {
+        // Runs found above leave the slots empty. See `fill_now` below.
+        if !runs_found && slots.len() != *length {
             slots.clear();
             slots.resize(*length, if alone { 0 } else { NOWHERE });
         }
@@ -2672,15 +2672,16 @@ impl<'a> Aggregate<'a> {
                 .count()
         };
         let whole;
-        let mut unspread = None;
         let length = match marked {
             Some((picks, all)) => {
                 let mut spread = Vec::with_capacity(slot_runs.len() + 8);
                 let most = all.saturating_mul(users) / RUN_ROWS;
                 if runs_found && spread_runs(slot_runs, picks.indices(), *all, most, &mut spread) {
                     *slot_runs = spread;
-                    unspread = Some((picks.indices(), *all));
                 } else {
+                    if runs_found {
+                        fill_slots(slots, slot_runs);
+                    }
                     spread_slots(slots, picks.indices(), *all);
                     runs_found = false;
                 }
@@ -2689,13 +2690,19 @@ impl<'a> Aggregate<'a> {
             }
             None => length,
         };
-        let mut spread_now = |slots: &mut Vec<usize>| {
-            if let Some((kept, all)) = unspread.take() {
-                spread_slots(slots, kept, all);
+        // A chunk whose runs were found out of the map has no slot a row until something below
+        // reads them that way, and most chunks have nothing that does: the count and the calls
+        // that fold by run read the runs. Writing a slot for every row as the runs were found was
+        // a tenth of the fold of ClickBench 28. The runs are over every row by now, a marked
+        // chunk's included, so they fill the slots the rows' own way round.
+        let mut unfilled = runs_found;
+        let mut fill_now = |slots: &mut Vec<usize>, runs: &[(usize, usize)]| {
+            if std::mem::take(&mut unfilled) {
+                fill_slots(slots, runs);
             }
         };
         if self.compact_numeric {
-            spread_now(slots);
+            fill_now(slots, slot_runs);
             let sum = arguments[1].first().expect("SUM has one argument");
             let mean = arguments[2].first().expect("AVG has one argument");
             let sum_flat = flat_smallint(sum);
@@ -2749,7 +2756,7 @@ impl<'a> Aggregate<'a> {
                     start = end;
                 }
             } else {
-                spread_now(slots);
+                fill_now(slots, slot_runs);
                 for &slot in slots.iter() {
                     if slot != NOWHERE {
                         counts[slot] += 1;
@@ -2771,7 +2778,7 @@ impl<'a> Aggregate<'a> {
                 continue;
             }
             if call.distinct {
-                spread_now(slots);
+                fill_now(slots, slot_runs);
                 aside += self.distinct(states, seen, seen_rows, slots, at, given)?;
                 continue;
             }
@@ -2781,7 +2788,7 @@ impl<'a> Aggregate<'a> {
             {
                 continue;
             }
-            spread_now(slots);
+            fill_now(slots, slot_runs);
             let (picked, tallied) = match &filters[at] {
                 None => {
                     let rows = slots.len().min(*length);
@@ -4257,6 +4264,14 @@ fn nowhere(slots: &mut Vec<usize>, rows: usize) -> &mut [usize] {
     slots.clear();
     slots.resize(rows, NOWHERE);
     slots
+}
+
+/// Every row's slot, out of runs of one slot each and the row each ends before.
+fn fill_slots(slots: &mut Vec<usize>, runs: &[(usize, usize)]) {
+    slots.clear();
+    for &(slot, end) in runs {
+        slots.resize(end, slot);
+    }
 }
 
 /// Moves the slot of each kept row to the row it was kept from, `all` rows long, and puts every
