@@ -1383,6 +1383,16 @@ impl Gather {
         self.counts.sketch(0).map(|sketch| sketch.distinct())
     }
 
+    /// The lowest and highest value of an integer column, when every value it saw had one.
+    pub(crate) fn span(&self) -> Option<(i128, i128)> {
+        match (&self.pass.low, &self.pass.high) {
+            (Some(Bound::Int(low)), Some(Bound::Int(high))) if self.pass.bounded => {
+                Some((*low, *high))
+            }
+            _ => None,
+        }
+    }
+
     /// Every non-null value of the column with the rows holding it, and the rows holding a null,
     /// while the tally still holds the whole column.
     ///
