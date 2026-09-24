@@ -2169,6 +2169,8 @@ impl Vector {
         if let Body::Constant(value) = &self.body {
             return Ok(Self::constant(ty, enum_position(&self.ty, value)?, self.len));
         }
+        // flatten: an enum's codes are its dictionary's codes read as integers, and a dictionary
+        // or run form would need the same relabelling done inside it, so the one flat copy is it.
         let flat = self.flatten()?;
         Ok(Self { ty, ..flat })
     }
