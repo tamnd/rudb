@@ -268,6 +268,11 @@ pub fn select_prepared(
                 &left_valid.and(&right_valid, len),
             ));
         }
+        if left_valid == Validity::AllValid {
+            if let Some(kept) = flat_against_literal(op, left, right, held) {
+                return Ok(kept);
+            }
+        }
         if let Some(answers) =
             specialized(op, left, right, &left_valid, &right_valid, len, identity, held)
         {
@@ -277,6 +282,82 @@ pub fn select_prepared(
         }
     }
     Ok(crate::select::selection(&compare_prepared(op, left, right, held)?, len))
+}
+
+/// The rows of a flat integer column with no nulls that hold against a literal, in one pass.
+///
+/// The common shape of a scan's first filter, `AdvEngineID <> 0` on ClickBench Q1. The general
+/// path gets there in two passes: an ordering per row into a run of booleans, through index
+/// closures the loop cannot see past, and then [`crate::select::picked`] over the booleans. Here
+/// the literal is compared in place and the row goes straight into the selection, so the loop is a
+/// load, a compare and a store, and it no longer writes a byte per row that is read once and thrown
+/// away. Floats are left to the general path, because their order is DuckDB's rather than the
+/// machine's.
+fn flat_against_literal(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    held: Option<&Held>,
+) -> Option<Selection> {
+    if op.is_total() || left.logical_type() != right.logical_type() {
+        return None;
+    }
+    let data = left.data()?;
+    let column = readied(held, left.logical_type(), right.constant_value()?)?;
+    let literal = column.data()?;
+    macro_rules! layouts {
+        ($(($variant:ident, $native:ty)),+ $(,)?) => {
+            match (data, literal) {
+                $(
+                    (Data::$variant(values), Data::$variant(wanted)) => {
+                        let wanted = *wanted.first()?;
+                        let values = values.get(..left.len())?;
+                        Some(match op {
+                            Comparison::Equal => kept_where(values, |value| value == wanted),
+                            Comparison::NotEqual => kept_where(values, |value| value != wanted),
+                            Comparison::Less => kept_where(values, |value| value < wanted),
+                            Comparison::LessOrEqual => kept_where(values, |value| value <= wanted),
+                            Comparison::Greater => kept_where(values, |value| value > wanted),
+                            Comparison::GreaterOrEqual => {
+                                kept_where(values, |value| value >= wanted)
+                            }
+                            Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
+                        })
+                    }
+                )+
+                _ => None,
+            }
+        };
+    }
+    layouts!(
+        (Int8, i8),
+        (Int16, i16),
+        (Int32, i32),
+        (Int64, i64),
+        (Int128, i128),
+        (UInt8, u8),
+        (UInt16, u16),
+        (UInt32, u32),
+        (UInt64, u64),
+        (UInt128, u128),
+    )
+}
+
+/// The positions of `values` that `held` keeps, written without a branch on the answer.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the caller checked that the row count fits in a u32 before getting here"
+)]
+#[inline]
+fn kept_where<T: Copy>(values: &[T], held: impl Fn(T) -> bool) -> Selection {
+    let mut out = vec![0_u32; values.len()];
+    let mut kept = 0;
+    for (index, &value) in values.iter().enumerate() {
+        out[kept] = index as u32;
+        kept += usize::from(held(value));
+    }
+    out.truncate(kept);
+    Selection::from_indices(out)
 }
 
 /// The rows of `kept` the comparison also keeps.
