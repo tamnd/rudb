@@ -179,6 +179,13 @@ const DEMOTED: &[u8; 8] = b"RUDBDM1\0";
 /// that safe to add without a format bump, because a table with no sections answers every query
 /// the way it did before, only without the graph path.
 const SECTIONS: &[u8; 8] = b"RUDBSE1\0";
+/// The table's primary, unique and foreign keys, written only when it has any.
+///
+/// Same convention as [`CLUSTERING`]: a table with no constraint writes no block, so every file that
+/// has none is the bytes it always was, and a build that predates the block refuses a file with one
+/// with `directory extension magic differs`. That is the right answer, because a build that dropped
+/// the keys would take a row that repeats one.
+const KEYS: &[u8; 8] = b"RUDBKY1\0";
 /// How many bytes of each column's global dictionary live outside its page, written only when any do.
 ///
 /// From format 27 a dictionary's payload blocks are written into the file while the load runs, so
@@ -1109,6 +1116,40 @@ pub struct Table {
     /// only the time, so a table with none here answers every query the same way and slower. That
     /// is what lets this field arrive without a migration.
     sections: Vec<Section>,
+    /// The keys and foreign keys the table was created with, which the file keeps so that a
+    /// reopened table refuses the rows it refused before.
+    constraints: Constraints,
+}
+
+/// A table's primary, unique and foreign keys, as the file stores them.
+///
+/// Columns are places in the table, and a foreign key names the table it points at by name alone,
+/// because every table in one file is in one schema.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Constraints {
+    /// Each key's columns, and whether it is the primary key rather than a unique one.
+    pub keys: Vec<(Vec<u16>, bool)>,
+    /// Each foreign key.
+    pub foreign: Vec<StoredForeign>,
+}
+
+impl Constraints {
+    /// Whether there is nothing here, which is what writes no block.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.foreign.is_empty()
+    }
+}
+
+/// One `FOREIGN KEY`, as the file stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredForeign {
+    /// The columns of this table.
+    pub columns: Vec<u16>,
+    /// The table it points at.
+    pub table: String,
+    /// The columns of that table, paired with `columns` one for one.
+    pub referenced: Vec<u16>,
 }
 
 impl Table {
@@ -1140,6 +1181,12 @@ impl Table {
     #[must_use]
     pub fn clustering(&self) -> Option<&Clustering> {
         self.clustering.as_ref()
+    }
+
+    /// The keys and foreign keys this table was created with.
+    #[must_use]
+    pub fn constraints(&self) -> &Constraints {
+        &self.constraints
     }
 
     /// The generation every section of this table is judged against.
@@ -2210,6 +2257,7 @@ impl Writer {
                 frequency_texts: Vec::new(),
                 host_groups: None,
                 clustering: None,
+                constraints: Constraints::default(),
                 generation,
                 sections: Vec::new(),
             },
@@ -2284,6 +2332,7 @@ impl Writer {
                 frequency_texts: Vec::new(),
                 host_groups: None,
                 clustering: None,
+                constraints: Constraints::default(),
                 generation: 1,
                 sections: Vec::new(),
             },
@@ -2391,6 +2440,7 @@ impl Writer {
                 frequency_texts: Vec::new(),
                 host_groups: None,
                 clustering: None,
+                constraints: Constraints::default(),
                 generation,
                 sections: Vec::new(),
             },
@@ -2457,6 +2507,29 @@ impl Writer {
             clustering.width(),
             &self.table.fields,
         )?);
+        Ok(self)
+    }
+
+    /// Records the keys and foreign keys of the table the writer is on, which come back out of
+    /// [`Table::constraints`]. Nothing here checks the rows against them, since the catalog already
+    /// did before it let the rows in.
+    ///
+    /// # Errors
+    ///
+    /// If a key or a foreign key names a column this table does not have, or has no columns.
+    pub fn constrain(mut self, constraints: Constraints) -> Result<Self> {
+        let width = self.table.fields.len();
+        let fits = |columns: &[u16]| {
+            !columns.is_empty() && columns.iter().all(|&column| usize::from(column) < width)
+        };
+        if !constraints.keys.iter().all(|(columns, _)| fits(columns))
+            || !constraints.foreign.iter().all(|foreign| {
+                fits(&foreign.columns) && foreign.referenced.len() == foreign.columns.len()
+            })
+        {
+            return Err(invalid("a constraint names a column the table does not have"));
+        }
+        self.table.constraints = constraints;
         Ok(self)
     }
 
@@ -8182,6 +8255,25 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             );
         }
     }
+    if !table.constraints.is_empty() {
+        out.extend_from_slice(KEYS);
+        put_count(&mut out, table.constraints.keys.len())?;
+        for (columns, primary) in &table.constraints.keys {
+            out.push(u8::from(*primary));
+            put_columns(&mut out, columns)?;
+        }
+        put_count(&mut out, table.constraints.foreign.len())?;
+        for foreign in &table.constraints.foreign {
+            put_columns(&mut out, &foreign.columns)?;
+            put_columns(&mut out, &foreign.referenced)?;
+            put_u32(
+                &mut out,
+                u32::try_from(foreign.table.len())
+                    .map_err(|_| invalid("table name is too long"))?,
+            );
+            out.extend_from_slice(foreign.table.as_bytes());
+        }
+    }
     // The section table, last, behind its own magic, for the same reason the frequency block is
     // behind its own: a reader that stops before it gets a table with no sections, and a table with
     // no sections is a correct table. The one difference from the blocks before it is that this one
@@ -9757,6 +9849,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut seen_sections = false;
     let mut dictionary_payloads = Vec::new();
     let mut seen_payloads = false;
+    let mut constraints = Constraints::default();
     // Zero until a section table says otherwise, which is what a format 22 table gets and what
     // makes every section stamp fail to match on one, because real generations start at one.
     let mut generation = 0;
@@ -10003,6 +10096,38 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 }
                 dictionary_payloads.push(bytes);
             }
+        } else if &tag == KEYS {
+            if !constraints.is_empty() {
+                return Err(invalid("directory names two key blocks"));
+            }
+            let fits = |columns: &[u16]| {
+                !columns.is_empty() && columns.iter().all(|&column| usize::from(column) < width)
+            };
+            let count = cur.u16()? as usize;
+            for _ in 0..count {
+                let primary = cur.u8()? != 0;
+                let columns = columns_of(&mut cur)?;
+                if !fits(&columns) {
+                    return Err(invalid("a stored key names a column the table does not have"));
+                }
+                constraints.keys.push((columns, primary));
+            }
+            let count = cur.u16()? as usize;
+            for _ in 0..count {
+                let columns = columns_of(&mut cur)?;
+                let referenced = columns_of(&mut cur)?;
+                let len = cur.u32()? as usize;
+                let table = std::str::from_utf8(cur.take(len)?)
+                    .map_err(|_| invalid("a foreign key's table name is not UTF-8"))?
+                    .to_owned();
+                if !fits(&columns) || referenced.len() != columns.len() || table.is_empty() {
+                    return Err(invalid("a stored foreign key does not match its table"));
+                }
+                constraints.foreign.push(StoredForeign { columns, table, referenced });
+            }
+            if constraints.is_empty() {
+                return Err(invalid("a key block holds no key"));
+            }
         } else {
             return Err(invalid("directory extension magic differs"));
         }
@@ -10037,7 +10162,29 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         clustering,
         generation,
         sections,
+        constraints,
     })
+}
+
+/// How many keys or columns follow, in the key block.
+fn put_count(out: &mut Vec<u8>, count: usize) -> Result<()> {
+    put_u16(out, u16::try_from(count).map_err(|_| invalid("too many constraints"))?);
+    Ok(())
+}
+
+/// A count and then that many column places, the layout the key block uses for every list.
+fn put_columns(out: &mut Vec<u8>, columns: &[u16]) -> Result<()> {
+    put_count(out, columns.len())?;
+    for &column in columns {
+        put_u16(out, column);
+    }
+    Ok(())
+}
+
+/// What [`put_columns`] wrote, for a list of columns.
+fn columns_of(cur: &mut Cursor<'_>) -> Result<Vec<u16>> {
+    let count = cur.u16()? as usize;
+    (0..count).map(|_| cur.u16()).collect()
 }
 
 /// A zone map's end, in the layout `rudb_common::bounds` defines. See [`Cursor::bound`].
@@ -12973,6 +13120,7 @@ mod tests {
             frequency_texts: Vec::new(),
             host_groups: None,
             clustering: None,
+            constraints: Constraints::default(),
             generation: 1,
             sections,
         }
@@ -16838,6 +16986,7 @@ mod tests {
             frequency_texts: Vec::new(),
             host_groups: None,
             clustering: None,
+            constraints: Constraints::default(),
             generation: 1,
             sections: Vec::new(),
         };
