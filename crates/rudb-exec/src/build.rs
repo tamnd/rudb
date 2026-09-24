@@ -70,8 +70,8 @@ use crate::enginenames::{
     version,
 };
 use crate::entrynames::{
-    columnnames, databasenames, indexnames, schemanames, sequencenames, showdatabases, showtables,
-    showtablesexpanded, tablenames, viewnames,
+    columnnames, constraintnames, databasenames, indexnames, schemanames, sequencenames,
+    showdatabases, showtables, showtablesexpanded, tablenames, viewnames,
 };
 use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
@@ -1494,6 +1494,7 @@ impl<'a> Building<'a, '_> {
                 | TableFunction::DuckdbViews
                 | TableFunction::DuckdbSequences
                 | TableFunction::DuckdbIndexes
+                | TableFunction::DuckdbConstraints
                 | TableFunction::DuckdbColumns
                 | TableFunction::DuckdbExtensions
                 | TableFunction::DuckdbOptimizers
@@ -1531,6 +1532,9 @@ impl<'a> Building<'a, '_> {
                         sequencenames(self.catalog, plan, index, columns)?
                     }
                     TableFunction::DuckdbIndexes => indexnames(self.catalog, plan, index, columns)?,
+                    TableFunction::DuckdbConstraints => {
+                        constraintnames(self.catalog, plan, index, columns)?
+                    }
                     TableFunction::DuckdbColumns => {
                         columnnames(self.catalog, plan, index, columns)?
                     }

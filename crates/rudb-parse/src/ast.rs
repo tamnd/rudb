@@ -222,6 +222,22 @@ pub struct CreateTable {
     /// The referenced columns of each of `foreign`, as a run of name lists, an empty one when the
     /// constraint named none and so means the referenced table's primary key.
     pub foreign_referenced: Slice,
+    /// Every constraint in the order written, as a run of [`Constraint`], which is the order the pin
+    /// lists them in. A `NOT NULL` a primary key implies is not here, since nobody wrote it.
+    pub order: Slice,
+}
+
+/// One constraint of a `CREATE TABLE`, by its place in the list of its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Constraint {
+    /// One of `CreateTable::keys`.
+    Key(u32),
+    /// One of `CreateTable::checks`.
+    Check(u32),
+    /// One of `CreateTable::foreign`.
+    Foreign(u32),
+    /// A `NOT NULL` written on the column at this place.
+    NotNull(u32),
 }
 
 /// One column of a `CREATE TABLE`.
@@ -1282,6 +1298,8 @@ pub struct Ast {
     pub case_arms: Vec<CaseArm>,
     /// The `CREATE TABLE` arena.
     pub create_tables: Vec<CreateTable>,
+    /// Backing store for every [`Slice`] of constraints.
+    pub constraints: Vec<Constraint>,
     /// The `CREATE VIEW` arena.
     pub create_views: Vec<CreateView>,
     /// The `DROP TABLE` arena.
@@ -1464,6 +1482,12 @@ impl Ast {
     /// The column definitions of a `CREATE TABLE`.
     pub fn column_defs(&self, slice: Slice) -> &[ColumnDef] {
         &self.column_defs[slice.range()]
+    }
+
+    /// The constraints of a run, in the order written.
+    #[must_use]
+    pub fn constraint_list(&self, slice: Slice) -> &[Constraint] {
+        &self.constraints[slice.range()]
     }
 
     /// The names of a name list, each of which is itself a run of parts.

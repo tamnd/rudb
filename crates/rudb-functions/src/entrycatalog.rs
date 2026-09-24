@@ -160,6 +160,29 @@ pub fn index_fields() -> Vec<Field> {
     ]
 }
 
+/// The columns of `duckdb_constraints()`, in the pin's order.
+#[must_use]
+pub fn constraint_fields() -> Vec<Field> {
+    let names = LogicalType::List(Box::new(LogicalType::Varchar));
+    vec![
+        Field::new("database_name", LogicalType::Varchar),
+        Field::new("database_oid", LogicalType::BigInt),
+        Field::new("schema_name", LogicalType::Varchar),
+        Field::new("schema_oid", LogicalType::BigInt),
+        Field::new("table_name", LogicalType::Varchar),
+        Field::new("table_oid", LogicalType::BigInt),
+        Field::new("constraint_index", LogicalType::BigInt),
+        Field::new("constraint_type", LogicalType::Varchar),
+        Field::new("constraint_text", LogicalType::Varchar),
+        Field::new("expression", LogicalType::Varchar),
+        Field::new("constraint_column_indexes", LogicalType::List(Box::new(LogicalType::BigInt))),
+        Field::new("constraint_column_names", names.clone()),
+        Field::new("constraint_name", LogicalType::Varchar),
+        Field::new("referenced_table", LogicalType::Varchar),
+        Field::new("referenced_column_names", names),
+    ]
+}
+
 /// The one column `PRAGMA show_tables` returns.
 ///
 /// Named `name` and nothing else, because the statement answers what is in reach of an unqualified

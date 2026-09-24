@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
-    AlterAction, Ast, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, CreateTable,
-    CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert, JoinKind, LiteralKind,
-    Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef,
-    SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target, Transaction, UnaryOp,
-    WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    AlterAction, Ast, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
+    CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert, JoinKind,
+    LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope, Select,
+    SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target, Transaction,
+    UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -104,8 +104,13 @@ type Foreign = (Slice, Slice, Slice);
 
 /// Where the constraints of a `CREATE TABLE` are collected: the keys, which of them is primary,
 /// the checks and the foreign keys.
-type Constraints<'c> =
-    (&'c mut Vec<Slice>, &'c mut u32, &'c mut Vec<ExprRef>, &'c mut Vec<Foreign>);
+type Constraints<'c> = (
+    &'c mut Vec<Slice>,
+    &'c mut u32,
+    &'c mut Vec<ExprRef>,
+    &'c mut Vec<Foreign>,
+    &'c mut Vec<Constraint>,
+);
 
 struct Transform<'a> {
     query: &'a str,
@@ -1358,9 +1363,10 @@ impl<'a> Transform<'a> {
         let mut primary = NONE;
         let mut checks = Vec::new();
         let mut foreign = Vec::new();
+        let mut order = Vec::new();
         let (columns, query) = match self.name(body) {
             "CreateColumnList" => {
-                let constraints = (&mut keys, &mut primary, &mut checks, &mut foreign);
+                let constraints = (&mut keys, &mut primary, &mut checks, &mut foreign, &mut order);
                 (self.column_list(body, name, constraints)?, NONE)
             }
             "CreateTableAs" => self.create_table_as(body)?,
@@ -1372,6 +1378,9 @@ impl<'a> Transform<'a> {
         let foreign_referenced =
             self.name_list_slice(foreign.iter().map(|f: &Foreign| f.2).collect());
         let foreign = self.name_list_slice(foreign.iter().map(|f: &Foreign| f.0).collect());
+        let start = self.ast.constraints.len() as u32;
+        self.ast.constraints.extend(order);
+        let order = Slice { start, len: self.ast.constraints.len() as u32 - start };
         let index = self.ast.create_tables.len() as u32;
         self.ast.create_tables.push(CreateTable {
             name,
@@ -1386,6 +1395,7 @@ impl<'a> Transform<'a> {
             foreign,
             foreign_tables,
             foreign_referenced,
+            order,
         });
         Ok(Statement::CreateTable(index))
     }
@@ -1444,7 +1454,7 @@ impl<'a> Transform<'a> {
         &mut self,
         node: u32,
         table: Slice,
-        (keys, primary, checks, foreign): Constraints<'_>,
+        (keys, primary, checks, foreign, order): Constraints<'_>,
     ) -> Result<Slice> {
         for kid in self.kids(node) {
             if matches!(self.name(kid), "PartitionOptions" | "SortedOptions" | "WithList") {
@@ -1461,7 +1471,9 @@ impl<'a> Transform<'a> {
         for element in self.kids(list) {
             let inner = self.first(element);
             if self.name(inner) == "CreateTableColumnDefinition" {
-                let (def, marks) = self.column_definition(self.first(inner), checks, foreign)?;
+                let at = (defs.len() as u32, keys.len() as u32);
+                let (def, marks) =
+                    self.column_definition(self.first(inner), checks, foreign, (order, at))?;
                 for is_primary in marks {
                     let names = self.part_slice(vec![def.name]);
                     self.add_key(table, names, is_primary, keys, primary)?;
@@ -1474,6 +1486,7 @@ impl<'a> Transform<'a> {
             let mut found = Vec::new();
             self.named_nodes(inner, "TopCheckConstraint", &mut found);
             if let Some(&check) = found.first() {
+                order.push(Constraint::Check(checks.len() as u32));
                 checks.push(self.check(check)?);
                 continue;
             }
@@ -1491,6 +1504,7 @@ impl<'a> Transform<'a> {
                 let count = names.len();
                 let names = self.part_slice(names);
                 let references = self.find(constraint, "ForeignKeyConstraint");
+                order.push(Constraint::Foreign(foreign.len() as u32));
                 foreign.push(self.foreign_key(references, names, count)?);
                 continue;
             }
@@ -1515,6 +1529,7 @@ impl<'a> Transform<'a> {
                 names.push(self.intern(&text));
             }
             let names = self.part_slice(names);
+            order.push(Constraint::Key(keys.len() as u32));
             self.add_key(table, names, is_primary, keys, primary)?;
         }
         Ok(self.column_def_slice(defs))
@@ -1616,6 +1631,7 @@ impl<'a> Transform<'a> {
         node: u32,
         checks: &mut Vec<ExprRef>,
         foreign: &mut Vec<Foreign>,
+        (order, (column, key_base)): (&mut Vec<Constraint>, (u32, u32)),
     ) -> Result<(ColumnDef, Vec<bool>)> {
         let name = self.identifier(self.find(node, "DottedIdentifier"));
         let type_node = self.find(node, "Type");
@@ -1639,15 +1655,26 @@ impl<'a> Transform<'a> {
             match self.name(constraint) {
                 "NotNullConstraint" => {
                     not_null = self.name(self.first(constraint)) == "NotNullColumnConstraint";
+                    order.retain(|&held| held != Constraint::NotNull(column));
+                    if not_null {
+                        order.push(Constraint::NotNull(column));
+                    }
                 }
-                "PrimaryKeyConstraint" => keys.push(true),
-                "UniqueConstraint" => keys.push(false),
+                // The key goes in once the column is made, at the place counted here.
+                "PrimaryKeyConstraint" | "UniqueConstraint" => {
+                    order.push(Constraint::Key(key_base + keys.len() as u32));
+                    keys.push(self.name(constraint) == "PrimaryKeyConstraint");
+                }
                 "DefaultValue" => {
                     default = self.expr(self.find(constraint, "ColumnDefaultExpr"))?;
                 }
-                "CheckConstraint" => checks.push(self.check(constraint)?),
+                "CheckConstraint" => {
+                    order.push(Constraint::Check(checks.len() as u32));
+                    checks.push(self.check(constraint)?);
+                }
                 "ForeignKeyConstraint" => {
                     let names = self.part_slice(vec![name]);
+                    order.push(Constraint::Foreign(foreign.len() as u32));
                     foreign.push(self.foreign_key(constraint, names, 1)?);
                 }
                 _ => return self.unsupported(constraint),
