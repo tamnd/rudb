@@ -1882,7 +1882,7 @@ fn index(
     links: &str,
     pages: &rudb_native::PagePool,
 ) -> Result<()> {
-    let declared = rudb_graph::parse_links(links).unwrap_or_default();
+    let declared = rudb_exec::declared(catalog, links);
     if declared.is_empty() {
         return Ok(());
     }
@@ -2813,8 +2813,9 @@ impl Shared {
         }
         let declared = self.inner.settings.links();
         // The common case by a long way, and the one worth not taking a lock for: no relationship
-        // is declared, so there is nothing to look for and nothing to cache.
-        if declared.is_empty() {
+        // is declared, either by the setting or by a foreign key, so there is nothing to look for
+        // and nothing to cache.
+        if declared.is_empty() && catalog.tables().all(|table| table.foreign().is_empty()) {
             return Arc::default();
         }
         let generation = catalog.generation();
@@ -2842,7 +2843,7 @@ impl Shared {
     /// there is no link to find for it whatever this did.
     fn related(catalog: &Catalog, declared: &str) -> Vec<rudb_opt::link::Linked> {
         let mut found = Vec::new();
-        for link in rudb_graph::parse_links(declared).unwrap_or_default() {
+        for link in rudb_exec::declared(catalog, declared) {
             // One column each, or two each for a key like `partsupp`'s. Anything wider has no
             // stored form, so there is nothing to plan over.
             let (child_keys, parent_keys) = (&link.child.columns, &link.parent.columns);

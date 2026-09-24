@@ -141,6 +141,7 @@ mod tests;
 
 pub use build::{build, build_measured, build_measured_into, build_with};
 pub use expr::{evaluate, evaluate_all};
+pub use links::declared;
 pub use prepared::{Prepared, Scratch};
 pub use query::Query;
 pub use register::registries;
