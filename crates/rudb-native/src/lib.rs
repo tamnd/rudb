@@ -4158,6 +4158,8 @@ pub struct Reader {
     /// summary inline, but a larger one otherwise rereads and decodes the same section on every
     /// plan and every summary-backed aggregate.
     frequency_summaries: Arc<Vec<OnceLock<Arc<FrequencySummary>>>>,
+    /// Each column's summary, the first time anything asks for it. See `stats::held_summary`.
+    summaries: Arc<Vec<OnceLock<Option<Arc<rudb_stats::Summary>>>>>,
     /// How many global dictionaries have been opened. A scan of a dictionary column should open its
     /// dictionary once however many workers it has, and the test that says so is the only thing
     /// keeping it that way.
@@ -6251,6 +6253,7 @@ impl Reader {
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
             frequency_values: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             frequency_summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
+            summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
             part_ranges: Arc::new(part_ranges),
