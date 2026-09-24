@@ -478,10 +478,11 @@ pub struct BuiltLink {
 
 /// Builds a forward link for each relationship and attaches each child table's in one commit.
 ///
-/// The parent's key map has to be in the file already. Section 3.8 is explicit that this is a
-/// second pass at checkpoint time for exactly that reason, so a missing key map here is a note on
-/// the report rather than an error: the relationship is one the file does not accelerate, and by
-/// section 3.1 that changes no answer.
+/// The parent's key map is the one the file holds when there is one, and otherwise one built here
+/// for the link and dropped once the link is written, so a key map the budget refused does not take
+/// the link with it. A parent key that is not unique is a note on the report rather than an
+/// error: the relationship is one the file does not accelerate, and by section 3.1 that changes no
+/// answer.
 ///
 /// # Errors
 ///
@@ -709,8 +710,14 @@ fn one_link(
     ))
 }
 
-/// The parent's key map for one link: the stored one for a key over one column, and one built here
-/// for a pair.
+/// The parent's key map for one link: the stored one when the file keeps one, and one built here
+/// when it does not.
+///
+/// A key map that the budget turned away still has to be built for the link, because the link is
+/// the smaller structure and the more useful one. `orders` stored by date needs the permuted form
+/// for `o_orderkey`, which is 4.7 MB on SF1 against a budget that is about four, while the
+/// `lineitem -> orders` link it lets the build write is under 1 MB and monotone. Refusing the link
+/// because the map was refused would make the one structure depend on the budget of the other.
 ///
 /// A pair's map is not kept, because nothing reads it but this build. The query follows the link and
 /// never looks a key up, and the map a pair needs is the expensive kind: its keys are sparse, so it
@@ -719,8 +726,9 @@ fn one_link(
 /// read of two parent columns per checkpoint, which is less than the child scan beside it.
 fn parent_map(parent: &Reader, edge: &Edge) -> std::result::Result<KeyMap, String> {
     if columns_of(edge.parent_column).len() == 1 {
-        return key_map(parent, edge.parent_column)
-            .ok_or_else(|| format!("no key map is stored for {}", edge.parent));
+        if let Some(stored) = key_map(parent, edge.parent_column) {
+            return Ok(stored);
+        }
     }
     KeyColumn::new(parent, edge.parent_column)
         .and_then(|keys| KeyMap::build_from(&keys))
@@ -1536,9 +1544,9 @@ mod tests {
     }
 
     #[test]
-    fn a_parent_with_no_key_map_is_a_relationship_with_no_link_rather_than_an_error() {
-        // Section 3.8's ordering is the reason: the key map has to exist first, and a checkpoint
-        // that has not built one yet is a normal state rather than a broken one.
+    fn a_parent_with_no_key_map_stored_gets_its_link_from_a_map_built_for_it() {
+        // A key map the budget turned away, or one nobody asked for, is not a reason to go without
+        // the link: the build makes the map it needs and keeps only the link.
         let path = table_of("unmapped", &(1..=100_i64).map(Some).collect::<Vec<_>>());
         let mut writer = Writer::open(&path, "child", vec![Field::new("fk", LogicalType::BigInt)])
             .expect("a second table");
@@ -1552,13 +1560,15 @@ mod tests {
         writer.finish().expect("commit");
 
         let report = build_links(&path, &[edge()]).expect("build");
-        assert!(!report[0].built);
-        assert_eq!(report[0].note.as_deref(), Some("no key map is stored for parent"));
+        assert!(report[0].built, "{:?}", report[0].note);
 
         let catalog = Catalog::open(&path).expect("reopen");
         let child = catalog.table("child").expect("the child");
         let parent = catalog.table("parent").expect("the parent");
-        assert!(stored_link(&child, &parent, &edge()).is_none());
+        assert!(key_map(&parent, 0).is_none(), "the map it was built with is not kept");
+        let link = stored_link(&child, &parent, &edge()).expect("the link is kept");
+        assert_eq!(link.linked(), 100);
+        assert_eq!(link.forward(99), Some(99));
 
         fs::remove_file(&path).expect("clean up");
     }
@@ -1694,7 +1704,7 @@ mod tests {
 
         let report = build_links(&path, &[edge()]).expect("build");
         assert!(!report[0].built);
-        assert_eq!(report[0].note.as_deref(), Some("no key map is stored for parent"));
+        assert_eq!(report[0].note.as_deref(), Some("the key of parent is not unique"));
 
         fs::remove_file(&path).expect("clean up");
     }

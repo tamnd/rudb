@@ -206,6 +206,17 @@ mod tests {
     }
 
     #[test]
+    fn the_permuted_form_round_trips_with_its_bitmap_index_and_rids() {
+        // Keys a third of their range, stored in an order that is not theirs, the shape of
+        // `o_orderkey` on a file clustered by date.
+        let column: Vec<Option<i128>> =
+            (0..5_000_i128).map(|at| Some((at * 7_919 % 5_000) * 3)).collect();
+        let map = survives(&column);
+        assert_eq!(map.form(), Form::Permuted);
+        assert_eq!(map.lookup(1).expect("lookup"), None);
+    }
+
+    #[test]
     fn a_column_with_nulls_round_trips_and_keeps_its_null_count() {
         let column = vec![Some(10), None, Some(20), None, Some(30)];
         let map = survives(&column);
