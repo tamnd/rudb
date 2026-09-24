@@ -32,6 +32,7 @@
 
 use rudb_common::{Error, Result};
 
+use crate::bits::BitVector;
 use crate::link::Link;
 use crate::rid::{NO_PARENT, PART_ROWS, Rid};
 
@@ -318,6 +319,9 @@ impl Rids {
         if self.is_full() && link.linked() == children {
             return Ok(Pushed { rids: Self::full(children), parts, skipped: 0, stopped: false });
         }
+        if let Some(runs) = link.runs() {
+            return Ok(self.push_runs(runs, children, parts, stopping));
+        }
         let mut words = vec![0_u64; index(children.div_ceil(64))];
         let mut parents = vec![NO_PARENT; PART_ROWS];
         let mut skipped = 0_u64;
@@ -359,6 +363,68 @@ impl Rids {
             }
         }
         Ok(Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false })
+    }
+
+    /// The push over a monotone link, a parent at a time.
+    ///
+    /// The children of one parent are one run of ones in the link, so a parent the set holds keeps
+    /// the whole run and one it does not keep none of it. The walk is then one step a parent and a
+    /// range of bits set, where reading the link a child at a time is one step a child and a test
+    /// of the set in each. On `lineitem` against `orders` that is a million and a half steps rather
+    /// than six million, see spec/perf/52-a-push-a-parent-at-a-time.md.
+    ///
+    /// A part is counted as skipped when none of its rows is kept, which for a link in parent order
+    /// is the part the zone map would have ruled out. The early stop is asked at the first run
+    /// that starts past the mark rather than at a part boundary, which is the same question asked a
+    /// few rows later at most.
+    fn push_runs(&self, runs: &BitVector, children: u64, parts: u64, stopping: bool) -> Pushed {
+        let mut words = vec![0_u64; index(children.div_ceil(64))];
+        let bits = runs.words();
+        let len = runs.len();
+        let mark = children.div_ceil(STOP_AFTER);
+        let mut asked = !stopping;
+        let (mut parent, mut child, mut kept, mut at) = (0_u64, 0_u64, 0_u64, 0_usize);
+        // A sparse set is asked in ascending order, so a cursor into it does what a binary search
+        // a parent would.
+        let mut cursor = 0;
+        while at < len {
+            let run = count(ones_from(bits, at, len));
+            if run > 0 {
+                if !asked && child >= mark {
+                    asked = true;
+                    if kept == child {
+                        return Pushed {
+                            rids: Self::full(children),
+                            parts,
+                            skipped: 0,
+                            stopped: true,
+                        };
+                    }
+                }
+                let held = match &self.body {
+                    Body::Full => true,
+                    Body::Dense { words, .. } => bit(words, parent),
+                    Body::Sparse(members) => {
+                        while members.get(cursor).is_some_and(|&member| member < parent) {
+                            cursor += 1;
+                        }
+                        members.get(cursor) == Some(&parent)
+                    }
+                };
+                if held {
+                    set_range(&mut words, child, child + run);
+                    kept += run;
+                }
+                child += run;
+            }
+            // The zero after the run, which moves on to the next parent.
+            at += index(run) + 1;
+            parent += 1;
+        }
+        let per_part = PART_ROWS / 64;
+        let skipped =
+            count(words.chunks(per_part).filter(|part| part.iter().all(|&word| word == 0)).count());
+        Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
     }
 
     /// Pushes a set of child rows backward through `link`, to the parents they point at.
@@ -477,6 +543,35 @@ fn shape(rows: u64, members: u64) -> Form {
 /// Whether bit `at` of a bitmap is set.
 fn bit(words: &[u64], at: u64) -> bool {
     words.get(index(at / 64)).is_some_and(|word| word >> (at % 64) & 1 == 1)
+}
+
+/// How many one bits in a row start at bit `at`, stopping at `len`.
+fn ones_from(bits: &[u64], at: usize, len: usize) -> usize {
+    let mut end = at;
+    while end < len {
+        let shift = end % 64;
+        // The shift brings in zeros at the top, which the negation turns into ones, so the count
+        // stops at the end of the word at the latest.
+        let word = bits.get(end / 64).copied().unwrap_or(0) >> shift;
+        let found = (!word).trailing_zeros() as usize;
+        if found < 64 - shift {
+            return (end + found).min(len) - at;
+        }
+        end += 64 - shift;
+    }
+    len - at
+}
+
+/// Sets the bits from `from` up to but not including `to`.
+fn set_range(words: &mut [u64], from: u64, to: u64) {
+    let (mut at, to) = (index(from), index(to));
+    while at < to {
+        let shift = at % 64;
+        let take = (64 - shift).min(to - at);
+        let mask = if take == 64 { u64::MAX } else { ((1_u64 << take) - 1) << shift };
+        words[at / 64] |= mask;
+        at += take;
+    }
 }
 
 /// The set bits of a bitmap, in order.
@@ -652,6 +747,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The monotone push a parent at a time against the definition a child at a time, on a link
+    /// where some parents have no children and some have runs that cross words and parts.
+    #[test]
+    fn a_push_a_parent_at_a_time_keeps_exactly_the_children_of_the_parents_held() {
+        let parents: u64 = 2000;
+        // Parent p has p % 7 children, and every hundredth one has three hundred, so runs are
+        // empty, short and longer than a word.
+        let sizes: Vec<u64> =
+            (0..parents).map(|p| if p % 100 == 42 { 300 } else { p % 7 }).collect();
+        let of: Vec<Rid> =
+            (0..parents).flat_map(|p| std::iter::repeat_n(p, index(sizes[index(p)]))).collect();
+        let children = count(of.len());
+        let link = Link::build(&of, parents).expect("a link");
+        assert_eq!(link.form(), crate::link::Form::Monotone);
+        for set in [
+            Rids::none(parents),
+            Rids::from_sorted(parents, vec![0, 42, 1999]).expect("sorted"),
+            Rids::from_sorted(parents, (0..parents).filter(|p| p % 3 != 0).collect())
+                .expect("sorted"),
+            Rids::from_sorted(parents, (0..parents).filter(|p| p % 5 == 2).collect())
+                .expect("sorted"),
+        ] {
+            let pushed = set.forward(&link).expect("the same table");
+            let expected: Vec<Rid> =
+                (0..children).filter(|&child| set.contains(of[index(child)])).collect();
+            assert_eq!(members(&pushed.rids), expected, "{:?}", set.form());
+            let parts = children.div_ceil(count(PART_ROWS));
+            let untouched = (0..parts)
+                .filter(|part| !expected.iter().any(|child| child / count(PART_ROWS) == *part))
+                .count();
+            assert_eq!(pushed.skipped, count(untouched), "{:?}", set.form());
+        }
+    }
+
+    fn index(rows: u64) -> usize {
+        usize::try_from(rows).expect("small")
     }
 
     fn count(rows: usize) -> u64 {
