@@ -120,6 +120,7 @@ const MAX_PAGE: usize = 256 * 1024 * 1024;
 const MAX_DIRECTORY: usize = 128 * 1024 * 1024;
 const FREQUENCIES_V2: &[u8; 8] = b"RUDBFQ2\0";
 const FREQUENCIES: &[u8; 8] = b"RUDBFQ3\0";
+const FREQUENCIES_SPANS: &[u8; 8] = b"RUDBFQ4\0";
 /// Inline spellings for string entries in the bounded frequency synopsis.
 ///
 /// A planner usually asks about one literal such as the empty string. Without this block it opens
@@ -882,8 +883,8 @@ struct PairFrequencySummary {
 /// A writer holds what it counted. A reader leaves every synopsis in the file and reads one back
 /// when a query asks about its column, because they are the largest thing in a directory once they
 /// are decoded, forty eight bytes an entry and nearly twenty thousand entries over `hits`, and
-/// most queries ask about none of them. Where one sits is found at open, by reading it through and
-/// checking it, so a torn synopsis is still refused when the table is opened.
+/// most queries ask about none of them. New directories give each synopsis a checked span, so
+/// opening an unrelated projection need not parse its ordinals.
 #[derive(Debug, Clone)]
 enum Frequencies {
     Held(FrequencySummary),
@@ -892,6 +893,7 @@ enum Frequencies {
     Stored {
         span: Span,
         values: bool,
+        entries: usize,
     },
 }
 
@@ -6525,7 +6527,7 @@ impl Reader {
         Ok(match self.table.frequencies.get(column) {
             None | Some(None) => None,
             Some(Some(Frequencies::Held(summary))) => Some(Cow::Borrowed(summary)),
-            Some(Some(Frequencies::Stored { span, values })) => {
+            Some(Some(Frequencies::Stored { span, values, entries })) => {
                 let slot = self
                     .frequency_summaries
                     .get(column)
@@ -6540,9 +6542,12 @@ impl Reader {
                     .ok_or_else(|| invalid("frequency column index out of range"))?;
                 let mut bytes = vec![0; span.length as usize];
                 read_at(&self.file, span.offset, &mut bytes)?;
-                let summary =
-                    decode_summary(&mut Cursor::new(&bytes), field, self.table.rows, *values)?;
+                let mut cur = Cursor::new(&bytes);
+                let summary = decode_summary(&mut cur, field, self.table.rows, *values)?;
                 let summary = summary.ok_or_else(|| invalid("a stored synopsis is missing"))?;
+                if !cur.done() || summary.entries.len() != *entries {
+                    return Err(invalid("a stored synopsis differs from its directory span"));
+                }
                 let _ = slot.set(Arc::new(summary));
                 Some(Cow::Borrowed(slot.get().expect("the decoded summary was stored").as_ref()))
             }
@@ -8060,7 +8065,7 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             }
         }
     }
-    out.extend_from_slice(FREQUENCIES);
+    out.extend_from_slice(FREQUENCIES_SPANS);
     put_u16(
         &mut out,
         u16::try_from(table.frequencies.len())
@@ -8069,7 +8074,8 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
     for summary in &table.frequencies {
         let summary = match summary {
             None => {
-                out.push(0);
+                put_u32(&mut out, 0);
+                put_u32(&mut out, 0);
                 continue;
             }
             Some(Frequencies::Held(summary)) => summary,
@@ -8078,6 +8084,14 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 return Err(invalid("a synopsis left in the file cannot be written back"));
             }
         };
+        let length_at = out.len();
+        put_u32(&mut out, 0);
+        put_u32(
+            &mut out,
+            u32::try_from(summary.entries.len())
+                .map_err(|_| invalid("too many frequency entries"))?,
+        );
+        let start = out.len();
         out.push(1);
         put_u64(&mut out, summary.omitted_max);
         put_u32(
@@ -8128,6 +8142,9 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
             }
             put_u16(&mut out, entry);
         }
+        let length = u32::try_from(out.len() - start)
+            .map_err(|_| invalid("a frequency synopsis is too long"))?;
+        out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
     }
     if !table.pair_frequencies.is_empty() {
         out.extend_from_slice(PAIR_FREQUENCIES);
@@ -9259,6 +9276,25 @@ fn decode_summary(
     })
 }
 
+/// Reads the fixed envelope of a frequency synopsis in a span-based directory.
+fn summary_span(cur: &mut Cursor<'_>) -> Result<Option<(usize, usize)>> {
+    let length = cur.u32()? as usize;
+    let entries = cur.u32()? as usize;
+    if entries > FREQUENCY_ENTRIES {
+        return Err(invalid("frequency entry count exceeds its bound"));
+    }
+    if length == 0 {
+        if entries != 0 {
+            return Err(invalid("missing frequency synopsis has entries"));
+        }
+        return Ok(None);
+    }
+    if length > MAX_DIRECTORY || length > cur.len().saturating_sub(cur.at) {
+        return Err(invalid("frequency synopsis span is outside the directory"));
+    }
+    Ok(Some((length, entries)))
+}
+
 /// Skips a synopsis whose column the caller does not need. The directory checksum was checked
 /// before this walk, and the fields still need their lengths and tags checked to find the next one.
 fn skip_summary(cur: &mut Cursor<'_>, values: bool, rows: usize) -> Result<()> {
@@ -9395,7 +9431,8 @@ fn quick_nonzero(
         return Ok(None);
     }
     let magic = cur.take(8)?;
-    let values = magic == FREQUENCIES;
+    let spanned = magic == FREQUENCIES_SPANS;
+    let values = magic == FREQUENCIES || spanned;
     if !values && magic != FREQUENCIES_V2 {
         return Err(invalid("directory extension magic differs"));
     }
@@ -9403,10 +9440,30 @@ fn quick_nonzero(
         return Err(invalid("frequency column count differs"));
     }
     for _ in 0..wanted {
-        skip_summary(&mut cur, values, rows)?;
+        if spanned {
+            if let Some((length, _)) = summary_span(&mut cur)? {
+                cur.skip(length)?;
+            }
+        } else {
+            skip_summary(&mut cur, values, rows)?;
+        }
     }
-    let Some(summary) = decode_summary(&mut cur, &fields[wanted], rows, values)? else {
-        return Ok(None);
+    let summary = if spanned {
+        let Some((length, entries)) = summary_span(&mut cur)? else {
+            return Ok(None);
+        };
+        let start = cur.at;
+        let summary = decode_summary(&mut cur, &fields[wanted], rows, values)?
+            .ok_or_else(|| invalid("a stored synopsis is missing"))?;
+        if cur.at - start != length || summary.entries.len() != entries {
+            return Err(invalid("a stored synopsis differs from its directory span"));
+        }
+        summary
+    } else {
+        let Some(summary) = decode_summary(&mut cur, &fields[wanted], rows, values)? else {
+            return Ok(None);
+        };
+        summary
     };
     let zero = summary
         .entries
@@ -9802,7 +9859,8 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         vec![None; width]
     } else {
         let frequency_magic = cur.take(8)?;
-        let frequency_values = frequency_magic == FREQUENCIES;
+        let spanned = frequency_magic == FREQUENCIES_SPANS;
+        let frequency_values = frequency_magic == FREQUENCIES || spanned;
         if !frequency_values && frequency_magic != FREQUENCIES_V2 {
             return Err(invalid("directory extension magic differs"));
         }
@@ -9811,19 +9869,50 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         }
         let mut frequencies = Vec::with_capacity(width);
         for (field, entry_count) in fields.iter().zip(&mut entry_counts) {
+            if spanned {
+                let Some((length, entries)) = summary_span(&mut cur)? else {
+                    frequencies.push(None);
+                    continue;
+                };
+                *entry_count = entries;
+                let start = cur.at;
+                if let Some(offset) = stored_at {
+                    cur.skip(length)?;
+                    frequencies.push(Some(Frequencies::Stored {
+                        span: Span {
+                            offset: offset
+                                .checked_add(start as u64)
+                                .ok_or_else(|| invalid("frequency synopsis offset overflow"))?,
+                            length: u32::try_from(length)
+                                .map_err(|_| invalid("a frequency synopsis is too long"))?,
+                        },
+                        values: true,
+                        entries,
+                    }));
+                } else {
+                    let summary = decode_summary(&mut cur, field, rows, true)?
+                        .ok_or_else(|| invalid("a stored synopsis is missing"))?;
+                    if cur.at - start != length || summary.entries.len() != entries {
+                        return Err(invalid("a stored synopsis differs from its directory span"));
+                    }
+                    frequencies.push(Some(Frequencies::Held(summary)));
+                }
+                continue;
+            }
             let start = cur.at;
             let summary = decode_summary(&mut cur, field, rows, frequency_values)?;
             *entry_count = summary.as_ref().map_or(0, |summary| summary.entries.len());
             frequencies.push(match (summary, stored_at) {
                 (None, _) => None,
                 (Some(summary), None) => Some(Frequencies::Held(summary)),
-                (Some(_), Some(offset)) => Some(Frequencies::Stored {
+                (Some(summary), Some(offset)) => Some(Frequencies::Stored {
                     span: Span {
                         offset: offset + start as u64,
                         length: u32::try_from(cur.at - start)
                             .map_err(|_| invalid("a frequency synopsis is too long"))?,
                     },
                     values: frequency_values,
+                    entries: summary.entries.len(),
                 }),
             });
         }
@@ -12601,6 +12690,22 @@ mod tests {
     use rudb_common::stat::Provenance;
 
     use super::*;
+
+    #[test]
+    fn spanned_frequency_header_rejects_missing_or_out_of_bounds_payloads() {
+        for (length, entries) in [(0_u32, 1_u32), (9, 0), (1, FREQUENCY_ENTRIES as u32 + 1)] {
+            let mut bytes = Vec::new();
+            put_u32(&mut bytes, length);
+            put_u32(&mut bytes, entries);
+            bytes.push(1);
+            assert!(summary_span(&mut Cursor::new(&bytes)).is_err());
+        }
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, 1);
+        put_u32(&mut bytes, 0);
+        bytes.push(1);
+        assert_eq!(summary_span(&mut Cursor::new(&bytes)).expect("one byte"), Some((1, 0)));
+    }
 
     #[test]
     fn a_name_taken_in_pieces_is_the_name_of_the_pieces_joined() {
@@ -16176,7 +16281,7 @@ mod tests {
                 match (left, held) {
                     (None, None) => {}
                     (
-                        Some(super::Frequencies::Stored { span, values }),
+                        Some(super::Frequencies::Stored { span, values, entries }),
                         Some(super::Frequencies::Held(summary)),
                     ) => {
                         let mut one = vec![0; span.length as usize];
@@ -16189,6 +16294,7 @@ mod tests {
                         )
                         .expect("a valid synopsis")
                         .expect("one is there");
+                        assert_eq!(*entries, read.entries.len());
                         assert_eq!(format!("{read:?}"), format!("{summary:?}"));
                         stored += 1;
                     }
