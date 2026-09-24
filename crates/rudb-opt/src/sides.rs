@@ -5,9 +5,26 @@
 //! which side that is, the binder emits the same answer for every join because at binding time
 //! there is nothing to choose with, and this pass is what chooses.
 //!
-//! The choice is made from [`estimate::rows`] and nothing else. No sample, no histogram, no
-//! reordering: this pass never moves a join and never changes what any join produces. It writes one
-//! field, and a plan it has run over is a plan whose answers are the answers it had before.
+//! The choice is made from [`estimate::rows`] and, for a hash join, from how wide a row of each side
+//! is. No sample, no histogram, no reordering: this pass never moves a join and never changes what
+//! any join produces. It writes one field, and a plan it has run over is a plan whose answers are
+//! the answers it had before.
+//!
+//! # Rows times width
+//!
+//! A hash table holds every column its side carries, so what has to fit in memory is the rows times
+//! the width of one of them and not the rows alone. The two can point different ways. TPC-H q9 joins
+//! `orders` on its key to what the rest of the query built out of `lineitem`, which is 319,404 rows
+//! carrying seven columns including the nation's name, against 1.5 million orders carrying two. By
+//! rows the lineitem side is the one to hold, by bytes it is the orders, and holding the orders took
+//! the query's peak resident set on SF1 from 307 MB to 238 MB with the same answer and a little less
+//! cpu. DuckDB weighs its build side the same way, by rows times the width of the row its hash table
+//! lays out.
+//!
+//! The width is the size of each column's type, and eight bytes for the hash every row is stored
+//! beside. A string counts as its sixteen byte header, the same number DuckDB uses, which says
+//! nothing about how long the strings are. The nested loop keeps comparing rows, because what it
+//! pays for is walking the gathered side a chunk at a time and a chunk is rows.
 //!
 //! # Which side is the right one
 //!
@@ -102,7 +119,7 @@
 //! So an outer join is back on the size rule with everything else. When no lookup answers it the
 //! nested loop runs and wants the larger side, which is what the size rule already says.
 
-use rudb_plan::{BuildSide, JoinKind, Node, Plan};
+use rudb_plan::{BuildSide, JoinKind, Node, NodeRef, Plan};
 
 use rudb_common::Result;
 
@@ -168,6 +185,7 @@ fn choose(plan: &mut Plan, stats: &Facts) {
         let Node::Join { left, right, kind, conditions, .. } = *plan.node(node) else {
             continue;
         };
+        let sides = (left, right);
         // A semi or an anti join has no mirror and is still a choice, because the executor runs a
         // turned around one as a different operator rather than as a different kind. See the
         // module documentation.
@@ -188,12 +206,61 @@ fn choose(plan: &mut Plan, stats: &Facts) {
         else {
             continue;
         };
+        // A hash table holds everything its side carries, so for the lookup the comparison is of
+        // bytes rather than rows wherever both widths can be read. See the module documentation.
+        let (left, right) = match (lookup, width(plan, sides.0), width(plan, sides.1)) {
+            (true, Some(one), Some(other)) => {
+                (left.saturating_mul(one + HASHED), right.saturating_mul(other + HASHED))
+            }
+            _ => (left, right),
+        };
         let Some(wanted) = prefers(left, right, lookup) else {
             continue;
         };
         if let Node::Join { build, .. } = plan.node_mut(node) {
             *build = wanted;
         }
+    }
+}
+
+/// What a hash table keeps beside each row it holds, which is the row's hash.
+const HASHED: u64 = 8;
+
+/// What one row of what `node` produces takes, by the size of each column's type.
+///
+/// Read off the plan rather than estimated, because a node's columns and their types are fixed by
+/// the time this pass runs: the unused ones are already gone and nothing after this adds any. The
+/// nodes that pass their input's row through unchanged answer what their input answers, and a join
+/// answers both of its sides except where its kind keeps only the left one. `None` for anything
+/// else, which leaves that join on the row counts.
+fn width(plan: &Plan, node: NodeRef) -> Option<u64> {
+    let fields = |columns| -> u64 {
+        plan.field_list(columns).iter().map(|field| field.ty.physical().size() as u64).sum()
+    };
+    let exprs = |list| -> u64 {
+        plan.expr_list(list).iter().map(|&expr| plan.expr_type(expr).physical().size() as u64).sum()
+    };
+    match *plan.node(node) {
+        Node::Get { columns, .. }
+        | Node::Values { columns, .. }
+        | Node::TableFunction { columns, .. }
+        | Node::CteScan { columns, .. } => Some(fields(columns)),
+        Node::Project { exprs: list, .. } => Some(exprs(list)),
+        Node::Aggregate { groups, aggregates, .. } => Some(exprs(groups) + exprs(aggregates)),
+        Node::Filter { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Limit { input, .. }
+        | Node::LimitPercent { input, .. }
+        | Node::TopN { input, .. }
+        | Node::Distinct { input, .. } => width(plan, input),
+        Node::Join { left, right, kind, .. }
+        | Node::LinkJoin { child: left, parent: right, kind, .. } => match kind {
+            JoinKind::Semi | JoinKind::Anti => width(plan, left),
+            JoinKind::Mark => Some(width(plan, left)? + 1),
+            _ => Some(width(plan, left)? + width(plan, right)?),
+        },
+        Node::CrossProduct { left, right } => Some(width(plan, left)? + width(plan, right)?),
+        _ => None,
     }
 }
 
@@ -282,6 +349,23 @@ mod tests {
         // against 4 on a key used to gather the 400,000.
         assert_eq!(keyed("INNER", 400_000, 4), BuildSide::Right);
         assert_eq!(chosen("INNER", 400_000, 4), BuildSide::Left);
+    }
+
+    #[test]
+    fn a_hash_join_gathers_the_side_with_fewer_bytes_even_when_it_has_more_rows() {
+        // A hundred thousand rows of one integer against forty thousand rows of five strings and a
+        // key, so the right side has fewer rows and three times the bytes.
+        let text = "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n  Get memory.main.l AS l #0 [a::BIGINT]\n  Get memory.main.r AS r #1 [b::BIGINT, c::VARCHAR, d::VARCHAR, e::VARCHAR, f::VARCHAR, g::VARCHAR]\n";
+        assert_eq!(side(text, 100_000, 40_000), BuildSide::Left);
+        // The same join on row counts alone would have gathered the right, and still does where the
+        // widths are the same.
+        assert_eq!(keyed("INNER", 100_000, 40_000), BuildSide::Right);
+    }
+
+    #[test]
+    fn the_nested_loop_still_compares_rows_whatever_the_widths() {
+        let text = "Join INNER on=[(#0.0::BIGINT < #1.0::BIGINT)::BOOLEAN]\n  Get memory.main.l AS l #0 [a::BIGINT]\n  Get memory.main.r AS r #1 [b::BIGINT, c::VARCHAR, d::VARCHAR, e::VARCHAR, f::VARCHAR, g::VARCHAR]\n";
+        assert_eq!(side(text, 100_000, 40_000), BuildSide::Left);
     }
 
     #[test]
