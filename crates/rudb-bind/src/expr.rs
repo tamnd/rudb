@@ -657,6 +657,9 @@ impl Binder<'_> {
         if let Some(field) = self.struct_field(&written, &bound)? {
             return Ok(field);
         }
+        if let Some(call) = self.sequence_call(&written, &bound)? {
+            return Ok(call);
+        }
         // `typeof` is answered here rather than by a kernel, because the type is settled the moment
         // its argument is bound and nothing about it changes per row. The argument still has to be
         // a legal expression where it was written, so it goes through the aggregate rules first and
@@ -945,6 +948,100 @@ impl Binder<'_> {
         let args = self.plan_mut().add_expr_list(&cast);
         let name = self.plan_mut().intern(stored_name.unwrap_or(resolved.name));
         Ok(self.add_expr(Expr::Function { name, args }, returns))
+    }
+
+    /// `nextval`, `currval` and `setval`, with the sequence they name looked up here.
+    ///
+    /// The name has to be a constant, which is the pin's rule too, and it is read as a qualified
+    /// name the way the pin reads it. What the kernel gets in its place is the number of the
+    /// sequence's counter, so a kernel that knows nothing about catalogs can move it. A null name
+    /// is a null answer without a sequence to look for. The sequence is also recorded, which is
+    /// what makes a table whose default calls `nextval` depend on it.
+    fn sequence_call(&mut self, written: &str, bound: &[ExprRef]) -> Result<Option<ExprRef>> {
+        let Some(name) = ["nextval", "currval", "setval"]
+            .into_iter()
+            .find(|name| rudb_catalog::same_name(written, name))
+        else {
+            return Ok(None);
+        };
+        if name == "setval" {
+            self.setval_arguments(bound)?;
+        }
+        let call = self.call(name, bound.to_vec())?;
+        let Expr::Function { args, .. } = *self.plan().expr(call) else {
+            return Ok(Some(call));
+        };
+        let mut args = self.plan().expr_list(args).to_vec();
+        let text = match fold::value_of(self.plan(), args[0]) {
+            Ok(Some(Value::Varchar(text))) => text,
+            Ok(Some(Value::Null)) => {
+                let null = self.plan_mut().add_value(Value::Null);
+                return Ok(Some(self.add_expr(Expr::Constant(null), LogicalType::BigInt)));
+            }
+            _ => {
+                return Err(Error::binder(format!(
+                    "The \"sequence_name\" argument in function \"{name}\" must be a constant \
+                     expression"
+                )));
+            }
+        };
+        let parts = qualified_parts(&text)?;
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let resolved = self.catalog().resolve_sequence(&parts)?;
+        let id = self.catalog().sequence(&resolved)?.counter().id();
+        if !self.sequences.contains(&resolved) {
+            self.sequences.push(resolved);
+        }
+        args[0] = self.add_constant(Value::BigInt(id as i64));
+        for (arg, wanted) in
+            args.iter_mut().skip(1).zip([LogicalType::BigInt, LogicalType::Boolean])
+        {
+            *arg = self.checked_cast_to(*arg, &wanted, false)?;
+        }
+        let args = self.plan_mut().add_expr_list(&args);
+        let name = self.plan_mut().intern(name);
+        Ok(Some(self.add_expr(Expr::Function { name, args }, LogicalType::BigInt)))
+    }
+
+    /// Refuses a `setval` whose value or flag no implicit cast reaches, the way the pin's overload
+    /// resolution does: an integer or a string literal can be the value and a boolean or a string
+    /// literal can be the flag, and `setval('s', 5.6)` or `setval('s', 1, 1)` fits neither
+    /// overload.
+    fn setval_arguments(&self, bound: &[ExprRef]) -> Result<()> {
+        let literal = |at: usize| {
+            matches!(self.plan().expr(bound[at]), Expr::Constant(_))
+                && *self.plan().expr_type(bound[at]) == LogicalType::Varchar
+        };
+        let fits = |at: usize, wanted: &LogicalType| {
+            let ty = self.plan().expr_type(bound[at]);
+            ty == wanted
+                || *ty == LogicalType::Null
+                || literal(at)
+                || (*wanted == LogicalType::BigInt
+                    && matches!(
+                        ty,
+                        LogicalType::TinyInt
+                            | LogicalType::SmallInt
+                            | LogicalType::Integer
+                            | LogicalType::UTinyInt
+                            | LogicalType::USmallInt
+                            | LogicalType::UInteger
+                    ))
+        };
+        let wanted = [LogicalType::BigInt, LogicalType::Boolean];
+        if !(2..=3).contains(&bound.len()) || (1..bound.len()).all(|at| fits(at, &wanted[at - 1])) {
+            return Ok(());
+        }
+        let types: Vec<LogicalType> =
+            bound.iter().map(|arg| self.plan().expr_type(*arg).clone()).collect();
+        Err(crate::maps::no_match(
+            "setval",
+            &types,
+            &[
+                "setval(col0 VARCHAR, col1 BIGINT) -> BIGINT",
+                "setval(col0 VARCHAR, col1 BIGINT, col2 BOOLEAN) -> BIGINT",
+            ],
+        ))
     }
 
     /// The value of the setting a constant names, folded into the plan.
@@ -1818,6 +1915,33 @@ fn number(text: &str, negative: bool) -> Result<Value> {
         }
     }
     Ok(Value::Double(written.parse::<f64>().map_err(|_| unreadable())?))
+}
+
+/// The parts of a name written inside a string, the way the pin reads the name `nextval` is given:
+/// split at each dot outside double quotes, with a doubled quote inside quotes standing for one.
+fn qualified_parts(text: &str) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut chars = text.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                part.push('"');
+            }
+            '"' => quoted = !quoted,
+            '.' if !quoted => parts.push(std::mem::take(&mut part)),
+            c => part.push(c),
+        }
+    }
+    if quoted {
+        return Err(Error::parser(format!(
+            "Unterminated quote in qualified name! (input: {text})"
+        )));
+    }
+    parts.push(part);
+    Ok(parts)
 }
 
 #[cfg(test)]

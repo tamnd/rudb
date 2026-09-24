@@ -40,7 +40,7 @@ fn entry(key: LogicalType, value: LogicalType) -> LogicalType {
 }
 
 /// The pin's refusal of a call that fits none of the ways it can be written.
-fn no_match(written: &str, types: &[LogicalType], candidates: &[&str]) -> Error {
+pub(crate) fn no_match(written: &str, types: &[LogicalType], candidates: &[&str]) -> Error {
     let types: Vec<String> = types.iter().map(ToString::to_string).collect();
     let mut message = format!(
         "No function matches the given name and argument types '{}({})'. You might need to add \

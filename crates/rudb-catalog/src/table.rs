@@ -980,6 +980,9 @@ pub struct Table {
     checks: Vec<String>,
     /// The foreign keys this table's rows have to meet, in the order written.
     foreign: Vec<ForeignKey>,
+    /// The sequences its defaults call `nextval` on, which it depends on the way the pin records it:
+    /// a `DROP SEQUENCE` without `CASCADE` is refused while this table is there.
+    sequences: Vec<QualifiedName>,
 }
 
 impl Table {
@@ -1006,6 +1009,7 @@ impl Table {
             defaults: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
+            sequences: Vec::new(),
         })
     }
 
@@ -1029,6 +1033,7 @@ impl Table {
             defaults: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
+            sequences: Vec::new(),
         })
     }
 
@@ -1327,6 +1332,17 @@ impl Table {
     #[must_use]
     pub fn checks(&self) -> &[String] {
         &self.checks
+    }
+
+    /// The sequences its defaults use.
+    #[must_use]
+    pub fn sequences(&self) -> &[QualifiedName] {
+        &self.sequences
+    }
+
+    /// Declares the sequences its defaults use.
+    pub fn set_sequences(&mut self, sequences: Vec<QualifiedName>) {
+        self.sequences = sequences;
     }
 
     /// Declares the table's `CHECK` constraints.

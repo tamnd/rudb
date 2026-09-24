@@ -822,6 +822,18 @@ const TABLE: &[Entry] = &[
         shape: Shape::Setting,
         numeric_only: false,
     },
+    // The sequence functions. The binder checks the name is a constant and turns it into the
+    // sequence's counter before the kernel sees it, so these rows are here for the argument types
+    // and the arity errors.
+    text("nextval", Arity::exactly(1), Fixed::BigInt),
+    text("currval", Arity::exactly(1), Fixed::BigInt),
+    Entry {
+        name: "setval",
+        kind: FunctionKind::Scalar,
+        arity: Arity::between(2, 3),
+        shape: Shape::LeadingFixedTo(1, Fixed::Varchar, Fixed::BigInt),
+        numeric_only: false,
+    },
     // Session context. Fourteen names for eight answers, which is the SQL standard's spellings and
     // Postgres's spellings and DuckDB's own sitting on top of each other. The binder folds every one
     // of them, so these rows exist to be listed by `duckdb_settings()`'s neighbour
@@ -1829,6 +1841,15 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ),
     ("typeof", &["typeof(col0 ANY) -> VARCHAR"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
+    ("nextval", &["nextval(sequence_name VARCHAR) -> BIGINT"]),
+    ("currval", &["currval(sequence_name VARCHAR) -> BIGINT"]),
+    (
+        "setval",
+        &[
+            "setval(sequence_name VARCHAR, new_value BIGINT) -> BIGINT",
+            "setval(sequence_name VARCHAR, new_value BIGINT, is_called BOOLEAN) -> BIGINT",
+        ],
+    ),
 ];
 
 /// What one element of a subscripted value is, or `None` for a value that cannot be subscripted.

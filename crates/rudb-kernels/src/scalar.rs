@@ -148,6 +148,10 @@ fn run<V: AsRef<Vector>>(
         return Vector::from_values(returns.clone(), &[]);
     }
 
+    if let Some(vector) = crate::sequence::call(name, args, rows)? {
+        return Ok(vector);
+    }
+
     // Every argument constant is one call rather than 1024 of them. This is `3 * 4` surviving
     // constant folding, and it is also every correlated scalar the optimizer has already evaluated.
     if !args.is_empty() && args.iter().all(|arg| arg.as_ref().form() == Form::Constant) {

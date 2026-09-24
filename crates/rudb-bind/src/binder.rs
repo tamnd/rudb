@@ -271,6 +271,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) in_filter: bool,
     /// The window runs this select block has collected, in the order they were first written.
     pub(crate) windows: Vec<WindowRun>,
+    /// The sequences a `nextval`, `currval` or `setval` named, which a table's default depends on.
+    pub(crate) sequences: Vec<QualifiedName>,
     /// Set while a window call's own arguments and keys are being bound, so nesting is caught.
     pub(crate) in_window: bool,
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
@@ -339,6 +341,7 @@ impl<'a> Binder<'a> {
             in_aggregate: false,
             in_filter: false,
             windows: Vec::new(),
+            sequences: Vec::new(),
             in_window: false,
             scalar_subqueries: Vec::new(),
             joined_above: Vec::new(),

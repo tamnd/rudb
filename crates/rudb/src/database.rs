@@ -3021,6 +3021,7 @@ impl Shared {
                 | Bound::CreateView(_)
                 | Bound::DropTable(_)
                 | Bound::Schema(_)
+                | Bound::Sequence(_)
                 | Bound::Insert(_)
         );
         if writes && self.open().as_ref().is_some_and(|open| open.read_only) {
@@ -3194,6 +3195,23 @@ impl Shared {
                     catalog.drop_schema(&change.catalog, &change.name, false)?;
                 }
                 catalog.create_schema(&change.catalog, &change.name)?;
+                Ok(QueryResult::empty())
+            }
+            Bound::Sequence(change) => {
+                let Some(name) = change.name else { return Ok(QueryResult::empty()) };
+                if change.drop {
+                    catalog.drop_sequence(&name, change.cascade)?;
+                    return Ok(QueryResult::empty());
+                }
+                // The native file has nowhere to keep a sequence yet, so one in it would be gone
+                // on the next open. Refused until the file can say it, the way a schema is.
+                if self.inner.path.is_some() && self.inner.writable && !name.temporary() {
+                    return Err(Error::not_implemented(
+                        "CREATE SEQUENCE in a database file, which cannot hold one so far",
+                    ));
+                }
+                let counter = rudb_common::sequence::Counter::register(&name.table, change.options);
+                catalog.create_sequence(name, counter, change.or_replace, change.if_not_exists)?;
                 Ok(QueryResult::empty())
             }
             Bound::Insert(mut insert) => {
@@ -4020,6 +4038,9 @@ fn create_table(
     }
     if create.defaults.iter().any(Option::is_some) {
         catalog.table_mut(&create.name)?.set_defaults(create.defaults);
+    }
+    if !create.sequences.is_empty() {
+        catalog.table_mut(&create.name)?.set_sequences(create.sequences);
     }
     if !create.checks.is_empty() {
         catalog.table_mut(&create.name)?.set_checks(create.checks);
