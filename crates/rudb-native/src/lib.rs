@@ -2882,6 +2882,20 @@ impl Writer {
         column: usize,
         counted: bool,
     ) -> Result<(Option<FrequencySummary>, Option<u64>)> {
+        let dbg_t = std::time::Instant::now();
+        let r = self.numeric_frequency_x(column, counted);
+        if std::env::var_os("RUDB_DEBUG_FREQ").is_some() {
+            if let Ok((s, d)) = &r {
+                eprintln!("FREQ {} {} counted={} ms={:.1} summary={} distinct={:?}", column, self.table.fields[column].name, counted, dbg_t.elapsed().as_secs_f64()*1e3, s.as_ref().map(|s| format!("{}e/{}o/{}", s.entries.len(), s.ordinals.len(), s.omitted_max)).unwrap_or("none".into()), d);
+            }
+        }
+        r
+    }
+    fn numeric_frequency_x(
+        &self,
+        column: usize,
+        counted: bool,
+    ) -> Result<(Option<FrequencySummary>, Option<u64>)> {
         let signed = match self.table.fields[column].ty {
             LogicalType::TinyInt
             | LogicalType::SmallInt
@@ -2918,7 +2932,7 @@ impl Writer {
                 Some((exact, (nulls != 0).then_some(nulls), values.len() as u64))
             });
         let (exact, null_count, decrements, distinct_count) = match tallied {
-            Some((exact, null_count, distinct)) => (exact, null_count, 0, Some(distinct)),
+            Some((exact, null_count, distinct)) => { if std::env::var_os("RUDB_DEBUG_FREQ").is_some() { eprintln!("TALLIED {column}"); } (exact, null_count, 0, Some(distinct)) },
             None => {
                 // Rows arrive a run of equal values at a time, because a sorted column is runs and
                 // a flag column is mostly one value, so a run is counted and inserted once rather
@@ -2930,6 +2944,7 @@ impl Writer {
                 // the set. The one that fills it hands the set everything it holds at that moment,
                 // plus the run it is about to add, and the set carries on from there as it always
                 // did.
+                let dbg_t0 = std::time::Instant::now();
                 let mut first = Candidates::default();
                 let mut distinct: Option<distinct::ExactDistinct> = None;
                 let mut run = Run::default();
@@ -2953,6 +2968,7 @@ impl Writer {
                     None => Some(first.held as u64),
                 };
                 let (nulls, decrements) = (first.nulls, first.decrements);
+                if std::env::var_os("RUDB_DEBUG_FREQ").is_some() { eprintln!("FIRST {column} held={} decrements={decrements} ms={:.1}", first.held, dbg_t0.elapsed().as_secs_f64()*1e3); }
                 let (exact, null_count) = if decrements == 0 {
                     let exact = first
                         .pairs()
