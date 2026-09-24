@@ -98,10 +98,13 @@ pub struct Built {
     pub stripes: usize,
     /// What the column takes in the file, which is what the budget is a share of.
     pub column_bytes: u64,
-    /// Whether the sections were kept. False means they were built, measured, and found to cost more
-    /// than section 3.8 allows, so the file does not have them and every query plans as though
-    /// statistics had never been implemented.
+    /// Whether the summary was kept. False means it was built, measured, and found to cost more than
+    /// section 3.8 allows, so the file does not have it and every query plans as though statistics
+    /// had never been implemented.
     pub built: bool,
+    /// Whether the sketches were kept as well, which they are only where the summary was and there
+    /// was room left after every summary that fit.
+    pub sketched: bool,
     /// How long the build took, the reading of the column included.
     pub build: Duration,
 }
@@ -1460,6 +1463,37 @@ pub(crate) fn within(costs: &[usize], allowance: u64, spent: u64) -> Vec<bool> {
     keep
 }
 
+/// Which summaries and which sketches fit the allowance, as a pair per column.
+///
+/// Every summary first and the sketches out of what is left, both smallest first. A summary is a
+/// few hundred bytes and a merged sketch is up to 32 KB, so pricing the two as one would throw a
+/// column's summary away because its sketch did not fit. That is what a small table's budget did:
+/// TPC-H `supplier` at SF1 has 64 KB to spend and kept neither for any of its strings, which left
+/// the planner with no width for them while the tables beside it had one. A sketch is only kept
+/// beside its own summary, because a sketch on its own is a file nothing plans from.
+pub(crate) fn kept(
+    summaries: &[usize],
+    sketches: &[usize],
+    allowance: u64,
+    spent: u64,
+) -> Vec<(bool, bool)> {
+    let summarized = within(summaries, allowance, spent);
+    let spent = summaries
+        .iter()
+        .zip(&summarized)
+        .filter(|&(_, &keep)| keep)
+        .fold(spent, |spent, (&cost, _)| spent.saturating_add(cost as u64));
+    // A column whose summary did not fit asks for more than the allowance, so it cannot take any of
+    // what is left.
+    let costs = sketches
+        .iter()
+        .zip(&summarized)
+        .map(|(&cost, &keep)| if keep { cost } else { usize::MAX })
+        .collect::<Vec<_>>();
+    let sketched = within(&costs, allowance, spent);
+    summarized.into_iter().zip(sketched).collect()
+}
+
 /// What the allowance is for a table whose columns come to this many bytes.
 pub(crate) fn allowance(column_bytes: u64, share: u64) -> u64 {
     (column_bytes.saturating_mul(share) / 100).max(BUDGET_FLOOR)
@@ -1576,21 +1610,27 @@ pub fn build_stats_for(
             stripes: stats.sketches.stripes.len(),
             column_bytes,
             built: false,
+            sketched: false,
             build: start.elapsed(),
         });
         payloads.push((column, summary, sketches));
     }
-    let costs = report.iter().map(Built::bytes).collect::<Vec<_>>();
-    let keep = within(&costs, allowance, spent);
-    for (one, &keep) in report.iter_mut().zip(&keep) {
-        one.built = keep;
+    let summaries = report.iter().map(|one| one.summary_bytes).collect::<Vec<_>>();
+    let sketches = report.iter().map(|one| one.sketch_bytes).collect::<Vec<_>>();
+    let keep = kept(&summaries, &sketches, allowance, spent);
+    for (one, &(built, sketched)) in report.iter_mut().zip(&keep) {
+        one.built = built;
+        one.sketched = sketched;
     }
     // The reader holds the file open and the attach opens it again to write, so it is dropped first
     // for the reason `graph` drops it: the moment the file is written is a moment nothing else in
     // this function is reading it.
     drop(reader);
     let mut attachments = Vec::with_capacity(payloads.len() * 2);
-    for ((column, summary, sketches), _) in payloads.iter().zip(&keep).filter(|&(_, &keep)| keep) {
+    for ((column, summary, sketches), &(built, sketched)) in payloads.iter().zip(&keep) {
+        if !built {
+            continue;
+        }
         let id = u64::try_from(*column).map_err(|_| invalid("column index overflow"))?;
         attachments.push(Attachment {
             kind: *section::SUMMARY,
@@ -1603,6 +1643,9 @@ pub fn build_stats_for(
                 .map_err(|_| invalid("a summary longer than a u32 can count"))?,
             bytes: summary,
         });
+        if !sketched {
+            continue;
+        }
         attachments.push(Attachment {
             kind: *section::SKETCHES,
             id,
@@ -2332,6 +2375,20 @@ mod tests {
 
         fs::remove_file(&ordered).expect("clean up");
         fs::remove_file(&mixed).expect("clean up");
+    }
+
+    #[test]
+    fn every_summary_that_fits_is_kept_before_any_sketch() {
+        // Three columns of a few hundred bytes of summary and 32 KB of sketch each against the 64 KB
+        // floor. Priced as one, only the first two columns would have anything. Priced apart, all
+        // three keep a summary and the sketches go to the smallest that still fit.
+        let summaries = [300, 200, 250];
+        let sketches = [32 * 1024, 32 * 1024, 20 * 1024];
+        let keep = kept(&summaries, &sketches, BUDGET_FLOOR, 0);
+        assert_eq!(keep, vec![(true, true), (true, false), (true, true)]);
+        // A summary that does not fit takes its sketch with it, however small the sketch is.
+        let keep = kept(&[100, 1_000], &[10, 10], 500, 0);
+        assert_eq!(keep, vec![(true, true), (false, false)]);
     }
 
     #[test]

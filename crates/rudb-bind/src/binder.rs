@@ -1987,6 +1987,11 @@ impl<'a> Binder<'a> {
                 self.plan.mark_ascending(index, &column);
             }
         }
+        if !excluded {
+            for (column, bytes) in table.widths() {
+                self.plan.measure_width(index, &column, bytes);
+            }
+        }
         let node = self.add_node(Node::Get {
             catalog: catalog_name,
             schema,

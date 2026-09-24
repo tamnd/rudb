@@ -933,6 +933,18 @@ impl Rows {
         }
     }
 
+    /// How many bytes a value of each string column takes on average, by name.
+    ///
+    /// Only a file can say, for the reason [`Rows::ascending`] gives. A column nobody can answer for
+    /// is left out.
+    #[must_use]
+    pub fn widths(&self) -> Vec<(String, u64)> {
+        match self {
+            Self::Memory(_) | Self::Grown(_, _) => Vec::new(),
+            Self::Native(reader) => rudb_native::widths(reader),
+        }
+    }
+
     /// One whole in-memory chunk, used by checkpointing and tests.
     ///
     /// Owned rather than borrowed, because a chunk of an in memory table is a window cut out of its
@@ -1170,6 +1182,13 @@ impl Table {
     #[must_use]
     pub fn ascending(&self) -> Vec<String> {
         self.rows.ascending()
+    }
+
+    /// How many bytes a value of each string column takes on average, which [`Rows::widths`]
+    /// answers.
+    #[must_use]
+    pub fn widths(&self) -> Vec<(String, u64)> {
+        self.rows.widths()
     }
 
     #[must_use]

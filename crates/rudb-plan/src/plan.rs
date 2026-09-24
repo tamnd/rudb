@@ -103,6 +103,9 @@ pub struct Plan {
     /// The columns a table is stored in ascending order of, by table index and name, as the binder
     /// read them off the store's own summaries. A fact about the file, like `distincts`.
     ascending: BTreeSet<(u32, String)>,
+    /// How many bytes a value of a string column takes on average, by table index and name, as the
+    /// binder read them off the store's own summaries. A fact about the file, like `distincts`.
+    widths: BTreeMap<(u32, String), u64>,
     /// The aggregates whose one grouping key arrives in ascending order, by output index, so that a
     /// group can be closed as soon as the key moves past it. A decision, like `dense`, written by
     /// one pass, `rudb_opt`'s `cluster`.
@@ -160,6 +163,7 @@ impl Plan {
             presized: BTreeMap::new(),
             dense: BTreeMap::new(),
             ascending: BTreeSet::new(),
+            widths: BTreeMap::new(),
             clustered: BTreeSet::new(),
             mirrors: Vec::new(),
         }
@@ -301,6 +305,7 @@ impl Plan {
         self.frequencies.clear();
         self.distincts.clear();
         self.ascending.clear();
+        self.widths.clear();
     }
 
     /// Records how many groups the aggregate binding its output to `index` is expected to produce.
@@ -357,6 +362,18 @@ impl Plan {
     #[must_use]
     pub fn ascending(&self, index: u32, column: &str) -> bool {
         self.ascending.contains(&(index, column.to_owned()))
+    }
+
+    /// Records that a value of the string column called `column` of the table bound at `index` takes
+    /// `bytes` bytes on average, counting only the values that are not null.
+    pub fn measure_width(&mut self, index: u32, column: &str, bytes: u64) {
+        self.widths.insert((index, column.to_owned()), bytes);
+    }
+
+    /// How many bytes a value of that column takes on average, where the store said.
+    #[must_use]
+    pub fn width_measured(&self, index: u32, column: &str) -> Option<u64> {
+        self.widths.get(&(index, column.to_owned())).copied()
     }
 
     /// Records that the aggregate binding its output to `index` sees its one key in ascending order.

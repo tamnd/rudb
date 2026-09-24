@@ -92,6 +92,8 @@ The arithmetic that says it fits, for TPC-H `lineitem` at SF100, sixteen columns
 
 **The rule that follows: per-stripe statistics are written only for columns that are read.** A column with no predicate ever pushed to it needs a summary and a merged sketch and nothing per stripe. The writer does not know which those are, so the default is per-stripe sketches for the columns the encoding chooser already sketched plus any column in a declared relationship or key, and everything else gets the table-level summary only. Document 06's observation log is what promotes a column into the per-stripe set on the next checkpoint, and document 08 says when that rewrite happens.
 
+The summaries are spent first. Every summary that fits is kept, smallest first, and the sketches come out of what is left in the same order, with a sketch kept only beside its own summary. Pricing a column's summary and sketch as one would throw away a few hundred bytes the planner reads on every query because 32 KB beside it did not fit, which is what a small table's floor did to TPC-H `supplier` at SF1 before the two were priced apart.
+
 That brings `lineitem` at SF100 to well under the two percent of a file whose column bytes are in the tens of gigabytes, and it is an honest example of the budget forcing a design decision rather than being asserted after one.
 
 ## 3.9 Ordering and commit

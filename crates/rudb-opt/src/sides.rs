@@ -22,9 +22,12 @@
 //! lays out.
 //!
 //! The width is the size of each column's type, and eight bytes for the hash every row is stored
-//! beside. A string counts as its sixteen byte header, the same number DuckDB uses, which says
-//! nothing about how long the strings are. The nested loop keeps comparing rows, because what it
-//! pays for is walking the gathered side a chunk at a time and a chunk is rows.
+//! beside. A string is its sixteen byte header, which holds a string of up to twelve bytes in place,
+//! and a longer one is the header and its bytes as well. How long a column's strings are comes from
+//! the average its file's summary gives, where the string is a column read straight out of a table
+//! that has one, and a string anywhere else counts as the header alone, which is what DuckDB counts
+//! for every string. The nested loop keeps comparing rows, because what it pays for is walking the
+//! gathered side a chunk at a time and a chunk is rows.
 //!
 //! # Which side is the right one
 //!
@@ -119,7 +122,8 @@
 //! So an outer join is back on the size rule with everything else. When no lookup answers it the
 //! nested loop runs and wants the larger side, which is what the size rule already says.
 
-use rudb_plan::{BuildSide, JoinKind, Node, NodeRef, Plan};
+use rudb_common::PhysicalType;
+use rudb_plan::{BuildSide, ColumnBinding, Expr, JoinKind, Node, NodeRef, Plan};
 
 use rudb_common::Result;
 
@@ -226,6 +230,9 @@ fn choose(plan: &mut Plan, stats: &Facts) {
 /// What a hash table keeps beside each row it holds, which is the row's hash.
 const HASHED: u64 = 8;
 
+/// The longest string a string's header holds in place, as `rudb_vector::INLINE_LIMIT` says.
+const INLINE: u64 = 12;
+
 /// What one row of what `node` produces takes, by the size of each column's type.
 ///
 /// Read off the plan rather than estimated, because a node's columns and their types are fixed by
@@ -238,11 +245,28 @@ fn width(plan: &Plan, node: NodeRef) -> Option<u64> {
         plan.field_list(columns).iter().map(|field| field.ty.physical().size() as u64).sum()
     };
     let exprs = |list| -> u64 {
-        plan.expr_list(list).iter().map(|&expr| plan.expr_type(expr).physical().size() as u64).sum()
+        plan.expr_list(list)
+            .iter()
+            .map(|&expr| {
+                let header = plan.expr_type(expr).physical().size() as u64;
+                match *plan.expr(expr) {
+                    Expr::Column(binding) => header + spilled(plan, binding),
+                    _ => header,
+                }
+            })
+            .sum()
     };
     match *plan.node(node) {
-        Node::Get { columns, .. }
-        | Node::Values { columns, .. }
+        Node::Get { index, columns, .. } => Some(
+            fields(columns)
+                + (0..plan.field_list(columns).len())
+                    .map(|column| {
+                        let column = u32::try_from(column).unwrap_or(u32::MAX);
+                        spilled(plan, ColumnBinding { table: index, column })
+                    })
+                    .sum::<u64>(),
+        ),
+        Node::Values { columns, .. }
         | Node::TableFunction { columns, .. }
         | Node::CteScan { columns, .. } => Some(fields(columns)),
         Node::Project { exprs: list, .. } => Some(exprs(list)),
@@ -262,6 +286,26 @@ fn width(plan: &Plan, node: NodeRef) -> Option<u64> {
         Node::CrossProduct { left, right } => Some(width(plan, left)? + width(plan, right)?),
         _ => None,
     }
+}
+
+/// The bytes a string in the column at `binding` keeps beside its header, which is none unless the
+/// column is read straight out of a table whose file says its strings average past what a header
+/// holds.
+fn spilled(plan: &Plan, binding: ColumnBinding) -> u64 {
+    let Some(field) = (0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX)).find_map(|at| {
+        match *plan.node(at) {
+            Node::Get { index, columns, .. } if index == binding.table => {
+                plan.field_list(columns).get(binding.column as usize)
+            }
+            _ => None,
+        }
+    }) else {
+        return 0;
+    };
+    if field.ty.physical() != PhysicalType::Varlen {
+        return 0;
+    }
+    plan.width_measured(binding.table, &field.name).filter(|&bytes| bytes > INLINE).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -310,8 +354,17 @@ mod tests {
 
     /// Runs the pass over a plan written out in full and reports the side it wrote on the root.
     fn side(text: &str, left: u64, right: u64) -> BuildSide {
+        measured(text, left, right, &[])
+    }
+
+    /// The same as `side`, with the average bytes a string column's file gave for it, as the table
+    /// index, the column's name and the bytes.
+    fn measured(text: &str, left: u64, right: u64, widths: &[(u32, &str, u64)]) -> BuildSide {
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        for &(index, column, bytes) in widths {
+            plan.measure_width(index, column, bytes);
+        }
         let mut facts = Facts::new();
         facts.record("memory", "main", "l", left);
         facts.record("memory", "main", "r", right);
@@ -360,6 +413,21 @@ mod tests {
         // The same join on row counts alone would have gathered the right, and still does where the
         // widths are the same.
         assert_eq!(keyed("INNER", 100_000, 40_000), BuildSide::Right);
+    }
+
+    #[test]
+    fn a_string_longer_than_its_header_holds_counts_its_bytes_as_well() {
+        // A hundred thousand rows of a key and a short string against thirty thousand of a key and a
+        // string the file says averages a hundred bytes. By headers alone the right is 32 bytes a row
+        // and the smaller side, and with its strings it is 132 bytes a row and the larger one.
+        let text = "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n  Get memory.main.l AS l #0 [a::BIGINT, n::VARCHAR]\n  Get memory.main.r AS r #1 [b::BIGINT, c::VARCHAR]\n";
+        assert_eq!(measured(text, 100_000, 30_000, &[]), BuildSide::Right);
+        assert_eq!(measured(text, 100_000, 30_000, &[(1, "c", 100)]), BuildSide::Left);
+        // A string the header holds in place costs nothing beside it, however the average is given.
+        assert_eq!(measured(text, 100_000, 30_000, &[(1, "c", 12)]), BuildSide::Right);
+        // The same reaches through a projection that passes the column up unchanged.
+        let projected = "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n  Get memory.main.l AS l #0 [a::BIGINT, n::VARCHAR]\n  Project #2 [#1.0::BIGINT AS b, #1.1::VARCHAR AS c]\n    Get memory.main.r AS r #1 [b::BIGINT, c::VARCHAR]\n";
+        assert_eq!(measured(projected, 100_000, 30_000, &[(1, "c", 100)]), BuildSide::Left);
     }
 
     #[test]
