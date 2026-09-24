@@ -1289,11 +1289,12 @@ impl Plan {
                     return fail("reads a link for a join kind a forward link cannot answer");
                 }
                 let conditions = self.checked_expr_list(conditions, reference)?;
-                // Exactly one, because the shape this node names is one equality over a declared
-                // relationship. A second condition is a filter the rewrite should have left above
-                // the join, and accepting one here would mean silently dropping it.
-                if conditions.len() != 1 {
-                    return fail("reads a link for something other than a single equality");
+                // One, or two for a key over two columns, because the shape this node names is the
+                // equalities of a declared relationship. Anything more is a filter the rewrite
+                // should have left above the join, and accepting one here would mean silently
+                // dropping it.
+                if !(1..=2).contains(&conditions.len()) {
+                    return fail("reads a link for something other than a relationship's key");
                 }
                 for &condition in conditions {
                     if *self.expr_type(condition) != LogicalType::Boolean {
@@ -1742,7 +1743,7 @@ mod tests {
     /// A link join reads one forward link per child row, and both halves of that sentence are
     /// checked here. A kind a forward link cannot answer is refused, because right and full need
     /// the parent rows nothing pointed at and a forward link is not asked that question. More than
-    /// one condition is refused, because the one condition is the link.
+    /// two conditions is refused, because the conditions are the link's key and no key is wider.
     #[test]
     fn a_link_join_is_refused_for_what_a_forward_link_cannot_answer() {
         let refused = |kind, count: usize| {
@@ -1771,10 +1772,11 @@ mod tests {
         for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti] {
             assert_eq!(refused(kind, 1), "", "{kind:?} is one of section 5.2's four");
         }
-        let message = refused(JoinKind::Inner, 2);
-        assert!(message.contains("a single equality"), "unhelpful message: {message}");
+        assert_eq!(refused(JoinKind::Inner, 2), "", "two is a key over two columns");
+        let message = refused(JoinKind::Inner, 3);
+        assert!(message.contains("a relationship's key"), "unhelpful message: {message}");
         let message = refused(JoinKind::Inner, 0);
-        assert!(message.contains("a single equality"), "unhelpful message: {message}");
+        assert!(message.contains("a relationship's key"), "unhelpful message: {message}");
     }
 
     /// The backwards-reference rule is what makes a cycle impossible, so the check for it has to

@@ -149,10 +149,10 @@ fn refused_key_map_of(catalog: &Catalog, parent: &Side) -> Option<u64> {
 /// is keyed by the child column, the way a degree section is, so two declarations over the same
 /// column and different parents read the same size, which is the size of whichever was built last.
 fn refused_link_of(catalog: &Catalog, link: &Relationship) -> Option<u64> {
-    let [child_key] = &link.child.columns[..] else { return None };
     let child = table_named(catalog, &link.child.table)?;
     let Rows::Native(rows) = child.rows() else { return None };
-    rudb_native::graph::refused_link(rows, child.column_index(child_key)?).map(|(_, bytes)| bytes)
+    rudb_native::graph::refused_link(rows, key_in(child, &link.child.columns)?)
+        .map(|(_, bytes)| bytes)
 }
 
 /// The stored forward link of a relationship, when both of its tables are in the same file and the
@@ -164,9 +164,6 @@ fn refused_link_of(catalog: &Catalog, link: &Relationship) -> Option<u64> {
 /// reader that had both open and had checked that neither had moved since. Nothing declares one
 /// today and this reports nothing for one rather than guessing.
 fn forward_link_of(catalog: &Catalog, link: &Relationship) -> Option<rudb_graph::Link> {
-    let ([child_key], [parent_key]) = (&link.child.columns[..], &link.parent.columns[..]) else {
-        return None;
-    };
     let child = table_named(catalog, &link.child.table)?;
     let parent = table_named(catalog, &link.parent.table)?;
     let (Rows::Native(child_rows), Rows::Native(parent_rows)) = (child.rows(), parent.rows())
@@ -175,9 +172,9 @@ fn forward_link_of(catalog: &Catalog, link: &Relationship) -> Option<rudb_graph:
     };
     let edge = Edge {
         child: child.name().table.clone(),
-        child_column: child.column_index(child_key)?,
+        child_column: key_in(child, &link.child.columns)?,
         parent: parent.name().table.clone(),
-        parent_column: parent.column_index(parent_key)?,
+        parent_column: key_in(parent, &link.parent.columns)?,
     };
     rudb_native::graph::stored_link(child_rows, parent_rows, &edge)
 }
@@ -189,10 +186,16 @@ fn forward_link_of(catalog: &Catalog, link: &Relationship) -> Option<rudb_graph:
 /// need to be: the build attaches the two together under the same id and stamps them with the same
 /// generation, so a file cannot hold one of them current without the other.
 fn degrees_of(catalog: &Catalog, link: &Relationship) -> Option<Degrees> {
-    let [child_key] = &link.child.columns[..] else { return None };
     let child = table_named(catalog, &link.child.table)?;
     let Rows::Native(rows) = child.rows() else { return None };
-    rudb_native::graph::stored_degrees(rows, child.column_index(child_key)?)
+    rudb_native::graph::stored_degrees(rows, key_in(child, &link.child.columns)?)
+}
+
+/// The number the graph sections name a key over these columns by: the column's index for one, and
+/// `rudb_native::graph::key_of`'s pair for two.
+fn key_in(table: &Table, columns: &[String]) -> Option<usize> {
+    let at = columns.iter().map(|column| table.column_index(column)).collect::<Option<Vec<_>>>()?;
+    rudb_native::graph::key_of(&at)
 }
 
 /// The first table of that name in any schema of any database.

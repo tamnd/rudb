@@ -154,6 +154,12 @@ pub struct Linked {
     /// a relationship with no link gets, since totality is a fact about the children and the thing
     /// that counted them is the link.
     pub total: bool,
+    /// The second key column of each side, child then parent, for a key over two columns.
+    ///
+    /// `partsupp(ps_partkey, ps_suppkey)` is the one TPC-H has. A link over one is stored the same
+    /// way as any other and read the same way, so the only thing that changes here is how many
+    /// equalities a join has to hold for it to be this relationship.
+    pub second: Option<(String, String)>,
 }
 
 impl Linked {
@@ -194,7 +200,14 @@ impl Linked {
             parent_column: parent_column.into(),
             built: false,
             total: false,
+            second: None,
         }
+    }
+
+    /// The same relationship over a second pair of key columns.
+    #[must_use]
+    pub fn and(self, child_column: impl Into<String>, parent_column: impl Into<String>) -> Self {
+        Self { second: Some((child_column.into(), parent_column.into())), ..self }
     }
 
     /// Whether the file has certified that a child row has exactly one parent row.
@@ -210,13 +223,31 @@ impl Linked {
 
     /// Whether this is the relationship between those two columns.
     ///
-    /// Names are matched without regard to case, the same way the catalog resolves one.
+    /// Names are matched without regard to case, the same way the catalog resolves one. A key over
+    /// two columns is never the relationship between one pair of them, because a join on half of it
+    /// may find many parents for a child.
     #[must_use]
     pub(crate) fn between(&self, child: (&str, &str), parent: (&str, &str)) -> bool {
-        self.child.eq_ignore_ascii_case(child.0)
-            && self.child_column.eq_ignore_ascii_case(child.1)
-            && self.parent.eq_ignore_ascii_case(parent.0)
-            && self.parent_column.eq_ignore_ascii_case(parent.1)
+        self.second.is_none() && self.over((child.0, parent.0), &[(child.1, parent.1)])
+    }
+
+    /// Whether this is the relationship between those two tables over exactly these pairs of
+    /// columns, child column then parent column, in any order.
+    #[must_use]
+    pub(crate) fn over(&self, tables: (&str, &str), pairs: &[(&str, &str)]) -> bool {
+        let same = |pair: &(&str, &str), child: &str, parent: &str| {
+            pair.0.eq_ignore_ascii_case(child) && pair.1.eq_ignore_ascii_case(parent)
+        };
+        let mine = |pair: &(&str, &str)| {
+            same(pair, &self.child_column, &self.parent_column)
+                || self.second.as_ref().is_some_and(|(child, parent)| same(pair, child, parent))
+        };
+        let width = 1 + usize::from(self.second.is_some());
+        self.child.eq_ignore_ascii_case(tables.0)
+            && self.parent.eq_ignore_ascii_case(tables.1)
+            && pairs.len() == width
+            && pairs.iter().all(mine)
+            && (width == 1 || !same(&pairs[0], pairs[1].0, pairs[1].1))
     }
 }
 
@@ -231,7 +262,8 @@ pub enum Why {
     /// A forward link answers neither a right nor a full join, because both want the parent rows
     /// nothing pointed at and a link is only ever read from the child.
     Kind,
-    /// Not one equality over two plain columns, so there is no single column a link is indexed by.
+    /// Not one equality over two plain columns, or two for a key over two columns, so there is no
+    /// key a link is indexed by.
     Key,
     /// Nobody declared a relationship between the two columns the join equates.
     None,
@@ -455,12 +487,12 @@ fn decided(
         JoinKind::Left | JoinKind::Semi | JoinKind::Anti => &[(left, right)],
         _ => return (Why::Kind, None),
     };
-    let Some(keys) = equated_pair(plan, conditions) else {
+    let Some(keys) = equalities(plan, conditions) else {
         return (Why::Key, None);
     };
     let mut worst = Why::None;
     for &(child, parent) in sides {
-        let found = match matched(plan, child, parent, keys, carried, context) {
+        let found = match matched(plan, child, parent, &keys, carried, context) {
             Ok(found) => found,
             Err(why) => {
                 worst = worst.or(why);
@@ -575,7 +607,7 @@ fn matched(
     plan: &Plan,
     child: NodeRef,
     parent: NodeRef,
-    keys: [ColumnBinding; 2],
+    keys: &[[ColumnBinding; 2]],
     carried: &[Carried],
     context: &Context,
 ) -> std::result::Result<Match, Why> {
@@ -586,36 +618,42 @@ fn matched(
     else {
         return Err(Why::ParentNotStored);
     };
-    let [child_key, parent_key] =
-        match (keys[0].table == parent_index, keys[1].table == parent_index) {
-            (false, true) => [keys[0], keys[1]],
-            (true, false) => [keys[1], keys[0]],
+    // Each equality read child side first. Every child key has to come out of the one scan, since
+    // a relationship is between two tables and a key split across two scans is not a key of either.
+    let mut oriented = Vec::with_capacity(keys.len());
+    for &[left, right] in keys {
+        oriented.push(match (left.table == parent_index, right.table == parent_index) {
+            (false, true) => (left, right),
+            (true, false) => (right, left),
             _ => return Err(Why::None),
-        };
-    let scan = scan_under(plan, child, child_key.table).ok_or(Why::ChildNotStored)?;
+        });
+    }
+    let child_index = oriented[0].0.table;
+    if oriented.iter().any(|(child_key, _)| child_key.table != child_index) {
+        return Err(Why::None);
+    }
+    let scan = scan_under(plan, child, child_index).ok_or(Why::ChildNotStored)?;
     let Node::Get { table: child_name, columns: child_columns, .. } = *plan.node(scan) else {
         return Err(Why::ChildNotStored);
     };
-    let child_column =
-        plan.field_list(child_columns).get(child_key.column as usize).ok_or(Why::None)?;
-    let parent_column =
-        plan.field_list(projected).get(parent_key.column as usize).ok_or(Why::None)?;
-    let relationship = (
-        (plan.string(child_name), child_column.name.as_str()),
-        (plan.string(parent_name), parent_column.name.as_str()),
-    );
-    let declared = context
-        .links()
-        .iter()
-        .find(|link| link.between(relationship.0, relationship.1))
-        .ok_or(Why::None)?;
+    let (child_fields, parent_fields) =
+        (plan.field_list(child_columns), plan.field_list(projected));
+    let mut pairs = Vec::with_capacity(oriented.len());
+    for (child_key, parent_key) in &oriented {
+        let child_column = child_fields.get(child_key.column as usize).ok_or(Why::None)?;
+        let parent_column = parent_fields.get(parent_key.column as usize).ok_or(Why::None)?;
+        pairs.push((child_column.name.as_str(), parent_column.name.as_str()));
+    }
+    let tables = (plan.string(child_name), plan.string(parent_name));
+    let declared =
+        context.links().iter().find(|link| link.over(tables, &pairs)).ok_or(Why::None)?;
     if !declared.built {
         return Err(Why::NotBuilt);
     }
     // Section 5.1's rule, and the only thing between this pass and a wrong answer. A link is
     // indexed by a row of the child table, so it may only be read where every row reaching the join
     // is still a row of that table.
-    if !carried.get(child as usize).is_some_and(|rids| rids.has(child_key.table)) {
+    if !carried.get(child as usize).is_some_and(|rids| rids.has(child_index)) {
         return Err(Why::RowIdGone);
     }
     Ok(Match { scan, projected })
@@ -657,21 +695,28 @@ fn width(plan: &Plan, columns: Slice) -> usize {
     plan.field_list(columns).iter().map(|field| field.ty.physical().size()).sum()
 }
 
-/// The two columns one equality holds equal, when that is what the conditions are.
+/// The two columns each equality holds equal, when that is all the conditions are.
 ///
-/// One condition and no more, because more than one equality is a composite key and a link is built
-/// over a single column. Two columns and nothing computed, because a link is indexed by a column.
-fn equated_pair(plan: &Plan, conditions: Slice) -> Option<[ColumnBinding; 2]> {
-    let [condition] = plan.expr_list(conditions) else {
+/// One condition, or two for a key over two columns, and no more, because no link is built over a
+/// wider key. Every one of them an equality between two columns and nothing computed, because a
+/// link is indexed by columns, and a condition that is not one would be dropped by reading the link.
+fn equalities(plan: &Plan, conditions: Slice) -> Option<Vec<[ColumnBinding; 2]>> {
+    let conditions = plan.expr_list(conditions);
+    if !(1..=2).contains(&conditions.len()) {
         return None;
-    };
-    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(*condition) else {
-        return None;
-    };
-    match (plan.expr(left), plan.expr(right)) {
-        (&Expr::Column(left), &Expr::Column(right)) => Some([left, right]),
-        _ => None,
     }
+    let mut keys = Vec::with_capacity(conditions.len());
+    for &condition in conditions {
+        let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+            return None;
+        };
+        let (&Expr::Column(left), &Expr::Column(right)) = (plan.expr(left), plan.expr(right))
+        else {
+            return None;
+        };
+        keys.push([left, right]);
+    }
+    Some(keys)
 }
 
 /// The scan of `index` under `at`, through the operators that leave a row where it was.
@@ -818,6 +863,85 @@ mod tests {
             .filter_map(|node| super::why(&plan, node, &context))
             .collect::<Vec<_>>();
         assert!(reasons.contains(&Why::RowIdGone), "{reasons:?}");
+    }
+
+    /// `lineitem` against `partsupp` over both halves of its key, with `on` as the conditions.
+    fn pair_joined(on: &str) -> (Plan, Context) {
+        let text = format!(
+            "Project #2 [#0.0::BIGINT AS k]\n  \
+             Join INNER on=[{on}]\n    \
+             Get memory.main.lineitem AS lineitem #0 [l_partkey::BIGINT, l_suppkey::BIGINT]\n    \
+             Get memory.main.partsupp AS partsupp #1 \
+             [ps_partkey::BIGINT, ps_suppkey::BIGINT, ps_supplycost::DOUBLE]\n"
+        );
+        let plan =
+            Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "lineitem", 6_000_000);
+        facts.record("memory", "main", "partsupp", 800_000);
+        let mut context = Context::new();
+        context.measure(Arc::new(facts));
+        context.relate(Arc::new(vec![
+            Linked::built("lineitem", "l_partkey", "partsupp", "ps_partkey")
+                .and("l_suppkey", "ps_suppkey"),
+        ]));
+        (plan, context)
+    }
+
+    fn reasons(plan: &Plan, context: &Context) -> Vec<Why> {
+        (0..u32::try_from(plan.node_count()).expect("a small plan"))
+            .filter_map(|node| super::why(plan, node, context))
+            .collect()
+    }
+
+    #[test]
+    fn a_join_over_both_columns_of_a_two_column_key_reads_the_link() {
+        // Q9's join with `partsupp`, and in the other order from the declaration, since the order
+        // the planner lists its conditions in is not something the declaration controls.
+        let (mut plan, context) = pair_joined(
+            "(#0.1::BIGINT = #1.1::BIGINT)::BOOLEAN, (#1.0::BIGINT = #0.0::BIGINT)::BOOLEAN",
+        );
+        let text = rewritten(&mut plan, &context);
+        assert!(text.contains("LinkJoin"), "a two column key was not read:\n{text}");
+    }
+
+    #[test]
+    fn a_join_over_half_of_a_two_column_key_does_not() {
+        // Four parents for every child, so reading the link here would drop three rows of four.
+        let (mut plan, context) = pair_joined("(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN");
+        let text = rewritten(&mut plan, &context);
+        assert!(!text.contains("LinkJoin"), "half a key was read as the key:\n{text}");
+        assert!(reasons(&plan, &context).contains(&Why::None));
+    }
+
+    #[test]
+    fn a_join_that_crosses_the_two_columns_does_not() {
+        let (mut plan, context) = pair_joined(
+            "(#0.0::BIGINT = #1.1::BIGINT)::BOOLEAN, (#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN",
+        );
+        let text = rewritten(&mut plan, &context);
+        assert!(!text.contains("LinkJoin"), "a crossed key was read as the key:\n{text}");
+    }
+
+    #[test]
+    fn a_join_that_names_one_column_pair_twice_does_not() {
+        let (mut plan, context) = pair_joined(
+            "(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN, (#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN",
+        );
+        let text = rewritten(&mut plan, &context);
+        assert!(!text.contains("LinkJoin"), "one pair twice was read as the key:\n{text}");
+    }
+
+    #[test]
+    fn a_two_column_relationship_is_never_the_relationship_between_one_pair() {
+        // What join elimination asks, and a yes here would let it drop a join that multiplies rows.
+        let link = Linked::verified("lineitem", "l_partkey", "partsupp", "ps_partkey")
+            .and("l_suppkey", "ps_suppkey");
+        assert!(!link.between(("lineitem", "l_partkey"), ("partsupp", "ps_partkey")));
+        assert!(link.over(
+            ("lineitem", "partsupp"),
+            &[("L_SUPPKEY", "ps_suppkey"), ("l_partkey", "PS_PARTKEY")]
+        ));
     }
 
     #[test]

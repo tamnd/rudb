@@ -28,14 +28,17 @@ use crate::{Catalog, Reader, invalid, type_tag};
 /// scan of the parts in order is a scan in `rid` order and there is nothing to look up. That is the
 /// whole of the correspondence and it is worth stating, because a build that read the parts in any
 /// other order would produce a map that resolved every key to the wrong row without failing.
+///
+/// Or two columns of it, when the key is a [`pair`]. Both are read from the same part in one call,
+/// so the two values of a row are the same row's.
 #[derive(Debug)]
 pub struct KeyColumn<'a> {
     reader: &'a Reader,
-    column: usize,
+    columns: Vec<usize>,
 }
 
 impl<'a> KeyColumn<'a> {
-    /// Names a column of a table as the key column of a relationship's parent side.
+    /// Names a column of a table, or a [`pair`] of them, as the key of a relationship's side.
     ///
     /// # Errors
     ///
@@ -43,35 +46,125 @@ impl<'a> KeyColumn<'a> {
     /// of those today: section 2.2 says a string key is mapped through its dictionary codes rather
     /// than its text, and the code path is not built yet. None of TPC-H's eight relationships needs
     /// it, so it is refused by name rather than approximated.
-    pub fn new(reader: &'a Reader, column: usize) -> Result<Self> {
+    pub fn new(reader: &'a Reader, key: usize) -> Result<Self> {
         let fields = reader.table().fields();
-        let Some(field) = fields.get(column) else {
-            return Err(invalid(&format!(
-                "column {column} is past the {} of table {}",
-                fields.len(),
-                reader.table().name()
-            )));
-        };
-        if !mappable(&field.ty) {
-            return Err(invalid(&format!(
-                "a key map over {} needs an integer key form, and {} has none",
-                field.name, field.ty
-            )));
+        let columns = columns_of(key);
+        for &column in &columns {
+            let Some(field) = fields.get(column) else {
+                return Err(invalid(&format!(
+                    "column {column} is past the {} of table {}",
+                    fields.len(),
+                    reader.table().name()
+                )));
+            };
+            if !mappable(&field.ty) {
+                return Err(invalid(&format!(
+                    "a key map over {} needs an integer key form, and {} has none",
+                    field.name, field.ty
+                )));
+            }
         }
-        Ok(Self { reader, column })
+        Ok(Self { reader, columns })
     }
 }
 
 impl Keys for KeyColumn<'_> {
     fn scan(&self, each: &mut dyn FnMut(Option<i128>) -> Result<()>) -> Result<()> {
         for part in 0..self.reader.parts() {
-            let chunk = self.reader.read(part, &[self.column])?;
-            let values = chunk.column(0)?;
+            let chunk = self.reader.read(part, &self.columns)?;
+            let first = chunk.column(0)?;
+            let second = if self.columns.len() == 2 { Some(chunk.column(1)?) } else { None };
             for row in 0..chunk.len() {
-                each(key_at(&chunk, values, row)?)?;
+                let key = key_at(&chunk, first, 0, row)?;
+                let key = match second {
+                    None => key,
+                    Some(second) => match (key, key_at(&chunk, second, 1, row)?) {
+                        (Some(high), Some(low)) => Some(fold(high, low)?),
+                        // A composite with a null in it matches nothing, the way SQL compares it.
+                        _ => None,
+                    },
+                };
+                each(key)?;
             }
         }
         Ok(())
+    }
+}
+
+/// Where a key over two columns sits among the column numbers.
+///
+/// A relationship's key is named by a number everywhere it is stored: the id of a key map or a link
+/// section, and the parent column in a link's binding. A key over one column is that column's index
+/// and always was. A key over two is this bit, with the two indexes packed under it, so the files
+/// written before there were two column keys read exactly as they did, and nothing that stores a
+/// key needs a second field for the rare key that has two columns. TPC-H has one of them,
+/// `partsupp(ps_partkey, ps_suppkey)`, which spec/graph/02-the-data-model.md section 2.3 names.
+const PAIR: usize = 1 << 31;
+
+/// How many bits each column index of a [`pair`] gets, which is room for 32,768 columns.
+const PAIR_BITS: u32 = 15;
+
+/// The number that names a key over these columns, or `None` for a list this cannot name.
+///
+/// One column is its own index. Two are a pair. More than two, or an index too large to pack, is a
+/// key nothing is built for, which section 3.1 says is a slower query and never a wrong one.
+#[must_use]
+pub fn key_of(columns: &[usize]) -> Option<usize> {
+    let fits = |column: usize| column < 1 << PAIR_BITS;
+    match *columns {
+        [column] if column < PAIR => Some(column),
+        [first, second] if fits(first) && fits(second) => Some(PAIR | first << PAIR_BITS | second),
+        _ => None,
+    }
+}
+
+/// The two columns of a pair key, first then second.
+#[must_use]
+pub fn pair(first: usize, second: usize) -> Option<usize> {
+    key_of(&[first, second])
+}
+
+/// The columns a key number names, which [`key_of`] made.
+#[must_use]
+pub fn columns_of(key: usize) -> Vec<usize> {
+    if key & PAIR == 0 {
+        return vec![key];
+    }
+    let mask = (1 << PAIR_BITS) - 1;
+    vec![(key >> PAIR_BITS) & mask, key & mask]
+}
+
+/// Two key values as one, with nothing lost.
+///
+/// Each value has to fit a 32 bit integer. The second moves up by 2^31 into `0..2^32` and the first
+/// is multiplied past that, so two different pairs never give the same number, which is the property
+/// a key map needs: a hash would be smaller and would also let two keys meet, and a key map has no
+/// second look at the row to tell them apart. The result fits an `i64`, because a key map's keys have
+/// to span no more than a `u64` does. A value outside that range is an error and the relationship
+/// gets no link, which section 3.1 says is a slower query and not a wrong one. TPC-H's keys are
+/// under two hundred million at scale factor 1000.
+fn fold(high: i128, low: i128) -> Result<i128> {
+    const SHIFT: i128 = 1 << 32;
+    let fits = |value: i128| i128::from(i32::MIN) <= value && value <= i128::from(i32::MAX);
+    if !fits(high) || !fits(low) {
+        return Err(invalid("a two column key holds a value too wide to fold into one key"));
+    }
+    Ok(high * SHIFT + (low - i128::from(i32::MIN)))
+}
+
+/// The type tag a key map over this key is stamped with, which is the column's own for one column.
+///
+/// A pair folds into an `i64`, so its map is stamped as a `BIGINT`, which is the type of the numbers
+/// in it. What keeps it from passing for a map over one column is its id, which no column has.
+fn key_tag(fields: &[rudb_common::Field], key: usize) -> Option<u8> {
+    match *columns_of(key) {
+        [column] => type_tag(&fields.get(column)?.ty).ok(),
+        [first, second] => {
+            fields.get(first)?;
+            fields.get(second)?;
+            type_tag(&LogicalType::BigInt).ok()
+        }
+        _ => None,
     }
 }
 
@@ -100,11 +193,16 @@ fn mappable(ty: &LogicalType) -> bool {
 /// all: a null shifts every row after it and a value this could not read would shift nothing while
 /// silently becoming one. So the slow path settles which it was, and a value that is neither is an
 /// error rather than a null.
-fn key_at(chunk: &Chunk, values: &rudb_vector::Vector, row: usize) -> Result<Option<i128>> {
+fn key_at(
+    chunk: &Chunk,
+    values: &rudb_vector::Vector,
+    column: usize,
+    row: usize,
+) -> Result<Option<i128>> {
     if let Some(key) = values.signed_at(row) {
         return Ok(Some(key));
     }
-    match chunk.value_at(row, 0) {
+    match chunk.value_at(row, column) {
         Value::Null => Ok(None),
         Value::TinyInt(key) => Ok(Some(i128::from(key))),
         Value::SmallInt(key) => Ok(Some(i128::from(key))),
@@ -225,7 +323,9 @@ pub fn build_key_maps_within(
     for &column in columns {
         let start = Instant::now();
         let map = build_key_map(&reader, column)?;
-        let payload = wire::encode(&map, type_tag(&reader.table().fields()[column].ty)?)?;
+        let tag = key_tag(reader.table().fields(), column)
+            .ok_or_else(|| invalid("a key map over a column the table does not have"))?;
+        let payload = wire::encode(&map, tag)?;
         report.push(Built {
             column,
             form: map.form(),
@@ -320,7 +420,7 @@ pub fn key_map(reader: &Reader, column: usize) -> Option<KeyMap> {
     // is no longer this one. It should be unreachable, since changing a column's type rewrites the
     // table and moves its generation, and it is checked rather than assumed because the cost of
     // being wrong is every key resolving to a plausible wrong row.
-    if tag != type_tag(&table.fields().get(column)?.ty).ok()? {
+    if tag != key_tag(table.fields(), column)? {
         return None;
     }
     Some(map)
@@ -547,8 +647,7 @@ fn one_link(
 ) -> std::result::Result<(BuiltLink, Vec<u8>), String> {
     let parent =
         catalog.table(&edge.parent).map_err(|_| format!("no table named {}", edge.parent))?;
-    let map = key_map(&parent, edge.parent_column)
-        .ok_or_else(|| format!("no key map is stored for {}", edge.parent))?;
+    let map = parent_map(&parent, edge)?;
     if !map.observed().usable_as_parent() {
         return Err(format!("the key of {} is not unique", edge.parent));
     }
@@ -599,6 +698,24 @@ fn one_link(
         },
         bytes,
     ))
+}
+
+/// The parent's key map for one link: the stored one for a key over one column, and one built here
+/// for a pair.
+///
+/// A pair's map is not kept, because nothing reads it but this build. The query follows the link and
+/// never looks a key up, and the map a pair needs is the expensive kind: its keys are sparse, so it
+/// is the sorted form, which on `partsupp` is several megabytes against a budget that is about four.
+/// Kept, it would be refused by the budget and take the link down with it. Built here, it costs one
+/// read of two parent columns per checkpoint, which is less than the child scan beside it.
+fn parent_map(parent: &Reader, edge: &Edge) -> std::result::Result<KeyMap, String> {
+    if columns_of(edge.parent_column).len() == 1 {
+        return key_map(parent, edge.parent_column)
+            .ok_or_else(|| format!("no key map is stored for {}", edge.parent));
+    }
+    KeyColumn::new(parent, edge.parent_column)
+        .and_then(|keys| KeyMap::build_from(&keys))
+        .map_err(|error| error.to_string())
 }
 
 /// What a structure that did not fit is recorded as having cost.
@@ -1170,6 +1287,102 @@ mod tests {
             assert_eq!(link.forward(rid as Rid), want, "child {rid}");
         }
         link
+    }
+
+    /// A two column table of these pairs, a thousand rows to a part.
+    fn pairs_into(mut writer: Writer, rows: &[(Option<i64>, Option<i64>)]) {
+        let values = |pick: fn(&(Option<i64>, Option<i64>)) -> Option<i64>, part: &[_]| {
+            let values = part
+                .iter()
+                .map(|row| pick(row).map_or(Value::Null, Value::BigInt))
+                .collect::<Vec<_>>();
+            Vector::from_values(LogicalType::BigInt, &values).expect("keys")
+        };
+        for part in rows.chunks(1000) {
+            let chunk = Chunk::new(vec![values(|row| row.0, part), values(|row| row.1, part)])
+                .expect("two columns");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+    }
+
+    #[test]
+    fn a_key_over_one_column_is_named_the_way_it_always_was() {
+        // The files written before there were pairs name every key by its column's index, so a
+        // single column has to come out as exactly that or every one of them stops resolving.
+        assert_eq!(key_of(&[0]), Some(0));
+        assert_eq!(key_of(&[17]), Some(17));
+        assert_eq!(columns_of(17), vec![17]);
+        let pair = key_of(&[1, 2]).expect("a pair");
+        assert_ne!(pair, key_of(&[2, 1]).expect("a pair"), "the order is part of the key");
+        assert_eq!(columns_of(pair), vec![1, 2]);
+        assert!(pair > u32::MAX as usize / 2, "a pair never reads as a column index");
+        assert_eq!(key_of(&[]), None);
+        assert_eq!(key_of(&[0, 1, 2]), None, "nothing is built over three columns");
+        assert_eq!(key_of(&[1 << 15, 0]), None, "an index too wide to pack is refused");
+    }
+
+    #[test]
+    fn two_values_fold_into_one_key_without_two_pairs_ever_meeting() {
+        let values = [i128::from(i32::MIN), -1, 0, 1, i128::from(i32::MAX)];
+        let mut seen = std::collections::HashSet::new();
+        for &high in &values {
+            for &low in &values {
+                assert!(seen.insert(fold(high, low).expect("fits")), "({high}, {low}) met another");
+            }
+        }
+        let wide = i128::from(i32::MAX) + 1;
+        assert!(fold(0, wide).is_err(), "a second value past 32 bits");
+        assert!(fold(wide, 0).is_err(), "a first value past 32 bits");
+        let span = fold(i128::from(i32::MAX), i128::from(i32::MAX)).expect("fits")
+            - fold(i128::from(i32::MIN), i128::from(i32::MIN)).expect("fits");
+        assert!(span <= i128::from(u64::MAX), "a key map's keys span no more than a u64");
+    }
+
+    #[test]
+    fn a_link_over_a_two_column_key_finds_the_row_holding_both_values() {
+        // `lineitem(l_partkey, l_suppkey) -> partsupp(ps_partkey, ps_suppkey)` in small: four
+        // suppliers for each of five hundred parts, and a child that names a pair of them. The
+        // first column alone repeats four times, so this is the case a link over it cannot answer.
+        let path = path("pair");
+        let fields =
+            vec![Field::new("part", LogicalType::BigInt), Field::new("supp", LogicalType::BigInt)];
+        let parents = (1..=500_i64)
+            .flat_map(|part| (0..4).map(move |at| (Some(part), Some((part + at * 125) % 1000 + 1))))
+            .collect::<Vec<_>>();
+        pairs_into(Writer::create(&path, "parent", fields.clone()).expect("new file"), &parents);
+        let mut children = (0..3000_i64)
+            .map(|at| parents[usize::try_from((at * 7) % 2000).expect("small")])
+            .collect::<Vec<_>>();
+        children[5] = (Some(3), Some(999)); // a part and a supplier that are never paired
+        children[6] = (None, Some(4));
+        children[7] = (Some(4), None);
+        pairs_into(Writer::open(&path, "child", fields).expect("a second table"), &children);
+
+        let key = pair(0, 1).expect("a pair");
+        let edge = Edge {
+            child: "child".into(),
+            child_column: key,
+            parent: "parent".into(),
+            parent_column: key,
+        };
+        let report = build_links(&path, std::slice::from_ref(&edge)).expect("build");
+        assert!(report[0].built, "{:?}", report[0].note);
+        assert_eq!(report[0].linked, 2997, "three children name no parent");
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let parent = catalog.table("parent").expect("the parent");
+        let child = catalog.table("child").expect("the child");
+        assert!(key_map(&parent, key).is_none(), "a pair's map is built for the link and not kept");
+        let link = stored_link(&child, &parent, &edge).expect("the link is in the file");
+        for (rid, row) in children.iter().enumerate() {
+            let want = parents.iter().position(|held| held == row).map(|at| at as Rid);
+            assert_eq!(link.forward(rid as Rid), want, "child {rid} is {row:?}");
+        }
+        let one = Edge { child_column: 0, parent_column: 0, ..edge };
+        assert!(stored_link(&child, &parent, &one).is_none(), "half of the key is not the key");
+
+        fs::remove_file(&path).expect("clean up");
     }
 
     #[test]
