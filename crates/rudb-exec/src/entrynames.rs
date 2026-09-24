@@ -1,4 +1,4 @@
-//! The five catalog tables: what is attached, what is in it, and what somebody created there.
+//! The catalog tables: what is attached, what is in it, and what somebody created there.
 //!
 //! `duckdb_databases()`, `duckdb_schemas()`, `duckdb_tables()`, `duckdb_views()` and
 //! `duckdb_columns()`, the metadata tables whose rows come out of the catalog rather than out of a
@@ -9,6 +9,8 @@
 //! `duckdb_columns()` lists a view's columns as well as a table's. What it reads is the list the
 //! binder wrote down the last time the view was bound, which is a cache that goes stale, and that is
 //! upstream's design rather than a shortcut taken here. See `rudb_catalog::View` for the measurement.
+//!
+//! `duckdb_sequences()` sits beside them and lists each sequence with the counter as it is now.
 //!
 //! `duckdb_views()` is the fifth and it reports the statement written back out, which the binder
 //! wrote down at `CREATE VIEW` using `rudb_parse::deparse`. The pin reports a deparse there too
@@ -41,8 +43,8 @@ use rudb_catalog::{Catalog, Database, Schema, TEMP_CATALOG, Table};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
     DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields,
-    show_database_fields, show_expanded_fields, show_table_fields, table_fields, type_oid,
-    view_fields,
+    sequence_fields, show_database_fields, show_expanded_fields, show_table_fields, table_fields,
+    type_oid, view_fields,
 };
 use rudb_parse::quoted;
 use rudb_plan::{Plan, Slice};
@@ -206,6 +208,61 @@ pub(crate) fn viewnames(
         }
     }
     Metadata::new("duckdb_views", &view_fields(), &rows, plan, index, columns)
+}
+
+/// Every sequence in the catalog, in the columns the plan asked for.
+///
+/// `start_value` is what the sequence was created with while `sql` writes the counter as it is now
+/// in its `START`, so the statement makes a sequence that carries on from where this one got to.
+/// The name goes into `sql` bare, without quotes and without its schema, which is what the pin
+/// writes as well.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn sequencenames(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut rows = Vec::new();
+    for database in catalog.databases() {
+        for schema in database.schemas() {
+            for sequence in schema.sequences() {
+                let counter = sequence.counter();
+                let options = counter.options();
+                let sql = format!(
+                    "CREATE SEQUENCE {} INCREMENT BY {} MINVALUE {} MAXVALUE {} START {} {};",
+                    sequence.name().table,
+                    options.increment,
+                    options.min,
+                    options.max,
+                    counter.counter(),
+                    if options.cycle { "CYCLE" } else { "NO CYCLE" }
+                );
+                rows.push(vec![
+                    text(database.name()),
+                    Value::BigInt(database.oid()),
+                    text(schema.name()),
+                    Value::BigInt(schema.oid()),
+                    text(&sequence.name().table),
+                    Value::BigInt(sequence.oid()),
+                    Value::Null,
+                    empty(),
+                    Value::Boolean(database.name() == TEMP_CATALOG),
+                    Value::BigInt(options.start),
+                    Value::BigInt(options.min),
+                    Value::BigInt(options.max),
+                    Value::BigInt(options.increment),
+                    Value::Boolean(options.cycle),
+                    counter.last().map_or(Value::Null, Value::BigInt),
+                    text(&sql),
+                ]);
+            }
+        }
+    }
+    Metadata::new("duckdb_sequences", &sequence_fields(), &rows, plan, index, columns)
 }
 
 /// Every column of every base table, in the columns the plan asked for.
