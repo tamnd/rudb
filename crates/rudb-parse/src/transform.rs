@@ -888,6 +888,7 @@ impl<'a> Transform<'a> {
             min: 1,
             max: i64::MAX,
             start: 1,
+            // flatten: an option that may be missing and may be given without a number.
             cycle: value("cycle").flatten() == Some(1),
         };
         let min = if no_min { None } else { value("minvalue") };

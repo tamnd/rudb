@@ -20,6 +20,7 @@ pub(crate) fn call<V: AsRef<Vector>>(
         return Ok(None);
     }
     let mut values = Vec::with_capacity(rows);
+    // row at a time: every row moves the counter once, in order, so there is no batch answer.
     for row in 0..rows {
         let id = args[0].as_ref().try_value_at(row)?;
         let Some(id) = id.as_i64() else {
