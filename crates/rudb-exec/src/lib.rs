@@ -96,6 +96,7 @@ mod group;
 mod group_count;
 mod group_distinct;
 mod group_mixed;
+mod group_ranged;
 mod join;
 mod key;
 mod keywords;

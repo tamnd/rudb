@@ -43,6 +43,7 @@ use crate::buffer::Buffered;
 use crate::group_count;
 use crate::group_distinct;
 use crate::group_mixed;
+use crate::group_ranged;
 use crate::key::{BigIntSet, Key, RowSet, mix, spread};
 use crate::pairs::{self, together};
 use crate::prepared::{Prepared, Scratch};
@@ -339,6 +340,8 @@ pub(crate) struct Aggregate<'a> {
     mixed: OnceLock<group_mixed::Exchange>,
     /// Keys and run weights exchanged for a single signed integer key's `COUNT(*)`.
     counted: OnceLock<group_count::Exchange>,
+    /// Counts in arrays the key indexes, for a key whose range is known. See [`group_ranged`].
+    ranged: OnceLock<group_ranged::Exchange>,
     out: Buffered,
 }
 
@@ -1154,6 +1157,7 @@ impl<'a> Aggregate<'a> {
             grouped_distinct: OnceLock::new(),
             mixed: OnceLock::new(),
             counted: OnceLock::new(),
+            ranged: OnceLock::new(),
             out: out.clone(),
         };
         Ok((aggregate, out))
@@ -1510,6 +1514,66 @@ impl<'a> Aggregate<'a> {
             && self.constants.iter().all(Option::is_none)
             && self.keys.len() == 1
             && signed_key(self.plan.expr_type(self.keys[0]))
+    }
+
+    /// Whether every call is a plain count and the one key has a range the planner knows, so the
+    /// counts can be kept in arrays the key indexes. See [`group_ranged`].
+    ///
+    /// Nothing that reads the groups afterwards is allowed, a TopN or a `HAVING` on the count or a
+    /// limit on the groups, since those live in the table this goes around.
+    fn ranged_counts(&self) -> bool {
+        !self.alone
+            && self.span.is_some()
+            && self.top_counts.is_none()
+            && self.having_count.is_none()
+            && self.max_groups.is_none()
+            && !self.sets
+            && self.keys.len() == 1
+            && self.constants.iter().all(Option::is_none)
+            && signed_key(self.plan.expr_type(self.keys[0]))
+            && self.calls.iter().all(|call| {
+                call.folds()
+                    && !call.distinct
+                    && call.filter.is_none()
+                    && call.returns == LogicalType::BigInt
+                    && match call.name.as_str() {
+                        "count_star" => call.args.is_empty(),
+                        "count" => call.args.len() == 1,
+                        _ => false,
+                    }
+            })
+    }
+
+    /// One chunk counted into this instance's arrays.
+    fn count_ranged(&self, rows: &Rows, local: &mut group_ranged::Local) -> Result<Progress> {
+        let rows = rows.settled()?;
+        let [key] = rows.keys.as_slice() else {
+            return Err(Error::internal("a ranged count received the wrong key width"));
+        };
+        let exchange = self.ranged.get_or_init(|| {
+            let (low, values) = self.span.expect("a ranged count has a range");
+            let calls = self
+                .calls
+                .iter()
+                .map(|call| {
+                    if call.args.is_empty() {
+                        group_ranged::Counted::Rows
+                    } else {
+                        group_ranged::Counted::Valid
+                    }
+                })
+                .collect();
+            group_ranged::Exchange::new(
+                self.plan.expr_type(self.keys[0]).clone(),
+                i64::try_from(low).unwrap_or(i64::MIN),
+                usize::try_from(values).unwrap_or(0),
+                calls,
+            )
+        });
+        let arguments: Vec<Option<&Vector>> =
+            rows.arguments.iter().map(|call| call.first()).collect();
+        exchange.count(key, &arguments, rows.rows, local)?;
+        Ok(Progress::More)
     }
 
     fn mixed_top_count(&self) -> bool {
@@ -4104,6 +4168,7 @@ struct Agreed {
 pub(crate) struct Partitioned {
     mixed: group_mixed::Local,
     counted: group_count::Local,
+    ranged: group_ranged::Local,
     grouped_distinct: group_distinct::Local,
     encoded: bool,
     encoded_records: Vec<EncodedCountPartition>,
@@ -4887,6 +4952,7 @@ impl Sink for Aggregate<'_> {
         Partitioned {
             mixed: group_mixed::Local::new(&self.memory),
             counted: group_count::Local::new(&self.memory),
+            ranged: group_ranged::Local::new(&self.memory),
             grouped_distinct: group_distinct::Local::new(&self.memory),
             encoded: false,
             encoded_records: (0..RADIX_PARTITIONS)
@@ -4963,6 +5029,7 @@ impl Sink for Aggregate<'_> {
         let Partitioned {
             mixed,
             counted,
+            ranged,
             grouped_distinct,
             encoded,
             encoded_records,
@@ -4989,6 +5056,9 @@ impl Sink for Aggregate<'_> {
             folded,
         } = local;
         let rows = self.read(chunk, expressions)?;
+        if self.ranged_counts() {
+            return self.count_ranged(&rows, ranged);
+        }
         if self.mixed_top_count() {
             let [group] = rows.keys.as_slice() else {
                 return Err(Error::internal("a mixed radix exchange received the wrong key width"));
@@ -5227,6 +5297,7 @@ impl Sink for Aggregate<'_> {
         let Partitioned {
             mixed,
             counted,
+            ranged,
             grouped_distinct,
             encoded,
             mut encoded_records,
@@ -5272,6 +5343,12 @@ impl Sink for Aggregate<'_> {
         if mixed.used() {
             let state = self.mixed.get().expect("a mixed exchange exists after its sink");
             state.combine(mixed)?;
+            self.built.lock().map_err(poisoned)?.instances += 1;
+            return Ok(());
+        }
+        if ranged.used() {
+            let state = self.ranged.get().expect("a ranged exchange exists after its sink");
+            state.combine(ranged)?;
             self.built.lock().map_err(poisoned)?.instances += 1;
             return Ok(());
         }
@@ -5436,6 +5513,10 @@ impl Sink for Aggregate<'_> {
                 self.top_counts.expect("a mixed exchange has a TopN bound").0,
                 &self.memory,
             )?;
+            return self.out.fill(chunks);
+        }
+        if let Some(ranged) = self.ranged.get() {
+            let chunks = ranged.finish(&self.memory)?;
             return self.out.fill(chunks);
         }
         if let Some(counted) = self.counted.get() {
