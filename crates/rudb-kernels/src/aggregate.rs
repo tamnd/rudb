@@ -184,10 +184,11 @@ enum State {
     /// A running total at a fixed decimal scale.
     Scaled { total: i128, scale: u8, seen: bool, returns: Return },
     /// The smallest or largest value so far.
-    // Box the one state whose scalar representation is much wider than every numeric aggregate.
-    // Most ClickBench groups contain count/sum/avg states and should not each pay for a 64-byte
-    // Value they never hold. Min and max allocate only after they see their first non-null value.
-    Extreme { held: Option<Box<Extremum>>, least: bool },
+    // A held value is boxed, since a Value is much wider than every numeric aggregate and most
+    // ClickBench groups hold count, sum and avg states that should not each pay for one. A rank is
+    // kept in place: it fits in the width the totals already take, and q29's MIN(Referer) over 400
+    // thousand groups spent 26 MB and an allocation a group on boxes of one.
+    Extreme { held: Option<Extremum>, least: bool },
     /// Any other aggregate, boxed so that the five above stay as narrow as they are.
     General(Box<General>),
 }
@@ -218,7 +219,7 @@ enum Route {
 #[derive(Debug, Clone)]
 enum Extremum {
     /// A value copied out of the column it came from.
-    Held(Value),
+    Held(Box<Value>),
     /// A position in a dictionary that knows its sorted order, kept in place of the value there.
     ///
     /// A grouped min over a column of strings does a comparison per row, and comparing two strings
@@ -239,7 +240,7 @@ impl Extremum {
     /// The value this holds, read out of the dictionary when that is where it still is.
     fn value(&self) -> Result<Value> {
         match self {
-            Self::Held(value) => Ok(value.clone()),
+            Self::Held(value) => Ok(Value::clone(value)),
             Self::Ranked { dictionary, code, .. } => dictionary.try_value_at(*code as usize),
         }
     }
@@ -248,7 +249,7 @@ impl Extremum {
     fn settle(&mut self) -> Result<&mut Value> {
         if let Self::Ranked { .. } = self {
             let value = self.value()?;
-            *self = Self::Held(value);
+            *self = Self::Held(Box::new(value));
         }
         match self {
             Self::Held(value) => Ok(value),
@@ -276,7 +277,7 @@ impl Extremum {
         let candidate = dictionary.try_value_at(code as usize)?;
         let ordering = order(&candidate, self.settle()?)?;
         if if least { ordering.is_lt() } else { ordering.is_gt() } {
-            *self = Self::Held(candidate);
+            *self = Self::Held(Box::new(candidate));
         }
         Ok(())
     }
@@ -473,7 +474,7 @@ impl Accumulator {
                     }
                 };
                 if replace {
-                    *held = Some(Box::new(Extremum::Held(value.clone())));
+                    *held = Some(Extremum::Held(Box::new(value.clone())));
                 }
             }
             // Taken at the top, before the null is skipped, and kept here for the match.
@@ -661,7 +662,7 @@ impl Accumulator {
                     }
                 };
                 if replace {
-                    *held = Some(Box::new(Extremum::Held(candidate)));
+                    *held = Some(Extremum::Held(Box::new(candidate)));
                 }
             }
             (State::Extreme { .. }, Contribution::Extreme(None)) => {}
@@ -748,7 +749,7 @@ impl Accumulator {
                 if least == same =>
             {
                 if let Some(candidate) = candidate {
-                    match (held.as_deref_mut(), candidate.as_ref()) {
+                    match (held.as_mut(), candidate) {
                         (None, _) => *held = Some(candidate.clone()),
                         // Two workers over one column hold ranks out of the one dictionary, so the
                         // merge that brings their tables together compares integers too.
@@ -799,7 +800,7 @@ impl Accumulator {
                     "an accumulator with no number and no extreme in it".to_string(),
                 ));
             };
-            return held.as_deref().map_or(Ok(Value::Null), Extremum::value);
+            return held.as_ref().map_or(Ok(Value::Null), Extremum::value);
         };
         match answer {
             Answer::Null => Ok(Value::Null),
@@ -1219,7 +1220,7 @@ pub fn update_tallied(
                 }
                 None => {
                     let text = Value::Varchar(utf8(bytes)?.to_owned());
-                    *held = Some(Box::new(Extremum::Held(text)));
+                    *held = Some(Extremum::Held(Box::new(text)));
                 }
             }
         }
@@ -1490,7 +1491,7 @@ fn ranked_extremes(
             Some(current) => current.offer(dictionary, code, rank, least)?,
             None => {
                 let kept = Extremum::Ranked { dictionary: dictionary.clone(), code, rank };
-                *held = Some(Box::new(kept));
+                *held = Some(kept);
             }
         }
     }
@@ -1544,7 +1545,7 @@ fn ranked_extreme(
             Some(current) => current.offer(dictionary, code, rank, least)?,
             None => {
                 let kept = Extremum::Ranked { dictionary: dictionary.clone(), code, rank };
-                *held = Some(Box::new(kept));
+                *held = Some(kept);
             }
         }
     }
@@ -1589,7 +1590,7 @@ pub fn settle_extremes(
                 return Err(Error::internal("an extreme to settle is out of range".to_string()));
             };
             let State::Extreme { held: Some(held), .. } = &state.state else { continue };
-            let Extremum::Ranked { dictionary, code, .. } = held.as_ref() else { continue };
+            let Extremum::Ranked { dictionary, code, .. } = held else { continue };
             let which = match dictionaries.iter().position(|kept| Arc::ptr_eq(kept, dictionary)) {
                 Some(found) => found,
                 None => {
@@ -1646,7 +1647,7 @@ fn settle_swept(
                 return Err(Error::internal("an extreme to settle is out of range".to_string()));
             };
             let State::Extreme { held: Some(held), .. } = &mut state.state else { continue };
-            **held = Extremum::Held(value);
+            *held = Extremum::Held(Box::new(value));
         }
         at = cursor;
     }
@@ -2339,7 +2340,7 @@ fn packed_into<M: Fn(usize) -> usize>(
                 // The `Value` is built on a win and not per row, exactly as the flat loop builds it.
                 if replace {
                     let value = input.try_value_at(row)?;
-                    *held = Some(Box::new(Extremum::Held(value)));
+                    *held = Some(Extremum::Held(Box::new(value)));
                 }
             });
             Ok(true)
@@ -2455,7 +2456,7 @@ fn extreme_into<M: Fn(usize) -> usize>(
                         // the harmonic number of the rows in the group.
                         if replace {
                             let value = run.input.try_value_at(row)?;
-                            *held = Some(Box::new(Extremum::Held(value)));
+                            *held = Some(Extremum::Held(Box::new(value)));
                         }
                     });
                 })+
