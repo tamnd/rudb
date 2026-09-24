@@ -1963,6 +1963,20 @@ fn attach_database(
 
 /// The value of an option such as `READ_ONLY`, which is true or false written any way a setting
 /// can be.
+/// The statements in `sql` when there is more than one of them, and nothing when there is one.
+///
+/// The split tokenizes the text a second time, so it only happens for text with a semicolon in it,
+/// which every script of several statements has and most single statements do not.
+///
+/// A text that does not tokenize is left whole to the parser, which says so with a position.
+fn several(sql: &str) -> Option<Vec<&str>> {
+    if !sql.contains(';') {
+        return None;
+    }
+    let found = crate::statements(sql).ok()?;
+    (found.len() > 1).then(|| found.iter().map(crate::Statement::sql).collect())
+}
+
 /// Checks a block size the way the pin does before it makes a file, even though a native file is
 /// not laid out in blocks of that size.
 fn check_block_size(size: u64) -> Result<()> {
@@ -2704,6 +2718,9 @@ impl Shared {
     /// since printing a plan changes nothing. A statement that writes is refused here rather than
     /// run under a read lock.
     pub(crate) fn query(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
+        if let Some(script) = several(sql) {
+            return self.run_script(&script, cancel, Self::query);
+        }
         self.in_transaction(sql, || {
             if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
                 return Ok(answer);
@@ -3178,6 +3195,9 @@ impl Shared {
     /// SELECT * FROM t` would otherwise read the table under a read lock, let go, and append to
     /// whatever the table had become in between.
     pub(crate) fn execute(&self, sql: &str, cancel: &Cancel) -> Result<QueryResult> {
+        if let Some(script) = several(sql) {
+            return self.run_script(&script, cancel, Self::execute);
+        }
         self.in_transaction(sql, || {
             if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
                 return Ok(answer);
@@ -3188,6 +3208,27 @@ impl Shared {
             })?;
             self.execute_ast(&ast, sql, &Parameters::new(), cancel, parse_ns)
         })
+    }
+
+    /// Runs a script of several statements one after another and answers with what the last one
+    /// produced, which is what the pin does with a script handed to one query call.
+    ///
+    /// Every statement but the last one is run as a statement that may write, since only the last
+    /// answer is read back. The first one that fails ends the script with its error, and whatever
+    /// ran before it stays done, the same as on the pin.
+    fn run_script(
+        &self,
+        script: &[&str],
+        cancel: &Cancel,
+        last: impl Fn(&Self, &str, &Cancel) -> Result<QueryResult>,
+    ) -> Result<QueryResult> {
+        let Some((final_statement, before)) = script.split_last() else {
+            return Err(Error::binder("no statement to bind"));
+        };
+        for statement in before {
+            self.execute(statement, cancel)?;
+        }
+        last(self, final_statement, cancel)
     }
 
     /// Runs one parsed statement, with values for its parameters.
