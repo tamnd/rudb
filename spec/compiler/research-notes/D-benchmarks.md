@@ -8,8 +8,6 @@ Conventions:
 - `[computed]` means summed or scored by me from raw result JSON or CSV. No official total exists.
 - All times are seconds unless marked otherwise.
 
----
-
 ## 0. TL;DR
 
 - **ClickBench, c6a.4xlarge, hot.** Umbra leads with a 7.41s hot sum and a relative score of about 1.35. DuckDB is at 26.25s (score about 5.2) and ClickHouse at 18.00s.
@@ -30,8 +28,6 @@ Conventions:
   - TPC-H SF1, single thread: about 0.93-0.98x DuckDB's time (roughly parity) while retiring 1.51x the instructions.
   - ClickBench full file: hot 27.07s vs DuckDB 14.03s (on gamingpc-wsl), with 42/43 queries answered.
   - Q21/Q22 slice benchmarks: up to 3.13x ahead.
-
----
 
 ## 1. ClickBench
 
@@ -167,8 +163,6 @@ What this says for a compiler:
   - "hot" rewards result and data caching.
 - **Rule churn** (restart-before-cold, in-memory exclusion, combined default) means a claimed ranking must name the date and metric.
 
----
-
 ## 2. TPC-H
 
 ### 2.1 Academic and vendor comparisons with numbers
@@ -262,8 +256,6 @@ Caveat: workload-specific. Correctness is only for the known query templates. Th
 - The 10x target at SF1 means cutting to about 1.79G instructions from 27.27G, a 15x instruction reduction.
 - Issue #770 "G10: Ten times DuckDB on TPC-H SF100" has these exit criteria: no query slower than DuckDB, plus an ablation for every layer.
 
----
-
 ## 3. TPC-DS
 
 Published numbers are sparse. What exists:
@@ -279,8 +271,6 @@ Published numbers are sparse. What exists:
   - outliers: Q67, Q72, Q4, Q11, Q14, Q23, Q78 dominate totals;
   - spilling at larger SFs.
 - DuckDB 1.4 made CTEs materialized by default. DuckDB 2.0 added aggregate spilling and partial-aggregate pushdown below joins. All of these target TPC-DS-like shapes.
-
----
 
 ## 4. JOB (Join Order Benchmark) and CEB
 
@@ -307,8 +297,6 @@ Published numbers are sparse. What exists:
 - JOB: 113 queries over IMDB (about 3.6GB CSV), 3-16 joins per query, correlated predicates, skew. It was designed to break cardinality estimation.
 - CEB: thousands of queries from templates over IMDB. Per-query times are small, so plan quality, per-query fixed overhead (parse, optimize, compile) and robustness to bad join orders dominate.
 - For a compiling engine, **JOB is the worst case for compile latency**: many short queries with large plans. Umbra's 7.6s of compile vs 0.93s of execution shows it.
-
----
 
 ## 5. TPC-C and OLTP in embedded analytical engines
 
@@ -386,8 +374,6 @@ Official audited TPC-C (distributed, irrelevant for embedded but defines "record
 - **Logging and group commit.** fsync per commit caps throughput at the device's fsync rate, so group commit or a log buffer is required. HyPer used logical redo.
 - **Row versus column storage.** Columnar insert and update of 10-20 columns per row touches 10-20 cache lines. Row-group append buffers or a delta store help.
 
----
-
 ## 6. DuckDB 1.4 / 1.5 / 2.0 changes that affect the comparison
 
 ### DuckDB 1.4.0 "Andium" LTS (2025-09-16, https://duckdb.org/2025/09/16/announcing-duckdb-140)
@@ -417,8 +403,6 @@ Official audited TPC-C (distributed, irrelevant for embedded but defines "record
 
 **The target moves.** A 10x claim must fix the DuckDB version. The rudb-bench README "ledger" explicitly flags when a rival's version changes between rows.
 
----
-
 ## 7. Benchmark critiques, 2025-2026
 
 - **"Survivorship Bias" (Marcus et al., CIDR 2026 Best Paper, https://www.vldb.org/cidrdb/papers/2026/p22-marcus.pdf).**
@@ -433,8 +417,6 @@ Official audited TPC-C (distributed, irrelevant for embedded but defines "record
   - there was no storage-tier distinction (fixed 2026-09-18).
 - **LLM-generated engines** (gendb on ClickBench; Bespoke OLAP) raise the question of per-benchmark specialization. Bespoke's 11-45x over DuckDB is achieved by workload-specific storage and code, which is exactly what TPC rules forbid (no benchmark-special code paths).
 - **Diamond hardware (VLDB 2024).** The same systems rank differently on different CPUs. This is a reminder to publish per-machine.
-
----
 
 ## 8. rudb-bench: local measured status (/Users/apple/github/tamnd/rudb-bench)
 
@@ -560,8 +542,6 @@ Per query, rudb/DuckDB time across the two sessions:
 - TPC-H: the interpreter-plus-format rudb is already at DuckDB parity per core, with higher IPC. The remaining gap to 10x is instruction count. q01 and q12 are the classic compile-friendly scan-filter-aggregate queries where fused compiled loops (no materialized vectors, no gather) pay the most.
 - ClickBench full-file: 2x behind DuckDB hot, with memory (Q6 OOM), format size (43GB) and cold load as the blockers. None of these are compiler problems.
 - The slice benchmarks show that string-skip layers (gram sieve, late phrase fetch) give the 3x wins on Q21/Q22.
-
----
 
 ## 9. What winning each benchmark requires
 

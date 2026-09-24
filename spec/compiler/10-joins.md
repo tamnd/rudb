@@ -115,7 +115,7 @@ The 0.95 is ours and C6 tunes it. For comparison, Parachute's probe-side filter 
 6. key-set probes
 7. `LIKE`, last
 
-This is the LIP recipe, which cut one SSB query's plan-to-plan spread from 2.1–58 s to 1.3–7.4 s (https://www.vldb.org/pvldb/vol10/p889-zhu.pdf).
+This is the LIP recipe, which cut one SSB query's plan-to-plan spread from 2.1 to 58 s to 1.3 to 7.4 s (https://www.vldb.org/pvldb/vol10/p889-zhu.pdf).
 
 **The zone-map rule.** No reduction filter ever causes a row group to be read that the local predicates alone would have skipped. The scan evaluates zone maps against the local predicates first, then intersects with the min-max ranges of the transferred filters, and never the reverse. RPT+ regressed on JOB templates 8, 10 and 24 exactly where transfer broke row-group skipping. The rule is checked in C6 by counting row groups read with and without reduction on every JOB query. The count with reduction must never be higher.
 
@@ -174,7 +174,7 @@ There is no hash field for integer keys, because recomputing is cheaper than loa
 **The LLC threshold is a starting value.** The evidence has two sides:
 
 - Birler et al. found OoO execution enough when the tag sits in the directory word.
-- Psaropoulos et al. measured group prefetching at 2.7–3.7x over a naive probe for tables that miss the cache (https://doi.org/10.14778/3149193.3149202).
+- Psaropoulos et al. measured group prefetching at 2.7 to 3.7x over a naive probe for tables that miss the cache (https://doi.org/10.14778/3149193.3149202).
 - ROF measured up to 2.2x over pure fusion (http://www.vldb.org/pvldb/vol11/p1-menon.pdf), and warns that boundaries placed from estimates land in the wrong place.
 
 So the boundary is placed from exact sizes at runtime, and C6 sweeps the threshold on both target machines.
@@ -269,15 +269,15 @@ JOB's string predicates run over millions of rows before any reduction applies, 
 
    This follows document 03 §3.6: comparisons that stay in the header are generated, and anything longer is a call.
 4. **`OR` of `LIKE`s over one column is fused.** 15c and 19a share a prefix (`'USA:'`, or none), so one pre-check is followed by one multi-segment search. For more than 8 patterns an Aho-Corasick automaton replaces them all. The same paper measured Aho-Corasick at up to 30.6x over DuckDB v1.4.4 on wildcard joins.
-5. **Dictionary columns evaluate the pattern once per entry.** Low-cardinality columns (`keyword.keyword`, `kind_type.kind`, `info_type.info`, `company_type.kind`) evaluate the pattern once per dictionary entry into a code bitmap. The filter then becomes the one-instruction bit test of §10.4. High-cardinality columns like `movie_info.info` gain little from this (research-notes C §7.6), and matching in the FSST domain (2.5–17x over decompress-then-match [snippet], DaMoN 2026) is evaluated at C7 only if storage keeps those columns in FSST.
+5. **Dictionary columns evaluate the pattern once per entry.** Low-cardinality columns (`keyword.keyword`, `kind_type.kind`, `info_type.info`, `company_type.kind`) evaluate the pattern once per dictionary entry into a code bitmap. The filter then becomes the one-instruction bit test of §10.4. High-cardinality columns like `movie_info.info` gain little from this (research-notes C §7.6), and matching in the FSST domain (2.5 to 17x over decompress-then-match [snippet], DaMoN 2026) is evaluated at C7 only if storage keeps those columns in FSST.
 
 **The honest gap.** The 13.3x was measured with the whole matcher generated. Ours generates only the pre-checks and calls kernels for the search. C7 measures both splits on JOB's patterns. If generating the segment search is worth more than its compile cost, it moves into generated code with a byte-size cap.
 
 ## 10.12 What we do not do, and TPC-DS star joins
 
-- **No worst-case-optimal joins by default.** Pure WCOJ is about 25x slower than binary joins on JOB in Umbra (Diamond). Free Join's 2.94x geomean over circa-2023 DuckDB (https://arxiv.org/abs/2301.10841) came with a minimum of 0.85x. A hybrid that fires only where binary joins would grow intermediates had 5 false negatives out of 923 joins (https://doi.org/10.14778/3407790.3407797). JOB is acyclic and `reduce_fold` covers what WCOJ would buy there. The multiway intersect of `../graph/05-execution.md` §5.8 is for cyclic queries, is not in C0–C12, and is listed in document 20.
+- **No worst-case-optimal joins by default.** Pure WCOJ is about 25x slower than binary joins on JOB in Umbra (Diamond). Free Join's 2.94x geomean over circa-2023 DuckDB (https://arxiv.org/abs/2301.10841) came with a minimum of 0.85x. A hybrid that fires only where binary joins would grow intermediates had 5 false negatives out of 923 joins (https://doi.org/10.14778/3407790.3407797). JOB is acyclic and `reduce_fold` covers what WCOJ would buy there. The multiway intersect of `../graph/05-execution.md` §5.8 is for cyclic queries, is not in C0 to C12, and is listed in document 20.
 - **No radix-partitioned probe.** In a code-generating engine a radix join rarely pays for its code and optimizer complexity (Bandle et al., https://db.in.tum.de/~bandle/papers/bandle-partitionVsNonPartition.pdf [snippet]). We partition the build, as §10.5 does, and never the probe.
-- **No SIMD hash probe.** The research found no 2025–2026 result where SIMD probing beats the scalar unchained probe in a real system. SIMD is used in the filter stages of §10.4, where it is measured to pay.
+- **No SIMD hash probe.** The research found no 2025 to 2026 result where SIMD probing beats the scalar unchained probe in a real system. SIMD is used in the filter stages of §10.4, where it is measured to pay.
 - **Star joins get fused probe chains with all dimension filters in the fact scan.** TPC-DS and SSB queries join one fact table to several dimensions. The compiled form is one pipeline: the fact scan applies every dimension's reduction filter as a §10.4 stage, then the survivors probe each dimension table in turn, staged or fused per §10.6. This is LIP (geomean 4.0x) and SQL Server's bitmap cascade (up to 3.47x on TPC-H SF100, https://www.vldb.org/cidrdb/papers/2026/p29-zhao.pdf) expressed as scan stages.
 
 ## 10.13 The JOB budget, and what C6 and C7 measure
@@ -297,7 +297,7 @@ These shares are a hypothesis. JOB totals are dominated by a few templates (8d, 
 
 - **C6: JOB at 5x DuckDB single-threaded**, which is at most 11.06 s total against 1.3.2 `[derived]`. No query may be slower than DuckDB. Every mechanism in §10.3 to §10.8 has a switch, and C6 publishes a per-query ablation table that turns each one off in turn. C6 also runs the tuning sweeps named above: the bitmap budget, the 0.95 drop threshold, the LLC threshold and the group size.
 - **C7: JOB at 10x single-threaded**, which is at most 5.53 s total `[derived]`, with compiled `LIKE`, dictionary predicates and the fused `OR`. C7 re-runs the ablation, because the factors are not independent (document 02 §2.9, caution 1).
-- **Both gates are run against the current DuckDB release, not the paper's version.** DuckDB 1.5.x already pushes join Bloom filters into probe scans (duckdb/duckdb#19502 [snippet]), and research-notes C expects it to absorb about 1.2–1.5x of the reduction gains. If that happens, the engine factors have to make up the difference, and the table above says where they would.
+- **Both gates are run against the current DuckDB release, not the paper's version.** DuckDB 1.5.x already pushes join Bloom filters into probe scans (duckdb/duckdb#19502 [snippet]), and research-notes C expects it to absorb about 1.2 to 1.5x of the reduction gains. If that happens, the engine factors have to make up the difference, and the table above says where they would.
 
 ## What we should take from this document
 

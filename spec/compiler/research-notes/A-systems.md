@@ -7,8 +7,6 @@ Conventions:
 - **[gap]** means I looked and could not get the data.
 - "CT" = compile time. "ET" = execution time. "SF" = TPC scale factor. "geo" = geometric mean. "1T" = single-threaded.
 
----
-
 ## 0. Cross-system quick table
 
 | System | Compiled unit | IR levels | Backend(s) | Compile latency (reported) | Short-query answer |
@@ -37,8 +35,6 @@ Conventions:
 | Bespoke OLAP | whole engine per workload | C++ (LLM-written) | clang/gcc | minutes to hours of synthesis | fallback DBMS for ad hoc queries |
 | GenDB | one executable per query | C++ (LLM-written) | compiler | 91-140 min of synthesis | n/a |
 
----
-
 ## 1. TUM line
 
 ### 1.1 HyPer: Neumann, "Efficiently Compiling Efficient Query Plans for Modern Hardware", VLDB 2011
@@ -65,7 +61,7 @@ URL: https://www.vldb.org/pvldb/vol4/p539-neumann.pdf
 |---|---|---|---|---|---|
 | HyPer+LLVM | 35 | 125 | 80 | 117 | 1105 |
 | HyPer+C++ | 142 | 374 | 141 | 203 | 1416 |
-| VectorWise | 98 | – | 257 | 436 | 1107 |
+| VectorWise | 98 | n/a | 257 | 436 | 1107 |
 | MonetDB | 72 | 218 | 112 | 8168 | 12028 |
 
 - Branches on Q1: LLVM 19.8M vs MonetDB 144.6M.
@@ -101,8 +97,8 @@ URL: https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf
 | bytecode | 232 | 45 |
 | unoptimized | 60 | 15 |
 | optimized | 46 | 12 |
-| PostgreSQL | 497 | – |
-| MonetDB | 57 | – |
+| PostgreSQL | 497 | n/a |
+| MonetDB | 57 | n/a |
 
 - The bytecode VM is 3.6x slower than unoptimized and 5.0x slower than optimized code, but 2.1x faster than PostgreSQL.
 - LLVM's own IR interpreter is over 800x slower, so it is unusable.
@@ -269,8 +265,6 @@ URL: https://www.hytradboi.com/2025/slides/leis-neumann-compilation.pdf
 - LingoDB 2022 reports Tableau Hyper is 1.3x faster than LingoDB on average (1T, SF1).
 - LingoDB 2023 reports LingoDB is 10% faster than Hyper at SF10.
 
----
-
 ## 2. Staging / generative-programming line
 
 ### 2.1 LegoBase (Klonatos, Koch, Rompf, Chafi, VLDB 2014) and DBLab
@@ -307,8 +301,6 @@ URL: https://www.usenix.org/conference/osdi18/presentation/essertel ; https://ar
   - "10x to 100x speedups on standard analytical benchmarks such as TPC-H" **[snippet: DOE report]**
   - "order of magnitude" (arXiv abstract) **[snippet]**
 - Scale-up, single machine, medium-size data.
-
----
 
 ## 3. Research engines
 
@@ -483,8 +475,6 @@ URL: https://arxiv.org/abs/2011.13127
 - TPDE paper: TPDE is "not as fast as a copy-and-patch-based compiler" but within the same order of magnitude, with code on par with LLVM -O0.
 - Now used by CPython 3.13 and Nautilus.
 
----
-
 ## 4. Industry
 
 ### 4.1 Apache Spark whole-stage codegen (WSCG, Tungsten, Spark 2.0, 2016)
@@ -647,8 +637,6 @@ URL: https://www.vldb.org/pvldb/vol15/p3372-pedreira.pdf
 - **Pattern:** every vectorized cloud engine found (Photon, Velox, Snowflake, Databend, Firebolt, DuckDB) either never compiled or limited JIT to expressions.
   - Whole-query compilation in production: HyPer/Tableau, Umbra/CedarDB, SingleStore, Redshift, HANA HEX, Spark WSCG, Hekaton.
 
----
-
 ## 5. 2024-2026 frontier
 
 ### 5.1 Bespoke OLAP: arXiv 2603.02001v2 (PVLDB 19(11), VLDB 2026)
@@ -707,8 +695,6 @@ URL: https://arxiv.org/abs/2603.02001
 - **"From Interpretation to Compilation"** (arXiv 2607.13407 vision; 2608.06677 system): query compilation for LLM semantic operators. Not relevant to SQL execution. **[snippet]**
 - **arXiv 2311.04692** (PostgreSQL vs mutable JIT): qualitative only; mutable beat PostgreSQL.
 
----
-
 ## 6. The debate: compiled vs vectorized
 
 ### 6.1 Kersten, Leis, Kemper, Neumann, Pavlo, Boncz, "Everything You Always Wanted to Know About Compiled and Vectorized Queries But Were Afraid to Ask", VLDB 2018
@@ -728,14 +714,14 @@ URL: https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf
 |---|---|---|---|---|---|---|---|
 | Q1 | Typer | 34 | 2.0 | 68 | 0.6 | 0.57 | 0.01 |
 | Q1 | Tectorwise | 59 | 2.8 | 162 | 2.0 | 0.57 | 0.03 |
-| Q6 | Typer | 11 | 1.8 | 20 | – | – | – |
-| Q6 | Tectorwise | 11 | 1.4 | 15 | – | – | – |
-| Q3 | Typer | 25 | – | – | – | – | – |
-| Q3 | Tectorwise | 24 | – | – | – | – | – |
-| Q9 | Typer | 74 | – | – | – | – | – |
-| Q9 | Tectorwise | 56 | – | – | – | – | – |
-| Q18 | Typer | 30 | – | – | – | – | – |
-| Q18 | Tectorwise | 48 | – | – | – | – | – |
+| Q6 | Typer | 11 | 1.8 | 20 | n/a | n/a | n/a |
+| Q6 | Tectorwise | 11 | 1.4 | 15 | n/a | n/a | n/a |
+| Q3 | Typer | 25 | n/a | n/a | n/a | n/a | n/a |
+| Q3 | Tectorwise | 24 | n/a | n/a | n/a | n/a | n/a |
+| Q9 | Typer | 74 | n/a | n/a | n/a | n/a | n/a |
+| Q9 | Tectorwise | 56 | n/a | n/a | n/a | n/a | n/a |
+| Q18 | Typer | 30 | n/a | n/a | n/a | n/a | n/a |
+| Q18 | Tectorwise | 48 | n/a | n/a | n/a | n/a | n/a |
 
 - Tectorwise executes up to 2.4x more instructions and has up to 3.3x more L1 misses.
 
@@ -781,8 +767,6 @@ URL: https://www.vldb.org/pvldb/vol11/p2209-kersten.pdf
 - **Photon (4.2):** vectorized plus specialization gets 3-4x over WSCG. The reasons for not compiling were engineering-process reasons.
 - **Bespoke OLAP (5.1):** the remaining 6-10x over Umbra comes from specialization of storage and algorithms, not from the execution paradigm.
 
----
-
 ## 7. Compile-latency reference points (one place)
 
 | Source | Workload | Backend | CT |
@@ -810,8 +794,6 @@ Rule of thumb from these points:
 - Single-pass: 0.1-2 ms.
 - Bytecode: under 1 ms.
 - DuckDB-class planning is ~0.5 ms.
-
----
 
 ## 8. Lessons for a new compiling engine
 

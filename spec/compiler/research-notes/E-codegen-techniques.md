@@ -1,12 +1,8 @@
 # E. Code-generation techniques for query pipelines (what to generate)
 
-Research notes for the rudb query-compiling engine (Rust, DuckDB-compatible, target ~10x DuckDB on
-ClickBench / TPC-H / JOB / TPC-C). Compiled 2026-09-24.
+Research notes for the rudb query-compiling engine (Rust, DuckDB-compatible, target ~10x DuckDB on ClickBench / TPC-H / JOB / TPC-C). Compiled 2026-09-24.
 
-This file is about *what code a pipeline compiler should emit*: pipeline shape, tuple layout, the
-SIMD/vector mix, expression semantics, error paths, latency tiers, testing, OLTP and adaptivity.
-Backend choice (LLVM, Cranelift, a single-pass backend) is only covered where it changes what the
-front end should generate.
+This file is about *what code a pipeline compiler should emit*: pipeline shape, tuple layout, the SIMD/vector mix, expression semantics, error paths, latency tiers, testing, OLTP and adaptivity. Backend choice (LLVM, Cranelift, a single-pass backend) is only covered where it changes what the front end should generate.
 
 Conventions:
 - Every number carries a source URL.
@@ -71,8 +67,7 @@ Conventions:
 - Takeaway for rudb: generating a high-level language and invoking a heavyweight compiler (C++, or Rust source + rustc) is ruled out for ad-hoc queries. The compile-time gap was 20x to 100x back in 2011.
 
 ### 1.2 Tidy Tuples: layering the generator (TIDY)
-Umbra splits the generator into layers, top to bottom
-(https://db.in.tum.de/~kersten/Tidy%20Tuples%20and%20Flying%20Start%20Fast%20Compilation%20and%20Fast%20Execution%20of%20Relational%20Queries%20in%20Umbra.pdf):
+Umbra splits the generator into layers, top to bottom (https://db.in.tum.de/~kersten/Tidy%20Tuples%20and%20Flying%20Start%20Fast%20Compilation%20and%20Fast%20Execution%20of%20Relational%20Queries%20in%20Umbra.pdf):
 
 1. **Operator translators.** produce/consume per relational operator.
 2. **Data structures.** Hash tables, buffers, sort runs; these are code-generating wrappers.
