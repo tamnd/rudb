@@ -39,6 +39,7 @@ It is not a bet against the hash join. Document 05 keeps the hash join as the ge
 | [09-measurement.md](09-measurement.md) | What is measured, against what, and the ablations that have to be run to claim any of this |
 | [10-milestones.md](10-milestones.md) | G1 through G8, each with an exit measurement |
 | [11-open-questions.md](11-open-questions.md) | The seven things this design does not know |
+| [12-the-order-the-suite-asks-for.md](12-the-order-the-suite-asks-for.md) | The whole suite measured with the layer on, what is in the way, and the order of work that follows |
 
 The benchmark half lives in [`../bench/tpc-h/`](../bench/tpc-h/), which is where the workload that justifies all of this is specified, including the harness changes that let it be measured before it is fast.
 
