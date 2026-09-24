@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{LogicalType, Result, Spread, serially};
-use rudb_vector::{Form, Vector, concat_on};
+use rudb_vector::{Form, Validity, Vector, concat_on};
 
 use crate::table::Rows;
 
@@ -198,6 +198,16 @@ impl Parent {
         if over.load(Ordering::Relaxed) {
             return Ok(None);
         }
+        if let Some(whole) = coded(&pieces)? {
+            return Ok((whole.footprint() <= room).then(|| Arc::new(whole)));
+        }
+        // Not codes into one dictionary all the way down, so the pieces that were left as codes on
+        // the chance they were are strings like the rest.
+        for piece in &mut pieces {
+            if piece.form() != Form::Flat {
+                *piece = piece.flatten()?;
+            }
+        }
         // On the same threads, because laying the parts end to end is a copy of every byte of the
         // column and it happens in the same place the reads do, with the pipeline stopped. On the
         // string column of q12's parent projection it measured as large as the parallel part reads
@@ -226,7 +236,8 @@ impl Parent {
         Ok(Some(Arc::new(whole.into_pages())))
     }
 
-    /// One part of one column, decoded, or nothing when the part holds no rows.
+    /// One part of one column, decoded unless it is codes into the table's dictionary, or nothing
+    /// when the part holds no rows.
     ///
     /// Everything expensive about reading a parent column is in here, which is why this is the unit
     /// the threads are shared out over: the read of the part and the decode of whatever encoding its
@@ -239,7 +250,9 @@ impl Parent {
         if piece.is_empty() {
             return Ok(None);
         }
-        if piece.form() == Form::Flat {
+        // Codes into the table's one dictionary are kept as codes, because a whole column of them
+        // is a column the gather can index as well, and [`coded`] lays them end to end.
+        if piece.form() == Form::Flat || piece.stable_dictionary_parts().is_some() {
             return Ok(Some(piece.clone()));
         }
         // flatten: the whole point of this type is a run the gather can index by a row id of the
@@ -247,6 +260,46 @@ impl Parent {
         // decoded. See the module doc for why this is a decode the hash join pays as well.
         Ok(Some(piece.flatten()?))
     }
+}
+
+/// The pieces of a column as one run of codes into the dictionary they all share, or `None` when
+/// they do not all share one.
+///
+/// A native table keeps a column of few distinct strings as codes into one dictionary for the whole
+/// table, and every part of it points at the same values. Flattening those turned TPC-H q12's
+/// `o_orderpriority`, five values over a million and a half orders, into a million and a half
+/// strings, and every chunk above the link join then compared the strings where a code would have
+/// done. The hash join it replaces already keeps the codes, see `spec/perf/39-codes-through-the-join.md`.
+fn coded(pieces: &[Vector]) -> Result<Option<Vector>> {
+    let mut shared: Option<&Arc<Vector>> = None;
+    let mut rows = 0;
+    let mut nulls = false;
+    for piece in pieces {
+        let Some((codes, values)) = piece.stable_dictionary_parts() else { return Ok(None) };
+        if codes.len() != piece.len() || shared.is_some_and(|held| !Arc::ptr_eq(held, values)) {
+            return Ok(None);
+        }
+        shared = Some(values);
+        rows += codes.len();
+        nulls |= piece.validity().has_nulls(piece.len());
+    }
+    let Some(values) = shared else { return Ok(None) };
+    let mut codes = Vec::with_capacity(rows);
+    let mut valid = Vec::with_capacity(if nulls { rows } else { 0 });
+    for piece in pieces {
+        let Some((run, _)) = piece.stable_dictionary_parts() else { return Ok(None) };
+        codes.extend_from_slice(run);
+        if nulls {
+            let validity = piece.validity();
+            valid.extend((0..run.len()).map(|row| validity.is_valid(row)));
+        }
+    }
+    let vector = Vector::stable_dictionary(codes, Arc::clone(values))?;
+    Ok(Some(if nulls {
+        vector.with_validity(Validity::from_iter(rows, |row| valid[row]))
+    } else {
+        vector
+    }))
 }
 
 /// What the columns already held cost between them.
@@ -260,7 +313,7 @@ mod tests {
 
     use rudb_common::{LogicalType, Result, Value};
     use rudb_storage::MemoryTable;
-    use rudb_vector::{Chunk, Vector};
+    use rudb_vector::{Chunk, Validity, Vector};
 
     use super::Parent;
     use crate::table::Rows;
@@ -311,6 +364,47 @@ mod tests {
             assert_eq!(column.len(), 500);
             assert_eq!(column.value_at(499), Value::Varchar("5-LOW".into()));
         }
+    }
+
+    /// Codes into one table wide dictionary come back as codes, in row order and with their nulls,
+    /// and codes that do not all share a dictionary come back as strings.
+    #[test]
+    fn codes_into_one_dictionary_stay_codes_and_two_dictionaries_become_strings() {
+        let words = |words: &[&str]| {
+            let values: Vec<Value> =
+                words.iter().map(|&word| Value::Varchar(word.into())).collect();
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("strings"))
+        };
+        let coded = |codes: &[u32], values: &Arc<Vector>, null: Option<usize>| {
+            Vector::stable_dictionary(codes.to_vec(), Arc::clone(values))
+                .expect("codes inside the dictionary")
+                .with_validity(Validity::from_iter(codes.len(), |row| Some(row) != null))
+        };
+        let values = words(&["1-URGENT", "2-HIGH", "5-LOW"]);
+        let parts = |second: &Arc<Vector>| {
+            let mut rows = MemoryTable::new(vec![LogicalType::Varchar]);
+            for column in [coded(&[2, 0, 1], &values, None), coded(&[1, 1], second, Some(0))] {
+                rows.append(Chunk::new(vec![column]).expect("a chunk")).expect("appended");
+            }
+            Rows::Memory(rows)
+        };
+        let text = |word: &str| Value::Varchar(word.into());
+        let want = [text("5-LOW"), text("1-URGENT"), text("2-HIGH"), Value::Null, text("2-HIGH")];
+
+        let parent = Parent::new(parts(&values), 64 * 1024 * 1024);
+        let column = parent.column(0, &LogicalType::Varchar).expect("read").expect("it fits");
+        let (codes, held) = column.stable_dictionary_parts().expect("still codes");
+        assert!(Arc::ptr_eq(held, &values), "the codes point somewhere else");
+        assert_eq!(codes.len(), 5);
+        let read: Vec<Value> = (0..5).map(|row| column.value_at(row)).collect();
+        assert_eq!(read, want);
+
+        let other = words(&["1-URGENT", "2-HIGH", "5-LOW"]);
+        let parent = Parent::new(parts(&other), 64 * 1024 * 1024);
+        let column = parent.column(0, &LogicalType::Varchar).expect("read").expect("it fits");
+        assert!(column.stable_dictionary_parts().is_none(), "two dictionaries are not one");
+        let read: Vec<Value> = (0..5).map(|row| column.value_at(row)).collect();
+        assert_eq!(read, want);
     }
 
     /// The thing the whole module exists for: the parts of a column come back as one vector, in
