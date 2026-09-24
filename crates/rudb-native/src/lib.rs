@@ -10021,110 +10021,27 @@ fn widened(data: &Data) -> Option<Vec<i64>> {
     }
 }
 
-/// An integer type a cascaded page can be read back into, and how to tell whether a value fits.
-///
-/// This exists so that the check and the conversion can be two loops instead of one. `TryFrom` puts
-/// them together, which is the right shape for one value and the wrong one for a page: a fallible
-/// conversion a value at a time is a branch a value at a time, the branch decides whether the loop
-/// keeps going, and a loop like that is one no compiler will widen.
-trait Narrow: Copy {
-    /// How wide this type is, and what to add to a value to put its range at the bottom of a `u64`.
-    ///
-    /// Half the width for a signed type, which is what moves its smallest value to zero, and nothing
-    /// for an unsigned one, whose smallest value is already there.
-    const BIASED: (u32, u64);
-
-    /// The value narrowed, which the caller has already shown fits.
-    fn narrow(value: i64) -> Self;
-}
-
-/// The bits of `value` a `T` cannot hold, and zero when the value fits.
-///
-/// The question is asked this way round because the answers or together. A page fits when every
-/// residue in it is zero, so the loop is an or into an accumulator and the decision is one test
-/// after it, where asking whether each value is between a floor and a ceiling gives an answer that
-/// does not combine and turns into a running minimum and maximum.
-///
-/// Biasing and shifting is what the answer is made of, rather than anything that reads more like the
-/// question, because those are the operations a machine has four of. A 64 bit integer minimum is
-/// AVX-512. So is a 64 bit arithmetic shift right, which is how the sign extension this could be
-/// written as would have to be done. An add and a logical shift right are AVX2 and are on every
-/// machine this runs on, so this is the form that gets four values a cycle instead of one.
-///
-/// Adding the bias moves the type's range to `0..=2^bits`, wrapping, so everything in range shifts
-/// away to nothing and everything outside it leaves something behind. A negative value under an
-/// unsigned type is caught by the same shift, because a negative `i64` read as a `u64` is enormous.
-#[allow(clippy::cast_sign_loss, reason = "a residue is a bit pattern and not a number")]
-fn residue<T: Narrow>(value: i64) -> u64 {
-    let (bits, bias) = T::BIASED;
-    (value as u64).wrapping_add(bias) >> bits
-}
-
-/// Says a primitive integer narrows with `as`, and where the bottom of its range is.
-///
-/// `as` is a truncation and is the right operation here only because [`fit`] has already found every
-/// residue zero, and it is what makes the second loop a narrowing store with no branch in it.
-macro_rules! narrows {
-    ($($ty:ty => $bias:expr),* $(,)?) => {$(
-        impl Narrow for $ty {
-            const BIASED: (u32, u64) = (<$ty>::BITS, $bias);
-
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "the caller has checked the bits this truncates away"
-            )]
-            fn narrow(value: i64) -> Self {
-                value as Self
-            }
-        }
-    )*};
-}
-
-narrows! {
-    i8 => 1 << 7,
-    u8 => 0,
-    i16 => 1 << 15,
-    u16 => 0,
-    i32 => 1 << 31,
-    u32 => 0,
-}
-
-/// Narrows a page's values, refusing the page if any of them does not fit.
-///
-/// The check first and the conversion second, rather than a fallible conversion a value at a time.
-/// Both loops here are ones a compiler widens: [`residue`] is three instructions a lane and a
-/// narrowing store is one. The version before this was a `TryFrom` and a `collect` into a `Result`,
-/// which is a compare, a branch and a short circuit a value at a time, and on ClickBench 39 it was
-/// seven percent of the query. The version after that kept a running minimum and maximum, which is
-/// the obvious way to ask and needs a 64 bit integer minimum that AVX2 does not have, so it stayed
-/// a value at a time and was still ten percent of the same query.
-///
-/// An empty page has nothing to refuse, which falls out of the accumulator starting at zero rather
-/// than needing a case of its own.
-fn fit<T: Narrow>(values: &[i64]) -> Result<Vec<T>> {
-    let mut spilled = 0u64;
-    for value in values {
-        spilled |= residue::<T>(*value);
-    }
-    if spilled != 0 {
-        return Err(invalid("page value is not of its type"));
-    }
-    Ok(values.iter().map(|value| T::narrow(*value)).collect())
-}
-
-/// The same values back in the width the column is declared at.
+/// A cascaded page decoded straight into the width the column is declared at.
 ///
 /// A value that does not fit is a page that disagrees with the directory about what the column is,
-/// which is a damaged file rather than a caller error, so it is refused rather than truncated.
-fn narrowed(ty: &LogicalType, values: Vec<i64>) -> Result<Data> {
+/// which is a damaged file rather than a caller error, so it is refused rather than truncated. The
+/// decoder does that check a block at a time where it can, see [`integer::decode_as`].
+fn cascade(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Data> {
+    fn wanted<T: integer::Lane>(bytes: &[u8], rows: usize) -> Result<Vec<T>> {
+        let values = integer::decode_as::<T>(bytes)
+            .map_err(|error| invalid(&format!("page value is not of its type: {error}")))?;
+        if values.len() != rows {
+            return Err(invalid("cascade page holds the wrong number of rows"));
+        }
+        Ok(values)
+    }
     Ok(match ty {
-        LogicalType::TinyInt => Data::Int8(fit::<i8>(&values)?.into()),
-        LogicalType::UTinyInt => Data::UInt8(fit::<u8>(&values)?.into()),
-        LogicalType::SmallInt => Data::Int16(fit::<i16>(&values)?.into()),
-        LogicalType::USmallInt => Data::UInt16(fit::<u16>(&values)?.into()),
-        LogicalType::Integer | LogicalType::Date => Data::Int32(fit::<i32>(&values)?.into()),
-        LogicalType::UInteger => Data::UInt32(fit::<u32>(&values)?.into()),
+        LogicalType::TinyInt => Data::Int8(wanted::<i8>(bytes, rows)?.into()),
+        LogicalType::UTinyInt => Data::UInt8(wanted::<u8>(bytes, rows)?.into()),
+        LogicalType::SmallInt => Data::Int16(wanted::<i16>(bytes, rows)?.into()),
+        LogicalType::USmallInt => Data::UInt16(wanted::<u16>(bytes, rows)?.into()),
+        LogicalType::Integer | LogicalType::Date => Data::Int32(wanted::<i32>(bytes, rows)?.into()),
+        LogicalType::UInteger => Data::UInt32(wanted::<u32>(bytes, rows)?.into()),
         LogicalType::BigInt
         | LogicalType::Timestamp
         | LogicalType::Time
@@ -10132,13 +10049,13 @@ fn narrowed(ty: &LogicalType, values: Vec<i64>) -> Result<Data> {
         | LogicalType::TimestampTz
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => Data::Int64(values.into()),
+        | LogicalType::TimestampNs => Data::Int64(wanted::<i64>(bytes, rows)?.into()),
         // A decimal is an integer of unscaled units, so the cascade reads back into whichever
         // integer the declared width says the column is stored as.
         LogicalType::Decimal { .. } => match ty.physical() {
-            PhysicalType::Int16 => Data::Int16(fit::<i16>(&values)?.into()),
-            PhysicalType::Int32 => Data::Int32(fit::<i32>(&values)?.into()),
-            PhysicalType::Int64 => Data::Int64(values.into()),
+            PhysicalType::Int16 => Data::Int16(wanted::<i16>(bytes, rows)?.into()),
+            PhysicalType::Int32 => Data::Int32(wanted::<i32>(bytes, rows)?.into()),
+            PhysicalType::Int64 => Data::Int64(wanted::<i64>(bytes, rows)?.into()),
             _ => return Err(invalid("cascade codec belongs to a decimal that is not an integer")),
         },
         _ => return Err(invalid("cascade codec belongs to a page that is not integers")),
@@ -11978,21 +11895,14 @@ fn decode(
         let codes = if codec == 4 {
             // The cascade holds the whole tail of the page and says how long it is itself, so the
             // check that nothing is left over is the one the decoder already makes.
-            let wide = integer::decode(&bytes[cur.at..])?;
-            if wide.len() != rows {
+            // Straight into `u32`, which is also the check that every code is one: a code outside
+            // it is a corrupt file and the decoder refuses it, a block at a time where it can.
+            let codes = integer::decode_as::<u32>(&bytes[cur.at..])
+                .map_err(|error| invalid(&format!("code is not a code: {error}")))?;
+            if codes.len() != rows {
                 return Err(invalid("encoded code page holds the wrong number of rows"));
             }
-            // Checked once for the page rather than a fallible conversion per code. Every code a
-            // file holds is inside a `u32` or the file is corrupt, so or the codes together and the
-            // answer has a bit set above the low thirty two, or the sign bit, exactly when one of
-            // them did. The or and the narrowing are two passes because each is then a vector
-            // loop. As one loop with a `push` a code, the length check and the store kept it scalar,
-            // and it was sixteen instructions a row on the two flag columns of q1.
-            let seen = wide.iter().fold(0_i64, |seen, &code| seen | code);
-            if seen < 0 || seen > i64::from(u32::MAX) {
-                return Err(invalid("code is not a code"));
-            }
-            wide.iter().map(|&code| code as u32).collect()
+            codes
         } else {
             let mut codes = Vec::with_capacity(rows);
             for _ in 0..rows {
@@ -12026,11 +11936,7 @@ fn decode(
     }
     if codec == 5 {
         // The cascade holds the whole tail of the page and says how long it is itself.
-        let values = integer::decode(&bytes[cur.at..])?;
-        if values.len() != rows {
-            return Err(invalid("cascade page holds the wrong number of rows"));
-        }
-        let data = narrowed(ty, values)?;
+        let data = cascade(ty, &bytes[cur.at..], rows)?;
         return Ok(Vector::flat(ty.clone(), data)?.with_validity(validity));
     }
     if codec == 2 {
@@ -16451,83 +16357,6 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// Narrowing a page takes what fits and refuses the page for anything that does not.
-    ///
-    /// The edges of the range on both sides and one step past each of them, for every type, because
-    /// checking a page separately from converting it is only right if the check refuses exactly what
-    /// `TryFrom` would have refused, and off by one there is a file that reads back a different
-    /// number than it was given. The check is a bit pattern rather than a comparison, so it is not
-    /// the shape a reader would guess from the bounds, which is why all six are here. The empty page
-    /// is here because a check written the obvious way starts with the extremes the wrong way round
-    /// and refuses it.
-    #[test]
-    fn narrowing_a_page_takes_what_fits_and_refuses_what_does_not() {
-        assert_eq!(fit::<i8>(&[]).expect("an empty page fits anything"), Vec::<i8>::new());
-        assert_eq!(fit::<i8>(&[-128, 0, 127]).expect("the edges fit"), vec![-128_i8, 0, 127]);
-        fit::<i8>(&[128]).expect_err("one past the top does not fit");
-        fit::<i8>(&[-129]).expect_err("one past the bottom does not fit");
-        assert_eq!(fit::<u8>(&[0, 255]).expect("the edges fit"), vec![0_u8, 255]);
-        fit::<u8>(&[256]).expect_err("one past the top does not fit");
-        fit::<u8>(&[-1]).expect_err("a negative does not fit an unsigned page");
-        assert_eq!(
-            fit::<i16>(&[-32_768, 0, 32_767]).expect("the edges fit"),
-            vec![-32_768_i16, 0, 32_767]
-        );
-        fit::<i16>(&[32_768]).expect_err("one past the top does not fit");
-        fit::<i16>(&[-32_769]).expect_err("one past the bottom does not fit");
-        assert_eq!(fit::<u16>(&[0, 65_535]).expect("the edges fit"), vec![0_u16, 65_535]);
-        fit::<u16>(&[65_536]).expect_err("one past the top does not fit");
-        fit::<u16>(&[-1]).expect_err("a negative does not fit an unsigned page");
-        assert_eq!(
-            fit::<i32>(&[i64::from(i32::MIN), 0, i64::from(i32::MAX)]).expect("the edges fit"),
-            vec![i32::MIN, 0, i32::MAX]
-        );
-        fit::<i32>(&[i64::from(i32::MAX) + 1]).expect_err("one past the top does not fit");
-        fit::<i32>(&[i64::from(i32::MIN) - 1]).expect_err("one past the bottom does not fit");
-        assert_eq!(
-            fit::<u32>(&[0, 4_294_967_295]).expect("the edges fit"),
-            vec![0_u32, 4_294_967_295]
-        );
-        fit::<u32>(&[4_294_967_296]).expect_err("one past the top does not fit");
-        fit::<u32>(&[-1]).expect_err("a negative does not fit an unsigned page");
-
-        // One value in a page that fits is still a page that does not, which is the thing an or
-        // into an accumulator could get wrong in a way a page of one value would never show.
-        fit::<i8>(&[0, 1, 2, 128, 3]).expect_err("one bad value spoils the page");
-    }
-
-    /// The residue says yes to exactly what `TryFrom` says yes to.
-    ///
-    /// The edges above are the cases anyone would think to write down. This is the argument that
-    /// there are no others, made by asking both questions about every value either narrow type could
-    /// have an opinion about, and then about the values around the wide edges and the ends of an
-    /// `i64`, which a range that size cannot reach.
-    #[test]
-    fn the_residue_agrees_with_a_checked_conversion_everywhere() {
-        for value in -70_000_i64..70_000 {
-            assert_eq!(fit::<i8>(&[value]).is_ok(), i8::try_from(value).is_ok(), "{value} as i8");
-            assert_eq!(fit::<u8>(&[value]).is_ok(), u8::try_from(value).is_ok(), "{value} as u8");
-            assert_eq!(fit::<i16>(&[value]).is_ok(), i16::try_from(value).is_ok(), "{value} i16");
-            assert_eq!(fit::<u16>(&[value]).is_ok(), u16::try_from(value).is_ok(), "{value} u16");
-        }
-        let wide = [i64::MIN, i64::MIN + 1, i64::from(i32::MIN), 0, i64::from(u32::MAX), i64::MAX];
-        for edge in wide {
-            for step in -2_i64..=2 {
-                let value = edge.saturating_add(step);
-                assert_eq!(
-                    fit::<i32>(&[value]).is_ok(),
-                    i32::try_from(value).is_ok(),
-                    "{value} as i32"
-                );
-                assert_eq!(
-                    fit::<u32>(&[value]).is_ok(),
-                    u32::try_from(value).is_ok(),
-                    "{value} as u32"
-                );
-            }
-        }
-    }
-
     /// All three block layouts come back as the same values in the same order.
     ///
     /// Blocks outside the page are what every file this build writes holds. Blocks that say where
@@ -16793,11 +16622,13 @@ mod tests {
     fn a_cascade_value_too_wide_for_its_column_is_refused_rather_than_cut() {
         // What a damaged page looks like from here: the cascade decoded, so the bytes are not
         // truncated, but the values do not belong to the column the directory says they do.
-        let over = vec![i64::from(i32::MAX) + 1];
-        let error = narrowed(&LogicalType::Integer, over).expect_err("a page that disagrees");
+        let over = integer::encode(&[i64::from(i32::MAX) + 1]).expect("a chunk");
+        let error = cascade(&LogicalType::Integer, &over, 1).expect_err("a page that disagrees");
         assert!(format!("{error}").contains("not of its type"), "{error}");
-        assert!(narrowed(&LogicalType::BigInt, vec![i64::MIN]).is_ok(), "bigint holds all of i64");
-        assert!(narrowed(&LogicalType::Varchar, vec![0]).is_err(), "strings are not integers");
+        let low = integer::encode(&[i64::MIN]).expect("a chunk");
+        assert!(cascade(&LogicalType::BigInt, &low, 1).is_ok(), "bigint holds all of i64");
+        let zero = integer::encode(&[0]).expect("a chunk");
+        assert!(cascade(&LogicalType::Varchar, &zero, 1).is_err(), "strings are not integers");
     }
 
     #[test]
