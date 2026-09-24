@@ -3152,7 +3152,9 @@ mod tests {
     fn a_range_it_has_no_loop_for_is_none() {
         let low = Value::Integer(1);
         let high = Value::Integer(5);
-        let bound = |op, value| Bound { op, value, held: None };
+        fn bound(op: Comparison, value: &Value) -> Bound<'_> {
+            Bound { op, value, held: None }
+        }
         let nulls = Vector::from_values(LogicalType::Integer, &[Value::Integer(2), Value::Null])
             .expect("integers");
         let range = |column: &Vector, low: &Value, high: &Value| {
