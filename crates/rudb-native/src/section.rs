@@ -72,6 +72,10 @@ pub const SKETCHES: &[u8; 8] = b"RUDBSK1\0";
 /// are found the same way and a rebuild replaces both.
 pub const DEGREES: &[u8; 8] = b"RUDBGD1\0";
 
+/// Rows sorted by one column and covering a second column. The payload holds row values,
+/// not grouped counts. A changed table generation makes the section stale.
+pub const SORTED_PROJECTION: &[u8; 8] = b"RUDBSP1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
@@ -201,7 +205,10 @@ impl Section {
     /// payload is never read.
     #[must_use]
     pub fn known(&self) -> bool {
-        matches!(&self.kind, KEY_MAP | FORWARD_LINK | ADJACENCY | SUMMARY | SKETCHES | DEGREES)
+        matches!(
+            &self.kind,
+            KEY_MAP | FORWARD_LINK | ADJACENCY | SUMMARY | SKETCHES | DEGREES | SORTED_PROJECTION
+        )
     }
 
     /// Whether this section's kind is one of these, which is how a budget finds what it owns.
