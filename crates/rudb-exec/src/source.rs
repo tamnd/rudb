@@ -819,9 +819,14 @@ impl Pushed {
 /// A run is a range of part numbers and a morsel covers one run. The ranges are built out of the
 /// parts the zone maps leave alive, so a run holds work rather than holding whatever happened to sit
 /// next to it, and the handout beside them is what hands one run to each worker that asks.
+///
+/// `order` is the order the runs go out in, as positions in `runs`, and empty for table order. A
+/// morsel is still numbered by its run's place in `runs`, so the rows a top N ranks by where they
+/// arrived arrive at the same places whatever order the runs are read in.
 #[derive(Debug)]
 struct Spread {
     runs: Vec<Range<usize>>,
+    order: Vec<usize>,
     handout: Handout,
 }
 
@@ -1433,6 +1438,13 @@ impl<'a> Scan<'a> {
         onto(&self.columns, vec![test])
     }
 
+    /// The table column a top N above this scan orders by first, and whether it runs descending.
+    fn ordered(&self) -> Option<(usize, bool)> {
+        let (column, op) = self.cutoff.as_ref()?.ordered(self.index)?;
+        let column = (*self.columns.get(column)?)?;
+        Some((column, op == Op::GreaterOrEqual))
+    }
+
     /// Whether part `at` holds nothing anything above this scan could want.
     ///
     /// The two sets of tests are asked separately rather than joined into one, so that a scan with no
@@ -1686,16 +1698,127 @@ fn runs_of(live: &[Live], instances: usize, rows: impl Fn(usize) -> usize) -> Ve
     runs
 }
 
+/// How many parts a run covers at most when a top N above the scan wants the best of them first.
+const ORDERED_RUN: usize = 8;
+
+/// The runs with the pieces of at most [`ORDERED_RUN`] parts a top N wants most cut out of them, and
+/// the order to hand them out in, for a scan under a top N whose first key is one of its columns.
+///
+/// The cutoff a top N tells the scan is only as good as the rows it has seen, and a scan that walks
+/// the file in the order it was written shows it rows in that order. ClickBench 26 orders by
+/// EventTime a file written in CounterID order, where every counter starts at the first day, so the
+/// earliest times are spread over the whole file and the scan read 380 of 2830 parts before the
+/// cutoff ruled out the rest. ClickHouse reads in the order of the key when it can for the same
+/// reason. Here the parts are not moved, since the file order is what the pages are cut by, but the
+/// pieces whose stored range reaches furthest the way the ordering wants, the smallest low for an
+/// ascending key and the largest high for a descending one, go out first. After those the cutoff is
+/// close to the answer's last key and most of what is left is ruled out by its stored range alone.
+///
+/// Only the best `front` pieces go first. What is left of each run between them stays one run and
+/// goes out after them in table order, so a query the cutoff helps little, such as one whose filter
+/// keeps few of the rows in the pieces that looked best, still reads most of the file in long runs.
+/// A piece with no stored range is never put first, and pieces that tie keep their table order.
+fn best_first(
+    runs: Vec<Range<usize>>,
+    front: usize,
+    descending: bool,
+    range: impl Fn(usize) -> Option<rudb_storage::Range>,
+) -> (Vec<Range<usize>>, Vec<usize>) {
+    let mut pieces = Vec::with_capacity(runs.len());
+    for run in runs.iter().cloned() {
+        let mut start = run.start;
+        while start < run.end {
+            let end = (start + ORDERED_RUN).min(run.end);
+            pieces.push(start..end);
+            start = end;
+        }
+    }
+    let reach: Vec<Option<Bound>> = pieces
+        .iter()
+        .map(|piece| {
+            piece
+                .clone()
+                .filter_map(|at| {
+                    let range = range(at)?;
+                    if descending { range.high } else { range.low }
+                })
+                .reduce(
+                    |one, other| if descending { one.larger(other) } else { one.smaller(other) },
+                )
+        })
+        .collect();
+    let better = if descending { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+    let mut first = vec![false; pieces.len()];
+    let mut chosen = Vec::with_capacity(front);
+    // A pass per piece picked rather than a sort, because two bounds need not compare and a sort
+    // handed an order that is not total may panic. `front` is a few times the workers.
+    for _ in 0..front.min(pieces.len()) {
+        let mut best: Option<usize> = None;
+        for (at, bound) in reach.iter().enumerate() {
+            let Some(bound) = bound else { continue };
+            if first[at] {
+                continue;
+            }
+            let wins = best
+                .and_then(|best| reach[best].as_ref())
+                .is_none_or(|held| bound.order(held) == Some(better));
+            if wins {
+                best = Some(at);
+            }
+        }
+        let Some(best) = best else { break };
+        first[best] = true;
+        chosen.push(best);
+    }
+    if chosen.is_empty() {
+        return (runs, Vec::new());
+    }
+    // Put back together in table order, a chosen piece on its own and the pieces between two chosen
+    // ones as one run, remembering where each chosen piece landed.
+    let mut out = Vec::with_capacity(runs.len() + 2 * chosen.len());
+    let mut landed = vec![0; pieces.len()];
+    let mut early = Vec::with_capacity(runs.len() + 2 * chosen.len());
+    let mut next = 0;
+    for run in &runs {
+        let mut rest: Option<Range<usize>> = None;
+        while let Some(piece) = pieces.get(next).filter(|piece| piece.start < run.end) {
+            if first[next] {
+                if let Some(rest) = rest.take() {
+                    out.push(rest);
+                    early.push(false);
+                }
+                landed[next] = out.len();
+                out.push(piece.clone());
+                early.push(true);
+            } else {
+                match rest.as_mut() {
+                    Some(rest) => rest.end = piece.end,
+                    None => rest = Some(piece.clone()),
+                }
+            }
+            next += 1;
+        }
+        if let Some(rest) = rest {
+            out.push(rest);
+            early.push(false);
+        }
+    }
+    let mut order: Vec<usize> = chosen.iter().map(|&piece| landed[piece]).collect();
+    order.extend((0..out.len()).filter(|&at| !early[at]));
+    (out, order)
+}
+
 impl Source for Scan<'_> {
     fn morsel(&self) -> Option<Morsel> {
         let Some(spread) = self.spread.get() else {
             return self.chunks.take();
         };
-        let index = spread.handout.number()?;
-        let run = spread.runs.get(usize::try_from(index).unwrap_or(usize::MAX))?;
+        let taken = usize::try_from(spread.handout.number()?).unwrap_or(usize::MAX);
+        let index = spread.order.get(taken).copied().unwrap_or(taken);
+        let run = spread.runs.get(index)?;
         let start = u64::try_from(run.start).unwrap_or(u64::MAX);
         let end = u64::try_from(run.end).unwrap_or(u64::MAX);
-        Some(Morsel::new(index, start, end))
+        Some(Morsel::new(u64::try_from(index).unwrap_or(u64::MAX), start, end))
     }
 
     fn morsels(&self, threads: usize, weight: usize) -> Option<usize> {
@@ -1735,7 +1858,13 @@ impl Source for Scan<'_> {
             self.table.rows().keep_stripes(instances.saturating_mul(2));
             let runs = runs_of(&live, instances, |at| self.table.rows().chunk_len(at).unwrap_or(0));
             self.unreached(&runs);
-            let _ = self.spread.set(Spread { handout: Handout::new(runs.len()), runs });
+            let (runs, order) = match self.ordered() {
+                Some((column, descending)) => best_first(runs, instances * 2, descending, |at| {
+                    self.table.rows().range_of(at, column)
+                }),
+                None => (runs, Vec::new()),
+            };
+            let _ = self.spread.set(Spread { handout: Handout::new(runs.len()), runs, order });
         }
         Some(instances)
     }
@@ -3267,8 +3396,8 @@ mod tests {
     use super::{
         Across, Bound, Cutoff, FileScan, Filters, Handout, Live, OnceLock, Op, Paying, Probe,
         Pushdown, RUN, Scan, Schema, Series, Session, Settings, Sideways, VECTOR_SIZE, WARMUP,
-        cut_rows, gather_target, gathered, hash, instances_for, morsels_of, next_piece, parts,
-        runs_of, worth_sifting,
+        best_first, cut_rows, gather_target, gathered, hash, instances_for, morsels_of, next_piece,
+        parts, runs_of, worth_sifting,
     };
     use crate::sideways::Found;
 
@@ -3594,6 +3723,43 @@ mod tests {
 
         assert_eq!(runs, [1..2, 3..4, 5..6, 7..8], "a run apiece, two workers, four to go round");
         assert!(runs.iter().all(|run| run.start >= 1 && run.end <= 8));
+    }
+
+    /// Under a top N the pieces of eight parts that reach furthest the way the ordering runs are cut
+    /// out of the runs and go out first, what is left of a run between them stays one run, and every
+    /// part is still in exactly one run. Part `at` holds `at % 13` to `at % 13 + 5`, and parts 30 to
+    /// 39 have no stored range. The pieces are 0..8, 8..16, 16..20, 20..28, 28..36, 36..44 and 44..45.
+    #[test]
+    fn the_pieces_a_top_n_wants_most_go_out_first() {
+        let range = |at: usize| {
+            let low = i128::try_from(at % 13).expect("small");
+            (!(30..40).contains(&at)).then(|| rudb_storage::Range {
+                low: Some(Bound::Int(low)),
+                high: Some(Bound::Int(low + 5)),
+                ..rudb_storage::Range::default()
+            })
+        };
+        let runs = vec![0..20, 20..45];
+
+        // Lows reached: 0, 0 (part 13), 3 (16..20 has 16 to 19), 0 (part 26), 2 (28 and 29), 1
+        // (part 40), 5 (part 44). The two that reach 0 first go first, in table order between them.
+        let (out, order) = best_first(runs.clone(), 2, false, range);
+        assert_eq!(out, [0..8, 8..16, 16..20, 20..45]);
+        assert_eq!(order, [0, 1, 2, 3]);
+        let (out, order) = best_first(runs.clone(), 3, false, range);
+        assert_eq!(out, [0..8, 8..16, 16..20, 20..28, 28..45]);
+        assert_eq!(order, [0, 1, 3, 2, 4], "the third best is the first to reach 0 after 13");
+        let (out, order) = best_first(runs.clone(), 4, false, range);
+        assert_eq!(out, [0..8, 8..16, 16..20, 20..28, 28..36, 36..44, 44..45]);
+        assert_eq!(order, [0, 1, 3, 5, 2, 4, 6]);
+        let (out, order) = best_first(runs.clone(), 1, true, range);
+        assert_eq!(out, [0..8, 8..16, 16..20, 20..45]);
+        assert_eq!(order, [1, 0, 2, 3], "part 12 reaches 17 and part 25 only ties it");
+        let (out, order) = best_first(runs.clone(), 99, false, |_| None);
+        assert_eq!((out, order), (runs, Vec::new()), "nothing stored leaves the runs alone");
+        let (out, _) = best_first(vec![0..20, 20..45], 3, false, range);
+        let seen: Vec<usize> = out.iter().flat_map(Clone::clone).collect();
+        assert_eq!(seen, (0..45).collect::<Vec<_>>());
     }
 
     /// A scan of the `rudb-parquet` fixture, which is 4096 rows in two row groups.
