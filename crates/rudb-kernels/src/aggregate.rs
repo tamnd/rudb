@@ -316,6 +316,55 @@ impl Accumulator {
         }
     }
 
+    /// The exact whole total this state holds and whether anything landed in it, or `None` for a
+    /// state that holds no exact total.
+    ///
+    /// A `sum` and an `avg` of the same column add the same numbers up, and an `avg` keeps the count
+    /// it will divide by as well, so a query asking for both can fold the column once and read the
+    /// sum out of the mean's state. This is that read. `None` for a mean that has gone inexact,
+    /// which is a total that did not fit an `i128`, and for every state that never held a whole
+    /// total, so that the caller has to say what it does about those rather than being given a
+    /// number that is not one.
+    #[must_use]
+    pub fn exact_total(&self) -> Option<(i128, bool)> {
+        match self.state {
+            State::Mean { total, seen, exact: true, .. } => Some((total, seen > 0)),
+            State::Whole { total, seen, .. } | State::Scaled { total, seen, .. } => {
+                Some((total, seen))
+            }
+            _ => None,
+        }
+    }
+
+    /// A `sum` over a column of this type, holding `total` already.
+    ///
+    /// Built through [`Accumulator::new`] and then written into, so that the state is the one a real
+    /// `sum` over the same column would have kept rather than a second opinion about which one that
+    /// is. The scale a decimal sum carries comes from `returns` the same way, which is what makes the
+    /// total read out of a mean over the same column the right number to put here: both are the sum
+    /// of the column's unscaled integers.
+    ///
+    /// # Errors
+    ///
+    /// A `returns` that gives `sum` a state holding no whole total, which is a caller asking for this
+    /// over a column no exact sum exists for.
+    pub fn sum_of(total: i128, seen: bool, returns: &LogicalType) -> Result<Self> {
+        let mut held = Self::new("sum", returns)?;
+        match &mut held.state {
+            State::Whole { total: into, seen: saw, .. }
+            | State::Scaled { total: into, seen: saw, .. } => {
+                *into = total;
+                *saw = seen;
+            }
+            _ => {
+                return Err(Error::internal(format!(
+                    "a sum over {returns} keeps no whole total to write into"
+                )));
+            }
+        }
+        Ok(held)
+    }
+
     fn kind(&self) -> Kind {
         match self.state {
             State::Counted { star, .. } => {
@@ -3853,6 +3902,53 @@ mod tests {
                         by_row[at].finish().expect("finishes"),
                         "{name} over {note}, group {group}"
                     );
+                }
+            }
+        }
+    }
+
+    /// A sum read out of a mean's state over the same column is the sum a call of its own reaches,
+    /// over every type a mean keeps an exact total for, with nulls among the rows and without, and
+    /// with rows in no group. Where the mean has no exact total to give, the sum of its own had
+    /// nowhere to put one either and says so.
+    #[test]
+    fn a_sum_read_out_of_a_mean_is_the_sum_a_call_of_its_own_reaches() {
+        let mut rng = Rng(0x5eed_0f00_2c0d_0031);
+        let types = [
+            LogicalType::TinyInt,
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::HugeInt,
+            LogicalType::UBigInt,
+            LogicalType::decimal(18, 4).expect("a legal decimal"),
+            LogicalType::decimal(30, 6).expect("a legal decimal"),
+        ];
+        let rows = 97;
+        let slots: Vec<usize> =
+            (0..rows).map(|row| if row % 11 == 4 { NOWHERE } else { row % 3 }).collect();
+        for ty in &types {
+            for nulls in [0_usize, 5] {
+                let column = flat(ty, rows, nulls, &mut rng);
+                let sums = returns_of("sum", ty);
+                let means = returns_of("avg", ty);
+                let mut summed = vec![Accumulator::new("sum", &sums).expect("known"); 3];
+                let mut meant = vec![Accumulator::new("avg", &means).expect("known"); 3];
+                let folded = update_scattered(&mut summed, &slots, 1, 0, Some(&column), rows);
+                update_scattered(&mut meant, &slots, 1, 0, Some(&column), rows).expect("folds");
+                for group in 0..3 {
+                    let note = format!("sum over {ty}, one null in {nulls}, group {group}");
+                    let Some((total, seen)) = meant[group].exact_total() else {
+                        assert!(folded.is_err(), "{note}: the mean is inexact and the sum is not");
+                        continue;
+                    };
+                    let read = Accumulator::sum_of(total, seen, &sums).expect("a whole total");
+                    let said =
+                        |answer: Result<Value>| answer.map_err(|at| at.message().to_string());
+                    let of_its_own = match &folded {
+                        Err(error) => Err(error.message().to_string()),
+                        Ok(()) => said(summed[group].finish()),
+                    };
+                    assert_eq!(said(read.finish()), of_its_own, "{note}");
                 }
             }
         }

@@ -61,6 +61,18 @@ struct Call {
     filter: Option<ExprRef>,
     returns: LogicalType,
     affine: Option<(usize, i64)>,
+    reads_total: Option<usize>,
+}
+
+impl Call {
+    /// Whether this call folds rows of its own, rather than finishing out of another call's state.
+    ///
+    /// A call that does not fold has no argument evaluated for it, no accumulator updated for it and
+    /// no run at a time finish taken for it, so this is asked at each of those places rather than
+    /// each of them asking about the two ways a call can be derived.
+    fn folds(&self) -> bool {
+        self.affine.is_none() && self.reads_total.is_none()
+    }
 }
 
 /// The `INTEGER` literal an expression is, and `None` for everything else.
@@ -103,6 +115,79 @@ fn mark_affine_sums(plan: &Plan, calls: &mut [Call]) {
             calls[at].affine = Some((source, offset));
         }
     }
+}
+
+/// Marks `sum(X)` calls that can read their total out of an `avg(X)` in the same aggregate.
+///
+/// A sum and a mean of one column add the same numbers up, and the mean keeps the count it is going
+/// to divide by besides, so a query asking for both only has to fold the column once. q01 asks for
+/// the sum and the mean of `l_quantity` and of `l_extendedprice`, and folding each of those columns
+/// twice was 266.6M of its 2786.2M instructions at SF1. The same pair of queries costs DuckDB the
+/// same either way, so it already does this.
+///
+/// The sum is what gets marked rather than the mean, because a mean's state keeps the total and the
+/// count and a sum's keeps only the total, so this is the direction that needs nothing added to a
+/// state. A `DISTINCT` or a `FILTER` on either call makes the two folds run over different rows. A
+/// mean that has gone inexact has no exact total left to read, and the finish is where that is found
+/// out, because whether it happens depends on the rows rather than on the plan.
+///
+/// Only over a column of whole numbers, which is an integer or a decimal. A mean of those adds the
+/// unscaled integers up in an `i128` and divides once, and that total is the number a sum of the same
+/// column reaches. A mean over floating point is not: it adds in floating point in the order the rows
+/// arrive, the way a sum of it does, and a sum read out of anything else would round differently on
+/// some columns and agree on others. So the two are only ever shared where they are the same
+/// addition.
+fn mark_sums_from_means(plan: &Plan, calls: &mut [Call]) {
+    let whole = |call: &Call| {
+        let [argument] = call.args.as_slice() else { return false };
+        let of = plan.expr_type(*argument);
+        of.is_integer() || matches!(of, LogicalType::Decimal { .. })
+    };
+    for at in 0..calls.len() {
+        if calls[at].name != "sum"
+            || calls[at].distinct
+            || calls[at].filter.is_some()
+            || calls[at].affine.is_some()
+            || !whole(&calls[at])
+        {
+            continue;
+        }
+        // A sum another call reads as its own base still has to fold, because what that call adds an
+        // offset to is this one's accumulator rather than its answer.
+        if calls.iter().any(|call| call.affine.is_some_and(|(source, _)| source == at)) {
+            continue;
+        }
+        calls[at].reads_total = (0..calls.len()).find(|&source| {
+            calls[source].name == "avg"
+                && !calls[source].distinct
+                && calls[source].filter.is_none()
+                && calls[source].folds()
+                && calls[source].args == calls[at].args
+        });
+    }
+}
+
+/// The answer a `sum` marked by [`mark_sums_from_means`] gives, out of the mean's state.
+///
+/// Its own function, and kept out of line, because it builds a whole accumulator and it is reached
+/// once a group for the one call in a query that was marked, while the loop that calls it finishes
+/// every call of every group. Written inline in that loop the building goes into the loop's body for
+/// every query, marked or not, and that loop already turns out to be sensitive to how much code is
+/// around it. See #1730 for what that sensitivity cost once. Neither shape measured differently on
+/// the queries here, so this is the one that keeps the cold path out of the hot one by construction
+/// rather than by an optimiser's opinion.
+///
+/// # Errors
+///
+/// A mean that has gone inexact, which is a total that did not fit an `i128`. A sum of its own would
+/// have raised on the row that stopped fitting rather than carrying on in floating point, so this
+/// raises too rather than answering something a real sum would not have answered.
+#[inline(never)]
+fn sum_from_mean(held: &Accumulator, returns: &LogicalType) -> Result<Value> {
+    let Some((total, seen)) = held.exact_total() else {
+        return Err(Error::out_of_range("a total too large for an exact sum".to_string()));
+    };
+    Accumulator::sum_of(total, seen, returns)?.finish()
 }
 
 /// A grouped or ungrouped aggregation.
@@ -929,6 +1014,7 @@ impl<'a> Aggregate<'a> {
                 filter,
                 returns: plan.expr_type(reference).clone(),
                 affine: None,
+                reads_total: None,
             });
         }
         if groups.is_empty() {
@@ -945,14 +1031,6 @@ impl<'a> Aggregate<'a> {
             fields.push(Field::new(call.name.clone(), call.returns.clone()));
         }
         let schema = Schema::numbered(fields, index);
-        let mut inputs = keys.clone();
-        for call in &calls {
-            if call.affine.is_none() {
-                inputs.extend_from_slice(&call.args);
-            }
-            inputs.extend(call.filter);
-        }
-        let inputs = Prepared::shared(plan, &inputs, &input_schema)?;
         let alone = groups.is_empty();
         let compact_numeric = !alone
             && calls.len() == 3
@@ -1003,6 +1081,21 @@ impl<'a> Aggregate<'a> {
             && calls[0].args.len() == 1
             && plan.expr_type(calls[0].args[0]) == &LogicalType::BigInt
             && calls[0].filter.is_none();
+        // Only where the accumulators own the calls. The four shapes above read their arguments by
+        // the position of the call in the list and finish without touching an accumulator at all, so
+        // a call marked as reading another's total would have its argument dropped from `inputs` and
+        // then be asked for it anyway.
+        if !compact_numeric && !distinct_count && !mixed_numeric_distinct && !radix_distinct_count {
+            mark_sums_from_means(plan, &mut calls);
+        }
+        let mut inputs = keys.clone();
+        for call in &calls {
+            if call.folds() {
+                inputs.extend_from_slice(&call.args);
+            }
+            inputs.extend(call.filter);
+        }
+        let inputs = Prepared::shared(plan, &inputs, &input_schema)?;
         let by_vector: Vec<bool> =
             calls.iter().map(|call| alone && !call.distinct && call.filter.is_none()).collect();
         // Every group of one operator starts from the same accumulator per call, so the one a group
@@ -1138,7 +1231,7 @@ impl<'a> Aggregate<'a> {
             && self.calls.iter().enumerate().all(|(at, call)| {
                 !call.distinct
                     && call.filter.is_none()
-                    && call.affine.is_none()
+                    && call.folds()
                     && !self.by_vector[at]
                     && match (call.name.as_str(), call.args.as_slice()) {
                         ("count_star", []) | ("count", [_]) => true,
@@ -1327,7 +1420,7 @@ impl<'a> Aggregate<'a> {
         let mut arguments = Vec::with_capacity(self.calls.len());
         let mut filters = Vec::with_capacity(self.calls.len());
         for call in &self.calls {
-            arguments.push(if call.affine.is_none() {
+            arguments.push(if call.folds() {
                 values.by_ref().take(call.args.len()).collect()
             } else {
                 Vec::new()
@@ -1950,7 +2043,7 @@ impl<'a> Aggregate<'a> {
         let Rows { keys, arguments, filters, rows: length, marked } = seen_rows;
         let mut aside = 0;
         for at in 0..calls {
-            if self.calls[at].affine.is_some() {
+            if !self.calls[at].folds() {
                 continue;
             }
             if self.by_vector[at] {
@@ -2281,10 +2374,7 @@ impl<'a> Aggregate<'a> {
                 .iter()
                 .enumerate()
                 .filter(|&(at, call)| {
-                    !self.by_vector[at]
-                        && call.affine.is_none()
-                        && !call.distinct
-                        && filters[at].is_none()
+                    !self.by_vector[at] && call.folds() && !call.distinct && filters[at].is_none()
                 })
                 .count()
         };
@@ -2353,7 +2443,7 @@ impl<'a> Aggregate<'a> {
         //
         // How many of this chunk's calls would read the runs decides whether finding them pays, so
         // it was counted above and is handed to `slot_runs_of` as its budget. The count loop below
-        // reads them once, and a call that goes by vector, that is affine, that is `DISTINCT` or
+        // reads them once, and a call that goes by vector, that does not fold, that is `DISTINCT` or
         // that carries a `FILTER` never reaches the run path at all.
         let by_runs = runs_found || slot_runs_of(slots, slot_runs, users);
         if self.count_only {
@@ -2384,7 +2474,7 @@ impl<'a> Aggregate<'a> {
             if self.count_only || self.compact_numeric {
                 break;
             }
-            if self.by_vector[at] || call.affine.is_some() {
+            if self.by_vector[at] || !call.folds() {
                 continue;
             }
             if call.distinct {
@@ -2609,7 +2699,7 @@ impl<'a> Aggregate<'a> {
                 // Everything it does not cover falls through unchanged, which is a `min` or a `max`,
                 // whose state owns a value away from itself, an affine call, which finishes from
                 // another call's state, and the two compact shapes, which have no accumulators.
-                if !self.count_only && !self.compact_numeric && self.calls[at].affine.is_none() {
+                if !self.count_only && !self.compact_numeric && self.calls[at].folds() {
                     if let Some(vector) = finish_run(&states, picked, calls, at, ty)? {
                         columns.push(vector);
                         continue;
@@ -2643,10 +2733,14 @@ impl<'a> Aggregate<'a> {
                             _ => unreachable!("compact numeric has three calls"),
                         }
                     } else {
-                        match self.calls[at].affine {
-                            Some((source, offset)) => states[slot * calls + source]
+                        match (self.calls[at].affine, self.calls[at].reads_total) {
+                            (Some((source, offset)), _) => states[slot * calls + source]
                                 .finish_offset(offset, affine_rows[source]),
-                            None => states[slot * calls + at].finish(),
+                            (None, Some(source)) => sum_from_mean(
+                                &states[slot * calls + source],
+                                &self.calls[at].returns,
+                            ),
+                            (None, None) => states[slot * calls + at].finish(),
                         }
                     }?;
                     taken += rows::owned(&value);
@@ -8012,6 +8106,7 @@ mod tests {
                 filter: None,
                 returns: LogicalType::BigInt,
                 affine: None,
+                reads_total: None,
             },
             Call {
                 name: "sum".into(),
@@ -8020,6 +8115,7 @@ mod tests {
                 filter: None,
                 returns: LogicalType::HugeInt,
                 affine: None,
+                reads_total: None,
             },
             Call {
                 name: "avg".into(),
@@ -8028,6 +8124,7 @@ mod tests {
                 filter: None,
                 returns: LogicalType::Double,
                 affine: None,
+                reads_total: None,
             },
         ];
 
@@ -8092,6 +8189,7 @@ mod tests {
             filter: None,
             returns,
             affine: None,
+            reads_total: None,
         };
         let calls = [
             call("count_star", LogicalType::BigInt),
