@@ -6454,7 +6454,8 @@ impl Reader {
         if boundary <= summary.omitted_max {
             return Ok(None);
         }
-        self.decode_frequencies(column, &field.ty, &summary.entries).map(Some)
+        self.decode_frequencies(column, &field.ty, &summary.entries)
+            .map(|values| Some(Vec::clone(&values)))
     }
 
     /// Exact leading counts for a numeric key paired with a stable-dictionary string key.
@@ -6525,6 +6526,18 @@ impl Reader {
     ///
     /// [`exact_frequencies`]: Self::exact_frequencies
     pub fn frequency_prefix(&self, column: usize) -> Result<Option<FrequencyPrefix>> {
+        Ok(self.held_prefix(column)?.map(|(entries, omitted_max)| FrequencyPrefix {
+            entries: Vec::clone(&entries),
+            omitted_max,
+        }))
+    }
+
+    /// [`Self::frequency_prefix`] as the reader holds it, shared rather than copied.
+    ///
+    /// The planner asks for a column's synopsis for every estimate that touches it, on every
+    /// statement, and the list of a string column is a few hundred strings, so copying it each time
+    /// was a hundred allocations for an answer nothing changes.
+    pub(crate) fn held_prefix(&self, column: usize) -> Result<Option<(Synopsis, u64)>> {
         let field = self
             .table
             .fields
@@ -6534,7 +6547,7 @@ impl Reader {
             return Ok(None);
         };
         let entries = self.decode_frequencies(column, &field.ty, &summary.entries)?;
-        Ok(Some(FrequencyPrefix { entries, omitted_max: summary.omitted_max }))
+        Ok(Some((entries, summary.omitted_max)))
     }
 
     /// One column's synopsis, read back from the file when the directory left it there.
@@ -6581,13 +6594,13 @@ impl Reader {
         column: usize,
         ty: &LogicalType,
         entries: &[FrequencyEntry],
-    ) -> Result<Vec<(Value, u64)>> {
+    ) -> Result<Synopsis> {
         if let Some(values) = self.frequency_values.get(column).and_then(OnceLock::get) {
-            return Ok(values.as_ref().clone());
+            return Ok(Arc::clone(values));
         }
-        let values = self.decode_frequencies_once(column, ty, entries)?;
+        let values = Arc::new(self.decode_frequencies_once(column, ty, entries)?);
         if let Some(slot) = self.frequency_values.get(column) {
-            let _ = slot.set(Arc::new(values.clone()));
+            let _ = slot.set(Arc::clone(&values));
         }
         Ok(values)
     }
@@ -6718,7 +6731,10 @@ impl Reader {
         }
         let (anchors, anchor_indices) = if summary.ordinal_entries.len() == summary.ordinals.len() {
             let entries = self.decode_frequencies(column, &field.ty, &summary.entries)?;
-            (entries.into_iter().map(|(value, _)| value).collect(), summary.ordinal_entries.clone())
+            (
+                entries.iter().map(|(value, _)| value.clone()).collect(),
+                summary.ordinal_entries.clone(),
+            )
         } else {
             (Vec::new(), Vec::new())
         };
