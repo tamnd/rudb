@@ -1920,8 +1920,11 @@ impl<'a> Aggregate<'a> {
         // value, and the row loop below is then a probe with the hash already in hand.
         // The probe, and nothing else. What comes out of it is one slot per row, which is what the
         // scatter below needs and what the row loop used to consume as it went.
+        //
+        // Emptied here and filled by whichever path below finds the slots. A key that comes in runs
+        // writes each slot once as it goes, and filling the slots with `NOWHERE` first was a second
+        // write of every one of them, 560 MB over seventy runs of ClickBench 28.
         slots.clear();
-        slots.resize(*length, if alone { 0 } else { NOWHERE });
         // The direct map first, because a chunk it answers is a chunk that is never hashed. The
         // whole key of q1 is two dictionary codes with six combinations between them, so the map is
         // six slots long and every row after the first six is a multiply add and a load. See
@@ -2034,12 +2037,12 @@ impl<'a> Aggregate<'a> {
                         slot = resolve(start)?;
                         coded_map[place] = slot;
                     }
-                    slots[start..end].fill(slot);
+                    slots.resize(end, slot);
                     *run = (slot, end);
                     start = end;
                 }
                 runs_found = true;
-            } else if codes.look_up(coded_map, slots) != Some(false) {
+            } else if codes.look_up(coded_map, nowhere(slots, *length)) != Some(false) {
                 // One pass that finds every row's slot straight out of the map when the key is one
                 // or two dictionary columns, which is the whole chunk once a row group's first rows
                 // are in. Only a chunk where some row found nothing, or a key the pass does not
@@ -2066,6 +2069,10 @@ impl<'a> Aggregate<'a> {
             }
         } else {
             coded_on.clear();
+        }
+        if slots.len() != *length {
+            slots.clear();
+            slots.resize(*length, if alone { 0 } else { NOWHERE });
         }
         // Hashed when the map did not take the chunk, since then every row is probed below.
         if !alone && closed.is_none() && direct.is_none() {
@@ -3666,6 +3673,13 @@ impl<'a> Aggregate<'a> {
         }
         types
     }
+}
+
+/// `slots` as `rows` places of `NOWHERE`, for a path that fills them in any order.
+fn nowhere(slots: &mut Vec<usize>, rows: usize) -> &mut [usize] {
+    slots.clear();
+    slots.resize(rows, NOWHERE);
+    slots
 }
 
 /// One chunk of rows, in the vectors the row loop reads them out of.
