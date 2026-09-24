@@ -154,33 +154,76 @@ fn after_quote(byte: u8) -> Error {
 
 /// Where one field's bytes are in the buffer it was read from.
 ///
-/// A quoted field's range is what is between its quotes. `escaped` says a doubled quote or an
-/// escaped one is in there, so the bytes are not the value yet and [`Span::text`] has to take the
-/// escapes out, which is the one case that copies before the value is used.
+/// A quoted field's range is what is between its quotes. Whether a doubled quote or an escaped one
+/// is in there is kept too, since then the bytes are not the value yet and [`Span::text`] has to
+/// take the escapes out, which is the one case that copies before the value is used.
+///
+/// Eight bytes, two `u32`s with the escape in the top bit of the end, because a chunk holds one of
+/// these for every field of eight thousand records and the converters walk them once per column.
+/// That caps a chunk's buffer at [`Span::MOST`] bytes, which the reader keeps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
-    /// The first byte of the field.
-    pub start: usize,
-    /// One past the last byte of the field.
-    pub end: usize,
-    /// Whether the bytes still hold escapes.
-    pub escaped: bool,
+    start: u32,
+    end: u32,
 }
 
+/// The bit of [`Span::end`] that says the field holds escapes.
+const ESCAPED: u32 = 1 << 31;
+
 impl Span {
+    /// The furthest into its buffer a range can reach.
+    pub const MOST: usize = (ESCAPED - 1) as usize;
+
+    /// The field from `start` to `end`, with escapes in it or not.
+    ///
+    /// # Panics
+    ///
+    /// In a debug build, if `end` is past [`Self::MOST`], which the reader never lets a buffer be.
+    #[must_use]
+    pub fn new(start: usize, end: usize, escaped: bool) -> Self {
+        debug_assert!(start <= end && end <= Self::MOST);
+        #[allow(clippy::cast_possible_truncation)]
+        let (start, end) = (start as u32, end as u32);
+        Self { start, end: end | if escaped { ESCAPED } else { 0 } }
+    }
+
+    /// The first byte of the field.
+    #[must_use]
+    pub const fn start(self) -> usize {
+        self.start as usize
+    }
+
+    /// One past the last byte of the field.
+    #[must_use]
+    pub const fn end(self) -> usize {
+        (self.end & !ESCAPED) as usize
+    }
+
+    /// Whether the bytes still hold escapes.
+    #[must_use]
+    pub const fn escaped(self) -> bool {
+        self.end & ESCAPED != 0
+    }
+
     /// Whether the field is empty, which the reader turns into a null.
     ///
     /// A field with an escape in it is never empty once the escape is taken out, since every escape
     /// leaves a quote behind, so the range answers for the value.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.start == self.end
+        self.start() == self.end()
+    }
+
+    /// How many bytes the field has in the buffer, escapes and all.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.end() - self.start()
     }
 
     /// The bytes of the field as they are in the buffer, escapes and all.
     #[must_use]
     pub fn raw(self, bytes: &[u8]) -> &[u8] {
-        &bytes[self.start..self.end]
+        &bytes[self.start()..self.end()]
     }
 
     /// The field as text, borrowed from the buffer unless it had an escape or a byte that is not
@@ -192,7 +235,7 @@ impl Span {
     #[must_use]
     pub fn text(self, bytes: &[u8], dialect: Dialect) -> Cow<'_, str> {
         let raw = self.raw(bytes);
-        if !self.escaped {
+        if !self.escaped() {
             return String::from_utf8_lossy(raw);
         }
         Cow::Owned(String::from_utf8_lossy(&unescape(raw, dialect)).into_owned())
@@ -276,6 +319,9 @@ impl Records {
         if by == 0 {
             return;
         }
+        // A shift is by less than the buffer is long, so it fits in the `u32` every range does.
+        #[allow(clippy::cast_possible_truncation)]
+        let by = by as u32;
         for span in &mut self.spans {
             span.start -= by;
             span.end -= by;
@@ -371,10 +417,10 @@ fn blocks(
                     let Some(escaped) = enclosed(&bytes[field..at], quote) else {
                         break 'blocks;
                     };
-                    out.spans.push(Span { start: field + 1, end: at - 1, escaped });
+                    out.spans.push(Span::new(field + 1, at - 1, escaped));
                     quoted = false;
                 } else {
-                    out.spans.push(Span { start: field, end: at, escaped: false });
+                    out.spans.push(Span::new(field, at, false));
                 }
                 let byte = bytes[at];
                 if byte == delimiter {
@@ -551,7 +597,7 @@ fn spans(
                 }
                 at += 1;
             }
-            span = Span { start, end: at, escaped };
+            span = Span::new(start, at, escaped);
             at += 1;
             match bytes.get(at) {
                 None if !eof => {
@@ -577,7 +623,7 @@ fn spans(
                 out.truncate(mark);
                 return Ok(None);
             }
-            span = Span { start, end: at, escaped: false };
+            span = Span::new(start, at, false);
         }
         out.push(span);
         match bytes.get(at) {

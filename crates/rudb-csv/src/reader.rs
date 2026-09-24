@@ -22,7 +22,7 @@ use rudb_vector::{Chunk, VECTOR_SIZE};
 use crate::convert::{self, Cells};
 use crate::dialect::{self, Dialect, Given};
 use crate::infer;
-use crate::scan::Records;
+use crate::scan::{Records, Span};
 
 /// How much is read at a time, and how much the sniffer gets to look at.
 ///
@@ -269,6 +269,14 @@ impl Reader {
             }
             // The records already read point into the buffer, so the refill keeps everything from
             // the start of the chunk and moves their ranges down by whatever it dropped in front.
+            // A range only reaches so far, so a chunk that would outgrow that ends early, and a
+            // single record that would is refused.
+            if self.buffer.len() - start + self.block > Span::MOST {
+                if self.records.is_empty() {
+                    return Err(Error::io("a record is longer than two gigabytes"));
+                }
+                break;
+            }
             self.fill(start)?;
             self.records.shift(start);
             start = 0;

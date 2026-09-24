@@ -178,7 +178,7 @@ fn fixed<T: Copy + Default>(
             valid.push(false);
             continue;
         };
-        let parsed = if span.escaped { None } else { fast(span.raw(cells.bytes)) };
+        let parsed = if span.escaped() { None } else { fast(span.raw(cells.bytes)) };
         let value = match parsed {
             Some(value) => value,
             None => {
@@ -204,7 +204,7 @@ fn text(cells: &Cells<'_>, column: usize, ty: &LogicalType) -> Vector {
     let mut strings = StringColumn::with_capacity(rows);
     let long: usize = (0..rows)
         .filter_map(|row| cells.at(row, column))
-        .map(|span| span.end - span.start)
+        .map(Span::len)
         .filter(|&len| len > INLINE_LIMIT)
         .sum();
     strings.reserve_bytes(long);
@@ -216,7 +216,7 @@ fn text(cells: &Cells<'_>, column: usize, ty: &LogicalType) -> Vector {
             continue;
         };
         let raw = span.raw(cells.bytes);
-        if !span.escaped && rudb_common::utf8::valid(raw) {
+        if !span.escaped() && rudb_common::utf8::valid(raw) {
             strings.push_bytes(raw);
         } else {
             strings.push(&span.text(cells.bytes, cells.dialect));
