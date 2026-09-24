@@ -3755,6 +3755,16 @@ impl Packed<'_> {
 
     /// The code of each of `rows` rows `at` names, in order.
     ///
+    /// [`Self::codes_into`] into a vector of its own. A caller reading a column a chunk at a time
+    /// wants that vector once rather than once a chunk, and calls the other one.
+    pub fn codes_at<M: Fn(usize) -> usize>(&self, at: M, rows: usize) -> Vec<u64> {
+        let mut codes = vec![0; rows];
+        self.codes_into(at, rows, &mut codes);
+        codes
+    }
+
+    /// The code of each of `rows` rows `at` names, in order, left in `out[..rows]`.
+    ///
     /// A filter's selection names rows close together and in order, so the span they cover is
     /// unpacked whole with [`Self::unpack`] and each row read out of it. Rows spread too far apart
     /// for that to pay are read a code at a time.
@@ -3771,9 +3781,26 @@ impl Packed<'_> {
     /// column of six million rows spent 37 percent of the query in here and the compare it fed 4.8
     /// percent, which is the shape of paying three passes for one. Whether the rows are a run is one
     /// compare a row in the pass that was already reading them.
-    pub fn codes_at<M: Fn(usize) -> usize>(&self, at: M, rows: usize) -> Vec<u64> {
+    ///
+    /// Rows that are not a run, which is the second conjunct of a filter reading only the rows the
+    /// first one kept, unpack the span they cover into a buffer each thread keeps rather than a
+    /// fresh one. The span of a selection over a chunk is about as wide as the chunk whatever the
+    /// selection keeps, so the fresh buffer was an allocation and a page of zeroes a chunk for a run
+    /// of zeroes that the unpack immediately writes over. [`Self::values_at`] below keeps its span
+    /// the same way and for the same reason.
+    ///
+    /// `out` is grown to hold `rows` and is not otherwise touched, so a buffer longer than the rows
+    /// keeps whatever is past them, and a buffer already long enough is not zeroed on the way in.
+    /// Every one of `out[..rows]` is written before this returns.
+    pub fn codes_into<M: Fn(usize) -> usize>(&self, at: M, rows: usize, out: &mut Vec<u64>) {
+        thread_local! {
+            static SPAN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+        if out.len() < rows {
+            out.resize(rows, 0);
+        }
         if rows == 0 {
-            return Vec::new();
+            return;
         }
         let first = at(0);
         let (mut low, mut high) = (first, first);
@@ -3785,16 +3812,28 @@ impl Packed<'_> {
             ascends &= row == first + index;
         }
         if ascends {
-            let mut codes = vec![0; rows];
-            self.unpack(first, &mut codes);
-            return codes;
+            self.unpack(first, &mut out[..rows]);
+            return;
         }
         if high - low >= rows.saturating_mul(4) {
-            return (0..rows).map(|index| self.code(at(index))).collect();
+            for (index, code) in out[..rows].iter_mut().enumerate() {
+                *code = self.code(at(index));
+            }
+            return;
         }
-        let mut run = vec![0; high - low + 1];
-        self.unpack(low, &mut run);
-        (0..rows).map(|index| run[at(index) - low]).collect()
+        // Taken out of the thread's slot and put back rather than borrowed for the body, so that the
+        // body is the straight line it was when it allocated. Handing the buffer to a closure and
+        // calling that closure from both arms of a borrow left the gather a call rather than a loop.
+        let span = high - low + 1;
+        let mut run = SPAN.with_borrow_mut(std::mem::take);
+        if run.len() < span {
+            run.resize(span, 0);
+        }
+        self.unpack(low, &mut run[..span]);
+        for (index, code) in out[..rows].iter_mut().enumerate() {
+            *code = run[at(index) - low];
+        }
+        SPAN.with_borrow_mut(|held| *held = run);
     }
 
     /// The value of each row `at` names, in order, made from its code by `value`.
@@ -4872,6 +4911,31 @@ mod tests {
                                 packed.codes_at(|index| shape[index], shape.len()),
                                 want,
                                 "width {width} offset {offset} start {start} rows {rows}"
+                            );
+                        }
+                    }
+                }
+                // The same shapes into a buffer the caller keeps, filled with a code no width can
+                // hold first, so that a row left as it arrived is a wrong answer rather than a zero
+                // that happens to be right. A buffer wider than the rows asked for keeps the rest.
+                let mut held = vec![u64::MAX; 260];
+                for start in [0_usize, 1, 64, 130] {
+                    for rows in [1_usize, 63, 64, 200] {
+                        let run: Vec<usize> = (start..start + rows).collect();
+                        let back: Vec<usize> = run.iter().rev().copied().collect();
+                        for shape in [&run, &back] {
+                            held.iter_mut().for_each(|code| *code = u64::MAX);
+                            packed.codes_into(|index| shape[index], shape.len(), &mut held);
+                            let want: Vec<u64> =
+                                shape.iter().map(|&row| packed.code(row)).collect();
+                            assert_eq!(
+                                &held[..rows],
+                                &want[..],
+                                "width {width} offset {offset} start {start} rows {rows}"
+                            );
+                            assert!(
+                                held[rows..].iter().all(|&code| code == u64::MAX),
+                                "width {width} wrote past the {rows} rows it was asked for"
                             );
                         }
                     }

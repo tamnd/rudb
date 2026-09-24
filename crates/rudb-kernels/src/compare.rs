@@ -69,6 +69,7 @@
 //! change is a number rather than a belief.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -1234,6 +1235,11 @@ where
 /// time was one row at a time with a call in the middle. On a sample of the TPC-H q20 filter, which
 /// is two comparisons of a packed date column over six million rows, this pair of loops was two
 /// thirds of everything the scan did.
+///
+/// The codes go into a vector each thread keeps and the answers are built by the sweep rather than
+/// laid out as a run of `false` for it to write over. Both of those were an allocation and a run of
+/// zeroes per chunk per conjunct, and a filter over six million rows is three thousand chunks, so
+/// the allocator and the zeroing were four of the twenty two instructions a row this path costs.
 fn packed_against<M>(
     op: Comparison,
     packed: &Packed<'_>,
@@ -1256,27 +1262,33 @@ where
         };
         return vec![same; len];
     };
-    let mut answers = vec![false; len];
+    thread_local! {
+        static CODES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+    // Taken out of the thread's slot and put back rather than borrowed for the body, because a body
+    // in a closure that both arms of a borrow call is a body that stops being inlined, and the sweep
+    // under each arm is the loop this whole path exists to keep tight.
+    let mut held = CODES.with_borrow_mut(std::mem::take);
     // Unpacked in bulk first, so that the loop under each arm is a compare of two numbers. See
     // [`Packed::unpack`].
-    let codes = packed.codes_at(map, len);
+    packed.codes_into(map, len, &mut held);
+    let codes = &held[..len];
     /// One pass over the rows with the comparison inlined into it.
     macro_rules! sweep {
         ($test:expr) => {{
             let test = $test;
-            for (answer, &found) in answers.iter_mut().zip(&codes) {
-                *answer = test(found, code);
-            }
+            codes.iter().map(|&found| test(found, code)).collect()
         }};
     }
-    match op {
+    let answers: Vec<bool> = match op {
         Comparison::Equal | Comparison::NotDistinctFrom => sweep!(|found, want| found == want),
         Comparison::NotEqual | Comparison::DistinctFrom => sweep!(|found, want| found != want),
         Comparison::Less => sweep!(|found, want| found < want),
         Comparison::LessOrEqual => sweep!(|found, want| found <= want),
         Comparison::Greater => sweep!(|found, want| found > want),
         Comparison::GreaterOrEqual => sweep!(|found, want| found >= want),
-    }
+    };
+    CODES.with_borrow_mut(|slot| *slot = held);
     answers
 }
 
