@@ -1354,10 +1354,14 @@ pub fn update_general(
 /// `AVG(STRLEN(URL))` and its `COUNT(*)` over rows sorted on `CounterID`.
 ///
 /// `false`, with nothing touched, for what this does not cover, which is anything but a count, an
-/// exact total or an exact mean, and any of those over a column with a null in it or in a form
-/// other than flat. The caller then goes the way [`update_scattered`] goes. A float total is left
-/// out on purpose, because adding a run up on its own first would round differently from adding
-/// its rows one at a time into what the group already holds.
+/// exact total or an exact mean, and any of those over a column with a null in it. The caller then
+/// goes the way [`update_scattered`] goes. A float total is left out on purpose, because adding a
+/// run up on its own first would round differently from adding its rows one at a time into what the
+/// group already holds.
+///
+/// A flat column is read where it lies. A dictionary, which is the form every stored decimal of
+/// TPC-H arrives in, is read into a run of `i64` first by [`coded_runs`] and then folded exactly as a
+/// flat column is. A count needs no values at all, so it covers every form there is.
 ///
 /// A mean that has already gone inexact takes its run a row at a time for the same reason. An
 /// exact total is the same answer in any order, and the only thing adding a run as one number can
@@ -1390,18 +1394,25 @@ pub fn update_runs(
         return Ok(true);
     }
     let Some(input) = input else { return Ok(false) };
-    if input.form() != Form::Flat
-        || input.len() < rows
-        || !matches!(nulls_of(input), Validity::AllValid)
-    {
+    if input.len() < rows || !all_valid(input) {
         return Ok(false);
     }
     let Some(feed) = feed_of(first, input.logical_type()) else {
         return Ok(false);
     };
-    // A count of a column with no nulls in it is the length of each run whatever the column holds.
+    // A count of a column with no nulls in it is the length of each run whatever the column holds,
+    // and in whatever form it holds it, since not one value is read to answer it.
     if matches!(feed, Feed::Counted) {
         count_runs(states, runs, group);
+        return Ok(true);
+    }
+    match feed {
+        Feed::Total | Feed::Whole { .. } => {}
+        Feed::Counted | Feed::Real { .. } | Feed::Extreme(_) => return Ok(false),
+    }
+    if input.form() != Form::Flat {
+        let Some(values) = coded_runs(input, rows) else { return Ok(false) };
+        one_runs(states, runs, stride, offset, &values, feed)?;
         return Ok(true);
     }
     let Some(data) = input.data().filter(|data| data.len() >= rows) else {
@@ -1411,62 +1422,152 @@ pub fn update_runs(
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
                 $(Data::$variant(values) => {
-                    let values = &values.as_slice()[..rows];
-                    if few_runs(states, runs, stride, offset, values, feed)? {
-                        return Ok(true);
-                    }
-                    let mut start = 0;
-                    for &(slot, end) in runs {
-                        let run = &values[start..end];
-                        let length = end - start;
-                        start = end;
-                        let Some(index) = group(slot) else { continue };
-                        match (&mut states[index].state, feed) {
-                            (
-                                State::Whole { total, seen, .. }
-                                | State::Scaled { total, seen, .. },
-                                Feed::Total,
-                            ) => {
-                                let sum = run_total(run).ok_or_else(overflowed)?;
-                                *total = total.checked_add(sum).ok_or_else(overflowed)?;
-                                *seen = true;
-                            }
-                            (
-                                State::Mean { total, seen, exact, scale: held, .. },
-                                Feed::Whole { scale },
-                            ) => {
-                                *held = scale;
-                                *seen += length as i64;
-                                let sum = run_total(run).filter(|_| *exact);
-                                match sum.and_then(|sum| total.checked_add(sum)) {
-                                    Some(sum) => *total = sum,
-                                    None => {
-                                        for &value in run {
-                                            let number = i128::from(value);
-                                            match total.checked_add(number).filter(|_| *exact) {
-                                                Some(sum) => *total = sum,
-                                                None => widened(total, exact, number),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => return Err(Error::internal(
-                                "a run into a state its feed does not fit".to_string(),
-                            )),
-                        }
-                    }
+                    one_runs(states, runs, stride, offset, &values.as_slice()[..rows], feed)?;
                 })+
                 _ => return Ok(false),
             }
         };
     }
-    match feed {
-        Feed::Total | Feed::Whole { .. } => {}
-        Feed::Counted | Feed::Real { .. } | Feed::Extreme(_) => return Ok(false),
-    }
     rudb_vector::for_each_layout!(exact, each);
     Ok(true)
+}
+
+/// Folds one call over a run of values, by [`few_runs`] where that fits and a run at a time where it
+/// does not.
+///
+/// This is [`update_runs`]'s body with the values already in hand, so that a flat column and a
+/// dictionary read into a run of `i64` reach the same loop rather than two copies of it.
+///
+/// # Errors
+///
+/// The overflow an exact total raises, and an internal error for a run folded into a state whose feed
+/// does not fit, which is a bug in the caller.
+fn one_runs<T: Copy + TryInto<i64> + Into<i128>>(
+    states: &mut [Accumulator],
+    runs: &[(usize, usize)],
+    stride: usize,
+    offset: usize,
+    values: &[T],
+    feed: Feed,
+) -> Result<()> {
+    if few_runs(states, runs, stride, offset, values, feed)? {
+        return Ok(());
+    }
+    let mut start = 0;
+    for &(slot, end) in runs {
+        let run = &values[start..end];
+        let length = end - start;
+        start = end;
+        let Some(index) = (slot != NOWHERE).then(|| slot * stride + offset) else { continue };
+        match (&mut states[index].state, feed) {
+            (State::Whole { total, seen, .. } | State::Scaled { total, seen, .. }, Feed::Total) => {
+                let sum = run_total(run).ok_or_else(overflowed)?;
+                *total = total.checked_add(sum).ok_or_else(overflowed)?;
+                *seen = true;
+            }
+            (State::Mean { total, seen, exact, scale: held, .. }, Feed::Whole { scale }) => {
+                *held = scale;
+                *seen += length as i64;
+                let sum = run_total(run).filter(|_| *exact);
+                match sum.and_then(|sum| total.checked_add(sum)) {
+                    Some(sum) => *total = sum,
+                    None => {
+                        for &value in run {
+                            let number = value.into();
+                            match total.checked_add(number).filter(|_| *exact) {
+                                Some(sum) => *total = sum,
+                                None => widened(total, exact, number),
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::internal(
+                    "a run into a state its feed does not fit".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether every row of a vector is valid, asked without building the mask [`nulls_of`] would build.
+///
+/// A column that points somewhere else keeps its nulls inside the values it points at, and reading
+/// those through the codes is a gather and an allocation. Both run paths only want to know whether
+/// there are any at all, and a column with none says so from the validities alone. One with any goes
+/// the row at a time way regardless, and that way asks its own question.
+///
+/// The arms are [`nulls_of`]'s arms, so that a form this says nothing about is a form that keeps its
+/// nulls where the vector's own validity is. A column of empty codes over all invalid values is the
+/// one case this is stricter about than [`nulls_of`], and being stricter only sends a chunk of no rows
+/// down a slower path.
+fn all_valid(input: &Vector) -> bool {
+    matches!(input.validity(), Validity::AllValid)
+        && match input.dictionary_parts().or_else(|| input.run_parts()) {
+            Some((_, values)) => all_valid(values),
+            None => true,
+        }
+}
+
+/// The numbers of a chunk of a column that is not laid out flat, laid out flat for the run loops.
+///
+/// A stored decimal column of a TPC-H table arrives packed, or as a dictionary over a packed run,
+/// which is what a column of few distinct values is written as, and the run loops ask for a flat
+/// column. So q01's `l_quantity`, `l_extendedprice` and `l_discount` were folded a row at a time
+/// through [`spread`] while the two decimals its own arithmetic computed, which are flat because
+/// nothing stored them, went down the run path beside them.
+///
+/// Reading the chunk out first costs a pass and an allocation and buys the run loops back, which on
+/// a mean run of 2.81 rows is three calls off the row at a time path and onto one walk they share.
+/// The codes are read a block at a time, by [`rudb_vector::Packed::unpack`] where the rows are the
+/// packed run in order and by [`rudb_vector::Packed::values_at`] where a dictionary points into it.
+///
+/// `None` for anything the run loops could not have taken anyway: a form that is neither packed nor
+/// pointing at something, a payload that is neither a packed run nor a run of exact numbers, and any
+/// value that does not fit an `i64`, which is where the locals of both fold loops keep their totals.
+/// What zero means in a packed run, as an `i64`, or `None` if the run reaches past one.
+///
+/// Asked of the two ends of the packed range rather than of each value, since a code is at most the
+/// ceiling and at least the base, so a run whose ends both fit has no value in it that does not.
+fn packed_base(packed: &rudb_vector::Packed<'_>) -> Option<i64> {
+    let base = i64::try_from(packed.base()).ok()?;
+    i64::try_from(packed.ceiling()).ok().map(|_| base)
+}
+
+fn coded_runs(input: &Vector, rows: usize) -> Option<Vec<i64>> {
+    if let Some(packed) = input.packed_parts() {
+        let base = packed_base(&packed)?;
+        let mut codes = vec![0_u64; rows];
+        packed.unpack(0, &mut codes);
+        let mut out = Vec::with_capacity(rows);
+        out.extend(codes.iter().map(|&code| base.wrapping_add(code as i64)));
+        return Some(out);
+    }
+    let (codes, values) = input.positions()?;
+    let codes = codes.get(..rows)?;
+    if let Some(packed) = values.packed_parts() {
+        let base = packed_base(&packed)?;
+        return Some(packed.values_at(codes, |code| base.wrapping_add(code as i64)));
+    }
+    let data = values.data()?;
+    macro_rules! read {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    let values = values.as_slice();
+                    let mut out = Vec::with_capacity(codes.len());
+                    for &code in codes {
+                        out.push((*values.get(code as usize)?).try_into().ok()?);
+                    }
+                    Some(out)
+                })+
+                _ => None,
+            }
+        };
+    }
+    rudb_vector::for_each_layout!(exact, read)
 }
 
 /// Folds several calls of one chunk in one pass over its runs, rather than one pass each.
@@ -1498,6 +1599,13 @@ pub fn update_runs(
 /// two `DECIMAL(15, 2)` columns, which are held in an `i64`, and two computed decimals wide enough to
 /// be held in an `i128`.
 ///
+/// A column that points somewhere else is read out into a run of `i64` by [`coded_runs`] first, and
+/// those calls share a pass of their own, since what they hold once they are read is one layout whatever
+/// they were held in. The reading costs a pass and an allocation, so it happens only for the calls whose
+/// pass is the one being taken, and a chunk whose flat calls outnumber them pays nothing for it. q01 is
+/// three calls over stored decimals, which arrive as dictionaries over packed runs, and two over
+/// decimals its own arithmetic computed, which are flat because nothing stored them.
+///
 /// A count reads no value, so it goes on whichever pass is first and asks nothing of the layout. What a
 /// count wants out of a run is its length, and the walk is adding those up per group regardless, so a
 /// count costs the pass one add per group at the end and nothing at all per run. `count_runs` is what
@@ -1527,6 +1635,7 @@ pub fn update_shared_runs(
     }
     let mut ready = Vec::new();
     let mut counting = Vec::new();
+    let mut coded = Vec::new();
     for (offset, input) in inputs.iter().enumerate().take(u64::BITS as usize) {
         if wanted >> offset & 1 == 0 {
             continue;
@@ -1534,6 +1643,7 @@ pub fn update_shared_runs(
         match shareable(states, stride, offset, *input, rows, groups) {
             Some(Share::Counted) => counting.push(offset),
             Some(Share::Folded(call)) => ready.push(call),
+            Some(Share::Coded(offset, feed, input)) => coded.push((offset, feed, input)),
             None => {}
         }
     }
@@ -1551,10 +1661,33 @@ pub fn update_shared_runs(
     }
     // One call is not sharing anything. Two are, whichever two they are, because what the second one
     // saves is a walk of the runs and the counts among them save a walk for an add.
-    if most + counting.len() < 2 {
+    if most.max(coded.len()) + counting.len() < 2 {
         return Ok(0);
     }
     let took = counting.iter().fold(0_u64, |took, &offset| took | 1 << offset);
+    // The columns that point somewhere else are read out into runs of `i64` and share a pass of their
+    // own, since what they hold once they are read is one layout whatever they were held in. Read only
+    // when there are more of them than of the widest flat layout, so that a chunk whose flat calls are
+    // the pass this time pays nothing for the reading, and the caller asks again for what is left.
+    let mut read = Vec::with_capacity(coded.len());
+    if coded.len() > most {
+        for &(offset, feed, input) in &coded {
+            if let Some(values) = coded_runs(input, rows) {
+                read.push((offset, feed, values));
+            }
+        }
+    }
+    if read.len() > most && read.len() + counting.len() >= 2 {
+        let group: Vec<(usize, Feed, &[i64])> =
+            read.iter().map(|(offset, feed, values)| (*offset, *feed, values.as_slice())).collect();
+        if !many_runs(states, runs, stride, &group, &counting, groups)? {
+            return Ok(0);
+        }
+        return Ok(group.iter().fold(took, |took, &(offset, _, _)| took | 1 << offset));
+    }
+    if most + counting.len() < 2 {
+        return Ok(0);
+    }
     let Some(picked) = picked else {
         // Nothing but counts, so the pass is the walk and the lengths and there is no value loop to
         // pick a layout for. The width the locals are asked for is zero, so which one this is has no
@@ -1590,6 +1723,9 @@ enum Share<'r> {
     Counted,
     /// A total of the values of a column, which is a loop inside each run.
     Folded(Ready<'r>),
+    /// A total of the values of a column that points somewhere else, so the chunk of it the runs cover
+    /// is read out flat before any of them is walked.
+    Coded(usize, Feed, &'r Vector),
 }
 
 /// One value reading call the shared pass has resolved down to what its run walk needs from it.
@@ -1630,10 +1766,7 @@ fn shareable<'r>(
         return Some(Share::Counted);
     }
     let input = input?;
-    if input.form() != Form::Flat
-        || input.len() < rows
-        || !matches!(nulls_of(input), Validity::AllValid)
-    {
+    if input.len() < rows || !all_valid(input) {
         return None;
     }
     let feed = feed_of(first, input.logical_type())?;
@@ -1653,6 +1786,11 @@ fn shareable<'r>(
             }
         }
         Feed::Real { .. } | Feed::Extreme(_) => return None,
+    }
+    // Said here rather than read here, because reading a chunk out costs a pass and the caller only
+    // spends that on the calls whose pass it picks.
+    if input.form() != Form::Flat {
+        return Some(Share::Coded(offset, feed, input));
     }
     let data = input.data().filter(|data| data.len() >= rows)?;
     Some(Share::Folded(Ready { offset, feed, data }))
@@ -4284,6 +4422,119 @@ mod tests {
                     alone[index].finish().expect("finishes"),
                     "{name} at {at} of group {group}"
                 );
+            }
+        }
+    }
+
+    /// A chunk shaped like q01's really is: calls over stored decimals, which arrive as a packed run or
+    /// as a dictionary over one, and calls over decimals the query's own arithmetic computed, which are
+    /// flat because nothing stored them.
+    ///
+    /// Every answer here is checked against the scatter rather than against the other run path, since
+    /// the point is that a column pointing somewhere else now reaches a run path at all. It asserts the
+    /// mask too: the coded calls outnumber the flat ones, so they are the first pass and the counts ride
+    /// with them, and the flat pair is the second.
+    #[test]
+    fn a_dictionary_over_a_packed_run_folds_over_the_runs_as_a_flat_column_does() {
+        let mut rng = Rng(0x5eed_c0de_dbca_0052);
+        let rows = 97;
+        let groups = 4;
+        let money = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let wide = LogicalType::decimal(30, 4).expect("a legal decimal");
+        // A count of a column is here as well as a `COUNT(*)`, because a count over a column with no
+        // nulls in it is the length of each run whatever form it is held in, and that was refused
+        // along with the totals. A packed run is here beside the dictionaries over one, since a stored
+        // column arrives as either.
+        let calls = [
+            ("sum", &money, "coded"),
+            ("avg", &money, "coded"),
+            ("sum", &money, "packed"),
+            ("count", &money, "packed"),
+            ("sum", &wide, "flat"),
+            ("avg", &wide, "flat"),
+            ("count_star", &LogicalType::BigInt, "none"),
+        ];
+        let stride = calls.len();
+        let slots: Vec<usize> =
+            (0..rows).map(|row| if row % 23 == 7 { NOWHERE } else { row / 5 % groups }).collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            match runs.last_mut() {
+                Some((held, end)) if *held == slot => *end = row + 1,
+                _ => runs.push((slot, row + 1)),
+            }
+        }
+        // Thirteen distinct values with the codes walking over them, which is what a stored column of
+        // few distinct values is written as and is not the order the rows are in.
+        let distinct = 13;
+        let packed = |ty: &LogicalType, held: usize, rng: &mut Rng| {
+            let values = flat(ty, held, 0, rng).bit_packed().expect("packs or hands it back");
+            assert_eq!(values.form(), Form::BitPacked, "the values of {ty} did not pack");
+            values
+        };
+        let coded = |ty: &LogicalType, rng: &mut Rng| {
+            let codes: Vec<u32> = (0..rows).map(|row| (row * 7 % distinct) as u32).collect();
+            let over =
+                Vector::dictionary(codes, packed(ty, distinct, rng)).expect("codes are in range");
+            assert_eq!(over.form(), Form::Dictionary);
+            over
+        };
+        let columns: Vec<Option<Vector>> = calls
+            .iter()
+            .map(|&(_, ty, held)| match held {
+                "coded" => Some(coded(ty, &mut rng)),
+                "packed" => Some(packed(ty, rows, &mut rng)),
+                "flat" => Some(flat(ty, rows, 0, &mut rng)),
+                _ => None,
+            })
+            .collect();
+        let inputs: Vec<Option<&Vector>> = columns.iter().map(Option::as_ref).collect();
+        let fresh = || {
+            let mut states = Vec::new();
+            for _ in 0..groups {
+                for &(name, ty, _) in &calls {
+                    states.push(Accumulator::new(name, &returns_of(name, ty)).expect("known"));
+                }
+            }
+            states
+        };
+        let mut alone = fresh();
+        for (at, &input) in inputs.iter().enumerate() {
+            update_scattered(&mut alone, &slots, stride, at, input, rows).expect("folds them in");
+        }
+        // One call at a time down the run path, which for the three dictionaries is the read and the
+        // fold that used to be refused.
+        let mut apiece = fresh();
+        for (at, &input) in inputs.iter().enumerate() {
+            assert!(
+                update_runs(&mut apiece, &runs, stride, at, input, rows).expect("folds them in"),
+                "the call at {at} was refused by the run path"
+            );
+        }
+        let mut together = fresh();
+        let offered = (1_u64 << stride) - 1;
+        let mut shared = 0;
+        let mut passes = 0;
+        loop {
+            let took =
+                update_shared_runs(&mut together, &runs, stride, &inputs, offered & !shared, rows)
+                    .expect("folds them in");
+            if took == 0 {
+                break;
+            }
+            assert_eq!(took & shared, 0, "a pass took a call another pass had already taken");
+            shared |= took;
+            passes += 1;
+        }
+        assert_eq!(shared, 0b111_1111, "the wrong calls shared a walk");
+        assert_eq!(passes, 2, "the coded calls and the flat ones did not take a pass each");
+        for group in 0..groups {
+            for (at, &(name, _, _)) in calls.iter().enumerate() {
+                let index = group * stride + at;
+                let note = format!("{name} at {at} of group {group}");
+                let answer = alone[index].finish().expect("finishes");
+                assert_eq!(apiece[index].finish().expect("finishes"), answer, "{note}, apiece");
+                assert_eq!(together[index].finish().expect("finishes"), answer, "{note}, together");
             }
         }
     }

@@ -1,0 +1,17 @@
+# Runs over a packed column
+
+A grouped aggregate whose chunk comes in runs of one group folds its calls in one walk of those runs, and the walk read a flat column only. A stored column of numbers is not flat. TPC-H's decimals are written packed, a base and a width with the codes laid end to end, and a column of few distinct values is written as a dictionary over a packed run of the values it holds. So q01's `l_quantity`, `l_extendedprice` and `l_discount` reached no run path at all. Their sums, their means and their counts each went a row at a time through the scatter, five of q01's eight calls, and the two decimals its own arithmetic computed were the only ones the shared walk had to share.
+
+So the walk reads them now. A chunk of a column that points somewhere else is read out into a run of `i64` first and then folded exactly as a flat column is, the packed run unpacked a block at a time and the dictionary gathered through its codes. That is a pass over the chunk which the fold did not pay before, so the calls over such columns share a pass of their own and it is read once for all of them, and the pass is only taken when there are more of those calls than of the widest flat layout, so a chunk whose flat calls are the better pass pays nothing for the reading.
+
+A base and a ceiling that both fit an `i64` mean no code between them does not, so the fit is asked once of the two ends of the packed range rather than of each value.
+
+A count is better than that again. A count over a column with no nulls in it is the length of each run whatever form the column holds, since not one value is read to answer it, so it rides the walk for nothing and no longer needs the column read out at all. q01 has two of those once its means are split into a total and a count.
+
+Whether a column has any nulls is now asked of the validities alone rather than by building the mask the scatter would build, because a column that points somewhere else keeps its nulls inside the values it points at and reading those through the codes is a gather and an allocation. A column with no nulls says so from the validities, and a column with any goes the row at a time way regardless, where that question is asked again.
+
+On server2 at SF1, one thread, three rounds, median, with the `SELECT 1` baseline subtracted, q01 went from 1940.2 M instructions to 1797.9 M and the suite from 17.03 G to 16.89 G. All 22 answers are unchanged.
+
+q09 moved 1.004x the other way and held there over five rounds. Its aggregate has one call, so it never reaches the shared pass, and a profile of both binaries puts the whole of its `Aggregate::fold` at 0.9 percent of the query and slightly lower after the change. What is higher after it is the kernel's page cache and cgroup accounting, `mem_cgroup_commit_charge` and `get_mem_cgroup_from_mm` and `blk_cgroup_congested`, on the query that reads six tables and the most bytes of any of them. The reading is that the seven million instructions are the box and not the fold.
+
+The dictionary was the form to look for first and it was the wrong one. Traced on an in memory replica of q01 every call shared the walk, and measured on the real SF1 file nothing moved at all, because the stored columns arrive packed and the accessor the read went through covers a dictionary and a run and not a packed column. The lesson is that a form found by building a chunk in memory is not the form the same column has when it is read back off a file.
