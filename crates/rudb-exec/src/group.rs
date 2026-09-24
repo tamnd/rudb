@@ -2242,19 +2242,50 @@ impl<'a> Aggregate<'a> {
             }
         }
         // The slots so far are one per kept row, and the arguments of a marked chunk are every row,
-        // so each slot moves to the row it was kept from and a dropped row lands in no group. Any
-        // runs found above were runs of kept rows, so they are found again over the moved slots.
+        // so each slot moves to the row it was kept from and a dropped row lands in no group. Runs
+        // found above were runs of kept rows, and they move the same way, a run at a time. The
+        // slots then move only if something below reads them a row at a time.
+        let users = if self.count_only {
+            1
+        } else if self.compact_numeric {
+            0
+        } else {
+            self.calls
+                .iter()
+                .enumerate()
+                .filter(|&(at, call)| {
+                    !self.by_vector[at]
+                        && call.affine.is_none()
+                        && !call.distinct
+                        && filters[at].is_none()
+                })
+                .count()
+        };
         let whole;
+        let mut unspread = None;
         let length = match marked {
             Some((picks, all)) => {
-                spread_slots(slots, picks.indices(), *all);
-                runs_found = false;
+                let mut spread = Vec::with_capacity(slot_runs.len() + 8);
+                let most = all.saturating_mul(users) / RUN_ROWS;
+                if runs_found && spread_runs(slot_runs, picks.indices(), *all, most, &mut spread) {
+                    *slot_runs = spread;
+                    unspread = Some((picks.indices(), *all));
+                } else {
+                    spread_slots(slots, picks.indices(), *all);
+                    runs_found = false;
+                }
                 whole = *all;
                 &whole
             }
             None => length,
         };
+        let mut spread_now = |slots: &mut Vec<usize>| {
+            if let Some((kept, all)) = unspread.take() {
+                spread_slots(slots, kept, all);
+            }
+        };
         if self.compact_numeric {
+            spread_now(slots);
             let sum = arguments[1].first().expect("SUM has one argument");
             let mean = arguments[2].first().expect("AVG has one argument");
             let sum_flat = flat_smallint(sum);
@@ -2294,25 +2325,9 @@ impl<'a> Aggregate<'a> {
         // slots can come in runs at all, which is a key whose rows are grouped together.
         //
         // How many of this chunk's calls would read the runs decides whether finding them pays, so
-        // it is counted here and handed to `slot_runs_of` as its budget. The count loop below reads
-        // them once, and a call that goes by vector, that is affine, that is `DISTINCT` or that
-        // carries a `FILTER` never reaches the run path at all.
-        let users = if self.count_only {
-            1
-        } else if self.compact_numeric {
-            0
-        } else {
-            self.calls
-                .iter()
-                .enumerate()
-                .filter(|&(at, call)| {
-                    !self.by_vector[at]
-                        && call.affine.is_none()
-                        && !call.distinct
-                        && filters[at].is_none()
-                })
-                .count()
-        };
+        // it was counted above and is handed to `slot_runs_of` as its budget. The count loop below
+        // reads them once, and a call that goes by vector, that is affine, that is `DISTINCT` or
+        // that carries a `FILTER` never reaches the run path at all.
         let by_runs = runs_found || slot_runs_of(slots, slot_runs, users);
         if self.count_only {
             if by_runs {
@@ -2324,6 +2339,7 @@ impl<'a> Aggregate<'a> {
                     start = end;
                 }
             } else {
+                spread_now(slots);
                 for &slot in slots.iter() {
                     if slot != NOWHERE {
                         counts[slot] += 1;
@@ -2345,6 +2361,7 @@ impl<'a> Aggregate<'a> {
                 continue;
             }
             if call.distinct {
+                spread_now(slots);
                 aside += self.distinct(states, seen, seen_rows, slots, at, given)?;
                 continue;
             }
@@ -2354,6 +2371,7 @@ impl<'a> Aggregate<'a> {
             {
                 continue;
             }
+            spread_now(slots);
             let (picked, tallied) = match &filters[at] {
                 None => {
                     let rows = slots.len().min(*length);
@@ -3706,10 +3724,6 @@ fn nowhere(slots: &mut Vec<usize>, rows: usize) -> &mut [usize] {
     slots
 }
 
-/// One chunk of rows, in the vectors the row loop reads them out of.
-///
-/// The same shape whether the rows came from the operator below or from a spill file, which is what
-/// lets one loop serve both.
 /// Moves the slot of each kept row to the row it was kept from, `all` rows long, and puts every
 /// row the filter dropped in no group.
 ///
@@ -3723,6 +3737,62 @@ fn spread_slots(slots: &mut Vec<usize>, kept: &[u32], all: usize) {
     }
 }
 
+/// The runs of a marked chunk's kept rows as runs of all `all` of its rows, with every row the
+/// filter dropped in a run of `NOWHERE`, or `false` with `into` empty once that takes more than
+/// `most` runs.
+///
+/// A run of kept rows with no dropped row inside it is one run of rows, which the first and last
+/// kept row say without looking at the ones between. That is nearly every run of a filter that
+/// drops few rows. Spreading the slots and cutting them into runs again took two passes over every
+/// row for the same answer, a third of the fold of ClickBench 28.
+fn spread_runs(
+    runs: &[(usize, usize)],
+    kept: &[u32],
+    all: usize,
+    most: usize,
+    into: &mut Vec<(usize, usize)>,
+) -> bool {
+    into.clear();
+    let mut push = |slot: usize, end: usize| {
+        match into.last_mut() {
+            Some(last) if last.0 == slot => last.1 = end,
+            _ => into.push((slot, end)),
+        }
+        into.len() <= most
+    };
+    let mut from = 0;
+    let mut row = 0;
+    for &(slot, end) in runs {
+        let Some(within) = kept.get(from..end) else { return false };
+        let mut rest = within;
+        while let (Some(&first), Some(&last)) = (rest.first(), rest.last()) {
+            let (first, last) = (first as usize, last as usize);
+            let length = if last - first == rest.len() - 1 {
+                rest.len()
+            } else {
+                1 + rest.windows(2).take_while(|pair| pair[1] == pair[0] + 1).count()
+            };
+            let upto = first + length;
+            if (first > row && !push(NOWHERE, first)) || !push(slot, upto) {
+                into.clear();
+                return false;
+            }
+            row = upto;
+            rest = &rest[length..];
+        }
+        from = end;
+    }
+    if from != kept.len() || row > all || (row < all && !push(NOWHERE, all)) {
+        into.clear();
+        return false;
+    }
+    true
+}
+
+/// One chunk of rows, in the vectors the row loop reads them out of.
+///
+/// The same shape whether the rows came from the operator below or from a spill file, which is what
+/// lets one loop serve both.
 #[derive(Clone)]
 struct Rows {
     keys: Vec<Vector>,
@@ -6560,6 +6630,30 @@ mod tests {
     fn column(out: &Buffered) -> Vec<Value> {
         let chunk = out.at(0).expect("readable").expect("one chunk");
         (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect()
+    }
+
+    /// Runs of kept rows moved onto all the rows come out as the runs that spreading the slots and
+    /// cutting them again finds, with dropped rows before, inside, between and after the runs.
+    #[test]
+    fn runs_of_kept_rows_spread_like_their_slots() {
+        let all = 200;
+        let kept: Vec<u32> =
+            (0..all as u32).filter(|row| !matches!(row % 37, 0 | 5 | 6) && *row < 190).collect();
+        let slots: Vec<usize> = (0..kept.len()).map(|at| [3, 3, 9, 1][at / 30 % 4]).collect();
+        let mut runs = Vec::new();
+        assert!(slot_runs_of(&slots, &mut runs, 1));
+        let mut spread = Vec::new();
+        assert!(spread_runs(&runs, &kept, all, usize::MAX, &mut spread));
+        let mut moved = slots.clone();
+        spread_slots(&mut moved, &kept, all);
+        let mut expected = Vec::new();
+        assert!(slot_runs_of(&moved, &mut expected, usize::MAX));
+        assert_eq!(spread, expected);
+        assert!(!spread_runs(&runs, &kept, all, 3, &mut spread));
+        assert!(spread.is_empty());
+        let whole: Vec<u32> = (0..all as u32).collect();
+        assert!(spread_runs(&[(5, 150), (2, 200)], &whole, all, 2, &mut spread));
+        assert_eq!(spread, [(5, 150), (2, 200)]);
     }
 
     /// Slots cut into runs come back as the runs they are, across the blocks the cut reads them in,
