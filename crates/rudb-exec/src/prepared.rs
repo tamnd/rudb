@@ -534,6 +534,60 @@ impl Prepared {
         Ok(())
     }
 
+    /// [`evaluate`](Self::evaluate) for a caller that is done with `chunk`, which a projection is.
+    ///
+    /// Every step has run before a root is handed over, so nothing reads the chunk after that and a
+    /// root that is a bare column can take the column rather than copy it. A column named by more
+    /// than one root is copied for all but the last of them. `SELECT *` into a table is all bare
+    /// columns, and copying them was most of what its projection did.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`evaluate`](Self::evaluate) reports.
+    pub fn evaluate_taking(
+        &self,
+        chunk: Chunk,
+        scratch: &mut Scratch,
+        out: &mut Vec<Vector>,
+    ) -> Result<()> {
+        self.run(&chunk, scratch)?;
+        let width = chunk.width();
+        let mut columns: Vec<Option<Vector>> = chunk.into_columns().into_iter().map(Some).collect();
+        let mut uses = vec![0usize; width];
+        let mut remaining: HashMap<usize, usize> = HashMap::new();
+        for &root in &self.roots {
+            match self.steps[root] {
+                Step::Column(position) if position < width => uses[position] += 1,
+                _ => *remaining.entry(root).or_default() += 1,
+            }
+        }
+        for &root in &self.roots {
+            if let Step::Column(position) = self.steps[root] {
+                let missing = || {
+                    Error::internal(format!(
+                        "column {position} of a chunk that has {width} columns"
+                    ))
+                };
+                let slot = columns.get_mut(position).ok_or_else(missing)?;
+                let left = &mut uses[position];
+                *left -= 1;
+                let column = if *left == 0 { slot.take() } else { slot.clone() };
+                out.push(column.ok_or_else(missing)?);
+                continue;
+            }
+            let Some(left) = remaining.get_mut(&root) else {
+                return Err(Error::internal("a prepared root was not counted"));
+            };
+            *left -= 1;
+            if *left == 0 {
+                out.push(scratch.slots[root].take().ok_or_else(|| missing(root))?);
+            } else {
+                out.push(scratch.slots[root].as_ref().ok_or_else(|| missing(root))?.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Evaluates a single expression over `chunk`, handing back a reference to the answer.
     ///
     /// A reference rather than a vector, because the caller of this is a filter, which reads the
@@ -2235,6 +2289,21 @@ mod tests {
         let mut twice = Vec::new();
         prepared.evaluate(&chunk, &mut scratch, &mut twice).expect("the second chunk runs");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn taking_the_chunk_answers_what_borrowing_it_does() {
+        let (schema, chunk) = input();
+        let (plan, list) = projection(
+            "#0.0::INTEGER AS a, \"+\"(#0.0::INTEGER, 1::INTEGER)::INTEGER AS b, #0.0::INTEGER AS c",
+        );
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the expressions resolve");
+        let mut scratch = prepared.scratch();
+        let mut borrowed = Vec::new();
+        prepared.evaluate(&chunk, &mut scratch, &mut borrowed).expect("the borrowed chunk runs");
+        let mut taken = Vec::new();
+        prepared.evaluate_taking(chunk, &mut scratch, &mut taken).expect("the taken chunk runs");
+        assert_eq!(borrowed, taken);
     }
 
     #[test]
