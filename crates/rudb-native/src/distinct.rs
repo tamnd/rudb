@@ -51,7 +51,8 @@ const FIRST_SLOTS: usize = 1 << 4;
 /// spreads consecutive integers, which are the common case, evenly, and seven eighths keeps the
 /// largest table's worth of keys inside `MAX_SLOTS` rather than needing twice the memory.
 fn full(len: usize, slots: usize) -> bool {
-    len * 8 >= slots * 7
+    let (num, den) = match std::env::var("DBG_LOAD").ok().as_deref() { Some("50") => (1, 2), Some("75") => (3, 4), _ => (7, 8) };
+    len * den >= slots * num
 }
 
 /// Fibonacci hashing, the value times the golden ratio in sixty four bits.
@@ -109,8 +110,9 @@ pub(crate) struct ExactDistinct {
 
 impl ExactDistinct {
     pub(crate) fn new() -> Self {
+        let first = std::env::var("DBG_PRESIZE").ok().and_then(|v| v.parse::<usize>().ok()).map_or(FIRST_SLOTS, |values| { let share = values / SETS * 9 / 8 + 1; let mut slots = FIRST_SLOTS; while full(share, slots) { slots *= 2; } slots });
         Self {
-            sets: vec![vec![0; FIRST_SLOTS]; SETS],
+            sets: vec![vec![0; first]; SETS],
             held: vec![0; SETS],
             buffered: vec![0; SETS * BUFFERED],
             waiting: vec![0; SETS],

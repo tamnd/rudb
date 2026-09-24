@@ -17335,3 +17335,34 @@ mod tests {
         assert_eq!(dictionary.values(), 50_000, "the values coded before stay");
     }
 }
+
+#[cfg(test)]
+mod dbg_bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn dbg_bench_frequency_structures() {
+        for (name, values) in [
+            ("unique", (0..1_000_000_u64).map(|v| v.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0x1234).collect::<Vec<_>>()),
+            ("300k", (0..1_000_000_u64).map(|v| (v.wrapping_mul(0x2545_F491_4F6C_DD1D) % 300_000).wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect::<Vec<_>>()),
+            ("86k", (0..1_000_000_u64).map(|v| (v.wrapping_mul(0x2545_F491_4F6C_DD1D) % 86_000) + 1_372_000_000).collect::<Vec<_>>()),
+        ] {
+            let t = std::time::Instant::now();
+            let mut first = Candidates::default();
+            for &v in &values { first.add(Some(v), 1); }
+            let mg = t.elapsed();
+            let t = std::time::Instant::now();
+            let mut set = distinct::ExactDistinct::new();
+            for &v in &values { set.insert(v); }
+            let n = set.count();
+            let ds = t.elapsed();
+            let t = std::time::Instant::now();
+            let mut sorted = values.clone();
+            sorted.sort_unstable();
+            let mut runs = 0_u64; let mut prev = None;
+            for &v in &sorted { if prev != Some(v) { runs += 1; prev = Some(v); } }
+            let so = t.elapsed();
+            eprintln!("{name}: mg {:?} (dec {}) distinct {:?} ({n:?}) sort {:?} ({runs})", mg, first.decrements, ds, so);
+        }
+    }
+}
