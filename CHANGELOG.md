@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.27
+
+A patch release of fourteen commits, almost all of them on TPC-H under G10. The native directory format number stays at 29 and the storage format version at 9.
+
+#1760 reads every other column only at the rows a join keeps, once the join's bitmap or filter has been measured keeping fewer than one row in 16, and integer pages now unpack single rows where their form allows it. On one thread q17 went from 0.789 G to 0.582 G instructions against DuckDB's 0.733 G, q20 from 0.727 G to 0.606 G, and q09 from 1.807 G to 1.750 G. #1753 answers a `LIKE '%a%b%'` that is the only reader of a compressed text column on the FSST codes, which took q13 from 1.605 G to 1.248 G. #1756 cuts a forward `substring` on bytes and compares a short text `IN` list by bytes, which took q22 from 0.416 G to 0.338 G. #1752 skips the lineitem and orders parts that hold none of a small join's keys, which took q18 from 1.477 G to 1.068 G. #1748 counts a grouped key with a known range in arrays, which took q13 from 1.849 G to 1.597 G before #1753.
+
+#1759 picks the rows of a short `IN` list inside the threaded filter, #1757 groups FSST's long symbols by their first three bytes and inlines the match, #1755 keeps the codes and the span a packed filter reads through, #1754 keeps encoded count runs as folded groups and pending records in blocks, #1751 checks gathered rows against the length with an or, #1750 counts a long string's bytes in a hash join's build side, #1749 finds a CSV block's quotes, delimiters and line endings with SSE2 movemask, and #1747 counts a short range integer column in a flat array at close.
+
+#1758 adds ALTER TABLE and ALTER VIEW.
+
 ## 0.4.26
 
 A patch release of eighteen commits, almost all of them on TPC-H under G10. The native directory format number stays at 29 and the storage format version at 9.
