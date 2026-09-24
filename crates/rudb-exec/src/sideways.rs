@@ -89,9 +89,9 @@ use crate::table::{Across, hash};
 /// still handed over and the filter is not, which is the same answer for fewer bytes.
 const BUDGET: usize = 32 << 20;
 
-/// The bits of a bitmap small enough to take whatever it costs a key, which is thirty two
-/// kilobytes, the first level data cache of the smallest core this is built for. See [`dense`].
-const SMALL: u64 = 32 << 13;
+/// The bits of a bitmap small enough to take whatever it costs a key, which is one megabyte, inside
+/// the second level cache of any core this is built for. See [`dense`].
+const SMALL: u64 = 1 << 23;
 
 /// The edge one join's runtime filter crosses, shared between the join, its build side's sink and
 /// one scan.
@@ -568,11 +568,14 @@ pub(crate) fn found_for(
 /// Sixty four bits a key is the most this takes, and never more than the filter's own budget, past
 /// which the filter is the smaller of the two and a bit test that misses the cache is no cheaper
 /// than a filter lookup that does too. A bitmap of [`SMALL`] bits or fewer is taken however few keys
-/// it holds, because it sits in the first level cache of any core this runs on, and there a bit
-/// test is cheaper than the hash the filter has to take first. TPC-H q17 is the case: two hundred
-/// and four parts over two hundred thousand keys is a thousand bits a key and 25 KB, and the
-/// filter it made instead cost a hash for each of six million rows and let through twelve times
-/// the rows that matched. Only the four signed integer types of sixty four bits or
+/// it holds, because it sits in the second level cache of any core this runs on, and there a bit
+/// test is far cheaper than the hash and the four lane probe the filter takes, which counted out
+/// at about sixty instructions a row. TPC-H q17 is the first case: two hundred and four parts over
+/// two hundred thousand keys is a thousand bits a key and 25 KB, and the filter it made instead
+/// cost a hash for each of six million rows and let through twelve times the rows that matched.
+/// q4 is the second: the orders of one quarter are fifty seven thousand keys over six million
+/// values, a hundred bits a key and 750 KB, and the bitmap took q4 from 0.756 G to 0.474 G
+/// instructions on one thread. Only the four signed integer types of sixty four bits or
 /// fewer, because the scan reads the driving column through the same widening and the join has
 /// already made the two sides one type. `None` for anything else, and the filter is built instead.
 fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
@@ -870,12 +873,12 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
-        let found = found(&keyed, None, &[chunk(&[Some(5), Some(900_000)]), chunk(&[Some(2)])])
+        let found = found(&keyed, None, &[chunk(&[Some(5), Some(90_000_000)]), chunk(&[Some(2)])])
             .expect("a column of integers");
 
-        assert_eq!(found.range, Some((Bound::Int(2), Bound::Int(900_000))));
+        assert_eq!(found.range, Some((Bound::Int(2), Bound::Int(90_000_000))));
         let filter = found.filter.expect("a filter over three keys");
-        assert_eq!(through(&filter, &[Some(5), Some(900_000), Some(2)]), [true, true, true]);
+        assert_eq!(through(&filter, &[Some(5), Some(90_000_000), Some(2)]), [true, true, true]);
     }
 
     /// The property the whole thing rests on: a filter says no about a key that is in it never, at
@@ -886,7 +889,7 @@ mod tests {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
-        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 1_000 + 11)).collect();
+        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 10_000 + 11)).collect();
 
         let found = found(&keyed, None, &chunks(&keys)).expect("a column of integers");
 
@@ -902,9 +905,9 @@ mod tests {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
-        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 1_000 + 11)).collect();
+        let keys: Vec<Option<i32>> = (0..4_000).map(|value| Some(value * 10_000 + 11)).collect();
         let absent: Vec<Option<i32>> =
-            (0..4_000).map(|value| Some(value * 7 + 10_000_000)).collect();
+            (0..4_000).map(|value| Some(value * 7 + 100_000_000)).collect();
 
         let found = found(&keyed, None, &chunks(&keys)).expect("a column of integers");
 
@@ -922,9 +925,9 @@ mod tests {
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
 
         let found =
-            found(&keyed, None, &[chunk(&[Some(3), None, Some(400_000)])]).expect("integers");
+            found(&keyed, None, &[chunk(&[Some(3), None, Some(40_000_000)])]).expect("integers");
 
-        assert_eq!(found.range, Some((Bound::Int(3), Bound::Int(400_000))));
+        assert_eq!(found.range, Some((Bound::Int(3), Bound::Int(40_000_000))));
         assert_eq!(through(&found.filter.expect("a filter"), &[None]), [false]);
     }
 
@@ -951,7 +954,7 @@ mod tests {
     }
 
     /// Past sixty four bits a key the bitmap is bigger than the filter it would replace, once it is
-    /// too big to sit in the first level cache.
+    /// too big to sit in the second level cache.
     #[test]
     fn keys_spread_wide_still_get_a_filter() {
         let mut plan = Plan::new();
@@ -964,8 +967,9 @@ mod tests {
         assert!(found.domain.is_none() && found.filter.is_some());
     }
 
-    /// A few keys over a range that fits the first level cache are a bitmap however far apart they
-    /// are, which is TPC-H q17's two hundred and four parts over two hundred thousand keys.
+    /// A few keys over a range that fits the second level cache are a bitmap however far apart they
+    /// are, which is TPC-H q17's two hundred and four parts over two hundred thousand keys and q4's
+    /// orders of one quarter over six million.
     #[test]
     fn a_few_keys_over_a_small_range_are_a_bitmap_however_far_apart() {
         let mut plan = Plan::new();
