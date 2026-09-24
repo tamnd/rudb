@@ -64,7 +64,7 @@ pub mod stats;
 mod zones;
 
 pub use prepare::{DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepared, Preparer};
-pub use projection::build_sorted_projection;
+pub use projection::{build_clustered_projection, build_sorted_projection};
 pub use section::Section;
 pub use zones::{Common, Stripes, ascending, distincts};
 
@@ -3794,11 +3794,12 @@ fn write_section(
     }
     let mut extents = Vec::new();
     let mut first = 0_u64;
-    let extent_size = if one.kind == *section::SORTED_PROJECTION {
-        1 << 19
-    } else {
-        section::MAX_EXTENT as usize
-    };
+    let extent_size =
+        if one.kind == *section::SORTED_PROJECTION || one.kind == *section::CLUSTERED_PROJECTION {
+            1 << 19
+        } else {
+            section::MAX_EXTENT as usize
+        };
     for chunk in one.bytes.chunks(extent_size) {
         let offset = append(file, at, chunk)?;
         extents.push(section::Extent {

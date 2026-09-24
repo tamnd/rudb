@@ -12,6 +12,7 @@ use rudb_common::{LogicalType, Result, Value};
 use crate::{Catalog, Reader, attach, invalid, section};
 
 const MAGIC: &[u8; 8] = b"RUDBSP1\0";
+const CLUSTER_MAGIC: &[u8; 8] = b"RUDBCP1\0";
 const FIXED_HEADER: usize = 8 + 2 + 2 + 8 + 2;
 const ROW_BYTES: usize = 10;
 
@@ -60,7 +61,33 @@ pub fn build_sorted_projection(
     order_column: &str,
     covered_column: &str,
 ) -> Result<()> {
-    let path = path.as_ref();
+    build_projection(path.as_ref(), table, order_column, covered_column, false)
+}
+
+/// Build a row-valued projection ordered by covered value, then order value.
+///
+/// This stores every source row, including duplicate pairs. No group count or distinct count is
+/// written. The explicit build time, memory, and file growth belong to the indexed workload.
+///
+/// # Errors
+///
+/// If the table or columns are missing, nullable, unsupported, or the file cannot be updated.
+pub fn build_clustered_projection(
+    path: impl AsRef<Path>,
+    table: &str,
+    order_column: &str,
+    covered_column: &str,
+) -> Result<()> {
+    build_projection(path.as_ref(), table, order_column, covered_column, true)
+}
+
+fn build_projection(
+    path: &Path,
+    table: &str,
+    order_column: &str,
+    covered_column: &str,
+    clustered: bool,
+) -> Result<()> {
     let catalog = Catalog::open(path)?;
     let reader = catalog.table(table)?;
     let fields = reader.table().fields();
@@ -102,14 +129,18 @@ pub fn build_sorted_projection(
         .enumerate()
         .map(|(at, &value)| (value, at as u16))
         .collect::<HashMap<_, _>>();
-    rows.sort_unstable_by_key(|&(user, _)| user);
+    if clustered {
+        rows.sort_unstable_by_key(|&(user, group)| (group, user));
+    } else {
+        rows.sort_unstable_by_key(|&(user, _)| user);
+    }
     let order_index =
         u16::try_from(order).map_err(|_| invalid("projection column index overflow"))?;
     let covered_index =
         u16::try_from(covered).map_err(|_| invalid("projection column index overflow"))?;
     let header = FIXED_HEADER + dictionary.len() * 4;
     let mut bytes = Vec::with_capacity(header + rows.len() * ROW_BYTES);
-    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(if clustered { CLUSTER_MAGIC } else { MAGIC });
     bytes.extend_from_slice(&order_index.to_le_bytes());
     bytes.extend_from_slice(&covered_index.to_le_bytes());
     bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
@@ -127,7 +158,11 @@ pub fn build_sorted_projection(
         path,
         table,
         &[section::Attachment {
-            kind: *section::SORTED_PROJECTION,
+            kind: if clustered {
+                *section::CLUSTERED_PROJECTION
+            } else {
+                *section::SORTED_PROJECTION
+            },
             id: id(order, covered)?,
             flags: 0,
             header_bytes: header as u32,
@@ -157,17 +192,30 @@ impl Reader {
         limit: usize,
     ) -> Result<Option<Vec<(i32, u64)>>> {
         let wanted = id(order, covered)?;
-        let Some(section) = self.table().sections().iter().find(|section| {
-            section.kind == *section::SORTED_PROJECTION
-                && section.id == wanted
-                && section.usable(self.table().generation())
-        }) else {
+        let current = |section: &&section::Section| {
+            section.id == wanted && section.usable(self.table().generation())
+        };
+        let sections = self.table().sections();
+        let Some(section) = sections
+            .iter()
+            .filter(current)
+            .find(|section| section.kind == *section::CLUSTERED_PROJECTION)
+            .or_else(|| {
+                sections
+                    .iter()
+                    .filter(current)
+                    .find(|section| section.kind == *section::SORTED_PROJECTION)
+            })
+        else {
             return Ok(None);
         };
+        let clustered = section.kind == *section::CLUSTERED_PROJECTION;
         let extents = self.extents(section)?;
         let first = extents.first().ok_or_else(|| invalid("projection has no extent"))?;
         let bytes = self.extent(first)?;
-        if bytes.len() < FIXED_HEADER || &bytes[..8] != MAGIC {
+        if bytes.len() < FIXED_HEADER
+            || &bytes[..8] != if clustered { CLUSTER_MAGIC } else { MAGIC }
+        {
             return Err(invalid("projection header differs"));
         }
         let stored_order = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
@@ -219,9 +267,23 @@ impl Reader {
         for worker in 1..workers {
             let mut at = rows * worker / workers;
             if at > 0 && at < rows {
-                let previous = projected_user(self, base, header, at - 1)?;
-                while at < rows && projected_user(self, base, header, at)? == previous {
-                    at += 1;
+                if clustered {
+                    let previous = projected_pair(self, base, header, at - 1)?;
+                    while at < rows {
+                        let next = projected_pair(self, base, header, at)?;
+                        if next < previous {
+                            return Err(invalid("clustered projection is not sorted"));
+                        }
+                        if next != previous {
+                            break;
+                        }
+                        at += 1;
+                    }
+                } else {
+                    let previous = projected_user(self, base, header, at - 1)?;
+                    while at < rows && projected_user(self, base, header, at)? == previous {
+                        at += 1;
+                    }
                 }
             }
             boundaries.push(at);
@@ -232,8 +294,13 @@ impl Reader {
             for pair in boundaries.windows(2) {
                 let (start, end) = (pair[0], pair[1]);
                 let extents = &extents;
-                handles
-                    .push(scope.spawn(move || scan_range(self, extents, header, size, start, end)));
+                handles.push(scope.spawn(move || {
+                    if clustered {
+                        scan_clustered_range(self, extents, header, size, start, end)
+                    } else {
+                        scan_range(self, extents, header, size, start, end)
+                    }
+                }));
             }
             handles
                 .into_iter()
@@ -260,6 +327,15 @@ fn projected_user(reader: &Reader, base: u64, header: usize, row: usize) -> Resu
     let offset = base + header as u64 + row as u64 * ROW_BYTES as u64;
     crate::read_at(&reader.file, offset, &mut bytes)?;
     Ok(i64::from_le_bytes(bytes))
+}
+
+fn projected_pair(reader: &Reader, base: u64, header: usize, row: usize) -> Result<(u16, i64)> {
+    let mut bytes = [0_u8; ROW_BYTES];
+    let offset = base + header as u64 + row as u64 * ROW_BYTES as u64;
+    crate::read_at(&reader.file, offset, &mut bytes)?;
+    let user = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let code = u16::from_le_bytes(bytes[8..].try_into().unwrap());
+    Ok((code, user))
 }
 
 fn scan_range(
@@ -329,6 +405,80 @@ fn scan_range(
     Ok(counts)
 }
 
+fn scan_clustered_range(
+    reader: &Reader,
+    extents: &[section::Extent],
+    header: usize,
+    dictionary: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u64>> {
+    let low = header as u64 + start as u64 * ROW_BYTES as u64;
+    let high = header as u64 + end as u64 * ROW_BYTES as u64;
+    let mut counts = vec![0_u64; dictionary];
+    let mut current_pair = None;
+    let mut seen = 0_usize;
+    let mut carry = [0_u8; ROW_BYTES];
+    let mut carry_len = 0_usize;
+    for extent in extents {
+        let extent_end = extent.first + u64::from(extent.length);
+        if extent_end <= low || extent.first >= high {
+            continue;
+        }
+        let bytes = reader.extent(extent)?;
+        let begin = low.saturating_sub(extent.first) as usize;
+        let finish = (high.min(extent_end) - extent.first) as usize;
+        let mut block = &bytes[begin..finish];
+        if carry_len != 0 {
+            let needed = ROW_BYTES - carry_len;
+            let taken = needed.min(block.len());
+            carry[carry_len..carry_len + taken].copy_from_slice(&block[..taken]);
+            carry_len += taken;
+            block = &block[taken..];
+            if carry_len < ROW_BYTES {
+                continue;
+            }
+            process_clustered_block(&carry, dictionary, &mut current_pair, &mut counts)?;
+            seen += 1;
+        }
+        let chunks = block.chunks_exact(ROW_BYTES);
+        let remainder = chunks.remainder();
+        for chunk in chunks {
+            process_clustered_block(chunk, dictionary, &mut current_pair, &mut counts)?;
+            seen += 1;
+        }
+        carry[..remainder.len()].copy_from_slice(remainder);
+        carry_len = remainder.len();
+    }
+    if carry_len != 0 || seen != end - start {
+        return Err(invalid("clustered projection scan did not cover its range"));
+    }
+    Ok(counts)
+}
+
+#[inline(always)]
+fn process_clustered_block(
+    bytes: &[u8],
+    dictionary: usize,
+    current_pair: &mut Option<(u16, i64)>,
+    counts: &mut [u64],
+) -> Result<()> {
+    let user = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let code = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+    if usize::from(code) >= dictionary {
+        return Err(invalid("clustered projection code is outside its dictionary"));
+    }
+    let pair = (code, user);
+    if current_pair.is_some_and(|previous| pair < previous) {
+        return Err(invalid("clustered projection is not sorted"));
+    }
+    if *current_pair != Some(pair) {
+        counts[usize::from(code)] += 1;
+        *current_pair = Some(pair);
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn process_block(
     bytes: &[u8],
@@ -367,7 +517,7 @@ mod tests {
 
     use crate::{Catalog, Writer};
 
-    use super::build_sorted_projection;
+    use super::{build_clustered_projection, build_sorted_projection};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -404,6 +554,40 @@ mod tests {
             Some(vec![(1, 2), (2, 1), (7, 1)]),
         );
         assert_eq!(reader.grouped_distinct_projection(1, 0, 10).expect("different order"), None);
+        std::fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn clustered_projection_counts_adjacent_pairs_without_saving_counts() {
+        let at = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("rudb-clustered-projection-{}-{at}.rdb", std::process::id()));
+        let fields = vec![
+            Field::required("user", LogicalType::BigInt),
+            Field::required("region", LogicalType::Integer),
+        ];
+        let mut writer = Writer::create(&path, "events", fields).expect("create native file");
+        for (users, regions) in [
+            (vec![9_i64, 2, 9, 1], vec![7_i32, 1, 7, 2]),
+            (vec![2_i64, 2, 5, 9], vec![2_i32, 2, 1, 1]),
+        ] {
+            let users = users.into_iter().map(Value::BigInt).collect::<Vec<_>>();
+            let regions = regions.into_iter().map(Value::Integer).collect::<Vec<_>>();
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &users).expect("users"),
+                Vector::from_values(LogicalType::Integer, &regions).expect("regions"),
+            ])
+            .expect("matching columns");
+            writer.append(&chunk).expect("append rows");
+        }
+        writer.finish().expect("commit native file");
+        build_clustered_projection(&path, "events", "user", "region")
+            .expect("build clustered projection");
+        let reader = Catalog::open(&path).expect("catalog").table("events").expect("table");
+        assert_eq!(
+            reader.grouped_distinct_projection(0, 1, 10).expect("valid projection"),
+            Some(vec![(1, 3), (2, 2), (7, 1)]),
+        );
         std::fs::remove_file(path).expect("remove scratch file");
     }
 

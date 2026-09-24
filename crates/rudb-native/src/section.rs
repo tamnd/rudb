@@ -76,6 +76,10 @@ pub const DEGREES: &[u8; 8] = b"RUDBGD1\0";
 /// not grouped counts. A changed table generation makes the section stale.
 pub const SORTED_PROJECTION: &[u8; 8] = b"RUDBSP1\0";
 
+/// Every source row ordered by the covered value and then by the order value. No grouped
+/// count or distinct pair is stored; a query discovers adjacent pairs while scanning rows.
+pub const CLUSTERED_PROJECTION: &[u8; 8] = b"RUDBCP1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
@@ -207,7 +211,14 @@ impl Section {
     pub fn known(&self) -> bool {
         matches!(
             &self.kind,
-            KEY_MAP | FORWARD_LINK | ADJACENCY | SUMMARY | SKETCHES | DEGREES | SORTED_PROJECTION
+            KEY_MAP
+                | FORWARD_LINK
+                | ADJACENCY
+                | SUMMARY
+                | SKETCHES
+                | DEGREES
+                | SORTED_PROJECTION
+                | CLUSTERED_PROJECTION
         )
     }
 
