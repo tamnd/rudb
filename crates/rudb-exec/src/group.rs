@@ -32,7 +32,7 @@ use rudb_common::{
 };
 use rudb_kernels::{
     Accumulator, NOWHERE, finish_run, group_tally, is_true, settle_extremes, update_general,
-    update_runs, update_tallied,
+    update_runs, update_tallied, whole_answers,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -1121,6 +1121,33 @@ impl<'a> Aggregate<'a> {
             && !self.grouped_distinct_top_count()
             && !self.mixed_top_count()
             && !self.counted_top_count()
+    }
+
+    /// Whether the groups a sorted chunk closes can be answered straight from their runs, with no
+    /// table and no accumulators. See [`Aggregate::close_runs`].
+    ///
+    /// Every call has to be a count or a total whose answer is the sum of the raw integers, which is
+    /// a total over an integer column or over a decimal at the scale the total is declared at. A
+    /// `FILTER` clause, a call finished from another call's state and the selections made from the
+    /// counts afterwards all live in the accumulators, so any of them leaves the chunk to the table.
+    fn closes_by_run(&self) -> bool {
+        self.closes()
+            && !self.compact_numeric
+            && self.having_count.is_none()
+            && self.top_counts.is_none()
+            && self.calls.iter().enumerate().all(|(at, call)| {
+                !call.distinct
+                    && call.filter.is_none()
+                    && call.affine.is_none()
+                    && !self.by_vector[at]
+                    && match (call.name.as_str(), call.args.as_slice()) {
+                        ("count_star", []) | ("count", [_]) => true,
+                        ("sum", [argument]) => {
+                            whole_total(self.plan.expr_type(*argument), &call.returns)
+                        }
+                        _ => false,
+                    }
+            })
     }
 
     /// Rows into this instance's own table or the partitions, which is every row that is not in a
@@ -3670,6 +3697,90 @@ impl<'a> Aggregate<'a> {
         }
     }
 
+    /// The groups between `from` and `to` of a sorted chunk, answered as a chunk of their own.
+    ///
+    /// Each run of the key in there is a whole group, for the reason [`interior`] gives, so its
+    /// answer is known as soon as the run ends. Going through the table cost a copy of the key a row
+    /// at a time and a fresh accumulator per call for every group, and then a probe of the slots to
+    /// fold each row into them, and on `GROUP BY l_orderkey` over lineitem, which is four rows a
+    /// group, that was most of the instructions of the grouping. Here the key is gathered once at
+    /// the first row of every run, and each call is one pass that adds a run up where it lies.
+    ///
+    /// `None` when an argument is in a layout this does not read, before anything is built, so the
+    /// caller can hand the chunk to the table instead.
+    fn close_runs(&self, rows: &Rows, from: usize, to: usize) -> Result<Option<Chunk>> {
+        let mut same = Vec::new();
+        crate::table::repeats(&rows.keys, rows.rows, 0, &mut same);
+        let mut starts: Vec<u32> = Vec::new();
+        for (row, &repeat) in same.iter().enumerate().take(to).skip(from) {
+            if row == from || !repeat {
+                starts.push(u32::try_from(row).map_err(|_| Error::internal("a chunk too long"))?);
+            }
+        }
+        let groups = starts.len();
+        let end = |group: usize| starts.get(group + 1).map_or(to, |&start| start as usize);
+        let types = self.schema.types();
+        let width = self.groups.len();
+        let mut columns = Vec::with_capacity(types.len());
+        let mut key = 0;
+        for (at, ty) in types.iter().take(width).enumerate() {
+            if let Some(value) = &self.constants[at] {
+                columns.push(Vector::constant(ty.clone(), value.clone(), groups));
+            } else {
+                columns.push(rows.keys[key].gather(&starts)?);
+                key += 1;
+            }
+        }
+        let mut answers = vec![0_i128; groups];
+        let mut valid = vec![true; groups];
+        for (at, ty) in types.iter().skip(width).enumerate() {
+            valid.fill(true);
+            if self.calls[at].name == "count_star" {
+                for (group, &start) in starts.iter().enumerate() {
+                    answers[group] = (end(group) - start as usize) as i128;
+                }
+            } else {
+                let argument = rows.arguments[at][0].clone().into_flat()?;
+                let nulls = argument.validity().has_nulls(rows.rows).then(|| argument.validity());
+                let counting = self.calls[at].name == "count";
+                let values = match counting {
+                    true => None,
+                    false => match integers(&argument, rows.rows) {
+                        Some(values) => Some(values),
+                        None => return Ok(None),
+                    },
+                };
+                for (group, &start) in starts.iter().enumerate() {
+                    let run = start as usize..end(group);
+                    let (total, seen) = match (&values, nulls) {
+                        (None, None) => (run.len() as i128, true),
+                        (None, Some(nulls)) => {
+                            (run.filter(|&row| nulls.is_valid(row)).count() as i128, true)
+                        }
+                        (Some(values), None) => {
+                            (values[run].iter().map(|&v| i128::from(v)).sum(), true)
+                        }
+                        (Some(values), Some(nulls)) => {
+                            let mut total = 0_i128;
+                            let mut seen = false;
+                            for row in run {
+                                if nulls.is_valid(row) {
+                                    total += i128::from(values[row]);
+                                    seen = true;
+                                }
+                            }
+                            (total, seen)
+                        }
+                    };
+                    answers[group] = total;
+                    valid[group] = seen;
+                }
+            }
+            columns.push(whole_answers(&answers, &valid, ty)?);
+        }
+        Chunk::with_rows(columns, groups).map(Some)
+    }
+
     /// The columns a spilled row is made of, in the order [`put_away`] writes them.
     ///
     /// The group key, then every argument of every call, then one column per call that has a
@@ -3854,6 +3965,10 @@ pub(crate) struct Partitioned {
     /// The groups this instance closed, which skip `single` and the partitions and are finished into
     /// chunks when the instance combines. `None` until the first chunk that closes one.
     closed: Option<Building>,
+    /// The groups this instance closed straight from their runs, already answered, and the room
+    /// they take. See [`Aggregate::close_runs`].
+    ran: Vec<Chunk>,
+    ran_memory: Reservation,
     /// Whether the agreed keys of a pushed down limit are already in this instance's table.
     ///
     /// They go in once and they never come out, so after that the table holds as many groups as the
@@ -3967,6 +4082,62 @@ impl Spreading {
             runs: 0,
         }
     }
+}
+
+/// Whether a total of `argument` declared as `returns` is the sum of the raw integers the argument
+/// holds and nothing else, which is what [`Aggregate::close_runs`] adds up.
+///
+/// A decimal counts only at the scale the total is declared at, since any other needs a rescale per
+/// row, and only up to eighteen digits, which is what fits in the `i64` it is read as.
+fn whole_total(argument: &LogicalType, returns: &LogicalType) -> bool {
+    use LogicalType as T;
+    match (argument, returns) {
+        (T::Decimal { width, scale }, T::Decimal { scale: declared, .. }) => {
+            *width <= 18 && scale == declared
+        }
+        (
+            T::TinyInt
+            | T::SmallInt
+            | T::Integer
+            | T::BigInt
+            | T::UTinyInt
+            | T::USmallInt
+            | T::UInteger,
+            T::TinyInt
+            | T::SmallInt
+            | T::Integer
+            | T::BigInt
+            | T::HugeInt
+            | T::UTinyInt
+            | T::USmallInt
+            | T::UInteger
+            | T::UBigInt
+            | T::UHugeInt,
+        ) => true,
+        _ => false,
+    }
+}
+
+/// A flat column of whole numbers read as `i64`, the raw integers of a decimal included.
+///
+/// `None` for any other layout, which leaves the chunk to the table.
+fn integers(flat: &Vector, rows: usize) -> Option<Vec<i64>> {
+    macro_rules! widened {
+        ($values:expr) => {{
+            let values = $values.as_slice();
+            values.get(..rows)?.iter().map(|&value| i64::from(value)).collect()
+        }};
+    }
+    Some(match flat.data() {
+        Some(Data::Int8(values)) => widened!(values),
+        Some(Data::Int16(values)) => widened!(values),
+        Some(Data::Int32(values)) => widened!(values),
+        Some(Data::Int64(values)) => widened!(values),
+        Some(Data::UInt8(values)) => widened!(values),
+        Some(Data::UInt16(values)) => widened!(values),
+        Some(Data::UInt32(values)) => widened!(values),
+        _ => return None,
+    })
 }
 
 /// Where the closed groups of a chunk start and end, as the first row after the first run of the
@@ -4573,6 +4744,8 @@ impl Sink for Aggregate<'_> {
             dense_memory: self.memory.reservation(),
             single: Some(self.start()),
             closed: None,
+            ran: Vec::new(),
+            ran_memory: self.memory.reservation(),
             installed: false,
             expressions: self.inputs.scratch(),
             spreading: Spreading::new(),
@@ -4643,6 +4816,8 @@ impl Sink for Aggregate<'_> {
             dense_memory,
             single,
             closed,
+            ran,
+            ran_memory,
             installed,
             expressions,
             spreading,
@@ -4822,6 +4997,18 @@ impl Sink for Aggregate<'_> {
             if let Some((from, to)) = interior(&rows.keys[0], rows.rows) {
                 if let (Ok(head), Ok(tail)) = (rows.slice(0, from), rows.slice(to, rows.rows - to))
                 {
+                    if self.closes_by_run() {
+                        let timing = stage::Timing::start(Stage::Fold);
+                        let answered = self.close_runs(&rows, from, to);
+                        timing.stop(0);
+                        if let Some(answered) = answered? {
+                            ran_memory.grow(width_of(answered.footprint()))?;
+                            ran.push(answered);
+                            self.open(&head, single, installed, spreading, own, folded)?;
+                            self.open(&tail, single, installed, spreading, own, folded)?;
+                            return Ok(Progress::More);
+                        }
+                    }
                     let building = closed.get_or_insert_with(|| self.shut());
                     let timing = stage::Timing::start(Stage::Fold);
                     let done = self.fold(&rows, building, None, Some((from, to)));
@@ -4892,10 +5079,17 @@ impl Sink for Aggregate<'_> {
             dense_memory,
             single,
             closed,
+            mut ran,
+            ran_memory,
             mut spreading,
             mut own,
             ..
         } = local;
+        if !ran.is_empty() {
+            let mut built = self.built.lock().map_err(poisoned)?;
+            built.chunks.append(&mut ran);
+            built.held.push(ran_memory);
+        }
         // Closed groups are finished groups, so they become chunks here on this instance's thread
         // and wait beside the answer for the partitions to finish.
         if let Some(closed) = closed {

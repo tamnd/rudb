@@ -127,3 +127,21 @@ fn an_unsorted_key_is_left_alone() {
     assert!(!pair.explain(query).contains(CLOSED), "the pass fired on an unsorted key");
     pair.the_same_either_way(query);
 }
+
+/// Counts and totals over nulls and decimals, which a closed group answers from its run without
+/// an accumulator. Every fifth key has no value at all in `m`, so its total is null and its count
+/// is zero, and `n` is null on a third of the rows, which cuts through runs.
+#[test]
+fn totals_answered_from_their_runs_keep_their_nulls_and_scale() {
+    let pair = Pair::new(
+        "runs",
+        "SELECT i // 4 AS k, ((i % 1000) / 7)::DECIMAL(15, 2) AS d, \
+         CASE WHEN i % 3 = 0 THEN NULL ELSE i END AS n, \
+         CASE WHEN (i // 4) % 5 = 0 THEN NULL ELSE (i % 9)::TINYINT END AS m \
+         FROM range(0, 300000) AS r(i)",
+    );
+    let query = "SELECT k, COUNT(*), COUNT(n), SUM(n), SUM(d), SUM(m), COUNT(m) FROM t \
+                 GROUP BY k ORDER BY k";
+    assert!(pair.explain(query).contains(CLOSED), "the pass did not fire on a sorted key");
+    pair.the_same_either_way(query);
+}
