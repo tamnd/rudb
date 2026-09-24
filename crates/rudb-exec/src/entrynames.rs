@@ -42,7 +42,7 @@
 use rudb_catalog::{Catalog, Database, Schema, TEMP_CATALOG, Table};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
-    DUCKDB, canonical, column_fields, database_fields, numeric_facts, schema_fields,
+    DUCKDB, canonical, column_fields, database_fields, index_fields, numeric_facts, schema_fields,
     sequence_fields, show_database_fields, show_expanded_fields, show_table_fields, table_fields,
     type_oid, view_fields,
 };
@@ -140,14 +140,16 @@ pub(crate) fn tablenames(
             empty(),
             Value::Boolean(entry_internal(database)),
             Value::Boolean(table.name().temporary()),
-            // A primary key is not a constraint rudb stores, so this one is still a constant rather
-            // than a fact read off the entry, and it stops being one the day the DDL grows the
-            // clause.
-            Value::Boolean(false),
+            Value::Boolean(table.keys().iter().any(|key| key.primary)),
             Value::BigInt(i64::try_from(table.rows().len()).unwrap_or(i64::MAX)),
             Value::BigInt(count),
-            Value::BigInt(0),
-            Value::BigInt(0),
+            // The pin backs every key and every foreign key with an index of its own, and counts
+            // those along with the ones `CREATE INDEX` made.
+            Value::BigInt(
+                i64::try_from(table.keys().len() + table.foreign().len() + table.indexes().len())
+                    .unwrap_or(i64::MAX),
+            ),
+            Value::BigInt(i64::try_from(table.checks().len()).unwrap_or(i64::MAX)),
             text(&create_table(table)),
         ]);
     }
@@ -208,6 +210,44 @@ pub(crate) fn viewnames(
         }
     }
     Metadata::new("duckdb_views", &view_fields(), &rows, plan, index, columns)
+}
+
+/// Every index `CREATE INDEX` made, in the columns the plan asked for.
+///
+/// The indexes behind keys are not here, which is the pin's rule too: `is_primary` is false on
+/// every row there is.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn indexnames(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut rows = Vec::new();
+    for (database, schema, table) in entries(catalog) {
+        for held in table.indexes() {
+            rows.push(vec![
+                text(database.name()),
+                Value::BigInt(database.oid()),
+                text(schema.name()),
+                Value::BigInt(schema.oid()),
+                text(&held.name),
+                Value::BigInt(held.oid),
+                text(&table.name().table),
+                Value::BigInt(table.oid()),
+                Value::Null,
+                empty(),
+                Value::Boolean(held.unique),
+                Value::Boolean(false),
+                text(&held.expressions),
+                text(&held.sql),
+            ]);
+        }
+    }
+    Metadata::new("duckdb_indexes", &index_fields(), &rows, plan, index, columns)
 }
 
 /// Every sequence in the catalog, in the columns the plan asked for.

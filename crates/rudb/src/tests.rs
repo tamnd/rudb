@@ -2314,7 +2314,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(14)]]
+        vec![vec![Value::BigInt(15)]]
     );
 }
 
@@ -9990,4 +9990,75 @@ fn a_float_cast_to_a_whole_number_rounds_half_to_even_and_a_decimal_does_not() {
             Value::Integer(2)
         ]]
     );
+}
+
+#[test]
+fn create_index_keeps_the_index_and_refuses_what_the_pin_refuses() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INT, b INT, l INT[])",
+        "INSERT INTO t VALUES (1, 1, NULL), (2, 1, NULL)",
+    ]);
+    let values = |sql: &str| -> Vec<String> {
+        db.query(sql)
+            .unwrap()
+            .rows()
+            .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    db.execute("CREATE INDEX i1 ON t(t.a)").unwrap();
+    db.execute("CREATE INDEX i2 ON t USING art (a)").unwrap();
+    db.execute("CREATE INDEX i3 ON t((a+b), b DESC)").unwrap();
+    db.execute("CREATE INDEX IF NOT EXISTS i3 ON t(a)").unwrap();
+    db.execute("CREATE INDEX t ON t(b)").unwrap();
+    assert_eq!(
+        values("SELECT index_name, expressions, sql FROM duckdb_indexes() ORDER BY index_oid"),
+        [
+            "i1|[a]|CREATE INDEX i1 ON t(a);",
+            "i2|[a]|CREATE INDEX i2 ON t USING art (a);",
+            "i3|['((a + b))', b]|CREATE INDEX i3 ON t(((a + b)), b);",
+            "t|[b]|CREATE INDEX t ON t(b);",
+        ]
+    );
+    assert_eq!(values("SELECT index_count FROM duckdb_tables()"), ["4"]);
+    let refusals = [
+        ("CREATE INDEX i1 ON t(b)", "Index with name \"i1\" already exists!"),
+        ("CREATE OR REPLACE INDEX i1 ON t(b)", "Index with name \"i1\" already exists!"),
+        ("CREATE INDEX i9 ON t(zz)", "Table \"t\" does not have a column named \"zz\""),
+        ("CREATE INDEX i9 ON t(a) WHERE a > 1", "partial indexes is not supported"),
+        ("CREATE INDEX i9 ON t((SELECT 1))", "cannot use subquery in index expressions"),
+        ("CREATE INDEX i9 ON t(sum(a))", "aggregate functions are not allowed in index"),
+        ("CREATE INDEX i9 ON t(l)", "Invalid Type [INTEGER[]]: Invalid type for index key."),
+        ("CREATE INDEX i9 ON t(1)", "does not refer to any columns in the base table!"),
+        ("CREATE INDEX i9 ON t USING hash (a)", "Unknown index type: hash"),
+        ("CREATE TEMP INDEX i9 ON t(a)", "Temporary indexes are not supported"),
+        ("CREATE INDEX ON t(a)", "Please provide an index name"),
+        ("CREATE INDEX i9 ON t(a COLLATE nocase)", "Index with collation not supported yet!"),
+        ("CREATE UNIQUE INDEX u1 ON t(b)", "Data contains duplicates on indexed column(s)"),
+        ("DROP INDEX i1, i2", "Can only drop one object at a time"),
+        ("DROP INDEX nope", "Index with name nope does not exist!"),
+    ];
+    for (sql, wanted) in refusals {
+        let got = refusal(&db, sql);
+        assert!(got.contains(wanted), "{sql}: {got}");
+    }
+    db.execute("CREATE UNIQUE INDEX u1 ON t(a)").unwrap();
+    assert!(refusal(&db, "INSERT INTO t VALUES (1, 5, NULL)").contains("Duplicate key \"a: 1\""));
+    db.execute("INSERT INTO t VALUES (NULL, 5, NULL), (NULL, 6, NULL)").unwrap();
+    let alters = [
+        ("ALTER TABLE t ALTER a TYPE BIGINT", "an index depends on it!"),
+        ("ALTER TABLE t DROP COLUMN a", "an index depends on a column after it!"),
+        ("ALTER TABLE t RENAME TO t2", "there are entries that depend on it."),
+    ];
+    for (sql, wanted) in alters {
+        let got = refusal(&db, sql);
+        assert!(got.contains(wanted), "{sql}: {got}");
+    }
+    db.execute("ALTER TABLE t ALTER b SET DEFAULT 3").unwrap();
+    db.execute("DROP INDEX u1").unwrap();
+    db.execute("DROP INDEX IF EXISTS u1").unwrap();
+    db.execute("INSERT INTO t (a) VALUES (1)").unwrap();
+    db.execute("BEGIN").unwrap();
+    db.execute("CREATE INDEX r1 ON t(a)").unwrap();
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(values("SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'r1'"), ["0"]);
 }

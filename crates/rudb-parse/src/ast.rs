@@ -67,6 +67,8 @@ pub type SchemaRef = u32;
 pub type SequenceRef = u32;
 /// Index into [`Ast::alters`].
 pub type AlterRef = u32;
+/// Index into [`Ast::indexes`].
+pub type IndexRef = u32;
 /// An index into `Ast::inserts`.
 pub type InsertRef = u32;
 /// An index into `Ast::settings`.
@@ -95,6 +97,8 @@ pub enum Statement {
     Sequence(SequenceRef),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(AlterRef),
+    /// `CREATE INDEX` or `DROP INDEX`.
+    Index(IndexRef),
     /// `INSERT INTO`.
     Insert(InsertRef),
     /// `UPDATE`, held as an [`Insert`] whose columns are the ones `SET` names and whose source is
@@ -316,6 +320,27 @@ pub struct Sequence {
     /// The table or view an `ALTER SEQUENCE ... OWNED BY` names, as a run of parts, and empty for
     /// anything else. An alter is a statement that is neither a drop nor has this empty.
     pub owner: Slice,
+}
+
+/// `CREATE [UNIQUE] INDEX name ON table (elements)` or `DROP INDEX name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Index {
+    /// The index, as a run of parts. One part on a create, where the grammar allows no more.
+    pub name: Slice,
+    /// The table a create is over, as a run of parts, and empty on a drop.
+    pub table: Slice,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Whether `IF NOT EXISTS` was written on a create or `IF EXISTS` on a drop.
+    pub quiet: bool,
+    /// Whether `UNIQUE` was written.
+    pub unique: bool,
+    /// Whether `OR REPLACE` was written.
+    pub or_replace: bool,
+    /// The kind after `USING`, or `NONE` when none was written.
+    pub using: StrRef,
+    /// The elements, each a column or an expression, in the order written.
+    pub elements: Slice,
 }
 
 /// `ALTER TABLE name action` or `ALTER VIEW name RENAME TO other`.
@@ -1267,6 +1292,8 @@ pub struct Ast {
     pub sequences: Vec<Sequence>,
     /// The `ALTER TABLE` and `ALTER VIEW` arena.
     pub alters: Vec<Alter>,
+    /// The `CREATE INDEX` and `DROP INDEX` arena.
+    pub indexes: Vec<Index>,
     /// The `INSERT` arena.
     pub inserts: Vec<Insert>,
     /// The `SET` and `RESET` arena.
@@ -1411,6 +1438,12 @@ impl Ast {
     /// One `CREATE SEQUENCE` or `DROP SEQUENCE`.
     pub fn sequence(&self, index: SequenceRef) -> Sequence {
         self.sequences[index as usize]
+    }
+
+    /// The `CREATE INDEX` or `DROP INDEX` at an index.
+    #[must_use]
+    pub fn index(&self, index: IndexRef) -> Index {
+        self.indexes[index as usize]
     }
 
     /// One `ALTER TABLE` or `ALTER VIEW`.

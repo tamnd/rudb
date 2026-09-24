@@ -3051,6 +3051,7 @@ impl Shared {
                 | Bound::Schema(_)
                 | Bound::Sequence(_)
                 | Bound::Alter(_)
+                | Bound::Index(_)
                 | Bound::Insert(_)
         );
         if writes && self.open().as_ref().is_some_and(|open| open.read_only) {
@@ -3266,6 +3267,20 @@ impl Shared {
                 catalog.alter(&name, alteration, rows, self.inner.pool.threads())?;
                 Ok(QueryResult::empty())
             }
+            Bound::Index(change) => {
+                // The native file keeps no keys yet, and an index is kept the way a key is, so one
+                // in a database file lasts until it is closed.
+                match (change.table, change.index) {
+                    (Some(table), Some(index)) => {
+                        catalog.create_index(&table, index, change.quiet)?;
+                    }
+                    _ => {
+                        let parts: Vec<&str> = change.name.iter().map(String::as_str).collect();
+                        catalog.drop_index(&parts, change.quiet)?;
+                    }
+                }
+                Ok(QueryResult::empty())
+            }
             Bound::Insert(mut insert) => {
                 // The source runs to completion before anything is appended, which is not an
                 // implementation detail. `INSERT INTO t SELECT * FROM t` reads the table it writes,
@@ -3285,7 +3300,7 @@ impl Shared {
                         && insert.returning.is_none()
                         && insert.checks.is_none()
                         && catalog.table(&insert.name).is_ok_and(|table| {
-                            table.keys().is_empty() && table.foreign().is_empty()
+                            table.guards().is_empty() && table.foreign().is_empty()
                         })
                 }) {
                     let target = catalog.table(&insert.name)?;

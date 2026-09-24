@@ -68,8 +68,8 @@
 use rudb_common::{Error, Field, LogicalType, Result};
 
 use crate::entrycatalog::{
-    column_fields, database_fields, schema_fields, sequence_fields, show_database_fields,
-    show_expanded_fields, show_table_fields, table_fields, view_fields,
+    column_fields, database_fields, index_fields, schema_fields, sequence_fields,
+    show_database_fields, show_expanded_fields, show_table_fields, table_fields, view_fields,
 };
 use crate::functioncatalog::function_fields;
 use crate::settingcatalog::setting_fields;
@@ -117,6 +117,8 @@ pub enum TableFunction {
     DuckdbViews,
     /// `duckdb_sequences()`, every sequence somebody created and where each one has got to.
     DuckdbSequences,
+    /// `duckdb_indexes()`, every index somebody created with `CREATE INDEX`.
+    DuckdbIndexes,
     /// `duckdb_columns()`, every column of every one of those.
     DuckdbColumns,
     /// `duckdb_extensions()`, every extension DuckDB names and whether this engine has it.
@@ -180,6 +182,7 @@ impl TableFunction {
             Self::DuckdbTables => "duckdb_tables",
             Self::DuckdbViews => "duckdb_views",
             Self::DuckdbSequences => "duckdb_sequences",
+            Self::DuckdbIndexes => "duckdb_indexes",
             Self::DuckdbColumns => "duckdb_columns",
             Self::DuckdbExtensions => "duckdb_extensions",
             Self::DuckdbOptimizers => "duckdb_optimizers",
@@ -343,6 +346,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_sequences") {
             return Some(Self::DuckdbSequences);
+        }
+        if name.eq_ignore_ascii_case("duckdb_indexes") {
+            return Some(Self::DuckdbIndexes);
         }
         if name.eq_ignore_ascii_case("duckdb_columns") {
             return Some(Self::DuckdbColumns);
@@ -638,6 +644,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbTables
         | TableFunction::DuckdbViews
         | TableFunction::DuckdbSequences
+        | TableFunction::DuckdbIndexes
         | TableFunction::DuckdbColumns
         | TableFunction::DuckdbExtensions
         | TableFunction::DuckdbOptimizers
@@ -673,6 +680,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbTables => Some(table_fields()),
         TableFunction::DuckdbViews => Some(view_fields()),
         TableFunction::DuckdbSequences => Some(sequence_fields()),
+        TableFunction::DuckdbIndexes => Some(index_fields()),
         TableFunction::DuckdbColumns => Some(column_fields()),
         TableFunction::DuckdbExtensions => Some(extension_fields()),
         TableFunction::DuckdbOptimizers => Some(optimizer_fields()),
