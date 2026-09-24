@@ -456,6 +456,25 @@ impl Counts {
         held.tally.extremes()
     }
 
+    /// The column's [`Sketch::ceiling`], once its values have outgrown the tally and filled the
+    /// sketch. Nothing for a column still being tallied, whose sketch is built from the tally.
+    #[must_use]
+    pub fn ceiling(&self, column: usize) -> Option<u64> {
+        let held = self.columns.get(column)?;
+        if held.blind || held.tally.counting() {
+            return None;
+        }
+        held.sketch.ceiling()
+    }
+
+    /// [`Sketch::cap_at`] on the column's sketch, for counts that will only be read after they are
+    /// absorbed into counts of the same column that another part with this ceiling went into.
+    pub fn cap_at(&mut self, column: usize, ceiling: u64) {
+        if let Some(held) = self.columns.get_mut(column) {
+            held.sketch.cap_at(ceiling);
+        }
+    }
+
     /// One column's sketch, as a structure that can be written down.
     ///
     /// `None` for a blind column, which is a column whose sketch is missing rows and says nothing

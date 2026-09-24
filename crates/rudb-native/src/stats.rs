@@ -1367,6 +1367,17 @@ impl Gather {
         self.pass.open_stripe(key);
     }
 
+    /// The distinct count's [`rudb_encoding::sketch::Sketch::ceiling`] for this column so far.
+    pub(crate) fn ceiling(&self) -> Option<u64> {
+        self.counts.ceiling(0)
+    }
+
+    /// Has the distinct count keep no hash at or above `ceiling`, for a gather that will be absorbed
+    /// into the same one as the gather that reported it.
+    pub(crate) fn cap_at(&mut self, ceiling: u64) {
+        self.counts.cap_at(0, ceiling);
+    }
+
     /// Takes one part of the stripe that is open, in order.
     pub(crate) fn part(&mut self, vector: &Vector) {
         self.counts.add_column(0, vector);

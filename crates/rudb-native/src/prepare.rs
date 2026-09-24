@@ -89,13 +89,29 @@ pub(crate) struct Coding {
     /// What every dictionary held the last time it was merged into, added up.
     held: AtomicU64,
     cap: AtomicU64,
+    /// The lowest distinct count ceiling a stripe of each column has reported, `u64::MAX` until one
+    /// has.
+    ///
+    /// Every stripe prepared for a writer is merged into the writer's statistics, so a stripe's full
+    /// sketch is one of the parts of the union, and no hash above its ceiling can be in the union's
+    /// bottom k. A stripe started later drops those hashes rather than hashing them into a table
+    /// that the union would trim them from anyway. Without it, every stripe filled a sketch from
+    /// empty, and `Sketch::insert` was about 2% of a `lineitem` load's samples.
+    ceilings: Box<[AtomicU64]>,
 }
 
 impl Coding {
     pub(crate) fn new(flags: impl IntoIterator<Item = bool>) -> Self {
         let flags = flags.into_iter().map(AtomicBool::new).collect::<Box<[_]>>();
         let growth = flags.iter().map(|_| AtomicU64::new(0)).collect();
-        Self { flags, growth, held: AtomicU64::new(0), cap: AtomicU64::new(DICTIONARY_CAP_BYTES) }
+        let ceilings = flags.iter().map(|_| AtomicU64::new(u64::MAX)).collect();
+        Self {
+            flags,
+            growth,
+            held: AtomicU64::new(0),
+            cap: AtomicU64::new(DICTIONARY_CAP_BYTES),
+            ceilings,
+        }
     }
 
     /// Sets what the dictionaries may hold between them before one is demoted.
@@ -639,7 +655,11 @@ impl Preparer {
                 } else {
                     Body::Pages(ColumnStripe::default(), Settling::default())
                 };
-                let gather = stats::Gather::new(&self.types[index], 0);
+                let mut gather = stats::Gather::new(&self.types[index], 0);
+                let ceiling = self.coded.ceilings[index].load(Atomic::Relaxed);
+                if let Some(gather) = gather.as_mut().filter(|_| ceiling < u64::MAX) {
+                    gather.cap_at(ceiling);
+                }
                 Mutex::new(Growing { body, gather })
             })
             .collect();
@@ -729,7 +749,8 @@ impl Preparer {
         let (columns, gathers) = building
             .columns
             .into_iter()
-            .map(|growing| {
+            .enumerate()
+            .map(|(index, growing)| {
                 let Growing { body, gather } = growing
                     .into_inner()
                     .map_err(|_| Error::internal("a native encode worker panicked"))?;
@@ -743,6 +764,9 @@ impl Preparer {
                 // A stripe of no parts has no statistics, rather than an empty stripe of them.
                 let gather = gather.filter(|_| !empty).map(|mut gather| {
                     gather.close_stripe();
+                    if let Some(ceiling) = gather.ceiling() {
+                        self.coded.ceilings[index].fetch_min(ceiling, Atomic::Relaxed);
+                    }
                     gather
                 });
                 Ok((column, gather))
@@ -1524,6 +1548,56 @@ mod tests {
         check(&split);
         fs::remove_file(alone).expect("remove");
         fs::remove_file(split).expect("remove");
+    }
+
+    /// Stripes counted under the ceiling an earlier stripe reported come to the same distinct count
+    /// as stripes counted from nothing, whatever order they are merged in.
+    ///
+    /// The file cannot say this on its own, because a table this small may not be given the budget
+    /// for its sketches, so the writer's statistics are compared before it closes.
+    #[test]
+    fn stripes_counted_under_an_earlier_ceiling_count_what_they_would_have() {
+        let estimates = |writer: &Writer| {
+            writer
+                .gathers
+                .iter()
+                .map(|gather| gather.as_ref().and_then(stats::Gather::distinct))
+                .collect::<Vec<_>>()
+        };
+        // What one gather makes of every row, with no stripe and so no ceiling anywhere.
+        let want = fields()
+            .iter()
+            .enumerate()
+            .map(|(column, field)| {
+                let mut gather = stats::Gather::new(&field.ty, 0)?;
+                for (_, chunk) in runs().into_iter().flatten() {
+                    gather.part(chunk.column(column).expect("a column"));
+                }
+                gather.distinct()
+            })
+            .collect::<Vec<_>>();
+
+        for reversed in [false, true] {
+            let split = path("capped");
+            let mut writer = Writer::create(&split, "t", fields()).expect("a file");
+            let preparer = writer.preparer();
+            let mut prepared = runs()
+                .into_iter()
+                .map(|run| preparer.prepare(run).expect("prepared"))
+                .collect::<Vec<_>>();
+            for column in [0, 2] {
+                assert!(preparer.coded.ceilings[column].load(Atomic::Relaxed) < u64::MAX);
+            }
+            if reversed {
+                prepared.reverse();
+            }
+            for one in prepared {
+                writer.append_prepared(one).expect("a stripe");
+            }
+            assert_eq!(estimates(&writer), want, "reversed {reversed}");
+            writer.finish().expect("commit");
+            fs::remove_file(split).expect("remove");
+        }
     }
 
     /// Two stripes merged in one order and written in the other read back as the rows they held,
