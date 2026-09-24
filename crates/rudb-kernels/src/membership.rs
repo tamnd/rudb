@@ -75,9 +75,43 @@ enum Held {
     /// Every integral type and the three whole calendar ones, widened to the widest signed integer.
     /// Widening is exact for all of them, and the binder has already cast the column and the list
     /// to one type, so two entries that differ here differ in SQL too.
-    Whole(HashSet<i128>),
+    Whole(Whole),
     /// Strings, compared by bytes, which is what DuckDB's `=` on a varchar does.
     Text(HashSet<String>),
+}
+
+/// A list of whole numbers, kept as the list itself while it is short.
+///
+/// Most lists a query writes out are two or three values, like `TraficSourceID IN (-1, 6)`, and
+/// hashing a row with the standard library's keyed hash to look one of those up cost more than the
+/// rest of the filter it sat in. Comparing against every entry of a short list is a few compares a
+/// row and nothing else, so the hash set is only built past [`SHORT`] entries.
+#[derive(Debug)]
+struct Whole {
+    short: Vec<i128>,
+    set: HashSet<i128>,
+}
+
+/// The longest list compared entry by entry rather than hashed.
+const SHORT: usize = 8;
+
+impl Whole {
+    fn of(set: HashSet<i128>) -> Self {
+        if set.len() <= SHORT {
+            Self { short: set.into_iter().collect(), set: HashSet::new() }
+        } else {
+            Self { short: Vec::new(), set }
+        }
+    }
+
+    #[inline]
+    fn contains(&self, value: &i128) -> bool {
+        if self.set.is_empty() { self.short.contains(value) } else { self.set.contains(value) }
+    }
+
+    fn len(&self) -> usize {
+        self.short.len() + self.set.len()
+    }
 }
 
 impl Members {
@@ -122,7 +156,7 @@ impl Members {
                 // enough that the `OR` can have it.
                 return None;
             }
-            Held::Whole(whole)
+            Held::Whole(Whole::of(whole))
         } else {
             Held::Text(text)
         };
@@ -371,7 +405,7 @@ fn packed_look<A: Fn(usize) -> usize>(
 }
 
 /// Whether the set holds the value at `index`, for any integer narrower than the key.
-fn holds<T: Copy>(set: &HashSet<i128>, values: &[T], index: usize) -> bool
+fn holds<T: Copy>(set: &Whole, values: &[T], index: usize) -> bool
 where
     i128: From<T>,
 {
@@ -476,6 +510,18 @@ mod tests {
         assert_eq!(
             over(&numbers(), &[Value::Integer(1), Value::Integer(3)], true),
             [Value::Boolean(false), Value::Boolean(true), Value::Null, Value::Boolean(false)]
+        );
+    }
+
+    /// A list past the length compared entry by entry is hashed, and answers the same.
+    #[test]
+    fn a_long_list_answers_what_a_short_one_does() {
+        let mut long: Vec<Value> = (100..120).map(Value::Integer).collect();
+        long.push(Value::Integer(3));
+        long.push(Value::Integer(1));
+        assert_eq!(
+            over(&numbers(), &long, false),
+            [Value::Boolean(true), Value::Boolean(false), Value::Null, Value::Boolean(true)]
         );
     }
 
