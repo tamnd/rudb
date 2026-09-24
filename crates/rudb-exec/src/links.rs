@@ -230,11 +230,21 @@ fn verdict(
         if table_named(catalog, &link.parent.table).is_none() {
             return (Cardinality::Unverified.label(), Some("no table of that name"));
         }
+        // A key over two columns never has a key map stored, because the link build makes the one
+        // it needs and nothing else reads it. The link is the whole answer for one of those.
+        // Without a link there is nothing that counted the parent's keys either.
+        if link.parent.columns.len() == 2 {
+            return match held {
+                Some(_) => linked(held, measured_link),
+                None if measured_link => (
+                    Cardinality::Unverified.label(),
+                    Some("the link was measured and not kept, so link_bytes is what it would cost"),
+                ),
+                None => (Cardinality::Unverified.label(), Some("no link is stored")),
+            };
+        }
         if link.parent.columns.len() != 1 {
-            return (
-                Cardinality::Unverified.label(),
-                Some("a composite key needs a folded key map, which is not built"),
-            );
+            return (Cardinality::Unverified.label(), Some("no link is built over a key this wide"));
         }
         // A build that looked and decided against it is a fourth answer, and the note says so
         // without saying why, because the record keeps the size and not the reason. The two
@@ -256,10 +266,19 @@ fn verdict(
             Some("the parent key repeats, so this is not a many to one relationship"),
         );
     }
-    // At most one until the link is built, because exactly one is a claim about the child side and
-    // the key map only ever saw the parent's. The link is what observes the child: a link whose
-    // every child found a parent is a relationship that is total in the direction the declaration
-    // claims, and one that did not is still at most one and is why the monotone form was refused.
+    linked(held, measured_link)
+}
+
+/// What the link says, for a parent key the build found distinct.
+///
+/// At most one until the link is built, because exactly one is a claim about the child side and the
+/// key map only ever saw the parent's. The link is what observes the child: a link whose every child
+/// found a parent is a relationship that is total in the direction the declaration claims, and one
+/// that did not is still at most one and is why the monotone form was refused.
+fn linked(
+    held: Option<&rudb_graph::Link>,
+    measured_link: bool,
+) -> (&'static str, Option<&'static str>) {
     match held {
         Some(held) if held.linked() == held.children() => (Cardinality::ExactlyOne.label(), None),
         Some(_) => (
