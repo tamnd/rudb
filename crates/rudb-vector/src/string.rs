@@ -519,6 +519,48 @@ impl StringColumn {
         Ok(self.views.len() - 1)
     }
 
+    /// Records every string of a page whose strings sit end to end in the arena, and checks them
+    /// for text once rather than one at a time.
+    ///
+    /// `ends` are where each string stops, the first starting at `start`. Text cut at places that
+    /// each fall at the start of a character is text in every piece, so one pass over the whole run
+    /// and a look at the byte after each cut answers what [`Self::push_in_place`] answers per string.
+    /// On the order comments of TPC-H q13 the check per string was a twelfth of the query, most of it
+    /// the setup of a call for forty odd bytes.
+    ///
+    /// # Errors
+    ///
+    /// If an end is before the one ahead of it or past the arena, or if the bytes are not valid
+    /// UTF-8, in which case nothing has been recorded.
+    pub fn push_run_in_place(&mut self, start: usize, ends: &[usize]) -> Result<()> {
+        let last = ends.last().copied().unwrap_or(start);
+        let run = self.arena.get(start..last).ok_or_else(|| {
+            Error::internal(format!(
+                "strings from {start} to {last} are not inside a {} byte arena",
+                self.arena.len()
+            ))
+        })?;
+        let mut from = start;
+        for &end in ends {
+            if end < from {
+                return Err(Error::internal(format!("a string ends at {end} before {from}")));
+            }
+            from = end;
+        }
+        // A byte of the form 10xxxxxx continues a character, so a cut before one splits it.
+        let cut = |at: usize| run.get(at - start).is_some_and(|&byte| byte & 0xC0 == 0x80);
+        if !rudb_common::utf8::valid(run) || ends.iter().any(|&end| cut(end)) {
+            return Err(Error::internal(format!("the bytes from {start} are not valid UTF-8")));
+        }
+        self.views.reserve(ends.len());
+        let mut from = start;
+        for &end in ends {
+            self.views.push(StringView::over(&self.arena[from..end], from as u64));
+            from = end;
+        }
+        Ok(())
+    }
+
     /// The same seam for a column whose bytes were never claimed to be text.
     ///
     /// What a `BLOB` or a `BIT` page is read through. [`Self::push_in_place`] validates because the
@@ -865,6 +907,30 @@ mod tests {
         assert_eq!(column.arena(), page.as_slice());
         assert_eq!(column.heap_bytes(), page.len());
         assert_eq!(column.len(), 2);
+    }
+
+    /// A page checked for text once answers what a check per string answers: it takes the strings
+    /// of good text, and refuses bytes that are not text and a cut through the middle of a
+    /// character, which would leave both halves not text though the whole run is.
+    #[test]
+    fn a_run_of_strings_is_checked_for_text_once_and_as_strictly() {
+        let page = "ab\u{e9}t\u{e9} and a string well past the inline limit".as_bytes().to_vec();
+        let mut column = StringColumn::over(Buffer::from_vec(page.clone()));
+        column.push_run_in_place(0, &[2, 2, 7, page.len()]).expect("text");
+        assert_eq!(column.get(0), Some("ab"));
+        assert_eq!(column.get(1), Some(""));
+        assert_eq!(column.get(2), Some("\u{e9}t\u{e9}"));
+        assert_eq!(column.get(3), Some(" and a string well past the inline limit"));
+
+        let mut split = StringColumn::over(Buffer::from_vec(page.clone()));
+        assert!(split.push_run_in_place(0, &[3, page.len()]).is_err(), "a cut inside a character");
+        assert_eq!(split.len(), 0);
+        let mut bad = StringColumn::over(Buffer::from_vec(vec![b'a', 0xff, b'b']));
+        assert!(bad.push_run_in_place(0, &[1, 3]).is_err(), "bytes that are not text");
+        let mut back = StringColumn::over(Buffer::from_vec(page.clone()));
+        assert!(back.push_run_in_place(0, &[5, 4, page.len()]).is_err(), "an end before its start");
+        let mut past = StringColumn::over(Buffer::from_vec(page));
+        assert!(past.push_run_in_place(0, &[4, 400]).is_err(), "an end past the page");
     }
 
     /// Copying between two columns, which is what a gather and a slice over a string column are.

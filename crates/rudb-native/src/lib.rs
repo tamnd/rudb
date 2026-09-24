@@ -11899,24 +11899,24 @@ fn decode_at(
     };
     let (payload, ends) = string::decode_flat_at(&bytes[cur.at..], positions)?.into_parts();
     let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
-    let mut start = 0;
-    for end in ends {
-        let len = end
-            .checked_sub(start)
-            .ok_or_else(|| invalid("compressed text value ends before it starts"))?;
-        push_value(&mut values, ty, start, len)?;
-        start = end;
-    }
+    push_values(&mut values, ty, &ends)?;
     Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity))
 }
 
-/// One value of a string or blob page, found in the page's payload. A varchar is checked for text
-/// on the way in and a blob is not, since a blob never claimed to hold any.
-fn push_value(values: &mut StringColumn, ty: &LogicalType, at: usize, len: usize) -> Result<()> {
+/// The values of a string or blob page, laid end to end in the page's payload from its start, each
+/// ending where `ends` says. A varchar is checked for text on the way in, once over the whole run,
+/// and a blob or a bit string is not, since neither ever claimed to hold any.
+fn push_values(values: &mut StringColumn, ty: &LogicalType, ends: &[usize]) -> Result<()> {
     if ty == &LogicalType::Varchar {
-        values.push_in_place(at, len)?;
-    } else {
-        values.push_bytes_in_place(at, len)?;
+        return values.push_run_in_place(0, ends);
+    }
+    let mut start = 0;
+    for &end in ends {
+        let len = end
+            .checked_sub(start)
+            .ok_or_else(|| invalid("a string value ends before it starts"))?;
+        values.push_bytes_in_place(start, len)?;
+        start = end;
     }
     Ok(())
 }
@@ -11964,9 +11964,8 @@ fn decode(
         // A page, because every chunk cut out of this dictionary points at the same payload and a
         // page is what lets a cut be the views and nothing else.
         let mut strings = StringColumn::over(Buffer::from_vec(payload).into_page());
-        for pair in offsets.windows(2) {
-            push_value(&mut strings, ty, pair[0] as usize, (pair[1] - pair[0]) as usize)?;
-        }
+        let ends: Vec<usize> = offsets[1..].iter().map(|&end| end as usize).collect();
+        push_values(&mut strings, ty, &ends)?;
         let mut codes = Vec::with_capacity(rows);
         for _ in 0..rows {
             codes.push(cur.u32()?);
@@ -12028,14 +12027,7 @@ fn decode(
         // A page, because this is read once and handed out a chunk at a time, and a cut of a paged
         // payload moves views rather than bytes.
         let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
-        let mut start = 0;
-        for end in ends {
-            let len = end
-                .checked_sub(start)
-                .ok_or_else(|| invalid("compressed text value ends before it starts"))?;
-            push_value(&mut values, ty, start, len)?;
-            start = end;
-        }
+        push_values(&mut values, ty, &ends)?;
         return Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity));
     }
     if codec == 5 {
@@ -12282,15 +12274,8 @@ fn decode(
             // because the second pair never claimed to hold any. Reading them through the checking
             // seam would refuse a column for holding exactly what it was told to hold.
             let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
-            let text = ty == &LogicalType::Varchar;
-            for pair in offsets.windows(2) {
-                let (at, len) = (pair[0] as usize, (pair[1] - pair[0]) as usize);
-                if text {
-                    values.push_in_place(at, len)?;
-                } else {
-                    values.push_bytes_in_place(at, len)?;
-                }
-            }
+            let ends: Vec<usize> = offsets[1..].iter().map(|&end| end as usize).collect();
+            push_values(&mut values, ty, &ends)?;
             Data::Varlen(values)
         }
         _ => return Err(Error::not_implemented(format!("native page for {ty}"))),
