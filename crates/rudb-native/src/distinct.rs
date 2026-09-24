@@ -90,7 +90,7 @@ pub(crate) fn bytes_for(estimate: f64) -> usize {
     while full(share, slots) {
         slots *= 2;
     }
-    (slots + BUFFERED) * SETS * size_of::<u64>()
+    (slots + BUFFERED) * SETS * size_of::<u64>() + BUFFERED * SETS * size_of::<u32>()
 }
 
 /// The low bits of a slot, which hold how many rows have the slot's value.
@@ -136,8 +136,10 @@ pub(crate) struct ExactCounts {
     sets: Vec<Vec<u64>>,
     /// How many values each set holds.
     held: Vec<usize>,
-    /// [`BUFFERED`] hashes per set waiting to go in, and how many of each are there.
+    /// [`BUFFERED`] hashes per set waiting to go in, the rows each stands for, and how many of each
+    /// set's are there.
     buffered: Vec<u64>,
+    times: Vec<u32>,
     waiting: Vec<u8>,
     /// The counts too large for a slot, by hash.
     spilled: HashMap<u64, u64, crate::Spread>,
@@ -152,6 +154,7 @@ impl ExactCounts {
             sets: vec![vec![0; FIRST_SLOTS]; SETS],
             held: vec![0; SETS],
             buffered: vec![0; SETS * BUFFERED],
+            times: vec![0; SETS * BUFFERED],
             waiting: vec![0; SETS],
             spilled: HashMap::default(),
             len: 0,
@@ -161,21 +164,20 @@ impl ExactCounts {
 
     /// Adds `times` rows of one value's bits.
     ///
-    /// A single row waits in its set's buffer. A run of equal rows goes straight in, since it is
-    /// one probe for all of them and there is no order among the adds to keep.
+    /// A run of equal rows waits in its set's buffer the same as a single row does. Runs used to go
+    /// straight in, as one probe for all of their rows, but a probe of a large set is a cache miss
+    /// and one taken on its own is waited out in full. On `lineitem`, whose `l_orderkey` comes in
+    /// runs of about four over a million and a half values, those misses were most of the time the
+    /// set took.
     pub(crate) fn insert(&mut self, value: u64, times: u32) {
         if self.gave_up || times == 0 {
             return;
         }
         let hash = hash(value);
         let set = (hash >> (64 - SET_BITS)) as usize;
-        if times > 1 {
-            self.add(set, hash, u64::from(times));
-            self.check_cap();
-            return;
-        }
         let waiting = usize::from(self.waiting[set]);
         self.buffered[set * BUFFERED + waiting] = hash;
+        self.times[set * BUFFERED + waiting] = times;
         self.waiting[set] = (waiting + 1) as u8;
         if waiting + 1 == BUFFERED {
             self.drain(set);
@@ -227,7 +229,7 @@ impl ExactCounts {
         touch(&self.sets[set], &self.buffered[from..from + waiting]);
         for at in from..from + waiting {
             let hash = self.buffered[at];
-            self.add(set, hash, 1);
+            self.add(set, hash, u64::from(self.times[at]));
         }
         self.check_cap();
     }
@@ -279,6 +281,7 @@ impl ExactCounts {
             self.gave_up = true;
             self.sets = Vec::new();
             self.buffered = Vec::new();
+            self.times = Vec::new();
             self.spilled = HashMap::default();
         }
     }
@@ -452,7 +455,8 @@ mod tests {
                 set.insert(value.wrapping_mul(0x0123_4567_89AB_CDEF), 1);
             }
             assert_eq!(set.count(), Some(distinct as u64));
-            let held = (set.sets.iter().map(Vec::len).sum::<usize>() + set.buffered.len()) * 8;
+            let held = (set.sets.iter().map(Vec::len).sum::<usize>() + set.buffered.len()) * 8
+                + set.times.len() * 4;
             let estimate = bytes_for(distinct as f64);
             assert!(held <= estimate, "{distinct} values held {held} bytes over {estimate}");
             assert!(
