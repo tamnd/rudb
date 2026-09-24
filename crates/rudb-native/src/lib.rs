@@ -6990,6 +6990,33 @@ impl Reader {
         Ok(())
     }
 
+    /// Reads the first `len` bytes of a section's payload, or all of it when it is shorter, without
+    /// checking them.
+    ///
+    /// Only the extent table is checked, because an extent's checksum is over the whole extent and
+    /// checking it is reading the whole of it, which is what this is here to avoid. It is for a
+    /// kind-specific header that a planner reads to decide what to plan, and never for bytes a
+    /// query's answer is made of: a reader that goes on to use the structure reads it again through
+    /// [`Self::payload`], and a header that was torn is found there.
+    ///
+    /// # Errors
+    ///
+    /// If the extent table fails its check or the first extent points outside the file.
+    pub fn payload_head(&self, of: &Section, len: usize) -> Result<Vec<u8>> {
+        let extents = self.extents(of)?;
+        let Some(first) = extents.first() else { return Ok(Vec::new()) };
+        let end = first
+            .offset
+            .checked_add(u64::from(first.length))
+            .ok_or_else(|| invalid("an extent overflows the file"))?;
+        if first.offset < HEADER || end > self.size {
+            return Err(invalid("an extent is outside the file"));
+        }
+        let mut bytes = vec![0; len.min(first.length as usize)];
+        read_at(&self.file, first.offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
     /// Reads a whole section's payload, every extent of it, in order.
     ///
     /// For a structure that is resident anyway, which a key map is. Anything large enough that the
