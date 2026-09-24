@@ -22,11 +22,11 @@ use std::collections::HashMap;
 use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, CreateTable, CreateView, Cte,
-    Distinct, DropTable, Expr, ExprRef, Insert, JoinKind, LiteralKind, Nulls, Order, OrderItem,
-    Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice,
-    Source, SourceRef, Statement, StrRef, Target, Transaction, UnaryOp, WindowBound, WindowExclude,
-    WindowRef, WindowSpec, WindowUnit,
+    AlterAction, Ast, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, CreateTable,
+    CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Insert, JoinKind, LiteralKind, Nulls,
+    Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp,
+    Setting, Slice, Source, SourceRef, Statement, StrRef, Target, Transaction, UnaryOp,
+    WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -1021,8 +1021,23 @@ impl<'a> Transform<'a> {
     /// are dropped without a word, and a list with no `OWNED BY` in it is not implemented there.
     fn alter_statement(&mut self, inner: u32) -> Result<Statement> {
         let stmt = self.first(self.find(inner, "AlterOptions"));
-        if self.name(stmt) != "AlterSequenceStmt" {
-            return self.unsupported(inner);
+        match self.name(stmt) {
+            "AlterTableStmt" => return self.alter_table(stmt),
+            "AlterViewStmt" => {
+                let to = self.identifier(self.find(self.find(stmt, "RenameAlter"), "Identifier"));
+                let alter = crate::ast::Alter {
+                    name: self.name_parts(self.find(stmt, "BaseTableName")),
+                    quiet: self.find(stmt, "IfExists") != NONE,
+                    view: true,
+                    action: AlterAction::Rename { to },
+                };
+                return Ok(self.alter_entry(alter));
+            }
+            "AlterSchemaStmt" => {
+                return Err(Error::not_implemented("Altering schemas is not yet supported"));
+            }
+            "AlterSequenceStmt" => {}
+            _ => return self.unsupported(inner),
         }
         let set = self.first(self.find(stmt, "AlterSequenceOptions"));
         if self.name(set) != "SetSequenceOption" {
@@ -1055,6 +1070,196 @@ impl<'a> Transform<'a> {
             owner,
         };
         Ok(self.sequence_statement(sequence))
+    }
+
+    /// `AlterTableStmt <- 'TABLE' IfExists? BaseTableName List(AlterTableOptions)`, with the
+    /// pin's refusals of the options it does not take, in the order it makes them.
+    fn alter_table(&mut self, stmt: u32) -> Result<Statement> {
+        let mut options = Vec::new();
+        self.named_nodes(stmt, "AlterTableOptions", &mut options);
+        if options.len() > 1 {
+            return Err(Error::parser("Only one ALTER command per statement is supported"));
+        }
+        let option = self.first(options[0]);
+        let nested = |this: &Self, node: u32| {
+            let mut dots = Vec::new();
+            this.named_nodes(node, "IdentifierDot", &mut dots);
+            !dots.is_empty()
+        };
+        let column = |this: &mut Self, node: u32| {
+            let name = this.find(node, "NestedColumnName");
+            this.identifier(this.find(name, "ColumnName"))
+        };
+        let action = match self.name(option) {
+            "RenameAlter" => {
+                AlterAction::Rename { to: self.identifier(self.find(option, "Identifier")) }
+            }
+            "RenameColumn" if !nested(self, option) => {
+                let at = column(self, option);
+                AlterAction::RenameColumn {
+                    column: at,
+                    to: self.identifier(self.find(option, "Identifier")),
+                }
+            }
+            "AddColumn" => self.add_column(option)?,
+            "DropColumn" if !nested(self, option) => AlterAction::DropColumn {
+                column: column(self, option),
+                quiet: self.find(option, "IfExists") != NONE,
+            },
+            "AlterColumn" if !nested(self, option) => {
+                let at = column(self, option);
+                let entry = self.first(self.find(option, "AlterColumnEntry"));
+                self.alter_column(at, entry)?
+            }
+            "DropConstraint" => {
+                return Err(Error::not_implemented("No support for that ALTER TABLE option yet!"));
+            }
+            "SetPartitionedBy" | "ResetPartitionedBy" => {
+                return Err(Error::not_implemented(
+                    "SET PARTITIONED BY is not supported for DuckDB tables",
+                ));
+            }
+            "SetSortedBy" | "ResetSortedBy" => {
+                return Err(Error::not_implemented(
+                    "SET SORTED BY is not supported for DuckDB tables",
+                ));
+            }
+            "SetOptions" => {
+                return Err(Error::not_implemented(
+                    "SET (<options>) is not supported for DuckDB tables",
+                ));
+            }
+            "ResetOptions" => {
+                return Err(Error::not_implemented(
+                    "RESET (<options>) is not supported for DuckDB tables",
+                ));
+            }
+            _ => return self.unsupported(option),
+        };
+        let alter = crate::ast::Alter {
+            name: self.name_parts(self.find(stmt, "BaseTableName")),
+            quiet: self.find(stmt, "IfExists") != NONE,
+            view: false,
+            action,
+        };
+        Ok(self.alter_entry(alter))
+    }
+
+    /// `AddColumn <- 'ADD' 'COLUMN'? IfNotExists? AddColumnEntry`.
+    ///
+    /// The pin keeps the type, `NOT NULL` and `DEFAULT` of the definition and drops every other
+    /// constraint on it without a word, so this does too.
+    fn add_column(&mut self, option: u32) -> Result<AlterAction> {
+        let entry = self.find(option, "AddColumnEntry");
+        let generated = self.find(entry, "GeneratedColumn");
+        if self.find(entry, "Type") == NONE && generated == NONE {
+            return Err(Error::parser("Column definition requires a type or generated expression"));
+        }
+        if generated != NONE {
+            return Err(Error::parser(
+                "Adding generated columns after table creation is not supported yet",
+            ));
+        }
+        let mut defaults = 0;
+        let mut kept = Vec::new();
+        for kid in self.kids(entry) {
+            if self.name(kid) != "ColumnConstraint" {
+                continue;
+            }
+            // The pin keeps these quietly and drops them, and the tests in its tree, written for
+            // the release after it, refuse them. The tests are what this follows.
+            let refused = match self.name(self.first(kid)) {
+                "DefaultValue" => {
+                    defaults += 1;
+                    None
+                }
+                "NotNullConstraint" => None,
+                "PrimaryKeyConstraint" => Some("PRIMARY KEY"),
+                "CheckConstraint" => Some("CHECK"),
+                "ForeignKeyConstraint" => Some("FOREIGN KEY"),
+                _ => continue,
+            };
+            if let Some(kind) = refused {
+                return Err(Error::parser(format!(
+                    "Adding columns with {kind} constraints is not supported yet"
+                )));
+            }
+            kept.push(kid);
+        }
+        if defaults > 1 {
+            return Err(Error::parser("Cannot define a default value twice"));
+        }
+        let dotted = self.find(entry, "DottedIdentifier");
+        let mut parts = Vec::new();
+        self.leaves(dotted, &mut parts);
+        if parts.iter().any(|&leaf| self.text(leaf) == ".") {
+            return self.unsupported(entry);
+        }
+        let name = self.identifier(dotted);
+        let type_node = self.find(entry, "Type");
+        let text = self.text(type_node).to_string();
+        let ty = self.intern(&text);
+        let mut not_null = false;
+        let mut default = NONE;
+        for kid in kept {
+            let constraint = self.first(kid);
+            if self.name(constraint) == "DefaultValue" {
+                default = self.expr(self.find(constraint, "ColumnDefaultExpr"))?;
+            } else {
+                not_null = self.name(self.first(constraint)) == "NotNullColumnConstraint";
+            }
+        }
+        let quiet = self.find(option, "IfNotExists") != NONE;
+        if quiet && not_null {
+            return Err(Error::not_implemented(
+                "Adding a NOT NULL column with IF NOT EXISTS is not supported",
+            ));
+        }
+        Ok(AlterAction::AddColumn { column: ColumnDef { name, ty, not_null, default }, quiet })
+    }
+
+    /// `AlterColumnEntry <- AddOrDropDefault / ChangeNullability / AlterType`.
+    fn alter_column(&mut self, column: StrRef, entry: u32) -> Result<AlterAction> {
+        Ok(match self.name(entry) {
+            "AddOrDropDefault" => {
+                let inner = self.first(entry);
+                let default = if self.name(inner) == "AddDefault" {
+                    self.expr(self.find(inner, "Expression"))?
+                } else {
+                    NONE
+                };
+                AlterAction::Default { column, default }
+            }
+            "ChangeNullability" => {
+                let which = self.first(self.find(entry, "DropOrSet"));
+                AlterAction::NotNull { column, set: self.name(which) == "SetNullability" }
+            }
+            "AlterType" => {
+                let type_node = self.find(entry, "Type");
+                let using = self.find(entry, "UsingExpression");
+                if type_node == NONE && using == NONE {
+                    return Err(Error::parser(
+                        "Omitting the type is only possible in combination with USING",
+                    ));
+                }
+                let ty = if type_node == NONE {
+                    NONE
+                } else {
+                    let text = self.text(type_node).to_string();
+                    self.intern(&text)
+                };
+                let using =
+                    if using == NONE { NONE } else { self.expr(self.find(using, "Expression"))? };
+                AlterAction::Type { column, ty, using }
+            }
+            _ => return self.unsupported(entry),
+        })
+    }
+
+    fn alter_entry(&mut self, alter: crate::ast::Alter) -> Statement {
+        let index = self.ast.alters.len() as u32;
+        self.ast.alters.push(alter);
+        Statement::Alter(index)
     }
 
     fn sequence_statement(&mut self, sequence: crate::ast::Sequence) -> Statement {
@@ -4989,6 +5194,59 @@ mod tests {
                 }
                 out
             }
+            Statement::Alter(index) => {
+                let alter = ast.alter(index);
+                let mut out = if alter.view { "ALTER VIEW" } else { "ALTER TABLE" }.to_string();
+                if alter.quiet {
+                    out += " IF EXISTS";
+                }
+                out += &format!(" {} ", ast.name_text(alter.name));
+                let expr = |expr| show(&ast, expr);
+                out + &match alter.action {
+                    AlterAction::Rename { to } => format!("RENAME TO {}", ast.string(to)),
+                    AlterAction::RenameColumn { column, to } => {
+                        format!("RENAME COLUMN {} TO {}", ast.string(column), ast.string(to))
+                    }
+                    AlterAction::AddColumn { column, quiet } => {
+                        let mut out = "ADD COLUMN ".to_string();
+                        if quiet {
+                            out += "IF NOT EXISTS ";
+                        }
+                        out += &format!("{} {}", ast.string(column.name), ast.string(column.ty));
+                        if column.default != NONE {
+                            out += &format!(" DEFAULT {}", expr(column.default));
+                        }
+                        if column.not_null {
+                            out += " NOT NULL";
+                        }
+                        out
+                    }
+                    AlterAction::DropColumn { column, quiet } => {
+                        let quiet = if quiet { "IF EXISTS " } else { "" };
+                        format!("DROP COLUMN {quiet}{}", ast.string(column))
+                    }
+                    AlterAction::Default { column, default } if default == NONE => {
+                        format!("ALTER COLUMN {} DROP DEFAULT", ast.string(column))
+                    }
+                    AlterAction::Default { column, default } => {
+                        format!("ALTER COLUMN {} SET DEFAULT {}", ast.string(column), expr(default))
+                    }
+                    AlterAction::NotNull { column, set } => {
+                        let which = if set { "SET" } else { "DROP" };
+                        format!("ALTER COLUMN {} {which} NOT NULL", ast.string(column))
+                    }
+                    AlterAction::Type { column, ty, using } => {
+                        let mut out = format!("ALTER COLUMN {} SET DATA TYPE", ast.string(column));
+                        if ty != NONE {
+                            out += &format!(" {}", ast.string(ty));
+                        }
+                        if using != NONE {
+                            out += &format!(" USING {}", expr(using));
+                        }
+                        out
+                    }
+                }
+            }
             Statement::Sequence(index) => {
                 let sequence = ast.sequence(index);
                 if !sequence.owner.is_empty() {
@@ -6178,15 +6436,15 @@ mod tests {
 
     #[test]
     fn an_unsupported_construct_names_itself_and_what_was_written() {
-        let error = parse_ast("ALTER TABLE t ADD COLUMN a INTEGER").unwrap_err().to_string();
+        let error = parse_ast("COMMENT ON TABLE t IS 'a note'").unwrap_err().to_string();
         assert!(error.starts_with("Not implemented Error"), "{error}");
-        assert!(error.contains("ALTER TABLE t ADD COLUMN a INTEGER"), "{error}");
-        assert!(error.contains("AlterStatement"), "{error}");
+        assert!(error.contains("COMMENT ON TABLE t IS 'a note'"), "{error}");
+        assert!(error.contains("CommentStatement"), "{error}");
     }
 
     #[test]
     fn a_long_construct_is_cut_short_in_the_message() {
-        let query = format!("ALTER TABLE t ADD COLUMN {} INTEGER", "a".repeat(80));
+        let query = format!("COMMENT ON TABLE t IS '{}'", "a".repeat(80));
         let error = parse_ast(&query).unwrap_err().to_string();
         assert!(error.contains("..."), "{error}");
         assert!(error.len() < 200, "{error}");

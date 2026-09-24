@@ -281,7 +281,7 @@ fn convert_run<M: Fn(usize) -> usize>(
         }
         (Numeric::Approximate { .. }, Numeric::Exact { scale, width }) => {
             let run = float_run(data, at, rows)?;
-            exact_out(tighten(&run, scale)?, width, physical)
+            exact_out(tighten(&run, scale, width.is_none())?, width, physical)
         }
         (Numeric::Approximate { .. }, Numeric::Approximate { single }) => {
             let run = float_run(data, at, rows)?;
@@ -608,7 +608,8 @@ fn loosened<M: Fn(usize) -> usize>(
 }
 
 /// A run of doubles as the exact numbers they round to at a scale, or `None` when one of them has
-/// no such number.
+/// no such number. A whole number target rounds half to even and a decimal one half away from zero,
+/// which is the pin's `nearbyint` for the one and its own rounding for the other.
 ///
 /// The bound is the one the row at a time path checks, and a NaN or an infinity fails it because
 /// every comparison against a NaN is false. A value that fails is not converted here at all, and
@@ -617,11 +618,12 @@ fn loosened<M: Fn(usize) -> usize>(
     clippy::cast_possible_truncation,
     reason = "the bound checked on the line above is what decides whether the value fits"
 )]
-fn tighten(run: &[f64], scale: u8) -> Option<Vec<i128>> {
+fn tighten(run: &[f64], scale: u8, even: bool) -> Option<Vec<i128>> {
     let factor = pow10(scale) as f64;
     let mut out = Vec::with_capacity(run.len());
     for &number in run {
-        let scaled = (number * factor).round();
+        let scaled = number * factor;
+        let scaled = if even { scaled.round_ties_even() } else { scaled.round() };
         if !(-1.7014118346046923e38..=1.7014118346046923e38).contains(&scaled) {
             return None;
         }
@@ -1069,13 +1071,14 @@ fn rounded_decimal(unscaled: i128, scale: u8) -> i128 {
     shifted / factor
 }
 
-/// A float as a whole number, rounded half away from zero the way DuckDB rounds.
+/// A float as a whole number, rounded half to even the way DuckDB rounds one, which is
+/// `nearbyint` upstream, so 2.5 is 2 and 3.5 is 4. A decimal rounds half away from zero instead.
 fn rounded(value: &Value, target: &LogicalType) -> Result<i128> {
     let number = approximate(value).ok_or_else(|| no_cast(value, target))?;
     if !number.is_finite() {
         return Err(out_of_range(value, target));
     }
-    let number = number.round();
+    let number = number.round_ties_even();
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the range check below is what decides whether the value fits"
@@ -2210,8 +2213,12 @@ mod tests {
             Value::Integer(2)
         );
         assert_eq!(
-            cast_to(Value::Double(-1.5), &LogicalType::Integer).expect("rounds away from zero"),
+            cast_to(Value::Double(-1.5), &LogicalType::Integer).expect("rounds half to even"),
             Value::Integer(-2)
+        );
+        assert_eq!(
+            cast_to(Value::Double(2.5), &LogicalType::Integer).expect("rounds half to even"),
+            Value::Integer(2)
         );
     }
 

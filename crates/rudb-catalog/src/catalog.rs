@@ -837,6 +837,98 @@ impl Catalog {
         Ok(())
     }
 
+    /// Makes one `ALTER TABLE` change, or renames a view. `rows` is every row of the table as it
+    /// reads after the change, for the changes that move data.
+    ///
+    /// # Errors
+    ///
+    /// The refusals of the table's own alter, a new name that is taken, and any change but adding a
+    /// column or changing a default to a table another table's foreign key points at, which the
+    /// pin refuses after the table's own checks.
+    pub fn alter(
+        &mut self,
+        name: &QualifiedName,
+        alteration: crate::Alteration,
+        rows: Option<Vec<rudb_vector::Chunk>>,
+        workers: usize,
+    ) -> Result<()> {
+        let renamed = match &alteration {
+            crate::Alteration::Rename(to) => Some(to.clone()),
+            _ => None,
+        };
+        if self.entry(name)? == Entry::View {
+            let Some(to) = renamed else {
+                return Err(Error::catalog("Can only modify view with ALTER VIEW statement"));
+            };
+            self.rename_check(name, &to)?;
+            self.changed();
+            let schema = self.schema_mut(&name.catalog, &name.schema)?;
+            if let Some(view) =
+                schema.views.iter_mut().find(|held| same_name(&held.name().table, &name.table))
+            {
+                view.rename(&to);
+            }
+            return Ok(());
+        }
+        let keeps = alteration.keeps_dependents();
+        let mut table = self.table(name)?.clone();
+        table.alter(alteration, rows, workers)?;
+        let depended = self.tables().any(|held| {
+            held.name() != name && held.foreign().iter().any(|foreign| &foreign.table == name)
+        });
+        if depended && !keeps {
+            return Err(Error::dependency(format!(
+                "Cannot alter entry \"{}\" because there are entries that depend on it.",
+                name.table
+            )));
+        }
+        if let Some(to) = &renamed {
+            self.rename_check(name, to)?;
+        }
+        self.changed();
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        let Some(held) =
+            schema.tables.iter_mut().find(|held| same_name(&held.name().table, &name.table))
+        else {
+            return Err(missing_table(&name.table));
+        };
+        *held = table;
+        let Some(to) = renamed else { return Ok(()) };
+        let moved = QualifiedName::new(name.catalog.clone(), name.schema.clone(), to);
+        // What points at the table by name points at the new one: its own foreign keys into
+        // itself, and the sequences it owns.
+        let held = self.table_mut(&moved)?;
+        let mut foreign = held.foreign().to_vec();
+        for key in &mut foreign {
+            if &key.table == name {
+                key.table = moved.clone();
+            }
+        }
+        held.set_foreign(foreign);
+        for database in &mut self.databases {
+            for schema in &mut database.schemas {
+                for sequence in &mut schema.sequences {
+                    if sequence.owner.as_ref() == Some(name) {
+                        sequence.owner = Some(moved.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a rename onto a name something else in the schema already has.
+    fn rename_check(&self, name: &QualifiedName, to: &str) -> Result<()> {
+        let schema = self.schema(&name.catalog, &name.schema)?;
+        if !same_name(&name.table, to) && schema.kind(to).is_some() {
+            return Err(Error::catalog(format!(
+                "Could not rename \"{}\" to \"{to}\": another entry with this name already exists!",
+                name.table
+            )));
+        }
+        Ok(())
+    }
+
     /// Removes a sequence, and with `cascade` every table whose default uses it.
     ///
     /// # Errors

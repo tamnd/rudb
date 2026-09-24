@@ -45,6 +45,8 @@ pub enum Bound {
     Schema(SchemaChange),
     /// `CREATE SEQUENCE` or `DROP SEQUENCE`.
     Sequence(SequenceChange),
+    /// `ALTER TABLE` or `ALTER VIEW`.
+    Alter(Alter),
     /// `INSERT INTO`.
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
@@ -188,6 +190,17 @@ pub struct SequenceChange {
     /// The table or view an `ALTER SEQUENCE ... OWNED BY` gives the sequence to, which makes this
     /// an alter rather than a create.
     pub owner: Option<QualifiedName>,
+}
+
+/// A bound `ALTER TABLE` or `ALTER VIEW`.
+#[derive(Debug)]
+pub struct Alter {
+    /// The table or view, or `None` when `IF EXISTS` found nothing to change.
+    pub name: Option<QualifiedName>,
+    /// The change, or `None` when an `IF EXISTS` or an `IF NOT EXISTS` on a column made it one.
+    pub alteration: Option<rudb_catalog::Alteration>,
+    /// Every row of the table as it reads after the change, for the changes that move data.
+    pub rewrite: Option<Plan>,
 }
 
 /// A bound `DROP TABLE` or `DROP VIEW`.
@@ -407,6 +420,7 @@ fn bind_one(
                 owner,
             }))
         }
+        ast::Statement::Alter(index) => alter(ast, catalog, parameters, session, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
         ast::Statement::Update(index) => change(ast, catalog, parameters, session, index, false),
         ast::Statement::Delete(index) => change(ast, catalog, parameters, session, index, true),
@@ -774,6 +788,286 @@ fn default_text(
         }
         Ok(_) => Ok((deparse::expression(ast, expr), binder.sequences)),
     }
+}
+
+/// `ALTER TABLE` and `ALTER VIEW`, refused the way the pin refuses each change before the catalog
+/// sees it: a missing column is the binder's sentence, and so is changing the type of a column a
+/// constraint is over.
+fn alter(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    index: ast::AlterRef,
+) -> Result<Bound> {
+    let written = ast.alter(index);
+    let nothing = |name| Ok(Bound::Alter(Alter { name, alteration: None, rewrite: None }));
+    let parts: Vec<&str> = ast.name(written.name).collect();
+    let wanted = if written.view { Entry::View } else { Entry::Table };
+    let name = match catalog.resolve_as(&parts, wanted) {
+        Ok(name) => name,
+        Err(_) if written.quiet => return nothing(None),
+        Err(error) => return Err(error),
+    };
+    let kind = catalog.entry(&name)?;
+    if written.view && kind == Entry::Table {
+        return Err(Error::catalog("Can only modify table with ALTER TABLE statement"));
+    }
+    if let ast::AlterAction::Rename { to } = written.action {
+        let alteration = rudb_catalog::Alteration::Rename(ast.string(to).to_string());
+        return Ok(Bound::Alter(Alter {
+            name: Some(name),
+            alteration: Some(alteration),
+            rewrite: None,
+        }));
+    }
+    if kind == Entry::View {
+        return Err(Error::catalog("Can only modify view with ALTER VIEW statement"));
+    }
+    let table = catalog.table(&name)?;
+    let fields = table.columns();
+    let place = |column: ast::StrRef| {
+        fields.iter().position(|field| same_name(&field.name, ast.string(column)))
+    };
+    let missing = |column: ast::StrRef| {
+        let names: Vec<String> = fields.iter().map(|field| format!("\"{}\"", field.name)).collect();
+        Error::binder(format!(
+            "Table \"{}\" does not have a column with name \"{}\"\n\nDid you mean: {}",
+            name.table,
+            ast.string(column),
+            names.join(", ")
+        ))
+    };
+    let found = |column: ast::StrRef| place(column).ok_or_else(|| missing(column));
+    let checks = table.checks();
+    let mut rewrite = None;
+    let alteration = match written.action {
+        ast::AlterAction::Rename { .. } => unreachable!("a rename is handled above"),
+        ast::AlterAction::RenameColumn { column, to } => {
+            let at = found(column)?;
+            let (old, to) = (fields[at].name.as_str(), ast.string(to));
+            if in_foreign_key(catalog, &name, table, at) {
+                // The doubled quotes are the pin's, which quotes a name that is already quoted.
+                return Err(Error::catalog(format!(
+                    "Cannot rename column \"\"{old}\"\" because this is involved in the foreign key \
+                     constraint"
+                )));
+            }
+            let checks =
+                checks.iter().map(|text| rename_in(text, old, to)).collect::<Result<Vec<_>>>()?;
+            rudb_catalog::Alteration::RenameColumn { column: at, to: to.to_string(), checks }
+        }
+        ast::AlterAction::AddColumn { column, quiet } => {
+            if quiet && place(column.name).is_some() {
+                return nothing(Some(name));
+            }
+            let ty = LogicalType::parse(ast.string(column.ty))?;
+            let field = Field {
+                not_null: column.not_null,
+                ..Field::new(ast.string(column.name), ty.clone())
+            };
+            let (default, sequences) = if column.default == NONE {
+                (None, Vec::new())
+            } else {
+                let (text, used) = default_text(ast, column.default, catalog, parameters, session)?;
+                (Some(text), used)
+            };
+            rewrite = Some(table_rewrite(
+                ast,
+                (catalog, parameters, session),
+                &name,
+                |binder, _, out| {
+                    let value = if column.default == NONE {
+                        let null = binder.add_constant(Value::Null);
+                        binder.cast_to(null, &ty)
+                    } else {
+                        let value =
+                            binder.bind_expr(ast, column.default, &crate::scope::Scope::empty())?;
+                        binder.checked_cast_to(value, &ty, false)?
+                    };
+                    out.push((value, field.name.clone()));
+                    Ok(())
+                },
+            )?);
+            rudb_catalog::Alteration::AddColumn { field, default, sequences }
+        }
+        ast::AlterAction::DropColumn { column, quiet } => {
+            let Some(at) = place(column) else {
+                return if quiet { nothing(Some(name)) } else { Err(missing(column)) };
+            };
+            let dropped = fields[at].name.as_str();
+            let mut kept = Vec::with_capacity(checks.len());
+            for text in checks {
+                let used = columns_in(text)?;
+                if !used.iter().any(|used| same_name(used, dropped)) {
+                    kept.push(text.clone());
+                } else if used.iter().any(|used| !same_name(used, dropped)) {
+                    return Err(Error::catalog(format!(
+                        "Cannot drop column \"{dropped}\" because there is a CHECK constraint that \
+                         depends on it"
+                    )));
+                }
+            }
+            rewrite =
+                Some(table_rewrite(ast, (catalog, parameters, session), &name, |_, _, out| {
+                    out.remove(at);
+                    Ok(())
+                })?);
+            rudb_catalog::Alteration::DropColumn { column: at, checks: kept }
+        }
+        ast::AlterAction::Default { column, default } => {
+            let at = found(column)?;
+            let (default, sequences) = if default == NONE {
+                (None, Vec::new())
+            } else {
+                let (text, used) = default_text(ast, default, catalog, parameters, session)?;
+                (Some(text), used)
+            };
+            rudb_catalog::Alteration::Default { column: at, default, sequences }
+        }
+        ast::AlterAction::NotNull { column, set } => {
+            rudb_catalog::Alteration::NotNull { column: found(column)?, set }
+        }
+        ast::AlterAction::Type { column, ty, using } => {
+            let at = found(column)?;
+            let changed = fields[at].name.as_str();
+            if table.keys().iter().any(|key| key.columns.contains(&at)) {
+                return Err(Error::binder(
+                    "Cannot change the type of a column that has a UNIQUE or PRIMARY KEY \
+                     constraint specified",
+                ));
+            }
+            for text in checks {
+                if columns_in(text)?.iter().any(|used| same_name(used, changed)) {
+                    return Err(Error::binder(
+                        "Cannot change the type of a column that has a CHECK constraint specified",
+                    ));
+                }
+            }
+            if in_foreign_key(catalog, &name, table, at) {
+                return Err(Error::binder(
+                    "Cannot change the type of a column that has a FOREIGN KEY constraint specified",
+                ));
+            }
+            let mut target =
+                if ty == NONE { None } else { Some(LogicalType::parse(ast.string(ty))?) };
+            rewrite = Some(table_rewrite(
+                ast,
+                (catalog, parameters, session),
+                &name,
+                |binder, scope, out| {
+                    let value = if using == NONE {
+                        out[at].0
+                    } else {
+                        binder.bind_expr(ast, using, scope)?
+                    };
+                    let ty = target
+                        .get_or_insert_with(|| binder.plan_mut().expr_type(value).clone())
+                        .clone();
+                    out[at].0 = binder.checked_cast_to(value, &ty, false)?;
+                    Ok(())
+                },
+            )?);
+            let ty = target.ok_or_else(|| Error::internal("an ALTER TYPE that settled no type"))?;
+            rudb_catalog::Alteration::Type { column: at, ty }
+        }
+    };
+    Ok(Bound::Alter(Alter { name: Some(name), alteration: Some(alteration), rewrite }))
+}
+
+/// Whether a column is in one of its table's foreign keys, or is a column another table's foreign
+/// key points at.
+fn in_foreign_key(
+    catalog: &Catalog,
+    name: &QualifiedName,
+    table: &rudb_catalog::Table,
+    at: usize,
+) -> bool {
+    table.foreign().iter().any(|key| key.columns.contains(&at))
+        || catalog.tables().any(|held| {
+            held.foreign().iter().any(|key| key.table == *name && key.referenced.contains(&at))
+        })
+}
+
+/// A plan over every row of a table giving each of its columns, as changed by `change`, which gets
+/// the column expressions and their names in order and can add, drop or replace any of them.
+fn table_rewrite(
+    ast: &Ast,
+    (catalog, parameters, session): (&Catalog, &Parameters, &Session),
+    name: &QualifiedName,
+    change: impl FnOnce(
+        &mut Binder<'_>,
+        &crate::scope::Scope,
+        &mut Vec<(ExprRef, String)>,
+    ) -> Result<()>,
+) -> Result<Plan> {
+    let mut binder = Binder::with(catalog, parameters, session);
+    let (root, scope) =
+        binder.bind_catalog_table(ast, name, name.table.clone(), ast::Slice::default())?;
+    let mut out = Vec::with_capacity(scope.columns.len() + 1);
+    for column in &scope.columns {
+        let expr = binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
+        out.push((expr, column.name.clone()));
+    }
+    change(&mut binder, &scope, &mut out)?;
+    let exprs: Vec<ExprRef> = out.iter().map(|(expr, _)| *expr).collect();
+    let names: Vec<_> = out.iter().map(|(_, name)| binder.plan_mut().intern(name)).collect();
+    let exprs = binder.plan_mut().add_expr_list(&exprs);
+    let names = binder.plan_mut().add_name_list(&names);
+    let index = binder.fresh_index();
+    let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+    finish(binder, root)
+}
+
+/// A kept `CHECK`, parsed back into an expression.
+fn check_ast(text: &str) -> Result<(Ast, ast::ExprRef)> {
+    let ast = parse_ast(&format!("SELECT {text}"))?;
+    let found = match ast.statements.first() {
+        Some(&ast::Statement::Query(query)) => match ast.query(query).body {
+            ast::QueryBody::Select(select) => {
+                ast.target_list(ast.select(select).targets).first().map(|target| target.expr)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let expr = found.ok_or_else(|| Error::internal("a check that is not an expression"))?;
+    Ok((ast, expr))
+}
+
+/// The columns a kept `CHECK` reads, by the last part of each name.
+fn columns_in(text: &str) -> Result<Vec<String>> {
+    let (ast, _) = check_ast(text)?;
+    let mut out = Vec::new();
+    for expr in &ast.exprs {
+        if let ast::Expr::Column { name } = *expr {
+            if let Some(last) = ast.name(name).last() {
+                out.push(last.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A kept `CHECK` with every column named `old` renamed to `to`, which is what the pin does to one
+/// over a column that `RENAME COLUMN` renames.
+fn rename_in(text: &str, old: &str, to: &str) -> Result<String> {
+    let (mut ast, expr) = check_ast(text)?;
+    let mut renamed = false;
+    for at in 0..ast.exprs.len() {
+        let ast::Expr::Column { name } = ast.exprs[at] else { continue };
+        if name.len == 0 {
+            continue;
+        }
+        let last = (name.start + name.len - 1) as usize;
+        if same_name(ast.string(ast.parts[last]), old) {
+            let index = ast.strings.len() as u32;
+            ast.strings.push(to.to_string());
+            ast.parts[last] = index;
+            renamed = true;
+        }
+    }
+    Ok(if renamed { deparse::expression(&ast, expr) } else { text.to_string() })
 }
 
 /// Renames the columns a query repeated, which is what makes `CREATE TABLE t AS SELECT 1 AS a, 2 AS
