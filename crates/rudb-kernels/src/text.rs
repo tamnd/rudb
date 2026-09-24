@@ -70,6 +70,34 @@ pub(crate) fn cut(text: &str, start: i128, length: Option<i128>) -> &str {
     &text[byte(from)..byte(to)]
 }
 
+/// [`cut`] from a start of one or more for a length of zero or more, on the bytes of a value that
+/// is already known to be text.
+///
+/// `skip` is the characters before the start and `take` how many to keep. A character starts at
+/// every byte that is not a continuation byte, so the two ends are found by counting those, and
+/// only as far into the value as the end of the cut. `substring(c_phone, 1, 2)` in TPC-H q22 reads
+/// two bytes of a fifteen byte phone number here, where [`cut`] had it checked for text and then for
+/// ASCII end to end first.
+pub(crate) fn cut_forward(text: &[u8], skip: usize, take: usize) -> &[u8] {
+    let from = after_characters(text, skip);
+    let rest = &text[from..];
+    &rest[..after_characters(rest, take)]
+}
+
+/// Where the character after the first `characters` of `text` starts, or its end.
+fn after_characters(text: &[u8], characters: usize) -> usize {
+    let mut seen = 0;
+    for (at, &byte) in text.iter().enumerate() {
+        if byte & 0xC0 != 0x80 {
+            if seen == characters {
+                return at;
+            }
+            seen += 1;
+        }
+    }
+    text.len()
+}
+
 /// Which characters `substring` keeps out of `count`, as a zero based range, or `None` for none.
 fn span(count: i128, start: i128, length: Option<i128>) -> Option<(usize, usize)> {
     let begin = if start < 0 { count + start + 1 } else { start };
@@ -212,6 +240,22 @@ mod tests {
 
     fn text(value: &str) -> Value {
         Value::Varchar(value.to_string())
+    }
+
+    #[test]
+    fn a_forward_cut_on_bytes_is_the_cut_on_characters() {
+        for value in ["", "a", "13-555", "héllo wörld", "日本語のテキスト", "ab€cd"] {
+            for start in 1..10 {
+                for length in 0..10 {
+                    let (skip, take) = (start as usize - 1, length as usize);
+                    assert_eq!(
+                        cut_forward(value.as_bytes(), skip, take),
+                        cut(value, start, Some(length)).as_bytes(),
+                        "{value} {start} {length}"
+                    );
+                }
+            }
+        }
     }
 
     fn at(index: i64) -> Value {

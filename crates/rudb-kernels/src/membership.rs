@@ -77,7 +77,7 @@ enum Held {
     /// to one type, so two entries that differ here differ in SQL too.
     Whole(Whole),
     /// Strings, compared by bytes, which is what DuckDB's `=` on a varchar does.
-    Text(HashSet<String>),
+    Text(Text),
 }
 
 /// A list of whole numbers, kept as the list itself while it is short.
@@ -107,6 +107,71 @@ impl Whole {
     #[inline]
     fn contains(&self, value: &i128) -> bool {
         if self.set.is_empty() { self.short.contains(value) } else { self.set.contains(value) }
+    }
+
+    fn len(&self) -> usize {
+        self.short.len() + self.set.len()
+    }
+}
+
+/// A list of strings, kept as the list itself while it is short, and compared by bytes.
+///
+/// The same reasoning as [`Whole`]. TPC-H q22 asks whether the first two characters of a phone
+/// number are one of seven codes, and hashing each two byte answer with the keyed hash after
+/// checking it was text was a sixth of the query. A value read out of a column is already known to
+/// be text, so the check found nothing, and seven two byte compares are cheaper than one hash.
+///
+/// A short list whose every entry fits in eight bytes is kept as words, each entry's bytes and its
+/// length, so a row is a load and a compare per entry with no call to compare bytes. The two bytes
+/// of a q22 country code went through `memcmp` seven times a row otherwise, and that was a third of
+/// what was left of the query after the hash went.
+#[derive(Debug)]
+struct Text {
+    words: Vec<(u64, usize)>,
+    short: Vec<Box<[u8]>>,
+    set: HashSet<Box<[u8]>>,
+}
+
+/// The bytes of a value of at most eight bytes as one word, the first byte lowest.
+#[inline]
+fn word(value: &[u8]) -> u64 {
+    let mut bytes = [0_u8; 8];
+    bytes[..value.len()].copy_from_slice(value);
+    u64::from_le_bytes(bytes)
+}
+
+impl Text {
+    fn of(set: HashSet<String>) -> Self {
+        let held = set.into_iter().map(|text| text.into_bytes().into_boxed_slice());
+        if held.len() > SHORT {
+            return Self { words: Vec::new(), short: Vec::new(), set: held.collect() };
+        }
+        let short: Vec<Box<[u8]>> = held.collect();
+        if short.iter().all(|text| text.len() <= 8) {
+            let words = short.iter().map(|text| (word(text), text.len())).collect();
+            return Self { words, short, set: HashSet::new() };
+        }
+        Self { words: Vec::new(), short, set: HashSet::new() }
+    }
+
+    #[inline]
+    fn contains(&self, value: &[u8]) -> bool {
+        if !self.words.is_empty() {
+            if value.len() > 8 {
+                return false;
+            }
+            let value = (word(value), value.len());
+            return self.words.contains(&value);
+        }
+        if self.set.is_empty() {
+            self.short.iter().any(|held| **held == *value)
+        } else {
+            self.set.contains(value)
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.short.iter().chain(self.set.iter()).map(|held| &**held)
     }
 
     fn len(&self) -> usize {
@@ -158,7 +223,7 @@ impl Members {
             }
             Held::Whole(Whole::of(whole))
         } else {
-            Held::Text(text)
+            Held::Text(Text::of(text))
         };
         Some(Self { held, has_null, negated, sought: OnceLock::new(), peel: Peel::default() })
     }
@@ -180,8 +245,8 @@ impl Members {
         if self.sought.get().is_none() {
             let ranks = dictionary.ranks()?;
             let mut hits = vec![false; dictionary.len()];
-            for text in set {
-                match search(dictionary, ranks, text.as_bytes()) {
+            for text in set.iter() {
+                match search(dictionary, ranks, text) {
                     Ok(Found::At(code)) => {
                         if let Some(hit) = hits.get_mut(code as usize) {
                             *hit = true;
@@ -206,10 +271,9 @@ impl Members {
     /// Whether the value at `code` of `dictionary` is in the list, for the memo to remember.
     fn at_code(&self, dictionary: &Vector, code: usize) -> Result<bool> {
         Ok(match &self.held {
-            Held::Text(set) => dictionary
-                .try_bytes_at(code)?
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .is_some_and(|text| set.contains(text)),
+            Held::Text(set) => {
+                dictionary.try_bytes_at(code)?.is_some_and(|text| set.contains(text))
+            }
             Held::Whole(set) => {
                 number(&dictionary.try_value_at(code)?).is_some_and(|held| set.contains(&held))
             }
@@ -341,7 +405,7 @@ fn look<A: Fn(usize) -> usize>(
 ) -> Result<Vector> {
     match (&members.held, data) {
         (Held::Text(set), Data::Varlen(column)) => answer(rows, base, members, returns, |index| {
-            column.get(at(index)).is_some_and(|text| set.contains(text))
+            column.bytes(at(index)).is_some_and(|text| set.contains(text))
         }),
         (Held::Whole(set), Data::Int8(held)) => {
             answer(rows, base, members, returns, |index| holds(set, held.as_slice(), at(index)))
@@ -465,7 +529,7 @@ fn row_at_a_time(
     let held: Vec<Value> =
         (0..rows).map(|index| input.try_value_at(index)).collect::<Result<_>>()?;
     answer(rows, base, members, returns, |index| match (&members.held, &held[index]) {
-        (Held::Text(set), Value::Varchar(text)) => set.contains(text.as_str()),
+        (Held::Text(set), Value::Varchar(text)) => set.contains(text.as_bytes()),
         (Held::Whole(set), value) => number(value).is_some_and(|held| set.contains(&held)),
         _ => false,
     })
@@ -495,6 +559,29 @@ mod tests {
             &[Value::Integer(1), Value::Integer(7), Value::Null, Value::Integer(3)],
         )
         .expect("four integers")
+    }
+
+    #[test]
+    fn a_text_list_matches_whole_values_whatever_their_length() {
+        let texts = ["13", "1", "", "130", "é", "éé", "exactly8", "exactly8!", "31"];
+        let input = Vector::from_values(
+            LogicalType::Varchar,
+            &texts.iter().map(|text| Value::Varchar((*text).into())).collect::<Vec<_>>(),
+        )
+        .expect("strings");
+        let text = |value: &str| Value::Varchar(value.into());
+        let lists: [&[&str]; 4] = [
+            &["13", "31", "é"],
+            &["", "exactly8", "éé"],
+            &["exactly8!", "1"],
+            &["a", "b", "c", "d", "e", "f", "g", "h", "13", "éé"],
+        ];
+        for list in lists {
+            let values: Vec<Value> = list.iter().map(|value| text(value)).collect();
+            let wanted: Vec<Value> =
+                texts.iter().map(|value| Value::Boolean(list.contains(value))).collect();
+            assert_eq!(over(&input, &values, false), wanted, "{list:?}");
+        }
     }
 
     #[test]

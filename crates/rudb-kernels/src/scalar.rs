@@ -539,6 +539,26 @@ fn cut_each<A: Fn(usize) -> usize>(
     base: Validity,
     rows: usize,
 ) -> Result<Option<Vector>> {
+    // Nested rather than a let chain, because the minimum supported Rust version is 1.85.
+    if let Some(length) = length {
+        if start >= 1 && length >= 0 {
+            let skip = usize::try_from(start - 1).unwrap_or(usize::MAX);
+            let take = usize::try_from(length).unwrap_or(usize::MAX);
+            if let Text::Read(vector) = text {
+                let visited = visited_bytes(vector, &base, rows, |value, into| {
+                    into.extend_from_slice(text::cut_forward(value, skip, take));
+                })?;
+                if let Some(out) = visited {
+                    return finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows));
+                }
+            }
+            let out = try_each_string(rows, &base, |index, into| {
+                into.push_bytes(text::cut_forward(text.bytes(index)?, skip, take));
+                Ok(())
+            })?;
+            return finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows));
+        }
+    }
     if let Text::Read(vector) = text {
         let visited = visited_strings(vector, &base, rows, |value, into| {
             into.push_str(text::cut(value, start, length));
@@ -942,6 +962,36 @@ fn visited_strings(
     Ok(Some(each_string(rows, base, |row, into| {
         let (from, to) = spans[row];
         into.push(&answers[from..to]);
+    })))
+}
+
+/// [`visited_strings`] for a body that works on bytes, and whose answer is text wherever its input
+/// was, which a value read out of a string column already is.
+fn visited_bytes(
+    vector: &Vector,
+    base: &Validity,
+    rows: usize,
+    mut each: impl FnMut(&[u8], &mut Vec<u8>),
+) -> Result<Option<StringColumn>> {
+    if vector.len() != rows {
+        return Ok(None);
+    }
+    let mut answers = Vec::new();
+    let mut spans = vec![(0, 0); rows];
+    let visited = vector.try_visit_text(&mut |row, bytes| {
+        let from = answers.len();
+        each(bytes, &mut answers);
+        if let Some(span) = spans.get_mut(row) {
+            *span = (from, answers.len());
+        }
+        Ok(())
+    })?;
+    if !visited {
+        return Ok(None);
+    }
+    Ok(Some(each_string(rows, base, |row, into| {
+        let (from, to) = spans[row];
+        into.push_bytes(&answers[from..to]);
     })))
 }
 
