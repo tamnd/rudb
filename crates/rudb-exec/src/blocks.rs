@@ -8,15 +8,55 @@
 //! across 64 runs, that left 260 MB resident on one thread for 160 MB of records. Here a full block
 //! stays where it is and the next one is added beside it, so the records are copied once, into the
 //! run, and what is resident is the records and at most the unwritten end of one block a run.
+//!
+//! Every block holds a power of two values, so where a position lies is a few shifts away and a run
+//! can be read and rewritten in place by position, which is what the encoded count's compaction
+//! does to its runs.
 
 use std::mem::size_of;
 
-/// The first block a list takes, in bytes. Small, because most runs of a small input stay small.
-const FIRST_BYTES: usize = 4 << 10;
+/// How many values the first block of a list holds. Small, because most runs of a small input stay
+/// small.
+const FIRST: usize = 128;
 
-/// The largest block a list takes, in bytes. Each block is twice the one before up to this, so a
-/// run of a few records costs a few kilobytes and a long one is a list of these.
-const LARGEST_BYTES: usize = 256 << 10;
+/// How many values the largest block holds. Each block is twice the one before up to this, so a run
+/// of a few records costs a few kilobytes and a long one is a list of these. The sizes are counted
+/// in values rather than bytes so that two lists of different types pushed in step, a run's records
+/// and their weights, put a position in the same block and can be walked with one cursor.
+const LARGEST: usize = 8_192;
+
+/// How many bits a position within the largest block takes, so that a block and a position in it
+/// pack into one integer as `block << WITHIN_BITS | within`.
+pub(crate) const WITHIN_BITS: u32 = LARGEST.ilog2();
+
+/// How many blocks double before they reach the largest size.
+const STEPS: usize = (LARGEST / FIRST).ilog2() as usize;
+
+/// How many values the doubling blocks hold between them.
+const RAMP: usize = LARGEST - FIRST;
+
+/// How many values block `block` holds.
+#[inline]
+pub(crate) fn size(block: usize) -> usize {
+    if block < STEPS { FIRST << block } else { LARGEST }
+}
+
+/// The first position block `block` holds.
+pub(crate) fn start(block: usize) -> usize {
+    if block < STEPS { FIRST * ((1 << block) - 1) } else { RAMP + (block - STEPS) * LARGEST }
+}
+
+/// The block position `at` lies in and where in it.
+#[inline]
+pub(crate) fn locate(at: usize) -> (usize, usize) {
+    if at < RAMP {
+        let block = (at / FIRST + 1).ilog2() as usize;
+        (block, at - FIRST * ((1 << block) - 1))
+    } else {
+        let past = at - RAMP;
+        (STEPS + past / LARGEST, past % LARGEST)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Blocks<T> {
@@ -45,14 +85,19 @@ impl<T: Copy> Blocks<T> {
 
     #[cold]
     fn grow(&mut self) {
-        let first = (FIRST_BYTES / size_of::<T>().max(1)).max(1);
-        let largest = (LARGEST_BYTES / size_of::<T>().max(1)).max(first);
-        let next = self.tail.capacity().saturating_mul(2).clamp(first, largest);
-        let full = std::mem::replace(&mut self.tail, Vec::with_capacity(next));
-        if !full.is_empty() {
+        // The tail is only empty before the first push, and that is the one time it is not a block.
+        if self.tail.capacity() != 0 {
+            let full = std::mem::take(&mut self.tail);
             self.held += full.len();
             self.full.push(full);
         }
+        self.tail = Vec::with_capacity(size(self.full.len()));
+    }
+
+    /// The blocks themselves, in order, so a caller reading the values once can let each block go
+    /// as soon as it is through with it.
+    pub(crate) fn into_blocks(self) -> impl Iterator<Item = Vec<T>> {
+        self.full.into_iter().chain(std::iter::once(self.tail))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -61,6 +106,17 @@ impl<T: Copy> Blocks<T> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The value at `within` of block `block`, for a caller walking a position it already located.
+    #[inline]
+    pub(crate) fn slot(&self, block: usize, within: usize) -> &T {
+        if block < self.full.len() { &self.full[block][within] } else { &self.tail[within] }
+    }
+
+    #[inline]
+    pub(crate) fn slot_mut(&mut self, block: usize, within: usize) -> &mut T {
+        if block < self.full.len() { &mut self.full[block][within] } else { &mut self.tail[within] }
     }
 
     /// The values in the order they were pushed, a block at a time.
@@ -101,8 +157,27 @@ mod tests {
         let read: Vec<u64> = blocks.slices().flatten().copied().collect();
         assert_eq!(read, (0..200_000).collect::<Vec<_>>());
         // No block is larger than the cap, so a long list is many blocks and none was copied.
-        assert!(blocks.slices().all(|slice| slice.len() <= (256 << 10) / 8));
+        assert!(blocks.slices().all(|slice| slice.len() <= super::LARGEST));
         assert!(blocks.footprint() >= 200_000 * 8);
-        assert!(blocks.footprint() < 200_000 * 8 + (256 << 10) + 4096);
+        assert!(blocks.footprint() < 200_000 * 8 + super::LARGEST * 8 + 4096);
+    }
+
+    #[test]
+    fn blocks_are_read_and_written_by_place() {
+        let mut blocks: Blocks<[u64; 3]> = Blocks::default();
+        for value in 0..100_000_u64 {
+            blocks.push([value, 0, 0]);
+        }
+        for at in [0, 1, 127, 128, 383, 384, 1_000, 8_063, 8_064, 20_000, 99_999] {
+            let (block, within) = super::locate(at);
+            assert_eq!(super::start(block) + within, at);
+            assert!(within < super::size(block) && within < 1 << super::WITHIN_BITS);
+            assert_eq!(blocks.slot(block, within)[0], at as u64);
+            blocks.slot_mut(block, within)[1] = 1;
+        }
+        let read: Vec<[u64; 3]> = blocks.into_blocks().flatten().collect();
+        assert_eq!(read.len(), 100_000);
+        assert!(read.iter().enumerate().all(|(at, value)| value[0] == at as u64));
+        assert_eq!(read.iter().filter(|value| value[1] == 1).count(), 11);
     }
 }
