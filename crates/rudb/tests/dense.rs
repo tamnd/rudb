@@ -169,3 +169,58 @@ fn a_key_of_two_columns_groups_the_same() {
     let pair = Pair::new("pair", "SELECT i % 300 AS k, i AS v FROM range(0, 40000) AS r(i)");
     pair.the_same_either_way("SELECT k, v % 7, COUNT(*) FROM t GROUP BY k, v % 7 ORDER BY k, 2");
 }
+
+/// Counts and nothing else, which the aggregate keeps in arrays the key indexes rather than in its
+/// table. A null key and a null argument both have to come out the way the table had them: the
+/// null key as a group of its own and a null argument as a row `COUNT(*)` sees and `COUNT(v)` does
+/// not, so a group whose every `v` is null is still a group, with a count of zero.
+#[test]
+fn counts_alone_group_the_same_with_nulls_in_the_key_and_the_argument() {
+    let pair = Pair::new(
+        "counts",
+        "SELECT CASE WHEN i % 37 = 0 THEN NULL ELSE i % 300 END AS k,
+         CASE WHEN i % 300 = 5 OR i % 7 = 0 THEN NULL ELSE i END AS v
+         FROM range(0, 40000) AS r(i)",
+    );
+    pair.the_same_either_way(
+        "SELECT k, COUNT(*), COUNT(v), COUNT(*) AS again FROM t GROUP BY k ORDER BY k",
+    );
+    pair.the_same_either_way("SELECT k, COUNT(v) FROM t GROUP BY k ORDER BY k NULLS FIRST");
+}
+
+/// The counts of a narrow key below zero and of a key wide enough that eight threads each see most
+/// of its values, which is where adding one instance's arrays into another's has to agree with
+/// merging their tables.
+#[test]
+fn counts_alone_group_the_same_below_zero_and_across_threads() {
+    let pair = Pair::new(
+        "counted",
+        "SELECT ((i % 601) - 300)::SMALLINT AS s, (i * 7919 % 50000)::INTEGER AS k, i AS v
+         FROM range(0, 300000) AS r(i)",
+    );
+    pair.the_same_either_way("SELECT s, COUNT(*) FROM t GROUP BY s ORDER BY s");
+    pair.the_same_either_way("SELECT k, COUNT(v), COUNT(*) FROM t GROUP BY k ORDER BY k");
+    pair.the_same_either_way(
+        "SELECT c, COUNT(*) FROM (SELECT k, COUNT(*) AS c FROM t WHERE v % 3 = 0 GROUP BY k) \
+         GROUP BY c ORDER BY c",
+    );
+}
+
+/// The shape of TPC-H q13, a count of the matches of a left join grouped by the key of the side
+/// every row is kept from. The keys with no match arrive after the others with a null argument,
+/// and each is a group with a count of zero.
+#[test]
+fn counts_over_a_left_join_group_the_same() {
+    let pair = Pair::new("joined", "SELECT i AS k, i * 3 AS v FROM range(1, 20001) AS r(i)");
+    let other = "CREATE TABLE u AS SELECT i % 30000 AS f, i AS w FROM range(0, 90000) AS r(i) \
+                 WHERE i % 30000 % 3 <> 0";
+    pair.memory.execute(other).expect("the memory side is made");
+    pair.file.execute(other).expect("the file side is made");
+    pair.the_same_either_way(
+        "SELECT c, COUNT(*) FROM (SELECT k, COUNT(w) AS c FROM t LEFT JOIN u ON k = f \
+         GROUP BY k) GROUP BY c ORDER BY c",
+    );
+    pair.the_same_either_way(
+        "SELECT k, COUNT(w), COUNT(*) FROM t LEFT JOIN u ON k = f GROUP BY k ORDER BY k",
+    );
+}
