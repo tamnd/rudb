@@ -138,7 +138,7 @@ fn answer_native_csv_once(options: &Options) -> Option<String> {
     } else if expression.eq_ignore_ascii_case("count(distinct") {
         answer_distinct_csv_once(options)
     } else if expression.ends_with(',') {
-        answer_group_count_csv_once(options).or_else(|| answer_group_distinct_csv_once(options))
+        answer_group_count_csv_once(options)
     } else {
         None
     }
@@ -153,17 +153,6 @@ fn answer_nonzero_csv_once(options: &Options) -> Option<String> {
 fn answer_group_count_csv_once(options: &Options) -> Option<String> {
     let sql = standard_native_csv_statement(options)?;
     let rows = Database::query_native_group_count_once(&options.database, sql).ok().flatten()?;
-    let mut csv = String::with_capacity(rows.len() * 24);
-    for (value, count) in rows {
-        csv.push_str(&format!("{value},{count}\n"));
-    }
-    Some(csv)
-}
-
-fn answer_group_distinct_csv_once(options: &Options) -> Option<String> {
-    let sql = standard_native_csv_statement(options)?;
-    let rows =
-        Database::query_native_grouped_distinct_once(&options.database, sql).ok().flatten()?;
     let mut csv = String::with_capacity(rows.len() * 24);
     for (value, count) in rows {
         csv.push_str(&format!("{value},{count}\n"));
