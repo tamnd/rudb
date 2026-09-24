@@ -6,6 +6,14 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.29
+
+A patch release of two commits, made because 0.4.28 went out without three of the changes its notes describe. The native directory format number stays at 29 and the storage format version at 9.
+
+#1770 was squashed from a branch that did not have #1767, #1768 or #1769, and its diff took all three back out, so 0.4.28 had none of them. #1772 puts them back: q11 reads its total off the held groups again and is at 0.105 G instructions on one thread against DuckDB's 0.149 G, q01 folds one counter for its repeated `count(*)` and is at 1.708 G against 2.137 G, and a hash join lets its gathered chunks go once they are laid out.
+
+#1770 gives an integer join key with between four and 256 values a gathered row apart its slot by rank in a bitmap over the key range instead of a hash, which took q21 to 1.484 G against DuckDB's 2.046 G on one thread.
+
 ## 0.4.28
 
 A patch release of seven commits, mostly on TPC-H under G10. The native directory format number stays at 29 and the storage format version at 9.
