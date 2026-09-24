@@ -521,7 +521,7 @@ pub fn refine_prepared(
     // One vectorized pass over a run of `u32` before any of the loops below index with them, which
     // is what turns a caller's mistake into this message rather than into a panic from inside a
     // macro generated loop eight frames down.
-    if kept.indices().iter().any(|&row| row as usize >= len) {
+    if !rudb_vector::below(kept.indices(), len) {
         return Err(Error::internal(format!("a selection past the end of a {len} row vector")));
     }
     if kept.is_empty() {

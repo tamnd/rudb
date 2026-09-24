@@ -72,7 +72,7 @@ pub fn selection(flags: &Vector, rows: usize) -> Selection {
 ///
 /// If a position in `kept` is past the end of `flags`.
 pub fn refine(flags: &Vector, kept: &Selection) -> Result<Selection> {
-    if kept.indices().iter().any(|&row| row as usize >= flags.len()) {
+    if !rudb_vector::below(kept.indices(), flags.len()) {
         return Err(Error::internal(format!(
             "a selection past the end of a {} row vector",
             flags.len()

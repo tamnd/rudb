@@ -1611,7 +1611,7 @@ fn signed_rows(key: &Vector, rows: usize, into: &mut Vec<i64>) -> bool {
         let Ok(base) = i64::try_from(packed.base()) else {
             return false;
         };
-        if at.iter().any(|&code| code as usize >= values.len()) {
+        if !rudb_vector::below(at, values.len()) {
             return false;
         }
         into.clear();
@@ -1678,7 +1678,7 @@ fn gathered(at: &[u32], values: &Vector, into: &mut Vec<i64>) -> bool {
     if at.iter().enumerate().any(|(row, &code)| (code as usize) < row) {
         return false;
     }
-    if !values.signed_block(into) || at.iter().any(|&code| code as usize >= into.len()) {
+    if !values.signed_block(into) || !rudb_vector::below(at, into.len()) {
         into.clear();
         return false;
     }
