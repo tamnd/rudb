@@ -534,6 +534,17 @@ name = "rudb-qc-ir"
 version = "0.4.32"
 
 [[package]]
+name = "rudb-qc-rt"
+version = "0.4.32"
+dependencies = [
+ "memchr",
+ "rudb-common",
+ "rudb-qc-interp",
+ "rudb-qc-ir",
+ "rudb-regex",
+]
+
+[[package]]
 name = "rudb-regex"
 version = "0.4.32"
 dependencies = [

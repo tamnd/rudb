@@ -43,6 +43,10 @@ rudb-qc-interp = 3
 # knows nothing about a schema, a plan or a binding, which is what lets an operator be tested with a
 # source made of two literal chunks and no planner anywhere in the picture.
 rudb-pipeline = 4
+# The query compiler's runtime: the pipeline ABI, strings, the hash table and every function compiled
+# code calls. Rank 4 because it needs the interpreter's `Runtime` trait and the regex engine and
+# nothing that knows about a plan, so the generator and the driver above can both reach it.
+rudb-qc-rt = 4
 
 # Storage and the format readers. None of these depends on the execution engine, which is what
 # keeps each of them usable and testable on its own.
