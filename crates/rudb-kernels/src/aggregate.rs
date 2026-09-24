@@ -52,6 +52,7 @@
 //! aggregate this is, and the match on which layout the column is in. All three of those are decided
 //! once per vector here and none of them per row.
 
+use std::array;
 use std::mem;
 use std::sync::Arc;
 
@@ -1841,30 +1842,19 @@ fn many_runs<T: Copy + TryInto<i64>>(
     let span = width + 1;
     let Some(cells) = groups.checked_mul(span) else { return Ok(false) };
     let mut folded = vec![0_i64; cells];
-    let mut start = 0;
-    for &(slot, end) in runs {
-        let from = start;
-        start = end;
-        if slot == NOWHERE {
-            continue;
-        }
-        // A slot past the groups is a bug elsewhere, and nothing has been folded yet, so the caller's
-        // loop gets to say so.
-        let Some(cells) = folded.get_mut(slot * span..).and_then(|rest| rest.get_mut(..span))
-        else {
-            return Ok(false);
-        };
-        for (total, &(_, _, values)) in cells.iter_mut().zip(group) {
-            let Some(run) = values.get(from..end) else { return Ok(false) };
-            let mut sum = *total;
-            for &value in run {
-                let Ok(value) = value.try_into() else { return Ok(false) };
-                let Some(next) = sum.checked_add(value) else { return Ok(false) };
-                sum = next;
+    // A width the compiler knows is a walk whose columns and totals are named rather than looked up,
+    // which is what the run visit costs most of, so the widths a query reaches each get a walk of
+    // their own and anything wider reads its calls out of the list as it goes.
+    macro_rules! widths {
+        ($($width:literal),+ $(,)?) => {
+            match width {
+                $($width => walk_runs::<$width, T>(&mut folded, runs, group),)+
+                _ => walk_any(&mut folded, runs, span, group),
             }
-            *total = sum;
-        }
-        cells[width] += (end - from) as i64;
+        };
+    }
+    if !widths!(1, 2, 3, 4, 5, 6, 7, 8) {
+        return Ok(false);
     }
     for (slot, cells) in folded.chunks_exact(span).enumerate() {
         let Some(&count) = cells.last() else { return Ok(false) };
@@ -1879,6 +1869,95 @@ fn many_runs<T: Copy + TryInto<i64>>(
         }
     }
     Ok(true)
+}
+
+/// [`many_runs`]'s walk of the runs, for a pass whose width the compiler knows.
+///
+/// A visit to a run costs about seventy instructions beyond the values it reads, and q01's runs of one
+/// group average 2.81 rows, so what the walk spends is mostly the visiting. Most of that per call: the
+/// call's column loaded out of the list, the slice of it the run covers bounds checked, and the group's
+/// total loaded and stored back. Named at compile time the columns are registers held across the whole
+/// walk, the totals are registers held across the run, and the loop over the calls is not a loop.
+///
+/// `false` with `folded` left however far it got, which the caller only reads on `true`, for the misses
+/// [`many_runs`] documents: a value that does not fit an `i64`, a total that leaves one, and a slot or a
+/// run past what the caller said there would be.
+fn walk_runs<const W: usize, T: Copy + TryInto<i64>>(
+    folded: &mut [i64],
+    runs: &[(usize, usize)],
+    group: &[(usize, Feed, &[T])],
+) -> bool {
+    let span = W + 1;
+    let Ok(group): std::result::Result<&[(usize, Feed, &[T]); W], _> = group.try_into() else {
+        return false;
+    };
+    let columns: [&[T]; W] = array::from_fn(|call| group[call].2);
+    let mut start = 0;
+    for &(slot, end) in runs {
+        let from = start;
+        start = end;
+        if slot == NOWHERE {
+            continue;
+        }
+        // A slot past the groups is a bug elsewhere, and nothing has been folded yet, so the caller's
+        // loop gets to say so.
+        let Some(cells) = folded.get_mut(slot * span..).and_then(|rest| rest.get_mut(..span))
+        else {
+            return false;
+        };
+        let mut sums: [i64; W] = array::from_fn(|call| cells[call]);
+        for (sum, values) in sums.iter_mut().zip(columns) {
+            let Some(run) = values.get(from..end) else { return false };
+            for &value in run {
+                let Ok(value) = value.try_into() else { return false };
+                let Some(next) = sum.checked_add(value) else { return false };
+                *sum = next;
+            }
+        }
+        for (cell, &sum) in cells.iter_mut().zip(&sums) {
+            *cell = sum;
+        }
+        cells[W] += (end - from) as i64;
+    }
+    true
+}
+
+/// [`walk_runs`] for a pass wider than any width it is written for, reading its calls out of the list.
+///
+/// A query with nine folding aggregates over one layout in one `GROUP BY` is past the point where the
+/// named widths are worth compiling, and a pass of no calls at all comes here too, since a count wants
+/// the walk and the run lengths and has no column to read.
+fn walk_any<T: Copy + TryInto<i64>>(
+    folded: &mut [i64],
+    runs: &[(usize, usize)],
+    span: usize,
+    group: &[(usize, Feed, &[T])],
+) -> bool {
+    let width = group.len();
+    let mut start = 0;
+    for &(slot, end) in runs {
+        let from = start;
+        start = end;
+        if slot == NOWHERE {
+            continue;
+        }
+        let Some(cells) = folded.get_mut(slot * span..).and_then(|rest| rest.get_mut(..span))
+        else {
+            return false;
+        };
+        for (total, &(_, _, values)) in cells.iter_mut().zip(group) {
+            let Some(run) = values.get(from..end) else { return false };
+            let mut sum = *total;
+            for &value in run {
+                let Ok(value) = value.try_into() else { return false };
+                let Some(next) = sum.checked_add(value) else { return false };
+                sum = next;
+            }
+            *total = sum;
+        }
+        cells[width] += (end - from) as i64;
+    }
+    true
 }
 
 /// Adds one group's total of one call, and how many rows it came from, into that call's accumulator.
