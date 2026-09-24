@@ -10813,8 +10813,16 @@ fn decode_membership(bytes: &[u8]) -> Result<Vec<u32>> {
     Ok(codes)
 }
 
+/// A varchar page as a dictionary of its distinct values and a code a row, or `None` when that does
+/// not come out smaller than the raw form.
+///
+/// Every text page that no global dictionary claims asks this first, including the page of
+/// comments that never has a repeat, so the map is hashed with [`Spread`] rather than SipHash and
+/// sized for the page up front. With the default hasher and growth it was 4% of the instructions of
+/// a `lineitem` load from CSV, all of it on `l_comment` pages this then refused.
 fn string_dictionary(vector: &Vector) -> Result<Option<Vec<u8>>> {
-    let mut by_text = HashMap::new();
+    let mut by_text: HashMap<&[u8], u32, Spread> =
+        HashMap::with_capacity_and_hasher(vector.len(), Spread);
     let mut values = Vec::new();
     let mut codes = Vec::with_capacity(vector.len());
     let mut plain_bytes = 0_usize;
