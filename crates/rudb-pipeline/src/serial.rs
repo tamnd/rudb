@@ -134,7 +134,14 @@ pub(crate) fn through(
             }
         }
 
-        match pipeline.sink().sink_state(chunk, &mut locals.sink)? {
+        // With nothing above owed another look at the chunk it is the sink's to keep, and a sink that
+        // holds its chunks, like a load's, keeps it rather than copying every column of it.
+        let sunk = if again.is_empty() {
+            pipeline.sink().sink_taking_state(chunk, &mut locals.sink)?
+        } else {
+            pipeline.sink().sink_state(chunk, &mut locals.sink)?
+        };
+        match sunk {
             Progress::Blocked(blocked) => return Err(parked(pipeline, blocked)),
             Progress::Done => finished = true,
             // A sink produces nothing, so there is nothing for it to have more of.

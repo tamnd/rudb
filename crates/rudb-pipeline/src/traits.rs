@@ -342,6 +342,21 @@ pub trait Sink: Send + Sync + fmt::Debug {
     /// and never an abort.
     fn sink(&self, chunk: &Chunk, local: &mut Self::Local) -> Result<Progress>;
 
+    /// [`Sink::sink`], for a chunk nothing will read again once the sink has it.
+    ///
+    /// A sink that keeps the chunks it is given can take this one with `std::mem::take` rather than
+    /// copying it. The driver calls this rather than `sink` when no operator above has more output
+    /// in the chunk, and the next read overwrites it either way. A sink that takes it must answer
+    /// [`Progress::More`] or [`Progress::Done`], because a blocked sink is handed the same chunk
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Sink::sink`].
+    fn sink_taking(&self, chunk: &mut Chunk, local: &mut Self::Local) -> Result<Progress> {
+        self.sink(chunk, local)
+    }
+
     /// Merge one instance's local state into the global state.
     ///
     /// Takes the local state by value, which is not a detail. Consuming it is what makes merging

@@ -2224,6 +2224,38 @@ struct NativeSink {
 }
 
 impl NativeSink {
+    /// Checks the chunk's NOT NULL columns and holds it for the next stripe.
+    fn keep(&self, chunk: Chunk, place: &mut NativePlace) -> Result<Progress> {
+        for (at, field) in self.fields.iter().enumerate().filter(|(_, field)| field.not_null) {
+            let vector = chunk.column(at)?;
+            let null = match vector.form() {
+                Form::Dictionary | Form::Rle => (0..vector.len()).any(|row| vector.is_null_at(row)),
+                _ => vector.validity().has_nulls(vector.len()),
+            };
+            if null {
+                return Err(Error::constraint(format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    self.table, field.name
+                )));
+            }
+        }
+        place.start();
+        place.rows = place.rows.saturating_add(chunk.len() as u64);
+        let footprint = chunk.footprint() as u64;
+        place.bytes = place.bytes.saturating_add(footprint);
+        place.holding = place.holding.saturating_add(footprint);
+        self.profile.hold(footprint);
+        place.held.push(((place.morsel, place.chunk), chunk));
+        place.chunk = place.chunk.saturating_add(1);
+        if place.held.len() == FEED_PARTS {
+            self.feed(place)?;
+        }
+        if place.fed.saturating_add(place.held.len()) == rudb_native::STRIPE_PARTS {
+            self.hand_over(place)?;
+        }
+        Ok(Progress::More)
+    }
+
     fn create(
         target: &Path,
         name: String,
@@ -2371,34 +2403,13 @@ impl Sink for NativeSink {
     }
 
     fn sink(&self, chunk: &Chunk, place: &mut Self::Local) -> Result<Progress> {
-        for (at, field) in self.fields.iter().enumerate().filter(|(_, field)| field.not_null) {
-            let vector = chunk.column(at)?;
-            let null = match vector.form() {
-                Form::Dictionary | Form::Rle => (0..vector.len()).any(|row| vector.is_null_at(row)),
-                _ => vector.validity().has_nulls(vector.len()),
-            };
-            if null {
-                return Err(Error::constraint(format!(
-                    "NOT NULL constraint failed: {}.{}",
-                    self.table, field.name
-                )));
-            }
-        }
-        place.start();
-        place.rows = place.rows.saturating_add(chunk.len() as u64);
-        let footprint = chunk.footprint() as u64;
-        place.bytes = place.bytes.saturating_add(footprint);
-        place.holding = place.holding.saturating_add(footprint);
-        self.profile.hold(footprint);
-        place.held.push(((place.morsel, place.chunk), chunk.clone()));
-        place.chunk = place.chunk.saturating_add(1);
-        if place.held.len() == FEED_PARTS {
-            self.feed(place)?;
-        }
-        if place.fed.saturating_add(place.held.len()) == rudb_native::STRIPE_PARTS {
-            self.hand_over(place)?;
-        }
-        Ok(Progress::More)
+        self.keep(chunk.clone(), place)
+    }
+
+    /// Keeps the chunk itself rather than a copy of it, which on a `lineitem` load from CSV was
+    /// about a tenth of the page faults and all of the copying the sink did.
+    fn sink_taking(&self, chunk: &mut Chunk, place: &mut Self::Local) -> Result<Progress> {
+        self.keep(std::mem::replace(chunk, Chunk::empty(&[])), place)
     }
 
     fn combine(&self, mut local: Self::Local) -> Result<()> {

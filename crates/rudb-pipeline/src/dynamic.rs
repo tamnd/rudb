@@ -162,6 +162,13 @@ pub trait DynSink: Send + Sync + fmt::Debug {
     /// Whatever the typed operator reports, plus an internal error if the state is the wrong one.
     fn sink_state(&self, chunk: &Chunk, local: &mut LocalState) -> Result<Progress>;
 
+    /// Take one chunk that nothing will read again. See [`Sink::sink_taking`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever the typed operator reports, plus an internal error if the state is the wrong one.
+    fn sink_taking_state(&self, chunk: &mut Chunk, local: &mut LocalState) -> Result<Progress>;
+
     /// Merge one instance's local state into the global state.
     ///
     /// # Errors
@@ -206,6 +213,10 @@ impl<S: Sink> DynSink for S {
 
     fn sink_state(&self, chunk: &Chunk, local: &mut LocalState) -> Result<Progress> {
         self.sink(chunk, local.downcast_mut::<S::Local>()?)
+    }
+
+    fn sink_taking_state(&self, chunk: &mut Chunk, local: &mut LocalState) -> Result<Progress> {
+        self.sink_taking(chunk, local.downcast_mut::<S::Local>()?)
     }
 
     fn combine_state(&self, local: LocalState) -> Result<()> {
