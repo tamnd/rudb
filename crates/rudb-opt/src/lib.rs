@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Twenty seven passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Twenty eight passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -39,6 +39,7 @@ pub mod pass;
 pub mod presize;
 pub mod reorder;
 pub mod semi;
+pub mod shared;
 pub mod sides;
 pub mod tables;
 pub mod topn;
@@ -181,11 +182,12 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 27] = [
+pub static PASSES: [&(dyn Pass + Sync); 28] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &fromkey::AnswersFromTheKey,
+    &shared::CommonAggregate,
     &filter::FilterPushdown,
     &delim::Deliminator,
     &order::JoinOrder,
@@ -214,7 +216,7 @@ pub static PASSES: [&(dyn Pass + Sync); 27] = [
 /// Every name `SET disabled_optimizers` accepts, which is every name DuckDB accepts.
 ///
 /// `SELECT name FROM duckdb_optimizers()` on the pinned binary, sorted, all forty four of them.
-/// Fifteen of them name a pass [`PASSES`] holds, and every name here is one rudb takes without
+/// Sixteen of them name a pass [`PASSES`] holds, and every name here is one rudb takes without
 /// complaint, because turning off a pass that does not exist is a thing that has already happened.
 ///
 /// Accepting the other twenty nine is the whole point. Forty five files in the upstream corpus run a
