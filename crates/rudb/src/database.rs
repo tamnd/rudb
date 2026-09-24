@@ -227,6 +227,49 @@ fn native_simple_group_count_statement(sql: &str) -> Option<(&str, &str)> {
     .then_some((table, key))
 }
 
+/// A grouped distinct count ordered by its count. A matching ordered, covering native
+/// projection supplies rows to count at query time; no grouped result is stored.
+fn native_grouped_distinct_statement(sql: &str) -> Option<(&str, &str, &str, usize)> {
+    let statement = sql.trim();
+    let statement = statement.strip_suffix(';').unwrap_or(statement).trim_end();
+    let mut words = statement.split_ascii_whitespace();
+    let select = words.next()?;
+    let group = words.next()?.strip_suffix(',')?;
+    let aggregate = words.next()?;
+    let distinct = words.next()?.strip_suffix(')')?;
+    let as_keyword = words.next()?;
+    let alias = words.next()?;
+    let from = words.next()?;
+    let table = words.next()?;
+    let group_keyword = words.next()?;
+    let group_by = words.next()?;
+    let grouped = words.next()?;
+    let order_keyword = words.next()?;
+    let order_by = words.next()?;
+    let ordered = words.next()?;
+    let descending = words.next()?;
+    let limit_keyword = words.next()?;
+    let limit = words.next()?.parse::<usize>().ok()?;
+    (words.next().is_none()
+        && select.eq_ignore_ascii_case("select")
+        && aggregate.eq_ignore_ascii_case("count(distinct")
+        && as_keyword.eq_ignore_ascii_case("as")
+        && from.eq_ignore_ascii_case("from")
+        && group_keyword.eq_ignore_ascii_case("group")
+        && group_by.eq_ignore_ascii_case("by")
+        && order_keyword.eq_ignore_ascii_case("order")
+        && order_by.eq_ignore_ascii_case("by")
+        && descending.eq_ignore_ascii_case("desc")
+        && limit_keyword.eq_ignore_ascii_case("limit")
+        && grouped.eq_ignore_ascii_case(group)
+        && ordered.eq_ignore_ascii_case(alias)
+        && native_simple_unquoted_identifier(table)
+        && native_simple_unquoted_identifier(group)
+        && native_simple_unquoted_identifier(distinct)
+        && native_simple_unquoted_identifier(alias))
+    .then_some((table, group, distinct, limit))
+}
+
 /// Recognizes the one aggregate whose exact answer is certified by a native frequency synopsis.
 /// Keep this check strict: every clause it does not understand belongs to the regular binder.
 fn native_nonzero_shape(ast: &Ast) -> Option<(&str, &str, &str)> {
@@ -707,6 +750,33 @@ fn runtime(config: &Config) -> Pool {
 }
 
 impl Database {
+    /// Count a grouped distinct query from an ordered, covering native projection if one is
+    /// current. The projection stores row values and this call performs the aggregate.
+    pub fn query_native_grouped_distinct_once(
+        path: &str,
+        sql: &str,
+    ) -> Result<Option<Vec<(i32, u64)>>> {
+        let Some((table, group, distinct, limit)) = native_grouped_distinct_statement(sql) else {
+            return Ok(None);
+        };
+        let catalog = rudb_native::Catalog::open(path)?;
+        let Some(name) = catalog.names().find(|name| name.eq_ignore_ascii_case(table)) else {
+            return Ok(None);
+        };
+        let Some(fields) = catalog.table_fields(name) else { return Ok(None) };
+        let Some(group) = fields.iter().position(|field| field.name.eq_ignore_ascii_case(group))
+        else {
+            return Ok(None);
+        };
+        let Some(distinct) =
+            fields.iter().position(|field| field.name.eq_ignore_ascii_case(distinct))
+        else {
+            return Ok(None);
+        };
+        let reader = catalog.table(name)?;
+        reader.grouped_distinct_projection(distinct, group, limit)
+    }
+
     /// Returns a filtered count for the narrow read-only CSV path without building a query
     /// result. The count is derived from a leading zero frequency, the row count, and
     /// null statistics when the statement runs.
@@ -3978,6 +4048,37 @@ mod tests {
             ]
         );
         drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn grouped_distinct_uses_current_ordered_rows_when_projection_covers_both_columns() {
+        let path = std::env::temp_dir()
+            .join(format!("rudb-grouped-distinct-projection-{}.rdb", std::process::id()));
+        let name = path.to_str().unwrap();
+        let database = Database::open(name).unwrap();
+        database
+            .execute("CREATE TABLE events (user_id BIGINT NOT NULL, region_id INTEGER NOT NULL)")
+            .unwrap();
+        database
+            .execute("INSERT INTO events VALUES (9, 7), (2, 1), (9, 7), (2, 2), (2, 2), (5, 1)")
+            .unwrap();
+        drop(database);
+        let sql = "SELECT region_id, COUNT(DISTINCT user_id) AS users FROM events GROUP BY region_id ORDER BY users DESC LIMIT 10";
+        assert_eq!(Database::query_native_grouped_distinct_once(name, sql).unwrap(), None);
+        rudb_native::build_sorted_projection(name, "events", "user_id", "region_id").unwrap();
+        assert_eq!(
+            Database::query_native_grouped_distinct_once(name, sql).unwrap(),
+            Some(vec![(1, 2), (2, 1), (7, 1)]),
+        );
+        assert_eq!(
+            Database::query_native_grouped_distinct_once(name, "SELECT region_id, COUNT(DISTINCT user_id) AS users FROM events WHERE region_id = 1 GROUP BY region_id ORDER BY users DESC LIMIT 10").unwrap(),
+            None,
+        );
+        let database = Database::open(name).unwrap();
+        database.execute("INSERT INTO events VALUES (3, 1)").unwrap();
+        drop(database);
+        assert_eq!(Database::query_native_grouped_distinct_once(name, sql).unwrap(), None);
         std::fs::remove_file(path).unwrap();
     }
 

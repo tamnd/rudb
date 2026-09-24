@@ -535,6 +535,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-projection"
+version = "0.4.22"
+dependencies = [
+ "rudb-native",
+]
+
+[[package]]
 name = "rudb-regex"
 version = "0.4.23"
 dependencies = [
