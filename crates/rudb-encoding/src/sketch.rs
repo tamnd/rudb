@@ -603,11 +603,41 @@ pub fn hash64(value: &[u8]) -> u64 {
     }
     let rest = chunks.remainder();
     if !rest.is_empty() {
-        let mut last = [0u8; 8];
-        last[..rest.len()].copy_from_slice(rest);
-        state = mix(state ^ u64::from_le_bytes(last), SEEDS[3]);
+        state = mix(state ^ tail(value, rest), SEEDS[3]);
     }
     mix(state, SEEDS[1])
+}
+
+/// The last one to seven bytes of `value`, which are `rest`, as the little endian word they make
+/// padded with zeroes above.
+///
+/// Copying them into a zeroed word is the plain way, and it was a call to `memcpy` a string and a
+/// load that waited on the copy's stores, about a fifth of what counting the distinct values of a
+/// `lineitem` load spends. So the word is read with loads of a fixed width instead. A value of eight
+/// bytes or more has a whole word ending where it ends, and shifting that right leaves the tail. A
+/// shorter one is two loads that may overlap, and bytes that overlap are the same byte in the same
+/// place, so or-ing them together changes nothing.
+fn tail(value: &[u8], rest: &[u8]) -> u64 {
+    let len = rest.len();
+    if let Some(word) = value.len().checked_sub(8).and_then(|at| value.get(at..)) {
+        return word_at(word, 0) >> (8 * (8 - len));
+    }
+    let at = |index: usize| u64::from(rest.get(index).copied().unwrap_or(0));
+    if len >= 4 {
+        u64::from(half_at(rest, 0)) | (u64::from(half_at(rest, len - 4)) << (8 * (len - 4)))
+    } else {
+        at(0) | (at(len / 2) << (8 * (len / 2))) | (at(len - 1) << (8 * (len - 1)))
+    }
+}
+
+/// Eight bytes from `at` as a little endian word, or zero past the end, which no caller reaches.
+fn word_at(bytes: &[u8], at: usize) -> u64 {
+    bytes.get(at..at + 8).and_then(|word| word.try_into().ok()).map_or(0, u64::from_le_bytes)
+}
+
+/// Four bytes from `at` as a little endian word, the same way.
+fn half_at(bytes: &[u8], at: usize) -> u32 {
+    bytes.get(at..at + 4).and_then(|word| word.try_into().ok()).map_or(0, u32::from_le_bytes)
 }
 
 /// The hash of a 16 byte integer, which is what every fixed width number is widened to before it
@@ -913,6 +943,34 @@ mod tests {
             let value = step.wrapping_mul(0x9e37_79b9_7f4a_7c15_1234_5678_9abc_def1);
             assert_eq!(hash128(value), hash64(&value.to_le_bytes()), "for {value}");
         }
+    }
+
+    /// The tail read with fixed loads is the zero padded copy it replaced, for every length a tail
+    /// can have and every offset a string can start at inside a longer one.
+    #[test]
+    fn hash64_matches_the_padded_tail() {
+        fn plain(value: &[u8]) -> u64 {
+            let mut state = SEEDS[0] ^ mix(value.len() as u64, SEEDS[1]);
+            let mut chunks = value.chunks_exact(8);
+            for chunk in &mut chunks {
+                state = mix(state ^ u64::from_le_bytes(chunk.try_into().unwrap()), SEEDS[2]);
+            }
+            let rest = chunks.remainder();
+            if !rest.is_empty() {
+                let mut last = [0u8; 8];
+                last[..rest.len()].copy_from_slice(rest);
+                state = mix(state ^ u64::from_le_bytes(last), SEEDS[3]);
+            }
+            mix(state, SEEDS[1])
+        }
+        let bytes: Vec<u8> = (0..64_u32).map(|at| (at.wrapping_mul(0x9E) ^ 0xA5) as u8).collect();
+        for start in 0..8 {
+            for len in 0..40 {
+                let value = &bytes[start..start + len];
+                assert_eq!(hash64(value), plain(value), "for {len} bytes at {start}");
+            }
+        }
+        assert_eq!(hash64(&[0xFF; 7]), plain(&[0xFF; 7]));
     }
 
     #[test]
