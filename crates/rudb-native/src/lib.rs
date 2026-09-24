@@ -33,7 +33,7 @@
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::mem::{size_of, size_of_val};
@@ -631,34 +631,6 @@ impl Default for Candidates {
     }
 }
 
-/// Starts the exact distinct count of a column whose candidate table is about to turn a value away.
-///
-/// Until then nothing was decremented and the table holds every value seen, so the set starts as
-/// those values and `ended`, the run about to be added. It is the caller's to insert every value
-/// after that. A column the close decided not to count gets a set that has already given up.
-fn count_from_full(
-    first: &Candidates,
-    distinct: &mut Option<distinct::ExactDistinct>,
-    ended: Option<u64>,
-    counted: bool,
-) {
-    if distinct.is_some() || !first.full() {
-        return;
-    }
-    if !counted {
-        *distinct = Some(distinct::ExactDistinct::declined());
-        return;
-    }
-    let mut set = distinct::ExactDistinct::new();
-    for held in first.held_bits() {
-        set.insert(held);
-    }
-    if let Some(ended) = ended {
-        set.insert(ended);
-    }
-    *distinct = Some(set);
-}
-
 impl Candidates {
     /// Counts `times` rows of `bits` and ends in the state `times` rows counted one at a time would.
     ///
@@ -694,16 +666,6 @@ impl Candidates {
             self.decrement();
             times -= 1;
         }
-    }
-
-    /// Whether a value not held yet would decrement the table rather than take a slot.
-    fn full(&self) -> bool {
-        self.held + usize::from(self.nulls != 0) >= FREQUENCY_CANDIDATES
-    }
-
-    /// The values held, in no particular order.
-    fn held_bits(&self) -> impl Iterator<Item = u64> + '_ {
-        self.slots.iter().filter(|slot| slot.count != 0).map(|slot| slot.bits)
     }
 
     /// The slot holding `bits` and `true`, or the empty slot a search for it stopped at and `false`.
@@ -2910,8 +2872,7 @@ impl Writer {
         };
         let value_of = |bits: Option<u64>| match bits {
             None => FrequencyValue::Null,
-            Some(bits) if signed => FrequencyValue::Integer(i128::from(bits as i64)),
-            Some(bits) => FrequencyValue::Integer(i128::from(bits)),
+            Some(bits) => integer_value(bits, signed),
         };
         // A column the writer's tally held whole has its exact counts already, gathered as the rows
         // went past, so the pages are not read back to count them again. On `hits` that is most of
@@ -2924,48 +2885,48 @@ impl Writer {
             .filter(|gather| gather.rows() == self.table.rows as u64)
             .and_then(stats::Gather::frequencies)
             .and_then(|(values, nulls)| {
-                let exact = values
+                let entries = values
                     .iter()
-                    .map(|(value, count)| Some((frequency_bits(value)?, *count)))
-                    .collect::<Option<FrequencyMap<_>>>()?;
-                Some((exact, (nulls != 0).then_some(nulls), values.len() as u64))
+                    .map(|(value, count)| {
+                        let value = value_of(Some(frequency_bits(value)?));
+                        Some(FrequencyEntry { value, count: *count })
+                    })
+                    .chain((nulls != 0).then_some(Some(FrequencyEntry {
+                        value: FrequencyValue::Null,
+                        count: nulls,
+                    })))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((entries, values.len() as u64))
             });
-        let (exact, null_count, decrements, distinct_count) = match tallied {
-            Some((exact, null_count, distinct)) => (exact, null_count, 0, Some(distinct)),
-            None => {
+        // A column the sketch expects to fit the exact set is counted there, every value with the
+        // rows holding it, which is its distinct count and its frequencies from one read of its
+        // pages. Only a column past the set's cap goes through the candidate table.
+        let exact = match (&tallied, counted) {
+            (None, true) => self.exact_frequency(column, signed)?,
+            _ => None,
+        };
+        let (mut entries, decrements, distinct_count) = match (tallied, exact) {
+            (Some((entries, distinct)), _) => (entries, 0, Some(distinct)),
+            (None, Some((Some(entries), distinct))) => (entries, 0, Some(distinct)),
+            (None, Some((None, distinct))) => return Ok((None, Some(distinct))),
+            (None, None) => {
                 // Rows arrive a run of equal values at a time, because a sorted column is runs and
                 // a flag column is mostly one value, so a run is counted and inserted once rather
                 // than per row.
-                //
-                // The exact distinct count is left alone until the candidate table is full. Until
-                // then no candidate has been decremented, so the table holds every value the column
-                // has had and its size is the count. Most columns never fill it and so never build
-                // the set. The one that fills it hands the set everything it holds at that moment,
-                // plus the run it is about to add, and the set carries on from there as it always
-                // did.
                 let mut first = Candidates::default();
-                let mut distinct: Option<distinct::ExactDistinct> = None;
                 let mut run = Run::default();
                 self.visit_numeric(column, signed, |_, bits| {
                     if let Some((ended, times)) = run.push(bits) {
-                        count_from_full(&first, &mut distinct, ended, counted);
                         first.add(ended, times);
-                    }
-                    if run.times == 1 {
-                        if let (Some(distinct), Some(bits)) = (distinct.as_mut(), bits) {
-                            distinct.insert(bits);
-                        }
                     }
                 })?;
                 if let Some((bits, times)) = run.take() {
-                    count_from_full(&first, &mut distinct, bits, counted);
                     first.add(bits, times);
                 }
-                let distinct_count = match distinct.as_mut() {
-                    Some(distinct) => distinct.count(),
-                    None => Some(first.held as u64),
-                };
+                // Until a candidate is turned away the table holds every value the column has, so
+                // its size is the count.
                 let (nulls, decrements) = (first.nulls, first.decrements);
+                let distinct_count = (decrements == 0).then_some(first.held as u64);
                 let (exact, null_count) = if decrements == 0 {
                     let exact = first
                         .pairs()
@@ -3014,14 +2975,17 @@ impl Writer {
                         .collect::<FrequencyMap<_>>();
                     (exact, null_count)
                 };
-                (exact, null_count, decrements, distinct_count)
+                let entries = exact
+                    .into_iter()
+                    .map(|(bits, count)| FrequencyEntry { value: value_of(Some(bits)), count })
+                    .chain(
+                        null_count
+                            .map(|count| FrequencyEntry { value: FrequencyValue::Null, count }),
+                    )
+                    .collect::<Vec<_>>();
+                (entries, decrements, distinct_count)
             }
         };
-        let mut entries = exact
-            .into_iter()
-            .map(|(bits, count)| FrequencyEntry { value: value_of(Some(bits)), count })
-            .chain(null_count.map(|count| FrequencyEntry { value: FrequencyValue::Null, count }))
-            .collect::<Vec<_>>();
         let mut omitted_max = keep_most_frequent(&mut entries).max(decrements);
         // A complete value-to-count table is also the result of grouping this column.
         // Keep up to two leading frequencies for selectivity and equality predicates,
@@ -3067,6 +3031,77 @@ impl Writer {
             Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries }),
             distinct_count,
         ))
+    }
+
+    /// Counts every value of an integer column and the rows holding it, and hands back the
+    /// frequency entries worth keeping beside the distinct count, or nothing for a column with more
+    /// values than [`distinct::ExactCounts`] keeps.
+    ///
+    /// The entries are `None` for a column with no value common enough to be worth a synopsis. The
+    /// rule is the one the candidate table applied. A column with more values than that table holds
+    /// keeps its frequencies only if its tenth commonest value is held by more rows than a
+    /// Misra-Gries table of [`FREQUENCY_CANDIDATES`] could have decremented it by, which is its rows
+    /// over one more than the candidates. The counts kept are exact either way, so the largest one
+    /// left out is exact too and not the table's bound on it.
+    ///
+    /// Only the commonest entries and the ones tied with the first left out are built, since on a
+    /// column of a million values the rest are thrown away the moment they are ranked.
+    fn exact_frequency(
+        &self,
+        column: usize,
+        signed: bool,
+    ) -> Result<Option<(Option<Vec<FrequencyEntry>>, u64)>> {
+        let mut set = distinct::ExactCounts::new();
+        let mut nulls = 0_u64;
+        let mut run = Run::default();
+        let mut add = |bits: Option<u64>, times: u32| match bits {
+            Some(bits) => set.insert(bits, times),
+            None => nulls += u64::from(times),
+        };
+        self.visit_numeric(column, signed, |_, bits| {
+            if let Some((bits, times)) = run.push(bits) {
+                add(bits, times);
+            }
+        })?;
+        if let Some((bits, times)) = run.take() {
+            add(bits, times);
+        }
+        let Some(distinct) = set.count() else {
+            return Ok(None);
+        };
+        // The commonest counts, one more than the entries kept so that the first left out is here.
+        let mut top = std::collections::BinaryHeap::with_capacity(FREQUENCY_ENTRIES + 2);
+        let mut rank = |count: u64| {
+            if top.len() <= FREQUENCY_ENTRIES {
+                top.push(Reverse(count));
+            } else if top.peek().is_some_and(|&Reverse(least)| count > least) {
+                top.pop();
+                top.push(Reverse(count));
+            }
+        };
+        set.visit(|_, count| rank(count));
+        if nulls != 0 {
+            rank(nulls);
+        }
+        let top = top.into_sorted_vec();
+        let values = distinct + u64::from(nulls != 0);
+        if values > FREQUENCY_CANDIDATES as u64 {
+            let bound = self.table.rows as u64 / (FREQUENCY_CANDIDATES as u64 + 1);
+            if top.get(FREQUENCY_BUILD_RANK - 1).is_none_or(|&Reverse(count)| count <= bound) {
+                return Ok(Some((None, distinct)));
+            }
+        }
+        let least = top.get(FREQUENCY_ENTRIES).map_or(0, |&Reverse(count)| count);
+        let mut entries = Vec::with_capacity(FREQUENCY_ENTRIES + 1);
+        set.visit(|bits, count| {
+            if count >= least {
+                entries.push(FrequencyEntry { value: integer_value(bits, signed), count });
+            }
+        });
+        if nulls != 0 && nulls >= least {
+            entries.push(FrequencyEntry { value: FrequencyValue::Null, count: nulls });
+        }
+        Ok(Some((Some(entries), distinct)))
     }
 
     /// Hands every row of an integer column to `visit` as its ordinal and its sixty four bits, or
@@ -8166,6 +8201,15 @@ fn table_complete_numeric_frequencies(table: &Table) -> Vec<StoredNumericFrequen
 ///
 /// The same bits [`Writer::visit_numeric`] hands over: a signed value sign extended to `i64`, and an
 /// unsigned one as it is.
+/// The value a column's sixty four bits stand for, read as signed or unsigned the way the column is.
+fn integer_value(bits: u64, signed: bool) -> FrequencyValue {
+    if signed {
+        FrequencyValue::Integer(i128::from(bits as i64))
+    } else {
+        FrequencyValue::Integer(i128::from(bits))
+    }
+}
+
 fn frequency_bits(value: &Value) -> Option<u64> {
     Some(match value {
         Value::TinyInt(value) => i64::from(*value) as u64,
