@@ -309,6 +309,9 @@ pub(crate) struct Aggregate<'a> {
     schema: Schema,
     /// Whether there are no group expressions, so every row goes to the one slot.
     alone: bool,
+    /// How many groups an instance holds before it partitions, which is [`PARTITION_FROM`] or
+    /// [`FIXED_PARTITION_FROM`] by the width of the keys.
+    partition_from: usize,
     /// Whether any call is `DISTINCT`, and so whether the sets that answer that are built at all. A
     /// group by with a million groups and no `DISTINCT` anywhere in it used to allocate a million
     /// empty sets to look at none of them.
@@ -1164,6 +1167,19 @@ fn spare(memory: &Memory, room: u64) -> bool {
 /// same peak memory. Both numbers were measured in the same sweep and the lower one won everywhere.
 const PARTITION_FROM: usize = 4_096;
 
+/// [`PARTITION_FROM`] for an aggregate whose keys are all fixed width.
+///
+/// The four thousand was measured when every aggregate partitioned at the same count, and the
+/// aggregates it was measured on mostly group by a string. A string group costs its payload in every
+/// table it is copied into, so it pays to stop keeping it per instance early. A group of integers is
+/// a few dozen bytes, and splitting it into sixty four tables is then most of what the aggregate
+/// does: ClickBench 40 folds 75 thousand rows into 7 thousand groups, and each instance crossed four
+/// thousand, handed every group into its partitions a row at a time and merged them again at the
+/// close. At sixteen thousand it spends a fifth to a third less CPU, and ClickBench 32 and 35, which
+/// also group only by integers, come out the same within the noise. The same number for string keys
+/// made ClickBench 39 12 percent slower, which is why they keep the lower one.
+const FIXED_PARTITION_FROM: usize = 16_384;
+
 /// How many rows a partitioned instance puts aside before it splits them, which is a few hundred
 /// rows to each of the [`RADIX_PARTITIONS`]. See [`Aggregate::drain`].
 const GATHER_ROWS: usize = 16_384;
@@ -1334,11 +1350,17 @@ impl<'a> Aggregate<'a> {
         let template: Option<Vec<Accumulator>> =
             calls.iter().map(|call| Accumulator::new(&call.name, &call.returns).ok()).collect();
         let out = Buffered::new();
+        let partition_from = if keys.iter().all(|&key| fixed_width(plan.expr_type(key))) {
+            FIXED_PARTITION_FROM
+        } else {
+            PARTITION_FROM
+        };
         let aggregate = Self {
             plan,
             keys,
             constants,
             alone,
+            partition_from,
             sets: calls.iter().any(|call| call.distinct),
             every: by_vector.iter().all(|&yes| yes),
             count_only: !alone
@@ -3590,7 +3612,7 @@ impl<'a> Aggregate<'a> {
         !self.alone
             && self.max_groups.is_none()
             && self.started.load(Ordering::Relaxed) > 1
-            && (table.groups >= PARTITION_FROM || crowded(&self.memory))
+            && (table.groups >= self.partition_from || crowded(&self.memory))
     }
 
     /// Turns partitioning on for every instance, and puts whatever was already combined where it
@@ -7001,6 +7023,36 @@ fn narrow_key(ty: &LogicalType) -> bool {
     matches!(ty, LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer)
 }
 
+/// Whether a group key is stored in a fixed number of bytes, so a group of them carries nothing
+/// beside the table. See [`FIXED_PARTITION_FROM`].
+fn fixed_width(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::Boolean
+            | LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::HugeInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+            | LogicalType::UHugeInt
+            | LogicalType::Float
+            | LogicalType::Double
+            | LogicalType::Decimal { .. }
+            | LogicalType::Uuid
+            | LogicalType::Date
+            | LogicalType::Time
+            | LogicalType::Timestamp
+            | LogicalType::TimestampS
+            | LogicalType::TimestampMs
+            | LogicalType::TimestampNs
+            | LogicalType::TimestampTz
+    )
+}
+
 /// One signed integer key put back into the type the query asked for.
 ///
 /// The narrowing cannot lose anything, because the value came out of a column of this type in the
@@ -7749,18 +7801,18 @@ mod tests {
 
     /// The partitioned path, finished on more than one thread, which is what a large group by takes.
     ///
-    /// Five thousand groups is past [`PARTITION_FROM`], so the instances hand their tables to the
-    /// partitions and `finalize` finishes those partitions in parallel. What this pins is that every
-    /// group comes out exactly once. A partition finished twice doubles its counts and one nobody
-    /// finished loses its groups, and neither can happen on a table small enough to stay in one
-    /// piece, which is every other test in here.
+    /// Twenty thousand groups is past [`FIXED_PARTITION_FROM`], so the instances hand their tables
+    /// to the partitions and `finalize` finishes those partitions in parallel. What this pins is
+    /// that every group comes out exactly once. A partition finished twice doubles its counts and
+    /// one nobody finished loses its groups, and neither can happen on a table small enough to stay
+    /// in one piece, which is every other test in here.
     #[test]
     fn a_partitioned_aggregate_answers_every_group_once() {
         let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
         let (aggregate, out) = aggregate(&plan);
         let mut left = aggregate.local();
         let mut right = aggregate.local();
-        let values: Vec<i32> = (0..5_000).collect();
+        let values: Vec<i32> = (0..20_000).collect();
         for part in values.chunks(1_024) {
             aggregate.sink(&chunk(part), &mut left).expect("a chunk of groups");
             aggregate.sink(&chunk(part), &mut right).expect("the same groups again");
@@ -7770,9 +7822,9 @@ mod tests {
         let built = aggregate.built.lock().expect("readable");
         assert!(
             built.partitioning,
-            "five thousand groups on two instances is meant to take the partitioned path"
+            "twenty thousand groups on two instances is meant to take the partitioned path"
         );
-        assert!(built.local, "five thousand groups fit in the cache twice over");
+        assert!(built.local, "twenty thousand groups fit in the cache twice over");
         drop(built);
         aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
@@ -7898,10 +7950,11 @@ mod tests {
     /// #1111 and #1123, and the aggregate scaling is worth more than the reduction, so only the
     /// group count has a say now.
     ///
-    /// Five thousand groups is over [`PARTITION_FROM`] so this splits, and a bound of a thousand is
-    /// over the seventy eight groups a partition is left holding, so no partition throws anything
-    /// away and the pipeline above gets all five thousand. The TopN up there is what makes that
-    /// right: reducing here is an optimisation and never the thing that gives the answer.
+    /// Twenty thousand groups is over [`FIXED_PARTITION_FROM`] so this splits, and a bound of a
+    /// thousand is over the three hundred groups a partition is left holding, so no partition
+    /// throws anything away and the pipeline above gets all twenty thousand. The TopN up there is
+    /// what makes that right: reducing here is an optimisation and never the thing that gives the
+    /// answer.
     #[test]
     fn an_aggregate_under_a_pushed_down_bound_is_split_all_the_same() {
         // Two calls, so that the counted exchange, which owns a lone count, leaves this to the
@@ -7913,7 +7966,7 @@ mod tests {
         let aggregate = aggregate.top_counts(1_000, 0);
         let mut left = aggregate.local();
         let mut right = aggregate.local();
-        let values: Vec<i32> = (0..5_000).collect();
+        let values: Vec<i32> = (0..20_000).collect();
         for part in values.chunks(1_024) {
             aggregate.sink(&chunk(part), &mut left).expect("a chunk of groups");
             aggregate.sink(&chunk(part), &mut right).expect("the same groups again");
@@ -7922,13 +7975,13 @@ mod tests {
         aggregate.combine(right).expect("the second instance");
         assert!(
             aggregate.built.lock().expect("readable").partitioning,
-            "five thousand groups is over the line whatever the bound above says"
+            "twenty thousand groups is over the line whatever the bound above says"
         );
         aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
 
         assert_eq!(
             answer(&out).len(),
-            5_000,
+            20_000,
             "a bound over what a partition holds throws nothing away"
         );
     }
