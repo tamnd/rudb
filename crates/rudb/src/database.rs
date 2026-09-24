@@ -4125,6 +4125,9 @@ fn create_table(
     if !create.checks.is_empty() {
         catalog.table_mut(&create.name)?.set_checks(create.checks);
     }
+    if !create.order.is_empty() {
+        catalog.table_mut(&create.name)?.set_order(create.order);
+    }
     if !create.foreign.is_empty() {
         catalog.table_mut(&create.name)?.set_foreign(create.foreign);
     }

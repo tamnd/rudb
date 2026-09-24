@@ -2314,7 +2314,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(15)]]
+        vec![vec![Value::BigInt(16)]]
     );
 }
 
@@ -10061,4 +10061,46 @@ fn create_index_keeps_the_index_and_refuses_what_the_pin_refuses() {
     db.execute("CREATE INDEX r1 ON t(a)").unwrap();
     db.execute("ROLLBACK").unwrap();
     assert_eq!(values("SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'r1'"), ["0"]);
+}
+
+#[test]
+fn duckdb_constraints_lists_them_the_way_the_pin_does() {
+    let db = scripted(&[
+        "CREATE TABLE p (a INT PRIMARY KEY, b INT NOT NULL UNIQUE, c INT CHECK (c > 0))",
+        "CREATE TABLE q (z INT REFERENCES p(a), x INT, y INT, CHECK (x + y > abs(x)))",
+    ]);
+    let values = |sql: &str| -> Vec<String> {
+        db.query(sql)
+            .unwrap()
+            .rows()
+            .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    let sql = "SELECT table_name, constraint_index, constraint_type, constraint_text, expression, \
+               constraint_column_indexes, constraint_column_names, constraint_name, \
+               referenced_table, referenced_column_names FROM duckdb_constraints()";
+    assert_eq!(
+        values(sql),
+        [
+            "p|0|PRIMARY KEY|PRIMARY KEY(a)|NULL|[0]|[a]|p_a_pkey|NULL|[]",
+            "p|1|NOT NULL|NOT NULL|NULL|[1]|[b]|p_b_not_null|NULL|[]",
+            "p|2|UNIQUE|UNIQUE(b)|NULL|[1]|[b]|p_b_key|NULL|[]",
+            "p|3|CHECK|CHECK((c > 0))|(c > 0)|[2]|[c]|p_c_check|NULL|[]",
+            "p|4|NOT NULL|NOT NULL|NULL|[0]|[a]|p_a_not_null|NULL|[]",
+            "q|5|FOREIGN KEY|FOREIGN KEY (z) REFERENCES p(a)|NULL|[0]|[z]|q_z_a_fkey|p|[a]",
+            "q|6|CHECK|CHECK(((x + y) > abs(x)))|((x + y) > abs(x))|[1, 2, 1]|[x, y, x]|\
+             q_x_y_x_check|NULL|[]",
+        ]
+    );
+    db.execute("ALTER TABLE q ADD COLUMN v INT").unwrap();
+    db.execute("ALTER TABLE q ADD COLUMN w INT").unwrap();
+    db.execute("ALTER TABLE q ALTER w SET NOT NULL").unwrap();
+    db.execute("ALTER TABLE q DROP COLUMN v").unwrap();
+    assert_eq!(
+        values(
+            "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() \
+                WHERE table_name = 'q'"
+        ),
+        ["FOREIGN KEY|[z]", "CHECK|[x, y, x]", "NOT NULL|[w]"]
+    );
 }

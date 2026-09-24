@@ -37,6 +37,20 @@ pub struct ForeignKey {
     pub referenced: Vec<usize>,
 }
 
+/// One constraint of a table, by its place in the list of its kind, which is how a table keeps the
+/// order its constraints were written in for `duckdb_constraints()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Constraint {
+    /// One of the table's keys.
+    Key(usize),
+    /// One of the table's `CHECK` constraints.
+    Check(usize),
+    /// One of the table's foreign keys.
+    Foreign(usize),
+    /// The `NOT NULL` of the column at this place.
+    NotNull(usize),
+}
+
 impl Key {
     /// The word the pin's message uses for the constraint.
     fn kind(&self) -> &'static str {

@@ -1064,6 +1064,8 @@ pub struct Table {
     checks: Vec<String>,
     /// The foreign keys this table's rows have to meet, in the order written.
     foreign: Vec<ForeignKey>,
+    /// The constraints in the order they were written, as far as that is known.
+    order: Vec<crate::Constraint>,
     /// The indexes over it, in the order they were created.
     indexes: Vec<crate::Index>,
     /// The sequences its defaults call `nextval` on, which it depends on the way the pin records it:
@@ -1096,6 +1098,7 @@ impl Table {
             defaults: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
+            order: Vec::new(),
             sequences: Vec::new(),
         })
     }
@@ -1124,6 +1127,7 @@ impl Table {
             defaults: Vec::new(),
             checks: Vec::new(),
             foreign,
+            order: Vec::new(),
             sequences: Vec::new(),
         })
     }
@@ -1535,6 +1539,39 @@ impl Table {
         self.foreign = foreign;
     }
 
+    /// Declares the order the table's constraints were written in.
+    pub fn set_order(&mut self, order: Vec<crate::Constraint>) {
+        self.order = order;
+    }
+
+    /// Every constraint of the table, in the order the pin lists them.
+    ///
+    /// That is the order they were written in, then the `NOT NULL` of each column that has one
+    /// nobody wrote, which is a primary key's or one an `ALTER` added. A constraint the kept order
+    /// does not know about, because a change after the table was made added it, goes after the
+    /// ones it does know, kind by kind.
+    #[must_use]
+    pub fn constraints(&self) -> Vec<crate::Constraint> {
+        use crate::Constraint;
+        let valid = |held: Constraint| match held {
+            Constraint::Key(at) => at < self.keys.len(),
+            Constraint::Check(at) => at < self.checks.len(),
+            Constraint::Foreign(at) => at < self.foreign.len(),
+            Constraint::NotNull(at) => self.columns.get(at).is_some_and(|field| field.not_null),
+        };
+        let rest = (0..self.keys.len()).map(Constraint::Key);
+        let rest = rest.chain((0..self.checks.len()).map(Constraint::Check));
+        let rest = rest.chain((0..self.foreign.len()).map(Constraint::Foreign));
+        let rest = rest.chain((0..self.columns.len()).map(Constraint::NotNull));
+        let mut out: Vec<Constraint> = Vec::new();
+        for held in self.order.iter().copied().chain(rest) {
+            if valid(held) && !out.contains(&held) {
+                out.push(held);
+            }
+        }
+        out
+    }
+
     /// Declares the table's keys, which makes the columns of a primary key `NOT NULL` as well.
     ///
     /// # Errors
@@ -1740,6 +1777,16 @@ impl Table {
                 }
                 for foreign in &mut self.foreign {
                     foreign.columns.iter_mut().for_each(shift);
+                }
+                // The kept order points at columns and checks by place, and both can move.
+                if checks.len() != self.checks.len() {
+                    self.order.retain(|held| !matches!(held, crate::Constraint::Check(_)));
+                }
+                self.order.retain(|&held| held != crate::Constraint::NotNull(column));
+                for held in &mut self.order {
+                    if let crate::Constraint::NotNull(at) = held {
+                        shift(at);
+                    }
                 }
                 self.columns.remove(column);
                 self.defaults.remove(column);

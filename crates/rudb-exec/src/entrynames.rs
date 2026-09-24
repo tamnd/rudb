@@ -39,14 +39,14 @@
 //! too on everything it returns from a fresh session, because a schema created by `CREATE SCHEMA`
 //! has no stored text and nothing nests schemas.
 
-use rudb_catalog::{Catalog, Database, Schema, TEMP_CATALOG, Table};
+use rudb_catalog::{Catalog, Constraint, Database, Schema, TEMP_CATALOG, Table};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
-    DUCKDB, canonical, column_fields, database_fields, index_fields, numeric_facts, schema_fields,
-    sequence_fields, show_database_fields, show_expanded_fields, show_table_fields, table_fields,
-    type_oid, view_fields,
+    DUCKDB, canonical, column_fields, constraint_fields, database_fields, index_fields,
+    numeric_facts, schema_fields, sequence_fields, show_database_fields, show_expanded_fields,
+    show_table_fields, table_fields, type_oid, view_fields,
 };
-use rudb_parse::quoted;
+use rudb_parse::{Kind, quoted, tokenize};
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -248,6 +248,146 @@ pub(crate) fn indexnames(
         }
     }
     Metadata::new("duckdb_indexes", &index_fields(), &rows, plan, index, columns)
+}
+
+/// Every constraint of every table, in the columns the plan asked for.
+///
+/// The pin's order, which is its tables by name within each schema, each table's constraints in
+/// the order they were written with the `NOT NULL` nobody wrote on a primary key's columns last,
+/// and `constraint_index` counting across all of it rather than starting again at each table.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn constraintnames(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut rows = Vec::new();
+    for database in catalog.databases() {
+        for schema in database.schemas() {
+            let mut tables: Vec<&Table> = schema.tables().iter().collect();
+            tables.sort_by(|left, right| left.name().table.cmp(&right.name().table));
+            for table in tables {
+                for held in table.constraints() {
+                    let mut row = vec![
+                        text(database.name()),
+                        Value::BigInt(database.oid()),
+                        text(schema.name()),
+                        Value::BigInt(schema.oid()),
+                        text(&table.name().table),
+                        Value::BigInt(table.oid()),
+                        Value::BigInt(rows.len() as i64),
+                    ];
+                    row.extend(constraint_row(catalog, table, held));
+                    rows.push(row);
+                }
+            }
+        }
+    }
+    Metadata::new("duckdb_constraints", &constraint_fields(), &rows, plan, index, columns)
+}
+
+/// The columns of one constraint from `constraint_type` on.
+fn constraint_row(catalog: &Catalog, table: &Table, held: Constraint) -> Vec<Value> {
+    let name_of = |at: usize| table.columns()[at].name.clone();
+    let list = |names: &[String]| names.iter().map(|name| quoted(name)).collect::<Vec<_>>();
+    let (kind, words, expression, places, referenced) = match held {
+        Constraint::Key(at) => {
+            let key = &table.keys()[at];
+            let names: Vec<String> = key.columns.iter().map(|&at| name_of(at)).collect();
+            let (kind, word) =
+                if key.primary { ("PRIMARY KEY", "pkey") } else { ("UNIQUE", "key") };
+            let text = format!("{kind}({})", list(&names).join(", "));
+            ((kind, text), word, None, key.columns.clone(), None)
+        }
+        Constraint::Check(at) => {
+            let expression = table.checks()[at].clone();
+            let places = check_columns(table, &expression);
+            let text = format!("CHECK({expression})");
+            (("CHECK", text), "check", Some(expression), places, None)
+        }
+        Constraint::Foreign(at) => {
+            let foreign = &table.foreign()[at];
+            let target = catalog.table(&foreign.table).ok().unwrap_or(table);
+            let wanted: Vec<String> =
+                foreign.referenced.iter().map(|&at| target.columns()[at].name.clone()).collect();
+            let names: Vec<String> = foreign.columns.iter().map(|&at| name_of(at)).collect();
+            let text = format!(
+                "FOREIGN KEY ({}) REFERENCES {}({})",
+                list(&names).join(", "),
+                quoted(&foreign.table.table),
+                list(&wanted).join(", ")
+            );
+            let referenced = (foreign.table.table.clone(), wanted);
+            (("FOREIGN KEY", text), "fkey", None, foreign.columns.clone(), Some(referenced))
+        }
+        Constraint::NotNull(at) => {
+            (("NOT NULL", "NOT NULL".to_string()), "not_null", None, vec![at], None)
+        }
+    };
+    let names: Vec<String> = places.iter().map(|&at| name_of(at)).collect();
+    let mut constraint = format!("{}_", table.name().table);
+    for name in &names {
+        constraint.push_str(&name.to_lowercase());
+        constraint.push('_');
+    }
+    for name in referenced.iter().flat_map(|(_, wanted)| wanted) {
+        constraint.push_str(&name.to_lowercase());
+        constraint.push('_');
+    }
+    constraint.push_str(words);
+    let (referenced_table, wanted) = match referenced {
+        Some((table, wanted)) => (text(&table), wanted),
+        None => (Value::Null, Vec::new()),
+    };
+    vec![
+        text(kind.0),
+        text(&kind.1),
+        expression.map_or(Value::Null, Value::Varchar),
+        Value::List {
+            element: LogicalType::BigInt,
+            values: places.iter().map(|&at| Value::BigInt(at as i64)).collect(),
+        },
+        names_of(names.into_iter()),
+        text(&constraint),
+        referenced_table,
+        names_of(wanted.into_iter()),
+    ]
+}
+
+/// The places of the columns a `CHECK` names, in the order it names them and once per mention.
+///
+/// Read off the tokens of its text: a word that names a column and is not followed by a `(`,
+/// which would make it a function.
+fn check_columns(table: &Table, expression: &str) -> Vec<usize> {
+    let Ok(tokens) = tokenize(expression) else {
+        return Vec::new();
+    };
+    let mut places = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        let word = &expression[token.start as usize..token.end as usize];
+        let word = match token.kind {
+            Kind::Identifier | Kind::Keyword => word.to_string(),
+            Kind::QuotedIdentifier => word.trim_matches('"').replace("\"\"", "\""),
+            _ => continue,
+        };
+        let call = tokens.get(at + 1).is_some_and(|next| {
+            next.kind == Kind::Operator
+                && &expression[next.start as usize..next.end as usize] == "("
+        });
+        if call {
+            continue;
+        }
+        if let Some(place) =
+            table.columns().iter().position(|field| field.name.eq_ignore_ascii_case(&word))
+        {
+            places.push(place);
+        }
+    }
+    places
 }
 
 /// Every sequence in the catalog, in the columns the plan asked for.
