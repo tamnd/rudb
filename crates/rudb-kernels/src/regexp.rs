@@ -21,7 +21,7 @@
 //! `GROUP BY` on that column costs 0.28 seconds against 4.5 for the same grouping done on the
 //! strings, measured in `spec/storage-v3/18`, where query 29 is 35% of the suite.
 
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -394,14 +394,16 @@ impl Memo {
     ) -> Result<(u32, Option<Arc<[u8]>>)> {
         let mut words = Words::default();
         answer.hash(&mut words);
-        let shard = &self.firsts[(words.finish() >> 32) as usize % REPLACE_SHARDS];
+        let hash = words.finish();
+        let shard = &self.firsts[(hash >> 32) as usize % REPLACE_SHARDS];
         let mut seen =
             shard.lock().map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
-        if let Some((held, &found)) = seen.get_key_value(answer) {
-            return Ok((found, (found == own).then(|| Arc::clone(held))));
+        let probe = (hash, answer);
+        if let Some((held, &found)) = seen.get_key_value(&probe as &dyn Answer) {
+            return Ok((found, (found == own).then(|| Arc::clone(&held.bytes))));
         }
         let held: Arc<[u8]> = answer.into();
-        seen.insert(Arc::clone(&held), own);
+        seen.insert(Held { hash, bytes: Arc::clone(&held) }, own);
         *added += answer.len() + 48;
         Ok((own, Some(held)))
     }
@@ -419,7 +421,98 @@ impl Memo {
 }
 
 /// The answers one shard has seen, each with the code of the first value that gave it.
-type Seen = HashMap<Arc<[u8]>, u32, BuildHasherDefault<Words>>;
+///
+/// Each answer keeps its hash beside it, so the table hashes an answer once on the way in and
+/// never again. Growing the table rehashed every answer through its pointer, a cache miss apiece,
+/// and on q29 that was 3.9% of the query.
+type Seen = HashMap<Held, u32, BuildHasherDefault<Stored>>;
+
+/// An answer in the table, with its hash.
+#[derive(Debug)]
+struct Held {
+    hash: u64,
+    bytes: Arc<[u8]>,
+}
+
+/// An answer the table can look up, whether held or only borrowed for the lookup.
+trait Answer {
+    fn hash(&self) -> u64;
+    fn bytes(&self) -> &[u8];
+}
+
+impl Answer for Held {
+    fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Answer for (u64, &[u8]) {
+    fn hash(&self) -> u64 {
+        self.0
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.1
+    }
+}
+
+impl<'a> Borrow<dyn Answer + 'a> for Held {
+    fn borrow(&self) -> &(dyn Answer + 'a) {
+        self
+    }
+}
+
+impl Hash for dyn Answer + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(Answer::hash(self));
+    }
+}
+
+impl PartialEq for dyn Answer + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        Answer::hash(self) == Answer::hash(other) && self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for dyn Answer + '_ {}
+
+impl Hash for Held {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.bytes == other.bytes
+    }
+}
+
+impl Eq for Held {}
+
+/// A hasher that passes on the hash an answer already carries.
+#[derive(Debug, Default)]
+struct Stored(u64);
+
+impl Hasher for Stored {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) | u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// A hash over a word at a time, for the replace memo's table of answers.
 ///
