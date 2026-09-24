@@ -159,15 +159,15 @@ const KEYS: usize = 1 << 16;
 /// keeps one stretch of it, and the wrong one for a filter that keeps keys scattered over the whole
 /// of it. TPC-H q18 is the case: the orders over three hundred in quantity are fifty seven keys
 /// spread over six million, so the range covers all of `lineitem` and `orders` and both scans read
-/// every part, and the filter drops all but a handful of rows only after each part was decoded. Both
-/// tables are stored in order key order, so a part covers a few thousand keys and almost none of
-/// them holds one of the fifty seven. Asking for the first key at or past the part's smallest and
-/// checking it against the part's largest is a binary search a part, and it rules out the part
-/// before a byte of it is read.
+/// every part, and the filter or the bitmap drops all but a handful of rows only after each part was
+/// decoded. Both tables are stored in order key order, so a part covers a few thousand keys and
+/// almost none of them holds one of the fifty seven. Asking for the first key at or past the part's
+/// smallest and checking it against the part's largest is a binary search a part, and it rules out
+/// the part before a byte of it is read.
 ///
-/// Kept only beside the filter, because the exact rows and the bitmap over the parent already skip
-/// what they can, and only up to [`KEYS`], where a part covering a few thousand keys would rarely
-/// fall between two of them anyway.
+/// Kept beside the filter or a bitmap, which both answer about a row and say nothing about a part,
+/// and not beside the exact rows, which already skip every part they hold nothing in. Only up to
+/// [`KEYS`], where a part covering a few thousand keys would rarely fall between two of them anyway.
 #[derive(Debug)]
 pub(crate) struct Keys {
     keys: Vec<i64>,
@@ -586,7 +586,7 @@ pub(crate) fn found_for(
     let held = if wanted && domain.is_none() { dense(&keyed, rows) } else { None };
     let settled = settled || domain.is_some();
     let mut filter = if settled { None } else { Blocked::sized(rows, BUDGET) };
-    let keys = if filter.is_some() && rows <= KEYS { sorted(&keyed) } else { None };
+    let keys = if exact.is_none() && !stopped && rows <= KEYS { sorted(&keyed) } else { None };
     let mut hashes = Vec::new();
     for (keys, len) in &keyed {
         let (Some(keys), len) = (keys, *len) else { continue };
