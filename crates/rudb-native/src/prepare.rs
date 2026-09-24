@@ -1198,6 +1198,7 @@ impl Merged {
 fn code_pages(parts: &[LocalPart], global: &[u32]) -> Result<ColumnStripe> {
     let mut stripe = ColumnStripe {
         pages: Vec::with_capacity(parts.len()),
+        sums: Vec::with_capacity(parts.len()),
         codes: Vec::with_capacity(parts.len()),
         sieves: Vec::with_capacity(parts.len()),
         ranges: Vec::with_capacity(parts.len()),
@@ -1213,6 +1214,7 @@ fn code_pages(parts: &[LocalPart], global: &[u32]) -> Result<ColumnStripe> {
         if bytes.len() > MAX_PAGE {
             return Err(invalid("column page exceeds the configured bound"));
         }
+        stripe.sums.push(checksum(&bytes));
         stripe.pages.push(bytes);
         stripe.codes.push(Some(unique_codes(&codes)));
         // None, because the codes already give the stripe an exact membership index, and an

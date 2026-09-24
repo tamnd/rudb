@@ -2007,6 +2007,9 @@ impl Part {
 #[derive(Debug, Default)]
 struct ColumnStripe {
     pages: Vec<Vec<u8>>,
+    /// Each page's checksum, taken where the page is built so that the writer, which holds its
+    /// lock while it writes, does not walk every byte of the stripe a second time.
+    sums: Vec<u64>,
     codes: Vec<Option<Vec<u32>>>,
     sieves: Vec<Option<Sieve>>,
     ranges: Vec<Range>,
@@ -2568,6 +2571,7 @@ impl Writer {
     fn encode_pages(columns: &[&Vector]) -> Result<ColumnStripe> {
         let mut stripe = ColumnStripe {
             pages: Vec::with_capacity(columns.len()),
+            sums: Vec::with_capacity(columns.len()),
             codes: Vec::with_capacity(columns.len()),
             sieves: Vec::with_capacity(columns.len()),
             ranges: Vec::with_capacity(columns.len()),
@@ -2605,6 +2609,7 @@ impl Writer {
         // membership index per stripe. Those do not come through here. See [`prepare`].
         let sieve =
             Sieve::of(column, &range, SIEVE_BUDGET).filter(|sieve| sieve.len() < bytes.len());
+        stripe.sums.push(checksum(&bytes));
         stripe.pages.push(bytes);
         stripe.codes.push(None);
         stripe.sieves.push(sieve);
@@ -2715,17 +2720,24 @@ impl Writer {
         let mut memberships = vec![None; width];
         let mut ranges = Vec::with_capacity(width);
         let mut index = Vec::with_capacity(width.saturating_mul(index_section(parts)?));
+        // Every page of the stripe goes to the file in one call after the loop, since they sit
+        // back to back from where the stripe starts and a page is often a few kilobytes.
+        let start = self.at;
+        let mut out = Vec::with_capacity(width.saturating_mul(parts));
         for stripe in &encoded {
             let offset = self.at;
             let section = index.len();
             let mut length = 0_usize;
-            for bytes in &stripe.pages {
-                self.file.write_at(self.at + length as u64, bytes)?;
+            if stripe.sums.len() != stripe.pages.len() {
+                return Err(Error::internal("a stripe's pages came without their checksums"));
+            }
+            for (bytes, &sum) in stripe.pages.iter().zip(&stripe.sums) {
                 put_u32(
                     &mut index,
                     u32::try_from(bytes.len()).map_err(|_| invalid("part length overflow"))?,
                 );
-                put_u64(&mut index, checksum(bytes));
+                put_u64(&mut index, sum);
+                out.push(bytes.as_slice());
                 length = length
                     .checked_add(bytes.len())
                     .ok_or_else(|| invalid("column page length overflow"))?;
@@ -2745,6 +2757,8 @@ impl Writer {
             });
             ranges.push(merged_range(stripe.ranges.iter().cloned()));
         }
+        self.file.write_parts_at(start, &out)?;
+        drop(out);
         for (membership, stripe) in memberships.iter_mut().zip(&encoded) {
             if stripe.codes.iter().all(Option::is_none) {
                 continue;

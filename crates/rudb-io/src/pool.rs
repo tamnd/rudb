@@ -499,6 +499,14 @@ impl File for Pooled {
         self.file.write_at(offset, data)
     }
 
+    fn write_parts_at(&self, offset: u64, parts: &[&[u8]]) -> Result<()> {
+        self.file.write_parts_at(offset, parts)
+    }
+
+    fn start_writeback(&self, offset: u64, length: u64) {
+        self.file.start_writeback(offset, length);
+    }
+
     fn sync(&self) -> Result<()> {
         self.file.sync()
     }

@@ -162,6 +162,25 @@ pub trait File: Debug + Send + Sync {
     /// If the underlying write fails, or if the file was not opened for writing.
     fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
 
+    /// Writes `parts` one after another starting at `offset`, the same bytes [`Self::write_at`]
+    /// would write for them joined together.
+    ///
+    /// A real file on Unix hands them to `pwritev` together, so a stripe of many small pages is a
+    /// few system calls rather than one a page. The default writes them one at a time, which is
+    /// what the simulation wants, since a crash can then fall between any two of them.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::write_at`]. Some of the parts may have been written when it fails.
+    fn write_parts_at(&self, offset: u64, parts: &[&[u8]]) -> Result<()> {
+        let mut at = offset;
+        for part in parts {
+            self.write_at(at, part)?;
+            at += part.len() as u64;
+        }
+        Ok(())
+    }
+
     /// Makes every write issued before this call durable.
     ///
     /// # Errors
