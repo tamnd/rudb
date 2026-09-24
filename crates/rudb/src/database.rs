@@ -2306,6 +2306,9 @@ impl NativeSink {
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
         place.inside_cpu = place.inside_cpu.saturating_add(cpu);
+        // The stripe's rows, its pages and whatever the encode built along the way were all just
+        // let go, which is the moment the allocator has the most to hand back.
+        rudb_common::heap::release();
         appended
     }
 }
