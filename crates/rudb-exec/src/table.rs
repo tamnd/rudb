@@ -1513,18 +1513,26 @@ fn window_of(
             lowest = lowest.min(current);
             highest = highest.max(current);
             for (at, stretch) in values.chunks(16).enumerate() {
-                if stretch.iter().fold(false, |differ, &value| differ | (value != current)) {
+                if !stretch.iter().fold(false, |differ, &value| differ | (value != current)) {
+                    continue;
+                }
+                if keeping {
                     for (row, &value) in stretch.iter().enumerate() {
                         if value != current {
-                            if keeping {
-                                runs.push((current, block * 128 + at * 16 + row));
-                                keeping = runs.len() < most_runs;
-                            }
+                            runs.push((current, block * 128 + at * 16 + row));
                             current = value;
                             lowest = lowest.min(value);
                             highest = highest.max(value);
                         }
                     }
+                    keeping = runs.len() < most_runs;
+                } else {
+                    // A key in no order, walked the way it was before the runs were kept.
+                    for &value in stretch {
+                        lowest = lowest.min(value);
+                        highest = highest.max(value);
+                    }
+                    current = stretch[stretch.len() - 1];
                 }
             }
         }
