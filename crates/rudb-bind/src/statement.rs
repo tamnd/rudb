@@ -47,6 +47,8 @@ pub enum Bound {
     Sequence(SequenceChange),
     /// `ALTER TABLE` or `ALTER VIEW`.
     Alter(Alter),
+    /// `CREATE INDEX` or `DROP INDEX`.
+    Index(IndexChange),
     /// `INSERT INTO`.
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
@@ -201,6 +203,19 @@ pub struct Alter {
     pub alteration: Option<rudb_catalog::Alteration>,
     /// Every row of the table as it reads after the change, for the changes that move data.
     pub rewrite: Option<Plan>,
+}
+
+/// A bound `CREATE INDEX` or `DROP INDEX`.
+#[derive(Debug)]
+pub struct IndexChange {
+    /// The table a create is over, and `None` on a drop.
+    pub table: Option<QualifiedName>,
+    /// The index a create makes, stamped by the catalog when it goes in, and `None` on a drop.
+    pub index: Option<rudb_catalog::Index>,
+    /// The name a drop removes, as written, and empty on a create.
+    pub name: Vec<String>,
+    /// Whether `IF NOT EXISTS` or `IF EXISTS` was written.
+    pub quiet: bool,
 }
 
 /// A bound `DROP TABLE` or `DROP VIEW`.
@@ -421,6 +436,7 @@ fn bind_one(
             }))
         }
         ast::Statement::Alter(index) => alter(ast, catalog, parameters, session, index),
+        ast::Statement::Index(index) => create_index(ast, catalog, parameters, session, index),
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
         ast::Statement::Update(index) => change(ast, catalog, parameters, session, index, false),
         ast::Statement::Delete(index) => change(ast, catalog, parameters, session, index, true),
@@ -973,6 +989,145 @@ fn alter(
         }
     };
     Ok(Bound::Alter(Alter { name: Some(name), alteration: Some(alteration), rewrite }))
+}
+
+/// `CREATE INDEX` and `DROP INDEX`, with every refusal the pin makes before its catalog sees the
+/// index. A drop is only its name here, since which index it is depends on the catalog it runs
+/// against.
+///
+/// Each element is bound over the table to find its type and the columns it reads. A bare column
+/// is written back by its name and anything else inside parentheses, so `ON t(b, (a+1))` keeps
+/// `b` and `((a + 1))`, which is what the pin's `sql` and `expressions` show.
+fn create_index(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    at: ast::IndexRef,
+) -> Result<Bound> {
+    let written = ast.index(at);
+    let parts: Vec<String> = ast.name(written.name).map(str::to_string).collect();
+    if written.drop {
+        return Ok(Bound::Index(IndexChange {
+            table: None,
+            index: None,
+            name: parts,
+            quiet: written.quiet,
+        }));
+    }
+    let written_table: Vec<&str> = ast.name(written.table).collect();
+    let name = catalog.resolve_as(&written_table, Entry::Table)?;
+    if catalog.entry(&name)? == Entry::View {
+        return Err(Error::binder("can only create an index on a base table"));
+    }
+    if written.using != NONE && !same_name(ast.string(written.using), "art") {
+        return Err(Error::binder(format!("Unknown index type: {}", ast.string(written.using))));
+    }
+    let fields = catalog.table(&name)?.columns();
+    let mut binder = Binder::with(catalog, parameters, session);
+    let (_, scope) =
+        binder.bind_catalog_table(ast, &name, name.table.clone(), ast::Slice::default())?;
+    let mut columns = Vec::new();
+    let mut plain = true;
+    let mut texts = Vec::new();
+    for &expr in ast.expr_list(written.elements) {
+        if let ast::Expr::Column { name: column } = ast.exprs[expr as usize] {
+            let column: Vec<&str> = ast.name(column).collect();
+            if let [only] = column[..] {
+                if !fields.iter().any(|field| same_name(&field.name, only)) {
+                    let names: Vec<String> =
+                        fields.iter().map(|field| format!("\"{}\"", field.name)).collect();
+                    // The stray colon is the pin's.
+                    return Err(Error::binder(format!(
+                        "Table \"{}\" does not have a column named \"{only}\"\n\nCandidate bindings: \
+                         : {}",
+                        name.table,
+                        names.join(", ")
+                    )));
+                }
+            }
+        }
+        if crate::expr::has_aggregate(ast, expr) {
+            return Err(Error::binder("aggregate functions are not allowed in index expressions"));
+        }
+        let before = binder.plan_mut().node_count();
+        let value = binder.bind_expr(ast, expr, &scope)?;
+        if binder.plan_mut().node_count() > before {
+            return Err(Error::binder("cannot use subquery in index expressions"));
+        }
+        if !binder.windows.is_empty() {
+            return Err(Error::binder("window functions are not allowed in index expressions"));
+        }
+        let ty = binder.plan_mut().expr_type(value).clone();
+        if ty.is_nested() {
+            return Err(Error::invalid_type(format!(
+                "Invalid Type [{ty}]: Invalid type for index key."
+            )));
+        }
+        let bare = match binder.plan_mut().expr(value) {
+            Expr::Column(binding) => scope.columns.iter().position(|held| held.binding == *binding),
+            _ => None,
+        };
+        if let Some(at) = bare {
+            columns.push(at);
+            texts.push(rudb_parse::quoted(&fields[at].name));
+            continue;
+        }
+        plain = false;
+        let text = deparse::expression(ast, expr);
+        let used = columns_in(&text)?;
+        if used.is_empty() {
+            return Err(Error::binder(
+                "CREATE INDEX does not refer to any columns in the base table!",
+            ));
+        }
+        for used in used {
+            if let Some(at) = fields.iter().position(|field| same_name(&field.name, &used)) {
+                columns.push(at);
+            }
+        }
+        texts.push(format!("({text})"));
+    }
+    if written.unique && !plain {
+        return Err(Error::not_implemented("A UNIQUE index over an expression is not supported"));
+    }
+    let expressions = Value::List {
+        element: LogicalType::Varchar,
+        values: texts.iter().map(|text| Value::Varchar(text.clone())).collect(),
+    };
+    let unique = if written.unique { "UNIQUE " } else { "" };
+    let table: Vec<String> = written_table.iter().map(|part| rudb_parse::quoted(part)).collect();
+    let using = if written.using == NONE {
+        String::new()
+    } else {
+        format!(" USING {} ", ast.string(written.using))
+    };
+    let index_name = parts.last().cloned().unwrap_or_default();
+    let sql = format!(
+        "CREATE {unique}INDEX {} ON {}{using}({});",
+        rudb_parse::quoted(&index_name),
+        table.join("."),
+        texts.join(", ")
+    );
+    if !plain {
+        columns.sort_unstable();
+        columns.dedup();
+    }
+    let index = rudb_catalog::Index {
+        name: index_name,
+        unique: written.unique,
+        columns,
+        plain,
+        expressions: expressions.to_string(),
+        sql,
+        oid: 0,
+    };
+    Ok(Bound::Index(IndexChange {
+        table: Some(name),
+        index: Some(index),
+        name: Vec::new(),
+        quiet: written.quiet,
+    }))
 }
 
 /// Whether a column is in one of its table's foreign keys, or is a column another table's foreign

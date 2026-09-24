@@ -17,6 +17,7 @@
 pub mod alter;
 pub mod catalog;
 pub mod held;
+pub mod index;
 pub mod keys;
 pub mod mirror;
 pub mod name;
@@ -30,6 +31,7 @@ pub use catalog::{
     Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA, DETACHED, Database, Entry, Schema, Sequence,
 };
 pub use held::Held;
+pub use index::Index;
 pub use keys::{ForeignKey, Key};
 pub use mirror::{FileStamp, MIRROR_CATALOG};
 pub use name::{QualifiedName, same_name};

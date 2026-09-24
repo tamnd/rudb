@@ -871,17 +871,51 @@ impl Catalog {
             return Ok(());
         }
         let keeps = alteration.keeps_dependents();
-        let mut table = self.table(name)?.clone();
-        table.alter(alteration, rows, workers)?;
-        let depended = self.tables().any(|held| {
-            held.name() != name && held.foreign().iter().any(|foreign| &foreign.table == name)
-        });
+        // The column a type change or a drop is about, with which of the two it is, for the
+        // index refusals that name the column's index rather than the table's dependents.
+        let changed = match &alteration {
+            crate::Alteration::Type { column, .. } => Some((*column, true)),
+            crate::Alteration::DropColumn { column, .. } => Some((*column, false)),
+            _ => None,
+        };
+        let original = self.table(name)?;
+        let indexed =
+            |column: usize| original.indexes().iter().any(|index| index.columns.contains(&column));
+        match changed {
+            Some((column, true)) if indexed(column) => {
+                return Err(Error::catalog(
+                    "Cannot change the type of this column: an index depends on it!",
+                ));
+            }
+            // Every column after a dropped one moves down a place, which the pin's indexes cannot
+            // follow, so one over any later column refuses the drop as well.
+            Some((column, false))
+                if original
+                    .indexes()
+                    .iter()
+                    .any(|index| index.columns.iter().any(|&at| at > column)) =>
+            {
+                return Err(Error::catalog(
+                    "Cannot drop this column: an index depends on a column after it!",
+                ));
+            }
+            Some((column, false)) if indexed(column) => {
+                return Err(Error::catalog("Cannot drop this column: an index depends on it!"));
+            }
+            _ => {}
+        }
+        let depended = !original.indexes().is_empty()
+            || self.tables().any(|held| {
+                held.name() != name && held.foreign().iter().any(|foreign| &foreign.table == name)
+            });
         if depended && !keeps {
             return Err(Error::dependency(format!(
                 "Cannot alter entry \"{}\" because there are entries that depend on it.",
                 name.table
             )));
         }
+        let mut table = original.clone();
+        table.alter(alteration, rows, workers)?;
         if let Some(to) = &renamed {
             self.rename_check(name, to)?;
         }
@@ -915,6 +949,66 @@ impl Catalog {
             }
         }
         Ok(())
+    }
+
+    /// Adds an index over a table, stamping its oid.
+    ///
+    /// `OR REPLACE` is no help with a name that is taken, which is the pin's rule as well: it
+    /// refuses the second index the same way it would without the clause.
+    ///
+    /// # Errors
+    ///
+    /// If another index in the table's schema has the name, unless `quiet` says to leave that one
+    /// be, and if a unique index finds a key the rows already repeat.
+    pub fn create_index(
+        &mut self,
+        table: &QualifiedName,
+        mut index: crate::Index,
+        quiet: bool,
+    ) -> Result<()> {
+        let schema = QualifiedName::new(table.catalog.clone(), table.schema.clone(), &index.name);
+        if self.index_in(&schema).is_some() {
+            if quiet {
+                return Ok(());
+            }
+            return Err(Error::catalog(format!(
+                "Index with name \"{}\" already exists!",
+                index.name
+            )));
+        }
+        index.oid = self.stamp();
+        self.changed();
+        self.table_mut(table)?.add_index(index)
+    }
+
+    /// Removes an index by its written name.
+    ///
+    /// # Errors
+    ///
+    /// If no index has the name, unless `quiet` says that is fine.
+    pub fn drop_index(&mut self, parts: &[&str], quiet: bool) -> Result<()> {
+        let found = self.candidates(parts)?.iter().find_map(|candidate| self.index_in(candidate));
+        let Some((holder, at)) = found else {
+            if quiet {
+                return Ok(());
+            }
+            let name = parts.last().copied().unwrap_or_default();
+            return Err(Error::catalog(format!("Index with name {name} does not exist!")));
+        };
+        self.changed();
+        self.table_mut(&holder)?.drop_index(at);
+        Ok(())
+    }
+
+    /// The table holding the index this name means, read as schema and index name, and where the
+    /// index is in its list.
+    fn index_in(&self, name: &QualifiedName) -> Option<(QualifiedName, usize)> {
+        let schema = self.schema(&name.catalog, &name.schema).ok()?;
+        schema.tables.iter().find_map(|table| {
+            let at =
+                table.indexes().iter().position(|index| same_name(&index.name, &name.table))?;
+            Some((table.name().clone(), at))
+        })
     }
 
     /// Refuses a rename onto a name something else in the schema already has.

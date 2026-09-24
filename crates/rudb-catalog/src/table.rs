@@ -1064,6 +1064,8 @@ pub struct Table {
     checks: Vec<String>,
     /// The foreign keys this table's rows have to meet, in the order written.
     foreign: Vec<ForeignKey>,
+    /// The indexes over it, in the order they were created.
+    indexes: Vec<crate::Index>,
     /// The sequences its defaults call `nextval` on, which it depends on the way the pin records it:
     /// a `DROP SEQUENCE` without `CASCADE` is refused while this table is there.
     sequences: Vec<QualifiedName>,
@@ -1090,6 +1092,7 @@ impl Table {
             clustering: None,
             keys: Vec::new(),
             seen: Vec::new(),
+            indexes: Vec::new(),
             defaults: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
@@ -1114,6 +1117,7 @@ impl Table {
             clustering,
             keys: Vec::new(),
             seen: Vec::new(),
+            indexes: Vec::new(),
             defaults: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
@@ -1351,7 +1355,7 @@ impl Table {
     /// program that catches one by its text is a program rudb has to not surprise.
     pub fn append(&mut self, chunk: Chunk) -> Result<()> {
         self.refuse_nulls(&chunk)?;
-        if !self.keys.is_empty() {
+        if !self.guards().is_empty() {
             return self.append_all(vec![chunk], 1);
         }
         self.rows.to_append()?.append(chunk)
@@ -1389,7 +1393,7 @@ impl Table {
             self.refuse_nulls(chunk)?;
         }
         let seen = self
-            .keys
+            .guards()
             .iter()
             .map(|key| Seen::of(&chunks, key, &self.columns, true))
             .collect::<Result<Vec<_>>>()?;
@@ -1405,6 +1409,47 @@ impl Table {
     #[must_use]
     pub fn keys(&self) -> &[Key] {
         &self.keys
+    }
+
+    /// The indexes over it, in the order they were created.
+    #[must_use]
+    pub fn indexes(&self) -> &[crate::Index] {
+        &self.indexes
+    }
+
+    /// Every key a write is checked against: the constraints, then each unique index over plain
+    /// columns, which the pin checks the same way and with the same sentence.
+    #[must_use]
+    pub fn guards(&self) -> Vec<Key> {
+        let mut guards = self.keys.clone();
+        for index in self.indexes.iter().filter(|index| index.unique && index.plain) {
+            guards.push(Key { columns: index.columns.clone(), primary: false });
+        }
+        guards
+    }
+
+    /// Adds an index, refusing a unique one over rows that already repeat a key.
+    pub(crate) fn add_index(&mut self, index: crate::Index) -> Result<()> {
+        if index.unique && index.plain {
+            let key = Key { columns: index.columns.clone(), primary: false };
+            let all: Vec<usize> = (0..self.columns.len()).collect();
+            let mut stored = Vec::with_capacity(self.rows.chunk_count());
+            for chunk in 0..self.rows.chunk_count() {
+                stored.push(self.rows.read(chunk, &all)?);
+            }
+            if Seen::of(&stored, &key, &self.columns, true).is_err() {
+                return Err(Error::constraint("Data contains duplicates on indexed column(s)"));
+            }
+        }
+        self.indexes.push(index);
+        self.seen = vec![None; self.guards().len()];
+        Ok(())
+    }
+
+    /// Takes away the index at this place in [`Self::indexes`].
+    pub(crate) fn drop_index(&mut self, at: usize) {
+        self.indexes.remove(at);
+        self.seen = vec![None; self.guards().len()];
     }
 
     /// The `DEFAULT` of a column as the SQL of its expression, or `None` when it has none, which
@@ -1469,7 +1514,7 @@ impl Table {
             }
         }
         self.keys = keys;
-        self.seen = vec![None; self.keys.len()];
+        self.seen = vec![None; self.guards().len()];
         let seen = self.appended_keys(&[])?;
         self.hold_keys(seen);
         Ok(())
@@ -1478,11 +1523,12 @@ impl Table {
     /// The key sets the table holds once these rows are appended, or the refusal of the first key
     /// they repeat. Builds the set of a key from the rows already held the first time it is asked.
     fn appended_keys(&mut self, chunks: &[Chunk]) -> Result<Vec<Seen>> {
-        if self.keys.is_empty() {
+        let guards = self.guards();
+        if guards.is_empty() {
             return Ok(Vec::new());
         }
-        let mut sets = Vec::with_capacity(self.keys.len());
-        for at in 0..self.keys.len() {
+        let mut sets = Vec::with_capacity(guards.len());
+        for (at, key) in guards.iter().enumerate() {
             let held = match &self.seen[at] {
                 Some(held) => held.clone(),
                 None => {
@@ -1491,12 +1537,12 @@ impl Table {
                     for chunk in 0..self.rows.chunk_count() {
                         stored.push(self.rows.read(chunk, &all)?);
                     }
-                    let held = Seen::of(&stored, &self.keys[at], &self.columns, true)?;
+                    let held = Seen::of(&stored, key, &self.columns, true)?;
                     self.seen[at] = Some(held.clone());
                     held
                 }
             };
-            sets.push(held.with(chunks, &self.keys[at], &self.columns)?);
+            sets.push(held.with(chunks, key, &self.columns)?);
         }
         Ok(sets)
     }
@@ -1533,7 +1579,7 @@ impl Table {
     /// If a row is not as wide as the table, if a value will not convert to its column's type, or
     /// if a `NOT NULL` column is handed a null.
     pub fn append_rows(&mut self, rows: &[Vec<Value>]) -> Result<()> {
-        if !self.keys.is_empty() {
+        if !self.guards().is_empty() {
             let mut staged = MemoryTable::new(self.types());
             staged.append_rows(rows)?;
             let chunks = (0..staged.chunk_count()).filter_map(|at| staged.chunk(at)).collect();
@@ -1702,7 +1748,7 @@ impl Table {
             }
             None => return Ok(()),
         };
-        self.seen = vec![None; self.keys.len()];
+        self.seen = vec![None; self.guards().len()];
         self.replace_all(rows, workers)
     }
 

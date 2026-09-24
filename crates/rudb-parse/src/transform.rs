@@ -23,9 +23,9 @@ use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
     AlterAction, Ast, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, CreateTable,
-    CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Insert, JoinKind, LiteralKind, Nulls,
-    Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp,
-    Setting, Slice, Source, SourceRef, Statement, StrRef, Target, Transaction, UnaryOp,
+    CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert, JoinKind, LiteralKind,
+    Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef,
+    SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target, Transaction, UnaryOp,
     WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
@@ -816,8 +816,83 @@ impl<'a> Transform<'a> {
                 Ok(self.schema_statement(schema))
             }
             "CreateSequenceStmt" => self.create_sequence_statement(inner, or_replace, temporary),
+            "CreateIndexStmt" => self.create_index_statement(inner, or_replace, temporary),
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `CreateIndexStmt <- UniqueIndex? 'INDEX' IfNotExists? IndexName? 'ON' BaseTableName
+    /// InsertColumnList? IndexType? Parens(List(IndexElement))? WithList? WhereClause?`.
+    ///
+    /// The refusals are the pin's, at the stage the pin gives them. `ON t(a)` matches the column
+    /// list and `ON t(a DESC)` or `ON t((a + 1))` the element list, and both are elements here. An
+    /// order on an element is dropped, as the pin drops it, and so are the `WITH` options.
+    fn create_index_statement(
+        &mut self,
+        inner: u32,
+        or_replace: bool,
+        temporary: bool,
+    ) -> Result<Statement> {
+        if temporary {
+            return Err(Error::parser("Temporary indexes are not supported"));
+        }
+        if self.find(inner, "WhereClause") != NONE {
+            return Err(Error::not_implemented(
+                "Creating partial indexes is not supported currently",
+            ));
+        }
+        let named = self.find(inner, "IndexName");
+        if named == NONE {
+            return Err(Error::not_implemented(
+                "Please provide an index name, e.g., CREATE INDEX my_name ...",
+            ));
+        }
+        let name = self.name_parts(named);
+        let table = self.name_parts(self.find(inner, "BaseTableName"));
+        let mut elements = Vec::new();
+        let list = self.find(inner, "InsertColumnList");
+        if list == NONE {
+            let mut found = Vec::new();
+            self.named_nodes(inner, "IndexElement", &mut found);
+            for element in found {
+                let expr = self.expr(self.find(element, "Expression"))?;
+                if let Expr::Binary { op: BinaryOp::Collate, .. } = self.ast.exprs[expr as usize] {
+                    return Err(Error::not_implemented("Index with collation not supported yet!"));
+                }
+                elements.push(expr);
+            }
+        } else {
+            for kid in self.kids(self.find(list, "ColumnList")).collect::<Vec<_>>() {
+                let part = self.identifier(kid);
+                let name = self.part_slice(vec![part]);
+                elements.push(self.push(Expr::Column { name }));
+            }
+        }
+        let kind = self.find(inner, "IndexType");
+        let using = if kind == NONE {
+            NONE
+        } else {
+            let text = self.text(self.find(kind, "Identifier")).to_string();
+            let text = self.fold_identifier(&text);
+            self.intern(&text)
+        };
+        let index = Index {
+            name,
+            table,
+            drop: false,
+            quiet: self.find(inner, "IfNotExists") != NONE,
+            unique: self.find(inner, "UniqueIndex") != NONE,
+            or_replace,
+            using,
+            elements: self.expr_slice(elements),
+        };
+        Ok(self.index_statement(index))
+    }
+
+    fn index_statement(&mut self, index: Index) -> Statement {
+        let at = self.ast.indexes.len() as u32;
+        self.ast.indexes.push(index);
+        Statement::Index(at)
     }
 
     /// `CreateSequenceStmt <- 'SEQUENCE' IfNotExists? QualifiedName SequenceOption*`.
@@ -1663,6 +1738,24 @@ impl<'a> Transform<'a> {
                 owner: Slice::default(),
             };
             return Ok(self.sequence_statement(sequence));
+        }
+        if self.name(inner) == "DropIndex" {
+            let names: Vec<u32> =
+                self.kids(inner).filter(|&kid| self.name(kid) == "QualifiedIndexName").collect();
+            let [name] = names[..] else {
+                return Err(Error::not_implemented("Can only drop one object at a time"));
+            };
+            let index = Index {
+                name: self.name_parts(name),
+                table: Slice::default(),
+                drop: true,
+                quiet: self.find(inner, "IfExists") != NONE,
+                unique: false,
+                or_replace: false,
+                using: NONE,
+                elements: Slice::default(),
+            };
+            return Ok(self.index_statement(index));
         }
         if self.name(inner) != "DropTable" {
             return self.unsupported(inner);
@@ -5246,6 +5339,19 @@ mod tests {
                         out
                     }
                 }
+            }
+            Statement::Index(index) => {
+                let index = ast.index(index);
+                if index.drop {
+                    return format!("DROP INDEX {}", ast.name_text(index.name));
+                }
+                let unique = if index.unique { " UNIQUE" } else { "" };
+                format!(
+                    "CREATE{unique} INDEX {} ON {} ({})",
+                    ast.name_text(index.name),
+                    ast.name_text(index.table),
+                    index.elements.len
+                )
             }
             Statement::Sequence(index) => {
                 let sequence = ast.sequence(index);

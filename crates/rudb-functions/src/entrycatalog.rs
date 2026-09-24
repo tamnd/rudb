@@ -139,6 +139,27 @@ pub fn sequence_fields() -> Vec<Field> {
     ]
 }
 
+/// The columns of `duckdb_indexes()`, in the pin's order.
+#[must_use]
+pub fn index_fields() -> Vec<Field> {
+    vec![
+        Field::new("database_name", LogicalType::Varchar),
+        Field::new("database_oid", LogicalType::BigInt),
+        Field::new("schema_name", LogicalType::Varchar),
+        Field::new("schema_oid", LogicalType::BigInt),
+        Field::new("index_name", LogicalType::Varchar),
+        Field::new("index_oid", LogicalType::BigInt),
+        Field::new("table_name", LogicalType::Varchar),
+        Field::new("table_oid", LogicalType::BigInt),
+        Field::new("comment", LogicalType::Varchar),
+        Field::new("tags", tags()),
+        Field::new("is_unique", LogicalType::Boolean),
+        Field::new("is_primary", LogicalType::Boolean),
+        Field::new("expressions", LogicalType::Varchar),
+        Field::new("sql", LogicalType::Varchar),
+    ]
+}
+
 /// The one column `PRAGMA show_tables` returns.
 ///
 /// Named `name` and nothing else, because the statement answers what is in reach of an unqualified

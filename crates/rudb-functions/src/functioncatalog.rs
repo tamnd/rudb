@@ -220,6 +220,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbTables,
     TableFunction::DuckdbViews,
     TableFunction::DuckdbSequences,
+    TableFunction::DuckdbIndexes,
     TableFunction::DuckdbColumns,
     TableFunction::DuckdbExtensions,
     TableFunction::DuckdbOptimizers,
@@ -261,6 +262,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::DuckdbTables
         | TableFunction::DuckdbViews
         | TableFunction::DuckdbSequences
+        | TableFunction::DuckdbIndexes
         | TableFunction::DuckdbColumns
         | TableFunction::DuckdbExtensions
         | TableFunction::DuckdbOptimizers

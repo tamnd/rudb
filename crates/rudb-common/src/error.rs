@@ -96,6 +96,8 @@ pub enum ErrorCode {
     ParameterNotAllowed,
     /// Two types were asked to meet and cannot, for example two structs of different sizes.
     MismatchType,
+    /// A type cannot be used where it was put, for example a list as the key of an index.
+    InvalidType,
     /// An invariant this code is responsible for does not hold. Always a bug here, never in the
     /// query.
     Internal,
@@ -129,6 +131,7 @@ impl ErrorCode {
             Self::Interrupt => "Interrupt Error",
             Self::ParameterNotAllowed => "Parameter Not Allowed Error",
             Self::MismatchType => "Mismatch Type Error",
+            Self::InvalidType => "Invalid type Error",
             Self::Internal => "INTERNAL Error",
         }
     }
@@ -155,6 +158,7 @@ impl ErrorCode {
                 | Self::Settings
                 | Self::ParameterNotAllowed
                 | Self::MismatchType
+                | Self::InvalidType
         )
     }
 }
@@ -327,6 +331,11 @@ impl Error {
         Self::new(ErrorCode::MismatchType, message)
     }
 
+    /// A type used where it cannot be.
+    pub fn invalid_type(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvalidType, message)
+    }
+
     /// The query was cancelled.
     pub fn interrupt(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Interrupt, message)
@@ -371,6 +380,7 @@ impl ErrorCode {
             Self::Interrupt => "Interrupt",
             Self::ParameterNotAllowed => "Parameter Not Allowed",
             Self::MismatchType => "Mismatch Type",
+            Self::InvalidType => "Invalid type",
             Self::Internal => "INTERNAL",
         }
     }
