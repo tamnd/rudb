@@ -21,7 +21,7 @@
 //! `GROUP BY` on that column costs 0.28 seconds against 4.5 for the same grouping done on the
 //! strings, measured in `spec/storage-v3/18`, where query 29 is 35% of the suite.
 
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -276,28 +276,32 @@ struct Memo {
     rewrite: Rewrite,
     global: bool,
     host: bool,
-    groups: Vec<OnceLock<Replaced>>,
+    /// The code standing for each value's answer, a group at a time.
+    groups: Vec<OnceLock<Box<[u32]>>>,
+    /// The answers each group gave first, which the codes in `firsts` read back out of. A group's
+    /// answers go in before any of its codes are put in `firsts`, so a code found there always has
+    /// its answer here.
+    answers: Vec<OnceLock<Replaced>>,
     /// Each distinct answer seen so far and the first value that gave it.
     firsts: Vec<Mutex<Seen>>,
     /// Bytes held so far, across every group and every answer.
     kept: AtomicUsize,
 }
 
-/// One group of values: the code standing for each one's answer, and the answers of the values
-/// that are their own code, with where in the group each of those sits.
+/// The answers one group of values was the first to give, with where in the group the value that
+/// gave each one sits.
 ///
 /// The answers the group was the first to give are copied once, end to end, into `bytes`, and the
-/// table of answers seen so far points into that same block rather than holding a copy. On q29 the
-/// answers come to 37 MB. Held one allocation apiece they were 2.7 million blocks for the
-/// allocator to take and later give back one at a time, and the giving back at the end of the
+/// table of answers seen so far reads them there through their codes rather than holding a copy.
+/// On q29 the answers come to 37 MB. Held one allocation apiece they were 2.7 million blocks for
+/// the allocator to take and later give back one at a time, and the giving back at the end of the
 /// query was a quarter of its cycles.
 #[derive(Debug)]
 struct Replaced {
-    firsts: Box<[u32]>,
     owns: Box<[u16]>,
     /// Where each owned answer starts and ends in `bytes`, in the order of `owns`.
     spans: Box<[(u32, u32)]>,
-    bytes: Arc<[u8]>,
+    bytes: Box<[u8]>,
 }
 
 impl Replaced {
@@ -311,9 +315,7 @@ impl Replaced {
     }
 
     fn footprint(&self) -> usize {
-        self.firsts.len() * size_of::<u32>()
-            + self.owns.len() * (size_of::<u16>() + size_of::<(u32, u32)>())
-            + self.bytes.len()
+        self.owns.len() * (size_of::<u16>() + size_of::<(u32, u32)>()) + self.bytes.len()
     }
 }
 
@@ -336,7 +338,7 @@ impl Memo {
     /// into one block. Another group can give the same answer in between. Whichever registers it
     /// first keeps its code, and the other group's values are moved onto that code before its
     /// group is published, so no two codes ever stand for one answer.
-    fn group(&self, code: usize) -> Result<&Replaced> {
+    fn group(&self, code: usize) -> Result<&[u32]> {
         let slot = self
             .groups
             .get(code / REPLACE_GROUP)
@@ -344,6 +346,7 @@ impl Memo {
         if let Some(done) = slot.get() {
             return Ok(done);
         }
+        let answers = &self.answers[code / REPLACE_GROUP];
         let first = code / REPLACE_GROUP * REPLACE_GROUP;
         let last = (first + REPLACE_GROUP).min(self.dictionary.len());
         let mut buffer = String::new();
@@ -359,7 +362,9 @@ impl Memo {
             let stopped = self.dictionary.sweep_text(at, last, &mut |_, text: &[u8]| {
                 let index = firsts.len();
                 let own = u32::try_from(first + index)
-                    .map_err(|_| Error::internal("a dictionary past four billion values"))?;
+                    .ok()
+                    .filter(|&own| own != u32::MAX)
+                    .ok_or_else(|| Error::internal("a dictionary past four billion values"))?;
                 let answer = replace_one(
                     &self.regex,
                     &self.rewrite,
@@ -429,18 +434,27 @@ impl Memo {
             }
             at = stopped;
         }
-        let bytes: Arc<[u8]> = mine.into();
-        let mut owns = Vec::with_capacity(pending.len());
-        let mut spans = Vec::with_capacity(pending.len());
+        // The answers go in before their codes do, so that another group that finds one of these
+        // codes in the shared table can read its answer. A thread deciding this group at the same
+        // time may have put its answers in first, and those hold every answer this one will put a
+        // code in for: an answer missing from the shared table when this one registers was missing
+        // when the other looked too, and the other gave it the same value's code.
+        let out = Replaced {
+            owns: pending.iter().map(|waiting| waiting.index).collect(),
+            spans: pending.iter().map(|waiting| (waiting.start, waiting.end)).collect(),
+            bytes: mine.as_slice().into(),
+        };
+        let held = out.footprint();
+        if answers.set(out).is_ok() {
+            self.kept.fetch_add(held, Ordering::Relaxed);
+        }
         let mut moved: HashMap<u32, u32> = HashMap::new();
         let mut added = 0;
         for waiting in &pending {
             let own = (first + usize::from(waiting.index)) as u32;
-            let found = self.register(waiting, &bytes, own, &mut added)?;
-            if found == own {
-                owns.push(waiting.index);
-                spans.push((waiting.start, waiting.end));
-            } else {
+            let answer = &mine[waiting.start as usize..waiting.end as usize];
+            let found = self.register(waiting.hash, answer, own, &mut added)?;
+            if found != own {
                 moved.insert(own, found);
             }
         }
@@ -451,18 +465,15 @@ impl Memo {
                 }
             }
         }
-        let out = Replaced {
-            firsts: firsts.into_boxed_slice(),
-            owns: owns.into_boxed_slice(),
-            spans: spans.into_boxed_slice(),
-            bytes,
-        };
-        let held = out.footprint();
-        if slot.set(out).is_ok() {
+        let firsts = firsts.into_boxed_slice();
+        let held = firsts.len() * size_of::<u32>();
+        if slot.set(firsts).is_ok() {
             self.kept.fetch_add(held, Ordering::Relaxed);
         }
         self.kept.fetch_add(added, Ordering::Relaxed);
-        slot.get().ok_or_else(|| Error::internal("a replaced group was set and is not there"))
+        slot.get()
+            .map(|done| &**done)
+            .ok_or_else(|| Error::internal("a replaced group was set and is not there"))
     }
 
     /// The code the shared table holds for `answer`, if it holds one.
@@ -470,7 +481,7 @@ impl Memo {
         let seen = self.firsts[shard_of(hash)]
             .lock()
             .map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
-        Ok(seen.get(&(hash, answer) as &dyn Answer).copied())
+        Ok(seen.find(hash, |code| self.owned(code) == Some(answer)))
     }
 
     /// Puts a group's answer in the shared table under `own`, and the code it stands for, which is
@@ -478,40 +489,33 @@ impl Memo {
     ///
     /// A thread deciding a group another has decided already finds its own values in the table
     /// under their own codes, so both reach the same codes whichever publishes its group.
-    fn register(
-        &self,
-        waiting: &Pending,
-        bytes: &Arc<[u8]>,
-        own: u32,
-        added: &mut usize,
-    ) -> Result<u32> {
-        let mut seen = self.firsts[shard_of(waiting.hash)]
+    fn register(&self, hash: u64, answer: &[u8], own: u32, added: &mut usize) -> Result<u32> {
+        let mut seen = self.firsts[shard_of(hash)]
             .lock()
             .map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
-        let answer = &bytes[waiting.start as usize..waiting.end as usize];
-        if let Some(&found) = seen.get(&(waiting.hash, answer) as &dyn Answer) {
+        if let Some(found) = seen.find(hash, |code| self.owned(code) == Some(answer)) {
             return Ok(found);
         }
-        let held = Held {
-            hash: waiting.hash,
-            bytes: Arc::clone(bytes),
-            start: waiting.start,
-            end: waiting.end,
-        };
-        seen.insert(held, own);
-        *added += size_of::<(Held, u32)>() + 8;
+        *added += seen.insert(hash, own);
         Ok(own)
+    }
+
+    /// The answer a group put in for the value at `code`, if its group has put its answers in.
+    fn owned(&self, code: u32) -> Option<&[u8]> {
+        let code = code as usize;
+        let answers = self.answers.get(code / REPLACE_GROUP)?.get()?;
+        Some(answers.get(code % REPLACE_GROUP))
     }
 
     /// The code standing for the answer of the value at `code`.
     fn first(&self, code: usize) -> Result<u32> {
-        Ok(self.group(code)?.firsts[code % REPLACE_GROUP])
+        Ok(self.group(code)?[code % REPLACE_GROUP])
     }
 
     /// The answer of the value at `code`.
     fn answer(&self, code: usize) -> Result<&[u8]> {
-        let first = self.first(code)? as usize;
-        Ok(self.group(first)?.get(first % REPLACE_GROUP))
+        let first = self.first(code)?;
+        self.owned(first).ok_or_else(|| Error::internal("a replaced code has no answer"))
     }
 }
 
@@ -532,82 +536,74 @@ fn hash_of(answer: &[u8]) -> u64 {
 /// second goes to the shared table every time.
 type Local = HashMap<u64, (u32, u32, u32), BuildHasherDefault<Stored>>;
 
-/// The answers one shard has seen, each with the code of the first value that gave it.
+/// The answers one shard has seen, each as the code of the first value that gave it.
 ///
-/// Each answer keeps its hash beside it, so the table hashes an answer once on the way in and
-/// never again. Growing the table rehashed every answer through its pointer, a cache miss apiece,
-/// and on q29 that was 3.9% of the query.
-type Seen = HashMap<Held, u32, BuildHasherDefault<Stored>>;
-
-/// An answer in the table, with its hash.
-#[derive(Debug)]
-struct Held {
-    hash: u64,
-    /// The block of the group that first gave the answer, which the answer is a span of.
-    bytes: Arc<[u8]>,
-    start: u32,
-    end: u32,
+/// A slot is a word: the low half of the answer's hash above the code. The answer itself is read
+/// through the code, out of the group that gave it, so the table holds no copy and no pointer. On
+/// q29 that is 2.7 million answers, and the map this replaced kept each one as a hash, a pointer
+/// to its group's block and a span, forty bytes a slot.
+///
+/// Open addressed with a linear probe and let fill to three quarters. The half hash in the slot is
+/// what a grown table places it by, so growing reads no answer, and it turns away nearly every
+/// slot that is not the answer asked for before its bytes are read.
+#[derive(Debug, Default)]
+struct Seen {
+    slots: Vec<u64>,
+    len: usize,
 }
 
-/// An answer the table can look up, whether held or only borrowed for the lookup.
-trait Answer {
-    fn hash(&self) -> u64;
-    fn bytes(&self) -> &[u8];
-}
+/// A slot nothing is in. A code is never `u32::MAX`, so no slot that is in use reads as this.
+const FREE: u64 = u64::MAX;
 
-impl Answer for Held {
-    fn hash(&self) -> u64 {
-        self.hash
+impl Seen {
+    /// The code of the answer `same` accepts among those filed under `hash`.
+    fn find(&self, hash: u64, mut same: impl FnMut(u32) -> bool) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let low = hash as u32;
+        let mut at = low as usize & mask;
+        loop {
+            let slot = self.slots[at];
+            if slot == FREE {
+                return None;
+            }
+            if (slot >> 32) as u32 == low && same(slot as u32) {
+                return Some(slot as u32);
+            }
+            at = (at + 1) & mask;
+        }
     }
 
-    fn bytes(&self) -> &[u8] {
-        &self.bytes[self.start as usize..self.end as usize]
+    /// Files `code` under `hash`, which the caller has found is not in yet, and hands back how many
+    /// bytes the table grew by.
+    fn insert(&mut self, hash: u64, code: u32) -> usize {
+        let mut grown = 0;
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
+            let wanted = (self.slots.len() * 2).max(16);
+            let old = std::mem::replace(&mut self.slots, vec![FREE; wanted]);
+            grown = (wanted - old.len()) * size_of::<u64>();
+            for slot in old {
+                if slot != FREE {
+                    self.place(slot);
+                }
+            }
+        }
+        self.place(u64::from(hash as u32) << 32 | u64::from(code));
+        self.len += 1;
+        grown
     }
-}
 
-impl Answer for (u64, &[u8]) {
-    fn hash(&self) -> u64 {
-        self.0
-    }
-
-    fn bytes(&self) -> &[u8] {
-        self.1
-    }
-}
-
-impl<'a> Borrow<dyn Answer + 'a> for Held {
-    fn borrow(&self) -> &(dyn Answer + 'a) {
-        self
-    }
-}
-
-impl Hash for dyn Answer + '_ {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(Answer::hash(self));
-    }
-}
-
-impl PartialEq for dyn Answer + '_ {
-    fn eq(&self, other: &Self) -> bool {
-        Answer::hash(self) == Answer::hash(other) && self.bytes() == other.bytes()
-    }
-}
-
-impl Eq for dyn Answer + '_ {}
-
-impl Hash for Held {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.hash);
-    }
-}
-
-impl PartialEq for Held {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && Answer::bytes(self) == Answer::bytes(other)
+    fn place(&mut self, slot: u64) {
+        let mask = self.slots.len() - 1;
+        let mut at = (slot >> 32) as usize & mask;
+        while self.slots[at] != FREE {
+            at = (at + 1) & mask;
+        }
+        self.slots[at] = slot;
     }
 }
-
-impl Eq for Held {}
 
 /// A hasher that passes on the hash an answer already carries.
 #[derive(Debug, Default)]
@@ -633,8 +629,8 @@ impl Hasher for Stored {
 ///
 /// The standard hasher resists keys chosen by an attacker and pays a few rounds a word for it, which
 /// on q29's 2.7 million answers showed up at 3.6% of the query. The shard takes bits from the
-/// middle, since the table buckets on the low bits and tags each slot with the top seven, and a
-/// shard picked from either would leave every key in it agreeing there.
+/// middle, since the table buckets on the low bits, and the group's own table also tags each slot
+/// with the top seven, so a shard picked from either would leave every key in it agreeing there.
 #[derive(Debug, Default)]
 struct Words(u64);
 
@@ -717,7 +713,10 @@ fn replace_stable(
             groups: (0..dictionary.len().div_ceil(REPLACE_GROUP))
                 .map(|_| OnceLock::new())
                 .collect(),
-            firsts: (0..REPLACE_SHARDS).map(|_| Mutex::new(HashMap::default())).collect(),
+            answers: (0..dictionary.len().div_ceil(REPLACE_GROUP))
+                .map(|_| OnceLock::new())
+                .collect(),
+            firsts: (0..REPLACE_SHARDS).map(|_| Mutex::new(Seen::default())).collect(),
             kept: AtomicUsize::new(0),
         });
         let source = Arc::new(ReplacedText { memo: Arc::clone(&memo) });
