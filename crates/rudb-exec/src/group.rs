@@ -1114,9 +1114,9 @@ impl<'a> Aggregate<'a> {
         let Some(table) = single else {
             let rows = rows.settled()?;
             if self.locally.load(Ordering::Relaxed) && self.still_local(*folded, spreading, own)? {
-                return self.spread_own(&*rows, spreading, own);
+                return self.spread_own(&rows, spreading, own);
             }
-            return self.spread(&*rows, spreading);
+            return self.spread(&rows, spreading);
         };
         if let Some(error) = table.failure.take() {
             return Err(error);
