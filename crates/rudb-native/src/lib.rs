@@ -2408,8 +2408,17 @@ impl Writer {
         }
         let name = name.into();
         let entry = self.close()?;
-        if self.closed.iter().chain(std::iter::once(&entry)).any(|held| held.name == name) {
+        if entry.name == name {
             return Err(invalid("two tables in one native file have the same name"));
+        }
+        // An empty table the committed generation holds under this name steps aside for this one,
+        // the same as it does for the first table in [`Writer::open`], and for the same reason: it
+        // has no pages to carry and the load writing it now is the one that fills it.
+        if let Some(at) = self.closed.iter().position(|held| held.name == name) {
+            if self.closed[at].rows > 0 {
+                return Err(invalid("two tables in one native file have the same name"));
+            }
+            self.closed.remove(at);
         }
         let Self { file, at, generation, mut closed, views, .. } = self;
         closed.push(entry);
