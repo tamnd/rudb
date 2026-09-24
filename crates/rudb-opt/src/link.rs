@@ -29,6 +29,10 @@
 //! a gap so much as the shape of the direction: a join that is selective on the parent side is what
 //! section 5.4's reduction is for, and the reduction is the next milestone.
 //!
+//! It will read one through joins on the child side, where the child's rows are the side a join
+//! streams, because that is where the child sits in nearly every real query. TPC-H Q9 reads
+//! `lineitem` three joins below the join with `orders`.
+//!
 //! It will also not read a link through a projection on the child side, because the row id is a
 //! column and a projection that was not asked to carry it does not. Widening a projection is one
 //! more rewrite than this pass needs for the queries it was written for, where the projections sit
@@ -672,12 +676,28 @@ fn equated_pair(plan: &Plan, conditions: Slice) -> Option<[ColumnBinding; 2]> {
 
 /// The scan of `index` under `at`, through the operators that leave a row where it was.
 ///
-/// A filter only, which is the shape a pushed down predicate leaves. A projection would be the
-/// second half of the note at the top of this module.
+/// A filter, which is the shape a pushed down predicate leaves, and a join, which is the shape
+/// every query with more than two tables in it leaves. A projection would be the second half of
+/// the note at the top of this module.
+///
+/// Through a join to whichever side holds the scan, and not further than that. Finding the scan is
+/// not the same as its rows arriving here as rows of the table: a join gathers its build side and
+/// pads the side an outer join keeps, and either one is the end of a row id. That question is
+/// [`rids_of`]'s and [`matched`] asks it next, so this only has to say where the scan is. TPC-H Q9
+/// is why it has to look at all: `lineitem` is three joins below the join with `orders`, and a
+/// filter only walk declined that link and built a hash table over every order instead.
+///
+/// A link join is walked through its child only, because its parent is never scanned and so
+/// has no row of its own to carry.
 fn scan_under(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
     match *plan.node(at) {
         Node::Get { index: found, .. } if found == index => Some(at),
-        Node::Filter { input, .. } => scan_under(plan, input, index),
+        Node::Filter { input, .. } | Node::LinkJoin { child: input, .. } => {
+            scan_under(plan, input, index)
+        }
+        Node::Join { left, right, .. } => {
+            scan_under(plan, left, index).or_else(|| scan_under(plan, right, index))
+        }
         _ => None,
     }
 }
@@ -760,6 +780,44 @@ mod tests {
             text.contains("file_row_number"),
             "the child scan was not asked for a row id:\n{text}"
         );
+    }
+
+    /// Q9's shape: the child is under another join, and `side` says which of that join's inputs
+    /// it builds a hash table from. `lineitem` is the right input, so `build=left` streams it.
+    fn under_a_join(side: &str) -> Plan {
+        let text = format!(
+            "Project #3 [#0.0::BIGINT AS k]\n  \
+             Join INNER on=[(#1.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n    \
+             Get memory.main.orders AS orders #1 [o_orderkey::BIGINT]\n    \
+             Join INNER on=[(#2.0::BIGINT = #0.1::BIGINT)::BOOLEAN] build={side}\n      \
+             Get memory.main.part AS part #2 [p_partkey::BIGINT]\n      \
+             Get memory.main.lineitem AS lineitem #0 [l_orderkey::BIGINT, l_partkey::BIGINT]\n"
+        );
+        Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"))
+    }
+
+    #[test]
+    fn a_child_streamed_through_another_join_still_reads_the_link() {
+        let mut plan = under_a_join("left");
+        let context = context(1_500_000);
+        let text = rewritten(&mut plan, &context);
+        assert!(text.contains("LinkJoin"), "a join below the child hid the link:\n{text}");
+        assert!(
+            text.contains("file_row_number"),
+            "the scan three nodes down was not asked for a row id:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_child_gathered_into_another_join_s_hash_table_does_not() {
+        let mut plan = under_a_join("right");
+        let context = context(1_500_000);
+        let text = rewritten(&mut plan, &context);
+        assert!(!text.contains("LinkJoin"), "a build side was read as rows of the table:\n{text}");
+        let reasons = (0..u32::try_from(plan.node_count()).expect("a small plan"))
+            .filter_map(|node| super::why(&plan, node, &context))
+            .collect::<Vec<_>>();
+        assert!(reasons.contains(&Why::RowIdGone), "{reasons:?}");
     }
 
     #[test]
