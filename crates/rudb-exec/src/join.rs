@@ -1482,7 +1482,7 @@ impl<'a> Probe<'a> {
     fn built_with(&self, threads: &Lease<'_>) -> Result<Arc<Built>> {
         self.built
             .get_or_init(|| {
-                let chunks = self.gathered.take()?;
+                let (chunks, kept) = self.gathered.take()?;
                 let keying =
                     self.equalities.gathered(self.plan, &self.right_schema, self.time_zone);
                 let mut charged = self.held.lock().map_err(poisoned)?;
@@ -1493,9 +1493,8 @@ impl<'a> Probe<'a> {
                     && !self.equalities.null_is_a_value.first().copied().unwrap_or(false)
                     && any_null_key(keying, &chunks, &self.cancel)?;
                 // The chunks laid end to end, which is a copy of the side and is charged as one.
-                // The chunks themselves are not charged again here: the keep that made them holds
-                // that reservation for as long as this operator can read them, and charging the
-                // same bytes twice would be a limit half the size it says it is.
+                // The chunks themselves are not charged again here: `kept` is what the keep that
+                // made them charged, and it goes when they do.
                 let rows = Build::new(&self.right_types, &chunks, threads)?;
                 charged.grow(rows.footprint())?;
                 // Laid before the table rather than after it, because a key that is a column of
@@ -1505,6 +1504,7 @@ impl<'a> Probe<'a> {
                         // Everything the table reads is in `rows` now, so the chunks go before
                         // the table is built rather than after the join is done.
                         drop(chunks);
+                        drop(kept);
                         let allowed = self.allowed(&keys, rows.rows());
                         let index = Lookup::build_among(
                             &keys,
