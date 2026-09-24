@@ -6,6 +6,12 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.24
+
+A patch release of four commits, and the release 0.4.23 should have been. The 0.4.23 tag failed its verify job on two summary tests that still expected a count filtered on a numeric column to be answered from the frequency synopsis, which stopped being true when numeric synopses began keeping only their two leading counts. So 0.4.23 never published. #1697 updates those tests, and everything listed under 0.4.23 ships in this release. The native directory format number stays at 29 and the storage format version at 9.
+
+#1696 holds a native page read for the first time only while it is among the column's newest pages and pools it the second time it is read, which took the summed peak memory of the native ClickBench suite on server3 from 3741 MB to 3552 MB with no loss of CPU. #1695 adds an optional sorted row projection, built with `rudb-projection`, that lets ClickBench q9 count distinct `(UserID, RegionID)` pairs while scanning rather than through a hash set. #1694 runs CREATE SCHEMA and DROP SCHEMA with the pin's refusals and messages.
+
 ## 0.4.23
 
 A patch release of ten commits, most of them on the write path under W1. The native directory format number stays at 29 and the storage format version at 9.
