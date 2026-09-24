@@ -32,7 +32,7 @@ use rudb_common::{
 };
 use rudb_kernels::{
     Accumulator, NOWHERE, finish_run, group_tally, is_true, settle_extremes, update_general,
-    update_runs, update_tallied, whole_answers,
+    update_runs, update_shared_runs, update_tallied, whole_answers,
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
@@ -581,6 +581,17 @@ const EMPTY_SLOT: u32 = SLOT_MASK;
 /// that the tag is the same bits of whichever it is.
 const fn slot_tag(hash: u64) -> u32 {
     (((hash >> SLOT_BITS) as u32) & 0xff) << SLOT_BITS
+}
+
+/// The bit that stands for the call at this offset in a set of calls, and zero for an offset too far
+/// along to have one.
+///
+/// The sets are the ones [`rudb_kernels::update_shared_runs`] is offered and answers with, and zero for
+/// an offset past sixty four leaves that call out of the sharing and folded the way it was folded
+/// before. No plan reaches it: sixty four folding aggregates in one `GROUP BY` is far past the point
+/// where finding runs at all pays for itself.
+fn one_call(at: usize) -> u64 {
+    u32::try_from(at).ok().and_then(|at| 1_u64.checked_shl(at)).unwrap_or(0)
 }
 
 /// Cuts a chunk's slots into runs of one slot, each given as its slot and the row it ends before,
@@ -2763,11 +2774,45 @@ impl<'a> Aggregate<'a> {
         // How many rows land in each group, taken the first time a call can use it. See
         // [`rudb_kernels::group_tally`].
         let mut counted: Option<Option<Vec<i64>>> = None;
+        // The calls that would each walk the runs on their own, folded in one walk instead. What a run
+        // costs before a value of it is read is most of what a run costs at all, and it was paid once
+        // per call. Asked again with what it left, because a pass covers one layout and q01 has two.
+        // See [`rudb_kernels::update_shared_runs`].
+        let mut shared = 0_u64;
+        if by_runs && users > 1 && !self.count_only && !self.compact_numeric {
+            let offered = self
+                .calls
+                .iter()
+                .enumerate()
+                .filter(|&(at, call)| {
+                    !self.by_vector[at] && call.folds() && !call.distinct && filters[at].is_none()
+                })
+                .fold(0_u64, |offered, (at, _)| offered | one_call(at));
+            let inputs: Vec<Option<&Vector>> =
+                arguments.iter().map(|argument| argument.first()).collect();
+            loop {
+                let took = update_shared_runs(
+                    states,
+                    slot_runs,
+                    calls,
+                    &inputs,
+                    offered & !shared,
+                    *length,
+                )?;
+                if took == 0 {
+                    break;
+                }
+                shared |= took;
+            }
+        }
         for (at, call) in self.calls.iter().enumerate() {
             if self.count_only || self.compact_numeric {
                 break;
             }
             if self.by_vector[at] || !call.folds() {
+                continue;
+            }
+            if shared & one_call(at) != 0 {
                 continue;
             }
             if call.distinct {
