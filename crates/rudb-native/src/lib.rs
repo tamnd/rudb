@@ -3007,7 +3007,15 @@ impl Writer {
             .map(|(bits, count)| FrequencyEntry { value: value_of(Some(bits)), count })
             .chain(null_count.map(|count| FrequencyEntry { value: FrequencyValue::Null, count }))
             .collect::<Vec<_>>();
-        let omitted_max = keep_most_frequent(&mut entries).max(decrements);
+        let mut omitted_max = keep_most_frequent(&mut entries).max(decrements);
+        // A complete value-to-count table is also the result of grouping this column.
+        // Keep up to two leading frequencies for selectivity and equality predicates,
+        // but leave multi-value grouped counts to the encoded rows at query time.
+        if omitted_max == 0 && entries.len() > 1 {
+            let retained = entries.len().saturating_sub(1).min(2);
+            omitted_max = entries[retained].count;
+            entries.truncate(retained);
+        }
         let kept_rows = entries.iter().try_fold(0_u64, |total, entry| {
             total.checked_add(entry.count).filter(|&total| total <= FREQUENCY_ORDINALS as u64)
         });
@@ -12533,11 +12541,9 @@ mod tests {
     }
 
     #[test]
-    fn the_planner_gets_a_row_count_per_value_off_a_complete_synopsis() {
-        // The whole of the frequency half of #1106, end to end over a real file. Six rows, three
-        // of one value and two of another, and a complete synopsis because six rows is well inside
-        // what the writer can account for. The estimate for `id = 4` is three rows rather than a
-        // sixth of the table, and for a value the file does not hold it is none.
+    fn the_planner_gets_a_leading_count_without_a_complete_numeric_synopsis() {
+        // Six rows hold three values. The two leading counts help equality planning, while the
+        // omitted value keeps the directory from being a complete grouped-count result.
         let path = path("frequencies_for_the_planner");
         let mut writer =
             Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
@@ -12568,17 +12574,12 @@ mod tests {
             common.rows_with(column, &Bound::Int(4)),
             Stat::exact(3, Provenance::FrequencySynopsis)
         );
-        // Not in the file, and a synopsis that accounts for all six rows proves it.
-        assert_eq!(
-            common.rows_with(column, &Bound::Int(7)),
-            Stat::exact(0, Provenance::FrequencySynopsis)
-        );
+        // An absent value cannot be distinguished from the omitted one by the synopsis.
+        assert_eq!(common.rows_with(column, &Bound::Int(7)), Stat::Unknown);
         // A constant of another domain against an integer column. Nothing in the list compares
         // with it, so the zero above would be an artefact of the mismatch rather than a fact.
         assert_eq!(common.rows_with(column, &Bound::Bytes(b"four".to_vec())), Stat::Unknown);
-        // A complete list has no remainder. Answering one of no rows over no values would hand the
-        // caller a division to special case, and the counts above already answer this column.
-        assert_eq!(common.remainder(column), None);
+        assert!(common.remainder(column).is_some());
         fs::remove_file(&path).expect("clean up");
     }
 
@@ -13479,11 +13480,10 @@ mod tests {
         assert_eq!(count.len(), 3);
         assert!(reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(100) }]));
         assert!(!reader.skips(0, &[Probe { column: 0, op: Op::Greater, value: Bound::Int(0) }]));
-        let integers = reader.top_frequencies(0, 1).expect("valid integer synopsis").expect("kept");
-        assert_eq!(
-            integers,
-            vec![(Value::Integer(-2), 2), (Value::Integer(4), 2), (Value::Integer(9), 2),]
-        );
+        assert_eq!(reader.top_frequencies(0, 1).expect("valid integer synopsis"), None);
+        let integers = reader.frequency_prefix(0).expect("valid integer synopsis").expect("kept");
+        assert_eq!(integers.entries, vec![(Value::Integer(-2), 2), (Value::Integer(4), 2)]);
+        assert_eq!(integers.omitted_max, 2);
         let strings = reader.top_frequencies(1, 1).expect("valid string synopsis").expect("kept");
         assert_eq!(strings.len(), 3);
         assert!(strings.contains(&(Value::Null, 2)));
@@ -14818,8 +14818,8 @@ mod tests {
                 .collect::<Vec<_>>();
             let prefix =
                 reader.frequency_prefix(column).expect("valid metadata").expect("a synopsis");
-            assert_eq!(prefix.entries.len(), wanted.len(), "column {column}");
-            assert_eq!(prefix.omitted_max, 0, "column {column}");
+            assert_eq!(prefix.entries.len(), 2, "column {column}");
+            assert!(prefix.omitted_max > 0, "column {column}");
             for (value, count) in &prefix.entries {
                 let held =
                     wanted.iter().find(|(wanted, _)| wanted == value).map(|(_, count)| count);
@@ -14912,12 +14912,15 @@ mod tests {
         assert_eq!(catalog.entries[0].nonzero, vec![None, None]);
         assert_eq!(catalog.entries[0].aggregates, vec![None, Some((10, 4))]);
         assert_eq!(catalog.entries[0].distincts, vec![Some(1), Some(3)]);
-        let frequencies =
-            catalog.exact_numeric_frequencies("items", 1).expect("frequencies").expect("complete");
-        assert_eq!(frequencies.len(), 4);
-        for pair in [(Some(0), 2), (Some(3), 1), (Some(7), 1), (None, 2)] {
-            assert!(frequencies.contains(&pair), "missing {pair:?}");
-        }
+        assert_eq!(catalog.exact_numeric_frequencies("items", 1).expect("frequencies"), None);
+        let prefix = catalog
+            .table("items")
+            .expect("reader")
+            .frequency_prefix(1)
+            .expect("valid metadata")
+            .expect("partial frequencies");
+        assert_eq!(prefix.entries, vec![(Value::Null, 2), (Value::Integer(0), 2)]);
+        assert_eq!(prefix.omitted_max, 1);
         assert_eq!(catalog.distinct_count("items", 1).expect("distinct count"), Some(3));
         assert_eq!(
             catalog.integer_extremes("items", 1).expect("extremes"),
@@ -14955,7 +14958,7 @@ mod tests {
                 .expect("reopen")
                 .exact_numeric_frequencies("items", 1)
                 .expect("frequencies"),
-            Some(frequencies)
+            None
         );
         assert_eq!(catalog.table("items").expect("reader").null_count(1).expect("nulls"), 2);
         fs::remove_file(path).expect("remove scratch file");
