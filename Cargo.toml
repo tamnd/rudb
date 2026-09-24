@@ -56,8 +56,6 @@ rudb-functions = { version = "=0.4.32", path = "crates/rudb-functions" }
 rudb-graph = { version = "=0.4.32", path = "crates/rudb-graph" }
 rudb-iceberg = { version = "=0.4.32", path = "crates/rudb-iceberg" }
 rudb-io = { version = "=0.4.32", path = "crates/rudb-io" }
-rudb-ir = { version = "=0.4.32", path = "crates/rudb-ir" }
-rudb-jit = { version = "=0.4.32", path = "crates/rudb-jit" }
 rudb-json = { version = "=0.4.32", path = "crates/rudb-json" }
 rudb-kernels = { version = "=0.4.32", path = "crates/rudb-kernels" }
 rudb-metrics = { version = "=0.4.32", path = "crates/rudb-metrics" }
@@ -67,6 +65,8 @@ rudb-parquet = { version = "=0.4.32", path = "crates/rudb-parquet" }
 rudb-parse = { version = "=0.4.32", path = "crates/rudb-parse" }
 rudb-pipeline = { version = "=0.4.32", path = "crates/rudb-pipeline" }
 rudb-plan = { version = "=0.4.32", path = "crates/rudb-plan" }
+rudb-qc-ir = { version = "=0.4.32", path = "crates/rudb-qc-ir" }
+rudb-qc-interp = { version = "=0.4.32", path = "crates/rudb-qc-interp" }
 rudb-regex = { version = "=0.4.32", path = "crates/rudb-regex" }
 rudb-seam = { version = "=0.4.32", path = "crates/rudb-seam" }
 rudb-stats = { version = "=0.4.32", path = "crates/rudb-stats" }

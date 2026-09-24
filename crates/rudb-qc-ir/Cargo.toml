@@ -1,6 +1,6 @@
 [package]
-name = "rudb-ir"
-description = "The typed SSA expression IR that all four execution tiers share."
+name = "rudb-qc-ir"
+description = "QIR, the flat SSA pipeline IR the query compiler's translators write and its backends read."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,8 +13,6 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-rudb-common.workspace = true
-rudb-vector.workspace = true
 
 [lints]
 workspace = true
