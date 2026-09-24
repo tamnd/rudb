@@ -11,16 +11,7 @@ use rudb::{Database, Value};
 /// relationship declared and built and the graph layer on. Three hundred thousand orders is several
 /// parts, which a skip needs, since a part of an integer column is about sixty five thousand rows.
 fn database(name: &str) -> (Database, std::path::PathBuf) {
-    let path = std::env::temp_dir().join(format!(
-        "rudb-reduction-{name}-{}-{}.rdb",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the clock advances")
-            .as_nanos()
-    ));
-    let database = Database::open(path.to_str().expect("a UTF-8 temporary path")).expect("opens");
-    database.execute("SET threads = 1").expect("sets the thread count");
+    let (database, path) = open(name);
     database.execute("CREATE TABLE customer (c_custkey INTEGER, c_name VARCHAR)").expect("creates");
     database
         .execute("CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER)")
@@ -37,6 +28,21 @@ fn database(name: &str) -> (Database, std::path::PathBuf) {
     (database, path)
 }
 
+/// An empty file at a fresh temporary path, running on one thread.
+fn open(name: &str) -> (Database, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-reduction-{name}-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let database = Database::open(path.to_str().expect("a UTF-8 temporary path")).expect("opens");
+    database.execute("SET threads = 1").expect("sets the thread count");
+    (database, path)
+}
+
 /// A filter that keeps the first two customers and the last one, so the range of the keys the join
 /// holds covers the whole of `orders` and only an exact set can rule the parts in between out.
 const QUERY: &str = "SELECT count(*), sum(o_orderkey), min(c_name), max(c_name) FROM orders JOIN \
@@ -44,6 +50,11 @@ const QUERY: &str = "SELECT count(*), sum(o_orderkey), min(c_name), max(c_name) 
 
 /// The scan line of the child table in an `EXPLAIN ANALYZE`.
 fn orders_scan(database: &Database, sql: &str) -> String {
+    scan_of(database, "orders", sql)
+}
+
+/// The scan line of `table` in an `EXPLAIN ANALYZE`.
+fn scan_of(database: &Database, table: &str, sql: &str) -> String {
     let result = database.query(&format!("EXPLAIN ANALYZE {sql}")).expect("the explain ran");
     let text = match result.value_at(0, 1) {
         Value::Varchar(text) => text,
@@ -51,8 +62,8 @@ fn orders_scan(database: &Database, sql: &str) -> String {
     };
     text.lines()
         .take_while(|line| !line.is_empty())
-        .find(|line| line.contains("Get ") && line.contains("orders"))
-        .unwrap_or_else(|| panic!("no scan of orders on the tree:\n{text}"))
+        .find(|line| line.contains("Get ") && line.contains(table))
+        .unwrap_or_else(|| panic!("no scan of {table} on the tree:\n{text}"))
         .to_owned()
 }
 
@@ -116,22 +127,55 @@ fn a_parent_key_that_comes_up_through_a_join_still_reduces_the_child() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A filter that drops only the last customer removes orders only in the last part, so the push
-/// has removed nothing by the time it is a third of the way through `orders` and stops there.
+/// A hundred segments with three thousand items each, stored in segment order, and a filter that
+/// keeps the first forty. A part of `items` is about a thousand rows, which is one segment or two, so
+/// from the counts alone a set of forty segments in a hundred leaves most parts without a match. The
+/// push is tried, but the forty are the ones at the front, so it has kept every row by the time it
+/// is a third of the way through `items` and stops there.
 #[test]
 fn a_reduction_that_removes_nothing_early_stops_and_says_so() {
-    let (database, path) = database("stops");
-    let sql = "SELECT count(*), sum(o_orderkey) FROM orders JOIN customer ON o_custkey = c_custkey \
-               WHERE c_custkey < 30000";
+    let (database, path) = open("stops");
+    database.execute("CREATE TABLE segment (s_key INTEGER, s_name VARCHAR)").expect("creates");
+    database.execute("CREATE TABLE items (i_key INTEGER, i_segment INTEGER)").expect("creates");
+    database
+        .execute("INSERT INTO segment SELECT i, 's' || i FROM range(1, 101) AS r(i)")
+        .expect("loads");
+    database
+        .execute("INSERT INTO items SELECT i, 1 + (i - 1) // 3000 FROM range(1, 300001) AS r(i)")
+        .expect("loads");
+    database.execute("SET graph_links = 'items(i_segment) -> segment(s_key)'").expect("sets");
+    database.execute("CHECKPOINT").expect("builds the link");
+    database.execute("SET graph_sections = 'on'").expect("turns the layer on");
+    let sql = "SELECT count(*), sum(i_key) FROM items JOIN segment ON i_segment = s_key WHERE \
+               s_key <= 40";
     let stopped = rows(&database, sql);
-    assert_eq!(stopped[0][0], Value::BigInt(299_990));
-    let line = orders_scan(&database, sql);
+    assert_eq!(stopped[0][0], Value::BigInt(120_000));
+    let line = scan_of(&database, "items", sql);
     assert!(line.contains("link reduction stopped"), "the push should have stopped: {line}");
     assert!(!line.contains("link kept"), "{line}");
 
     database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
     assert_eq!(rows(&database, sql), stopped, "stopping changed an answer");
-    assert!(!orders_scan(&database, sql).contains("link"), "no reduction with the layer off");
+    assert!(!scan_of(&database, "items", sql).contains("link"), "no reduction with the layer off");
+    drop(database);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A filter that drops only the last customer leaves nearly every parent key in the build side, so
+/// no stretch of `orders` could be skipped and the push is not tried at all. The keys the join holds
+/// answer the scan instead.
+#[test]
+fn a_side_that_holds_nearly_every_parent_does_not_push() {
+    let (database, path) = database("dense");
+    let sql = "SELECT count(*), sum(o_orderkey) FROM orders JOIN customer ON o_custkey = c_custkey \
+               WHERE c_custkey < 30000";
+    let reduced = rows(&database, sql);
+    assert_eq!(reduced[0][0], Value::BigInt(299_990));
+    let line = orders_scan(&database, sql);
+    assert!(!line.contains("link kept") && !line.contains("link reduction stopped"), "{line}");
+
+    database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
+    assert_eq!(rows(&database, sql), reduced, "the layer changed an answer");
     drop(database);
     std::fs::remove_file(&path).ok();
 }
