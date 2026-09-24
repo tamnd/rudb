@@ -801,6 +801,19 @@ impl<'a> Transform<'a> {
         match self.name(inner) {
             "CreateTableStmt" => self.create_table_statement(inner, or_replace, temporary),
             "CreateViewStmt" => self.create_view_statement(inner, or_replace, temporary),
+            "CreateSchemaStmt" => {
+                let name = self.name_parts(self.find(inner, "QualifiedName"));
+                let quiet = self.find(inner, "IfNotExists") != NONE;
+                let schema = crate::ast::Schema {
+                    name,
+                    drop: false,
+                    quiet,
+                    or_replace,
+                    temporary,
+                    cascade: false,
+                };
+                Ok(self.schema_statement(schema))
+            }
             _ => self.unsupported(inner),
         }
     }
@@ -1157,12 +1170,32 @@ impl<'a> Transform<'a> {
     /// `DropTable <- TableOrView IfExists? List(BaseTableName)`, and `TableOrView` covers `VIEW`
     /// and `MATERIALIZED VIEW` as well as `TABLE`, so it is checked rather than assumed. The first
     /// two are done and a materialized view is not a thing this database has.
+    ///
+    /// `CASCADE` on a table or a view changes nothing, because the pin keeps no dependency between
+    /// a view and the tables it reads, and a foreign key holds a table in place with or without it.
+    /// `DropSchema <- 'SCHEMA' IfExists? List(QualifiedName)` is the other rule that is done, where
+    /// `CASCADE` does mean something, and the pin takes one schema at a time.
     fn drop_statement(&mut self, node: u32) -> Result<Statement> {
-        if self.find(node, "DropBehavior") != NONE {
-            return self.unsupported(self.find(node, "DropBehavior"));
-        }
+        let behavior = self.find(node, "DropBehavior");
+        let cascade = behavior != NONE && self.name(self.first(behavior)) == "CascadeDropBehavior";
         let entries = self.find(node, "DropEntries");
         let inner = self.first(entries);
+        if self.name(inner) == "DropSchema" {
+            let names: Vec<u32> =
+                self.kids(inner).filter(|&kid| self.name(kid) == "QualifiedName").collect();
+            let [name] = names[..] else {
+                return Err(Error::not_implemented("Can only drop one object at a time"));
+            };
+            let schema = crate::ast::Schema {
+                name: self.name_parts(name),
+                drop: true,
+                quiet: self.find(inner, "IfExists") != NONE,
+                or_replace: false,
+                temporary: false,
+                cascade,
+            };
+            return Ok(self.schema_statement(schema));
+        }
         if self.name(inner) != "DropTable" {
             return self.unsupported(inner);
         }
@@ -1183,6 +1216,12 @@ impl<'a> Transform<'a> {
         let index = self.ast.drop_tables.len() as u32;
         self.ast.drop_tables.push(DropTable { names, if_exists, view });
         Ok(Statement::DropTable(index))
+    }
+
+    fn schema_statement(&mut self, schema: crate::ast::Schema) -> Statement {
+        let index = self.ast.schemas.len() as u32;
+        self.ast.schemas.push(schema);
+        Statement::Schema(index)
     }
 
     /// `InsertStatement <- ... InsertTarget InsertColumnList? InsertValues ...`.
@@ -4667,6 +4706,25 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(", ");
                 out + &format!(" {names}")
+            }
+            Statement::Schema(index) => {
+                let schema = ast.schema(index);
+                let mut out = if schema.drop { "DROP" } else { "CREATE" }.to_string();
+                if schema.or_replace {
+                    out += " OR REPLACE";
+                }
+                if schema.temporary {
+                    out += " TEMPORARY";
+                }
+                out += " SCHEMA";
+                if schema.quiet {
+                    out += if schema.drop { " IF EXISTS" } else { " IF NOT EXISTS" };
+                }
+                out += &format!(" {}", ast.name_text(schema.name));
+                if schema.cascade {
+                    out += " CASCADE";
+                }
+                out
             }
             Statement::Insert(index) => {
                 let insert = ast.insert(index);

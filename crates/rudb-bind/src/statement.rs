@@ -41,6 +41,8 @@ pub enum Bound {
     CreateView(CreateView),
     /// `DROP TABLE` or `DROP VIEW`.
     DropTable(DropTable),
+    /// `CREATE SCHEMA` or `DROP SCHEMA`.
+    Schema(SchemaChange),
     /// `INSERT INTO`.
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
@@ -140,6 +142,28 @@ pub struct CreateView {
     /// that is where `duckdb_columns()` and `duckdb_views()` read it from. See the doc on
     /// `rudb_catalog::View` for why the catalog keeps a list it will have to refresh later.
     pub columns: Vec<Field>,
+}
+
+/// A bound `CREATE SCHEMA` or `DROP SCHEMA`.
+///
+/// Only the name is resolved here. Whether the schema is there is a question for the catalog the
+/// statement runs against, which is where `IF NOT EXISTS`, `IF EXISTS` and `OR REPLACE` are
+/// answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaChange {
+    /// The database the schema is in.
+    pub catalog: String,
+    /// The schema's own name.
+    pub name: String,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Whether a create over a schema that is there, or a drop of one that is not, does nothing.
+    pub quiet: bool,
+    /// Whether a create drops a schema that is there first, which a schema that holds anything
+    /// refuses.
+    pub or_replace: bool,
+    /// Whether a drop takes everything in the schema with it.
+    pub cascade: bool,
 }
 
 /// A bound `DROP TABLE` or `DROP VIEW`.
@@ -313,6 +337,22 @@ fn bind_one(
         }
         ast::Statement::CreateView(index) => create_view(ast, catalog, parameters, session, index),
         ast::Statement::DropTable(index) => drop_table(ast, catalog, index),
+        ast::Statement::Schema(index) => {
+            let written = ast.schema(index);
+            if written.temporary {
+                return Err(Error::binder("Temporary schemas are not supported"));
+            }
+            let parts: Vec<&str> = ast.name(written.name).collect();
+            let (catalog, name) = catalog.schema_name(&parts)?;
+            Ok(Bound::Schema(SchemaChange {
+                catalog,
+                name,
+                drop: written.drop,
+                quiet: written.quiet,
+                or_replace: written.or_replace,
+                cascade: written.cascade,
+            }))
+        }
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
         ast::Statement::Update(index) => change(ast, catalog, parameters, session, index, false),
         ast::Statement::Delete(index) => change(ast, catalog, parameters, session, index, true),

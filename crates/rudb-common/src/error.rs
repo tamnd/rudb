@@ -80,6 +80,9 @@ pub enum ErrorCode {
     NotImplemented,
     /// A primary key, unique, not null or check constraint was violated.
     Constraint,
+    /// An entry cannot go because others depend on it, for example a schema that still holds
+    /// tables.
+    Dependency,
     /// A conflict, an abort, or a statement issued outside a transaction that needs one.
     Transaction,
     /// A setting cannot be applied in the current engine configuration.
@@ -117,6 +120,7 @@ impl ErrorCode {
             Self::Io => "IO Error",
             Self::NotImplemented => "Not implemented Error",
             Self::Constraint => "Constraint Error",
+            Self::Dependency => "Dependency Error",
             Self::Transaction => "TransactionContext Error",
             Self::Settings => "Settings Error",
             Self::Interrupt => "Interrupt Error",
@@ -142,6 +146,7 @@ impl ErrorCode {
                 | Self::OutOfRange
                 | Self::InvalidInput
                 | Self::Constraint
+                | Self::Dependency
                 | Self::Transaction
                 | Self::Settings
                 | Self::ParameterNotAllowed
@@ -303,6 +308,11 @@ impl Error {
         Self::new(ErrorCode::ParameterNotAllowed, message)
     }
 
+    /// An entry that others depend on.
+    pub fn dependency(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Dependency, message)
+    }
+
     /// Two types that cannot meet.
     pub fn mismatch_type(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::MismatchType, message)
@@ -345,6 +355,7 @@ impl ErrorCode {
             Self::Io => "IO",
             Self::NotImplemented => "Not implemented",
             Self::Constraint => "Constraint",
+            Self::Dependency => "Dependency",
             Self::Transaction => "TransactionContext",
             Self::Settings => "Settings",
             Self::Interrupt => "Interrupt",

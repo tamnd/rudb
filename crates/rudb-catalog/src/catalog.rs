@@ -308,22 +308,122 @@ impl Catalog {
         Ok(())
     }
 
-    /// Creates a schema in an attached database.
+    /// The database and the schema a written schema name means, for `CREATE SCHEMA` and `DROP
+    /// SCHEMA`.
+    ///
+    /// One part is a schema in the default database and two are a database and a schema in it. The
+    /// pin blames the first part that is not an attached database when that reading fails, which
+    /// for three parts is the middle one once the first is a database.
     ///
     /// # Errors
     ///
-    /// If the database is not attached, or a schema of that name is already in it.
+    /// If a part that has to be a database is not one.
+    pub fn schema_name(&self, parts: &[&str]) -> Result<(String, String)> {
+        let not_one = |part: &str| Error::catalog(format!("\"{part}\" is not a catalog or schema"));
+        match parts {
+            [schema] => Ok((self.default_catalog.clone(), (*schema).to_string())),
+            [catalog, schema] => match self.database(catalog) {
+                Ok(database) => Ok((database.name.clone(), (*schema).to_string())),
+                Err(_) => Err(not_one(catalog)),
+            },
+            [catalog, middle, ..] if self.database(catalog).is_ok() => Err(not_one(middle)),
+            [first, ..] => Err(not_one(first)),
+            [] => Err(Error::internal("a schema name with no parts")),
+        }
+    }
+
+    /// Whether a schema of that name is in that database.
+    #[must_use]
+    pub fn has_schema(&self, catalog: &str, name: &str) -> bool {
+        self.schema(catalog, name).is_ok()
+    }
+
+    /// Creates a schema in an attached database.
+    ///
+    /// The two schemas the engine keeps its own views in are refused by name wherever they are
+    /// written, which is the pin's answer even for a database that does not hold them.
+    ///
+    /// # Errors
+    ///
+    /// If the database is not attached, or is one the engine owns, or a schema of that name is
+    /// already in it.
     pub fn create_schema(&mut self, catalog: &str, name: &str) -> Result<()> {
         self.changed();
         let oid = self.stamp();
+        let reserved = [INFORMATION_SCHEMA, PG_CATALOG].iter().any(|held| same_name(held, name));
         let database = self.database_mut(catalog)?;
-        if database.internal {
-            return Err(in_the_system_catalog());
+        if same_name(&database.name, TEMP_CATALOG) && !reserved {
+            return Err(Error::invalid_input(format!(
+                "Cannot create non-temporary entry \"{name}\" in temporary catalog"
+            )));
+        }
+        if database.internal || reserved {
+            return Err(Error::binder("Cannot create schema in system catalog"));
         }
         if database.schemas.iter().any(|held| same_name(&held.name, name)) {
             return Err(Error::catalog(format!("Schema with name \"{name}\" already exists!")));
         }
         database.schemas.push(Schema::empty(name, oid));
+        Ok(())
+    }
+
+    /// Removes a schema, and with `cascade` everything in it.
+    ///
+    /// Without `cascade` a schema that still holds anything stays, and the pin's sentence lists
+    /// what it holds, views first and then tables, the newest of each first. The pin's own order
+    /// follows its hash sets, which is not one worth copying, and every file in the corpus that
+    /// spells the list out holds one entry. With `cascade` a table another schema holds a foreign
+    /// key into still stays, for the same reason [`Catalog::drop_table`] gives.
+    ///
+    /// # Errors
+    ///
+    /// If there is no such schema, if it is `main` or one the engine owns, or if it holds something
+    /// and `cascade` was not asked for.
+    pub fn drop_schema(&mut self, catalog: &str, name: &str, cascade: bool) -> Result<()> {
+        let database = self.database(catalog)?;
+        let schema = self.schema(catalog, name)?;
+        if database.internal || same_name(&schema.name, DEFAULT_SCHEMA) {
+            return Err(Error::catalog(format!(
+                "Cannot drop entry \"{}\" because it is an internal system entry",
+                schema.name
+            )));
+        }
+        if !cascade && (!schema.tables.is_empty() || !schema.views.is_empty()) {
+            let mut message = format!(
+                "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
+                schema.name
+            );
+            for view in schema.views.iter().rev() {
+                message += &format!(
+                    "view \"{}\" depends on schema \"{}\".\n",
+                    view.name().table,
+                    schema.name
+                );
+            }
+            for table in schema.tables.iter().rev() {
+                message += &format!(
+                    "table \"{}\" depends on schema \"{}\".\n",
+                    table.name().table,
+                    schema.name
+                );
+            }
+            message += "Use DROP...CASCADE to drop all dependents.";
+            return Err(Error::dependency(message));
+        }
+        let inside = |held: &QualifiedName| {
+            same_name(&held.catalog, catalog) && same_name(&held.schema, name)
+        };
+        let holder = self.tables().find(|table| {
+            !inside(table.name()) && table.foreign().iter().any(|foreign| inside(&foreign.table))
+        });
+        if let Some(holder) = holder {
+            return Err(Error::catalog(format!(
+                "Could not drop the table because this table is main key table of the table \"{}\"",
+                holder.name().table
+            )));
+        }
+        self.changed();
+        self.database_mut(catalog)?.schemas.retain(|held| !same_name(&held.name, name));
         Ok(())
     }
 
@@ -580,8 +680,20 @@ impl Catalog {
             let held = match self.schema(&candidate.catalog, &candidate.schema) {
                 Ok(schema) => schema.kind(&candidate.table),
                 // The first reading is the preferred one, so its complaint is the one that names
-                // the piece the writer most likely meant and got wrong.
+                // the piece the writer most likely meant and got wrong. A read of a table in a
+                // schema that is not there says both, the way the pin does.
                 Err(error) => {
+                    let error = if wanted == Entry::Table
+                        && self.database(&candidate.catalog).is_ok()
+                    {
+                        Error::catalog(format!(
+                            "Table with name \"{}.{}\" does not exist because schema \"{}\" does \
+                             not exist.",
+                            candidate.schema, candidate.table, candidate.schema
+                        ))
+                    } else {
+                        error
+                    };
                     first_error = first_error.or(Some(error));
                     continue;
                 }
@@ -1033,7 +1145,7 @@ mod tests {
         let error = catalog.resolve_for_create(&["temp", "main", "x"]).expect_err("the temp one");
         assert!(error.message().contains("Only TEMPORARY table names"), "{error}");
         let error = catalog.create_schema("system", "s").expect_err("a schema in system");
-        assert_eq!(error.message(), "Cannot create entry in system catalog");
+        assert_eq!(error.message(), "Cannot create schema in system catalog");
     }
 
     /// And nothing comes out of one either, which is a different sentence from a missing name.
@@ -1115,7 +1227,10 @@ mod tests {
         let catalog = with_hits();
         let error =
             catalog.resolve(&["memory", "nope", "hits"]).expect_err("there is no schema nope");
-        assert_eq!(error.to_string(), "Catalog Error: Schema with name nope does not exist!");
+        assert_eq!(
+            error.to_string(),
+            "Catalog Error: Table with name \"nope.hits\" does not exist because schema \"nope\" does not exist."
+        );
     }
 
     #[test]
