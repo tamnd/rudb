@@ -94,7 +94,7 @@ pub use datetime::came_round;
 pub use fallback::Kernel;
 pub use lists::{Stepping, moment_steps};
 pub use logic::{Connective, combine, is_true};
-pub use membership::{Members, in_set};
+pub use membership::{Members, in_set, select_in};
 pub use peel::{Found, Lookup};
 pub use prepare::{Held, Recipe};
 pub use scalar::{call, call_prepared, call_values};

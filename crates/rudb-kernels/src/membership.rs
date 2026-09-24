@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_vector::{Data, Form, Live, Validity, Vector};
+use rudb_vector::{Data, Form, Live, Selection, Validity, Vector};
 
 use crate::fallback::{self, Kernel};
 use crate::peel::{Found, Peel, search};
@@ -390,6 +390,120 @@ pub fn in_set(input: &Vector, members: &Members, returns: &LogicalType) -> Resul
     }
 }
 
+/// The rows of `input` in the list, out of `live` when there is one and out of every row when not.
+///
+/// The filter's half of [`in_set`]. That builds a flag a row over the whole chunk and the filter then
+/// reads the flags back out at the rows still in play, so an `IN` after a selective conjunct did all
+/// of its work on rows already thrown away. ClickBench 40 is that: `RefererHash` keeps one row in
+/// eight and `TraficSourceID IN (-1, 6)` was looked up on all eight. Here the rows come out as a
+/// selection directly, each one compared against the list in the column's own width, so a row is a
+/// load and a couple of compares rather than a widening to 128 bits and a walk along a vector.
+///
+/// `None` for anything but a short list of whole numbers with no null in it, over a flat or packed
+/// column with no null in it. The caller falls back to [`in_set`] for the rest.
+#[must_use]
+pub fn select_in(input: &Vector, members: &Members, live: Option<&Selection>) -> Option<Selection> {
+    let Held::Whole(set) = &members.held else { return None };
+    if members.has_null || !set.set.is_empty() || !input.none_null() {
+        return None;
+    }
+    let rows = input.len();
+    u32::try_from(rows).ok()?;
+    let negated = members.negated;
+    let named = live.map(Selection::indices);
+    if named.is_some_and(|named| named.iter().any(|&row| row as usize >= rows)) {
+        return None;
+    }
+    let count = named.map_or(rows, <[u32]>::len);
+    /// The list in the column's width, leaving out what that width cannot hold, since no row can.
+    macro_rules! flat {
+        ($values:expr, $ty:ty) => {{
+            let values = $values.as_slice();
+            let wanted: Vec<$ty> =
+                set.short.iter().filter_map(|&value| <$ty>::try_from(value).ok()).collect();
+            Some(match named {
+                Some(named) => chosen(|slot| values[named[slot] as usize], &wanted, negated, named),
+                None => chosen_all(values, &wanted, negated),
+            })
+        }};
+    }
+    match input.form() {
+        Form::Flat => match input.data()? {
+            Data::Int8(values) => flat!(values, i8),
+            Data::Int16(values) => flat!(values, i16),
+            Data::Int32(values) => flat!(values, i32),
+            Data::Int64(values) => flat!(values, i64),
+            Data::UInt8(values) => flat!(values, u8),
+            Data::UInt16(values) => flat!(values, u16),
+            Data::UInt32(values) => flat!(values, u32),
+            Data::UInt64(values) => flat!(values, u64),
+            _ => None,
+        },
+        Form::BitPacked => {
+            let packed = input.packed_parts()?;
+            let wanted: Vec<u64> =
+                set.short.iter().filter_map(|&value| packed.code_of(value)).collect();
+            Some(match named {
+                Some(named) => {
+                    let codes = packed.codes_at(|slot| named[slot] as usize, count);
+                    chosen(|slot| codes[slot], &wanted, negated, named)
+                }
+                None => {
+                    let mut codes = vec![0; rows];
+                    packed.unpack(0, &mut codes);
+                    chosen_all(&codes, &wanted, negated)
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Every row of `values` that is one of `wanted`, or that is none of them when `negated`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the caller checked that the row count fits in a u32"
+)]
+fn chosen_all<T: Copy + PartialEq>(values: &[T], wanted: &[T], negated: bool) -> Selection {
+    let mut out = vec![0_u32; values.len()];
+    let mut kept = 0;
+    for (row, &value) in values.iter().enumerate() {
+        out[kept] = row as u32;
+        kept += usize::from(among(value, wanted) != negated);
+    }
+    out.truncate(kept);
+    Selection::from_indices(out)
+}
+
+/// [`chosen_all`] over the rows `named` names, with slot `i` of `value` being row `named[i]`.
+fn chosen<T: Copy + PartialEq>(
+    value: impl Fn(usize) -> T,
+    wanted: &[T],
+    negated: bool,
+    named: &[u32],
+) -> Selection {
+    let mut out = vec![0_u32; named.len()];
+    let mut kept = 0;
+    for (slot, &row) in named.iter().enumerate() {
+        out[kept] = row;
+        kept += usize::from(among(value(slot), wanted) != negated);
+    }
+    out.truncate(kept);
+    Selection::from_indices(out)
+}
+
+/// Whether `value` is one of `wanted`, with no branch for the lists a query writes out by hand.
+#[inline]
+fn among<T: Copy + PartialEq>(value: T, wanted: &[T]) -> bool {
+    match *wanted {
+        [] => false,
+        [one] => value == one,
+        [one, two] => (value == one) | (value == two),
+        [one, two, three] => (value == one) | (value == two) | (value == three),
+        _ => wanted.iter().fold(false, |found, &each| found | (value == each)),
+    }
+}
+
 /// The lookup loop, once per physical layout the column can arrive in.
 ///
 /// The index mapping is a generic parameter rather than a function pointer for the reason the
@@ -542,9 +656,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as Memory};
 
     use rudb_common::{LogicalType, Value};
-    use rudb_vector::{Form, Vector};
+    use rudb_vector::{Form, Selection, Vector};
 
-    use super::{Kernel, Members, fallback, in_set};
+    use super::{Kernel, Members, fallback, in_set, select_in};
 
     /// What the kernel answers for each row, as the values a caller would read back.
     fn over(input: &Vector, list: &[Value], negated: bool) -> Vec<Value> {
@@ -677,6 +791,49 @@ mod tests {
         // test's own calls and nobody else's.
         assert_eq!(fallback::count(Kernel::Membership, Form::BitPacked, Form::BitPacked), 0);
         assert_eq!(fallback::count(Kernel::Membership, Form::Dictionary, Form::Dictionary), 0);
+    }
+
+    /// The rows a filter keeps are the rows the flag kernel says yes to, over every row and over a
+    /// selection, flat and packed, for `IN` and `NOT IN`. A list entry the column's width cannot
+    /// hold is one no row matches, which the flat `TINYINT` case is there for.
+    #[test]
+    fn selecting_the_rows_in_a_list_keeps_what_the_flags_say() {
+        let values: Vec<Value> = (0..300).map(|row| Value::Integer(row % 12 - 1)).collect();
+        let flat = Vector::from_values(LogicalType::Integer, &values).expect("integers");
+        let packed = flat.clone().bit_packed().expect("a range of twelve packs");
+        assert_eq!(packed.form(), Form::BitPacked);
+        let tiny: Vec<Value> = (0..300)
+            .map(|row| Value::TinyInt(i8::try_from(row % 12 - 1).expect("small")))
+            .collect();
+        let tiny = Vector::from_values(LogicalType::TinyInt, &tiny).expect("tiny integers");
+        let live = Selection::from_indices((0..300).filter(|row| row % 5 != 2).collect());
+        let lists = [
+            vec![Value::Integer(-1), Value::Integer(6)],
+            vec![Value::Integer(3), Value::Integer(9), Value::Integer(4000)],
+            vec![Value::Integer(0), Value::Integer(1), Value::Integer(2), Value::Integer(10)],
+        ];
+        for list in &lists {
+            for negated in [false, true] {
+                let members = Members::of(list, negated).expect("this list folds");
+                let yes = over(&flat, list, negated);
+                let kept = |row: usize| yes[row] == Value::Boolean(true);
+                let every = Selection::from_predicate(300, kept);
+                let among = Selection::from_indices(
+                    live.indices().iter().copied().filter(|&row| kept(row as usize)).collect(),
+                );
+                for column in [&flat, &packed, &tiny] {
+                    let all = select_in(column, &members, None).expect("a short whole list");
+                    assert_eq!(all, every, "{list:?} negated {negated} over {:?}", column.form());
+                    let some = select_in(column, &members, Some(&live)).expect("the same");
+                    assert_eq!(some, among, "{list:?} negated {negated} over the live rows");
+                }
+            }
+        }
+        // A null in the column or in the list is left to the flag kernel, which knows the rule.
+        let nulled = Members::of(&[Value::Integer(1), Value::Null], false).expect("folds");
+        assert!(select_in(&flat, &nulled, None).is_none());
+        let members = Members::of(&lists[0], false).expect("folds");
+        assert!(select_in(&numbers(), &members, None).is_none());
     }
 
     #[test]
