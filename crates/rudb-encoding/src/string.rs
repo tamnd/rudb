@@ -66,7 +66,7 @@ use std::time::Instant;
 use rudb_common::{Error, Result};
 
 use crate::chooser::{Chooser, EXHAUSTIVE, Settled};
-use crate::fsst::SymbolTable;
+use crate::fsst::{MAX_SYMBOL_LEN, SymbolTable};
 use crate::integer;
 use crate::lz;
 use crate::reader::Reader;
@@ -720,12 +720,8 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
         }
         Kind::Fsst => {
             let runs = read_compressed(reader, count)?;
-            let mut flat = Flat::with_capacity(count, runs.payload.len());
-            let mut at = 0;
-            for index in 0..count {
-                runs.run_into(index, &mut at, &mut flat.bytes)?;
-                flat.ends.push(flat.bytes.len());
-            }
+            let mut flat = Flat::with_capacity(count, 0);
+            runs.all_into(&mut flat)?;
             Ok(flat)
         }
         Kind::Dict => {
@@ -855,6 +851,41 @@ impl Compressed<'_> {
     /// If there is no such run, if it runs off the end of the payload, or if it does not decompress.
     fn run_into(&self, index: usize, at: &mut usize, out: &mut Vec<u8>) -> Result<()> {
         self.table.decompress(self.run(index, at)?, out)
+    }
+
+    /// Decompresses every run in order onto the end of `flat`.
+    ///
+    /// Each symbol is one eight byte store into room made ahead of it, which is what
+    /// [`SymbolTable::decompress_at`] is for. A run of `n` codes writes at most `n` symbols of at
+    /// most [`MAX_SYMBOL_LEN`] bytes, the last store included, so that much room past where the run
+    /// starts is all it needs. The room is made by doubling, so the zeroes written to make it add up
+    /// to at most twice what the chunk decompresses to. Growing a vector a symbol at a time and
+    /// cutting it back was a fifth of TPC-H q13, all of it the order comment.
+    ///
+    /// # Errors
+    ///
+    /// If a run is past the end of the chunk or does not decompress.
+    fn all_into(&self, flat: &mut Flat) -> Result<()> {
+        let out = &mut flat.bytes;
+        let mut at = out.len();
+        let mut payload = self.payload;
+        for &run in &self.lengths {
+            let Some((codes, rest)) = payload.split_at_checked(run) else {
+                return Err(Error::internal("a compressed run is past the end of its chunk"));
+            };
+            payload = rest;
+            let need = run
+                .checked_mul(MAX_SYMBOL_LEN)
+                .and_then(|room| room.checked_add(at))
+                .ok_or_else(|| Error::internal("a compressed chunk longer than memory"))?;
+            if out.len() < need {
+                out.resize(need.max(out.len() * 2), 0);
+            }
+            at = self.table.decompress_at(codes, out, at)?;
+            flat.ends.push(at);
+        }
+        out.truncate(at);
+        Ok(())
     }
 
     /// The compressed bytes of run `index`, with `at` saying where the run starts and left where
