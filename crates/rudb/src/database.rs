@@ -4144,6 +4144,76 @@ mod tests {
     }
 
     #[test]
+    fn covering_projection_runs_grouped_distinct_from_bound_columns() {
+        let path = std::env::temp_dir()
+            .join(format!("rudb-covering-distinct-plan-{}.rdb", std::process::id()));
+        let name = path.to_str().unwrap();
+        let database = Database::open(name).unwrap();
+        database
+            .execute("CREATE TABLE events (person BIGINT NOT NULL, zone INTEGER NOT NULL)")
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO events VALUES (9, 7), (2, 1), (9, 7), (2, 2), \
+                 (2, 2), (5, 1), (9, 1), (7, 2)",
+            )
+            .unwrap();
+        drop(database);
+        rudb_native::build_run_projection(name, "events", "person", "zone").unwrap();
+
+        let database = Database::open(name).unwrap();
+        let plain = "SELECT zone, COUNT(DISTINCT person) FROM events GROUP BY zone ORDER BY zone";
+        let result = database.query(plain).unwrap();
+        assert_eq!(
+            result.rows().collect::<Vec<_>>(),
+            vec![
+                vec![Value::Integer(1), Value::BigInt(3)],
+                vec![Value::Integer(2), Value::BigInt(2)],
+                vec![Value::Integer(7), Value::BigInt(1)],
+            ]
+        );
+        assert!(
+            result.metrics().unwrap().operators.iter().any(|operator| {
+                operator.detail.as_deref() == Some("covering grouped distinct")
+            })
+        );
+        let ranked = database
+            .query("SELECT zone AS z, COUNT(DISTINCT person) AS n FROM events GROUP BY zone ORDER BY n DESC LIMIT 2")
+            .unwrap();
+        assert_eq!(
+            ranked.rows().collect::<Vec<_>>(),
+            vec![
+                vec![Value::Integer(1), Value::BigInt(3)],
+                vec![Value::Integer(2), Value::BigInt(2)],
+            ]
+        );
+        assert!(
+            ranked.metrics().unwrap().operators.iter().any(|operator| {
+                operator.detail.as_deref() == Some("covering grouped distinct")
+            })
+        );
+        let filtered = database
+            .query("SELECT zone, COUNT(DISTINCT person) FROM events WHERE zone > 0 GROUP BY zone ORDER BY zone")
+            .unwrap();
+        assert_eq!(filtered.rows().collect::<Vec<_>>(), result.rows().collect::<Vec<_>>());
+        assert!(
+            !filtered.metrics().unwrap().operators.iter().any(|operator| {
+                operator.detail.as_deref() == Some("covering grouped distinct")
+            })
+        );
+        database.execute("INSERT INTO events VALUES (3, 1)").unwrap();
+        let stale = database.query(plain).unwrap();
+        assert_eq!(stale.rows().next().unwrap(), vec![Value::Integer(1), Value::BigInt(4)]);
+        assert!(
+            !stale.metrics().unwrap().operators.iter().any(|operator| {
+                operator.detail.as_deref() == Some("covering grouped distinct")
+            })
+        );
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn cold_extrema_shape_accepts_only_direct_bounds() {
         let parsed =
             rudb_parse::parse_ast("SELECT MIN(EventDate), MAX(EventDate) FROM hits").unwrap();

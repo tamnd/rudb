@@ -23,6 +23,7 @@ use rudb_functions::{
 use rudb_graph::Rids;
 use rudb_kernels::{Stepping, cast, moment_steps};
 use rudb_metrics::Counters;
+use rudb_native::Reader as NativeReader;
 use rudb_parquet::{Bound, Op, Reader, Test, skips};
 use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
 use rudb_plan::{ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
@@ -167,6 +168,107 @@ impl Source for Frequencies {
             .get(at)
             .ok_or_else(|| Error::internal("a frequency morsel is out of range"))?
             .clone();
+        morsel.advance(1);
+        Ok(Progress::Done)
+    }
+}
+
+/// A grouped distinct aggregate evaluated from a current row-preserving covering projection.
+///
+/// The source is chosen from bound columns, and the projection is scanned when the pipeline runs.
+/// It stores original covered codes, not group counts. The ordinary operators above this source
+/// still apply projection, ordering, and limits.
+#[derive(Debug)]
+pub(crate) struct ProjectionDistinct<'a> {
+    reader: &'a NativeReader,
+    order: usize,
+    covered: usize,
+    schema: Schema,
+    handout: Handout,
+    output: Mutex<(Option<Vec<Chunk>>, usize)>,
+}
+
+impl<'a> ProjectionDistinct<'a> {
+    pub(crate) fn new(
+        reader: &'a NativeReader,
+        order: usize,
+        covered: usize,
+        schema: Schema,
+    ) -> Self {
+        Self {
+            reader,
+            order,
+            covered,
+            schema,
+            handout: Handout::new(1),
+            output: Mutex::new((None, 0)),
+        }
+    }
+}
+
+impl Source for ProjectionDistinct<'_> {
+    fn morsel(&self) -> Option<Morsel> {
+        self.handout.take()
+    }
+
+    fn morsels(&self, _threads: usize, _weight: usize) -> Option<usize> {
+        Some(1)
+    }
+
+    fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
+        let mut held =
+            self.output.lock().map_err(|_| Error::internal("projection output lock poisoned"))?;
+        if held.0.is_none() {
+            // One engine worker owns this morsel, so the native scan runs on that worker rather
+            // than opening another thread pool outside the query's lease.
+            let rows = self
+                .reader
+                .grouped_distinct_run_projection_with_workers(
+                    self.order,
+                    self.covered,
+                    usize::MAX,
+                    1,
+                )?
+                .ok_or_else(|| Error::internal("a selected covering projection disappeared"))?;
+            let group_type = self.schema.types()[0].clone();
+            let entries = rows
+                .into_iter()
+                .map(|(group, count)| {
+                    let value = match group_type {
+                        LogicalType::TinyInt => {
+                            Value::TinyInt(i8::try_from(group).map_err(|_| {
+                                Error::internal("a projection group exceeds TINYINT")
+                            })?)
+                        }
+                        LogicalType::SmallInt => {
+                            Value::SmallInt(i16::try_from(group).map_err(|_| {
+                                Error::internal("a projection group exceeds SMALLINT")
+                            })?)
+                        }
+                        LogicalType::Integer => Value::Integer(group),
+                        _ => {
+                            return Err(Error::internal(
+                                "a projection group has an unsupported type",
+                            ));
+                        }
+                    };
+                    Ok((vec![value], count))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            held.0 = Some(Frequencies::grouped(self.schema.clone(), entries)?.chunks);
+        }
+        let chunks = held.0.as_ref().expect("projection output was initialized");
+        let total = chunks.len();
+        let next = chunks.get(held.1).cloned();
+        if let Some(chunk) = next {
+            *out = chunk;
+            held.1 += 1;
+            if held.1 < total {
+                return Ok(Progress::More);
+            }
+        } else {
+            *out = Chunk::empty(&self.schema.types());
+        }
         morsel.advance(1);
         Ok(Progress::Done)
     }

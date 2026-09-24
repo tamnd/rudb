@@ -93,7 +93,8 @@ use crate::settingnames::settingnames;
 use crate::sideways::{self, Exact, Keyed, Sideways};
 use crate::sort::Sort;
 use crate::source::{
-    Dummy, FileScan, Filters, Frequencies, Pushdown, Scan, Series, Summary, Values,
+    Dummy, FileScan, Filters, Frequencies, ProjectionDistinct, Pushdown, Scan, Series, Summary,
+    Values,
 };
 use crate::storagenames::storage_info;
 use crate::strategies::strategies;
@@ -1125,6 +1126,49 @@ fn summary_schema(plan: &Plan, index: u32, aggregates: Slice) -> Result<Schema> 
     Ok(Schema::numbered(fields, index))
 }
 
+/// A native row-preserving projection usable for a bound grouped distinct aggregate.
+///
+/// The lookup uses column bindings and the current table generation. SQL spelling, aliases,
+/// ordering, and limits do not enter the decision. Unsupported plans keep the regular aggregate.
+fn covering_grouped_distinct<'a>(
+    plan: &Plan,
+    catalog: &'a Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+) -> Result<Option<(&'a rudb_native::Reader, usize, usize, LogicalType)>> {
+    let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+        return Ok(None);
+    };
+    let [group] = plan.expr_list(groups) else { return Ok(None) };
+    let Expr::Column(group_binding) = *plan.expr(*group) else { return Ok(None) };
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct: true, filter: None } = *plan.expr(*aggregate)
+    else {
+        return Ok(None);
+    };
+    if plan.string(name) != "count" {
+        return Ok(None);
+    }
+    let [argument] = plan.expr_list(args) else { return Ok(None) };
+    let Expr::Column(order_binding) = *plan.expr(*argument) else { return Ok(None) };
+    let (Some(group_column), Some(order_column)) = (
+        stored_column(plan, table, index, columns, group_binding),
+        stored_column(plan, table, index, columns, order_binding),
+    ) else {
+        return Ok(None);
+    };
+    let group_type = plan.expr_type(*group).clone();
+    if !matches!(group_type, LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer) {
+        return Ok(None);
+    }
+    let Some(reader) = table.rows().stored() else { return Ok(None) };
+    if !reader.has_run_projection(order_column, group_column)? {
+        return Ok(None);
+    }
+    Ok(Some((reader, order_column, group_column, group_type)))
+}
+
 /// One end of a stored column, from the two places a file keeps one.
 ///
 /// The dictionary is asked first, because a string column keeps its values in sorted order and the
@@ -1802,6 +1846,30 @@ impl<'a> Building<'a, '_> {
         aggregates: Slice,
         bound: AggregateBound,
     ) -> Result<Segment<'a>> {
+        if bound.max_groups.is_none() && bound.having_count.is_none() {
+            if let Some((reader, order, covered, group_type)) =
+                covering_grouped_distinct(self.plan, self.catalog, input, groups, aggregates)?
+            {
+                let schema = Schema::numbered(
+                    vec![
+                        Field::new("group".to_string(), group_type),
+                        Field::new("count".to_string(), LogicalType::BigInt),
+                    ],
+                    index,
+                );
+                let source = ProjectionDistinct::new(reader, order, covered, schema.clone());
+                let id = self.shape.operator(reference);
+                let pipeline = self.shape.pipeline(reference);
+                let counters = self.watch(
+                    reference,
+                    id,
+                    pipeline,
+                    "Aggregate",
+                    Some("covering grouped distinct"),
+                );
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+            }
+        }
         // Before the input is built, because building it is what puts it in a pipeline and a
         // pipeline that exists is a pipeline that runs. A summary that let the rows be counted
         // underneath it would answer in no time and take exactly as long as it always did.
