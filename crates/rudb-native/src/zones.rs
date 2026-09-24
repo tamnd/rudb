@@ -269,18 +269,18 @@ impl Frequencies for Common {
         // The writer recounts the candidates that survive its pass, so what an incomplete synopsis
         // lost is values rather than counts, and a value it kept is one of the leading values of the
         // column, which is the one an equality would otherwise guess worst about.
-        let Ok(Some(prefix)) = self.reader.frequency_prefix(column) else {
+        let Ok(Some((entries, omitted_max))) = self.reader.held_prefix(column) else {
             return Stat::Unknown;
         };
         let mut comparable = false;
-        for (held, count) in prefix.entries {
+        for (held, count) in entries.iter() {
             // A null entry is the column's nulls, and no equality matches a null. Skipping it is
             // both the right answer and the only one available, since a null has no bound.
-            let Some(bound) = Bound::of_value(&held) else {
+            let Some(bound) = Bound::of_value(held) else {
                 continue;
             };
             match bound.order(value) {
-                Some(Ordering::Equal) => return Stat::exact(count, Provenance::FrequencySynopsis),
+                Some(Ordering::Equal) => return Stat::exact(*count, Provenance::FrequencySynopsis),
                 Some(_) => comparable = true,
                 None => {}
             }
@@ -291,7 +291,7 @@ impl Frequencies for Common {
         // bound the writer recorded, and a prefix has nothing to say about which. Where not one
         // entry would even compare, the constant is of another type and the zero would be an
         // artefact of that rather than a fact about the rows.
-        if prefix.omitted_max == 0 && comparable {
+        if omitted_max == 0 && comparable {
             Stat::exact(0, Provenance::FrequencySynopsis)
         } else {
             Stat::Unknown
@@ -299,18 +299,18 @@ impl Frequencies for Common {
     }
 
     fn remainder(&self, column: usize) -> Option<Remainder> {
-        let Ok(Some(prefix)) = self.reader.frequency_prefix(column) else {
+        let Ok(Some((entries, omitted_max))) = self.reader.held_prefix(column) else {
             return None;
         };
         // A complete list has nothing outside it, and saying so as a remainder of no rows over no
         // values would hand the caller a division it has to special case. `rows_with` answers that
         // column outright.
-        if prefix.omitted_max == 0 {
+        if omitted_max == 0 {
             return None;
         }
         let mut held: u64 = 0;
         let mut listed: u64 = 0;
-        for (value, count) in &prefix.entries {
+        for (value, count) in entries.iter() {
             held = held.saturating_add(*count);
             // The null entry's rows come out of the pool and the null itself is not one of the
             // values, because the counts this is subtracted from do not count it as one. A null in
@@ -323,7 +323,7 @@ impl Frequencies for Common {
         // Saturating because two reads of one table disagreeing about its rows is not a reason to
         // report a tail larger than the column.
         let rows = Frequencies::rows(self).saturating_sub(held);
-        Some(Remainder { rows, listed, most: prefix.omitted_max })
+        Some(Remainder { rows, listed, most: omitted_max })
     }
 }
 
