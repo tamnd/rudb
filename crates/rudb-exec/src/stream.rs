@@ -271,8 +271,10 @@ impl Stream for Project {
 
     fn push(&self, chunk: &mut Chunk, scratch: &mut Scratch) -> Result<Progress> {
         let mut columns = Vec::with_capacity(self.exprs.len());
-        self.exprs.evaluate(chunk, scratch, &mut columns)?;
-        *chunk = Chunk::with_rows(columns, chunk.len())?;
+        let rows = chunk.len();
+        let taken = std::mem::replace(chunk, Chunk::with_rows(Vec::new(), 0)?);
+        self.exprs.evaluate_taking(taken, scratch, &mut columns)?;
+        *chunk = Chunk::with_rows(columns, rows)?;
         Ok(Progress::More)
     }
 
