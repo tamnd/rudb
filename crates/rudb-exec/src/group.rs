@@ -6609,7 +6609,7 @@ mod tests {
         Distinct, EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition,
         FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed,
         WINDOW_RATE, WINDOW_SLACK, bigint_distinct_partition, encoded_count_partition,
-        fixed_partition, slot_runs_of,
+        fixed_partition, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
