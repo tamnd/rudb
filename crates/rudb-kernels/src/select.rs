@@ -183,7 +183,7 @@ fn swept(flags: &Vector, rows: usize) -> Option<Selection> {
             if values.len() < rows {
                 return None;
             }
-            Some(picked(values, identity, rows, &nulls_of(flags)))
+            Some(picked_flat(&values[..rows], &nulls_of(flags)))
         }
         Form::Dictionary | Form::Rle => {
             let (codes, inner) = flags.positions()?;
@@ -198,6 +198,43 @@ fn swept(flags: &Vector, rows: usize) -> Option<Selection> {
             Some(picked(values, |index| codes[index] as usize, rows, &nulls_of(flags)))
         }
         _ => None,
+    }
+}
+
+/// [`picked`] for flags that are one flat run, a block of 64 rows at a time.
+///
+/// [`picked`] writes every row into a buffer as long as the input, which it zeroes first, and moves
+/// the end of the answer by each flag in turn, so no two rows are worked on at once. ClickBench 10
+/// keeps one row in thirty of the phone models and spent a twelfth of the query there. This folds
+/// each block's flags and its validity word into one mask the way [`kept_in_blocks`] does for a
+/// comparison, so a block with nothing kept costs a few vector instructions and nothing else.
+///
+/// [`kept_in_blocks`]: crate::compare::kept_in_blocks
+pub(crate) fn picked_flat(values: &[bool], nulls: &Validity) -> Selection {
+    let rows = values.len();
+    match nulls {
+        Validity::AllValid => crate::compare::kept_in_blocks(
+            rows,
+            |base, flags| {
+                for (flag, &value) in flags.iter_mut().zip(&values[base..base + 64]) {
+                    *flag = u8::from(value);
+                }
+            },
+            |index| values[index],
+        ),
+        Validity::AllInvalid => Selection::empty(),
+        Validity::Mask(mask) => crate::compare::kept_in_blocks(
+            rows,
+            |base, flags| {
+                let word = mask.word(base / 64);
+                for (lane, (flag, &value)) in
+                    flags.iter_mut().zip(&values[base..base + 64]).enumerate()
+                {
+                    *flag = u8::from(value) & u8::from(word >> lane & 1 == 1);
+                }
+            },
+            |index| values[index] && mask.word(index / 64) >> (index % 64) & 1 == 1,
+        ),
     }
 }
 
