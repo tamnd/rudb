@@ -101,7 +101,7 @@ use std::sync::Arc;
 
 use rudb_common::{LogicalType, Value};
 use rudb_encoding::sketch::{DEFAULT_K, Sketch, hash64, hash128};
-use rudb_vector::{Chunk, Data, Form, Vector};
+use rudb_vector::{Chunk, Data, Form, Validity, Vector};
 
 use crate::tally::Tally;
 
@@ -142,12 +142,26 @@ struct Column {
 struct Entries {
     /// The dictionary these are for, held so that its address stays its own while it is compared.
     values: Option<Arc<Vector>>,
-    /// Each entry's hash, once some row has pointed at it.
-    hashes: Vec<Option<u64>>,
-    /// How many rows of the chunk being walked point at each entry, back to nothing after the walk.
-    seen: Vec<u64>,
+    /// One slot an entry.
+    slots: Vec<Entry>,
     /// The entries the chunk being walked pointed at, in the order it first did.
     touched: Vec<u32>,
+}
+
+/// What [`Entries`] knows about one entry.
+///
+/// The count and the hash sit side by side because the dictionary of a Parquet column chunk can be
+/// far larger than the cache, and a row that points at an entry then costs a miss to count. Held in
+/// two arrays that was a miss for the count and another for the hash when the chunk's entries were
+/// walked. Held together the walk finds the line the count already brought in.
+#[derive(Debug, Clone, Copy, Default)]
+struct Entry {
+    hash: u64,
+    /// How many rows of the chunk being walked point at the entry, back to zero after the walk. A
+    /// chunk's rows are counted in `u32` like its codes are.
+    seen: u32,
+    /// Whether `hash` has been worked out yet, which is once some row has pointed at the entry.
+    hashed: bool,
 }
 
 impl Entries {
@@ -157,8 +171,7 @@ impl Entries {
             return;
         }
         self.values = Some(Arc::clone(values));
-        self.hashes = vec![None; values.len()];
-        self.seen = vec![0; values.len()];
+        self.slots = vec![Entry::default(); values.len()];
         self.touched.clear();
     }
 }
@@ -687,6 +700,8 @@ fn coded(
     let validity = vector.validity();
     let nullable = validity.has_nulls(vector.len());
     let inner = values.validity();
+    // Asked of the form rather than counted, since the mask covers the whole dictionary.
+    let inner_nullable = !matches!(inner, Validity::AllValid);
     entries.over(values);
     for row in 0..vector.len() {
         if nullable && !validity.is_valid(row) {
@@ -695,30 +710,29 @@ fn coded(
         let Some(&code) = codes.get(row) else { return false };
         // A code pointing at a null is a null row, however the vector's own mask reads, which is the
         // same rule `Vector::is_null_at` follows through a dictionary.
-        if !inner.is_valid(code as usize) {
+        if inner_nullable && !inner.is_valid(code as usize) {
             continue;
         }
-        let Some(slot) = entries.seen.get_mut(code as usize) else { return false };
-        if *slot == 0 {
+        let Some(slot) = entries.slots.get_mut(code as usize) else { return false };
+        if slot.seen == 0 {
             entries.touched.push(code);
         }
-        *slot += 1;
+        slot.seen += 1;
     }
-    let Entries { hashes, seen, touched, .. } = entries;
+    let Entries { slots, touched, .. } = entries;
     for code in touched.drain(..) {
-        let code = code as usize;
-        let (Some(held), Some(hash)) = (seen.get_mut(code), hashes.get_mut(code)) else {
-            return false;
-        };
-        let held = std::mem::take(held);
-        let hash = match *hash {
-            Some(hash) => hash,
-            None => match entry_hash(values, code) {
-                Some(found) => *hash.insert(found),
+        let Some(slot) = slots.get_mut(code as usize) else { return false };
+        let held = u64::from(std::mem::take(&mut slot.seen));
+        if !slot.hashed {
+            match entry_hash(values, code as usize) {
+                Some(found) => {
+                    slot.hash = found;
+                    slot.hashed = true;
+                }
                 None => return false,
-            },
-        };
-        sink.add(hash, held, || values.value_at(code));
+            }
+        }
+        sink.add(slot.hash, held, || values.value_at(code as usize));
     }
     true
 }
