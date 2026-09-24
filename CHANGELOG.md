@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.28
+
+A patch release of seven commits, mostly on TPC-H under G10. The native directory format number stays at 29 and the storage format version at 9.
+
+0.4.27 went out without #1760. #1761 was squashed from a branch cut before #1760 merged, and its diff took the sparse row reads back out, so the paragraph about them in the 0.4.27 notes describes code that was not in that release. #1766 puts them back, and on one thread q17 is at 0.559 G instructions against DuckDB's 0.752 G and q20 at 0.589 G against 0.803 G.
+
+#1769 adds an optimizer pass that reads a total off a grouped aggregate over the same rows, so q11's HAVING subquery no longer runs the partsupp, supplier and nation join a second time. On one thread q11 went from 0.162 G to 0.109 G instructions against DuckDB's 0.165 G.
+
+#1768 folds one counter for an aggregate call the plan asks for twice, #1767 lets a hash join's gathered chunks go once they are laid out, and #1764 joins chunks before a partitioned aggregate splits them. On the load path, #1765 lets a load's sink keep the chunk it is given rather than copy it and #1763 converts a CSV chunk a block of rows at a time.
+
 ## 0.4.27
 
 A patch release of fourteen commits, almost all of them on TPC-H under G10. The native directory format number stays at 29 and the storage format version at 9.
