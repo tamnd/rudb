@@ -307,7 +307,7 @@ fn divided(plan: &mut Plan, total: ExprRef, seen: ExprRef, span: Span) -> Option
 }
 
 /// One scalar call, with its arguments cast to what the catalog says it takes.
-fn scalar(plan: &mut Plan, name: &str, args: &[ExprRef], span: Span) -> Option<ExprRef> {
+pub(crate) fn scalar(plan: &mut Plan, name: &str, args: &[ExprRef], span: Span) -> Option<ExprRef> {
     let given: Vec<LogicalType> = args.iter().map(|&arg| plan.expr_type(arg).clone()).collect();
     let resolved = rudb_functions::resolve(name, &given).ok()?;
     if resolved.arguments.len() != args.len() {
@@ -325,7 +325,7 @@ fn scalar(plan: &mut Plan, name: &str, args: &[ExprRef], span: Span) -> Option<E
 }
 
 /// `expr` as `to`, which is `expr` itself when it is already that type.
-fn cast(plan: &mut Plan, expr: ExprRef, to: &LogicalType, span: Span) -> ExprRef {
+pub(crate) fn cast(plan: &mut Plan, expr: ExprRef, to: &LogicalType, span: Span) -> ExprRef {
     if plan.expr_type(expr) == to {
         return expr;
     }
