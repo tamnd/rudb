@@ -234,12 +234,14 @@ impl Domain {
                 // A key under the base wraps round to an offset far past the range, so one compare
                 // covers both ends, and the row is written whether it is kept or not so that the loop
                 // has no branch to mispredict on a bitmap that keeps about half.
+                // A key past the range is moved onto the bit at the range itself, which
+                // [`words_for`] leaves room for and nothing sets, so the range test is a
+                // conditional move and not a branch that half the keys of a filtered parent take.
                 kept.resize(rows, 0);
                 let mut at = 0;
                 for (row, &key) in block[..rows].iter().enumerate() {
-                    let offset = key.wrapping_sub(base) as u64;
-                    let hit = offset < self.range
-                        && self.words[(offset / 64) as usize] >> (offset % 64) & 1 == 1;
+                    let offset = (key.wrapping_sub(base) as u64).min(self.range);
+                    let hit = self.words[(offset / 64) as usize] >> (offset % 64) & 1 == 1;
                     kept[at] = row as u32;
                     at += usize::from(hit);
                 }
@@ -660,7 +662,7 @@ fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
     if (range > (rows as u64).saturating_mul(64) && range > SMALL) || bytes > BUDGET {
         return None;
     }
-    let mut words = vec![0_u64; usize::try_from(range.div_ceil(64)).ok()?];
+    let mut words = vec![0_u64; words_for(range)?];
     for (keys, len) in keyed {
         let Some(keys) = keys else { continue };
         if !keys.signed_block(&mut block) {
@@ -676,6 +678,14 @@ fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
         }
     }
     Some(Domain { base: i128::from(low), range, words })
+}
+
+/// How many words a [`Domain`] over `range` keys takes, or `None` for more than memory holds.
+///
+/// One more bit than the range, always zero, so that [`Domain::keep`] can send every key outside
+/// the range to it rather than branch around the read.
+fn words_for(range: u64) -> Option<usize> {
+    usize::try_from(range / 64 + 1).ok()
 }
 
 /// The build side's keys sorted and each once, or `None` when one is not an integer [`dense`] reads.
@@ -756,7 +766,7 @@ fn domain_of(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Optio
         return Ok(None);
     }
     let Some((base, range)) = exact.keys.span() else { return Ok(None) };
-    let Ok(len) = usize::try_from(range.div_ceil(64)) else { return Ok(None) };
+    let Some(len) = words_for(range) else { return Ok(None) };
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let mut words = vec![0_u64; len];
     for chunk in chunks {
@@ -1043,6 +1053,33 @@ mod tests {
         assert_eq!(kept, [0, 3, 6]);
         let whole = column(&[Some(60), Some(1), Some(7), Some(i32::MIN), Some(i32::MAX)]);
         assert_eq!(domain.keep(&whole, whole.len(), &mut Vec::new()), [0, 2]);
+    }
+
+    /// A range that ends on a word boundary still has the bit past its end to send a miss to, so a
+    /// key one past the largest, far past it or under the smallest is dropped and not read out of
+    /// the next word or out of bounds.
+    #[test]
+    fn a_bitmap_whose_range_fills_its_words_drops_every_key_outside_it() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+
+        let found = found(&keyed, None, &[chunk(&[Some(0), Some(63), Some(64), Some(127)])])
+            .expect("integers");
+
+        let domain = found.domain.expect("a bitmap over a hundred and twenty eight values");
+        assert_eq!(domain.range, 128);
+        let driving = column(&[
+            Some(127),
+            Some(128),
+            Some(129),
+            Some(191),
+            Some(192),
+            Some(-1),
+            Some(i32::MAX),
+            Some(64),
+        ]);
+        assert_eq!(domain.keep(&driving, driving.len(), &mut Vec::new()), [0, 7]);
     }
 
     /// Past sixty four bits a key the bitmap is bigger than the filter it would replace, once it is
