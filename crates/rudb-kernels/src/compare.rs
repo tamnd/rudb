@@ -482,25 +482,27 @@ fn packed_kept(
         // vector registers. Compared through a closure over the row, each row reloaded both
         // vectors behind the flag it had just stored, which could have been either of them for
         // all the compiler knew, and that was a fifth of q12.
-        let (mut a, mut b) = (vec![0_u64; len], vec![0_u64; len]);
-        one.unpack(0, &mut a);
-        other.unpack(0, &mut b);
         // Codes of 30 bits or fewer, moved by less than 2^30, fit an `i32` on both sides, and a
         // vector register holds twice as many of those and compares them signed in one step,
-        // where a signed compare of `i64` lanes is put together out of several on SSE2.
+        // where a signed compare of `i64` lanes is put together out of several on SSE2. Either
+        // way the codes go straight into their lanes a block at a time, rather than into a run of
+        // `u64` zeroed first and then walked again into a second run, which was 6% of q12.
         if one.width() <= 30 && other.width() <= 30 && shift.unsigned_abs() < 1 << 30 {
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "a code is below 2^30 and the shift is below 2^30 either way"
             )]
-            let (a, b): (Vec<i32>, Vec<i32>) = (
-                a.into_iter().map(|code| code as i32).collect(),
-                b.into_iter().map(|code| (code as i64 + shift) as i32).collect(),
-            );
+            let (a, b) = {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                one.unpack_mapped(0, len, &mut a, |code| code as i32);
+                other.unpack_mapped(0, len, &mut b, |code| (code as i64 + shift) as i32);
+                (a, b)
+            };
             flat_by(op, rows, &a, &b)?
         } else {
-            let a: Vec<i64> = a.into_iter().map(|code| code as i64).collect();
-            let b: Vec<i64> = b.into_iter().map(|code| code as i64 + shift).collect();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            one.unpack_mapped(0, len, &mut a, |code| code as i64);
+            other.unpack_mapped(0, len, &mut b, |code| code as i64 + shift);
             flat_by(op, rows, &a, &b)?
         }
     } else {
