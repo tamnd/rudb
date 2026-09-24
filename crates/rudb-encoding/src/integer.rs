@@ -488,16 +488,23 @@ fn candidates(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Vec<Kind> {
     let considered = |kind| chooser.considers_integer(kind, depth);
     // Every neighbouring difference is no wider than the whole range, so a range that fits in an
     // `i64` answers for all of them and only a chunk holding both ends of the type walks the pairs.
+    let fits = profile.max.checked_sub(profile.min).is_some();
     if considered(Kind::Delta)
-        && (profile.max.checked_sub(profile.min).is_some() || deltas_fit(values))
+        && (if fits { profile.deltas_pay(values) } else { deltas_fit(values) })
     {
         kinds.push(Kind::Delta);
     }
     if considered(Kind::Rle) && profile.runs * 4 <= values.len() * 3 {
         kinds.push(Kind::Rle);
     }
-    if considered(Kind::Dict) && spread_of(values).0 * 2 <= values.len() {
-        kinds.push(Kind::Dict);
+    // A dictionary's codes are as wide as its distinct count, so one whose codes are no narrower
+    // than the values has only added a dictionary. On TPC-H SF1 it was offered 1,124 times, kept 16
+    // times and cost 30% of the integer cascade's time before this.
+    if considered(Kind::Dict) && profile.width() > 1 {
+        let distinct = spread_of(values).0;
+        if distinct * 2 <= values.len() && width_of(distinct as u64 - 1) < profile.width() {
+            kinds.push(Kind::Dict);
+        }
     }
     // A value in four rows out of five leaves a fifth for everything else, and each of those rows
     // starts at most two runs, so a chunk with more runs than that has no such value and the vote
@@ -522,24 +529,97 @@ fn candidates(values: &[i64], depth: u8, chooser: &dyn Chooser) -> Vec<Kind> {
 /// they were most of the tenth of the load's CPU that `encode_at` came to, since a replayed part
 /// still asks every question the fallback would. This is one pass, and the vote is only taken where
 /// the run count leaves room for it.
+///
+/// The same pass looks at the differences too, since it has both neighbours in hand. `DELTA` was
+/// offered on every chunk whose range fit, and on the `hits_0` load it was 3,325 offers, 20.6% of
+/// the integer cascade's time and never kept once. What it stores is the zigzagged differences, so
+/// their spread says how wide they pack and their runs say whether they would run-length code.
 struct Profile {
     min: i64,
     max: i64,
     /// Runs of equal neighbours, which is one for a chunk of a single value.
     runs: usize,
+    /// The smallest and largest zigzagged difference between neighbours. They wrap where the range
+    /// does not fit in an `i64`, and nothing reads them then.
+    delta_low: u64,
+    delta_high: u64,
+    /// Runs of equal differences, which is one for a chunk of fewer than three values.
+    delta_runs: usize,
 }
 
 impl Profile {
     fn of(values: &[i64]) -> Option<Self> {
         let first = *values.first()?;
         let (mut min, mut max, mut breaks) = (first, first, 0usize);
+        let mut last = values.get(1).map_or(0, |second| second.wrapping_sub(first));
+        let (mut delta_low, mut delta_high, mut turns) = (u64::MAX, 0u64, 0usize);
         for (before, after) in values.iter().zip(&values[1..]) {
             min = min.min(*after);
             max = max.max(*after);
             breaks += usize::from(before != after);
+            let delta = after.wrapping_sub(*before);
+            let zigzagged = zigzag(delta);
+            delta_low = delta_low.min(zigzagged);
+            delta_high = delta_high.max(zigzagged);
+            turns += usize::from(delta != last);
+            last = delta;
         }
-        Some(Self { min, max, runs: breaks + 1 })
+        Some(Self { min, max, runs: breaks + 1, delta_low, delta_high, delta_runs: turns + 1 })
     }
+
+    /// How many bits `Packed` needs for a value of this chunk at most, from the whole range.
+    fn width(&self) -> u32 {
+        width_of(self.max.wrapping_sub(self.min) as u64)
+    }
+
+    /// Whether the differences are worth encoding, for a chunk whose range fits in an `i64`.
+    ///
+    /// They are when they pack narrower than the values, which is a sorted key or a slowly moving
+    /// counter, or when they run-length code and the values do not, which is a column that climbs
+    /// in steps, or when the first few take only a handful of values, which is a column that walks
+    /// a cycle and whose differences make a dictionary of a few entries. Anything else comes out no
+    /// smaller than `Packed` or `Rle` on the values.
+    fn deltas_pay(&self, values: &[i64]) -> bool {
+        let len = values.len();
+        let narrower = width_of(self.delta_high.wrapping_sub(self.delta_low)) < self.width();
+        // A chunk that run-length codes has differences that are nearly all zero, so they repeat
+        // and there are few of them, and `Rle` on the values still beats them.
+        let unruly = self.runs * 4 > len * 3;
+        let repeat = self.delta_runs * 4 <= len.saturating_sub(1) * 3;
+        narrower || (unruly && (repeat || few_deltas(values)))
+    }
+}
+
+/// Whether the first [`FEW_DELTAS_SEEN`] differences take no more than [`FEW_DELTAS`] values.
+///
+/// It stops at the first difference past that many, which on a chunk with nothing cyclic in it is
+/// a handful of pairs in.
+fn few_deltas(values: &[i64]) -> bool {
+    let mut seen = [0i64; FEW_DELTAS];
+    let mut count = 0;
+    for pair in values.windows(2).take(FEW_DELTAS_SEEN) {
+        let delta = pair[1].wrapping_sub(pair[0]);
+        if seen[..count].contains(&delta) {
+            continue;
+        }
+        if count == FEW_DELTAS {
+            return false;
+        }
+        seen[count] = delta;
+        count += 1;
+    }
+    true
+}
+
+/// How many distinct differences [`few_deltas`] allows.
+const FEW_DELTAS: usize = 4;
+
+/// How many differences [`few_deltas`] looks at.
+const FEW_DELTAS_SEEN: usize = 64;
+
+/// The bits a value up to `range` takes, which is zero for a range of zero.
+fn width_of(range: u64) -> u32 {
+    u64::BITS - range.leading_zeros()
 }
 
 /// `None` when the encoding does not apply to this input, which the caller treats as a candidate
@@ -1484,14 +1564,31 @@ mod tests {
                 if chunk.iter().all(|value| *value == chunk[0]) {
                     expected = vec![Kind::Constant];
                 } else {
-                    if chunk.len() >= 2 && deltas_fit(&chunk) {
+                    let runs = 1 + chunk.windows(2).filter(|pair| pair[0] != pair[1]).count();
+                    let low = *chunk.iter().min().unwrap();
+                    let high = *chunk.iter().max().unwrap();
+                    let bits = |range: u128| 128 - range.leading_zeros();
+                    let width = bits((i128::from(high) - i128::from(low)) as u128);
+                    let zigzags: Vec<u128> = chunk
+                        .windows(2)
+                        .map(|pair| u128::from(zigzag(pair[1].wrapping_sub(pair[0]))))
+                        .collect();
+                    let spread = zigzags.iter().max().unwrap() - zigzags.iter().min().unwrap();
+                    let turns = 1 + zigzags.windows(2).filter(|pair| pair[0] != pair[1]).count();
+                    let mut first: Vec<u128> = zigzags.iter().take(64).copied().collect();
+                    first.sort_unstable();
+                    first.dedup();
+                    let pays = bits(spread) < width
+                        || (runs * 4 > chunk.len() * 3
+                            && (turns * 4 <= (chunk.len() - 1) * 3 || first.len() <= 4));
+                    if deltas_fit(&chunk) && pays {
                         expected.push(Kind::Delta);
                     }
-                    let runs = 1 + chunk.windows(2).filter(|pair| pair[0] != pair[1]).count();
                     if runs * 4 <= chunk.len() * 3 {
                         expected.push(Kind::Rle);
                     }
-                    if spread_of(&chunk).0 * 2 <= chunk.len() {
+                    let distinct = spread_of(&chunk).0;
+                    if distinct * 2 <= chunk.len() && bits(distinct as u128 - 1) < width {
                         expected.push(Kind::Dict);
                     }
                     if majority(&chunk).is_some_and(|(_, count)| count * 10 >= chunk.len() * 8) {
@@ -2037,7 +2134,7 @@ mod tests {
 
     #[test]
     fn candidate_sizes_reports_what_the_chooser_looked_at() {
-        let values: Vec<i64> = (0..5000).map(|index| index % 17).collect();
+        let values: Vec<i64> = (0..5000).map(|index| index % 17 * 1000).collect();
         let sizes = candidate_sizes(&values).unwrap();
         assert!(sizes.iter().any(|(kind, _)| *kind == Kind::Dict));
         assert!(sizes.iter().any(|(kind, _)| *kind == Kind::Packed));

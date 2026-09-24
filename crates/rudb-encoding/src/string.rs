@@ -1618,9 +1618,17 @@ mod tests {
         // is whatever wins on them, and since #575 that is the match finder rather than front
         // coding with the leftovers FSST compressed. The point of the test is unchanged: nobody
         // named the shape and the chooser arrived at it.
+        //
+        // The rows pick their value by a hash of the row number. They used to walk the values in
+        // a fixed stride, which makes the dictionary codes a cycle whose differences take a
+        // quarter as many values as the codes do, and a real column's codes are not that.
         let distinct = urls(500);
-        let values: Vec<Vec<u8>> =
-            (0..50_000).map(|index| distinct[index * 7919 % distinct.len()].clone()).collect();
+        let values: Vec<Vec<u8>> = (0..50_000_u64)
+            .map(|index| {
+                let hashed = (index.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize;
+                distinct[hashed % distinct.len()].clone()
+            })
+            .collect();
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Dict);
         let shape = describe(&bytes).unwrap();
