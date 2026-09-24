@@ -290,23 +290,24 @@ fn signed(raw: &[u8]) -> (bool, &[u8]) {
 /// A run of one to twenty ASCII digits as a number, or `None` when it is empty, longer, has a byte
 /// in it that is not a digit, or is more than a `u64` holds.
 ///
-/// The digits are read eight at a time, see [`eight`]. The first `len % 8` of them go in a word of
-/// their own with zeros in front, which do not change its value, and the rest are whole words. So
-/// a short number, which is most of them, is one word, and every step after it is a
-/// multiplication by the same ten to the eighth. Only a twenty digit number can overflow, and the
-/// checked arithmetic is what refuses it.
+/// The first `len % 8` digits are read one at a time and the rest eight at a time, see [`eight`],
+/// each step after the first a multiplication by the same ten to the eighth. The short head is a
+/// loop rather than a word padded with zeros because copying a slice of unknown length into the
+/// pad is a call to `memcpy`, which cost more than the digits. Only a twenty digit number can
+/// overflow, and the checked arithmetic is what refuses it.
 fn digits(run: &[u8]) -> Option<u64> {
     if run.is_empty() || run.len() > 20 {
         return None;
     }
     let (head, words) = run.split_at(run.len() % 8);
-    let mut value = if head.is_empty() {
-        0
-    } else {
-        let mut padded = [b'0'; 8];
-        padded[8 - head.len()..].copy_from_slice(head);
-        eight(padded)?
-    };
+    let mut value = 0;
+    for &byte in head {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value * 10 + u64::from(digit);
+    }
     for word in words.chunks_exact(8) {
         let word = eight(word.try_into().ok()?)?;
         value = value.checked_mul(100_000_000)?.checked_add(word)?;
