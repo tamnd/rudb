@@ -1702,7 +1702,7 @@ fn selected_runs(
     let (mut kept, mut written) = (0, 0_usize);
     for read in 0..runs.len() {
         let (value, end) = runs[read];
-        let upto = kept + at[kept..].partition_point(|&row| (row as usize) < end);
+        let upto = kept + below(&at[kept..], end);
         if upto == kept {
             continue;
         }
@@ -1725,6 +1725,23 @@ fn selected_runs(
         into.resize(end, value);
     }
     true
+}
+
+/// How many of `at`, rows that climb, are below `end`.
+///
+/// Rows that climb are at least one apart, so no more than `end - at[0]` of them can be below
+/// `end`, and that many are, exactly, wherever the filter kept every row in between. A filter that
+/// keeps nearly every row, as `URL <> ''` does, leaves most runs like that, and a search of the
+/// whole chunk a run was half of what [`selected_runs`] cost on ClickBench 28.
+fn below(at: &[u32], end: usize) -> usize {
+    let Some(&first) = at.first() else {
+        return 0;
+    };
+    let most = end.saturating_sub(first as usize).min(at.len());
+    if most == 0 || (at[most - 1] as usize) < end {
+        return most;
+    }
+    at[..most].partition_point(|&row| (row as usize) < end)
 }
 
 /// The first `rows` values of an integer key column, widened to `i64`, into `into`.
@@ -5039,5 +5056,20 @@ mod tests {
         let backwards = Vector::dictionary((0..40).rev().collect(), column).unwrap();
         assert!(!selected_runs(&backwards, 40, &mut into, &mut runs));
         assert!(runs.is_empty());
+    }
+
+    /// The count of rows below an end is the one a search of them all gives, whether the rows are
+    /// every row or have gaps in them.
+    #[test]
+    fn rows_below_an_end_match_a_search() {
+        let every: Vec<u32> = (10..60).collect();
+        let gaps: Vec<u32> =
+            (10..200).filter(|row| row % 7 != 3 && !(40..90).contains(row)).collect();
+        for at in [&every[..], &gaps[..], &[][..], &[5][..]] {
+            for end in 0..220 {
+                let wanted = at.partition_point(|&row| (row as usize) < end);
+                assert_eq!(below(at, end), wanted, "{end} in {at:?}");
+            }
+        }
     }
 }
