@@ -328,6 +328,8 @@ impl Memo {
         let mut added = 0;
         let mut previous = Vec::new();
         let mut previous_found = None;
+        let mut local = Local::default();
+        let mut kept = Vec::new();
         let mut at = first;
         while at < last {
             let stopped = self.dictionary.sweep_text(at, last, &mut |_, text: &[u8]| {
@@ -343,10 +345,35 @@ impl Memo {
                 )?;
                 // Neighbouring values often give the same answer, the pages of one host, and the
                 // one before is still at hand, so a repeat skips the table and its lock.
+                //
+                // Past that, a group of values holds about a third as many distinct answers as it
+                // has values that differ from the one before, and those repeats find their code in
+                // a table of the group's own answers that stays in cache. The shared table is a
+                // cache miss and a lock a lookup.
                 let found = match previous_found {
                     Some(found) if previous.as_slice() == answer => found,
                     _ => {
-                        let (found, shared) = self.first_of(answer, own, &mut added)?;
+                        let hash = hash_of(answer);
+                        let (found, shared) = match local.get(&hash) {
+                            Some(&(start, end, found))
+                                if kept.get(start as usize..end as usize) == Some(answer) =>
+                            {
+                                (found, None)
+                            }
+                            Some(_) => self.first_of(hash, answer, own, &mut added)?,
+                            None => {
+                                let (found, shared) =
+                                    self.first_of(hash, answer, own, &mut added)?;
+                                let start = kept.len();
+                                kept.extend_from_slice(answer);
+                                if let (Ok(start), Ok(end)) =
+                                    (u32::try_from(start), u32::try_from(kept.len()))
+                                {
+                                    local.insert(hash, (start, end, found));
+                                }
+                                (found, shared)
+                            }
+                        };
                         if let Some(shared) = shared {
                             owns.push(
                                 u16::try_from(firsts.len())
@@ -388,13 +415,11 @@ impl Memo {
     /// under their own codes, and takes the same shared answers the first one did.
     fn first_of(
         &self,
+        hash: u64,
         answer: &[u8],
         own: u32,
         added: &mut usize,
     ) -> Result<(u32, Option<Arc<[u8]>>)> {
-        let mut words = Words::default();
-        answer.hash(&mut words);
-        let hash = words.finish();
         let shard = &self.firsts[(hash >> 32) as usize % REPLACE_SHARDS];
         let mut seen =
             shard.lock().map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
@@ -419,6 +444,18 @@ impl Memo {
         Ok(self.group(first)?.get(first % REPLACE_GROUP))
     }
 }
+
+/// The hash an answer is filed under, in the shared table and in a group's own.
+fn hash_of(answer: &[u8]) -> u64 {
+    let mut words = Words::default();
+    answer.hash(&mut words);
+    words.finish()
+}
+
+/// The answers one group has looked up so far, by hash, each as where its bytes sit in the group's
+/// copy of them and the code it came back with. Two answers with one hash keep the first, and the
+/// second goes to the shared table every time.
+type Local = HashMap<u64, (u32, u32, u32), BuildHasherDefault<Stored>>;
 
 /// The answers one shard has seen, each with the code of the first value that gave it.
 ///
