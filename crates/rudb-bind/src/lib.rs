@@ -34,7 +34,7 @@ pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
 pub use parameters::Parameters;
 pub use statement::{
     Bound, Checks, Conflict, ConflictAction, CreateTable, CreateView, DropTable, Insert,
-    SchemaChange, SequenceChange, Write, bind_statement, bind_statement_outlined,
+    SchemaChange, SequenceChange, TypeChange, Write, bind_statement, bind_statement_outlined,
     bind_statement_sql, bind_statement_with,
 };
 

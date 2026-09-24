@@ -513,8 +513,22 @@ impl LogicalType {
     /// If the text is not a type name this understands. The message names the offending word,
     /// because a type parse failure two levels inside a `STRUCT` is otherwise unreadable.
     pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_with(text, &mut |_| None)
+    }
+
+    /// Reads a written type the way [`LogicalType::parse`] does, asking `resolve` about a name that
+    /// is not a built in one. The name comes as its parts, outermost first, and the answer is the
+    /// type a `CREATE TYPE` made it stand for.
+    ///
+    /// # Errors
+    ///
+    /// As [`LogicalType::parse`], and for a name `resolve` does not know either.
+    pub fn parse_with(
+        text: &str,
+        resolve: &mut dyn FnMut(&[String]) -> Option<LogicalType>,
+    ) -> Result<Self> {
         let tokens = lex(text)?;
-        let mut parser = TypeParser { tokens: &tokens, position: 0 };
+        let mut parser = TypeParser { tokens: &tokens, position: 0, resolve };
         let ty = parser.parse_type()?;
         if parser.position != parser.tokens.len() {
             return Err(Error::parser(format!("Type \"{text}\" has trailing text")));
@@ -770,6 +784,7 @@ enum Token {
     LeftBracket,
     RightBracket,
     Comma,
+    Dot,
 }
 
 fn lex(text: &str) -> Result<Vec<Token>> {
@@ -798,6 +813,10 @@ fn lex(text: &str) -> Result<Vec<Token>> {
             }
             ',' => {
                 tokens.push(Token::Comma);
+                i += 1;
+            }
+            '.' => {
+                tokens.push(Token::Dot);
                 i += 1;
             }
             '"' => {
@@ -853,6 +872,8 @@ fn lex(text: &str) -> Result<Vec<Token>> {
 struct TypeParser<'a> {
     tokens: &'a [Token],
     position: usize,
+    /// What a name that is not a built in type stands for.
+    resolve: &'a mut dyn FnMut(&[String]) -> Option<LogicalType>,
 }
 
 impl TypeParser<'_> {
@@ -909,6 +930,9 @@ impl TypeParser<'_> {
             }
             _ => return Err(Error::parser("Expected a type name".to_string())),
         };
+        if self.peek() == Some(&Token::Dot) {
+            return self.parse_qualified(word);
+        }
         let upper = word.to_ascii_uppercase();
 
         match upper.as_str() {
@@ -973,7 +997,30 @@ impl TypeParser<'_> {
         // A length modifier on a string type parses and is discarded, which is what DuckDB does:
         // VARCHAR(10) does not truncate and does not reject, it is VARCHAR.
         self.eat_length_modifier()?;
-        alias(&upper).ok_or_else(|| Error::parser(format!("Unrecognized type name \"{word}\"")))
+        // A built in name comes first, and there is no hiding one behind a `CREATE TYPE` of the
+        // same name because the pin refuses to make it.
+        if let Some(ty) = alias(&upper) {
+            return Ok(ty);
+        }
+        (self.resolve)(std::slice::from_ref(&word)).ok_or_else(|| missing_type(&word))
+    }
+
+    /// `schema.name` or `catalog.schema.name`, which can only be a type `CREATE TYPE` made.
+    fn parse_qualified(&mut self, first: String) -> Result<LogicalType> {
+        let mut parts = vec![first];
+        while self.eat(&Token::Dot) {
+            match self.peek().cloned() {
+                Some(Token::Word(part) | Token::Quoted(part)) => {
+                    self.position += 1;
+                    parts.push(part);
+                }
+                _ => return Err(Error::parser("Expected a type name".to_string())),
+            }
+        }
+        match (self.resolve)(&parts) {
+            Some(ty) => Ok(ty),
+            None => Err(missing_type(parts.last().map_or("", String::as_str))),
+        }
     }
 
     /// `WITH TIME ZONE` or `WITHOUT TIME ZONE`, returning whether the zone is carried.
@@ -1035,6 +1082,11 @@ impl TypeParser<'_> {
             _ => Err(Error::parser("Expected a number".to_string())),
         }
     }
+}
+
+/// The pin's sentence for a type name nothing answers to.
+fn missing_type(name: &str) -> Error {
+    Error::catalog(format!("Type with name {name} does not exist!"))
 }
 
 fn expect(matched: bool, what: &str) -> Result<()> {

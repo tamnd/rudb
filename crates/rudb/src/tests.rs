@@ -10148,3 +10148,58 @@ fn set_schema_and_search_path_follow_the_pin() {
     db.execute("DROP SCHEMA s2 CASCADE").unwrap();
     assert_eq!(values("SELECT current_schema()"), ["main"]);
 }
+
+/// `CREATE TYPE` gives another name to a type, which columns and casts read through, and a type
+/// made from another one holds it in place the way the pin says.
+#[test]
+fn create_type_names_a_type_and_drop_type_follows_the_pin() {
+    let db = scripted(&[
+        "CREATE TYPE myint AS INTEGER",
+        "CREATE TYPE pair AS STRUCT(a INT, b VARCHAR)",
+        "CREATE TYPE lst AS myint[]",
+        "CREATE SCHEMA s",
+        "CREATE TYPE s.st AS VARCHAR",
+    ]);
+    let values = |sql: &str| -> Vec<String> {
+        db.query(sql)
+            .unwrap()
+            .rows()
+            .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    let error = |sql: &str| db.execute(sql).unwrap_err().to_string();
+    assert!(
+        error("CREATE TYPE myint AS BIGINT").contains("Type with name \"myint\" already exists!")
+    );
+    assert!(error("CREATE TYPE integer AS VARCHAR").contains("\"integer\" already exists!"));
+    db.execute("CREATE TYPE IF NOT EXISTS myint AS BIGINT").unwrap();
+    assert!(
+        error("CREATE OR REPLACE TYPE myint AS BIGINT").contains("type \"lst\" depends on type")
+    );
+    db.execute("CREATE TABLE t(a myint, b pair, c lst)").unwrap();
+    assert_eq!(
+        values("SELECT column_type FROM (DESCRIBE t)"),
+        ["INTEGER", "STRUCT(a INTEGER, b VARCHAR)", "INTEGER[]"]
+    );
+    assert_eq!(values("SELECT typeof(1::myint), typeof(NULL::s.st)"), ["INTEGER|VARCHAR"]);
+    assert!(error("SELECT NULL::st").contains("Type with name st does not exist!"));
+    assert_eq!(
+        values(
+            "SELECT schema_name, type_name, logical_type, type_category FROM duckdb_types() \
+             WHERE NOT internal"
+        ),
+        [
+            "main|lst|LIST|COMPOSITE",
+            "main|myint|INTEGER|NUMERIC",
+            "main|pair|STRUCT|COMPOSITE",
+            "s|st|VARCHAR|STRING",
+        ]
+    );
+    db.execute("DROP TYPE pair").unwrap();
+    assert_eq!(values("SELECT count(*) FROM t"), ["0"]);
+    assert!(error("DROP TYPE nope").contains("Type with name nope does not exist!"));
+    db.execute("DROP TYPE IF EXISTS nope").unwrap();
+    assert!(error("DROP SCHEMA s").contains("type \"st\" depends on schema \"s\"."));
+    db.execute("DROP TYPE myint CASCADE").unwrap();
+    assert_eq!(values("SELECT type_name FROM duckdb_types() WHERE NOT internal"), ["st"]);
+}

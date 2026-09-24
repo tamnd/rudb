@@ -17,12 +17,16 @@
 //! about bytes.
 //!
 //! Everything else matches: `comment` and `extension_name` and `labels` are null, `tags` is the
-//! empty map, `internal` is true on every row because every name here is built in, and `parameters`
-//! and `parameter_types` are empty lists rather than null on a row with no modifiers.
+//! empty map, `internal` is true on every built in row, and `parameters` and `parameter_types` are
+//! empty lists rather than null on a row with no modifiers.
+//!
+//! The types `CREATE TYPE` made come after the built in ones, by schema and then by name, which is
+//! the order the pin lists them in. Those rows are not internal, and they carry the oids of their
+//! database and schema and one of their own, as a table does.
 
-use rudb_catalog::{DEFAULT_CATALOG, DEFAULT_SCHEMA};
+use rudb_catalog::{Catalog, DEFAULT_CATALOG, DEFAULT_SCHEMA};
 use rudb_common::{LogicalType, Result, Value};
-use rudb_functions::{TYPE_NAMES, type_category, type_fields, type_size};
+use rudb_functions::{TYPE_NAMES, canonical, type_category, type_fields, type_size};
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -32,7 +36,12 @@ use crate::metadata::{Metadata, text};
 /// # Errors
 ///
 /// If the plan asks for a column this table does not have.
-pub(crate) fn typenames(plan: &Plan, index: u32, columns: Slice) -> Result<Metadata> {
+pub(crate) fn typenames(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
     let mut rows = Vec::with_capacity(TYPE_NAMES.len());
     for entry in TYPE_NAMES {
         for (position, signature) in entry.signatures.iter().enumerate() {
@@ -64,6 +73,39 @@ pub(crate) fn typenames(plan: &Plan, index: u32, columns: Slice) -> Result<Metad
                 Value::List { element: LogicalType::Varchar, values: types },
                 entry.varargs.map_or(Value::Null, text),
             ]);
+        }
+    }
+    for database in catalog.databases() {
+        for schema in database.schemas() {
+            let mut made: Vec<_> = catalog
+                .types()
+                .filter(|held| {
+                    held.name().catalog == database.name() && held.name().schema == schema.name()
+                })
+                .collect();
+            made.sort_by_key(|held| held.name().table.to_lowercase());
+            for held in made {
+                let logical_type = canonical(held.ty());
+                rows.push(vec![
+                    text(database.name()),
+                    Value::BigInt(database.oid()),
+                    text(schema.name()),
+                    Value::BigInt(schema.oid()),
+                    Value::BigInt(held.oid()),
+                    text(&held.name().table),
+                    type_size(&logical_type).map_or(Value::Null, Value::BigInt),
+                    text(&logical_type),
+                    type_category(&logical_type).map_or(Value::Null, text),
+                    Value::Null,
+                    Value::map(LogicalType::Varchar, LogicalType::Varchar, Vec::new()),
+                    Value::Boolean(false),
+                    Value::Null,
+                    Value::Null,
+                    Value::List { element: LogicalType::Varchar, values: Vec::new() },
+                    Value::List { element: LogicalType::Varchar, values: Vec::new() },
+                    Value::Null,
+                ]);
+            }
         }
     }
     Metadata::new("duckdb_types", &type_fields(), &rows, plan, index, columns)

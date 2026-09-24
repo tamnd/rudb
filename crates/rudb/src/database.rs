@@ -2992,6 +2992,7 @@ impl Shared {
                 | Bound::DropTable(_)
                 | Bound::Schema(_)
                 | Bound::Sequence(_)
+                | Bound::Type(_)
                 | Bound::Alter(_)
                 | Bound::Index(_)
                 | Bound::Insert(_)
@@ -3188,6 +3189,27 @@ impl Shared {
                 }
                 let counter = rudb_common::sequence::Counter::register(&name.table, change.options);
                 catalog.create_sequence(name, counter, change.or_replace, change.if_not_exists)?;
+                Ok(QueryResult::empty())
+            }
+            Bound::Type(change) => {
+                let Some(name) = change.name else { return Ok(QueryResult::empty()) };
+                let Some(ty) = change.ty else {
+                    catalog.drop_type(&name, change.cascade)?;
+                    return Ok(QueryResult::empty());
+                };
+                // The native file has nowhere to keep a type yet, the same as a sequence.
+                if self.inner.path.is_some() && self.inner.writable && !name.temporary() {
+                    return Err(Error::not_implemented(
+                        "CREATE TYPE in a database file, which cannot hold one so far",
+                    ));
+                }
+                catalog.create_type(
+                    name,
+                    ty,
+                    change.uses,
+                    change.or_replace,
+                    change.if_not_exists,
+                )?;
                 Ok(QueryResult::empty())
             }
             Bound::Alter(alter) => {
