@@ -875,6 +875,14 @@ impl Prepared {
         for step in begin..index {
             self.run_step(step, chunk, scratch)?;
         }
+        // Straight to the rows it keeps, and only among the ones still in play, where the list and
+        // the column allow it. See [`rudb_kernels::select_in`].
+        if let Step::InSet { input, members } = &self.steps[index] {
+            let column = self.operand(*input, chunk, &scratch.slots)?;
+            if let Some(kept) = rudb_kernels::select_in(column, members, live) {
+                return Ok(kept);
+            }
+        }
         if let Step::Compare { op, left, right, held } = &self.steps[index] {
             let one = self.operand(*left, chunk, &scratch.slots)?;
             let other = self.operand(*right, chunk, &scratch.slots)?;
