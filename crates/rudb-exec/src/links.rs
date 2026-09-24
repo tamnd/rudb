@@ -285,18 +285,21 @@ fn verdict(
         if table_named(catalog, &link.parent.table).is_none() {
             return (Cardinality::Unverified.label(), Some("no table of that name"));
         }
-        // A key over two columns never has a key map stored, because the link build makes the one
-        // it needs and nothing else reads it. The link is the whole answer for one of those.
+        // A link is only written over a parent key the build found distinct, with the map it
+        // needed built for it when the file keeps none: always for a key over two columns, and for
+        // one column when the budget turned the map away. So a held link is the whole answer.
         // Without a link there is nothing that counted the parent's keys either.
+        if held.is_some() {
+            return linked(held, measured_link);
+        }
         if link.parent.columns.len() == 2 {
-            return match held {
-                Some(_) => linked(held, measured_link),
-                None if measured_link => (
+            if measured_link {
+                return (
                     Cardinality::Unverified.label(),
                     Some("the link was measured and not kept, so link_bytes is what it would cost"),
-                ),
-                None => (Cardinality::Unverified.label(), Some("no link is stored")),
-            };
+                );
+            }
+            return (Cardinality::Unverified.label(), Some("no link is stored"));
         }
         if link.parent.columns.len() != 1 {
             return (

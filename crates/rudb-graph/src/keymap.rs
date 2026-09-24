@@ -13,8 +13,16 @@
 //!   but two numbers, and TPC-H hits this on six of its eight tables.
 //! - [`Form::Dense`] when the keys are distinct integers packed densely enough into a range that a
 //!   bitmap plus a rank index beats storing them.
+//! - [`Form::Permuted`] when the keys are dense in their range the way the second form needs, but
+//!   the rows are not stored in key order. The same bitmap and rank, and then a permutation from
+//!   rank to `rid`, because a rank is a `rid` only while the rows are in key order.
 //! - [`Form::Sorted`] for everything else, including every string key, which arrives here as
 //!   dictionary codes rather than as text.
+//!
+//! The fourth exists because the stored order is a choice, and spec/graph/12-the-order-the-suite-
+//! asks-for.md section 12.5 makes it one. `orders` stored by date holds the same keys `orders`
+//! stored by key does, and a map that answered one in constant time and needed the budget four times
+//! over for the other would make the layer depend on the order it was supposed to be free to pick.
 //!
 //! What is deliberately absent is a hash. A minimal perfect hash is faster to probe than the sorted
 //! form and much slower to build, and there is no measurement yet saying the probe is where the
@@ -46,6 +54,8 @@ pub enum Form {
     Dense,
     /// Binary search over the sorted keys, then a permutation lookup.
     Sorted,
+    /// `rid = perm[rank(key - base)]`, the dense form with a permutation behind it.
+    Permuted,
 }
 
 impl Form {
@@ -56,6 +66,7 @@ impl Form {
             Self::Identity => 0,
             Self::Dense => 1,
             Self::Sorted => 2,
+            Self::Permuted => 3,
         }
     }
 
@@ -66,6 +77,7 @@ impl Form {
             Self::Identity => "identity",
             Self::Dense => "dense",
             Self::Sorted => "sorted",
+            Self::Permuted => "permuted",
         }
     }
 
@@ -82,6 +94,7 @@ impl Form {
             0 => Ok(Self::Identity),
             1 => Ok(Self::Dense),
             2 => Ok(Self::Sorted),
+            3 => Ok(Self::Permuted),
             _ => Err(malformed(format!("key map form {tag} is not one this build knows"))),
         }
     }
@@ -148,6 +161,16 @@ enum Body {
         perm: Vec<u8>,
         count: u64,
     },
+    Permuted {
+        base: i128,
+        range: u64,
+        bits: Vec<u64>,
+        rank: Rank,
+        /// Bits one permutation entry takes, which is `ceil(log2(rows))`.
+        rid_width: usize,
+        /// Rank to `rid`, bit packed, one entry per key.
+        perm: Vec<u8>,
+    },
 }
 
 /// A map from a parent key value to the `rid` of the row that holds it.
@@ -189,6 +212,22 @@ impl KeyMap {
                 Self { body: Body::Identity { base, count }, observed }
             }
             Plan::Dense { base, range } => Self { body: dense(keys, base, range)?, observed },
+            Plan::Permuted { base, range } => {
+                let mut bits = DenseBits::new(base, range);
+                for key in keys.iter().flatten() {
+                    if !bits.mark(*key)? {
+                        observed.distinct = false;
+                        return Ok(Self { body: Body::Identity { base: 0, count: 0 }, observed });
+                    }
+                }
+                let mut perm = Permutation::new(bits, keys.len())?;
+                for (rid, key) in keys.iter().enumerate() {
+                    if let Some(key) = *key {
+                        perm.place(key, rid)?;
+                    }
+                }
+                Self { body: perm.finish()?, observed }
+            }
             Plan::Sorted { base } => {
                 // The sorted form sorts, so it is the one place distinctness can be settled for a
                 // column that did not arrive in order. `observe` can only see an adjacent
@@ -249,6 +288,38 @@ impl KeyMap {
                 })?;
                 Self { body: bits.finish(), observed }
             }
+            Plan::Permuted { base, range } => {
+                // Three scans rather than one that holds the column. The second marks the bitmap,
+                // and is where a repeat the first scan could not see is found, since a key is
+                // marked twice only when two rows hold it. The third places each row at its key's
+                // rank. Holding the column instead would be sixteen bytes a row for the length of
+                // the build, which is the cost `build_from` exists to avoid.
+                let mut bits = DenseBits::new(base, range);
+                let mut repeated = false;
+                keys.scan(&mut |key| {
+                    if let Some(key) = key {
+                        repeated |= !bits.mark(key)?;
+                    }
+                    Ok(())
+                })?;
+                if repeated {
+                    observed.distinct = false;
+                    return Ok(Self { body: Body::Identity { base: 0, count: 0 }, observed });
+                }
+                let rows = observed.rows + observed.nulls;
+                let rows = usize::try_from(rows)
+                    .map_err(|_| malformed("the column is too long for this machine"))?;
+                let mut perm = Permutation::new(bits, rows)?;
+                let mut rid = 0_usize;
+                keys.scan(&mut |key| {
+                    if let Some(key) = key {
+                        perm.place(key, rid)?;
+                    }
+                    rid += 1;
+                    Ok(())
+                })?;
+                Self { body: perm.finish()?, observed }
+            }
             Plan::Sorted { base } => {
                 let mut held = Vec::with_capacity(
                     usize::try_from(observed.rows + observed.nulls).unwrap_or_default(),
@@ -271,6 +342,7 @@ impl KeyMap {
             Body::Identity { .. } => Form::Identity,
             Body::Dense { .. } => Form::Dense,
             Body::Sorted { .. } => Form::Sorted,
+            Body::Permuted { .. } => Form::Permuted,
         }
     }
 
@@ -279,13 +351,17 @@ impl KeyMap {
     /// The identity and dense forms are the two that exist because the keys fill most of a range,
     /// at most one hole in [`DENSE_THRESHOLD`] values, so a bitmap over that range is at most that
     /// many bits a parent row. That is what lets a join test a child's key against a set of parents
-    /// with one subtraction and one bit, and with no link at all. The sorted form is the one for
-    /// keys spread over a range too wide for that, and answers `None`.
+    /// with one subtraction and one bit, and with no link at all. The permuted form spans the same
+    /// range the dense one does, since the span is about the keys and not about where their rows
+    /// are. The sorted form is the one for keys spread over a range too wide for that, and answers
+    /// `None`.
     #[must_use]
     pub fn span(&self) -> Option<(i128, u64)> {
         match self.body {
             Body::Identity { base, count } => Some((base, count)),
-            Body::Dense { base, range, .. } => Some((base, range)),
+            Body::Dense { base, range, .. } | Body::Permuted { base, range, .. } => {
+                Some((base, range))
+            }
             Body::Sorted { .. } => None,
         }
     }
@@ -299,9 +375,10 @@ impl KeyMap {
     /// The value every stored key is an offset from, which is the smallest key.
     pub(crate) fn base(&self) -> i128 {
         match &self.body {
-            Body::Identity { base, .. } | Body::Dense { base, .. } | Body::Sorted { base, .. } => {
-                *base
-            }
+            Body::Identity { base, .. }
+            | Body::Dense { base, .. }
+            | Body::Sorted { base, .. }
+            | Body::Permuted { base, .. } => *base,
         }
     }
 
@@ -331,6 +408,21 @@ impl KeyMap {
                     out.push(width);
                 }
                 out.extend_from_slice(keys);
+                out.extend_from_slice(perm);
+                Ok(())
+            }
+            Body::Permuted { range, bits, rank, rid_width, perm, .. } => {
+                // The dense form's bytes and then the permutation, so that everything up to the
+                // rank index reads the way the dense form's does. The rank index's length follows
+                // from the range, which is how a reader finds where the permutation starts.
+                out.extend_from_slice(&range.to_le_bytes());
+                for word in bits {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+                rank.write(out);
+                let width = u8::try_from(*rid_width)
+                    .map_err(|_| malformed("a permuted key map's width does not fit a byte"))?;
+                out.push(width);
                 out.extend_from_slice(perm);
                 Ok(())
             }
@@ -429,6 +521,51 @@ impl KeyMap {
                     observed,
                 })
             }
+            Form::Permuted => {
+                let Some(head) = body.get(..size_of::<u64>()) else {
+                    return Err(malformed("a permuted key map has no range"));
+                };
+                let range = u64::from_le_bytes(head.try_into().expect("eight bytes"));
+                let Ok(range_usize) = usize::try_from(range) else {
+                    return Err(malformed("a permuted key map's range does not fit this machine"));
+                };
+                let words = range_usize.div_ceil(64);
+                let bitmap = words * size_of::<u64>();
+                let (blocks, superblocks) = Rank::shape(words);
+                let ranks = superblocks * size_of::<u32>() + blocks * size_of::<u16>();
+                let rest = &body[size_of::<u64>()..];
+                if rest.len() < bitmap + ranks + 1 {
+                    return Err(malformed("a permuted key map is shorter than its range implies"));
+                }
+                let bits: Vec<u64> = rest[..bitmap]
+                    .chunks_exact(size_of::<u64>())
+                    .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
+                    .collect();
+                let rank = Rank::read(&rest[bitmap..bitmap + ranks], words)?;
+                let rid_width = usize::from(rest[bitmap + ranks]);
+                if rid_width == 0 || rid_width > 64 {
+                    return Err(malformed("a permuted key map's width is not one a u64 can take"));
+                }
+                let Ok(count) = usize::try_from(observed.rows) else {
+                    return Err(malformed(
+                        "a permuted key map holds more keys than this machine can",
+                    ));
+                };
+                let perm = rest[bitmap + ranks + 1..].to_vec();
+                if perm.len() != (count * rid_width).div_ceil(8) {
+                    return Err(malformed(
+                        "a permuted key map's permutation is not the size its width and count imply",
+                    ));
+                }
+                observed.max = Some(
+                    base.checked_add(i128::from(range) - 1)
+                        .ok_or_else(|| malformed("a permuted key map's range overflows"))?,
+                );
+                Ok(Self {
+                    body: Body::Permuted { base, range, bits, rank, rid_width, perm },
+                    observed,
+                })
+            }
         }
     }
 
@@ -437,7 +574,7 @@ impl KeyMap {
     pub fn len(&self) -> u64 {
         match &self.body {
             Body::Identity { count, .. } | Body::Sorted { count, .. } => *count,
-            Body::Dense { .. } => self.observed.rows,
+            Body::Dense { .. } | Body::Permuted { .. } => self.observed.rows,
         }
     }
 
@@ -457,6 +594,9 @@ impl KeyMap {
             Body::Identity { .. } => size_of::<i128>() + size_of::<u64>(),
             Body::Dense { bits, rank, .. } => bits.len() * size_of::<u64>() + rank.bytes(),
             Body::Sorted { keys, perm, .. } => keys.len() + perm.len(),
+            Body::Permuted { bits, rank, perm, .. } => {
+                bits.len() * size_of::<u64>() + rank.bytes() + perm.len()
+            }
         }
     }
 
@@ -499,6 +639,31 @@ impl KeyMap {
                     return Ok(None);
                 }
                 Ok(Some(rank.rank(bits, at)))
+            }
+            Body::Permuted { base, range, bits, rank, rid_width, perm } => {
+                let Some(offset) = key.checked_sub(*base) else {
+                    return Ok(None);
+                };
+                let Ok(offset) = u64::try_from(offset) else {
+                    return Ok(None);
+                };
+                if offset >= *range {
+                    return Ok(None);
+                }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the build checked the range fits a usize"
+                )]
+                let at = offset as usize;
+                if bits[at / 64] >> (at % 64) & 1 == 0 {
+                    return Ok(None);
+                }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a rank is below the key count, which the build checked fits a usize"
+                )]
+                let place = rank.rank(bits, at) as usize;
+                Ok(Some(bitpack::tail_at(perm, *rid_width, place)?))
             }
             Body::Sorted { base, key_width, keys, rid_width, perm, count } => {
                 let Some(offset) = key.checked_sub(*base) else {
@@ -573,6 +738,7 @@ enum Plan {
     Empty,
     Identity { base: i128, count: u64 },
     Dense { base: i128, range: u64 },
+    Permuted { base: i128, range: u64 },
     Sorted { base: i128 },
 }
 
@@ -609,8 +775,18 @@ fn plan(observed: &Observed) -> Result<Plan> {
 
     // The bitmap is over the value range, so a range that does not fit a `usize` cannot be one
     // however dense it is.
-    if positional && usize::try_from(range).is_ok() && range / observed.rows < DENSE_THRESHOLD {
+    let compact = usize::try_from(range).is_ok() && range / observed.rows < DENSE_THRESHOLD;
+    if positional && compact {
         return Ok(Plan::Dense { base: min, range });
+    }
+
+    // The same keys stored in another order, or with nulls between them. A rank is no longer a
+    // `rid`, so a permutation turns one into the other. It is half the sorted form or less whenever
+    // the range is compact, because the bitmap costs under a byte a key where the sorted keys cost
+    // their width, and it answers with a bit test and a rank rather than a search. A column the
+    // first scan already saw repeat never gets here.
+    if observed.distinct && compact {
+        return Ok(Plan::Permuted { base: min, range });
     }
 
     Ok(Plan::Sorted { base: min })
@@ -745,6 +921,88 @@ impl DenseBits {
     fn finish(self) -> Body {
         let rank = Rank::build(&self.bits);
         Body::Dense { base: self.base, range: self.range, bits: self.bits, rank }
+    }
+
+    /// Sets a key's bit in any order, and says whether it was clear, which is false for a repeat.
+    fn mark(&mut self, key: i128) -> Result<bool> {
+        let offset = offset_of(key, self.base)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the caller checked the range fits a usize and the offset is inside it"
+        )]
+        let at = offset as usize;
+        let bit = 1 << (at % 64);
+        let fresh = self.bits[at / 64] & bit == 0;
+        self.bits[at / 64] |= bit;
+        Ok(fresh)
+    }
+}
+
+/// The permutation of the permuted form, filled one row at a time in any order.
+///
+/// Built over a finished bitmap, so a key's place is its rank and every place is filled exactly
+/// once. Held as `u64` a key while it fills, which is the one allocation the build makes that the
+/// map does not keep, and packed at the end to the width the row count needs.
+struct Permutation {
+    base: i128,
+    range: u64,
+    bits: Vec<u64>,
+    rank: Rank,
+    places: Vec<u64>,
+    rid_width: usize,
+}
+
+impl Permutation {
+    /// Takes the finished bitmap, and `rows`, which is how many rows the column has, nulls included.
+    fn new(bits: DenseBits, rows: usize) -> Result<Self> {
+        let keys: u64 = bits.bits.iter().map(|word| u64::from(word.count_ones())).sum();
+        let keys =
+            usize::try_from(keys).map_err(|_| malformed("too many keys for this machine"))?;
+        let largest = u64::try_from(rows.saturating_sub(1))
+            .map_err(|_| malformed("the column is too long for a rid"))?;
+        let rank = Rank::build(&bits.bits);
+        Ok(Self {
+            base: bits.base,
+            range: bits.range,
+            bits: bits.bits,
+            rank,
+            places: vec![0; keys],
+            rid_width: width_for(largest),
+        })
+    }
+
+    /// Puts `rid` at the place of `key`, which the bitmap already holds.
+    fn place(&mut self, key: i128, rid: usize) -> Result<()> {
+        let offset = offset_of(key, self.base)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the offset is inside a range the caller checked fits a usize"
+        )]
+        let at = offset as usize;
+        let place = usize::try_from(self.rank.rank(&self.bits, at))
+            .map_err(|_| malformed("a rank past what this machine can index"))?;
+        let rid = u64::try_from(rid).map_err(|_| malformed("the column is too long for a rid"))?;
+        let slot = self
+            .places
+            .get_mut(place)
+            .ok_or_else(|| malformed("a key was placed that the bitmap does not hold"))?;
+        *slot = rid;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Body> {
+        let mut perm = Vec::new();
+        // The linear packer for the reason [`sorted`] gives: a parent key column is longer than a
+        // tail, and `tail_at` reads either layout.
+        bitpack::pack_linear(&self.places, self.rid_width, &mut perm)?;
+        Ok(Body::Permuted {
+            base: self.base,
+            range: self.range,
+            bits: self.bits,
+            rank: self.rank,
+            rid_width: self.rid_width,
+            perm,
+        })
     }
 }
 
@@ -908,26 +1166,26 @@ mod tests {
     #[test]
     fn a_descending_column_dense_enough_for_a_bitmap_still_resolves_correctly() {
         // The trap in the dense form: a bitmap is in value order, so a rank is a position in value
-        // order, and on a descending column that is not the rid. `dense` detects it and falls back.
+        // order, and on a descending column that is not the rid. So it takes the permutation too.
         let column = keys(&(0..500).rev().collect::<Vec<i128>>());
         let map = KeyMap::build(&column).expect("build");
-        assert_eq!(map.form(), Form::Sorted, "a descending column cannot take the bitmap");
+        assert_eq!(map.form(), Form::Permuted, "a descending column cannot take the bare bitmap");
         resolves(&column, &map);
     }
 
     #[test]
     fn nulls_are_not_keys_and_do_not_shift_the_rows_around_them() {
         // This column is distinct, ascending, and dense enough for a bitmap on the numbers alone:
-        // three keys over a range of twenty one. It cannot have one, because a rank counts keys
-        // below a value and the nulls in between mean that count is not the row's position. A map
-        // that took the bitmap here would resolve key 20 to row 1 and look entirely healthy doing
-        // it.
+        // three keys over a range of twenty one. It cannot have the bare one, because a rank counts
+        // keys below a value and the nulls in between mean that count is not the row's position. A
+        // map that took the bitmap here would resolve key 20 to row 1 and look entirely healthy
+        // doing it, so it takes the permutation behind the bitmap.
         let column = vec![Some(10), None, Some(20), None, Some(30)];
         let map = KeyMap::build(&column).expect("build");
         assert_eq!(
             map.form(),
-            Form::Sorted,
-            "a null before a key shifts it out of the cheap forms"
+            Form::Permuted,
+            "a null before a key shifts it out of the positional forms"
         );
         resolves(&column, &map);
         assert_eq!(map.observed().nulls, 2);
@@ -1058,10 +1316,10 @@ mod tests {
 
     #[test]
     fn the_form_tag_round_trips_and_an_unknown_one_is_refused() {
-        for form in [Form::Identity, Form::Dense, Form::Sorted] {
+        for form in [Form::Identity, Form::Dense, Form::Sorted, Form::Permuted] {
             assert_eq!(Form::from_tag(form.tag()).expect("a known tag"), form);
         }
-        assert!(Form::from_tag(3).is_err(), "an unfamiliar form is refused rather than guessed");
+        assert!(Form::from_tag(4).is_err(), "an unfamiliar form is refused rather than guessed");
     }
 
     #[test]
@@ -1107,6 +1365,8 @@ mod tests {
             keys(&[5, 5, 9]),
             vec![Some(10), None, Some(20), None, Some(30)],
             vec![None, None],
+            shuffled(1_000, 4),
+            keys(&[1, 3, 2, 1]),
         ];
         for column in &columns {
             let held = KeyMap::build(column).expect("build from a slice");
@@ -1150,6 +1410,53 @@ mod tests {
         let sorted = Counted { column: keys(&[100, 3, 40, 7, 9000]), scans: 0.into() };
         assert_eq!(KeyMap::build_from(&sorted).expect("build").form(), Form::Sorted);
         assert_eq!(sorted.scans.get(), 2);
+
+        // The permuted form reads it twice more, once to mark the bitmap and once to place the
+        // rows, rather than holding it.
+        let permuted = Counted { column: shuffled(1_000, 4), scans: 0.into() };
+        assert_eq!(KeyMap::build_from(&permuted).expect("build").form(), Form::Permuted);
+        assert_eq!(permuted.scans.get(), 3);
+    }
+
+    /// `count` keys a `step` apart from zero, stored in an order that is not theirs.
+    ///
+    /// The order is a multiplication by a prime modulo the count, so it is the same every run and
+    /// visits every key once.
+    fn shuffled(count: i128, step: i128) -> Vec<Option<i128>> {
+        (0..count).map(|at| Some((at * 7_919 % count) * step)).collect()
+    }
+
+    #[test]
+    fn dense_keys_stored_out_of_key_order_take_the_permuted_form() {
+        // `orders` stored by date: the same keys, one in four of their range, in an order that has
+        // nothing to do with them. The dense form cannot answer it and the sorted form costs its
+        // keys and its permutation, which on SF1 was 8.25 MB and over the budget.
+        let column = shuffled(10_000, 4);
+        let map = KeyMap::build(&column).expect("build");
+        assert_eq!(map.form(), Form::Permuted);
+        assert!(map.observed().distinct);
+        assert!(!map.observed().sorted);
+        resolves(&column, &map);
+        assert_eq!(map.lookup(1).expect("lookup"), None, "a key between two keys is not a key");
+        assert_eq!(map.lookup(40_000).expect("lookup"), None, "past the end");
+        assert_eq!(map.span(), Some((0, 39_997)), "the span is about the keys and not the rows");
+        // The sorted form would hold a 16 bit key and a 14 bit rid a row. This holds a bit per value
+        // of the range, the rank index over it, and the rid.
+        let sorted = 10_000 * (16 + 14) / 8;
+        assert!(map.bytes() * 10 < sorted * 7, "{} bytes against {sorted}", map.bytes());
+    }
+
+    #[test]
+    fn a_repeat_that_is_not_adjacent_keeps_a_dense_column_out_of_every_form() {
+        // The first scan only sees a repeat that sits next to itself. The bitmap sees every one,
+        // because a key is marked twice only when two rows hold it.
+        let column = keys(&[4, 1, 3, 2, 4]);
+        let map = KeyMap::build(&column).expect("build");
+        assert!(!map.observed().distinct);
+        assert!(!map.observed().usable_as_parent());
+        assert_eq!(map.lookup(4).expect("lookup"), None);
+        let read = KeyMap::build_from(&column[..]).expect("build");
+        assert_eq!(read.observed(), map.observed());
     }
 
     #[test]
