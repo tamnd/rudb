@@ -1834,12 +1834,25 @@ fn attach_database(
     pages: &rudb_native::PagePool,
 ) -> Result<()> {
     let memory = attach.path.is_empty() || attach.path == MEMORY;
-    let mut read_only = false;
+    // Whether the statement asked for a mode, which the pin holds a second attach of the same
+    // name to, and otherwise leaves automatic.
+    let mut access = None;
     for (name, value) in &attach.options {
         let name = name.to_ascii_lowercase();
         match name.as_str() {
-            "read_only" => read_only = value.as_ref().map_or(Ok(true), option_flag)?,
-            "read_write" => read_only = !value.as_ref().map_or(Ok(true), option_flag)?,
+            "read_only" | "readonly" => {
+                access = Some(value.as_ref().map_or(Ok(true), option_flag)?)
+            }
+            "read_write" | "readwrite" => {
+                access = Some(!value.as_ref().map_or(Ok(true), option_flag)?);
+            }
+            "block_size" => {
+                let size = value.as_ref().map(Value::to_string).unwrap_or_default();
+                let size = size.parse::<u64>().map_err(|_| {
+                    Error::invalid_input(format!("the block size must be a number, got {size}"))
+                })?;
+                check_block_size(size)?;
+            }
             "type" => {
                 let kind = value.as_ref().map(Value::to_string).unwrap_or_default();
                 if !kind.eq_ignore_ascii_case("duckdb") {
@@ -1848,8 +1861,19 @@ fn attach_database(
                     )));
                 }
             }
-            // How the pin lays out its own file, which a native file has no use for.
-            "block_size" | "storage_version" | "row_group_size" => {}
+            // How the pin lays out, reads and recovers its own file, which a native file has no
+            // use for, and whether the name is listed, which nothing here hides yet.
+            "storage_version"
+            | "row_group_size"
+            | "compress"
+            | "io_mode"
+            | "mmap_reserve_size"
+            | "recovery_mode"
+            | "vacuum_rebuild_indexes"
+            | "hidden" => {}
+            "encryption_key" | "encryption_cipher" | "default_table" => {
+                return Err(Error::not_implemented(format!("the {name} option of ATTACH")));
+            }
             _ => return Err(Error::binder(format!("Unrecognized option for attach \"{name}\""))),
         }
     }
@@ -1860,7 +1884,18 @@ fn attach_database(
             .file_stem()
             .map_or_else(|| attach.path.clone(), |stem| stem.to_string_lossy().into_owned()),
     };
+    let read_only = access.unwrap_or(false);
     if let Some(held) = catalog.attached(&name) {
+        if (attach.if_not_exists || attach.or_replace)
+            && access.is_some_and(|asked| asked != held.read_only())
+        {
+            let mode = |read_only: bool| if read_only { "READ_ONLY" } else { "READ_WRITE" };
+            return Err(Error::binder(format!(
+                "Database \"{name}\" is already attached in {} mode, cannot re-attach in {} mode",
+                mode(held.read_only()),
+                mode(read_only)
+            )));
+        }
         if attach.if_not_exists {
             return Ok(());
         }
@@ -1928,6 +1963,31 @@ fn attach_database(
 
 /// The value of an option such as `READ_ONLY`, which is true or false written any way a setting
 /// can be.
+/// Checks a block size the way the pin does before it makes a file, even though a native file is
+/// not laid out in blocks of that size.
+fn check_block_size(size: u64) -> Result<()> {
+    const SMALLEST: u64 = 16384;
+    const LARGEST: u64 = 262_144;
+    if !size.is_power_of_two() {
+        return Err(Error::invalid_input(format!(
+            "the block size must be a power of two, got {size}"
+        )));
+    }
+    if size < SMALLEST {
+        return Err(Error::invalid_input(format!(
+            "the block size must be greater or equal than the minimum block size of {SMALLEST}, \
+             got {size}"
+        )));
+    }
+    if size > LARGEST {
+        return Err(Error::invalid_input(format!(
+            "the block size must be lesser or equal than the maximum block size of {LARGEST}, \
+             got {size}"
+        )));
+    }
+    Ok(())
+}
+
 fn option_flag(value: &Value) -> Result<bool> {
     match value {
         Value::Boolean(flag) => Ok(*flag),

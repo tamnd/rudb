@@ -10346,6 +10346,14 @@ fn attach_and_detach_answer_the_way_the_pin_does() {
     assert_eq!(err, "Catalog Error: Cannot launch in-memory database in read-only mode!");
     let err = db.execute("ATTACH ':memory:' AS m (BOGUS 1)").unwrap_err().to_string();
     assert_eq!(err, "Binder Error: Unrecognized option for attach \"bogus\"");
+    let err = db.execute("ATTACH ':memory:' AS m (BLOCK_SIZE 123456)").unwrap_err().to_string();
+    assert_eq!(err, "Invalid Input Error: the block size must be a power of two, got 123456");
+    let err = db.execute("ATTACH IF NOT EXISTS ':memory:' AS db1 (READ_ONLY)").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Binder Error: Database \"db1\" is already attached in READ_WRITE mode, cannot re-attach \
+         in READ_ONLY mode"
+    );
     db.execute("USE db1").unwrap();
     assert_eq!(rows(&db, "SELECT current_database()"), vec![vec![Value::Varchar("db1".into())]]);
     let err = db.execute("DETACH db1").unwrap_err().to_string();
