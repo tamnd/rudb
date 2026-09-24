@@ -3613,14 +3613,13 @@ mod tests {
         let moved =
             rudb_opt::bounds::into_scan(&plan, plan.root()).expect("a filter over a stored table");
         let pruning = rudb_opt::bounds::of(&plan, input, predicate);
-        let pushdown =
-            Pushdown {
-                node: plan.root(),
-                predicate,
-                tests: moved.tests,
-                whole: moved.whole,
-                marks: false,
-            };
+        let pushdown = Pushdown {
+            node: plan.root(),
+            predicate,
+            tests: moved.tests,
+            whole: moved.whole,
+            marks: false,
+        };
         let filters = Filters { pruning, pushed: Some(pushdown), ..Filters::default() };
         let scan = Scan::new(
             &plan,
@@ -3668,14 +3667,13 @@ mod tests {
         let Node::Get { index, columns, .. } = *plan.node(input) else { panic!("under a get") };
         let moved =
             rudb_opt::bounds::into_scan(&plan, plan.root()).expect("a filter over a stored table");
-        let pushdown =
-            Pushdown {
-                node: plan.root(),
-                predicate,
-                tests: moved.tests,
-                whole: moved.whole,
-                marks: false,
-            };
+        let pushdown = Pushdown {
+            node: plan.root(),
+            predicate,
+            tests: moved.tests,
+            whole: moved.whole,
+            marks: false,
+        };
         let filters = Filters { pushed: Some(pushdown), ..Filters::default() };
         let scan = Scan::new(
             &plan,
