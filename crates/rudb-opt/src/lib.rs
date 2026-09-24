@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Twenty nine passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Thirty passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -13,6 +13,7 @@
 pub mod bounds;
 pub mod cluster;
 pub mod columns;
+pub mod consistent;
 pub mod cte;
 pub mod delim;
 pub mod dense;
@@ -181,6 +182,12 @@ pub const RANK: u8 = 11;
 /// of a nested query, so the number of rounds it takes is how deeply the query is nested. What fixes
 /// it is filter pushdown crossing the limits itself, which is described where it does that.
 ///
+/// Answering a MIN or MAX over a join without the join goes immediately before join ordering. After
+/// filter pushdown and the deliminator, because what it reads is a region of inner joins whose
+/// predicates have all landed, and a predicate still sitting above the region is one it would have to
+/// place itself. Before join ordering, because a region it takes is a region nobody has to order, and
+/// the search over a region of seventeen relations is the most expensive thing planning does.
+///
 /// Reading a link instead of building a hash table is last of all, after the build side has been
 /// chosen. It replaces a join outright, so a pass that ran after it would have to know about a
 /// second kind of join to say anything about one, and there is nothing any of them want to say:
@@ -190,7 +197,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 29] = [
+pub static PASSES: [&(dyn Pass + Sync); 30] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -199,6 +206,7 @@ pub static PASSES: [&(dyn Pass + Sync); 29] = [
     &total::TotalFromGroups,
     &filter::FilterPushdown,
     &delim::Deliminator,
+    &consistent::ConsistentExtremes,
     &order::JoinOrder,
     &semi::MarkToSemi,
     &semi::DistinctToSemi,
@@ -380,7 +388,8 @@ fn output_columns(plan: &Plan, reference: NodeRef) -> usize {
         | Node::TableFunction { columns, .. }
         | Node::Fetch { columns, .. }
         | Node::TableFetch { columns, .. }
-        | Node::CteScan { columns, .. } => plan.field_list(columns).len(),
+        | Node::CteScan { columns, .. }
+        | Node::Consistent { columns, .. } => plan.field_list(columns).len(),
         Node::Project { exprs, .. } => plan.expr_list(exprs).len(),
         Node::Aggregate { groups, aggregates, .. } => {
             plan.expr_list(groups).len() + plan.expr_list(aggregates).len()

@@ -547,7 +547,8 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
         | Node::TableFunction { .. }
         | Node::LateralFunction { .. }
         | Node::Dummy
-        | Node::CteScan { .. } => filter(plan, at, pending),
+        | Node::CteScan { .. }
+        | Node::Consistent { .. } => filter(plan, at, pending),
     }
 }
 

@@ -8,6 +8,7 @@ use rudb_common::{Error, Field, LogicalType, Result, Span, Stat, Value};
 
 use crate::expr::{Arm, ColumnBinding, Expr, SortKey};
 use crate::node::{Bound, JoinKind, Node, WindowBound};
+use crate::reducer::Reducer;
 use crate::{ExprRef, NodeRef, Slice, StrRef, ValueRef};
 
 /// A bound logical plan.
@@ -127,6 +128,19 @@ pub struct Plan {
     /// wish here for the database to act on before it binds the statement again. Document 33 is
     /// what a mirror is and when one is trusted.
     mirrors: Vec<(String, bool, u64)>,
+    /// The join trees of the [`Node::Consistent`] nodes, which each point at one by position.
+    ///
+    /// A pool rather than a field of the node, because a node is a fixed size and a join tree over
+    /// seventeen relations is not, and every other variable length thing a node holds is a run in a
+    /// pool for the same reason.
+    reducers: Vec<Reducer>,
+    /// Why an aggregate that looked like one a [`Node::Consistent`] could answer was left alone.
+    ///
+    /// Beside the plan rather than in it, because a declined rewrite leaves no node behind to hang
+    /// the reason on, and the reason is the one thing a reader of a slow plan wants: an aggregate
+    /// over a join that ran the join may have missed the rewrite by a single predicate, and which
+    /// predicate is not something the plan itself can say. `EXPLAIN` prints these under the tree.
+    declined: Vec<String>,
 }
 
 impl Default for Plan {
@@ -177,6 +191,8 @@ impl Plan {
             clustered: BTreeSet::new(),
             grouped: BTreeSet::new(),
             mirrors: Vec::new(),
+            reducers: Vec::new(),
+            declined: Vec::new(),
         }
     }
 
@@ -898,6 +914,7 @@ impl Plan {
             Node::Get { .. }
             | Node::Dummy
             | Node::CteScan { .. }
+            | Node::Consistent { .. }
             | Node::MaterializedCte { .. }
             | Node::CrossProduct { .. }
             | Node::SetOp { .. }
@@ -978,6 +995,42 @@ impl Plan {
         for &expr in self.expr_list(slice) {
             self.read_columns(expr, found);
         }
+    }
+
+    /// Adds a join tree to the pool and hands back its position, for a [`Node::Consistent`].
+    ///
+    /// # Panics
+    ///
+    /// If the pool already holds `u32::MAX` of them.
+    pub fn add_reducer(&mut self, reducer: Reducer) -> u32 {
+        self.reducers.push(reducer);
+        u32::try_from(self.reducers.len() - 1).expect("fewer than u32::MAX join trees")
+    }
+
+    /// The join tree at `reference`.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the pool.
+    #[must_use]
+    pub fn reducer(&self, reference: u32) -> &Reducer {
+        &self.reducers[reference as usize]
+    }
+
+    /// Writes down why a rewrite into a [`Node::Consistent`] was declined, once per reason.
+    ///
+    /// Once rather than per call, because the passes run twice in a debug build and a note that was
+    /// written again on the second run would say the same thing twice.
+    pub fn note_declined(&mut self, reason: String) {
+        if !self.declined.contains(&reason) {
+            self.declined.push(reason);
+        }
+    }
+
+    /// Every reason written down by [`Plan::note_declined`], in the order they were first written.
+    #[must_use]
+    pub fn declined(&self) -> &[String] {
+        &self.declined
     }
 
     /// The node at `reference`, to be rewritten in place.
@@ -1383,6 +1436,20 @@ impl Plan {
                 self.checked_field_list(columns, reference)?;
             }
             Node::SetOp { .. } => {}
+            Node::Consistent { columns, reducer, .. } => {
+                if reducer as usize >= self.reducers.len() {
+                    return fail("names a join tree that is not in the pool");
+                }
+                let width = self.checked_field_list(columns, reference)?.len();
+                let tree = &self.reducers[reducer as usize];
+                if tree.extremes.len() != width {
+                    return fail("produces a different number of columns than it has extremes");
+                }
+                if tree.leaves.iter().any(|leaf| leaf.input >= reference) {
+                    return fail("reads a relation that is not behind it");
+                }
+                tree.validate()?;
+            }
         }
 
         // An aggregate is legal only as a direct element of an Aggregate node's aggregate list,
@@ -1444,6 +1511,7 @@ impl Plan {
             | Node::CrossProduct { .. }
             | Node::MaterializedCte { .. }
             | Node::CteScan { .. }
+            | Node::Consistent { .. }
             | Node::SetOp { .. } => Vec::new(),
             // The ends of a limit hold an expression only when the query wrote something the
             // binder could not work out, which is a column read off the row the limit is given.

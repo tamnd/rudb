@@ -153,13 +153,15 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Carried]) -> Carried {
         // An aggregate's rows are groups. A group is not a row of anything.
         Node::Aggregate { .. } => Carried::none(),
 
-        // Rows that were written down, rows a function made up, and rows read back out of a
-        // materialisation, none of which are rows of a base table.
+        // Rows that were written down, rows a function made up, rows read back out of a
+        // materialisation and the one row of extremes a consistent node reads off its relations,
+        // none of which are rows of a base table.
         Node::Dummy
         | Node::Values { .. }
         | Node::TableFunction { .. }
         | Node::LateralFunction { .. }
-        | Node::CteScan { .. } => Carried::none(),
+        | Node::CteScan { .. }
+        | Node::Consistent { .. } => Carried::none(),
 
         // Set operations renumber everything. Even a `UNION ALL`, which emits the rows of both
         // sides untouched, emits them with two different tables' rows interleaved under one output

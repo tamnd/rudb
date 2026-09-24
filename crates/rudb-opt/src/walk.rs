@@ -94,7 +94,8 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
         | Node::Dummy
         | Node::Values { .. }
         | Node::TableFunction { .. }
-        | Node::CteScan { .. } => {}
+        | Node::CteScan { .. }
+        | Node::Consistent { .. } => {}
     }
 }
 
@@ -116,7 +117,8 @@ pub(crate) fn outputs(plan: &Plan, at: NodeRef) -> Option<Vec<(ColumnBinding, Lo
         | Node::TableFunction { index, columns, .. }
         | Node::Fetch { index, columns, .. }
         | Node::TableFetch { index, columns, .. }
-        | Node::CteScan { index, columns, .. } => Some(
+        | Node::CteScan { index, columns, .. }
+        | Node::Consistent { index, columns, .. } => Some(
             plan.field_list(columns)
                 .iter()
                 .enumerate()

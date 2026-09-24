@@ -118,7 +118,8 @@ fn node_expressions(plan: &mut Plan, node: NodeRef, done: &mut Done) {
         | Node::SetOp { .. }
         | Node::CrossProduct { .. }
         | Node::MaterializedCte { .. }
-        | Node::CteScan { .. } => {}
+        | Node::CteScan { .. }
+        | Node::Consistent { .. } => {}
         Node::Values { rows, .. } => {
             let held = plan.row_list(rows).to_vec();
             let rewritten: Vec<Slice> =

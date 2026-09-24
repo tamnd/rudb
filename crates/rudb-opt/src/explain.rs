@@ -236,6 +236,7 @@ fn printed(
         Printing { plan, context, facts, shape: &shape, seams, measured, statistics, keys: &keys };
     let mut out = String::new();
     printing.write_node(plan.root(), 0, false, &mut out);
+    write_declined(plan, &mut out);
     write_pipelines(&shape, measured, &mut out);
     write_seams(seams, &mut out);
     if statistics == Statistics::Asked {
@@ -352,7 +353,7 @@ impl Printing<'_> {
                 );
             }
         }
-        for child in children(self.plan.node(node)) {
+        for child in children(self.plan, node) {
             self.write_node(child, depth + 1, moved, out);
         }
     }
@@ -786,8 +787,29 @@ fn among(words: &[String], conjunction: &str) -> String {
 }
 
 /// The children of a node, in the order they print.
-fn children(node: &Node) -> Vec<NodeRef> {
-    node.children().into_iter().flatten().collect()
+///
+/// The relations a [`Node::Consistent`] reads are not its children as far as the plan is concerned,
+/// because no pass should move them, but they are what it runs and a plan that left them out would
+/// hide every scan and every filter the query does. They print under it in the order they are
+/// scanned, which is children of the join tree before their parents.
+fn children(plan: &Plan, node: NodeRef) -> Vec<NodeRef> {
+    match *plan.node(node) {
+        Node::Consistent { reducer, .. } => {
+            plan.reducer(reducer).leaves.iter().map(|leaf| leaf.input).collect()
+        }
+        ref other => other.children().into_iter().flatten().collect(),
+    }
+}
+
+/// Why an aggregate over a join was not answered without the join, one line per reason.
+///
+/// Printed after the tree because there is no node to print it on: the aggregate that was left alone
+/// is on the tree looking exactly as it always did, and the reason it was left alone is what tells
+/// a reader whether that was the query or the rule.
+fn write_declined(plan: &Plan, out: &mut String) {
+    for reason in plan.declined() {
+        let _ = writeln!(out, "Consistent declined: {reason}");
+    }
 }
 
 #[cfg(test)]

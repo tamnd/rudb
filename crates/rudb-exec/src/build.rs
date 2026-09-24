@@ -63,6 +63,7 @@ use rudb_plan::{
 use rudb_seam::Settings;
 
 use crate::buffer::Buffered;
+use crate::consistent::{Answer, Collect, Reduction};
 use crate::cutoff::{self, Cutoff};
 use crate::devicecard::device_card;
 use crate::enginenames::{
@@ -2541,6 +2542,35 @@ impl<'a> Building<'a, '_> {
                 let segment = self.node(body);
                 self.held.pop();
                 segment?
+            }
+            Node::Consistent { index, columns, reducer } => {
+                // One pipeline per relation, children of the join tree first, each ending in the
+                // sink that runs the first sweep over it, and then this node as the source of the
+                // one row. Each relation's pipeline waits for its children's, because its sink
+                // reads the keys they kept. See `crate::consistent`.
+                let tree = plan.reducer(reducer);
+                let fields = plan.field_list(columns).to_vec();
+                let types = fields.iter().map(|field| field.ty.clone()).collect();
+                let shared = Arc::new(Reduction::new(tree, types, memory)?);
+                let mut filled: Vec<PipelineRef> = Vec::with_capacity(tree.leaves.len());
+                for (at, leaf) in tree.leaves.iter().enumerate() {
+                    let own = self.shape.pipeline(leaf.input);
+                    let mut below = self.node(leaf.input)?;
+                    let position = u32::try_from(at)
+                        .map_err(|_| Error::internal("a join tree of more than u32::MAX relations"))?;
+                    below.after.extend(tree.children(position).map(|(child, _)| filled[child as usize]));
+                    self.close(below, own, Arc::new(Collect::new(Arc::clone(&shared), at)));
+                    filled.push(own);
+                }
+                let answer = Answer::new(shared, Schema::numbered(fields, index));
+                let schema = answer.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "Consistent", None);
+                Segment {
+                    source: Arc::new(Watched::new(answer, counters)),
+                    streams: Vec::new(),
+                    schema,
+                    after: filled,
+                }
             }
             Node::CteScan { index, cte, columns, .. } => {
                 // A read of the held rows, which is a leaf the same way a scan of a table is. Each

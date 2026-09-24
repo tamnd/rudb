@@ -178,7 +178,8 @@ fn reads(node: &Node) -> u32 {
         | Node::Dummy
         | Node::Values { .. }
         | Node::TableFunction { .. }
-        | Node::CteScan { .. } => 0,
+        | Node::CteScan { .. }
+        | Node::Consistent { .. } => 0,
         // The rows of a materialisation are written once and read once per read of it, and the
         // filter this is counting for is either in the definition, where the write is the pass, or
         // in the body, where this node is not on the path at all.

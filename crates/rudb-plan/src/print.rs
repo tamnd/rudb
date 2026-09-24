@@ -65,6 +65,13 @@ fn write_node<W: Write>(plan: &Plan, out: &mut W, node: NodeRef, depth: usize) -
     for child in held.children().into_iter().flatten() {
         write_node(plan, out, child, depth + 1)?;
     }
+    // The relations a consistent node reads are not its children, for the reason on the variant,
+    // and a plan that printed without them would be two plans that print the same.
+    if let Node::Consistent { reducer, .. } = *held {
+        for leaf in &plan.reducer(reducer).leaves {
+            write_node(plan, out, leaf.input, depth + 1)?;
+        }
+    }
     Ok(())
 }
 
@@ -238,7 +245,54 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             let quantifier = if all { "ALL" } else { "DISTINCT" };
             write!(out, " {} {quantifier} #{index}", kind.keyword())
         }
+        Node::Consistent { index, columns, reducer } => {
+            write!(out, " #{index} ")?;
+            write_schema(plan, out, columns)?;
+            write_reducer(plan.reducer(reducer), out)
+        }
     }
+}
+
+/// The join tree of a consistent node, on the node's own line.
+///
+/// Three lists, each numbering the relations by the order they are printed underneath. `keys` is
+/// which class each relation's join columns are in, as class at column. `tree` is each relation that
+/// has a parent, the parent and the class they share. `extremes` is where each produced column is
+/// read from, as relation at column.
+fn write_reducer<W: Write>(reducer: &crate::Reducer, out: &mut W) -> fmt::Result {
+    out.write_str(" keys=[")?;
+    for (at, leaf) in reducer.leaves.iter().enumerate() {
+        if at > 0 {
+            out.write_char(' ')?;
+        }
+        write!(out, "{at}:")?;
+        for (position, key) in leaf.keys.iter().enumerate() {
+            if position > 0 {
+                out.write_char(',')?;
+            }
+            write!(out, "c{}@{}", key.class, key.column)?;
+        }
+    }
+    out.write_str("] tree=[")?;
+    let mut first = true;
+    for (at, leaf) in reducer.leaves.iter().enumerate() {
+        if let Some(edge) = leaf.parent {
+            if !first {
+                out.write_char(' ')?;
+            }
+            first = false;
+            write!(out, "{at}>{}@c{}", edge.leaf, edge.class)?;
+        }
+    }
+    out.write_str("] extremes=[")?;
+    for (position, extreme) in reducer.extremes.iter().enumerate() {
+        if position > 0 {
+            out.write_str(", ")?;
+        }
+        let name = if extreme.max { "max" } else { "min" };
+        write!(out, "{name} {}@{}", extreme.leaf, extreme.column)?;
+    }
+    out.write_char(']')
 }
 
 /// A named and typed column list, which is what a scan and a `VALUES` produce.
