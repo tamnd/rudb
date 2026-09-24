@@ -367,10 +367,10 @@ pub fn records(
 
 /// [`records`] for a dialect whose escape is its quote, sixty four bytes at a time.
 ///
-/// Each block becomes two masks, the quotes and the bytes that can end a field. The prefix XOR of
-/// the quote mask has a bit set for every byte after an odd number of quotes, which is every byte
-/// inside a quoted field, and a doubled quote flips it twice between two adjacent bytes and so
-/// changes nothing. Whether the block ended inside a quote is carried into the next one. The field
+/// Each block becomes three masks: the quotes, the bytes that can end a field, and the line endings
+/// among those. The prefix XOR of the quote mask has a bit set for every byte after an odd number of
+/// quotes, which is every byte inside a quoted field, and a doubled quote flips it twice between two
+/// adjacent bytes and so changes nothing. Whether the block ended inside a quote is carried into the next one. The field
 /// endings left once those bits are taken away are walked in order with `trailing_zeros`.
 ///
 /// That is only right while every quote is where a quoted field puts it: first and last in its
@@ -400,7 +400,7 @@ fn blocks(
         let mut block = record;
         'blocks: while block < len && out.len() < limit {
             let end = len.min(block + 64);
-            let (quotes, ends) = masks(&bytes[block..end], delimiter, quote);
+            let (quotes, ends, lines) = masks(&bytes[block..end], delimiter, quote);
             let prefix = prefix_xor(quotes) ^ inside;
             inside = 0u64.wrapping_sub(prefix >> 63);
             let mut structural = ends & !prefix;
@@ -422,13 +422,12 @@ fn blocks(
                 } else {
                     out.spans.push(Span::new(field, at, false));
                 }
-                let byte = bytes[at];
-                if byte == delimiter {
+                if lines >> bit & 1 == 0 {
                     field = at + 1;
                     continue;
                 }
                 let mut next = at + 1;
-                if byte == b'\r' {
+                if bytes[at] == b'\r' {
                     match bytes.get(next) {
                         Some(b'\n') => next += 1,
                         Some(_) => {}
@@ -469,54 +468,24 @@ fn blocks(
     }
 }
 
-/// The quotes in a block of up to sixty four bytes, and the delimiters and line endings, one bit a
-/// byte with the first byte in the lowest bit.
+/// The quotes in a block of up to sixty four bytes, the bytes that can end a field, and of those
+/// the ones that can end a line, one bit a byte with the first byte in the lowest bit.
 ///
-/// Written as a plain loop over a fixed size array so that the compiler turns it into vector
-/// compares, which it does, and without `unsafe` or a platform's intrinsics. A short block at the
-/// end of the buffer is padded and the bits for the padding are cleared afterwards, so the padding
-/// byte does not have to be one that cannot be a delimiter.
+/// A short block at the end of the buffer is padded and the bits for the padding are cleared
+/// afterwards, so the padding byte does not have to be one that cannot be a delimiter.
 #[inline]
-fn masks(block: &[u8], delimiter: u8, quote: u8) -> (u64, u64) {
-    let mut padded = [0u8; 64];
-    let full: &[u8; 64] = if let Ok(full) = block.try_into() {
-        full
+fn masks(block: &[u8], delimiter: u8, quote: u8) -> (u64, u64, u64) {
+    let needles = [quote, delimiter, b'\n', b'\r'];
+    let [quotes, delimiters, newlines, returns] = if let Ok(full) = block.try_into() {
+        rudb_vector::bytes::masks(full, needles)
     } else {
+        let mut padded = [0u8; 64];
         padded[..block.len()].copy_from_slice(block);
-        &padded
-    };
-    // One byte a byte first, the quote in the low bit and a field ending in the next one, which is
-    // a loop with nothing between the lanes and becomes a handful of vector compares. Then eight
-    // of those bytes at a time are gathered into eight bits with one multiply.
-    let mut class = [0u8; 64];
-    for (class, &byte) in class.iter_mut().zip(full) {
-        let end = (byte == delimiter) | (byte == b'\n') | (byte == b'\r');
-        *class = u8::from(byte == quote) | (u8::from(end) << 1);
-    }
-    let mut quotes = 0u64;
-    let mut ends = 0u64;
-    for (at, eight) in class.chunks_exact(8).enumerate() {
-        let word = u64::from_le_bytes(eight.try_into().expect("eight bytes"));
-        quotes |= gather(word & LOW_BITS) << (8 * at);
-        ends |= gather((word >> 1) & LOW_BITS) << (8 * at);
-    }
-    if block.len() < 64 {
         let live = below(block.len());
-        quotes &= live;
-        ends &= live;
-    }
-    (quotes, ends)
-}
-
-/// The lowest bit of each of the eight bytes of a word.
-const LOW_BITS: u64 = 0x0101_0101_0101_0101;
-
-/// Eight bytes that are each nought or one as eight bits, the first byte in the lowest bit.
-///
-/// The multiply puts a copy of byte `i` at bit `56 + i` for every `i` at once, and every other
-/// copy it makes lands on a bit of its own below bit 56, so nothing carries into the top byte.
-const fn gather(word: u64) -> u64 {
-    word.wrapping_mul(0x0102_0408_1020_4080) >> 56
+        rudb_vector::bytes::masks(&padded, needles).map(|mask| mask & live)
+    };
+    let lines = newlines | returns;
+    (quotes, delimiters | lines, lines)
 }
 
 /// Every bit set that has an odd number of set bits at or below it in `bits`.
