@@ -4099,11 +4099,22 @@ fn verify_part(bytes: &[u8], span: PartSpan) -> Result<()> {
 /// do not belong under the same budget. Riding in the page cache meant a worker that came back to a
 /// stripe after its page had been evicted read the index again with it, which on the full
 /// ClickBench file was about thirteen hundred reads out of a hundred and fourteen thousand.
+///
+/// `seen` is which stripes have had their page read before, and `passing` is the pages read for the
+/// first time that are still held, oldest first. A page goes into the pool the second time it is
+/// read and not the first, which is the rule [`NativeText`] follows for its decoded blocks. A
+/// process that runs one statement, which is how a script or a benchmark uses the engine, reads
+/// each page once, and with no memory limit the pool kept every one of them to the end: ClickBench
+/// q33 held all of `WatchID` and `ClientIP` at its peak for a second scan that never came. The
+/// first read now keeps a page only while it is among the column's floor of newest ones, and a
+/// session that scans the table again pays one more read of each page and keeps it from then on.
 #[derive(Debug, Default)]
 struct Cached {
     pages: Vec<Option<Resident>>,
     loading: Vec<usize>,
     index: Vec<Option<Arc<Vec<PartSpan>>>>,
+    seen: Vec<bool>,
+    passing: VecDeque<usize>,
 }
 
 /// One page a reader holds, and whether anyone has read it since the pool last looked.
@@ -6004,6 +6015,7 @@ impl Reader {
                 Mutex::new(Cached {
                     pages: (0..stripes).map(|_| None).collect(),
                     index: (0..stripes).map(|_| None).collect(),
+                    seen: vec![false; stripes],
                     ..Cached::default()
                 })
             })
@@ -7070,6 +7082,19 @@ impl Reader {
         }
         let held = read?;
         let taken = remember(&mut cached, &held);
+        let first = taken.is_some()
+            && cached.seen.get_mut(at).is_some_and(|seen| !std::mem::replace(seen, true));
+        if first {
+            let floor = self.cache.kept.load(Atomic::Relaxed).max(1);
+            cached.passing.push_back(at);
+            while cached.passing.len() > floor {
+                let Some(old) = cached.passing.pop_front() else { break };
+                if let Some(slot) = cached.pages.get_mut(old) {
+                    *slot = None;
+                }
+            }
+            return Ok(held);
+        }
         drop(cached);
         if let Some((bytes, used)) = taken {
             self.cache.held[column].fetch_add(1, Atomic::Relaxed);
@@ -14271,7 +14296,7 @@ mod tests {
     #[test]
     fn a_pool_keeps_pages_between_scans_and_gives_them_to_the_table_being_read() {
         let path = path("page-pool");
-        let parts = STRIPE_PARTS * (CACHED_STRIPES_PER_COLUMN + 2);
+        let parts = STRIPE_PARTS * (CACHED_STRIPES_PER_COLUMN * 2 + 2);
         let fields = || vec![Field::required("id", LogicalType::Integer)];
         let mut writer = Writer::create(&path, "a", fields()).expect("new file");
         for table in ["a", "b"] {
@@ -14293,30 +14318,47 @@ mod tests {
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let (a, b) = (catalog.table("a").expect("a"), catalog.table("b").expect("b"));
         let stripes = a.table().stripes().len();
-        assert!(stripes > CACHED_STRIPES_PER_COLUMN, "the floor has to be smaller than a table");
+        assert!(
+            stripes > CACHED_STRIPES_PER_COLUMN * 2,
+            "the floor has to be smaller than a table"
+        );
         let scan = |reader: &Reader| {
             for part in 0..parts {
                 let chunk = reader.read(part, &[0]).expect("a part");
                 assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
             }
         };
+        // The first scan keeps the newest pages of the floor and no more, so the second reads the
+        // rest again and keeps them, and the third reads nothing.
         scan(&a);
+        assert_eq!(pool.bytes(), 0, "a page read once is not the pool's");
         scan(&a);
-        assert_eq!(a.pages.load(Atomic::Relaxed), stripes, "the second scan reads nothing");
+        let twice = stripes * 2 - CACHED_STRIPES_PER_COLUMN;
+        assert_eq!(a.pages.load(Atomic::Relaxed), twice, "the second scan reads the rest again");
+        scan(&a);
+        assert_eq!(a.pages.load(Atomic::Relaxed), twice, "the third scan reads nothing");
         let one = pool.bytes();
         assert!(one > 0, "the pool counts what the reader holds");
 
         // Room for one table. Reading the other takes the first one's pages down to its floor.
         pool.budget.store(one, Atomic::Relaxed);
         scan(&b);
-        assert_eq!(b.pages.load(Atomic::Relaxed), stripes, "a page is never let go while in use");
+        scan(&b);
+        assert_eq!(b.pages.load(Atomic::Relaxed), twice, "a page is never let go while in use");
         assert_eq!(a.cache.held[0].load(Atomic::Relaxed), CACHED_STRIPES_PER_COLUMN);
-        let held = a.cache.columns[0].lock().expect("the column").pages.iter().flatten().count();
-        assert_eq!(held, CACHED_STRIPES_PER_COLUMN, "the count and the slots agree");
+        let column = a.cache.columns[0].lock().expect("the column");
+        let held = column.pages.iter().flatten().count();
+        assert_eq!(
+            held,
+            CACHED_STRIPES_PER_COLUMN + column.passing.len(),
+            "the count and the slots agree"
+        );
+        drop(column);
 
         // A reader that goes takes its pages out of the count with it.
         drop((a, b, catalog));
         let c = Catalog::open_in(&path, &pool).expect("again").table("a").expect("a");
+        scan(&c);
         scan(&c);
         assert!(pool.bytes() <= one, "only what the live reader holds is counted");
         fs::remove_file(path).expect("remove scratch file");
