@@ -2314,7 +2314,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // This table lists itself, because it is a table function and the table lists those.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'duckdb_%'"),
-        vec![vec![Value::BigInt(13)]]
+        vec![vec![Value::BigInt(14)]]
     );
 }
 
@@ -9763,4 +9763,80 @@ fn a_sequence_counts_the_way_the_pin_counts() {
     db.execute("DROP SEQUENCE seq CASCADE").unwrap();
     assert!(refusal(&db, "SELECT * FROM u").contains("Table with name u does not exist"));
     db.execute("DROP SEQUENCE IF EXISTS seq").unwrap();
+}
+
+#[test]
+fn duckdb_sequences_lists_each_sequence_where_it_has_got_to() {
+    let db = scripted(&[
+        "CREATE SEQUENCE s INCREMENT 2 START 5 MAXVALUE 100 CYCLE",
+        "SELECT nextval('s')",
+        "CREATE TEMP SEQUENCE t",
+    ]);
+    let rows: Vec<Vec<String>> = db
+        .query(
+            "SELECT database_name, sequence_name, temporary, start_value, max_value, cycle, \
+             last_value, sql FROM duckdb_sequences() ORDER BY sequence_name",
+        )
+        .unwrap()
+        .rows()
+        .map(|row| row.iter().map(ToString::to_string).collect())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            [
+                "memory",
+                "s",
+                "false",
+                "5",
+                "100",
+                "true",
+                "5",
+                "CREATE SEQUENCE s INCREMENT BY 2 MINVALUE 1 MAXVALUE 100 START 7 CYCLE;",
+            ],
+            [
+                "temp",
+                "t",
+                "true",
+                "1",
+                "9223372036854775807",
+                "false",
+                "NULL",
+                "CREATE SEQUENCE t INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 1 NO \
+                 CYCLE;",
+            ],
+        ]
+    );
+}
+
+#[test]
+fn a_sequence_owned_by_a_table_goes_with_it() {
+    let db = scripted(&[
+        "CREATE SEQUENCE s",
+        "CREATE SEQUENCE other",
+        "CREATE TABLE t (i INTEGER)",
+        "CREATE TABLE u (i INTEGER)",
+        "ALTER SEQUENCE s OWNED BY t",
+        "ALTER SEQUENCE s OWNED BY t",
+        "ALTER SEQUENCE IF EXISTS gone OWNED BY nothing",
+    ]);
+    for (statement, message) in [
+        ("ALTER SEQUENCE s OWNED BY u", "\"s\" is already owned by \"t\""),
+        ("ALTER SEQUENCE s OWNED BY t OWNED BY u", "Owned by value should be passed at most once"),
+        ("ALTER SEQUENCE other OWNED BY nope", "CatalogElement \"main.nope\" does not exist!"),
+        ("ALTER SEQUENCE gone OWNED BY t", "Sequence with name gone does not exist!"),
+        ("ALTER SEQUENCE s INCREMENT 2", "ALTER SEQUENCE option not yet supported"),
+        (
+            "DROP SEQUENCE s",
+            "Cannot drop entry \"s\" because there are entries that depend on it.\ntable \"t\" \
+             depends on sequence \"s\".\nUse DROP...CASCADE to drop all dependents.",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    db.execute("DROP TABLE t").unwrap();
+    assert!(refusal(&db, "SELECT nextval('s')").contains("Sequence with name s does not exist!"));
+    db.execute("ALTER SEQUENCE other OWNED BY u").unwrap();
+    db.execute("DROP SEQUENCE other CASCADE").unwrap();
+    assert!(refusal(&db, "SELECT * FROM u").contains("Table with name u does not exist"));
 }

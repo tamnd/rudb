@@ -185,6 +185,9 @@ pub struct SequenceChange {
     pub cascade: bool,
     /// What a create settled.
     pub options: rudb_common::sequence::Options,
+    /// The table or view an `ALTER SEQUENCE ... OWNED BY` gives the sequence to, which makes this
+    /// an alter rather than a create.
+    pub owner: Option<QualifiedName>,
 }
 
 /// A bound `DROP TABLE` or `DROP VIEW`.
@@ -377,7 +380,9 @@ fn bind_one(
         ast::Statement::Sequence(index) => {
             let written = ast.sequence(index);
             let parts: Vec<&str> = ast.name(written.name).collect();
-            let name = if written.drop {
+            let alter = !written.owner.is_empty();
+            let mut owner = None;
+            let name = if written.drop || alter {
                 match catalog.resolve_sequence(&parts) {
                     Ok(name) => Some(name),
                     Err(_) if written.quiet => None,
@@ -388,6 +393,10 @@ fn bind_one(
             } else {
                 Some(catalog.resolve_for_create(&parts)?)
             };
+            if alter && name.is_some() {
+                let parts: Vec<&str> = ast.name(written.owner).collect();
+                owner = Some(catalog.resolve_owner(&parts)?);
+            }
             Ok(Bound::Sequence(SequenceChange {
                 name,
                 drop: written.drop,
@@ -395,6 +404,7 @@ fn bind_one(
                 or_replace: written.or_replace,
                 cascade: written.cascade,
                 options: written.options,
+                owner,
             }))
         }
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),

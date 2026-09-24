@@ -309,6 +309,9 @@ pub struct Sequence {
     pub cascade: bool,
     /// What a create settled, and the defaults on a drop.
     pub options: rudb_common::sequence::Options,
+    /// The table or view an `ALTER SEQUENCE ... OWNED BY` names, as a run of parts, and empty for
+    /// anything else. An alter is a statement that is neither a drop nor has this empty.
+    pub owner: Slice,
 }
 
 /// `INSERT INTO name (columns) query`.

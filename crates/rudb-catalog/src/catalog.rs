@@ -107,6 +107,9 @@ pub struct Sequence {
     name: QualifiedName,
     oid: i64,
     counter: Arc<Counter>,
+    /// The table or view `ALTER SEQUENCE ... OWNED BY` gave it to, which takes it along when it
+    /// is dropped.
+    owner: Option<QualifiedName>,
 }
 
 impl Sequence {
@@ -126,6 +129,12 @@ impl Sequence {
     #[must_use]
     pub fn counter(&self) -> &Arc<Counter> {
         &self.counter
+    }
+
+    /// The table or view that owns it, if one does.
+    #[must_use]
+    pub fn owner(&self) -> Option<&QualifiedName> {
+        self.owner.as_ref()
     }
 }
 
@@ -623,20 +632,27 @@ impl Catalog {
         match schema.kind(&name.table) {
             // The type in this one is the type being dropped, so `DROP VIEW gone` is a missing view
             // and `DROP TABLE gone` is a missing table over the same absent name.
-            None => Err(missing(wanted, &name.table)),
-            Some(found) if found != wanted => Err(Error::catalog(format!(
-                "Existing object \"{}\" is of type {found}, trying to drop type {wanted}",
-                name.table
-            ))),
+            None => return Err(missing(wanted, &name.table)),
+            Some(found) if found != wanted => {
+                return Err(Error::catalog(format!(
+                    "Existing object \"{}\" is of type {found}, trying to drop type {wanted}",
+                    name.table
+                )));
+            }
             Some(Entry::Table) => {
                 schema.tables.retain(|held| !same_name(&held.name().table, &name.table));
-                Ok(())
             }
             Some(Entry::View) => {
                 schema.views.retain(|held| !same_name(&held.name().table, &name.table));
-                Ok(())
             }
         }
+        // A sequence the entry owned goes with it, wherever the sequence lives.
+        for database in &mut self.databases {
+            for schema in &mut database.schemas {
+                schema.sequences.retain(|held| held.owner.as_ref() != Some(name));
+            }
+        }
+        Ok(())
     }
 
     /// Creates a sequence around a counter already made for it.
@@ -682,6 +698,7 @@ impl Catalog {
             name,
             oid,
             counter,
+            owner: None,
         });
         Ok(())
     }
@@ -760,6 +777,64 @@ impl Catalog {
         }
         message += "Use DROP...CASCADE to drop all dependents.";
         Err(Error::dependency(message))
+    }
+
+    /// The table or view an `OWNED BY` names, which the pin looks for in the default database and
+    /// in `main` unless a schema is written, whatever the search path says.
+    ///
+    /// # Errors
+    ///
+    /// If there is no table or view by that name there.
+    pub fn resolve_owner(&self, parts: &[&str]) -> Result<QualifiedName> {
+        let (schema, table) = match parts {
+            [.., schema, table] => (*schema, *table),
+            [table] => (DEFAULT_SCHEMA, *table),
+            [] => return Err(Error::internal("an OWNED BY without a name")),
+        };
+        let missing =
+            || Error::catalog(format!("CatalogElement \"{schema}.{table}\" does not exist!"));
+        let held = self.schema(&self.default_catalog, schema).map_err(|_| missing())?;
+        let found = held
+            .tables
+            .iter()
+            .map(Table::name)
+            .chain(held.views.iter().map(View::name))
+            .find(|name| same_name(&name.table, table))
+            .ok_or_else(missing)?;
+        Ok(found.clone())
+    }
+
+    /// Gives a sequence to a table or view, so that dropping the owner drops the sequence and the
+    /// sequence cannot be dropped on its own while the owner is there.
+    ///
+    /// # Errors
+    ///
+    /// If the sequence is missing, or something else owns it already.
+    pub fn own_sequence(&mut self, name: &QualifiedName, owner: QualifiedName) -> Result<()> {
+        if let Some(held) = self.sequence(name)?.owner() {
+            if *held == owner {
+                return Ok(());
+            }
+            return Err(Error::dependency(format!(
+                "\"{}\" is already owned by \"{}\"",
+                name.table, held.table
+            )));
+        }
+        self.changed();
+        if let Ok(table) = self.table_mut(&owner) {
+            if !table.sequences().contains(name) {
+                let mut sequences = table.sequences().to_vec();
+                sequences.push(name.clone());
+                table.set_sequences(sequences);
+            }
+        }
+        let schema = self.schema_mut(&name.catalog, &name.schema)?;
+        if let Some(sequence) =
+            schema.sequences.iter_mut().find(|held| same_name(&held.name.table, &name.table))
+        {
+            sequence.owner = Some(owner);
+        }
+        Ok(())
     }
 
     /// Removes a sequence, and with `cascade` every table whose default uses it.

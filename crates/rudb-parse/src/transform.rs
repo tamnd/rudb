@@ -453,6 +453,7 @@ impl<'a> Transform<'a> {
             }
             "CreateStatement" => self.create_statement(inner),
             "DropStatement" => self.drop_statement(inner),
+            "AlterStatement" => self.alter_statement(inner),
             "InsertStatement" | "UpdateStatement" | "DeleteStatement" => {
                 self.write_statement(inner)
             }
@@ -940,6 +941,7 @@ impl<'a> Transform<'a> {
             temporary,
             cascade: false,
             options,
+            owner: Slice::default(),
         };
         Ok(self.sequence_statement(sequence))
     }
@@ -1010,6 +1012,48 @@ impl<'a> Transform<'a> {
             }
             _ => Err(Error::parser("Expected constant expression.")),
         }
+    }
+
+    /// `ALTER SEQUENCE name OWNED BY table`, the one `ALTER` there is so far.
+    ///
+    /// The pin reads only the `OWNED BY` out of a list of options, so any others written beside it
+    /// are dropped without a word, and a list with no `OWNED BY` in it is not implemented there.
+    fn alter_statement(&mut self, inner: u32) -> Result<Statement> {
+        let stmt = self.first(self.find(inner, "AlterOptions"));
+        if self.name(stmt) != "AlterSequenceStmt" {
+            return self.unsupported(inner);
+        }
+        let set = self.first(self.find(stmt, "AlterSequenceOptions"));
+        if self.name(set) != "SetSequenceOption" {
+            return self.unsupported(inner);
+        }
+        let written: Vec<u32> =
+            self.kids(set).filter(|&kid| self.name(kid) == "SequenceOption").collect();
+        let mut owner = None;
+        for option in written {
+            let option = self.first(option);
+            if self.name(option) != "SeqOwnedBy" {
+                continue;
+            }
+            if owner.is_some() {
+                return Err(Error::parser("Owned by value should be passed at most once"));
+            }
+            owner = Some(self.name_parts(self.find(option, "QualifiedName")));
+        }
+        let Some(owner) = owner else {
+            return Err(Error::not_implemented("ALTER SEQUENCE option not yet supported"));
+        };
+        let sequence = crate::ast::Sequence {
+            name: self.name_parts(self.find(stmt, "QualifiedSequenceName")),
+            drop: false,
+            quiet: self.find(stmt, "IfExists") != NONE,
+            or_replace: false,
+            temporary: false,
+            cascade: false,
+            options: rudb_common::sequence::Options::default(),
+            owner,
+        };
+        Ok(self.sequence_statement(sequence))
     }
 
     fn sequence_statement(&mut self, sequence: crate::ast::Sequence) -> Statement {
@@ -1410,6 +1454,7 @@ impl<'a> Transform<'a> {
                 temporary: false,
                 cascade,
                 options: rudb_common::sequence::Options::default(),
+                owner: Slice::default(),
             };
             return Ok(self.sequence_statement(sequence));
         }
@@ -4945,6 +4990,17 @@ mod tests {
             }
             Statement::Sequence(index) => {
                 let sequence = ast.sequence(index);
+                if !sequence.owner.is_empty() {
+                    let mut out = "ALTER SEQUENCE".to_string();
+                    if sequence.quiet {
+                        out += " IF EXISTS";
+                    }
+                    return format!(
+                        "{out} {} OWNED BY {}",
+                        ast.name_text(sequence.name),
+                        ast.name_text(sequence.owner)
+                    );
+                }
                 let mut out = if sequence.drop { "DROP" } else { "CREATE" }.to_string();
                 if sequence.or_replace {
                     out += " OR REPLACE";

@@ -3216,6 +3216,10 @@ impl Shared {
             }
             Bound::Sequence(change) => {
                 let Some(name) = change.name else { return Ok(QueryResult::empty()) };
+                if let Some(owner) = change.owner {
+                    catalog.own_sequence(&name, owner)?;
+                    return Ok(QueryResult::empty());
+                }
                 if change.drop {
                     catalog.drop_sequence(&name, change.cascade)?;
                     return Ok(QueryResult::empty());
