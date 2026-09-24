@@ -149,8 +149,13 @@ pub(crate) struct Found {
     keys: Option<Keys>,
 }
 
-/// The most keys a build side keeps as a sorted list, which is half a megabyte of them.
-const KEYS: usize = 1 << 16;
+/// The most keys a build side keeps as a sorted list.
+///
+/// A part covers a few thousand keys of a table stored in key order, so past a few thousand keys
+/// spread over a few million there is rarely a part with none of them in it, and the sort is paid
+/// for nothing. TPC-H q4 is the case: the orders of one quarter are fifty seven thousand keys that
+/// land in every part of `lineitem`.
+const KEYS: usize = 1 << 12;
 
 /// The build side's keys, sorted and each once, for the scan to rule out parts with.
 ///
@@ -167,7 +172,7 @@ const KEYS: usize = 1 << 16;
 ///
 /// Kept beside the filter or a bitmap, which both answer about a row and say nothing about a part,
 /// and not beside the exact rows, which already skip every part they hold nothing in. Only up to
-/// [`KEYS`], where a part covering a few thousand keys would rarely fall between two of them anyway.
+/// [`KEYS`].
 #[derive(Debug)]
 pub(crate) struct Keys {
     keys: Vec<i64>,
