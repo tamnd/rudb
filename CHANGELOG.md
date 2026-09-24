@@ -6,6 +6,20 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.32
+
+A patch release of twenty seven commits, mostly kernel work for TPC-H and ClickBench, with ENUM types for DuckDB compatibility and the spec folders for the query compiler and the JOB plan. The native directory format number stays at 29 and the storage format version at 9. 0.4.31's binaries were never published because its release run stopped on a rustdoc link to a private function, and this release is the first one with binaries since 0.4.30.
+
+On scans and filters, #1805 scans covering projection pages on engine workers, #1807 picks the kept rows of a flag vector 64 at a time, #1812 checks a run length chunk once and expands its runs without asking again, #1813 cuts a chunk's slots into runs with no branch per row, and #1819 unpacks a packed column into the values it is wanted as in one pass. #1821 finds a filtered sorted key's runs on its column rather than on its kept rows. #1823 and #1825 compare two packed columns as flat runs in narrow lanes, straight into their lanes. #1843 selects a string IN list over a dictionary at the live rows only.
+
+On aggregation and joins, #1806 walks the runs once for the flat i64 calls beside the read out ones, #1811 names the width of a shared run pass at compile time, #1818 keeps integer groups per instance until sixteen thousand, and #1841 holds the aggregate's map of key places as 32 bit slots. #1809 looks up the next hash chain before walking this one. #1815 tests a join domain's keys with no branch on the key, #1814 pushes a reduction through a link only where it could skip parts, and #1855 reads whether a link is verified off its header rather than the whole link.
+
+On strings, #1810 keeps a regexp_replace group's answers in one block, #1822 reads the tail of a hashed string without a memcpy, and #1827 keeps replaced string answers in one place per group. On storage, #1817 decompresses zstd pages straight into the reader's buffer and #1816 encodes uniform projection runs without losing rows.
+
+For DuckDB compatibility, #1808 adds CREATE TYPE and DROP TYPE for types made from other types, #1826 adds ENUM types with enum_range, enum_first, enum_last, enum_code and enum_range_boundary, and #1854 compares an enum with a number as the number and names both enums in a failed enum cast.
+
+#1824 and #1842 are spec only: the graph layer measured over the whole suite with the work ordered by it, and the query compiler folder.
+
 ## 0.4.31
 
 A patch release of twenty two commits, on TPC-H under G10, ClickBench, the graph layer and DuckDB compatibility. The native directory format number stays at 29 and the storage format version at 9, but a table with keys now writes a directory block 0.4.30 does not know, and 0.4.30 refuses a file that has one.

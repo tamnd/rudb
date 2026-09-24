@@ -2306,6 +2306,9 @@ impl NativeSink {
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
         place.inside_cpu = place.inside_cpu.saturating_add(cpu);
+        // The stripe's rows, its pages and whatever the encode built along the way were all just
+        // let go, which is the moment the allocator has the most to hand back.
+        rudb_common::heap::release();
         appended
     }
 }
@@ -3557,12 +3560,12 @@ fn planned(
 /// The same question `rudb_links()` answers in its stored columns, asked here for one relationship
 /// at a time. `None` is no link, `Some(false)` is a link some of whose children matched nothing, and
 /// `Some(true)` is both certificates of `spec/stats/07-graph-statistics.md` section 7.3. Totality is
-/// read off the link rather than out of the degree section beside it, because the link counted the
+/// read off the link's header rather than out of the degree section beside it, because the link counted the
 /// children on its way to being written and a file from before that section existed still answers.
 ///
 /// Both tables have to be in the same file, because a row id is a position in a table and a link
 /// that named a parent in another file would only be resolvable by a reader that had both open and
-/// had checked that neither had moved. The binding check inside `stored_link` is what catches a
+/// had checked that neither had moved. The binding check inside `stored_link_counts` is what catches a
 /// parent that was rewritten since the link was built.
 fn stored_link(
     catalog: &Catalog,
@@ -3589,8 +3592,8 @@ fn stored_link(
         parent: parent_table.name().table.clone(),
         parent_column,
     };
-    let held = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)?;
-    Some(held.linked() == held.children())
+    let counts = rudb_native::graph::stored_link_counts(child_rows, parent_rows, &edge)?;
+    Some(counts.linked == counts.children)
 }
 
 /// Whether the parent's file holds a key map over its key column, which says the column is a key.

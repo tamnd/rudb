@@ -104,6 +104,24 @@ pub fn cast_in_time_zone(
     if let Some(vector) = flagged(input, target) {
         return Ok(vector);
     }
+    // A label missing from the other enum is reported with both enums named, which is the pin's
+    // wording for a column. The row loop below would say only that the string does not convert.
+    if let (LogicalType::Enum(_), LogicalType::Enum(labels), false) =
+        (input.logical_type(), target, try_cast)
+    {
+        // row at a time: an enum to enum cast is a catalogue change, not a hot path, and this loop
+        // only looks for the first label the target does not have, to name both enums in the error.
+        for index in 0..input.len() {
+            if let Value::Varchar(label) = input.try_value_at(index)? {
+                if !labels.contains(&label) {
+                    return Err(Error::conversion(format!(
+                        "Type {} with value {label} can't be cast to the destination type {target}",
+                        input.logical_type()
+                    )));
+                }
+            }
+        }
+    }
     // A cast reads one vector, so its form goes in both halves of the report rather than leaving a
     // column of zeros next to every row of it.
     fallback::record(Kernel::Cast, input.form(), input.form());

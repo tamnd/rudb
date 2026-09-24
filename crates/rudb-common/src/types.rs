@@ -1021,6 +1021,9 @@ impl TypeParser<'_> {
             "STRUCT" | "ROW" => return self.parse_fields().map(LogicalType::Struct),
             "UNION" => return self.parse_fields().map(LogicalType::Union),
             "ENUM" if self.peek() == Some(&Token::LeftParen) => return self.parse_labels(),
+            "ENUM" => {
+                return Err(Error::binder("ENUM type requires at least one argument".to_string()));
+            }
             // An unnamed struct prints as a tuple of its types, and the plan text reads it back.
             "TUPLE" => {
                 expect(self.eat(&Token::LeftParen), "(")?;

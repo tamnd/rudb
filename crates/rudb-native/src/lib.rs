@@ -3653,16 +3653,20 @@ impl Writer {
         let profile = self.profile.as_deref();
         let run = |job: Closing<'_>, bytes: usize| -> Result<Closed> {
             let _holding = profile.map(|profile| profile.holding(bytes as u64));
-            match job {
+            let closed = match job {
                 Closing::Numeric { column, counted, dense } => {
                     let _timing = profile.map(|profile| profile.span(Stage::Publish));
-                    Ok(Closed::Numeric(column, self.numeric_frequency(column, counted, dense)?))
+                    Closed::Numeric(column, self.numeric_frequency(column, counted, dense)?)
                 }
                 Closing::Dictionary { index, dictionary } => {
                     let _timing = profile.map(|profile| profile.span(Stage::Dictionary));
-                    Ok(Closed::Dictionary(index, self.close_dictionary(index, dictionary)?))
+                    Closed::Dictionary(index, self.close_dictionary(index, dictionary)?)
                 }
-            }
+            };
+            // A dictionary's decoded values or a column's distinct set were just dropped, and the
+            // next job is about to take as much again.
+            rudb_common::heap::release();
+            Ok(closed)
         };
         let workers = close_workers().min(jobs.len());
         let pieces = if workers <= 1 {
@@ -6988,6 +6992,33 @@ impl Reader {
             return Err(invalid("an extent does not checksum"));
         }
         Ok(())
+    }
+
+    /// Reads the first `len` bytes of a section's payload, or all of it when it is shorter, without
+    /// checking them.
+    ///
+    /// Only the extent table is checked, because an extent's checksum is over the whole extent and
+    /// checking it is reading the whole of it, which is what this is here to avoid. It is for a
+    /// kind-specific header that a planner reads to decide what to plan, and never for bytes a
+    /// query's answer is made of: a reader that goes on to use the structure reads it again through
+    /// [`Self::payload`], and a header that was torn is found there.
+    ///
+    /// # Errors
+    ///
+    /// If the extent table fails its check or the first extent points outside the file.
+    pub fn payload_head(&self, of: &Section, len: usize) -> Result<Vec<u8>> {
+        let extents = self.extents(of)?;
+        let Some(first) = extents.first() else { return Ok(Vec::new()) };
+        let end = first
+            .offset
+            .checked_add(u64::from(first.length))
+            .ok_or_else(|| invalid("an extent overflows the file"))?;
+        if first.offset < HEADER || end > self.size {
+            return Err(invalid("an extent is outside the file"));
+        }
+        let mut bytes = vec![0; len.min(first.length as usize)];
+        read_at(&self.file, first.offset, &mut bytes)?;
+        Ok(bytes)
     }
 
     /// Reads a whole section's payload, every extent of it, in order.

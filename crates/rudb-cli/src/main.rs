@@ -80,6 +80,8 @@ use std::process::ExitCode;
 
 #[cfg(feature = "mimalloc")]
 mod heap;
+#[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
+mod trim;
 
 /// The allocator every allocation in the shell goes through.
 ///
@@ -92,6 +94,8 @@ static ALLOCATOR: heap::MiMalloc = heap::MiMalloc;
 fn main() -> ExitCode {
     #[cfg(feature = "mimalloc")]
     heap::keep_freed_memory();
+    #[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
+    trim::install();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let code = rudb_cli::run(&arguments, Box::new(std::io::stdout()), Box::new(std::io::stderr()));
     #[cfg(feature = "mimalloc")]

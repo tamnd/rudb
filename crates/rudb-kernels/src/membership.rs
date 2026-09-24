@@ -399,11 +399,20 @@ pub fn in_set(input: &Vector, members: &Members, returns: &LogicalType) -> Resul
 /// selection directly, each one compared against the list in the column's own width, so a row is a
 /// load and a couple of compares rather than a widening to 128 bits and a walk along a vector.
 ///
+/// A list of strings over a dictionary column is answered once a code, the way [`in_set`] answers
+/// it, but only for the codes of the rows in play. q12's `l_shipmode IN ('MAIL', 'SHIP')` runs after
+/// the date conjuncts have kept about one row in seven, and it built its flags on all seven.
+///
 /// `None` for anything but a short list of whole numbers with no null in it, over a flat or packed
-/// column with no null in it. The caller falls back to [`in_set`] for the rest.
+/// column with no null in it, or a list of strings with no null in it over a dictionary column with
+/// no null in it. The caller falls back to [`in_set`] for the rest, which also reports any error a
+/// lookup here met rather than this deciding what it means.
 #[must_use]
 pub fn select_in(input: &Vector, members: &Members, live: Option<&Selection>) -> Option<Selection> {
-    let Held::Whole(set) = &members.held else { return None };
+    let set = match &members.held {
+        Held::Whole(set) => set,
+        Held::Text(_) => return select_text(input, members, live),
+    };
     if members.has_null || !set.set.is_empty() || !input.none_null() {
         return None;
     }
@@ -457,6 +466,56 @@ pub fn select_in(input: &Vector, members: &Members, live: Option<&Selection>) ->
         }
         _ => None,
     }
+}
+
+/// [`select_in`] for a list of strings, over the codes of a dictionary column.
+fn select_text(input: &Vector, members: &Members, live: Option<&Selection>) -> Option<Selection> {
+    if members.has_null || !input.none_null() || !matches!(input.form(), Form::Dictionary) {
+        return None;
+    }
+    let rows = input.len();
+    u32::try_from(rows).ok()?;
+    let named = live.map(Selection::indices);
+    let (codes, _) = input.shared_dictionary_parts()?;
+    if codes.len() < rows
+        || named.is_some_and(|named| named.iter().any(|&row| row as usize >= rows))
+    {
+        return None;
+    }
+    let count = named.map_or(rows, <[u32]>::len);
+    #[expect(clippy::cast_possible_truncation, reason = "the row count was checked to fit a u32")]
+    let row = |slot: usize| named.map_or(slot as u32, |named| named[slot]);
+    let negated = members.negated;
+    // The sorted search reads no value at all, and the memo takes the dictionaries without an order.
+    if let Some(found) = members.sought(input) {
+        let found = found.ok()?;
+        return Some(picked(count, row, |slot| {
+            found.get(codes[row(slot) as usize] as usize).copied().unwrap_or(false) != negated
+        }));
+    }
+    let flags = members
+        .peel
+        .answer(
+            input,
+            count,
+            |slot| row(slot) as usize,
+            |dictionary, code| members.at_code(dictionary, code),
+        )?
+        .ok()?;
+    Some(picked(count, row, |slot| flags[slot] != negated))
+}
+
+/// The rows `row` names for each slot below `count` that `keep` holds for, written without a
+/// branch on the answer.
+fn picked(count: usize, row: impl Fn(usize) -> u32, keep: impl Fn(usize) -> bool) -> Selection {
+    let mut out = vec![0_u32; count];
+    let mut kept = 0;
+    for slot in 0..count {
+        out[kept] = row(slot);
+        kept += usize::from(keep(slot));
+    }
+    out.truncate(kept);
+    Selection::from_indices(out)
 }
 
 /// Every row of `values` that is one of `wanted`, or that is none of them when `negated`.
@@ -976,6 +1035,50 @@ mod tests {
         let holed_flat =
             flat.with_validity(rudb_vector::Validity::from_run(&[true, false, true, true, false]));
         assert_eq!(over(&holed, &list, false), over(&holed_flat, &list, false));
+    }
+
+    /// A list of strings over a dictionary column, threaded, through both the sorted search and the
+    /// memo a dictionary with no order goes through, against the flags the flat column answers.
+    #[test]
+    fn a_text_list_over_a_dictionary_selects_what_the_flat_column_flags() {
+        let words = ["AIR", "MAIL", "RAIL", "SHIP", "TRUCK"];
+        let codes: Vec<u32> = (0..300_u32).map(|row| (row * 7 + row / 3) % 5).collect();
+        let (sorted, flat, source) = filed(&words, codes.clone());
+        let values = Vector::from_values(
+            LogicalType::Varchar,
+            &words.iter().map(|&word| Value::Varchar(word.into())).collect::<Vec<_>>(),
+        )
+        .expect("builds");
+        let unsorted =
+            Vector::stable_dictionary(codes, Arc::new(values)).expect("codes are in range");
+        let live = Selection::from_predicate(300, |row| row % 3 != 1);
+        let lists = [
+            vec![Value::Varchar("MAIL".into()), Value::Varchar("SHIP".into())],
+            vec![Value::Varchar("BOAT".into()), Value::Varchar("CART".into())],
+        ];
+        for list in &lists {
+            for negated in [false, true] {
+                let yes = over(&flat, list, negated);
+                let kept = |row: usize| yes[row] == Value::Boolean(true);
+                let every = Selection::from_predicate(300, kept);
+                let among = Selection::from_indices(
+                    live.indices().iter().copied().filter(|&row| kept(row as usize)).collect(),
+                );
+                for column in [&sorted, &unsorted] {
+                    // A fresh list each time, so each column starts with nothing remembered.
+                    let members = Members::of(list, negated).expect("this list folds");
+                    let some = select_in(column, &members, Some(&live)).expect("a dictionary");
+                    assert_eq!(some, among, "{list:?} negated {negated} over the live rows");
+                    let all = select_in(column, &members, None).expect("the same dictionary");
+                    assert_eq!(all, every, "{list:?} negated {negated} over every row");
+                }
+            }
+        }
+        assert_eq!(source.reads.load(Memory::Relaxed), 0, "the sorted search read a value");
+        // A null in the list is left to the flag kernel, which knows the rule.
+        let nulled =
+            Members::of(&[Value::Varchar("MAIL".into()), Value::Null], false).expect("folds");
+        assert!(select_in(&sorted, &nulled, None).is_none());
     }
 
     /// No null in the column and none in the list, which is the path that writes only the answer.

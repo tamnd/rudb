@@ -781,16 +781,45 @@ fn encode_link(link: &link::Link, parent: &Reader, edge: &Edge) -> Result<Vec<u8
 /// rewritten, and resolving through it would produce a plausible wrong row rather than an error.
 #[must_use]
 pub fn stored_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<link::Link> {
+    let held = link_section(child, edge)?;
+    let bytes = child.payload(held).ok()?;
+    let binding = bound(&bytes, parent, edge)?;
+    link::Link::read(&bytes[binding..]).ok()
+}
+
+/// The counts at the front of the stored link [`stored_link`] would return, read without the link.
+///
+/// The same section, the same binding and the same header checks, over the first few dozen bytes of
+/// the payload rather than all of it. Whether a relationship is verified is a question a planner
+/// asks of every declared one before its first query, and the answer is whether `linked` equals
+/// `children`. Reading the links whole to find that out cost about 95 million instructions at SF1,
+/// most of it copying and faulting in lineitem's links, on a query that then read none of them.
+///
+/// The bytes are not checksummed, for the reason on [`Reader::payload_head`]: a plan that reads the
+/// link loads it through [`stored_link`], which checks everything, and refuses to run if that fails.
+#[must_use]
+pub fn stored_link_counts(child: &Reader, parent: &Reader, edge: &Edge) -> Option<link::Counts> {
+    let held = link_section(child, edge)?;
+    let binding = binding_bytes(&edge.parent);
+    let bytes = child.payload_head(held, binding + link::HEADER_BYTES).ok()?;
+    let binding = bound(&bytes, parent, edge)?;
+    link::Link::counts(&bytes[binding..]).ok()
+}
+
+/// The child's current forward link section for this edge's child column.
+fn link_section<'a>(child: &'a Reader, edge: &Edge) -> Option<&'a section::Section> {
     let table = child.table();
     let id = u64::try_from(edge.child_column).ok()?;
     let held = table
         .sections()
         .iter()
         .find(|section| section.kind == *section::FORWARD_LINK && section.id == id)?;
-    if !held.usable(table.generation()) {
-        return None;
-    }
-    let bytes = child.payload(held).ok()?;
+    held.usable(table.generation()).then_some(held)
+}
+
+/// Where the link starts in a payload whose binding names this edge's parent as it is now, or
+/// `None` when it names another table, another column, or an older generation of this one.
+fn bound(bytes: &[u8], parent: &Reader, edge: &Edge) -> Option<usize> {
     let binding = binding_bytes(&edge.parent);
     if bytes.len() < binding {
         return None;
@@ -805,7 +834,7 @@ pub fn stored_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<link:
     {
         return None;
     }
-    link::Link::read(&bytes[binding..]).ok()
+    Some(binding)
 }
 
 /// What the build measured of a relationship's shape, when the child table carries it.
@@ -1546,13 +1575,27 @@ mod tests {
         let catalog = Catalog::open(&path).expect("reopen");
         let child = catalog.table("child").expect("the child");
         let parent = catalog.table("parent").expect("the parent");
-        assert!(stored_link(&child, &parent, &edge()).is_some());
+        let held = stored_link(&child, &parent, &edge()).expect("the link is handed over");
+        // The header alone says what the link says, and is refused wherever the link is.
+        let counts = stored_link_counts(&child, &parent, &edge()).expect("and so are its counts");
+        assert_eq!(
+            counts,
+            link::Counts {
+                children: held.children(),
+                parents: held.parents(),
+                linked: held.linked()
+            }
+        );
+        assert_eq!((counts.children, counts.linked), (500, 500));
         let wrong = Edge { parent: "child".into(), ..edge() };
         assert!(stored_link(&child, &parent, &wrong).is_none(), "a different parent name");
+        assert!(stored_link_counts(&child, &parent, &wrong).is_none(), "a different parent name");
         let wrong = Edge { parent_column: 1, ..edge() };
         assert!(stored_link(&child, &parent, &wrong).is_none(), "a different parent column");
+        assert!(stored_link_counts(&child, &parent, &wrong).is_none(), "a different parent column");
         let wrong = Edge { child_column: 1, ..edge() };
         assert!(stored_link(&child, &parent, &wrong).is_none(), "a different child column");
+        assert!(stored_link_counts(&child, &parent, &wrong).is_none(), "a different child column");
 
         fs::remove_file(&path).expect("clean up");
     }

@@ -61,6 +61,17 @@ const LAYOUT: u8 = 1;
 /// `children`, `parents`, `linked`, then the four bytes that say what shape the rest is.
 pub const HEADER_BYTES: usize = 32;
 
+/// The three counts a forward link's header holds. See [`Link::counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    /// Rows in the child table.
+    pub children: u64,
+    /// Rows in the parent table.
+    pub parents: u64,
+    /// Children that found a parent.
+    pub linked: u64,
+}
+
 /// Which physical form a forward link took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Form {
@@ -398,6 +409,35 @@ impl Link {
         Ok(())
     }
 
+    /// The counts at the front of a link's payload, read without its body.
+    ///
+    /// `bytes` is at least the first [`HEADER_BYTES`] of what [`Link::write`] produced, and may be
+    /// all of it. This is for a caller that only wants to know whether every child found a parent,
+    /// which a planner asks of every relationship before a query, and which is three numbers at the
+    /// front of a body that is megabytes long for the links of a large table.
+    ///
+    /// # Errors
+    ///
+    /// If there are fewer bytes than a header, or the header names a form or a layout this build
+    /// does not know, which is what [`Link::read`] refuses the header for too.
+    pub fn counts(bytes: &[u8]) -> Result<Counts> {
+        if bytes.len() < HEADER_BYTES {
+            return Err(malformed("a forward link payload is shorter than its header"));
+        }
+        Form::from_tag(bytes[24])?;
+        if bytes[26] != LAYOUT {
+            return Err(malformed(format!(
+                "forward link layout {} is not one this build knows",
+                bytes[26]
+            )));
+        }
+        Ok(Counts {
+            children: number(&bytes[0..8])?,
+            parents: number(&bytes[8..16])?,
+            linked: number(&bytes[16..24])?,
+        })
+    }
+
     /// Reads a link from exactly the bytes [`Link::write`] produced.
     ///
     /// # Errors
@@ -406,20 +446,9 @@ impl Link {
     /// know, or holds a body that is not the size its header implies. Every one of those is a
     /// section to drop rather than a query to fail, by section 3.1.
     pub fn read(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_BYTES {
-            return Err(malformed("a forward link payload is shorter than its header"));
-        }
-        let children = number(&bytes[0..8])?;
-        let parents = number(&bytes[8..16])?;
-        let linked = number(&bytes[16..24])?;
+        let Counts { children, parents, linked } = Self::counts(bytes)?;
         let form = Form::from_tag(bytes[24])?;
         let width = bytes[25] as usize;
-        if bytes[26] != LAYOUT {
-            return Err(malformed(format!(
-                "forward link layout {} is not one this build knows",
-                bytes[26]
-            )));
-        }
         let rest = &bytes[HEADER_BYTES..];
         let body = match form {
             Form::Packed => {
@@ -549,6 +578,11 @@ mod tests {
         let mut bytes = Vec::new();
         built.write(&mut bytes).expect("write");
         let read = Link::read(&bytes).expect("read");
+        let counts = Link::counts(&bytes[..HEADER_BYTES]).expect("the header alone");
+        assert_eq!(
+            counts,
+            Counts { children: built.children(), parents: built.parents(), linked: built.linked() }
+        );
         assert_eq!(read.form(), built.form(), "the form survives the round trip");
         assert_eq!(read.children(), built.children());
         assert_eq!(read.parents(), built.parents());
@@ -699,6 +733,7 @@ mod tests {
         link.write(&mut bytes).expect("write");
         for cut in [0, 1, HEADER_BYTES - 1] {
             assert!(Link::read(&bytes[..cut]).is_err(), "a payload of {cut} bytes is refused");
+            assert!(Link::counts(&bytes[..cut]).is_err(), "a header of {cut} bytes is refused");
         }
     }
 
@@ -710,6 +745,7 @@ mod tests {
         let mut wrong = bytes.clone();
         wrong[24] = 9;
         assert!(Link::read(&wrong).is_err(), "an unknown form is refused");
+        assert!(Link::counts(&wrong).is_err(), "and its counts are not read");
         let mut wrong = bytes;
         wrong[26] = LAYOUT + 1;
         assert!(Link::read(&wrong).is_err(), "an unknown layout is refused");

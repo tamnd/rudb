@@ -51,7 +51,7 @@ use crate::rows;
 use crate::schema::Schema;
 use crate::signed::SignedBlock;
 use crate::spill::{Reader, Spill};
-use crate::table::{Origin, Probe, Table, Walk};
+use crate::table::{Origin, Probe, Table, UNSEEN, Walk, held_at, slot_at};
 
 /// One aggregate call, taken apart once when the operator is built.
 #[derive(Debug, Clone)]
@@ -2312,7 +2312,7 @@ impl<'a> Aggregate<'a> {
             .and_then(|(low, values)| crate::table::seeded_window(&types, low, values));
         if let Some((low, places)) = window {
             local.coded_on.push(Origin::Window(low, places));
-            local.coded_map.resize(places, NOWHERE);
+            local.coded_map.resize(places, UNSEEN);
         }
         if self.alone {
             local.groups = 1;
@@ -2419,7 +2419,11 @@ impl<'a> Aggregate<'a> {
         //
         // Refused while there is a spill file, because a row that does not fit goes out whole and
         // the map has nothing to say about where it went.
-        let direct = if alone || over.is_some() || closed.is_some() {
+        let direct = if alone
+            || over.is_some()
+            || closed.is_some()
+            || !crate::table::fits_the_map(table.len(), *length)
+        {
             coded_on.clear();
             None
         } else {
@@ -2453,13 +2457,13 @@ impl<'a> Aggregate<'a> {
                     // window a dozen times a query, and clearing the whole map for each was a
                     // second write of every place the map had, and a probe of every group again.
                     Some(span) => {
-                        let null = std::mem::replace(&mut coded_map[span - 1], NOWHERE);
-                        coded_map.resize(codes.combos(), NOWHERE);
+                        let null = std::mem::replace(&mut coded_map[span - 1], UNSEEN);
+                        coded_map.resize(codes.combos(), UNSEEN);
                         coded_map[codes.combos() - 1] = null;
                     }
                     None => {
                         coded_map.clear();
-                        coded_map.resize(codes.combos(), NOWHERE);
+                        coded_map.resize(codes.combos(), UNSEEN);
                     }
                 }
             }
@@ -2519,10 +2523,10 @@ impl<'a> Aggregate<'a> {
                 let mut start = 0;
                 for run in slot_runs.iter_mut() {
                     let (place, end) = *run;
-                    let mut slot = coded_map[place];
+                    let mut slot = slot_at(coded_map[place]);
                     if slot == NOWHERE {
                         slot = resolve(start)?;
-                        coded_map[place] = slot;
+                        coded_map[place] = held_at(slot);
                     }
                     *run = (slot, end);
                     start = end;
@@ -2537,7 +2541,7 @@ impl<'a> Aggregate<'a> {
                 let mut row = 0;
                 loop {
                     while row < *length {
-                        let found = coded_map[coded_places[row]];
+                        let found = slot_at(coded_map[coded_places[row]]);
                         if found == NOWHERE {
                             break;
                         }
@@ -2549,7 +2553,7 @@ impl<'a> Aggregate<'a> {
                     }
                     let slot = resolve(row)?;
                     slots[row] = slot;
-                    coded_map[coded_places[row]] = slot;
+                    coded_map[coded_places[row]] = held_at(slot);
                     row += 1;
                 }
             }
@@ -4890,8 +4894,8 @@ pub(crate) struct Building {
     /// Empty when the last chunk was not one the direct map could answer, so the map is rebuilt
     /// rather than read. See [`Coded`](crate::table::Coded).
     coded_on: Vec<Origin>,
-    /// One slot per combination of codes, or [`NOWHERE`] where that combination has not been seen.
-    coded_map: Vec<usize>,
+    /// One slot per combination of codes, or [`UNSEEN`] where that combination has not been seen.
+    coded_map: Vec<u32>,
     /// Which combination each row of the last chunk is, worked out one key column at a time.
     coded_places: Vec<usize>,
     /// The values of each integer key column the map reads by value, widened, and their runs.
