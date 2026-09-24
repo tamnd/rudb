@@ -3647,24 +3647,24 @@ impl Writer {
         if payloads.is_empty() {
             return Ok(());
         }
-        let costs = payloads
-            .iter()
-            .map(|(_, summary, sketches)| summary.len() + sketches.len())
-            .collect::<Vec<_>>();
+        let summaries = payloads.iter().map(|(_, summary, _)| summary.len()).collect::<Vec<_>>();
+        let sketches = payloads.iter().map(|(_, _, sketches)| sketches.len()).collect::<Vec<_>>();
         let allowance = stats::allowance(stats::column_bytes(&self.table), stats::BUDGET_SHARE);
         // Nothing is spent yet. A table this writer is closing is one it wrote from nothing, so the
         // only statistics sections it can have are the ones about to go in.
-        let keep = stats::within(&costs, allowance, 0);
-        for ((column, summary, sketches), _) in
-            payloads.iter().zip(&keep).filter(|&(_, &keep)| keep)
-        {
+        let keep = stats::kept(&summaries, &sketches, allowance, 0);
+        for ((column, summary, sketches), &(built, sketched)) in payloads.iter().zip(&keep) {
+            if !built {
+                continue;
+            }
             let id = u64::try_from(*column).map_err(|_| invalid("column index overflow"))?;
-            for (kind, bytes, header_bytes) in [
+            let sections = [
                 // A summary is a header the whole way down: there is nothing behind it a reader
                 // could decide not to read.
                 (*section::SUMMARY, summary, summary.len() as u32),
                 (*section::SKETCHES, sketches, rudb_stats::sketches::HEADER_BYTES),
-            ] {
+            ];
+            for (kind, bytes, header_bytes) in sections.into_iter().take(1 + usize::from(sketched)) {
                 let written = write_section(
                     &*self.file,
                     &mut self.at,
