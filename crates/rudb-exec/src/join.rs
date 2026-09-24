@@ -1482,7 +1482,7 @@ impl<'a> Probe<'a> {
     fn built_with(&self, threads: &Lease<'_>) -> Result<Arc<Built>> {
         self.built
             .get_or_init(|| {
-                let chunks = held(&self.gathered)?;
+                let chunks = self.gathered.take()?;
                 let keying =
                     self.equalities.gathered(self.plan, &self.right_schema, self.time_zone);
                 let mut charged = self.held.lock().map_err(poisoned)?;
@@ -1502,6 +1502,9 @@ impl<'a> Probe<'a> {
                 // this side is already laid out in `rows` and the table reads it from there.
                 let index = match laid_keys(keying, &rows) {
                     Some(keys) => {
+                        // Everything the table reads is in `rows` now, so the chunks go before
+                        // the table is built rather than after the join is done.
+                        drop(chunks);
                         let allowed = self.allowed(&keys, rows.rows());
                         let index = Lookup::build_among(
                             &keys,

@@ -73,6 +73,18 @@ impl Buffered {
         Ok(self.shared.chunks.lock().map_err(poisoned)?.len())
     }
 
+    /// Every chunk, leaving nothing behind for any handle on the same list.
+    ///
+    /// For the one reader that turns the whole list into something else and never reads it again,
+    /// so that the list and what it was turned into are not both held.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Buffered::fill`].
+    pub(crate) fn take(&self) -> Result<Vec<Chunk>> {
+        Ok(std::mem::take(&mut *self.shared.chunks.lock().map_err(poisoned)?))
+    }
+
     /// One chunk by position, or `None` past the end.
     ///
     /// # Errors
