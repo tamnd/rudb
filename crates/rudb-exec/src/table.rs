@@ -1515,14 +1515,21 @@ fn window_of(
     (into, runs, keep_runs): (&mut Vec<i64>, &mut Vec<(i64, usize)>, bool),
 ) -> Option<(i64, usize, bool)> {
     runs.clear();
-    if !signed_rows(key, rows, into) {
+    let nullable = !key.none_null();
+    // A marked chunk's key, when it is a sorted column, has its values and runs found on the column
+    // and nothing is left for the pass below to find. See [`selected_runs`].
+    let selected = keep_runs && !nullable && selected_runs(key, rows, into, runs);
+    if !selected && !signed_rows(key, rows, into) {
         return None;
     }
-    let nullable = !key.none_null();
     // A block at a time, so that a key spread wider than the map, a user id say, is given up
     // after a block rather than after the whole chunk. Its rows are hashed after all of this, and
     // a whole pass here that ends in a refusal was five percent of ClickBench 18.
     let (mut lowest, mut highest) = (i64::MAX, i64::MIN);
+    for &(value, _) in runs.iter() {
+        lowest = lowest.min(value);
+        highest = highest.max(value);
+    }
     // The last value taken in, so that a stretch repeating it is passed over. There is no compare of
     // two 64 bit integers on the baseline x86 this is built for, so the lowest and highest are a
     // compare and a branch a value, where a test for equal is a vector compare. A sorted key such
@@ -1534,7 +1541,8 @@ fn window_of(
     let mut current = into.first().copied().unwrap_or_default();
     let mut keeping = keep_runs && !nullable;
     let most_runs = into.len() / 8 + 1;
-    for (block, values) in into.chunks(128).enumerate() {
+    let scanned: &[i64] = if selected { &[] } else { into };
+    for (block, values) in scanned.chunks(128).enumerate() {
         if nullable {
             for (row, &value) in values.iter().enumerate() {
                 if !key.is_null_at(block * 128 + row) {
@@ -1573,7 +1581,11 @@ fn window_of(
             return None;
         }
     }
-    if keeping && !into.is_empty() {
+    if selected {
+        if (i128::from(highest) - i128::from(lowest)) >= limit as i128 {
+            return None;
+        }
+    } else if keeping && !into.is_empty() {
         runs.push((current, into.len()));
     } else {
         runs.clear();
@@ -1614,6 +1626,78 @@ fn window_of(
     let slack_below = if climbing { 0 } else { (wanted - width) / 2 };
     let low = i64::try_from(bottom - slack_below).or_else(|_| i64::try_from(bottom)).ok()?;
     Some((low, usize::try_from(wanted).ok()?.checked_add(1)?, nullable))
+}
+
+/// The values and the runs of a key a filter cut out of a flat integer column, with the runs found
+/// on the column rather than on the rows the filter kept.
+///
+/// A marked chunk's key is the column under the kept rows as codes. Gathering the kept values out
+/// of it and then walking them for their runs is two passes over every kept row, where a sorted
+/// column has the same runs over all of its rows and finds them in a pass of vector compares. Where
+/// each run ends among the kept rows is a search of the codes, and the values are filled a run at a
+/// time. `false`, with `runs` cleared, for any other form, for codes that do not climb, and for a
+/// key with more runs than one in every eight rows.
+///
+/// Never inlined, so that [`window_of`] is the size it was for every key that is not one of these.
+#[inline(never)]
+fn selected_runs(
+    key: &Vector,
+    rows: usize,
+    into: &mut Vec<i64>,
+    runs: &mut Vec<(i64, usize)>,
+) -> bool {
+    runs.clear();
+    let Some((at, values)) = key.dictionary_parts() else {
+        return false;
+    };
+    let Some(at) = at.get(..rows) else {
+        return false;
+    };
+    let (Some(&first), Some(&last)) = (at.first(), at.last()) else {
+        return false;
+    };
+    let span = (first as usize, last as usize + 1);
+    // Codes that climb over `rows` rows span at least that many, which a dictionary smaller than
+    // the chunk never does, and that is most of the dictionaries that reach here.
+    if span.1.saturating_sub(span.0) < rows {
+        return false;
+    }
+    // Every pair of codes compared without stopping at the first that fails, which the compiler
+    // makes vector compares of, since a filter's codes always climb and this is there to be sure.
+    let climbing =
+        || at.iter().zip(&at[1..]).fold(true, |up, (&before, &after)| up & (before < after));
+    if !values.signed_runs(span, 8, runs) || !climbing() {
+        runs.clear();
+        return false;
+    }
+    // In place, since a run of the kept rows is written no later than the run of the column it came
+    // from.
+    let (mut kept, mut written) = (0, 0_usize);
+    for read in 0..runs.len() {
+        let (value, end) = runs[read];
+        let upto = kept + at[kept..].partition_point(|&row| (row as usize) < end);
+        if upto == kept {
+            continue;
+        }
+        kept = upto;
+        match written.checked_sub(1).map(|last| &mut runs[last]) {
+            Some(last) if last.0 == value => last.1 = kept,
+            _ => {
+                runs[written] = (value, kept);
+                written += 1;
+            }
+        }
+    }
+    runs.truncate(written);
+    if kept != rows || runs.len() > rows / 8 + 1 {
+        runs.clear();
+        return false;
+    }
+    into.clear();
+    for &(value, end) in runs.iter() {
+        into.resize(end, value);
+    }
+    true
 }
 
 /// The first `rows` values of an integer key column, widened to `i64`, into `into`.
@@ -4903,5 +4987,30 @@ mod tests {
         let (batched, batched_slots) = a_batch_at_a_time(&run, values.len(), &types);
         assert_eq!(batched_slots, plain_slots);
         assert_eq!(batched.len(), over_plain.len());
+    }
+
+    /// A key a filter cut out of a flat column has the values and the runs of the rows it kept,
+    /// found on the column, and codes that do not climb are left to the gather.
+    #[test]
+    fn the_runs_of_a_cut_key_are_those_of_the_rows_the_filter_kept() {
+        // Forty rows each of 5, 7, 9 and 2.
+        let values: Vec<i32> = [5, 7, 9, 2].iter().flat_map(|&value| [value; 40]).collect();
+        let column = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        let (mut into, mut runs) = (Vec::new(), Vec::new());
+        // Every other row but the ones from 90 to 130, so the run of 9 keeps five rows.
+        let kept: Vec<u32> = (0..160).step_by(2).filter(|row| !(90..130).contains(row)).collect();
+        let cut = Vector::dictionary(kept.clone(), column.clone()).unwrap();
+        assert!(selected_runs(&cut, kept.len(), &mut into, &mut runs));
+        let wanted: Vec<i64> = kept.iter().map(|&row| [5, 7, 9, 2][row as usize / 40]).collect();
+        assert_eq!(into, wanted);
+        assert_eq!(runs, [(5, 20), (7, 40), (9, 45), (2, 60)]);
+        // A run with no kept row is left out.
+        let kept: Vec<u32> = (0..40).chain(80..160).collect();
+        let cut = Vector::dictionary(kept.clone(), column.clone()).unwrap();
+        assert!(selected_runs(&cut, kept.len(), &mut into, &mut runs));
+        assert_eq!(runs, [(5, 40), (9, 80), (2, 120)]);
+        let backwards = Vector::dictionary((0..40).rev().collect(), column).unwrap();
+        assert!(!selected_runs(&backwards, 40, &mut into, &mut runs));
+        assert!(runs.is_empty());
     }
 }
