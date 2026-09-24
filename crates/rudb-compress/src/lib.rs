@@ -148,10 +148,12 @@ impl Codec {
     /// The buffer is only ever grown, so it comes back at least `expected` bytes long and the
     /// answer is the first `expected` of them.
     ///
-    /// Zstandard is the codec that does not write straight into it. A frame states its length as a
-    /// promise rather than a fact and the decoder builds its output as it goes, so this copies that
-    /// output across afterwards. One `memcpy` against a page fault per four kilobytes is still the
-    /// better side of the trade, and it keeps one path here rather than two at every caller.
+    /// Zstandard builds its output as it goes, because a frame states its length as a promise
+    /// rather than a fact, so it empties the buffer and appends. The buffer keeps its capacity, so
+    /// that is still no fresh pages, and it comes back exactly `expected` bytes long. It used to
+    /// decompress into a buffer of its own and copy that across, which on a million row `hits`
+    /// load was a second pass over every byte the Parquet reader decompressed and a fresh
+    /// allocation for every page.
     ///
     /// # Errors
     ///
@@ -162,12 +164,12 @@ impl Codec {
             let produced = snappy::decompress_into(input, expected, out)?;
             return self.exactly(produced, expected);
         }
-        let frame;
         let bytes: &[u8] = match self {
             Self::Uncompressed => input,
             Self::Zstd => {
-                frame = zstd::decompress(input)?;
-                &frame
+                out.clear();
+                zstd::decompress_onto(input, out)?;
+                return self.exactly(out.len(), expected);
             }
             other => {
                 return Err(rudb_common::Error::not_implemented(format!(
