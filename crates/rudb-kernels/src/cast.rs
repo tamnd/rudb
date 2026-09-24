@@ -109,6 +109,8 @@ pub fn cast_in_time_zone(
     if let (LogicalType::Enum(_), LogicalType::Enum(labels), false) =
         (input.logical_type(), target, try_cast)
     {
+        // row at a time: an enum to enum cast is a catalogue change, not a hot path, and this loop
+        // only looks for the first label the target does not have, to name both enums in the error.
         for index in 0..input.len() {
             if let Value::Varchar(label) = input.try_value_at(index)? {
                 if !labels.contains(&label) {
