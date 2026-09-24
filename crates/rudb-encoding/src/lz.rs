@@ -124,13 +124,18 @@ fn matches_in(
 ) {
     let mut literal_start = start;
     let mut at = start;
-    while at < end {
-        if at + HASH_LEN > end {
-            break;
-        }
-        let key = hash(&input[at..at + HASH_LEN]);
-        let found = longest(input, at, end, head[key], prev, start);
-        insert(input, at, end, head, prev, start);
+    let (mut key, mut first) = chain_at(input, at, end, head);
+    while at + HASH_LEN <= end {
+        // The chain for the next position is looked up before this one is walked. The walk is a
+        // run of branches on bytes nobody can predict, and a load issued after it waits for all
+        // of them, where one issued before it is in flight while they resolve. Most positions are
+        // not the start of a copy, so the next one is usually the one after this. On a load of a
+        // million rows of `hits` the head lookup was about a ninth of the matcher's cycles.
+        let (next_key, next_first) = chain_at(input, at + 1, end, head);
+        let found = longest(input, at, end, first, prev, start);
+        let slot = at - start;
+        prev[slot] = first;
+        head[key] = slot as u32;
         match found {
             Some((length, offset)) => {
                 push(raw, (literal_start, at), length, offset);
@@ -139,8 +144,15 @@ fn matches_in(
                 }
                 at += length;
                 literal_start = at;
+                (key, first) = chain_at(input, at, end, head);
             }
-            None => at += 1,
+            None => {
+                at += 1;
+                // The lookup went ahead of the insert above, which changed it when both
+                // positions hash the same.
+                first = if next_key == key { slot as u32 } else { next_first };
+                key = next_key;
+            }
         }
     }
     if literal_start < end {
@@ -186,6 +198,16 @@ fn longest(
         tries += 1;
     }
     best
+}
+
+/// The hash of `at` and the newest position on its chain, or nothing for a position too near the
+/// end to hash.
+fn chain_at(input: &[u8], at: usize, end: usize, head: &[u32]) -> (usize, u32) {
+    if at + HASH_LEN > end {
+        return (0, u32::MAX);
+    }
+    let key = hash(&input[at..at + HASH_LEN]);
+    (key, head[key])
 }
 
 /// Puts `at` at the head of its chain, so later positions can match against it.
@@ -360,6 +382,10 @@ mod tests {
     /// saw them. They are cut into blocks of 1024 values the way a dictionary's payload is, and each
     /// block is matched as it is and after front coding, which are the two ways a settled shape
     /// reaches this.
+    ///
+    /// The digest of the tokens is there so a change that is meant to be only faster can show it
+    /// found the same copies. `LZ_ONLY` skips the full encodes, which otherwise take most of the
+    /// time and hide what the matcher did under a profiler or a cycle count.
     #[test]
     #[ignore = "a measurement over real text, run by hand in release with LZ_DATA set"]
     fn measure_on_real_text() {
@@ -372,19 +398,28 @@ mod tests {
                 text.split(|byte| *byte == b'\n').filter(|value| !value.is_empty()).collect();
             let (mut raw, mut lz, mut front) = (0, 0, 0);
             let mut spent = Duration::ZERO;
+            let mut digest = 0u64;
             for block in values.chunks(1024) {
                 let joined = block.concat();
                 let suffixes = front_code(block).1.concat();
                 raw += joined.len();
                 let start = Instant::now();
-                std::hint::black_box(tokens_of(&joined));
-                std::hint::black_box(tokens_of(&suffixes));
+                let tokens = [tokens_of(&joined), tokens_of(&suffixes)];
                 spent += start.elapsed();
-                lz += size_as(Kind::Lz, block, 0).expect("encodes").expect("applies");
-                front += size_as(Kind::Front, block, 0).expect("encodes").expect("applies");
+                for token in &tokens {
+                    for (length, offset) in token.lengths.iter().zip(&token.offsets) {
+                        digest = (digest ^ (*length as u64) ^ ((*offset as u64) << 32))
+                            .wrapping_mul(0x0100_0000_01B3);
+                    }
+                }
+                if std::env::var_os("LZ_ONLY").is_none() {
+                    lz += size_as(Kind::Lz, block, 0).expect("encodes").expect("applies");
+                    front += size_as(Kind::Front, block, 0).expect("encodes").expect("applies");
+                }
             }
             println!(
-                "{name}: {raw} bytes, matched in {:.1} ms, LZ {lz} ({:.3}x), FRONT {front} ({:.3}x)",
+                "{name}: {raw} bytes, matched in {:.1} ms, LZ {lz} ({:.3}x), FRONT {front} ({:.3}x), \
+                 tokens {digest:016x}",
                 spent.as_secs_f64() * 1e3,
                 raw as f64 / lz as f64,
                 raw as f64 / front as f64,
