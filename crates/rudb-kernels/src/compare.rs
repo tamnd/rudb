@@ -268,8 +268,11 @@ pub fn select_prepared(
                 &left_valid.and(&right_valid, len),
             ));
         }
-        if left_valid == Validity::AllValid {
-            if let Some(kept) = flat_against_literal(op, left, right, held) {
+        if left_valid == Validity::AllValid && right_valid == Validity::AllValid {
+            if let Some(kept) = flat_kept(op, left, right, None, held) {
+                return Ok(kept);
+            }
+            if let Some(kept) = packed_kept(op, left, right, None) {
                 return Ok(kept);
             }
         }
@@ -284,78 +287,183 @@ pub fn select_prepared(
     Ok(crate::select::selection(&compare_prepared(op, left, right, held)?, len))
 }
 
-/// The rows of a flat integer column with no nulls that hold against a literal, in one pass.
+/// The rows of a flat integer column with no nulls that hold against a literal or against another
+/// such column, in one pass.
 ///
-/// The common shape of a scan's first filter, `AdvEngineID <> 0` on ClickBench Q1. The general
-/// path gets there in two passes: an ordering per row into a run of booleans, through index
-/// closures the loop cannot see past, and then [`crate::select::picked`] over the booleans. Here
-/// the literal is compared in place and the row goes straight into the selection, so the loop is a
-/// load, a compare and a store, and it no longer writes a byte per row that is read once and thrown
-/// away. Floats are left to the general path, because their order is DuckDB's rather than the
-/// machine's.
-fn flat_against_literal(
+/// The common shape of a scan's first filter, `AdvEngineID <> 0` on ClickBench Q1, and of the date
+/// checks in TPC-H q4, q12 and q21, `l_commitdate < l_receiptdate`. The general path gets there in
+/// two passes: an ordering per row into a run of booleans, through index closures the loop cannot
+/// see past, and then [`crate::select::picked`] or [`narrowed`] over the booleans. Here the two
+/// sides are compared in place and the row goes straight into the selection, so the loop is two
+/// loads, a compare and a store, and it no longer writes a byte per row that is read once and
+/// thrown away. `rows` is the rows the conjuncts before this one kept, or `None` for every row.
+/// Floats are left to the general path, because their order is DuckDB's rather than the machine's.
+fn flat_kept(
     op: Comparison,
     left: &Vector,
     right: &Vector,
+    rows: Option<&[u32]>,
     held: Option<&Held>,
 ) -> Option<Selection> {
     if op.is_total() || left.logical_type() != right.logical_type() {
         return None;
     }
+    let len = left.len();
     let data = left.data()?;
-    let column = readied(held, left.logical_type(), right.constant_value()?)?;
-    let literal = column.data()?;
+    macro_rules! ordered {
+        ($left:expr, $right:expr) => {{
+            let (one, other) = ($left, $right);
+            match op {
+                Comparison::Equal => kept_where(rows, len, |row| one(row) == other(row)),
+                Comparison::NotEqual => kept_where(rows, len, |row| one(row) != other(row)),
+                Comparison::Less => kept_where(rows, len, |row| one(row) < other(row)),
+                Comparison::LessOrEqual => kept_where(rows, len, |row| one(row) <= other(row)),
+                Comparison::Greater => kept_where(rows, len, |row| one(row) > other(row)),
+                Comparison::GreaterOrEqual => kept_where(rows, len, |row| one(row) >= other(row)),
+                Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
+            }
+        }};
+    }
     macro_rules! layouts {
-        ($(($variant:ident, $native:ty)),+ $(,)?) => {
-            match (data, literal) {
-                $(
-                    (Data::$variant(values), Data::$variant(wanted)) => {
-                        let wanted = *wanted.first()?;
-                        let values = values.get(..left.len())?;
-                        Some(match op {
-                            Comparison::Equal => kept_where(values, |value| value == wanted),
-                            Comparison::NotEqual => kept_where(values, |value| value != wanted),
-                            Comparison::Less => kept_where(values, |value| value < wanted),
-                            Comparison::LessOrEqual => kept_where(values, |value| value <= wanted),
-                            Comparison::Greater => kept_where(values, |value| value > wanted),
-                            Comparison::GreaterOrEqual => {
-                                kept_where(values, |value| value >= wanted)
-                            }
-                            Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
-                        })
-                    }
-                )+
-                _ => None,
+        ($($variant:ident),+ $(,)?) => {
+            if let Some(others) = right.data() {
+                match (data, others) {
+                    $(
+                        (Data::$variant(values), Data::$variant(others)) => {
+                            let (values, others) = (values.get(..len)?, others.get(..len)?);
+                            Some(ordered!(|row: usize| values[row], |row: usize| others[row]))
+                        }
+                    )+
+                    _ => None,
+                }
+            } else {
+                let column = readied(held, left.logical_type(), right.constant_value()?)?;
+                match (data, column.data()?) {
+                    $(
+                        (Data::$variant(values), Data::$variant(wanted)) => {
+                            let (values, wanted) = (values.get(..len)?, *wanted.first()?);
+                            Some(ordered!(|row: usize| values[row], |_: usize| wanted))
+                        }
+                    )+
+                    _ => None,
+                }
             }
         };
     }
-    layouts!(
-        (Int8, i8),
-        (Int16, i16),
-        (Int32, i32),
-        (Int64, i64),
-        (Int128, i128),
-        (UInt8, u8),
-        (UInt16, u16),
-        (UInt32, u32),
-        (UInt64, u64),
-        (UInt128, u128),
-    )
+    layouts!(Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UInt128)
 }
 
-/// The positions of `values` that `held` keeps, written without a branch on the answer.
+/// The rows where one bit packed column with no nulls holds against another, in one pass.
+///
+/// This is `l_commitdate < l_receiptdate` and `l_shipdate < l_commitdate` in q4, q12 and q21 as a
+/// stored table hands them up. [`packed_against_packed`] reads each code on its own, working out
+/// the word and the straddle every time, and writes a flag per row for a second pass to pick the
+/// rows out of. Here both sides are unpacked in blocks by [`Packed::unpack`], where the width is a
+/// constant, and the comparison writes the selection directly. The two bases are folded into one
+/// difference added to the right side, so the loop compares two `i64` rather than two `i128`. When
+/// the conjuncts before this one left only a few rows, the codes of just those rows are read one at
+/// a time instead, since unpacking the whole vector would read far more than it keeps.
+///
+/// `None` for anything but two straight packed runs of the same type, for codes too wide to leave
+/// room for the difference, and for two ranges that do not meet, which the general path answers
+/// without reading a code.
+fn packed_kept(
+    op: Comparison,
+    left: &Vector,
+    right: &Vector,
+    rows: Option<&[u32]>,
+) -> Option<Selection> {
+    if op.is_total() || left.logical_type() != right.logical_type() {
+        return None;
+    }
+    let (one, other) = (left.packed_parts()?, right.packed_parts()?);
+    if one.width() > 61 || other.width() > 61 {
+        return None;
+    }
+    if one.ceiling() < other.base() || other.ceiling() < one.base() {
+        return None;
+    }
+    // A row holds when `one.base() + a op other.base() + b`, which is `a op b + shift`.
+    let shift = i64::try_from(other.base() - one.base()).ok()?;
+    if shift.unsigned_abs() > 1 << 61 {
+        return None;
+    }
+    let len = left.len();
+    let dense = rows.is_none_or(|rows| rows.len() * 8 >= len);
+    macro_rules! ordered {
+        ($at:expr, $rows:expr) => {{
+            let at = $at;
+            match op {
+                Comparison::Equal => kept_where($rows, len, |row| {
+                    let (a, b) = at(row);
+                    a == b
+                }),
+                Comparison::NotEqual => kept_where($rows, len, |row| {
+                    let (a, b) = at(row);
+                    a != b
+                }),
+                Comparison::Less => kept_where($rows, len, |row| {
+                    let (a, b) = at(row);
+                    a < b
+                }),
+                Comparison::LessOrEqual => kept_where($rows, len, |row| {
+                    let (a, b) = at(row);
+                    a <= b
+                }),
+                Comparison::Greater => kept_where($rows, len, |row| {
+                    let (a, b) = at(row);
+                    a > b
+                }),
+                Comparison::GreaterOrEqual => kept_where($rows, len, |row| {
+                    let (a, b) = at(row);
+                    a >= b
+                }),
+                Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
+            }
+        }};
+    }
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "both widths are at most 61 bits, so a code is well inside an i64"
+    )]
+    let kept = if dense {
+        let (mut a, mut b) = (vec![0_u64; len], vec![0_u64; len]);
+        one.unpack(0, &mut a);
+        other.unpack(0, &mut b);
+        ordered!(|row: usize| (a[row] as i64, b[row] as i64 + shift), rows)
+    } else {
+        ordered!(|row: usize| (one.code(row) as i64, other.code(row) as i64 + shift), rows)
+    };
+    Some(kept)
+}
+
+/// The rows out of `rows`, or out of every row below `len` when there is no `rows`, that `held`
+/// keeps, written without a branch on the answer.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the caller checked that the row count fits in a u32 before getting here"
 )]
 #[inline]
-fn kept_where<T: Copy>(values: &[T], held: impl Fn(T) -> bool) -> Selection {
-    let mut out = vec![0_u32; values.len()];
+fn kept_where(rows: Option<&[u32]>, len: usize, held: impl Fn(usize) -> bool) -> Selection {
     let mut kept = 0;
-    for (index, &value) in values.iter().enumerate() {
-        out[kept] = index as u32;
-        kept += usize::from(held(value));
-    }
+    let mut out = match rows {
+        None => {
+            let mut out = vec![0_u32; len];
+            for index in 0..len {
+                out[kept] = index as u32;
+                kept += usize::from(held(index));
+            }
+            out
+        }
+        Some(rows) => {
+            let mut out = vec![0_u32; rows.len()];
+            for &row in rows {
+                out[kept] = row;
+                kept += usize::from(held(row as usize));
+            }
+            out
+        }
+    };
     out.truncate(kept);
     Selection::from_indices(out)
 }
@@ -431,6 +539,14 @@ pub fn refine_prepared(
     }
 
     let rows = kept.indices();
+    if left_valid == Validity::AllValid && right_valid == Validity::AllValid {
+        if let Some(kept) = flat_kept(op, left, right, Some(rows), held) {
+            return Ok(kept);
+        }
+        if let Some(kept) = packed_kept(op, left, right, Some(rows)) {
+            return Ok(kept);
+        }
+    }
     let map = |slot: usize| rows[slot] as usize;
     if let Some(answers) = external_text_literal(op, left, right, kept.len(), map, held)? {
         return Ok(narrowed(&answers, rows, |slot| {
@@ -2741,6 +2857,64 @@ mod tests {
             (total * 2) as u64,
             "only the two total comparisons fall through"
         );
+    }
+
+    /// The rows the oracle's flags keep out of `kept`, or out of every row.
+    fn wanted(op: Comparison, left: &Vector, right: &Vector, kept: Option<&Selection>) -> Vec<u32> {
+        let flags = oracle(op, left, right);
+        let every = crate::select::selection(&flags, flags.len());
+        match kept {
+            None => every.indices().to_vec(),
+            Some(kept) => {
+                kept.indices().iter().copied().filter(|row| every.indices().contains(row)).collect()
+            }
+        }
+    }
+
+    /// Two date columns of a thousand rows, flat and packed, compared the way a filter's first
+    /// conjunct and a later one compare them. A thousand rows is whole blocks of sixty four and a
+    /// tail, and the later conjunct is asked over a dense selection, which unpacks, and a sparse
+    /// one, which reads a code at a time.
+    #[test]
+    fn two_columns_compared_in_one_pass_keep_the_rows_the_oracle_keeps() {
+        let one: Vec<i32> = (0..1000).map(|row| 9000 + (row * 37) % 500).collect();
+        let other: Vec<i32> = (0..1000).map(|row| 9200 + (row * 53) % 400).collect();
+        let flat = |values: Vec<i32>| {
+            Vector::flat(LogicalType::Date, Data::Int32(values.into())).expect("dates are i32")
+        };
+        let (left, right) = (flat(one), flat(other));
+        let (packed_left, packed_right) =
+            (left.bit_packed().expect("packs"), right.bit_packed().expect("packs"));
+        assert_eq!(packed_left.form(), Form::BitPacked);
+        assert_eq!(packed_right.form(), Form::BitPacked);
+        let dense = Selection::from_predicate(1000, |row| row % 3 != 0);
+        let sparse = Selection::from_predicate(1000, |row| row % 97 == 5);
+        for op in EVERY {
+            for (a, b) in [(&left, &right), (&right, &left), (&packed_left, &packed_right)] {
+                let picked = select_prepared(op, a, b, None).expect("selects");
+                assert_eq!(picked.indices(), wanted(op, a, b, None), "{op:?} {:?}", a.form());
+                for kept in [&dense, &sparse] {
+                    let refined = refine(op, a, b, kept).expect("refines");
+                    assert_eq!(refined.indices(), wanted(op, a, b, Some(kept)), "{op:?}");
+                }
+            }
+        }
+        let refined = refine(Comparison::Less, &packed_left, &packed_right, &sparse).expect("ok");
+        assert!(!refined.is_empty(), "the sparse rows reach both answers");
+    }
+
+    /// A literal against a flat column in a later conjunct, which now picks its rows in the same
+    /// pass that compares them.
+    #[test]
+    fn a_flat_column_refined_against_a_literal_keeps_the_rows_the_oracle_keeps() {
+        let values: Vec<i64> = (0..700).map(|row| (row * 7919) % 1000).collect();
+        let column = Vector::flat(LogicalType::BigInt, Data::Int64(values.into())).expect("i64");
+        let literal = Vector::constant(LogicalType::BigInt, Value::BigInt(500), 700);
+        let kept = Selection::from_predicate(700, |row| row % 4 == 1);
+        for op in EVERY {
+            let refined = refine(op, &column, &literal, &kept).expect("refines");
+            assert_eq!(refined.indices(), wanted(op, &column, &literal, Some(&kept)), "{op:?}");
+        }
     }
 
     /// A column whose largest value is below the other's smallest answers every row the same way,
