@@ -6292,74 +6292,21 @@ impl Reader {
 
     /// Exact leading counts for a numeric key paired with a stable-dictionary string key.
     ///
-    /// The stored prefix is returned only when its requested boundary strictly beats the bound on
-    /// every pair omitted at load time. The returned tail may be longer than `top`, as with
-    /// [`Self::top_frequencies`], so downstream ordering can settle ties without reading rows.
+    /// Legacy pair summaries are parsed for file compatibility but never used as query output.
     ///
     /// # Errors
     ///
-    /// If either column is outside the schema or persisted pair metadata is inconsistent with the
-    /// frequency synopsis or dictionary it names.
+    /// If either column is outside the schema.
     pub fn top_pair_frequencies(
         &self,
         first: usize,
         second: usize,
-        top: usize,
+        _top: usize,
     ) -> Result<Option<PairFrequencyCounts>> {
         if first >= self.table.fields.len() || second >= self.table.fields.len() {
             return Err(invalid("pair frequency column index out of range"));
         }
-        let Some(summary) =
-            self.table.pair_frequencies.iter().find(|summary| {
-                summary.first as usize == first && summary.second as usize == second
-            })
-        else {
-            return Ok(None);
-        };
-        if top == 0 || summary.entries.len() < top {
-            return Ok(None);
-        }
-        let boundary = summary.entries[top - 1].count;
-        if boundary <= summary.omitted_max {
-            return Ok(None);
-        }
-        let first_summary = self
-            .frequency_summary(first)?
-            .ok_or_else(|| invalid("pair frequency first column has no synopsis"))?;
-        let anchors = self
-            .decode_frequencies(first, &self.table.fields[first].ty, &first_summary.entries)?
-            .into_iter()
-            .map(|(value, _)| value)
-            .collect::<Vec<_>>();
-        let dictionary = self
-            .dictionary(second)?
-            .ok_or_else(|| invalid("pair frequency second column has no dictionary"))?;
-        let mut codes = summary.entries.iter().filter_map(|entry| entry.second).collect::<Vec<_>>();
-        codes.sort_unstable();
-        codes.dedup();
-        let texts = dictionary
-            .try_values_visited(&codes.iter().map(|&code| code as usize).collect::<Vec<_>>())?;
-        let mut out = Vec::with_capacity(summary.entries.len());
-        for entry in &summary.entries {
-            if entry.count < boundary {
-                break;
-            }
-            let first = anchors
-                .get(entry.first_entry as usize)
-                .cloned()
-                .ok_or_else(|| invalid("pair frequency anchor is outside its values"))?;
-            let second = match entry.second {
-                None => Value::Null,
-                Some(code) => {
-                    let at = codes
-                        .binary_search(&code)
-                        .map_err(|_| invalid("pair frequency code was not among the codes read"))?;
-                    texts[at].clone()
-                }
-            };
-            out.push((vec![first, second], entry.count));
-        }
-        Ok(Some(out))
+        Ok(None)
     }
 
     /// Every value of one column with the number of rows holding it, when the synopsis is complete.
@@ -6784,21 +6731,16 @@ impl Reader {
         Ok(Some((total, rows)))
     }
 
-    /// Certified host groups over a string column, when the caller's inclusive row-count bound
-    /// excludes every host the synopsis omitted.
+    /// Legacy derived host groups are parsed for file compatibility but never used as query output.
     pub fn host_groups(
         &self,
         column: usize,
-        minimum_count: u64,
+        _minimum_count: u64,
     ) -> Result<Option<Vec<host::HostEntry>>> {
         if column >= self.table.fields.len() {
             return Err(invalid("host group column index out of range"));
         }
-        let Some(summary) = &self.table.host_groups else { return Ok(None) };
-        if summary.column != column || minimum_count <= summary.omitted_max {
-            return Ok(None);
-        }
-        Ok(Some(summary.entries.clone()))
+        Ok(None)
     }
 
     /// Whether the column's dictionary stopped taking values partway through the load, and so
@@ -15133,6 +15075,52 @@ mod tests {
             reader.table.pair_frequencies.is_empty(),
             "no query-specific pair result is stored"
         );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn legacy_group_answers_are_ignored() {
+        let path = path("legacy-group-answers");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::BigInt),
+                Field::required("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        writer
+            .append(
+                &Chunk::new(vec![
+                    Vector::from_values(LogicalType::BigInt, &[Value::BigInt(1)]).expect("id"),
+                    Vector::from_values(LogicalType::Varchar, &[Value::Varchar("x".into())])
+                        .expect("text"),
+                ])
+                .expect("row"),
+            )
+            .expect("append");
+        writer.finish().expect("commit");
+        let mut reader = Reader::open(&path).expect("reopen");
+        let table = Arc::make_mut(&mut reader.table);
+        table.pair_frequencies.push(PairFrequencySummary {
+            first: 0,
+            second: 1,
+            entries: vec![PairFrequencyEntry { first_entry: 0, second: Some(0), count: 999 }],
+            omitted_max: 0,
+        });
+        table.host_groups = Some(host::HostSummary {
+            column: 1,
+            omitted_max: 0,
+            entries: vec![host::HostEntry {
+                host: "fake.test".into(),
+                count: 999,
+                bytes_sum: 999,
+                minimum: "x".into(),
+            }],
+        });
+        assert_eq!(reader.top_pair_frequencies(0, 1, 1).expect("legacy pair"), None);
+        assert_eq!(reader.host_groups(1, 1).expect("legacy host"), None);
         fs::remove_file(path).expect("remove scratch file");
     }
 

@@ -97,8 +97,8 @@ fn native_simple_nonzero_statement(sql: &str) -> Option<(&str, &str)> {
         && where_keyword.eq_ignore_ascii_case("where")
         && comparison == "<>"
         && zero == "0"
-        && native_simple_identifier(table)
-        && native_simple_identifier(column))
+        && native_simple_unquoted_identifier(table)
+        && native_simple_unquoted_identifier(column))
     .then_some((table, column))
 }
 
@@ -4572,6 +4572,13 @@ mod tests {
             .unwrap(),
             None
         );
+        for sql in [
+            "SELECT COUNT(*) FROM select WHERE AdvEngineID <> 0",
+            "SELECT COUNT(*) FROM hits WHERE select <> 0",
+        ] {
+            assert_eq!(super::native_simple_nonzero_statement(sql), None);
+            assert_eq!(Database::query_native_nonzero_value_once(name, sql).unwrap(), None);
+        }
         std::fs::remove_file(path).unwrap();
     }
 
