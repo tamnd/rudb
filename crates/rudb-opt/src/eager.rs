@@ -71,15 +71,22 @@
 //!       <B>
 //! ```
 //!
-//! The top aggregate keeps its index and its output order, so nothing above it moves. A second run
+//! Where that join is the only one on the path, it says nothing but that K equals columns of the
+//! other side, and a group key is a column of that side that a built link names as a parent key,
+//! each group above has one row in it and there is nothing left to add up. The top aggregate is a
+//! projection then, of the group keys and each partial answer, with the same `coalesce` a padded
+//! count needs. On q13 with the links declared that is a grouping of 150,000 customers gone.
+//!
+//! The top node keeps the aggregate's index and its output order, so nothing above it moves. A second run
 //! finds an aggregate where B was and stops, so the pass settles after one.
 
 use std::collections::HashMap;
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_plan::{ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
+use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 
 use crate::estimate::{self, Facts};
+use crate::link::Linked;
 use crate::pass::{Context, Pass};
 use crate::walk;
 
@@ -93,15 +100,16 @@ impl Pass for EagerAggregation {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        push(plan, context.facts());
+        push(plan, context.facts(), context.links());
         Ok(())
     }
 }
 
 /// Rewrites every aggregate in `plan` that this applies to.
-pub fn push(plan: &mut Plan, stats: &Facts) {
+pub fn push(plan: &mut Plan, stats: &Facts, links: &[Linked]) {
     let mut moved = false;
-    let root = walk::restack(plan, plan.root(), &mut moved, &mut |plan, at| split(plan, at, stats));
+    let root =
+        walk::restack(plan, plan.root(), &mut moved, &mut |plan, at| split(plan, at, stats, links));
     if moved {
         plan.set_root(root);
     }
@@ -117,7 +125,7 @@ enum Step {
 }
 
 /// The two stage form of `at` when it is an aggregate this applies to.
-fn split(plan: &mut Plan, at: NodeRef, stats: &Facts) -> Option<NodeRef> {
+fn split(plan: &mut Plan, at: NodeRef, stats: &Facts, links: &[Linked]) -> Option<NodeRef> {
     let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else { return None };
     let calls = plan.expr_list(aggregates).to_vec();
     if calls.is_empty() || !calls.iter().all(|&call| movable(plan, call)) {
@@ -160,7 +168,12 @@ fn split(plan: &mut Plan, at: NodeRef, stats: &Facts) -> Option<NodeRef> {
                 if let Some(kept) =
                     scan.then(|| worth(plan, &path, &keys, below, &side, &other, stats)).flatten()
                 {
-                    let staged = Staged { below, kept, padded };
+                    let joins =
+                        path.iter().filter(|step| matches!(step, Step::Join { .. })).count();
+                    let alone = joins == 1
+                        && covers(plan, here, &kept, &other)
+                        && keyed(plan, here, beside, &keys, links);
+                    let staged = Staged { below, kept, padded, alone };
                     return Some(rewrite(plan, &path, staged, index, &keys, &calls));
                 }
                 here = below;
@@ -277,6 +290,81 @@ struct Staged {
     /// Whether a left join on the path pads B's side with nulls, which is what makes a count read
     /// `coalesce` above it.
     padded: bool,
+    /// Whether every group above gets one joined row, which makes the aggregate above a projection.
+    /// See [`covers`] and [`keyed`].
+    alone: bool,
+}
+
+/// Whether the join at `at` says nothing but that each column of K equals a column of the other
+/// side, and says it for every column of K.
+///
+/// The partial rows are one per value of K, so then a row of the other side meets one of them at
+/// most, and every row out of the join is a row of the other side, once.
+fn covers(
+    plan: &Plan,
+    at: NodeRef,
+    kept: &[(ColumnBinding, LogicalType)],
+    other: &[(ColumnBinding, LogicalType)],
+) -> bool {
+    let Node::Join { conditions, .. } = *plan.node(at) else { return false };
+    let column = |expr: ExprRef| match *plan.expr(expr) {
+        Expr::Column(binding) => Some(binding),
+        _ => None,
+    };
+    let ours = |binding: ColumnBinding| kept.iter().any(|(found, _)| *found == binding);
+    let theirs = |binding: ColumnBinding| other.iter().any(|(found, _)| *found == binding);
+    let mut met = Vec::new();
+    for &condition in plan.expr_list(conditions) {
+        let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+            return false;
+        };
+        let (Some(left), Some(right)) = (column(left), column(right)) else { return false };
+        if ours(left) && theirs(right) {
+            met.push(left);
+        } else if theirs(left) && ours(right) {
+            met.push(right);
+        } else {
+            return false;
+        }
+    }
+    kept.iter().all(|(binding, _)| met.contains(binding))
+}
+
+/// Whether a group key is a column of the scan at `beside` that a built link names as the parent
+/// key, so that no two rows of the scan are in one group.
+///
+/// A link is only written over a parent key the build found distinct, but the build lets nulls
+/// through, and every null lands in one group. So the column has to be declared `NOT NULL`, or the
+/// file has to say it holds no nulls, or the join has to be an inner one that compares it, which
+/// drops a null before it gets to the group.
+fn keyed(plan: &Plan, join: NodeRef, beside: NodeRef, keys: &[ExprRef], links: &[Linked]) -> bool {
+    let Node::Join { kind, conditions, .. } = *plan.node(join) else { return false };
+    let Node::Get { table, columns, index, .. } = *plan.node(beside) else { return false };
+    let table = plan.string(table);
+    let fields = plan.field_list(columns);
+    let compared = |binding: ColumnBinding| {
+        plan.expr_list(conditions).iter().any(|&condition| {
+            matches!(*plan.expr(condition), Expr::Compare { op: CompareOp::Equal, left, right }
+                if [left, right].iter().any(|&side| *plan.expr(side) == Expr::Column(binding)))
+        })
+    };
+    keys.iter().any(|&key| {
+        let Expr::Column(binding) = *plan.expr(key) else { return false };
+        if binding.table != index {
+            return false;
+        }
+        let Some(field) = fields.get(binding.column as usize) else { return false };
+        let never_null = field.not_null
+            || estimate::never_null(plan, beside, binding)
+            || (kind == JoinKind::Inner && compared(binding));
+        never_null
+            && links.iter().any(|link| {
+                link.built
+                    && link.second.is_none()
+                    && link.parent.eq_ignore_ascii_case(table)
+                    && link.parent_column.eq_ignore_ascii_case(&field.name)
+            })
+    })
 }
 
 /// Puts the partial aggregate over `below` and rebuilds the path above it to read from it.
@@ -288,7 +376,7 @@ fn rewrite(
     keys: &[ExprRef],
     calls: &[ExprRef],
 ) -> NodeRef {
-    let Staged { below, kept, padded } = staged_at;
+    let Staged { below, kept, padded, alone } = staged_at;
     let staged = walk::fresh_index(plan);
     let column = |plan: &mut Plan, at: usize, ty: LogicalType| {
         let at = u32::try_from(at).expect("an aggregate with this many expressions cannot bind");
@@ -354,9 +442,21 @@ fn rewrite(
             let coalesce = Expr::Function { name: plan.intern("coalesce"), args };
             arg = plan.add_expr_at(coalesce, ty.clone(), span);
         }
+        if alone {
+            outer_calls.push(arg);
+            continue;
+        }
         let args = plan.add_expr_list(&[arg]);
         let total = Expr::Aggregate { name, args, distinct: false, filter: None };
         outer_calls.push(plan.add_expr_at(total, ty, span));
+    }
+    if alone {
+        let exprs: Vec<ExprRef> = outer_keys.into_iter().chain(outer_calls).collect();
+        let names: Vec<_> =
+            (0..exprs.len()).map(|position| plan.intern(&format!("column{position}"))).collect();
+        let exprs = plan.add_expr_list(&exprs);
+        let names = plan.add_name_list(&names);
+        return plan.add_node(Node::Project { input: built, index, exprs, names });
     }
     let groups = plan.add_expr_list(&outer_keys);
     let aggregates = plan.add_expr_list(&outer_calls);
@@ -389,15 +489,16 @@ mod tests {
 
     use super::push;
     use crate::estimate::Facts;
+    use crate::link::Linked;
 
     /// What the plan a text prints looks like once the pass has run over it, twice.
     fn pushed(text: &str) -> String {
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
-        push(&mut plan, &Facts::new());
+        push(&mut plan, &Facts::new(), &[]);
         plan.validate().unwrap_or_else(|error| panic!("{text} did not stay valid: {error}"));
         let once = plan.to_string();
-        push(&mut plan, &Facts::new());
+        push(&mut plan, &Facts::new(), &[]);
         assert_eq!(plan.to_string(), once, "a second run moved the plan again");
         once
     }
@@ -473,7 +574,7 @@ mod tests {
     fn a_count_below_the_padded_side_of_a_left_join_reads_coalesce_above_it() {
         let stats = counted(1_500_000, 100_000);
         let mut plan = Plan::parse(PADDED).expect("parses");
-        push(&mut plan, &stats);
+        push(&mut plan, &stats, &[]);
         plan.validate().expect("valid");
         assert_eq!(
             plan.to_string(),
@@ -487,8 +588,38 @@ mod tests {
             )
         );
         let once = plan.to_string();
-        push(&mut plan, &stats);
+        push(&mut plan, &stats, &[]);
         assert_eq!(plan.to_string(), once, "a second run moved the plan again");
+    }
+
+    /// `c(k)` is the parent key of a built link, and an inner join on it drops a null key, so each
+    /// customer is a group of its own and the aggregate above has nothing to add up. A left join
+    /// keeps a null key, and nothing here says there is none, so that one keeps its aggregate.
+    #[test]
+    fn a_group_key_a_link_says_is_unique_makes_the_top_a_projection() {
+        let stats = counted(1_500_000, 100_000);
+        let link = |built: bool| Linked { built, ..Linked::declared("o", "c", "c", "k") };
+        let inner = PADDED.replace("Join LEFT", "Join INNER");
+        let mut plan = Plan::parse(&inner).expect("parses");
+        push(&mut plan, &stats, &[link(true)]);
+        plan.validate().expect("valid");
+        assert_eq!(
+            plan.to_string(),
+            concat!(
+                "Project #3 [#0.0::BIGINT AS column0, #4.1::BIGINT AS column1, #4.2::BIGINT AS column2]\n",
+                "  Join INNER on=[(#0.0::BIGINT = #4.0::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.c AS c #0 [k::BIGINT]\n",
+                "    Aggregate #4 groups=[#1.0::BIGINT] aggregates=[count(#1.1::BIGINT)::BIGINT, count_star()::BIGINT]\n",
+                "      Filter (#1.1::BIGINT > 5::BIGINT)::BOOLEAN\n",
+                "        Get memory.main.o AS o #1 [c::BIGINT, key::BIGINT]\n",
+            )
+        );
+
+        for (text, built) in [(inner.as_str(), false), (PADDED, true)] {
+            let mut plan = Plan::parse(text).expect("parses");
+            push(&mut plan, &stats, &[link(built)]);
+            assert!(plan.to_string().starts_with("Aggregate #3"), "{plan}");
+        }
     }
 
     /// Without a string to group by, what decides is how far grouping shrinks B, and that is only
@@ -499,7 +630,7 @@ mod tests {
             [(1_500_000, 100_000, true), (400, 100, true), (400, 101, false)]
         {
             let mut plan = Plan::parse(PADDED).expect("parses");
-            push(&mut plan, &counted(rows, distinct));
+            push(&mut plan, &counted(rows, distinct), &[]);
             assert_eq!(plan.to_string() != PADDED, moves, "{rows} rows over {distinct} values");
         }
         assert_eq!(pushed(PADDED), PADDED, "nothing measured");
