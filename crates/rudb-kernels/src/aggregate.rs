@@ -2023,12 +2023,27 @@ fn count_runs(
 ///
 /// Only a run of 128 bit values can miss, since a run of anything narrower would need more rows
 /// than there are to leave the range, and so only that width pays for a check per value.
+///
+/// A value of 64 bits or fewer is added as its low 32 bits and the rest, into two sums of 64 bits
+/// that a block of 2^30 values cannot overflow. Added as an `i128` each, every add waited on the
+/// carry out of the one before it, and on ClickBench 28 that chain was four fifths of the fold of
+/// `AVG(length(URL))` by `CounterID`. Two sums with no carry between them are two adds a value
+/// that do not wait on each other, and a loop the compiler can put in vector registers.
 fn run_total<T: Copy + Into<i128>>(run: &[T]) -> Option<i128> {
-    if size_of::<T>() < size_of::<i128>() {
-        Some(run.iter().map(|&value| value.into()).sum())
-    } else {
-        run.iter().try_fold(0_i128, |sum, &value| sum.checked_add(value.into()))
+    if size_of::<T>() > size_of::<u64>() {
+        return run.iter().try_fold(0_i128, |sum, &value| sum.checked_add(value.into()));
     }
+    let mut total = 0_i128;
+    for block in run.chunks(1 << 30) {
+        let (mut low, mut high) = (0_u64, 0_i64);
+        for &value in block {
+            let value: i128 = value.into();
+            low += value as u64 & u64::from(u32::MAX);
+            high += (value >> 32) as i64;
+        }
+        total += (i128::from(high) << 32) + i128::from(low);
+    }
+    Some(total)
 }
 
 /// A grouped min or max over a dictionary that sorted its values when it was written.
@@ -3751,6 +3766,24 @@ mod tests {
         // A LogicalType can own a nested schema. Keeping one in every aggregate state cost more
         // than a hundred MiB on ClickBench q33 before the return was narrowed to Return.
         assert!(size_of::<Accumulator>() <= 32, "{} bytes", size_of::<Accumulator>());
+    }
+
+    /// A run's total split into two sums is the total an `i128` gives, at the ends of every width.
+    #[test]
+    fn a_run_total_is_exact_at_the_ends_of_its_width() {
+        fn plain<T: Copy + Into<i128>>(run: &[T]) -> i128 {
+            run.iter().map(|&value| value.into()).sum()
+        }
+        let signed = [i64::MIN, i64::MAX, -1, 0, 1, i64::MIN, i64::MIN, 1 << 32, -(1 << 32) - 7];
+        assert_eq!(run_total(&signed), Some(plain(&signed)));
+        let unsigned = [u64::MAX, u64::MAX, 0, 1 << 63, u64::from(u32::MAX)];
+        assert_eq!(run_total(&unsigned), Some(plain(&unsigned)));
+        let narrow = [i32::MIN, i32::MAX, -3, 900];
+        assert_eq!(run_total(&narrow), Some(plain(&narrow)));
+        let many = vec![i64::MIN; 10_000];
+        assert_eq!(run_total(&many), Some(plain(&many)));
+        assert_eq!(run_total::<i64>(&[]), Some(0));
+        assert_eq!(run_total(&[i128::MAX, 1]), None);
     }
 
     fn run(name: &str, returns: &LogicalType, rows: &[Value]) -> Value {
