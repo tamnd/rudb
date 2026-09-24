@@ -828,6 +828,24 @@ pub fn stored_degrees(child: &Reader, child_column: usize) -> Option<Degrees> {
     Degrees::read(&child.payload(held).ok()?).ok()
 }
 
+/// Whether this table holds a key map over this column at its current generation.
+///
+/// The build only writes a key map over a column whose values it found distinct, nulls aside, so
+/// one being there says the column is a key of the table. That is a fact about the parent alone
+/// and holds whether or not a child's link to it fit its own budget. A record of a map that did not
+/// fit is not a map and does not count. Nothing is decoded, so asking this costs nothing.
+#[must_use]
+pub fn holds_key_map(reader: &Reader, column: usize) -> bool {
+    let table = reader.table();
+    let Ok(id) = u64::try_from(column) else { return false };
+    table.sections().iter().any(|section| {
+        section.kind == *section::KEY_MAP
+            && section.id == id
+            && section.usable(table.generation())
+            && section.refused().is_none()
+    })
+}
+
 /// What a key map over this column would have cost, when a build measured one and did not keep it.
 ///
 /// This and [`key_map`] are exclusive: an entry either holds a map or records the absence of one,
@@ -1024,6 +1042,7 @@ mod tests {
 
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
         assert!(key_map(&reader, 0).is_none(), "no map was written to read back");
+        assert!(!holds_key_map(&reader, 0), "and the record of a refusal does not say it is a key");
         // What is written is the entry that says so, with no bytes behind it. Section 3.7 wants the
         // size to survive the build that decided against it, and fifty six bytes of entry is the
         // whole of what a refusal costs.
@@ -1044,6 +1063,7 @@ mod tests {
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
         assert!(key_map(&reader, 0).is_none());
         assert!(key_map(&reader, 99).is_none(), "a column that does not exist is not a panic");
+        assert!(!holds_key_map(&reader, 0));
         fs::remove_file(&path).expect("clean up");
     }
 
@@ -1056,6 +1076,7 @@ mod tests {
         // map stays current: that is the distinction `Table::generation` exists to make.
         let reader = Catalog::open(&path).expect("reopen").table("parent").expect("the table");
         assert!(key_map(&reader, 0).is_some());
+        assert!(holds_key_map(&reader, 0));
         let generation = reader.table().generation();
         drop(reader);
 

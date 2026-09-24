@@ -2796,6 +2796,7 @@ impl Shared {
             };
             found.push(match second {
                 Some((child, parent)) => linked.and(child, parent),
+                None if parent_keyed(catalog, &link.parent.table, parent_keys) => linked.keyed(),
                 None => linked,
             });
         }
@@ -3563,6 +3564,13 @@ fn stored_link(
     };
     let held = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)?;
     Some(held.linked() == held.children())
+}
+
+/// Whether the parent's file holds a key map over its key column, which says the column is a key.
+fn parent_keyed(catalog: &Catalog, table: &str, columns: &[String]) -> bool {
+    let Some(table) = table_named(catalog, table) else { return false };
+    let rudb_catalog::table::Rows::Native(rows) = table.rows() else { return false };
+    key_in(table, columns).is_some_and(|column| rudb_native::graph::holds_key_map(rows, column))
 }
 
 /// The first table of that name in any schema of any database.
