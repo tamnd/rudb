@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
-    AlterAction, Ast, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
+    AlterAction, Ast, Attach, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
     CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert, JoinKind,
     LiteralKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef, Scope, Select,
     SelectRef, SetOp, Setting, Slice, Source, SourceRef, Statement, StrRef, Target, Transaction,
@@ -471,7 +471,17 @@ impl<'a> Transform<'a> {
             "UseStatement" => self.use_statement(inner),
             "PragmaStatement" => self.pragma_statement(inner),
             "ExplainStatement" => self.explain_statement(inner),
-            "CheckpointStatement" => Ok(Statement::Checkpoint),
+            "CheckpointStatement" => {
+                let name = self.find(inner, "CatalogName");
+                let name = if name == NONE { NONE } else { self.identifier(name) };
+                Ok(Statement::Checkpoint(name))
+            }
+            "AttachStatement" => self.attach_statement(inner),
+            "DetachStatement" => {
+                let if_exists = self.find(inner, "IfExists") != NONE;
+                let name = self.identifier(self.find(inner, "CatalogName"));
+                Ok(Statement::Detach { name, if_exists })
+            }
             "TransactionStatement" => {
                 let kind = self.first(inner);
                 Ok(Statement::Transaction(match self.name(kind) {
@@ -618,6 +628,50 @@ impl<'a> Transform<'a> {
         let index = self.ast.settings.len() as u32;
         self.ast.settings.push(Setting { name, scope, value, pragma: false });
         Ok(Statement::Set(index))
+    }
+
+    /// `ATTACH [OR REPLACE] [IF NOT EXISTS] [DATABASE] path [AS alias] [(options)]`.
+    ///
+    /// The options are the generic copy option list, a name with a value or without one, and what
+    /// each name means is the layer above's business, the same as for a setting.
+    fn attach_statement(&mut self, node: u32) -> Result<Statement> {
+        let path = self.expr(self.first(self.find(node, "DatabasePath")))?;
+        let alias = self.find(node, "AttachAlias");
+        let alias = if alias == NONE { NONE } else { self.identifier(self.find(alias, "ColId")) };
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        let options = self.find(node, "AttachOptions");
+        if options != NONE {
+            let mut found = Vec::new();
+            self.named_nodes(options, "GenericCopyOption", &mut found);
+            for option in found {
+                let name = self.identifier(self.find(option, "CopyOptionName"));
+                let value = self.find(option, "GenericCopyOptionValue");
+                let value = if value == NONE {
+                    NONE
+                } else {
+                    let inner = self.first(value);
+                    if self.name(inner) != "GenericCopyOptionExpression" {
+                        return self.unsupported(inner);
+                    }
+                    self.expr(self.first(inner))?
+                };
+                names.push(name);
+                values.push(value);
+            }
+        }
+        let names = self.part_slice(names);
+        let values = self.expr_slice(values);
+        let index = self.ast.attaches.len() as u32;
+        self.ast.attaches.push(Attach {
+            path,
+            alias,
+            or_replace: self.find(node, "OrReplace") != NONE,
+            if_not_exists: self.find(node, "IfNotExists") != NONE,
+            names,
+            values,
+        });
+        Ok(Statement::Attach(index))
     }
 
     /// A `SET schema` to this text, which is what `SET SCHEMA 'name'` and `USE` both come to.
@@ -5563,7 +5617,21 @@ mod tests {
                 };
                 format!("RESET{scope} {}", ast.string(setting.name))
             }
-            Statement::Checkpoint => "CHECKPOINT".to_string(),
+            Statement::Checkpoint(name) if name == NONE => "CHECKPOINT".to_string(),
+            Statement::Checkpoint(name) => format!("CHECKPOINT {}", ast.string(name)),
+            Statement::Attach(index) => {
+                let attach = ast.attach(index);
+                let alias = if attach.alias == NONE {
+                    String::new()
+                } else {
+                    format!(" AS {}", ast.string(attach.alias))
+                };
+                format!("ATTACH {}{alias}", show(&ast, attach.path))
+            }
+            Statement::Detach { name, if_exists } => {
+                let exists = if if_exists { "IF EXISTS " } else { "" };
+                format!("DETACH {exists}{}", ast.string(name))
+            }
             Statement::Transaction(Transaction::Begin { read_only: false }) => "BEGIN".to_string(),
             Statement::Transaction(Transaction::Begin { read_only: true }) => {
                 "BEGIN READ ONLY".to_string()
