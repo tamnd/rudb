@@ -141,6 +141,13 @@ pub use rudb_common::{
 };
 pub use rudb_vector::{Chunk, VECTOR_SIZE};
 
+/// How the program hands freed memory back to the system, for the binary that owns the allocator.
+///
+/// See `rudb_common::heap` for why the library asks rather than does it.
+pub mod heap {
+    pub use rudb_common::heap::{on_release, release};
+}
+
 /// Every optimizer pass, by the name `SET disabled_optimizers` knows it by, in the order they run.
 ///
 /// What a caller does with it is turn the optimizer off: `SET disabled_optimizers` takes DuckDB's
