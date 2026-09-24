@@ -422,6 +422,41 @@ pub fn encode_only(kind: Kind, values: &[&[u8]]) -> Result<Option<Vec<u8>>> {
     encode_as(kind, values, 0, &EXHAUSTIVE)
 }
 
+/// A shape that is FSST alone, against one table trained on a sample of `values`.
+///
+/// For a writer that compresses page after page of one column with FSST and nothing else. Training
+/// is most of what FSST costs on a page of a thousand short values, and a page of `l_comment` trained
+/// a table of its own, which on a TPC-H `lineitem` load from CSV was six percent of every cycle. The
+/// table a page trains is much the same as the one the page before it trained, so the writer trains
+/// one here, hands it to [`encode_fsst`] for the pages after, and trains again when it stops paying.
+///
+/// The time is counted as choosing, the way the rest of the time spent deciding is.
+#[must_use]
+pub fn fsst_shape(values: &[&[u8]]) -> Settled {
+    let started = Instant::now();
+    let table = SymbolTable::train(&sample_of(values));
+    tally::chose(Family::String, started);
+    Settled::new(vec![Kind::Fsst], Vec::new()).with_symbols(0, table)
+}
+
+/// `values` as one FSST chunk against the table in `shape`, which [`fsst_shape`] made.
+///
+/// `None` when the table is empty, which is what a sample with nothing worth a symbol trains. This
+/// is counted as an offer of FSST and, when it comes out, as kept, so that the pages a writer
+/// compresses this way show up in `rudb_codec_metrics()` with the rest.
+///
+/// # Errors
+///
+/// As [`encode`].
+pub fn encode_fsst(values: &[&[u8]], shape: &Settled) -> Result<Option<Vec<u8>>> {
+    let out =
+        tally::offer(Family::String, Kind::Fsst.tag(), || encode_as(Kind::Fsst, values, 0, shape))?;
+    if out.is_some() {
+        tally::kept(Family::String, Kind::Fsst.tag());
+    }
+    Ok(out)
+}
+
 /// How big one candidate comes out, which is all a sampling chooser needs from it.
 ///
 /// The bytes are thrown away, so this says nothing [`encode_only`] does not. It is `pub(crate)` and
