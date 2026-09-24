@@ -5,6 +5,7 @@ use std::sync::Arc;
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value};
+use rudb_encoding::sequence::Sequence;
 use rudb_native::{
     Common, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts, Reader as NativeReader,
     StoredPart, Stripes,
@@ -813,6 +814,30 @@ impl Rows {
                 }
                 Chunk::with_rows(selected, positions.len())
             }
+        }
+    }
+
+    /// The rows of one part whose string column `column` holds `sequence`'s pieces in order, or with
+    /// `negated` the rows whose column does not, nulls in neither, when the part can say without its
+    /// strings being read. `None` when it cannot, which is every part but a compressed text page of
+    /// a native file.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    pub fn rows_holding(
+        &self,
+        at: usize,
+        column: usize,
+        sequence: &Sequence,
+        negated: bool,
+    ) -> Result<Option<Vec<u32>>> {
+        match self {
+            Self::Native(reader) => reader.rows_holding(at, column, sequence, negated),
+            Self::Grown(reader, _) if at < reader.parts() => {
+                reader.rows_holding(at, column, sequence, negated)
+            }
+            Self::Memory(_) | Self::Grown(_, _) => Ok(None),
         }
     }
 

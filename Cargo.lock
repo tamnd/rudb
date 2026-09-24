@@ -282,6 +282,7 @@ name = "rudb-catalog"
 version = "0.4.26"
 dependencies = [
  "rudb-common",
+ "rudb-encoding",
  "rudb-functions",
  "rudb-native",
  "rudb-storage",

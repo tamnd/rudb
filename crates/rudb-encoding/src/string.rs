@@ -70,6 +70,7 @@ use crate::fsst::{MAX_SYMBOL_LEN, SymbolTable};
 use crate::integer;
 use crate::lz;
 use crate::reader::Reader;
+use crate::sequence::Sequence;
 use crate::tally::{self, Family};
 
 /// How deep the recursion goes. A dictionary of a dictionary is not a thing, so this only has to
@@ -290,6 +291,43 @@ pub fn decode_flat(bytes: &[u8]) -> Result<Flat> {
         )));
     }
     Ok(flat)
+}
+
+/// Whether each value of a chunk written by [`encode`] holds `sequence`'s pieces in order, answered
+/// without decompressing it, or `None` for a chunk that is not compressed.
+///
+/// A compressed chunk is walked a code at a time, see [`Sequence`], and nothing is written out. Any
+/// other shape is cheap to decode already and the caller reads it the usual way. A null is stored as
+/// an empty value here, so the caller still has to take the nulls out.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn holds_in(bytes: &[u8], sequence: &Sequence) -> Result<Option<Vec<bool>>> {
+    if bytes.first() != Some(&Kind::Fsst.tag()) {
+        return Ok(None);
+    }
+    let mut reader = Reader::new(bytes);
+    reader.u8()?;
+    let count = reader.u32()? as usize;
+    let runs = read_compressed(&mut reader, count)?;
+    let mut coded = sequence.over(&runs.table);
+    let mut held = Vec::with_capacity(count);
+    let mut payload = runs.payload;
+    for &run in &runs.lengths {
+        let Some((codes, rest)) = payload.split_at_checked(run) else {
+            return Err(Error::internal("a compressed run is past the end of its chunk"));
+        };
+        payload = rest;
+        held.push(coded.holds(codes)?);
+    }
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a string chunk",
+            reader.remaining()
+        )));
+    }
+    Ok(Some(held))
 }
 
 /// Decodes only the values at `positions` of a chunk written by [`encode`], in that order.

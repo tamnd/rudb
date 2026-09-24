@@ -44,6 +44,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
 use rudb_common::{Clustering, Error, Field, LogicalType, PhysicalType, Result, Value, Width};
+use rudb_encoding::sequence::Sequence;
 use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_io::{Filesystem, OpenMode, RealFilesystem};
 use rudb_metrics::{LoadProfile, Stage};
@@ -6966,37 +6967,15 @@ impl Reader {
         ) {
             return Ok(None);
         }
-        let stripe_index = place.stripe as usize;
-        let stripe = self
-            .table
-            .stripes
-            .get(stripe_index)
-            .ok_or_else(|| invalid("stripe index out of range"))?;
-        let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
-        let held = self.held(stripe_index, stripe, column, true)?;
-        let span = *held
-            .index
-            .get(place.part as usize)
-            .ok_or_else(|| invalid("part index out of range"))?;
-        let owned;
-        let bytes = match &held.page {
-            Some(page) => page.part(place.part as usize, span)?,
-            None => {
-                let offset = page
-                    .offset
-                    .checked_add(span.start as u64)
-                    .ok_or_else(|| invalid("part range overflow"))?;
-                let mut bytes = vec![0; span.length];
-                read_at(&self.file, offset, &mut bytes)?;
-                verify_part(&bytes, span)?;
-                owned = bytes;
-                &owned
+        let (rows, counts) = match self.with_part(place, column, |bytes| {
+            if bytes.first() != Some(&5) || bytes.get(1) != Some(&0) {
+                return Ok(None);
             }
+            integer::tally(&bytes[2..]).map(Some)
+        })? {
+            Some(tallied) => tallied,
+            None => return Ok(None),
         };
-        if bytes.first() != Some(&5) || bytes.get(1) != Some(&0) {
-            return Ok(None);
-        }
-        let (rows, counts) = integer::tally(&bytes[2..])?;
         if rows != place.rows as usize {
             return Err(invalid("encoded integer part holds the wrong number of rows"));
         }
@@ -7013,6 +6992,98 @@ impl Reader {
             }
         }
         Ok(Some(counts))
+    }
+
+    /// The rows of one text part that hold `sequence`'s pieces in order, or with `negated` the rows
+    /// that do not, answered on the compressed page without decompressing it. Nulls are in neither.
+    /// `None` for a part that is not compressed text, which the caller reads the usual way.
+    ///
+    /// For a scan whose filter is the only thing that reads the column, which then never has the
+    /// strings at all. In TPC-H q13 that is `o_comment NOT LIKE '%special%requests%'`, and
+    /// decompressing the comments and searching them was most of the orders scan.
+    ///
+    /// # Errors
+    ///
+    /// If a part, column, page, or checksum is invalid.
+    pub fn rows_holding(
+        &self,
+        part: usize,
+        column: usize,
+        sequence: &Sequence,
+        negated: bool,
+    ) -> Result<Option<Vec<u32>>> {
+        let place = *self.places.get(part).ok_or_else(|| invalid("part index out of range"))?;
+        let field =
+            self.table.fields.get(column).ok_or_else(|| invalid("column index out of range"))?;
+        if field.ty != LogicalType::Varchar {
+            return Ok(None);
+        }
+        let rows = place.rows as usize;
+        self.with_part(place, column, |bytes| {
+            if bytes.first() != Some(&6) {
+                return Ok(None);
+            }
+            let mut cur = Cursor::new(bytes);
+            cur.u8()?;
+            let mask = match cur.u8()? {
+                0 => None,
+                1 => return Ok(Some(Vec::new())),
+                2 => {
+                    let from = cur.at;
+                    cur.take(rows.div_ceil(8))?;
+                    Some(&bytes[from..cur.at])
+                }
+                _ => return Err(invalid("page validity tag differs")),
+            };
+            let Some(held) = string::holds_in(&bytes[cur.at..], sequence)? else {
+                return Ok(None);
+            };
+            if held.len() != rows {
+                return Err(invalid("compressed text page holds the wrong number of rows"));
+            }
+            let valid = |row: usize| mask.is_none_or(|mask| mask[row / 8] >> (row % 8) & 1 == 1);
+            Ok(Some(
+                (0..rows)
+                    .filter(|&row| held[row] != negated && valid(row))
+                    .map(|row| row as u32)
+                    .collect(),
+            ))
+        })
+    }
+
+    /// Runs `read` over the stored bytes of one column of one part, out of the stripe's page when
+    /// it is held and read off the file on their own when it is not.
+    fn with_part<T>(
+        &self,
+        place: Place,
+        column: usize,
+        read: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let stripe_index = place.stripe as usize;
+        let stripe = self
+            .table
+            .stripes
+            .get(stripe_index)
+            .ok_or_else(|| invalid("stripe index out of range"))?;
+        let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
+        let held = self.held(stripe_index, stripe, column, true)?;
+        let span = *held
+            .index
+            .get(place.part as usize)
+            .ok_or_else(|| invalid("part index out of range"))?;
+        match &held.page {
+            Some(page) => read(page.part(place.part as usize, span)?),
+            None => {
+                let offset = page
+                    .offset
+                    .checked_add(span.start as u64)
+                    .ok_or_else(|| invalid("part range overflow"))?;
+                let mut bytes = vec![0; span.length];
+                read_at(&self.file, offset, &mut bytes)?;
+                verify_part(&bytes, span)?;
+                read(&bytes)
+            }
+        }
     }
 
     /// Reads named columns from one part, only at the rows `positions` names.
