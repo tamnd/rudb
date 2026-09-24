@@ -6065,6 +6065,7 @@ fn dense_partition(
     // and zero and then read back to find those rows in.
     let mut groups: Vec<(u32, i64)> = if rows.saturating_mul(SPARSE_DENSE) < width {
         let mut sorted: Vec<u32> =
+            // flatten: the codes arrive as blocks of slices, and sorting them needs one buffer.
             partition.runs.iter().flat_map(Blocks::slices).flatten().copied().collect();
         sorted.sort_unstable();
         sorted.chunk_by(|left, right| left == right).map(|run| (run[0], run.len() as i64)).collect()
