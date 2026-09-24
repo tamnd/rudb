@@ -1003,6 +1003,20 @@ pub fn finish_run(
     Ok(Some(vector.with_validity(Validity::from_run(&valid))))
 }
 
+/// A column of whole answers, one a group, as [`finish_run`] writes one for a total or a count,
+/// with a null where `valid` is false.
+///
+/// For a caller that added its groups up itself rather than keeping an accumulator for each, so
+/// that an answer that does not fit the declared type raises the error it would have raised there.
+///
+/// # Errors
+///
+/// If an answer does not fit in `ty`, or `ty` is not a whole number.
+pub fn whole_answers(answers: &[i128], valid: &[bool], ty: &LogicalType) -> Result<Vector> {
+    let data = narrow(answers, valid, ty)?;
+    Ok(Vector::flat(ty.clone(), data)?.with_validity(Validity::from_run(valid)))
+}
+
 /// A run of whole answers as the layout `ty` stores, which is the check [`fit`] makes per value.
 ///
 /// A null row carries a zero in the run and is skipped by the range check, because a value that is
