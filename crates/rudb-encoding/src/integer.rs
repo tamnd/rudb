@@ -185,6 +185,66 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
     Ok(values)
 }
 
+/// Decodes one encoded chunk straight into the integer type a column is declared at.
+///
+/// The same values [`decode`] gives, without the `i64` in between. A reader that wants a `SMALLINT`
+/// column used to fill eight bytes a row with zeros, write every value into them, and then copy the
+/// lot into two bytes a row, which on ClickBench Q1 was a fifth of the query. Constant, packed,
+/// sparse and run length chunks are written in the target type directly. The other kinds decode as
+/// before and are narrowed after, since they are rare at the top of a column.
+///
+/// # Errors
+///
+/// As [`decode`], or if a value does not fit in `T`, which is a chunk that disagrees with the type
+/// it was written for.
+pub fn decode_as<T: Lane>(bytes: &[u8]) -> Result<Vec<T>> {
+    let mut reader = Reader::new(bytes);
+    let values = with_decoding(|scratch| decode_chunk_as(&mut reader, scratch))?;
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a chunk",
+            reader.remaining()
+        )));
+    }
+    Ok(values)
+}
+
+/// An integer type a chunk can be decoded straight into. See [`decode_as`].
+pub trait Lane: Copy + Default {
+    /// The value in this type, or `None` when it does not fit.
+    fn fit(value: i64) -> Option<Self>;
+
+    /// The value in this type, for a value already known to fit.
+    fn wrap(value: i64) -> Self;
+}
+
+macro_rules! lanes {
+    ($($ty:ty),* $(,)?) => {$(
+        impl Lane for $ty {
+            fn fit(value: i64) -> Option<Self> {
+                Self::try_from(value).ok()
+            }
+
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::unnecessary_cast,
+                reason = "only called on a value the caller has checked fits"
+            )]
+            fn wrap(value: i64) -> Self {
+                value as Self
+            }
+        }
+    )*};
+}
+
+lanes!(i8, u8, i16, u16, i32, u32, i64, u64);
+
+/// One value in the type the chunk is being decoded into, or the error for a value that is not.
+fn lane<T: Lane>(value: i64) -> Result<T> {
+    T::fit(value).ok_or_else(|| Error::internal(format!("{value} is outside the chunk's type")))
+}
+
 /// Counts values in one encoded chunk without expanding sparse or run-length chunks into rows.
 ///
 /// The result is computed from the encoded row values when called. It is not a stored histogram.
@@ -956,6 +1016,131 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
                 values.push(value_from(step.wrapping_mul(stride), base));
             }
             Ok(values)
+        }
+    }
+}
+
+/// [`decode_chunk`] into `T`. See [`decode_as`].
+fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<T>> {
+    let Some(&tag) = reader.rest().first() else {
+        return Err(Error::internal("a chunk ended before its encoding tag"));
+    };
+    if !matches!(Kind::from_tag(tag)?, Kind::Constant | Kind::Packed | Kind::Sparse | Kind::Rle) {
+        return decode_chunk(reader, scratch)?.into_iter().map(lane).collect();
+    }
+    let kind = Kind::from_tag(reader.u8()?)?;
+    let count = reader.u32()? as usize;
+    match kind {
+        Kind::Constant => Ok(vec![lane(reader.i64()?)?; count]),
+        Kind::Packed => {
+            let mut values = vec![T::default(); count];
+            scratch.ready();
+            let mut wide = [0i64; VALUES];
+            let mut done = 0;
+            while done < count {
+                let base = reader.i64()?;
+                let width = reader.u8()? as usize;
+                let wanted = (count - done).min(VALUES);
+                let into = &mut values[done..done + wanted];
+                let bytes = if wanted == VALUES {
+                    let words = bitpack::packed_len::<u64>(width);
+                    for word in &mut scratch.packed[..words] {
+                        *word = reader.u64()?;
+                    }
+                    None
+                } else {
+                    Some(reader.bytes(bitpack::tail_len(wanted, width))?)
+                };
+                // Every value of a block is between its base and the base plus the widest offset its
+                // width holds, so when both ends fit the whole block does and the unpack writes the
+                // target type with no check a value. A block that could hold more than the type,
+                // which a width rounded up past the range can, is unpacked wide and checked.
+                let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+                let top = i64::try_from(i128::from(base) + i128::from(mask)).ok();
+                if T::fit(base).is_some() && top.and_then(T::fit).is_some() {
+                    let map = |offset| T::wrap(value_from(offset, base));
+                    match bytes {
+                        None => {
+                            let words = bitpack::packed_len::<u64>(width);
+                            bitpack::unpack_mapped(&scratch.packed[..words], width, into, map)?;
+                        }
+                        Some(bytes) => bitpack::unpack_tail_into(bytes, width, into, map)?,
+                    }
+                } else {
+                    let wide = &mut wide[..wanted];
+                    let map = |offset| value_from(offset, base);
+                    match bytes {
+                        None => {
+                            let words = bitpack::packed_len::<u64>(width);
+                            bitpack::unpack_mapped(&scratch.packed[..words], width, wide, map)?;
+                        }
+                        Some(bytes) => bitpack::unpack_tail_into(bytes, width, wide, map)?,
+                    }
+                    for (value, &held) in into.iter_mut().zip(wide.iter()) {
+                        *value = lane(held)?;
+                    }
+                }
+                done += wanted;
+            }
+            Ok(values)
+        }
+        Kind::Rle => {
+            let run_values = decode_chunk(reader, scratch)?;
+            let run_lengths = decode_chunk(reader, scratch)?;
+            if run_values.len() != run_lengths.len() {
+                return Err(Error::internal("an RLE chunk has more runs than run lengths"));
+            }
+            // The two shapes [`decode_chunk`] has, for the reasons it gives.
+            let long = run_values.len().saturating_mul(LONG_RUN) <= count;
+            let mut values =
+                if long { Vec::with_capacity(count) } else { vec![T::default(); count + RUN] };
+            let mut at = 0usize;
+            for (value, length) in run_values.into_iter().zip(run_lengths) {
+                let value = lane::<T>(value)?;
+                let length = usize::try_from(length)
+                    .map_err(|_| Error::internal("a negative RLE run length"))?;
+                let end = at
+                    .checked_add(length)
+                    .filter(|end| *end <= count)
+                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
+                if long {
+                    values.resize(end, value);
+                } else {
+                    let short =
+                        if length <= RUN { values[at..].first_chunk_mut::<RUN>() } else { None };
+                    match short {
+                        Some(window) => window.fill(value),
+                        None => values[at..end].fill(value),
+                    }
+                }
+                at = end;
+            }
+            check_count(at, count)?;
+            values.truncate(count);
+            Ok(values)
+        }
+        Kind::Sparse => {
+            let value = lane::<T>(reader.i64()?)?;
+            let exception_count = reader.u32()? as usize;
+            let positions = decode_chunk(reader, scratch)?;
+            let exceptions = decode_chunk(reader, scratch)?;
+            if positions.len() != exception_count || exceptions.len() != exception_count {
+                return Err(Error::internal("a sparse chunk disagrees about its exception count"));
+            }
+            let mut values = vec![value; count];
+            for (position, exception) in positions.into_iter().zip(exceptions) {
+                let position = usize::try_from(position)
+                    .ok()
+                    .filter(|position| *position < count)
+                    .ok_or_else(|| {
+                        Error::internal(format!("exception at {position} is outside the chunk"))
+                    })?;
+                values[position] = lane(exception)?;
+            }
+            Ok(values)
+        }
+        Kind::Delta | Kind::Dict | Kind::Strided => {
+            Err(Error::internal("a chunk kind that decodes wide reached the narrow decoder"))
         }
     }
 }
@@ -2170,5 +2355,82 @@ mod tests {
         for len in 0..bytes.len() {
             assert!(decode_prefix(&bytes[..len]).is_err(), "{len} bytes decoded");
         }
+    }
+
+    /// Every kind decodes into a narrow type as the same values [`decode`] gives, whichever kind
+    /// the chunk is at the top.
+    #[test]
+    fn decoding_into_a_narrow_type_agrees_with_the_wide_decoder() {
+        let columns: Vec<Vec<i64>> = vec![
+            vec![7; 3000],
+            (0..3000).map(|i| (i * 37) % 200 - 100).collect(),
+            (0..3000).map(|i| if i % 97 == 0 { i % 50 } else { 0 }).collect(),
+            (0..3000).map(|i| i / 250).collect(),
+            (0..3000).map(|i| i * 3 + 11).collect(),
+            (0..3000).map(|i| [5, -9, 120][i as usize % 3]).collect(),
+        ];
+        let kinds = [
+            Kind::Constant,
+            Kind::Packed,
+            Kind::Delta,
+            Kind::Rle,
+            Kind::Dict,
+            Kind::Sparse,
+            Kind::Strided,
+        ];
+        for values in &columns {
+            for kind in kinds {
+                let Some(bytes) = encode_only(kind, values).unwrap() else { continue };
+                let wide = decode(&bytes).unwrap();
+                let as_i16: Vec<i64> =
+                    decode_as::<i16>(&bytes).unwrap().into_iter().map(i64::from).collect();
+                let as_i32: Vec<i64> =
+                    decode_as::<i32>(&bytes).unwrap().into_iter().map(i64::from).collect();
+                assert_eq!(as_i16, wide, "{kind:?} as i16");
+                assert_eq!(as_i32, wide, "{kind:?} as i32");
+                assert_eq!(decode_as::<i64>(&bytes).unwrap(), wide, "{kind:?} as i64");
+            }
+            let chosen = encode(values).unwrap();
+            let narrow: Vec<i64> =
+                decode_as::<i16>(&chosen).unwrap().into_iter().map(i64::from).collect();
+            assert_eq!(narrow, decode(&chosen).unwrap(), "the chosen cascade as i16");
+        }
+    }
+
+    /// A value is refused exactly where `TryFrom` refuses it, at both edges of every type.
+    #[test]
+    fn decoding_into_a_narrow_type_takes_what_fits_and_refuses_what_does_not() {
+        fn check<T: Lane + TryFrom<i64> + PartialEq + std::fmt::Debug>(edges: [i64; 2]) {
+            for edge in edges {
+                for value in [edge - 1, edge, edge + 1] {
+                    for kind in [Kind::Constant, Kind::Packed, Kind::Rle, Kind::Sparse] {
+                        let values = [value, value, edges[0].max(0).min(edges[1]), value];
+                        let Some(bytes) = encode_only(kind, &values).unwrap() else { continue };
+                        let fits = values.iter().all(|&value| T::try_from(value).is_ok());
+                        assert_eq!(decode_as::<T>(&bytes).is_ok(), fits, "{value} {kind:?}");
+                    }
+                }
+            }
+        }
+        check::<i8>([-128, 127]);
+        check::<u8>([0, 255]);
+        check::<i16>([-32_768, 32_767]);
+        check::<u16>([0, 65_535]);
+        check::<i32>([i64::from(i32::MIN), i64::from(i32::MAX)]);
+        check::<u32>([0, i64::from(u32::MAX)]);
+    }
+
+    /// A packed block whose width reaches past the type while every value in it still fits, which
+    /// is the block that has to be checked a value at a time rather than by its two ends.
+    #[test]
+    fn a_packed_block_wider_than_its_type_still_decodes_when_its_values_fit() {
+        let values: Vec<i64> = (0..1500).map(|i| if i % 2 == 0 { -5 } else { 32_767 }).collect();
+        let bytes = encode_only(Kind::Packed, &values).unwrap().expect("packing always applies");
+        let narrow: Vec<i64> =
+            decode_as::<i16>(&bytes).unwrap().into_iter().map(i64::from).collect();
+        assert_eq!(narrow, values);
+        let over: Vec<i64> = values.iter().map(|&value| value + 1).collect();
+        let bytes = encode_only(Kind::Packed, &over).unwrap().expect("packing always applies");
+        assert!(decode_as::<i16>(&bytes).is_err(), "32768 is not an i16");
     }
 }
