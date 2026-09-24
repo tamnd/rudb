@@ -811,7 +811,8 @@ fn when(ast: &Ast, operand: ExprRef, arm: &CaseArm) -> String {
 /// This walks the text rather than going through the type system, because the type system throws
 /// away what has to survive here. `DECIMAL(5)` and `DECIMAL` both become a width and a scale, and
 /// `VARCHAR(10)` becomes `VARCHAR`, but upstream prints back the length that was written.
-fn typename(text: &str) -> String {
+#[must_use]
+pub fn typename(text: &str) -> String {
     let text = text.trim();
     // A trailing `[]` or `[3]` is a list or an array of whatever is in front of it, and the element
     // is resolved the same way: `int[]` is `INTEGER[]` while `int4[]` stays `int4[]`.
@@ -819,6 +820,10 @@ fn typename(text: &str) -> String {
         return typename(&text[..open]) + &text[open..];
     }
     let (base, arguments) = arguments(text);
+    // `ENUM('a','b')` is written back with a space after each comma, whatever it was written with.
+    if let ("ENUM", Some(inside)) = (base.to_ascii_uppercase().as_str(), arguments) {
+        return format!("ENUM({})", pieces(inside).join(", "));
+    }
     let Some(name) = standard(base) else {
         let base = unquote(base);
         return match arguments {
@@ -902,13 +907,16 @@ fn arguments(text: &str) -> (&str, Option<&str>) {
 /// The entries of an argument list, split on the commas that are not inside anything.
 fn pieces(inside: &str) -> Vec<&str> {
     let mut found = Vec::new();
-    let (mut depth, mut quoted, mut start) = (0usize, false, 0usize);
+    let (mut depth, mut quoted, mut text, mut start) = (0usize, false, false, 0usize);
     for (at, byte) in inside.bytes().enumerate() {
         match byte {
-            b'"' => quoted = !quoted,
-            b'(' | b'[' if !quoted => depth += 1,
-            b')' | b']' if !quoted => depth = depth.saturating_sub(1),
-            b',' if !quoted && depth == 0 => {
+            b'"' if !text => quoted = !quoted,
+            // An enum label is a string, and a comma inside one is part of the label.
+            b'\'' if !quoted => text = !text,
+            _ if quoted || text => {}
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
                 found.push(inside[start..at].trim());
                 start = at + 1;
             }

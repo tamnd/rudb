@@ -1028,6 +1028,22 @@ pub fn part_type(spelling: &str) -> LogicalType {
 /// number where the function needs one, or if the arguments have no type in common. The messages
 /// are DuckDB's, since a great deal of code in the wild asserts on them.
 pub fn resolve(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
+    // An `ENUM` goes wherever a string does, which is how `upper(mood)` binds on the pin. It is
+    // tried as itself first so that a function that takes anything keeps the enum, and the failure
+    // that is reported is the one about the types that were written.
+    match resolved(name, arguments) {
+        Err(error) if arguments.iter().any(|ty| ty.labels().is_some()) => {
+            let texts: Vec<LogicalType> = arguments
+                .iter()
+                .map(|ty| if ty.labels().is_some() { LogicalType::Varchar } else { ty.clone() })
+                .collect();
+            resolved(name, &texts).map_err(|_| error)
+        }
+        answer => answer,
+    }
+}
+
+fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
     let entry = find(name).ok_or_else(|| {
         Error::catalog(format!("Scalar Function with name {name} does not exist!"))
     })?;

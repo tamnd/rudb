@@ -102,6 +102,11 @@ pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
                 return Ok(None);
             }
             let Some(values) = values_of(plan, args)? else { return Ok(None) };
+            // The one call the values alone cannot answer, since a value of an enum is its string
+            // and the position is in the type.
+            if let ("enum_code", [only], [arg]) = (name, values.as_slice(), plan.expr_list(args)) {
+                return rudb_vector::enum_position(plan.expr_type(*arg), only).map(Some);
+            }
             // No expression to name, because there is no expression to keep. A caller that wanted
             // the expression rather than the error is throwing the error away anyway, and the one
             // that wanted the value reports what was written around it instead.

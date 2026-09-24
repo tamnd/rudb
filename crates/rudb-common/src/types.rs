@@ -10,6 +10,7 @@
 //! INT4)` is a thing people write.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
@@ -129,6 +130,12 @@ pub enum LogicalType {
     Map(Box<LogicalType>, Box<LogicalType>),
     /// `UNION(tag type, ...)`.
     Union(Vec<Field>),
+    /// `ENUM('a', 'b', ...)`, a value out of a fixed list of strings.
+    ///
+    /// Stored as the position of the string in the list, in the narrowest unsigned integer that
+    /// holds every position, which is why it sorts in the order the list was written and not in the
+    /// order of the strings. The list is shared, since every vector of the type carries it.
+    Enum(Arc<[String]>),
 }
 
 /// How a value is actually laid out in a vector.
@@ -282,6 +289,11 @@ impl LogicalType {
             Self::List(_) | Self::Map(_, _) => PhysicalType::List,
             Self::Array(_, _) => PhysicalType::Array,
             Self::Struct(_) | Self::Union(_) => PhysicalType::Struct,
+            Self::Enum(labels) => match labels.len() {
+                0..=0xff => PhysicalType::UInt8,
+                0x100..=0xffff => PhysicalType::UInt16,
+                _ => PhysicalType::UInt32,
+            },
         }
     }
 
@@ -309,6 +321,11 @@ impl LogicalType {
             Self::UInteger => "UINT32",
             Self::UBigInt => "UINT64",
             Self::UHugeInt => "UINT128",
+            Self::Enum(_) => match self.physical() {
+                PhysicalType::UInt8 => "UINT8",
+                PhysicalType::UInt16 => "UINT16",
+                _ => "UINT32",
+            },
             other => return other.to_string(),
         };
         name.to_string()
@@ -489,6 +506,11 @@ impl LogicalType {
                     _ => None,
                 }
             }
+            // Two different enums, or an enum and a string, meet as strings, which is how the pin
+            // compares them: by what they say rather than by where they sit in their lists.
+            (Self::Enum(_), Self::Enum(_) | Self::Varchar) | (Self::Varchar, Self::Enum(_)) => {
+                Some(Self::Varchar)
+            }
             _ => None,
         }
     }
@@ -503,6 +525,32 @@ impl LogicalType {
                 fields.iter().map(|f| f.ty.clone()).collect()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// An `ENUM` of these strings, in this order.
+    ///
+    /// # Errors
+    ///
+    /// If a string is there twice, since then a string would have two positions.
+    pub fn enumeration(labels: Vec<String>) -> Result<Self> {
+        let mut seen = std::collections::HashSet::with_capacity(labels.len());
+        for label in &labels {
+            if !seen.insert(label.as_str()) {
+                return Err(Error::invalid_input(format!(
+                    "Attempted to create ENUM type with duplicate value {label}"
+                )));
+            }
+        }
+        Ok(Self::Enum(labels.into()))
+    }
+
+    /// The strings of an `ENUM`, in order, and `None` for any other type.
+    #[must_use]
+    pub fn labels(&self) -> Option<&[String]> {
+        match self {
+            Self::Enum(labels) => Some(labels),
+            _ => None,
         }
     }
 
@@ -587,6 +635,16 @@ impl fmt::Display for LogicalType {
             }
             Self::Struct(fields) => write_fields(f, "STRUCT", fields),
             Self::Union(fields) => write_fields(f, "UNION", fields),
+            Self::Enum(labels) => {
+                f.write_str("ENUM(")?;
+                for (index, label) in labels.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "'{}'", label.replace('\'', "''"))?;
+                }
+                f.write_str(")")
+            }
         }
     }
 }
@@ -778,6 +836,8 @@ fn write_identifier(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
 enum Token {
     Word(String),
     Quoted(String),
+    /// A string in single quotes, which only an `ENUM` has.
+    Text(String),
     Number(u32),
     LeftParen,
     RightParen,
@@ -840,6 +900,28 @@ fn lex(text: &str) -> Result<Vec<Token>> {
                     name.push(c);
                 }
                 tokens.push(Token::Quoted(name));
+            }
+            '\'' => {
+                let mut label = String::new();
+                i += 1;
+                loop {
+                    let Some(&c) = chars.get(i) else {
+                        return Err(Error::parser(format!(
+                            "Type \"{text}\" has an unterminated string"
+                        )));
+                    };
+                    i += 1;
+                    if c == '\'' {
+                        if chars.get(i) == Some(&'\'') {
+                            label.push('\'');
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    label.push(c);
+                }
+                tokens.push(Token::Text(label));
             }
             c if c.is_ascii_digit() => {
                 let start = i;
@@ -938,6 +1020,7 @@ impl TypeParser<'_> {
         match upper.as_str() {
             "STRUCT" | "ROW" => return self.parse_fields().map(LogicalType::Struct),
             "UNION" => return self.parse_fields().map(LogicalType::Union),
+            "ENUM" if self.peek() == Some(&Token::LeftParen) => return self.parse_labels(),
             // An unnamed struct prints as a tuple of its types, and the plan text reads it back.
             "TUPLE" => {
                 expect(self.eat(&Token::LeftParen), "(")?;
@@ -1003,6 +1086,51 @@ impl TypeParser<'_> {
             return Ok(ty);
         }
         (self.resolve)(std::slice::from_ref(&word)).ok_or_else(|| missing_type(&word))
+    }
+
+    /// The strings of an `ENUM`, after its name.
+    ///
+    /// Each one has to be a string, none of them may be `NULL` and no two may be the same, and the
+    /// messages for those are the pin's. The pin says which parameter was the null counting from
+    /// one, and names the types of all of them when one is not a string.
+    fn parse_labels(&mut self) -> Result<LogicalType> {
+        expect(self.eat(&Token::LeftParen), "(")?;
+        let mut labels: Vec<String> = Vec::new();
+        let mut kinds = Vec::new();
+        let mut null = None;
+        if !self.eat(&Token::RightParen) {
+            loop {
+                match self.peek().cloned() {
+                    Some(Token::Text(label)) => {
+                        kinds.push("VARCHAR");
+                        labels.push(label);
+                    }
+                    Some(Token::Number(_)) => kinds.push("INTEGER"),
+                    Some(Token::Word(word)) if word.eq_ignore_ascii_case("NULL") => {
+                        null.get_or_insert(kinds.len() + 1);
+                        kinds.push("\"NULL\"");
+                    }
+                    _ => return Err(Error::parser("Expected a string in ENUM".to_string())),
+                }
+                self.position += 1;
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            expect(self.eat(&Token::RightParen), ")")?;
+        }
+        if let Some(at) = null {
+            return Err(Error::binder(format!(
+                "Type parameter {at} for type \"ENUM\" cannot be NULL"
+            )));
+        }
+        if kinds.iter().any(|kind| *kind != "VARCHAR") {
+            return Err(Error::binder(format!(
+                "Type \"ENUM\" does not accept type parameters ({})\n\tCandidate definitions:\n\tENUM(VARCHAR...)",
+                kinds.join(", ")
+            )));
+        }
+        LogicalType::enumeration(labels)
     }
 
     /// `schema.name` or `catalog.schema.name`, which can only be a type `CREATE TYPE` made.

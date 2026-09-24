@@ -909,7 +909,8 @@ impl Vector {
         }
         let mut data = empty_data_for(&ty)?;
         for value in values {
-            push_value(&mut data, value)?;
+            let value = stored(&ty, value)?;
+            push_value(&mut data, &value)?;
         }
         let validity = Validity::from_iter(values.len(), |index| !values[index].is_null());
         Ok(Self { ty, len: values.len(), validity, body: Body::Flat(data) })
@@ -2149,6 +2150,27 @@ impl Vector {
             Body::Sequence { start, step } => Some((start, step)),
             _ => None,
         }
+    }
+
+    /// The positions of an `ENUM` vector, as the unsigned integers they are held in.
+    ///
+    /// What `enum_code` answers, and what an `ENUM` is ordered by. A flat vector hands its run over
+    /// as it is under the new type, and any other form is flattened first, since a dictionary or a
+    /// gather over one would read its values back out as strings.
+    ///
+    /// # Errors
+    ///
+    /// If this is not an `ENUM` vector, or a constant holds a string that is not one of the list.
+    pub fn enum_codes(&self) -> Result<Self> {
+        if self.ty.labels().is_none() {
+            return Err(Error::internal(format!("enum_code over a {} vector", self.ty)));
+        }
+        let ty = enum_code_type(&self.ty);
+        if let Body::Constant(value) = &self.body {
+            return Ok(Self::constant(ty, enum_position(&self.ty, value)?, self.len));
+        }
+        let flat = self.flatten()?;
+        Ok(Self { ty, ..flat })
     }
 
     /// The value at `index`, as a single value.
@@ -3496,8 +3518,9 @@ impl Vector {
                     return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), rows));
                 }
                 let mut data = empty_data_for(&self.ty)?;
+                let value = stored(&self.ty, value)?;
                 for &index in &at {
-                    push_value(&mut data, if index == NOWHERE { &Value::Null } else { value })?;
+                    push_value(&mut data, if index == NOWHERE { &Value::Null } else { &value })?;
                 }
                 Body::Flat(data)
             }
@@ -4738,6 +4761,9 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         LogicalType::Varchar | LogicalType::Blob | LogicalType::Bit => {
             data.bytes_at(index).map(|bytes| bytes_as(ty, bytes))
         }
+        LogicalType::Enum(labels) => unsigned()
+            .and_then(|code| labels.get(usize::try_from(code).ok()?))
+            .map(|label| Value::Varchar(label.clone())),
         LogicalType::Date => signed().and_then(|x| i32::try_from(x).ok()).map(Value::Date),
         LogicalType::Time => signed().and_then(|x| i64::try_from(x).ok()).map(Value::Time),
         LogicalType::TimeTz => signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimeTz),
@@ -4836,6 +4862,53 @@ pub(crate) fn data_for(ty: &LogicalType, rows: usize) -> Result<Data> {
     }
     crate::for_each_layout!(fixed, reserved);
     Ok(data)
+}
+
+/// A value the way a run of this type holds it.
+///
+/// Only an `ENUM` holds something other than the value itself. A value of one is its string,
+/// which is what a result reads out and what a test asserts on, and the run holds the position of
+/// the string in the list instead. Everything else comes back as it went in.
+fn stored<'v>(ty: &LogicalType, value: &'v Value) -> Result<Cow<'v, Value>> {
+    match (ty, value) {
+        (LogicalType::Enum(_), Value::Varchar(_)) => enum_position(ty, value).map(Cow::Owned),
+        _ => Ok(Cow::Borrowed(value)),
+    }
+}
+
+/// Where a value of an `ENUM` sits in its list, as the unsigned integer a run of the type holds,
+/// with a null staying null.
+///
+/// # Errors
+///
+/// If the type is not an `ENUM` or the value is not one of its strings.
+pub fn enum_position(ty: &LogicalType, value: &Value) -> Result<Value> {
+    let label = match (ty, value) {
+        (_, Value::Null) => return Ok(Value::Null),
+        (LogicalType::Enum(_), Value::Varchar(label)) => label,
+        _ => return Err(Error::internal(format!("{value:?} is not a value of {ty}"))),
+    };
+    let code = ty
+        .labels()
+        .and_then(|labels| labels.iter().position(|one| one == label))
+        .and_then(|code| u32::try_from(code).ok())
+        .ok_or_else(|| Error::internal(format!("{label:?} is not a value of {ty}")))?;
+    Ok(match enum_code_type(ty) {
+        LogicalType::UTinyInt => Value::UTinyInt(code as u8),
+        LogicalType::USmallInt => Value::USmallInt(code as u16),
+        _ => Value::UInteger(code),
+    })
+}
+
+/// The unsigned integer type the positions of an `ENUM` are held in, which is what `enum_code`
+/// answers with.
+#[must_use]
+pub fn enum_code_type(ty: &LogicalType) -> LogicalType {
+    match ty.physical() {
+        rudb_common::PhysicalType::UInt8 => LogicalType::UTinyInt,
+        rudb_common::PhysicalType::UInt16 => LogicalType::USmallInt,
+        _ => LogicalType::UInteger,
+    }
 }
 
 /// Appends one value to a run of data, or a zero of the right shape when it is null.

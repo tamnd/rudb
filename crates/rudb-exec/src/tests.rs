@@ -961,20 +961,20 @@ fn the_six_words_in_two_classes_at_once_get_a_row_each() {
 
 #[test]
 fn the_types_table_is_one_row_per_name_and_modifier_signature() {
-    // 93 rows over 73 names, which is the pinned binary's 104 over 83 less the eleven rows for the
-    // ten types rudb does not have. Every row that is here matches the pin in every column but the
+    // 94 rows over 74 names, which is the pinned binary's 104 over 83 less the ten rows for the nine
+    // types rudb does not have. Every row that is here matches the pin in every column but the
     // three sizes and the two catalog oids, which is checked by diffing the two tables rather than
     // in here, and what this holds is that the operator produces a row per signature rather than a
     // row per name.
     let rows = run("TableFunction duckdb_types args=[] #0 [type_name::VARCHAR, type_oid::BIGINT]");
-    assert_eq!(rows.len(), 93);
+    assert_eq!(rows.len(), 94);
     let mut names: Vec<&Value> = rows.iter().map(|row| &row[0]).collect();
     names.dedup();
-    assert_eq!(names.len(), 73);
-    // 32 oids over 93 rows, because a type has one oid and several names and the pin puts it on the
+    assert_eq!(names.len(), 74);
+    // 33 oids over 94 rows, because a type has one oid and several names and the pin puts it on the
     // alphabetically first name's bare row.
     let carried = rows.iter().filter(|row| row[1] != Value::Null).count();
-    assert_eq!(carried, 32);
+    assert_eq!(carried, 33);
 }
 
 #[test]
@@ -992,8 +992,8 @@ fn the_types_table_says_what_this_engine_stores_rather_than_what_the_pin_does() 
     assert_eq!(size("varchar"), Value::BigInt(16));
     assert_eq!(size("decimal"), Value::Null);
     assert_eq!(size("row"), Value::BigInt(0));
-    // Four types are in no category at all, which is not an oversight here, it is what the pin
-    // says, and the nine names they go by are these.
+    // Five types are in no category at all, which is not an oversight here, it is what the pin
+    // says, and the ten names they go by are these.
     let mut uncategorised: Vec<String> = rows
         .iter()
         .filter(|row| row[2] == Value::Null)
@@ -1005,7 +1005,18 @@ fn the_types_table_says_what_this_engine_stores_rather_than_what_the_pin_does() 
     uncategorised.dedup();
     assert_eq!(
         uncategorised,
-        ["binary", "bit", "bitstring", "blob", "bytea", "guid", "null", "uuid", "varbinary"]
+        [
+            "binary",
+            "bit",
+            "bitstring",
+            "blob",
+            "bytea",
+            "enum",
+            "guid",
+            "null",
+            "uuid",
+            "varbinary"
+        ]
     );
 }
 

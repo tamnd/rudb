@@ -2264,7 +2264,7 @@ fn a_null_map_is_a_value_now_rather_than_an_unwritten_vector() {
 #[test]
 fn the_types_table_answers_a_query_a_client_would_actually_write() {
     let db = database();
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_types()"), vec![vec![Value::BigInt(93)]]);
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_types()"), vec![vec![Value::BigInt(94)]]);
     // A client reading this table is asking whether the engine has a type, so the useful query is a
     // name lookup, and it has to work through the where clause rather than only over the whole
     // table.
@@ -10202,4 +10202,39 @@ fn create_type_names_a_type_and_drop_type_follows_the_pin() {
     assert!(error("DROP SCHEMA s").contains("type \"st\" depends on schema \"s\"."));
     db.execute("DROP TYPE myint CASCADE").unwrap();
     assert_eq!(values("SELECT type_name FROM duckdb_types() WHERE NOT internal"), ["st"]);
+}
+
+/// `CREATE TYPE ... AS ENUM` and the enum functions, per #468.
+///
+/// Every answer here is the pin's. The ones that matter are the ordering, which is by position in
+/// the label list and not by the text, and the comparison with a plain string, which is a string
+/// comparison because the pin promotes both sides to VARCHAR.
+#[test]
+fn enum_types_follow_the_pin() {
+    let db = database();
+    let text = |s: &str| Value::Varchar(s.to_string());
+    db.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')").unwrap();
+    db.execute("CREATE TABLE moods (m mood)").unwrap();
+    db.execute("INSERT INTO moods VALUES ('happy'), ('sad'), (NULL), ('ok')").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT m FROM moods ORDER BY m"),
+        vec![vec![text("sad")], vec![text("ok")], vec![text("happy")], vec![Value::Null]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT min(m), max(m), typeof(min(m)) FROM moods"),
+        vec![vec![text("sad"), text("happy"), text("ENUM('sad', 'ok', 'happy')")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT 'ok'::mood < 'happy'::mood, 'ok'::mood < 'happy'"),
+        vec![vec![Value::Boolean(true), Value::Boolean(false)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT enum_first(NULL::mood), enum_last(NULL::mood), enum_code('ok'::mood)"),
+        vec![vec![text("sad"), text("happy"), Value::UTinyInt(1)]]
+    );
+    assert_eq!(rows(&db, "SELECT upper(m) FROM moods WHERE m = 'ok'"), vec![vec![text("OK")]]);
+    let err = db.execute("SELECT 'awesome'::mood").unwrap_err().to_string();
+    assert!(err.contains("Could not convert string 'awesome' to UINT8"), "{err}");
+    let err = db.execute("CREATE TYPE dup AS ENUM ('a', 'a')").unwrap_err().to_string();
+    assert!(err.contains("duplicate value a"), "{err}");
 }
