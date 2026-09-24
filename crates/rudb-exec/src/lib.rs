@@ -88,6 +88,7 @@ mod devicecard;
 mod enginenames;
 mod entrynames;
 mod expr;
+mod extents;
 mod fetch;
 mod functionnames;
 mod fused;

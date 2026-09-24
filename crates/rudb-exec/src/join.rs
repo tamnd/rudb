@@ -96,6 +96,7 @@ use rudb_vector::{Chunk, Data, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
 use crate::expr::evaluate_all_in_time_zone;
+use crate::extents::{Extents, Spread};
 use crate::gather::{self, Gathering};
 use crate::lookup::{Lookup, MISS, NONE, Scratch};
 use crate::rows;
@@ -1763,6 +1764,13 @@ pub(crate) struct Marking<'a> {
     schema: Schema,
     /// One bit per gathered row, set where some driving row matched it.
     marked: Mutex<Vec<u64>>,
+    /// The one comparison left over after the equalities, when it is one [`Extents`] answers.
+    spread: Option<Spread>,
+    /// The smallest and the largest driving value per key, made on the first driving chunk.
+    ///
+    /// Nothing inside when the gathered column did not read as integers or the reservation said
+    /// no, and the join then answers the residual pair by pair as it would without this.
+    extents: OnceLock<Option<Extents>>,
     /// What the answer is charged, held for as long as it is readable.
     held: Mutex<Reservation>,
     out: Buffered,
@@ -1786,6 +1794,8 @@ pub(crate) struct Marks {
     /// Empty until the first chunk, because how many bits there are is how many rows the gathered
     /// side has and [`Sink::local`] cannot fail and so cannot read the table.
     bits: Vec<u64>,
+    /// The driving column [`Extents::widen`] reads, a chunk at a time.
+    block: Vec<i64>,
 }
 
 impl<'a> Marking<'a> {
@@ -1809,11 +1819,15 @@ impl<'a> Marking<'a> {
             return None;
         }
         let probe = Probe::new(plan, left, right, kind, conditions, cancel, memory)?;
+        let spread =
+            Spread::of(plan, &probe.equalities.residual, &probe.combined, probe.left_width);
         let out = Buffered::new();
         let marking = Self {
             probe,
             schema: right.schema.clone(),
             marked: Mutex::new(Vec::new()),
+            spread,
+            extents: OnceLock::new(),
             held: Mutex::new(memory.reservation()),
             out: out.clone(),
         };
@@ -1854,6 +1868,23 @@ impl<'a> Marking<'a> {
     pub(crate) fn sideways(&self) -> Vec<(ExprRef, ColumnBinding)> {
         self.probe.keyed_sideways()
     }
+
+    /// The ranges per key, made the first time a driving chunk asks, when this join has a spread.
+    ///
+    /// A reservation that says no is the same as a column that does not read as integers: the
+    /// join answers pair by pair, which costs time rather than memory.
+    fn extents(&self, built: &Built) -> Option<&Extents> {
+        let spread = self.spread?;
+        self.extents
+            .get_or_init(|| {
+                let column = built.rows.column(spread.gathered)?;
+                let extents = Extents::new(built.index.slot_count(), column)?;
+                let mut held = self.held.lock().ok()?;
+                held.grow(extents.footprint()).ok()?;
+                Some(extents)
+            })
+            .as_ref()
+    }
 }
 
 impl Sink for Marking<'_> {
@@ -1867,6 +1898,7 @@ impl Sink for Marking<'_> {
             chain: Vec::new(),
             cand: Candidates::default(),
             bits: Vec::new(),
+            block: Vec::new(),
         }
     }
 
@@ -1913,6 +1945,13 @@ impl Sink for Marking<'_> {
                 &mut local.scratch,
                 &mut local.slots,
             );
+        }
+        // The residual answered by two numbers per key rather than pair by pair, see [`Extents`].
+        if let Some(extents) = self.extents(&built) {
+            let column = chunk.column(self.spread.map_or(0, |spread| spread.driving))?;
+            if extents.widen(column, &local.slots, &mut local.block)? {
+                return Ok(Progress::More);
+            }
         }
         // What a residual answered about the chunk before this one says nothing about this one,
         // and the row numbers it is held under would be read as if it did.
@@ -1965,7 +2004,11 @@ impl Sink for Marking<'_> {
     /// the promise [`Sink::parallel`] asks for.
     fn finalize(&self, threads: &Lease<'_>) -> Result<()> {
         let built = self.probe.built_with(threads)?;
-        let marked = std::mem::take(&mut *self.marked.lock().map_err(poisoned)?);
+        let mut marked = std::mem::take(&mut *self.marked.lock().map_err(poisoned)?);
+        if let (Some(spread), Some(Some(extents))) = (self.spread, self.extents.get()) {
+            marked.resize(built.rows.rows().div_ceil(u64::BITS as usize), 0);
+            extents.mark(spread, &built.index, &mut marked);
+        }
         // A semi join keeps the rows something matched and an anti join keeps the rest. That one
         // comparison is the whole difference between the two kinds here.
         let wanted = self.probe.kind == JoinKind::Semi;

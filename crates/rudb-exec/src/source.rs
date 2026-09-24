@@ -301,10 +301,6 @@ pub(crate) struct Scan<'a> {
     /// projection, which are read after the filters have run and only for the rows they kept. See
     /// [`Self::read_deferring`].
     deferred: Vec<usize>,
-    /// Every projected column the pushed filter does not read, by its place in the projection,
-    /// which are read that way instead once a join's bitmap or filter is measured keeping few rows.
-    /// See [`Paying::tight`].
-    deferrable: Vec<usize>,
     /// What the filters kept of the parts read that way, which stops the deferring once they are
     /// measured keeping most rows, since then the string columns are read nearly whole anyway and
     /// the second read is a cost with nothing to show for it.
@@ -331,10 +327,6 @@ pub(crate) struct Scan<'a> {
 
 /// How many rows go through the runtime filter before it has to justify itself.
 const WARMUP: usize = 1 << 16;
-
-/// How few rows in how many a join's filter has to keep before a scan reads its other columns only
-/// at the rows it kept, whatever their type. See [`Scan::read_deferring`].
-const TIGHT: usize = 16;
 
 /// Whether the runtime filter is worth the hash it costs, counted as the scan goes.
 ///
@@ -367,12 +359,6 @@ impl Paying {
     fn loose(&self) -> bool {
         let seen = self.seen.load(Ordering::Relaxed);
         seen >= WARMUP && self.kept.load(Ordering::Relaxed).saturating_mul(2) > seen
-    }
-
-    /// Whether the filter has been measured keeping under one row in [`TIGHT`].
-    fn tight(&self) -> bool {
-        let seen = self.seen.load(Ordering::Relaxed);
-        seen >= WARMUP && self.kept.load(Ordering::Relaxed).saturating_mul(TIGHT) < seen
     }
 
     /// Records what one chunk put through the filter and what came out.
@@ -878,10 +864,9 @@ impl<'a> Scan<'a> {
             });
         }
         let types = schema.types();
-        let deferrable: Vec<usize> =
-            (0..columns.len()).filter(|&at| columns[at].is_some() && !read[at]).collect();
-        let deferred =
-            deferrable.iter().copied().filter(|&at| types[at] == LogicalType::Varchar).collect();
+        let deferred = (0..columns.len())
+            .filter(|&at| columns[at].is_some() && !read[at] && types[at] == LogicalType::Varchar)
+            .collect();
         let unread = pushdown
             .as_ref()
             .and_then(|pushdown| read_above(plan, pushdown.node, &schema))
@@ -913,7 +898,6 @@ impl<'a> Scan<'a> {
             skipped: AtomicUsize::new(0),
             counters: None,
             deferred,
-            deferrable,
             deferring: Paying::default(),
             unread,
             paying: Paying::default(),
@@ -1220,32 +1204,21 @@ impl<'a> Scan<'a> {
     /// keeps nearly all of lineitem and reading the two flags a second time cost 7 percent. A graph
     /// reduction names rows by where they were read and a late LIKE has its own path, so those do
     /// not come here.
-    ///
-    /// Once a join's bitmap or filter is measured keeping under one row in [`TIGHT`], every column
-    /// neither it nor the pushed filter reads is put off the same way, integers included, since an
-    /// integer page unpacks at the rows asked for alone. In TPC-H q17 the bitmap over the parts of
-    /// one brand and container keeps about one `lineitem` row in a thousand, and decoding the
-    /// quantity and the price of the other nine hundred and ninety nine was a third of the query.
-    /// See `spec/perf/46-columns-at-the-kept-rows.md`.
     fn read_deferring(&self, at: usize, out: &mut Chunk) -> Result<bool> {
-        if !self.deferring.worth() || self.reduced(at).is_some() {
+        if self.deferred.is_empty() || !self.deferring.worth() || self.reduced(at).is_some() {
             return Ok(false);
         }
-        let own = self.sideways.iter().map(|sideways| (sideways, &self.paying));
-        let joins = own.chain(self.also.iter().map(|(sideways, paying)| (sideways, paying)));
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
         let mut keys = Vec::new();
-        let mut tight = false;
-        for (sideways, paying) in joins {
-            let before = keys.len();
+        for sideways in joins {
             keys.extend(sideways.domain(self.index).map(|(key, _)| key));
             keys.extend(sideways.sifting(self.index).map(|(key, _)| key));
-            tight |= keys.len() > before && paying.tight();
         }
-        let wide = if tight { &self.deferrable } else { &self.deferred };
-        if wide.is_empty() || (self.pushed.is_none() && keys.is_empty()) {
+        if self.pushed.is_none() && keys.is_empty() {
             return Ok(false);
         }
-        let deferred: Vec<usize> = wide.iter().copied().filter(|at| !keys.contains(at)).collect();
+        let deferred: Vec<usize> =
+            self.deferred.iter().copied().filter(|at| !keys.contains(at)).collect();
         let first: Vec<usize> = (0..self.columns.len())
             .filter(|at| !deferred.contains(at))
             .filter_map(|at| self.columns[at])
@@ -3773,7 +3746,6 @@ mod tests {
             skipped: AtomicUsize::new(0),
             counters: None,
             deferred: Vec::new(),
-            deferrable: Vec::new(),
             deferring: Paying::default(),
             unread: Vec::new(),
             paying: Paying::default(),

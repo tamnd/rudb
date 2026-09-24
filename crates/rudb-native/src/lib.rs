@@ -11960,17 +11960,6 @@ fn decode_at(
     if positions.last().is_some_and(|&last| last as usize >= rows) {
         return Err(invalid("a position is past the end of the part"));
     }
-    // Past about one row in eight, unpacking the whole part and picking the rows out is the cheaper
-    // of the two, since a unit unpacks at a fraction of what a row unpacked on its own costs.
-    if bytes.first() == Some(&5)
-        && positions.len().saturating_mul(8) <= rows
-        // Past the codec, the validity flag and the mask a flag of 2 has.
-        && bytes
-            .get(2 + if bytes.get(1) == Some(&2) { rows.div_ceil(8) } else { 0 }..)
-            .is_some_and(integer::pointed)
-    {
-        return cascade_at(ty, rows, bytes, positions);
-    }
     if bytes.first() != Some(&6) {
         return decode(ty, rows, bytes, global)?.gather(positions);
     }
@@ -11995,64 +11984,6 @@ fn decode_at(
     let mut values = StringColumn::over(Buffer::from_vec(payload).into_page());
     push_values(&mut values, ty, &ends)?;
     Ok(Vector::flat(ty.clone(), Data::Varlen(values))?.with_validity(validity))
-}
-
-/// The rows `positions` names of an integer cascade page, unpacked at those rows alone.
-///
-/// A scan whose join keeps a few rows in a thousand reads its other columns only at those rows, and
-/// decoding the whole part to pick them out afterwards was most of what it cost. In TPC-H q17 the
-/// bitmap over the parts of one brand and container keeps about one `lineitem` row in a thousand.
-fn cascade_at(ty: &LogicalType, rows: usize, bytes: &[u8], positions: &[u32]) -> Result<Vector> {
-    fn wanted<T: integer::Lane>(values: &[i64]) -> Result<Vec<T>> {
-        values
-            .iter()
-            .map(|&value| T::fit(value).ok_or_else(|| invalid("page value is not of its type")))
-            .collect()
-    }
-    let mut cur = Cursor::new(bytes);
-    cur.u8()?;
-    let validity = match cur.u8()? {
-        0 => Validity::AllValid,
-        1 => Validity::AllInvalid,
-        2 => {
-            let mask = cur.take(rows.div_ceil(8))?;
-            Validity::from_iter(positions.len(), |at| {
-                let row = positions[at] as usize;
-                mask[row / 8] >> (row % 8) & 1 == 1
-            })
-        }
-        _ => return Err(invalid("page validity tag differs")),
-    };
-    let at: Vec<usize> = positions.iter().map(|&row| row as usize).collect();
-    let values = integer::decode_selected(&bytes[cur.at..], &at)
-        .map_err(|error| invalid(&format!("page value is not of its type: {error}")))?;
-    if values.len() != positions.len() {
-        return Err(invalid("cascade page holds the wrong number of rows"));
-    }
-    let data = match ty {
-        LogicalType::TinyInt => Data::Int8(wanted::<i8>(&values)?.into()),
-        LogicalType::UTinyInt => Data::UInt8(wanted::<u8>(&values)?.into()),
-        LogicalType::SmallInt => Data::Int16(wanted::<i16>(&values)?.into()),
-        LogicalType::USmallInt => Data::UInt16(wanted::<u16>(&values)?.into()),
-        LogicalType::Integer | LogicalType::Date => Data::Int32(wanted::<i32>(&values)?.into()),
-        LogicalType::UInteger => Data::UInt32(wanted::<u32>(&values)?.into()),
-        LogicalType::BigInt
-        | LogicalType::Timestamp
-        | LogicalType::Time
-        | LogicalType::TimeTz
-        | LogicalType::TimestampTz
-        | LogicalType::TimestampS
-        | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => Data::Int64(values.into()),
-        LogicalType::Decimal { .. } => match ty.physical() {
-            PhysicalType::Int16 => Data::Int16(wanted::<i16>(&values)?.into()),
-            PhysicalType::Int32 => Data::Int32(wanted::<i32>(&values)?.into()),
-            PhysicalType::Int64 => Data::Int64(values.into()),
-            _ => return Err(invalid("cascade codec belongs to a decimal that is not an integer")),
-        },
-        _ => return Err(invalid("cascade codec belongs to a page that is not integers")),
-    };
-    Ok(Vector::flat(ty.clone(), data)?.with_validity(validity))
 }
 
 /// The values of a string or blob page, laid end to end in the page's payload from its start, each
