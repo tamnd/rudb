@@ -27,10 +27,11 @@
 //! padded rows go through the same loop as the matched ones.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_pipeline::Lease;
-use rudb_vector::{Assembly, Chunk, Form, Vector};
+use rudb_vector::{Assembly, Chunk, Form, Validity, Vector};
 
 use crate::pairs::in_parallel;
 
@@ -167,6 +168,9 @@ pub(crate) fn laid_out(
 ) -> Result<Vec<Vector>> {
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     let one = |index: usize| -> Result<Vector> {
+        if let Some(coded) = coded(chunks, index)? {
+            return Ok(coded);
+        }
         if let Some(laid) = end_to_end(&types[index], chunks, index)? {
             return Ok(laid);
         }
@@ -232,6 +236,50 @@ fn end_to_end(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option
     rudb_vector::concat(ty, &pieces)
 }
 
+/// One column of the chunks as codes into the one dictionary every piece of it shares, or `None`
+/// when the pieces do not all share one.
+///
+/// A column a native table keeps under a table wide dictionary is scanned as codes into it, and
+/// every chunk of the scan points at the same values. Flattening those here turned the codes back
+/// into strings, and everything above the join paid for the strings: on TPC-H q16 the grouping on
+/// `p_brand` and `p_type` hashed and compared their bytes for 118,000 rows, where two codes would
+/// have done. Laid end to end the codes are four bytes a row, a probe gathers them the way it
+/// gathers any dictionary and keeps them stable, and the grouping and the sort above take codes
+/// they already know how to read.
+fn coded(chunks: &[Chunk], index: usize) -> Result<Option<Vector>> {
+    let mut shared: Option<&Arc<Vector>> = None;
+    let mut rows = 0;
+    let mut nulls = false;
+    for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+        let column = chunk.column(index)?;
+        let Some((codes, values)) = column.stable_dictionary_parts() else { return Ok(None) };
+        if codes.len() != column.len() || shared.is_some_and(|held| !Arc::ptr_eq(held, values)) {
+            return Ok(None);
+        }
+        shared = Some(values);
+        rows += codes.len();
+        nulls |= column.validity().has_nulls(column.len());
+    }
+    let Some(values) = shared else { return Ok(None) };
+    let mut codes = Vec::with_capacity(rows);
+    let mut valid = Vec::with_capacity(if nulls { rows } else { 0 });
+    for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+        let column = chunk.column(index)?;
+        let Some((run, _)) = column.stable_dictionary_parts() else { return Ok(None) };
+        codes.extend_from_slice(run);
+        if nulls {
+            let validity = column.validity();
+            valid.extend((0..run.len()).map(|row| validity.is_valid(row)));
+        }
+    }
+    let vector = Vector::stable_dictionary(codes, Arc::clone(values))?;
+    Ok(Some(if nulls {
+        vector.with_validity(Validity::from_iter(rows, |row| valid[row]))
+    } else {
+        vector
+    }))
+}
+
 /// Whether a flat piece holds fewer values than it has rows, which is what an untyped null is.
 fn short(piece: &Vector) -> bool {
     piece.data().is_none_or(|data| data.len() != piece.len())
@@ -239,9 +287,11 @@ fn short(piece: &Vector) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rudb_common::{LogicalType, Value};
     use rudb_pipeline::Lease;
-    use rudb_vector::{Chunk, Data, Vector};
+    use rudb_vector::{Chunk, Data, Validity, Vector};
 
     use super::{Build, PAD};
 
@@ -306,6 +356,44 @@ mod tests {
         assert_eq!(gathered.len(), 2);
         assert_eq!(gathered[0].value_at(0), Value::Null);
         assert_eq!(gathered[1].value_at(1), Value::Null);
+    }
+
+    /// Codes into `values`, as a scan of a table wide dictionary hands them up, with the rows in
+    /// `nulls` null.
+    fn coded(codes: &[u32], values: &Arc<Vector>, nulls: &[usize]) -> Chunk {
+        let column = Vector::stable_dictionary(codes.to_vec(), Arc::clone(values))
+            .expect("codes inside the dictionary")
+            .with_validity(Validity::from_iter(codes.len(), |row| !nulls.contains(&row)));
+        Chunk::new(vec![column]).expect("one column")
+    }
+
+    fn words(words: &[&str]) -> Arc<Vector> {
+        let values: Vec<Value> = words.iter().map(|&word| Value::Varchar(word.into())).collect();
+        Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("strings"))
+    }
+
+    #[test]
+    fn codes_into_one_shared_dictionary_stay_codes_and_read_back_as_the_strings() {
+        let values = words(&["MEDIUM", "LARGE", "SMALL"]);
+        let chunks = [coded(&[2, 0], &values, &[]), coded(&[1, 1, 0], &values, &[1])];
+        let side = Build::new(&[LogicalType::Varchar], &chunks, &alone()).expect("two chunks");
+        let gathered = side.gather(&[4, PAD, 0, 3, 2]).expect("positions in range and a pad");
+        let (_, held) = gathered[0].stable_dictionary_parts().expect("still codes after a gather");
+        assert!(Arc::ptr_eq(held, &values), "the codes point somewhere else");
+        let read: Vec<Value> = (0..5).map(|row| gathered[0].value_at(row)).collect();
+        let text = |word: &str| Value::Varchar(word.into());
+        assert_eq!(read, [text("MEDIUM"), Value::Null, text("SMALL"), Value::Null, text("LARGE")]);
+    }
+
+    #[test]
+    fn codes_into_two_different_dictionaries_are_laid_out_as_strings() {
+        let (one, two) = (words(&["a", "b"]), words(&["b", "c"]));
+        let chunks = [coded(&[1], &one, &[]), coded(&[1, 0], &two, &[])];
+        let side = Build::new(&[LogicalType::Varchar], &chunks, &alone()).expect("two chunks");
+        let gathered = side.gather(&[0, 1, 2]).expect("three positions");
+        assert!(gathered[0].stable_dictionary_parts().is_none(), "codes of two code spaces mixed");
+        let read: Vec<Value> = (0..3).map(|row| gathered[0].value_at(row)).collect();
+        assert_eq!(read, ["b", "c", "b"].map(|word| Value::Varchar(word.into())));
     }
 
     #[test]
