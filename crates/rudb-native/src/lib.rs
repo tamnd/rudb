@@ -4033,7 +4033,44 @@ struct PartSpan {
 struct CachedColumn {
     stripe: usize,
     index: Arc<Vec<PartSpan>>,
-    page: Option<Arc<Vec<u8>>>,
+    page: Option<Arc<HeldPage>>,
+}
+
+/// One stripe's page of one column, with which of its parts have already matched their checksums.
+///
+/// The bytes never change once they are read, so a part that matched once matches for as long as
+/// the page is held. Hashing it again on every read was 3.5% of a `GROUP BY CounterID` over the
+/// held pages of the ClickBench sample, run seventy times in one process. A part read without its
+/// page is still checked every time, since those bytes come fresh off the file.
+#[derive(Debug)]
+struct HeldPage {
+    bytes: Vec<u8>,
+    checked: Vec<AtomicBool>,
+}
+
+impl HeldPage {
+    /// The bytes of part `part`, checked against `span` the first time anyone asks for them.
+    fn part(&self, part: usize, span: PartSpan) -> Result<&[u8]> {
+        let bytes = part_bytes(&self.bytes, span)?;
+        let checked = self.checked.get(part).ok_or_else(|| invalid("part index out of range"))?;
+        if !checked.load(Atomic::Relaxed) {
+            verify_part(bytes, span)?;
+            checked.store(true, Atomic::Relaxed);
+        }
+        Ok(bytes)
+    }
+}
+
+/// Checks one part's bytes against the hash its index carries for them.
+fn verify_part(bytes: &[u8], span: PartSpan) -> Result<()> {
+    let got = checksum(bytes);
+    if got != span.hash {
+        return Err(invalid(&format!(
+            "column page checksum differs, part at {}+{} bytes, wanted {:016x} and got {got:016x}",
+            span.start, span.length, span.hash,
+        )));
+    }
+    Ok(())
 }
 
 /// One column's stripes a reader holds, and which of them somebody is reading right now.
@@ -4065,7 +4102,7 @@ struct Cached {
 /// One page a reader holds, and whether anyone has read it since the pool last looked.
 #[derive(Debug, Clone)]
 struct Resident {
-    page: Arc<Vec<u8>>,
+    page: Arc<HeldPage>,
     used: Arc<AtomicBool>,
 }
 
@@ -5509,7 +5546,7 @@ fn remember(cached: &mut Cached, held: &CachedColumn) -> Option<(usize, Arc<Atom
     if slot.is_some() {
         return None;
     }
-    let bytes = page.len();
+    let bytes = page.bytes.len();
     // Set, so that the page a worker has just paid to read is not the one the pass it pays for
     // lets go of before the worker has read a part out of it.
     let used = Arc::new(AtomicBool::new(true));
@@ -6864,7 +6901,7 @@ impl Reader {
             .ok_or_else(|| invalid("part index out of range"))?;
         let owned;
         let bytes = match &held.page {
-            Some(page) => part_bytes(page, span)?,
+            Some(page) => page.part(place.part as usize, span)?,
             None => {
                 let offset = page
                     .offset
@@ -6872,13 +6909,11 @@ impl Reader {
                     .ok_or_else(|| invalid("part range overflow"))?;
                 let mut bytes = vec![0; span.length];
                 read_at(&self.file, offset, &mut bytes)?;
+                verify_part(&bytes, span)?;
                 owned = bytes;
                 &owned
             }
         };
-        if checksum(bytes) != span.hash {
-            return Err(invalid("integer part checksum differs"));
-        }
         if bytes.first() != Some(&5) || bytes.get(1) != Some(&0) {
             return Ok(None);
         }
@@ -7067,7 +7102,8 @@ impl Reader {
             let span = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
             let mut bytes = vec![0; span.length as usize];
             read_at(&self.file, span.offset, &mut bytes)?;
-            Some(Arc::new(bytes))
+            let checked = index.iter().map(|_| AtomicBool::new(false)).collect();
+            Some(Arc::new(HeldPage { bytes, checked }))
         } else {
             None
         };
@@ -7101,7 +7137,7 @@ impl Reader {
                 .ok_or_else(|| invalid("part index out of range"))?;
             let owned;
             let bytes = match &held.page {
-                Some(held) => part_bytes(held, span)?,
+                Some(held) => held.part(place.part as usize, span),
                 None => {
                     let offset = page
                         .offset
@@ -7110,21 +7146,17 @@ impl Reader {
                     let mut bytes = vec![0; span.length];
                     read_at(&self.file, offset, &mut bytes)?;
                     owned = bytes;
-                    &owned
+                    verify_part(&owned, span).map(|()| owned.as_slice())
                 }
-            };
-            if checksum(bytes) != span.hash {
-                return Err(invalid(&format!(
-                    "column page checksum differs, column {column} part {} at {}+{} of {} bytes, \
-                     wanted {:016x} and got {:016x}",
+            }
+            .map_err(|error| {
+                invalid(&format!(
+                    "{}, column {column} part {} of the page at {}",
+                    error.message(),
                     place.part,
                     page.offset,
-                    span.start,
-                    span.length,
-                    span.hash,
-                    checksum(bytes),
-                )));
-            }
+                ))
+            })?;
             let dictionary = self.dictionary(column)?;
             // Held as a page, because a column that came out of a file is handed out more than
             // once. A group by clones its key columns out of the chunk so the keys outlive it, a
