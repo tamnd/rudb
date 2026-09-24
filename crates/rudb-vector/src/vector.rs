@@ -2863,22 +2863,6 @@ impl Vector {
                 Err(_) => false,
             },
             Body::Dictionary { codes, values, .. } => {
-                // A selection over row numbers is a dictionary over a sequence as long as the part
-                // it came from, and working each code out is cheaper than laying all of those out.
-                if let Some((start, step)) = values.sequence_parts() {
-                    let Some(codes) = codes.get(..self.len) else {
-                        return false;
-                    };
-                    if codes.iter().any(|&code| code as usize >= values.len()) {
-                        return false;
-                    }
-                    out.extend(
-                        codes
-                            .iter()
-                            .map(|&code| start.wrapping_add(step.wrapping_mul(i64::from(code)))),
-                    );
-                    return true;
-                }
                 let mut entries = Vec::new();
                 if !values.none_null() || !values.signed_block(&mut entries) {
                     return false;
@@ -6251,17 +6235,6 @@ mod tests {
         assert!(out.is_empty());
         assert!(!Vector::sequence(100, 5, 4).signed_gather(&at, &mut out));
         assert!(integers(&[1]).signed_gather(&[], &mut out) && out.is_empty());
-    }
-
-    /// The rows a filter kept out of a part's row numbers are a dictionary over the numbers of the
-    /// whole part, and the block holds the numbers the codes pick without laying the rest out.
-    #[test]
-    fn a_block_of_picked_row_numbers_holds_the_numbers_picked() {
-        let mut out = Vec::new();
-        let picked =
-            Vector::dictionary(vec![0, 3, 3, 8191], Vector::sequence(100, 5, 8192)).unwrap();
-        assert!(picked.signed_block(&mut out));
-        assert_eq!(out, [100, 115, 115, 100 + 5 * 8191]);
     }
 
     /// What the block form will not answer for, where the caller reads the vector a row at a time

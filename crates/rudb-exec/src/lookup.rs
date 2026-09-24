@@ -453,6 +453,11 @@ impl Lookup {
         }
     }
 
+    /// How many slots a probe can hand out, which is one past the largest.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.head.len()
+    }
+
     /// Whether every key in the table holds exactly one gathered row.
     ///
     /// True of a join against a primary key, which is most of the large joins in TPC-H. Every chain

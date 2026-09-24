@@ -363,10 +363,6 @@ pub fn fold(bytes: &[u8], mut emit: impl FnMut(i64, u64) -> Result<()>) -> Resul
     Ok(count)
 }
 
-/// How few of a packed unit's values a selected decode has to want before it finds each one on its
-/// own rather than unpacking the unit, as one in this many.
-const SPARSE: usize = 32;
-
 /// Decodes selected row positions from a chunk written by [`encode`].
 ///
 /// Positions must be sorted and unique. Packed chunks read only the words holding those positions,
@@ -390,33 +386,6 @@ pub fn decode_selected(bytes: &[u8], positions: &[usize]) -> Result<Vec<i64>> {
         )));
     }
     Ok(values)
-}
-
-/// Whether [`decode_selected`] reads a few rows of this chunk for less than decoding all of it.
-///
-/// True for the kinds whose rows can be found without the rows before them: a constant, packed
-/// units, and strides or dictionary codes over packed units. A run length chunk walks every run to
-/// find where a row is, and a delta chunk adds up every delta before it, so for those a caller that
-/// wants a few rows does better decoding the chunk the usual way and picking them out.
-#[must_use]
-pub fn pointed(bytes: &[u8]) -> bool {
-    let simple = |bytes: &[u8]| {
-        bytes
-            .first()
-            .and_then(|&tag| Kind::from_tag(tag).ok())
-            .is_some_and(|kind| matches!(kind, Kind::Constant | Kind::Packed))
-    };
-    match bytes.first().and_then(|&tag| Kind::from_tag(tag).ok()) {
-        Some(Kind::Constant | Kind::Packed) => true,
-        // The tag, the count, the base and the stride come before the steps.
-        Some(Kind::Strided) => bytes.get(1 + 4 + 8 + 8..).is_some_and(simple),
-        // The dictionary is read whole whatever the rows, so only the codes need a point form.
-        Some(Kind::Dict) => {
-            let mut reader = Reader::new(bytes.get(1 + 4..).unwrap_or_default());
-            skip_chunk(&mut reader).is_ok() && simple(reader.rest())
-        }
-        _ => false,
-    }
 }
 
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
@@ -1185,7 +1154,7 @@ fn decode_selected_chunk(
         return Err(Error::internal("a chunk ended before its encoding tag"));
     };
     let kind = Kind::from_tag(tag)?;
-    if !matches!(kind, Kind::Constant | Kind::Packed | Kind::Rle | Kind::Strided | Kind::Dict) {
+    if !matches!(kind, Kind::Constant | Kind::Packed | Kind::Rle) {
         let values = decode_chunk(reader, scratch)?;
         return positions
             .iter()
@@ -1223,20 +1192,7 @@ fn decode_selected_chunk(
                 let width = reader.u8()? as usize;
                 let wanted = (count - done).min(VALUES);
                 let upto = positions.partition_point(|&position| position < done + wanted);
-                if wanted == VALUES && (upto - from) * SPARSE > VALUES {
-                    // Enough of the unit is wanted that unpacking all of it is cheaper than
-                    // finding each value on its own.
-                    let words = bitpack::packed_len::<u64>(width);
-                    scratch.ready();
-                    for word in &mut scratch.packed[..words] {
-                        *word = reader.u64()?;
-                    }
-                    let mut unit = [0_i64; VALUES];
-                    bitpack::unpack_mapped(&scratch.packed[..words], width, &mut unit, |offset| {
-                        value_from(offset, base)
-                    })?;
-                    out.extend(positions[from..upto].iter().map(|&position| unit[position - done]));
-                } else if wanted == VALUES {
+                if wanted == VALUES {
                     let bytes = reader.bytes(bitpack::packed_len::<u64>(width) * 8)?;
                     for &position in &positions[from..upto] {
                         let offset = bitpack::unpack_u64_at(bytes, width, position - done)?;
@@ -1298,37 +1254,6 @@ fn decode_selected_chunk(
                 out.extend(std::iter::repeat_n(value, repeat));
             }
             Ok(out)
-        }
-        // The steps and the codes are chunks of their own, read at the same rows, and the dictionary
-        // is read whole since a code can point anywhere in it.
-        Kind::Strided => {
-            let base = reader.i64()?;
-            let stride = reader.u64()?;
-            let steps = decode_selected_chunk(reader, positions, scratch)?;
-            steps
-                .into_iter()
-                .map(|step| {
-                    let step = u64::try_from(step)
-                        .map_err(|_| Error::internal("a negative number of strides"))?;
-                    Ok(value_from(step.wrapping_mul(stride), base))
-                })
-                .collect()
-        }
-        Kind::Dict => {
-            let dictionary = decode_chunk(reader, scratch)?;
-            let codes = decode_selected_chunk(reader, positions, scratch)?;
-            codes
-                .into_iter()
-                .map(|code| {
-                    usize::try_from(code)
-                        .ok()
-                        .and_then(|index| dictionary.get(index))
-                        .copied()
-                        .ok_or_else(|| {
-                            Error::internal(format!("code {code} is not in the dictionary"))
-                        })
-                })
-                .collect()
         }
         _ => unreachable!("unsupported kinds used the full decoder"),
     }
@@ -2176,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_positions_agree_with_a_full_decode_for_every_kind_with_a_point_form() {
+    fn selected_positions_agree_with_a_full_decode_for_packed_and_run_length_chunks() {
         let positions = [0, 1, 17, 1023, 1024, 4097, 8191];
         let packed: Vec<i64> = (0..8192).map(|index| index * 31 % 1_000_003).collect();
         let mut runs = Vec::new();
@@ -2184,23 +2109,12 @@ mod tests {
             runs.extend(std::iter::repeat_n(run * 13, (run as usize % 71) + 2));
         }
         runs.resize(8192, -7);
-        let strided: Vec<i64> = (0..8192).map(|index| 500 + index * 7 % 5003 * 100).collect();
-        let coded: Vec<i64> =
-            (0..8192).map(|index| [-9_000_000_000, 3, 77, 1 << 40][index % 4]).collect();
 
-        for (kind, values) in [
-            (Kind::Packed, packed),
-            (Kind::Rle, runs),
-            (Kind::Strided, strided),
-            (Kind::Dict, coded),
-        ] {
+        for (kind, values) in [(Kind::Packed, packed), (Kind::Rle, runs)] {
             let bytes = encode_only(kind, &values).unwrap().expect("encoding applies");
             let selected = decode_selected(&bytes, &positions).unwrap();
             let expected = positions.iter().map(|&position| values[position]).collect::<Vec<_>>();
             assert_eq!(selected, expected, "{}", kind.name());
-            let shape = describe(&bytes).unwrap();
-            let simple = !shape.contains("RLE") && !shape.contains("DELTA");
-            assert_eq!(pointed(&bytes), simple, "{shape}");
         }
     }
 
