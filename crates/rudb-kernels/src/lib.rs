@@ -67,6 +67,7 @@ mod general;
 mod lists;
 pub mod logic;
 mod maps;
+mod math;
 pub mod membership;
 mod nested_text;
 mod number;

@@ -82,6 +82,16 @@ enum Shape {
     PromotedTo(Fixed),
     /// Every argument is cast to one fixed type and the result is another. `||` over strings.
     FixedTo(Fixed, Fixed),
+    /// `floor` and `ceil`, which DuckDB declares over decimals and floats only. A whole number is
+    /// cast to a double on the way in, which is why `floor(5)` is `5.0`, and a decimal keeps its
+    /// width and loses its scale, which is why `floor(5.25)` is a `DECIMAL(3,0)`.
+    Floored,
+    /// `round` and `trunc`, which keep every numeric type as it is. A decimal loses its scale with
+    /// one argument, and with a second one the binder narrows the scale when the count is a literal,
+    /// since that is the one place a call's type comes from an argument's value.
+    Rounded,
+    /// `gcd` and `lcm`, which are declared over `BIGINT` and `HUGEINT` and nothing else.
+    Whole,
     /// Every argument has to be that type already and the result is fixed. `lower`, `length`,
     /// `LIKE`, `chr`.
     ///
@@ -324,9 +334,11 @@ impl Spelled {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fixed {
     Boolean,
+    TinyInt,
     Integer,
     BigInt,
     UBigInt,
+    HugeInt,
     Double,
     Varchar,
     Date,
@@ -341,9 +353,11 @@ impl Fixed {
     fn ty(self) -> LogicalType {
         match self {
             Self::Boolean => LogicalType::Boolean,
+            Self::TinyInt => LogicalType::TinyInt,
             Self::Integer => LogicalType::Integer,
             Self::BigInt => LogicalType::BigInt,
             Self::UBigInt => LogicalType::UBigInt,
+            Self::HugeInt => LogicalType::HugeInt,
             Self::Double => LogicalType::Double,
             Self::Varchar => LogicalType::Varchar,
             Self::Date => LogicalType::Date,
@@ -444,6 +458,50 @@ const TABLE: &[Entry] = &[
     number("/", Arity::exactly(2), Shape::Slashed),
     number("//", Arity::exactly(2), Shape::Divided),
     number("abs", Arity::exactly(1), Shape::Promoted),
+    // Math. Everything over a double is declared over a double alone, so a whole number or a
+    // decimal is cast on the way in, and none of these raises on a value outside its domain: the
+    // pin answers `sqrt(-1)` with a NaN and `ln(0)` with minus infinity, and so does this.
+    number("sqrt", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("cbrt", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("exp", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("ln", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("log", Arity::between(1, 2), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("log10", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("log2", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("sin", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("cos", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("tan", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("cot", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("asin", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("acos", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("atan", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("atan2", Arity::exactly(2), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("sinh", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("cosh", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("tanh", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("asinh", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("acosh", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("atanh", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("degrees", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("radians", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("even", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("gamma", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("lgamma", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("pow", Arity::exactly(2), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("nextafter", Arity::exactly(2), Shape::FixedTo(Fixed::Double, Fixed::Double)),
+    number("pi", Arity::exactly(0), Shape::Constant(Fixed::Double)),
+    number("floor", Arity::exactly(1), Shape::Floored),
+    number("ceil", Arity::exactly(1), Shape::Floored),
+    number("round", Arity::between(1, 2), Shape::Rounded),
+    number("round_even", Arity::exactly(2), Shape::Rounded),
+    number("sign", Arity::exactly(1), Shape::PromotedTo(Fixed::TinyInt)),
+    number("signbit", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Boolean)),
+    number("isnan", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Boolean)),
+    number("isinf", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Boolean)),
+    number("isfinite", Arity::exactly(1), Shape::FixedTo(Fixed::Double, Fixed::Boolean)),
+    number("gcd", Arity::exactly(2), Shape::Whole),
+    number("lcm", Arity::exactly(2), Shape::Whole),
+    number("factorial", Arity::exactly(1), Shape::FixedTo(Fixed::Integer, Fixed::HugeInt)),
     // Strings.
     // `||` takes anything and turns it into a string, which is why everything under it is a `Text`
     // and this is not. `1 || 'a'` is `1a` upstream, and two lists are the second reading of the same
@@ -681,7 +739,7 @@ const TABLE: &[Entry] = &[
     // it was handed, which is what `Shape::Promoted` says over one argument. The exception is the
     // decimal, where upstream drops the scale and gives `DECIMAL(2,0)` for `trunc(1.7)` and this
     // keeps `DECIMAL(2,1)` holding 1.0, since no shape in this table drops a scale.
-    number("trunc", Arity::exactly(1), Shape::Promoted),
+    number("trunc", Arity::between(1, 2), Shape::Rounded),
     // Regular expressions. The pattern is a string like the text is, so three of the four are the
     // plain string shape. `regexp_extract` is not, because its third argument is the group number
     // and casting that to a string and reading it back would be a way to accept `'two'`.
@@ -1063,9 +1121,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             // A null literal has no type yet and every function accepts one, since the alternative
             // is that `sum(NULL)` fails to bind rather than returning null.
             if !ty.is_numeric() && *ty != LogicalType::Null {
-                return Err(Error::binder(format!(
-                    "No function matches the given name and argument types '{name}({ty})'. You might need to add explicit type casts."
-                )));
+                return Err(no_match(entry.name, arguments));
             }
         }
     }
@@ -1125,6 +1181,45 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             (vec![common; arguments.len()], fixed.ty())
         }
         Shape::FixedTo(argument, result) => (vec![argument.ty(); arguments.len()], result.ty()),
+        Shape::Floored => {
+            let held = arguments.first().cloned().unwrap_or(LogicalType::Null);
+            match held {
+                LogicalType::Float => (vec![LogicalType::Float], LogicalType::Float),
+                LogicalType::Decimal { width, .. } => {
+                    (vec![held], LogicalType::Decimal { width, scale: 0 })
+                }
+                _ => (vec![LogicalType::Double], LogicalType::Double),
+            }
+        }
+        Shape::Rounded => {
+            let held = arguments.first().cloned().unwrap_or(LogicalType::Null);
+            // An untyped null is a `BIGINT` here, which is what the pin's first overload is.
+            let held = if held == LogicalType::Null { LogicalType::BigInt } else { held };
+            let returns = match held {
+                LogicalType::Decimal { width, .. } if arguments.len() == 1 => {
+                    LogicalType::Decimal { width, scale: 0 }
+                }
+                ref other => other.clone(),
+            };
+            let mut cast_to = vec![held];
+            cast_to.extend(arguments.iter().skip(1).map(|_| LogicalType::Integer));
+            (cast_to, returns)
+        }
+        Shape::Whole => {
+            if arguments.iter().any(|ty| !ty.is_integer() && *ty != LogicalType::Null) {
+                return Err(no_match(entry.name, arguments));
+            }
+            let common = promote_all(name, arguments)?;
+            let returns = if matches!(
+                common,
+                LogicalType::HugeInt | LogicalType::UHugeInt | LogicalType::UBigInt
+            ) {
+                LogicalType::HugeInt
+            } else {
+                LogicalType::BigInt
+            };
+            (vec![returns.clone(); arguments.len()], returns)
+        }
         Shape::Exact(argument, result) => {
             let wanted = argument.ty();
             for ty in arguments {
@@ -1639,6 +1734,171 @@ fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
 /// A name missing from here gets the sentence with no block under it, which is what every function
 /// outside the string family does today.
 const CANDIDATES: &[(&str, &[&str])] = &[
+    // The math family, word for word the pin's lists.
+    ("sqrt", &["sqrt(col0 DOUBLE) -> DOUBLE"]),
+    ("cbrt", &["cbrt(col0 DOUBLE) -> DOUBLE"]),
+    ("exp", &["exp(col0 DOUBLE) -> DOUBLE"]),
+    ("ln", &["ln(col0 DOUBLE) -> DOUBLE"]),
+    ("log", &["log(col0 DOUBLE) -> DOUBLE", "log(col0 DOUBLE, col1 DOUBLE) -> DOUBLE"]),
+    ("log10", &["log10(col0 DOUBLE) -> DOUBLE"]),
+    ("log2", &["log2(col0 DOUBLE) -> DOUBLE"]),
+    ("sin", &["sin(col0 DOUBLE) -> DOUBLE"]),
+    ("cos", &["cos(col0 DOUBLE) -> DOUBLE"]),
+    ("tan", &["tan(col0 DOUBLE) -> DOUBLE"]),
+    ("cot", &["cot(col0 DOUBLE) -> DOUBLE"]),
+    ("asin", &["asin(col0 DOUBLE) -> DOUBLE"]),
+    ("acos", &["acos(col0 DOUBLE) -> DOUBLE"]),
+    ("atan", &["atan(col0 DOUBLE) -> DOUBLE"]),
+    ("atan2", &["atan2(col0 DOUBLE, col1 DOUBLE) -> DOUBLE"]),
+    ("sinh", &["sinh(col0 DOUBLE) -> DOUBLE"]),
+    ("cosh", &["cosh(col0 DOUBLE) -> DOUBLE"]),
+    ("tanh", &["tanh(col0 DOUBLE) -> DOUBLE"]),
+    ("asinh", &["asinh(col0 DOUBLE) -> DOUBLE"]),
+    ("acosh", &["acosh(col0 DOUBLE) -> DOUBLE"]),
+    ("atanh", &["atanh(col0 DOUBLE) -> DOUBLE"]),
+    ("degrees", &["degrees(col0 DOUBLE) -> DOUBLE"]),
+    ("radians", &["radians(col0 DOUBLE) -> DOUBLE"]),
+    ("even", &["even(col0 DOUBLE) -> DOUBLE"]),
+    ("gamma", &["gamma(col0 DOUBLE) -> DOUBLE"]),
+    ("lgamma", &["lgamma(col0 DOUBLE) -> DOUBLE"]),
+    ("pow", &["pow(col0 DOUBLE, col1 DOUBLE) -> DOUBLE"]),
+    (
+        "nextafter",
+        &[
+            "nextafter(col0 DOUBLE, col1 DOUBLE) -> DOUBLE",
+            "nextafter(col0 FLOAT, col1 FLOAT) -> FLOAT",
+        ],
+    ),
+    ("pi", &["pi() -> DOUBLE"]),
+    (
+        "floor",
+        &[
+            "floor(col0 FLOAT) -> FLOAT",
+            "floor(col0 DOUBLE) -> DOUBLE",
+            "floor(col0 DECIMAL) -> DECIMAL",
+        ],
+    ),
+    (
+        "ceil",
+        &[
+            "ceil(col0 FLOAT) -> FLOAT",
+            "ceil(col0 DOUBLE) -> DOUBLE",
+            "ceil(col0 DECIMAL) -> DECIMAL",
+        ],
+    ),
+    (
+        "round",
+        &[
+            "round(x TINYINT) -> TINYINT",
+            "round(x TINYINT, \"precision\" INTEGER) -> TINYINT",
+            "round(x SMALLINT) -> SMALLINT",
+            "round(x SMALLINT, \"precision\" INTEGER) -> SMALLINT",
+            "round(x INTEGER) -> INTEGER",
+            "round(x INTEGER, \"precision\" INTEGER) -> INTEGER",
+            "round(x BIGINT) -> BIGINT",
+            "round(x BIGINT, \"precision\" INTEGER) -> BIGINT",
+            "round(x HUGEINT) -> HUGEINT",
+            "round(x HUGEINT, \"precision\" INTEGER) -> HUGEINT",
+            "round(x FLOAT) -> FLOAT",
+            "round(x FLOAT, \"precision\" INTEGER) -> FLOAT",
+            "round(x DOUBLE) -> DOUBLE",
+            "round(x DOUBLE, \"precision\" INTEGER) -> DOUBLE",
+            "round(x DECIMAL) -> DECIMAL",
+            "round(x DECIMAL, \"precision\" INTEGER) -> DECIMAL",
+        ],
+    ),
+    (
+        "round_even",
+        &[
+            "round_even(x TINYINT, \"precision\" INTEGER) -> TINYINT",
+            "round_even(x SMALLINT, \"precision\" INTEGER) -> SMALLINT",
+            "round_even(x INTEGER, \"precision\" INTEGER) -> INTEGER",
+            "round_even(x BIGINT, \"precision\" INTEGER) -> BIGINT",
+            "round_even(x HUGEINT, \"precision\" INTEGER) -> HUGEINT",
+            "round_even(x FLOAT, \"precision\" INTEGER) -> FLOAT",
+            "round_even(x DOUBLE, \"precision\" INTEGER) -> DOUBLE",
+            "round_even(x DECIMAL, \"precision\" INTEGER) -> DECIMAL",
+        ],
+    ),
+    (
+        "trunc",
+        &[
+            "trunc(col0 TINYINT) -> TINYINT",
+            "trunc(col0 TINYINT, col1 INTEGER) -> TINYINT",
+            "trunc(col0 SMALLINT) -> SMALLINT",
+            "trunc(col0 SMALLINT, col1 INTEGER) -> SMALLINT",
+            "trunc(col0 INTEGER) -> INTEGER",
+            "trunc(col0 INTEGER, col1 INTEGER) -> INTEGER",
+            "trunc(col0 BIGINT) -> BIGINT",
+            "trunc(col0 BIGINT, col1 INTEGER) -> BIGINT",
+            "trunc(col0 HUGEINT) -> HUGEINT",
+            "trunc(col0 HUGEINT, col1 INTEGER) -> HUGEINT",
+            "trunc(col0 FLOAT) -> FLOAT",
+            "trunc(col0 FLOAT, col1 INTEGER) -> FLOAT",
+            "trunc(col0 DOUBLE) -> DOUBLE",
+            "trunc(col0 DOUBLE, col1 INTEGER) -> DOUBLE",
+            "trunc(col0 DECIMAL) -> DECIMAL",
+            "trunc(col0 DECIMAL, col1 INTEGER) -> DECIMAL",
+            "trunc(col0 UTINYINT) -> UTINYINT",
+            "trunc(col0 UTINYINT, col1 INTEGER) -> UTINYINT",
+            "trunc(col0 USMALLINT) -> USMALLINT",
+            "trunc(col0 USMALLINT, col1 INTEGER) -> USMALLINT",
+            "trunc(col0 UINTEGER) -> UINTEGER",
+            "trunc(col0 UINTEGER, col1 INTEGER) -> UINTEGER",
+            "trunc(col0 UBIGINT) -> UBIGINT",
+            "trunc(col0 UBIGINT, col1 INTEGER) -> UBIGINT",
+            "trunc(col0 UHUGEINT) -> UHUGEINT",
+            "trunc(col0 UHUGEINT, col1 INTEGER) -> UHUGEINT",
+        ],
+    ),
+    (
+        "sign",
+        &[
+            "sign(col0 TINYINT) -> TINYINT",
+            "sign(col0 SMALLINT) -> TINYINT",
+            "sign(col0 INTEGER) -> TINYINT",
+            "sign(col0 BIGINT) -> TINYINT",
+            "sign(col0 HUGEINT) -> TINYINT",
+            "sign(col0 FLOAT) -> TINYINT",
+            "sign(col0 DOUBLE) -> TINYINT",
+            "sign(col0 UTINYINT) -> TINYINT",
+            "sign(col0 USMALLINT) -> TINYINT",
+            "sign(col0 UINTEGER) -> TINYINT",
+            "sign(col0 UBIGINT) -> TINYINT",
+            "sign(col0 UHUGEINT) -> TINYINT",
+        ],
+    ),
+    ("signbit", &["signbit(col0 FLOAT) -> BOOLEAN", "signbit(col0 DOUBLE) -> BOOLEAN"]),
+    ("isnan", &["isnan(col0 FLOAT) -> BOOLEAN", "isnan(col0 DOUBLE) -> BOOLEAN"]),
+    (
+        "isinf",
+        &[
+            "isinf(col0 FLOAT) -> BOOLEAN",
+            "isinf(col0 DOUBLE) -> BOOLEAN",
+            "isinf(col0 DATE) -> BOOLEAN",
+            "isinf(col0 TIMESTAMP) -> BOOLEAN",
+            "isinf(col0 TIMESTAMP WITH TIME ZONE) -> BOOLEAN",
+        ],
+    ),
+    (
+        "isfinite",
+        &[
+            "isfinite(col0 FLOAT) -> BOOLEAN",
+            "isfinite(col0 DOUBLE) -> BOOLEAN",
+            "isfinite(col0 DATE) -> BOOLEAN",
+            "isfinite(col0 TIMESTAMP) -> BOOLEAN",
+            "isfinite(col0 TIMESTAMP WITH TIME ZONE) -> BOOLEAN",
+        ],
+    ),
+    (
+        "gcd",
+        &["gcd(col0 BIGINT, col1 BIGINT) -> BIGINT", "gcd(col0 HUGEINT, col1 HUGEINT) -> HUGEINT"],
+    ),
+    (
+        "lcm",
+        &["lcm(col0 BIGINT, col1 BIGINT) -> BIGINT", "lcm(col0 HUGEINT, col1 HUGEINT) -> HUGEINT"],
+    ),
+    ("factorial", &["factorial(col0 INTEGER) -> HUGEINT"]),
     // The session context functions, which all print the same way because they all take nothing.
     // The four spelled as macros upstream are not here on purpose: the pin answers those with
     // "Macro current_user() does not support the supplied arguments" and a `Candidate macros:` block
@@ -2188,9 +2448,11 @@ impl Fixed {
     const fn name(self) -> &'static str {
         match self {
             Self::Boolean => "BOOLEAN",
+            Self::TinyInt => "TINYINT",
             Self::Integer => "INTEGER",
             Self::BigInt => "BIGINT",
             Self::UBigInt => "UBIGINT",
+            Self::HugeInt => "HUGEINT",
             Self::Double => "DOUBLE",
             Self::Varchar => "VARCHAR",
             Self::Date => "DATE",
@@ -2243,6 +2505,9 @@ impl Shape {
             | Self::PromotedWithCarry
             | Self::Accumulated => (all(SAME), ANY),
             Self::PromotedTo(fixed) => (all(SAME), fixed.name()),
+            Self::Floored => (all("DECIMAL"), "DECIMAL"),
+            Self::Rounded => (leading(1, SAME, "INTEGER"), SAME),
+            Self::Whole => (all("BIGINT"), "BIGINT"),
             // The floor is what a shape that widens is declared as, which is the overload upstream
             // lists first and the one a call with nothing to say about its arguments lands on.
             Self::FixedTo(from, to)
@@ -2352,6 +2617,16 @@ fn canonical(name: &str) -> &str {
 /// and not the written one, so `list_slice(1, 2, 3)` says `array_slice` here where upstream says
 /// `list_slice`, exactly as `len(1)` says `length`.
 const ALIASES: &[(&str, &str)] = &[
+    ("ceiling", "ceil"),
+    ("power", "pow"),
+    ("roundbankers", "round_even"),
+    ("greatest_common_divisor", "gcd"),
+    ("least_common_multiple", "lcm"),
+    ("mod", "%"),
+    ("add", "+"),
+    ("subtract", "-"),
+    ("multiply", "*"),
+    ("divide", "//"),
     ("len", "length"),
     ("char_length", "length"),
     ("character_length", "length"),

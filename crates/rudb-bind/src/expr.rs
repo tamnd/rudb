@@ -942,6 +942,13 @@ impl Binder<'_> {
         let settled: &[&str] = match resolved.name {
             "list_sort" | "list_grade_up" => &["sort_order", "null_order"],
             "list_reverse_sort" => &["null_order"],
+            // Rounding a decimal picks the scale of the answer from the count of digits, so the
+            // count has to be known before there are any rows.
+            "round" | "trunc" | "round_even"
+                if matches!(resolved.returns, LogicalType::Decimal { .. }) =>
+            {
+                &["precision"]
+            }
             _ => &[],
         };
         for (&arg, parameter) in args.iter().skip(1).zip(settled) {
@@ -958,7 +965,15 @@ impl Binder<'_> {
         }
         let returns = self.narrowed_part(resolved.name, &cast, resolved.returns);
         let args = self.plan_mut().add_expr_list(&cast);
-        let name = self.plan_mut().intern(stored_name.unwrap_or(resolved.name));
+        // With `ieee_floating_point_ops` off, the math functions raise on a value outside their
+        // domain instead of answering a NaN or an infinity, and the kernel is told which reading it
+        // is by the name the call is stored under.
+        let strict = (stored_name.is_none()
+            && !self.semantics.ieee_floating_point_ops()
+            && STRICT_MATH.contains(&resolved.name))
+        .then(|| format!("__rudb_strict_{}", resolved.name));
+        let name =
+            self.plan_mut().intern(strict.as_deref().or(stored_name).unwrap_or(resolved.name));
         Ok(self.add_expr(Expr::Function { name, args }, returns))
     }
 
@@ -1269,7 +1284,15 @@ impl Binder<'_> {
     ///
     /// A specifier that names nothing is left alone here rather than refused, so that the message
     /// about it comes from the one place that writes it, which is the kernel.
+    ///
+    /// `round` and `trunc` of a decimal with a count of digits are the other two, for the same
+    /// reason. The scale of the answer is the count when that is a literal below the scale the
+    /// decimal has, none at all when the count is negative, and the scale the decimal has otherwise,
+    /// so `round(1.2345, 2)` is a `DECIMAL(5,2)` and `round(12.345, -1)` a `DECIMAL(5,0)`.
     fn narrowed_part(&self, name: &str, args: &[ExprRef], returns: LogicalType) -> LogicalType {
+        if matches!(name, "round" | "trunc" | "round_even") {
+            return self.narrowed_scale(args, returns);
+        }
         if name != "date_part" {
             return returns;
         }
@@ -1277,6 +1300,16 @@ impl Binder<'_> {
         let Expr::Constant(value) = *self.plan().expr(spec) else { return returns };
         let Value::Varchar(spelling) = self.plan().value(value) else { return returns };
         part_type(spelling)
+    }
+
+    /// The scale a decimal keeps once rounded to the digits the second argument asks for.
+    fn narrowed_scale(&self, args: &[ExprRef], returns: LogicalType) -> LogicalType {
+        let LogicalType::Decimal { width, scale } = returns else { return returns };
+        let Some(&digits) = args.get(1) else { return returns };
+        let Ok(Some(digits)) = fold::value_of(self.plan(), digits) else { return returns };
+        let Some(digits) = digits.as_i64() else { return returns };
+        let kept = if digits < 0 { 0 } else { u8::try_from(digits).unwrap_or(u8::MAX).min(scale) };
+        LogicalType::Decimal { width, scale: kept }
     }
 
     /// A cast to `ty`, or the expression itself when it is already that type.
@@ -2064,6 +2097,12 @@ fn qualified_parts(text: &str) -> Result<Vec<String>> {
     parts.push(part);
     Ok(parts)
 }
+
+/// The math functions that check their domain when `ieee_floating_point_ops` is off.
+const STRICT_MATH: &[&str] = &[
+    "sqrt", "ln", "log", "log10", "log2", "sin", "cos", "tan", "cot", "asin", "acos", "atanh",
+    "gamma", "lgamma", "pow",
+];
 
 #[cfg(test)]
 mod tests {

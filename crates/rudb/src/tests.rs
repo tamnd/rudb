@@ -2286,6 +2286,47 @@ fn the_types_table_answers_a_query_a_client_would_actually_write() {
     );
 }
 
+/// The math family from the SQL side, per #470. The types are the pin's, which is the part a
+/// client notices first: `floor` of a whole number is a double and of a decimal a decimal with no
+/// scale, and `round` to a literal count of digits narrows the scale to that count.
+#[test]
+fn the_math_functions_answer_with_the_pins_types() {
+    let db = database();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT typeof(floor(5)), typeof(ceil(9.99)), typeof(round(1.2345, 2)), \
+             typeof(round(12.345, -1)), typeof(sign(2)), typeof(factorial(3)), typeof(pi())"
+        ),
+        vec![
+            [
+                "DOUBLE",
+                "DECIMAL(3,0)",
+                "DECIMAL(5,2)",
+                "DECIMAL(5,0)",
+                "TINYINT",
+                "HUGEINT",
+                "DOUBLE"
+            ]
+            .map(|name| Value::Varchar(name.to_string()))
+            .to_vec()
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT sqrt(x), log(100), log(2, 8), round(-2.5::DOUBLE) FROM range(5, 6) t(x)"),
+        vec![vec![
+            Value::Double(5f64.sqrt()),
+            Value::Double(2.0),
+            Value::Double(3.0),
+            Value::Double(-3.0)
+        ]]
+    );
+    let error = db
+        .execute("SELECT round(x, n) FROM (VALUES (1.25, 1)) t(x, n)")
+        .expect_err("the precision is a column");
+    assert!(error.message().contains("must be a constant expression"), "{error}");
+}
+
 /// `duckdb_functions()` through the binder and the executor, per #465.
 #[test]
 fn the_functions_table_answers_the_question_a_client_asks_it() {
@@ -2293,7 +2334,7 @@ fn the_functions_table_answers_the_question_a_client_asks_it() {
     // The query a client actually writes, which is whether a name is there at all.
     assert_eq!(
         rows(&db, "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'sqrt'"),
-        vec![vec![Value::BigInt(0)]]
+        vec![vec![Value::BigInt(1)]]
     );
     assert_eq!(
         rows(&db, "SELECT function_type FROM duckdb_functions() WHERE function_name = 'avg'"),
@@ -10389,7 +10430,8 @@ fn a_script_of_several_statements_runs_them_all_and_answers_with_the_last() {
 #[test]
 fn dropping_the_schema_the_session_is_in_goes_back_to_main_of_the_same_database() {
     let db = Database::new();
-    db.execute("ATTACH ':memory:' AS nd; USE nd; CREATE SCHEMA s; USE nd.s; DROP SCHEMA nd.s").unwrap();
+    db.execute("ATTACH ':memory:' AS nd; USE nd; CREATE SCHEMA s; USE nd.s; DROP SCHEMA nd.s")
+        .unwrap();
     assert_eq!(
         rows(&db, "SELECT current_database(), current_schema()"),
         vec![vec![Value::Varchar("nd".into()), Value::Varchar("main".into())]]
