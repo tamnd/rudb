@@ -16,7 +16,7 @@ const MAGIC: &[u8; 8] = b"RUDBSP1\0";
 const FIXED_HEADER: usize = 8 + 2 + 2 + 8 + 2;
 const ROW_BYTES: usize = 10;
 
-fn id(order: usize, covered: usize) -> Result<u64> {
+pub(crate) fn id(order: usize, covered: usize) -> Result<u64> {
     let order =
         u32::try_from(order).map_err(|_| invalid("projection order column is too large"))?;
     let covered =
@@ -26,7 +26,7 @@ fn id(order: usize, covered: usize) -> Result<u64> {
 
 /// Every value of a non-null signed integer column, as a block where the vector hands one over and
 /// through `signed_at` for the forms it does not.
-fn integers(vector: &Vector, out: &mut Vec<i64>) -> Result<()> {
+pub(crate) fn integers(vector: &Vector, out: &mut Vec<i64>) -> Result<()> {
     if vector.signed_block(out) && out.len() == vector.len() {
         return Ok(());
     }
@@ -42,7 +42,7 @@ fn integers(vector: &Vector, out: &mut Vec<i64>) -> Result<()> {
     Ok(())
 }
 
-fn eligible(order: &LogicalType, covered: &LogicalType) -> bool {
+pub(crate) fn eligible(order: &LogicalType, covered: &LogicalType) -> bool {
     matches!(
         order,
         LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer | LogicalType::BigInt
