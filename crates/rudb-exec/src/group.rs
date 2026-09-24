@@ -38,6 +38,7 @@ use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Validity, Vector};
 
+use crate::blocks::Blocks;
 use crate::buffer::Buffered;
 use crate::group_count;
 use crate::group_distinct;
@@ -265,7 +266,7 @@ struct DenseCount {
 
 #[derive(Debug, Default)]
 struct DensePartition {
-    runs: Vec<Vec<u32>>,
+    runs: Vec<Blocks<u32>>,
     nulls: i64,
 }
 
@@ -346,7 +347,7 @@ struct EncodedCountRuns {
 /// [`EncodedCountRuns`], which this is the same thing as for a different record.
 #[derive(Debug, Default)]
 struct FixedRuns {
-    runs: Vec<FixedPartition>,
+    runs: Vec<FixedRun>,
 }
 
 /// The slots of the `bound` largest of `groups` counts, largest first and, among equal counts, in
@@ -664,9 +665,32 @@ impl FixedPartition {
             self.validity.push(valid);
         }
     }
+}
+
+/// What one instance scatters into one fixed radix partition, read back once and in order by the
+/// fold, so its records are kept in [`Blocks`] rather than grown and copied as one vector.
+#[derive(Debug, Default)]
+struct FixedRun {
+    rows: Blocks<FixedRecord>,
+    /// Empty while every field is valid, as in [`FixedPartition`].
+    validity: Vec<u8>,
+}
+
+impl FixedRun {
+    /// Takes one record, the way [`FixedPartition::push`] does.
+    fn push(&mut self, row: FixedRecord, valid: u8) {
+        let keeping = !self.validity.is_empty() || valid != FixedRecord::ALL;
+        if keeping {
+            self.validity.resize(self.rows.len(), FixedRecord::ALL);
+        }
+        self.rows.push(row);
+        if keeping {
+            self.validity.push(valid);
+        }
+    }
 
     fn footprint(&self) -> usize {
-        self.rows.capacity() * size_of::<FixedRecord>() + self.validity.capacity() * size_of::<u8>()
+        self.rows.footprint() + self.validity.capacity() * size_of::<u8>()
     }
 }
 
@@ -1379,7 +1403,7 @@ impl<'a> Aggregate<'a> {
     fn buffer_fixed(
         &self,
         rows: &Rows,
-        partitions: &mut [FixedPartition],
+        partitions: &mut [FixedRun],
         memory: &mut Reservation,
         blocks: &mut FixedBlocks,
     ) -> Result<()> {
@@ -1396,7 +1420,7 @@ impl<'a> Aggregate<'a> {
         };
         let sum = rows.arguments[1].first().expect("SUM has one argument");
         let mean = rows.arguments[2].first().expect("AVG has one argument");
-        let before = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
+        let before = partitions.iter().map(FixedRun::footprint).sum::<usize>();
         let shift = u64::BITS - RADIX_PARTITIONS.ilog2();
         // The four columns read once for the chunk rather than four times per row. See
         // [`FixedBlocks`] for what that was costing.
@@ -1441,7 +1465,7 @@ impl<'a> Aggregate<'a> {
             let hash = fixed_hash(record, valid);
             partitions[(hash >> shift) as usize].push(record, valid);
         }
-        let after = partitions.iter().map(FixedPartition::footprint).sum::<usize>();
+        let after = partitions.iter().map(FixedRun::footprint).sum::<usize>();
         memory.grow(width_of(after.saturating_sub(before)))
     }
 
@@ -3799,11 +3823,11 @@ pub(crate) struct Partitioned {
     radix_distinct_records: Vec<BigIntDistinctPartition>,
     radix_distinct_memory: Reservation,
     fixed: bool,
-    fixed_records: Vec<FixedPartition>,
+    fixed_records: Vec<FixedRun>,
     fixed_memory: Reservation,
     fixed_blocks: FixedBlocks,
     dense: bool,
-    dense_codes: Vec<Vec<u32>>,
+    dense_codes: Vec<Blocks<u32>>,
     dense_nulls: i64,
     dense_memory: Reservation,
     /// The table this instance folds into while it still keeps its groups to itself.
@@ -4526,11 +4550,11 @@ impl Sink for Aggregate<'_> {
                 .collect(),
             radix_distinct_memory: self.memory.reservation(),
             fixed: false,
-            fixed_records: (0..RADIX_PARTITIONS).map(|_| FixedPartition::default()).collect(),
+            fixed_records: (0..RADIX_PARTITIONS).map(|_| FixedRun::default()).collect(),
             fixed_blocks: FixedBlocks::default(),
             fixed_memory: self.memory.reservation(),
             dense: false,
-            dense_codes: vec![Vec::new(); DENSE_PARTITIONS],
+            dense_codes: (0..DENSE_PARTITIONS).map(|_| Blocks::default()).collect(),
             dense_nulls: 0,
             dense_memory: self.memory.reservation(),
             single: Some(self.start()),
@@ -4742,7 +4766,7 @@ impl Sink for Aggregate<'_> {
                         ));
                     }
                     let validity = key.validity();
-                    let before = dense_codes.iter().map(Vec::capacity).sum::<usize>();
+                    let before = dense_codes.iter().map(Blocks::footprint).sum::<usize>();
                     if !validity.has_nulls(rows.rows)
                         && !dictionary.validity().has_nulls(dictionary.len())
                     {
@@ -4769,8 +4793,8 @@ impl Sink for Aggregate<'_> {
                             }
                         }
                     }
-                    let after = dense_codes.iter().map(Vec::capacity).sum::<usize>();
-                    dense_memory.grow(width_of(after.saturating_sub(before) * size_of::<u32>()))?;
+                    let after = dense_codes.iter().map(Blocks::footprint).sum::<usize>();
+                    dense_memory.grow(width_of(after.saturating_sub(before)))?;
                     *dense = true;
                     return Ok(Progress::More);
                 }
@@ -5180,6 +5204,7 @@ impl Sink for Aggregate<'_> {
                             &dense.dictionary,
                             at,
                             &mut held,
+                            self.top_counts.map(|(bound, _)| bound),
                             &self.constants,
                             group_types,
                         )
@@ -5650,9 +5675,13 @@ fn fixed_partition(
     let timing = stage::Timing::start(Stage::Merge);
     for run in std::mem::take(&mut runs.runs) {
         let all_valid = run.validity.is_empty();
-        for (source, &row) in run.rows.iter().enumerate() {
-            let valid = if all_valid { FixedRecord::ALL } else { run.validity[source] };
-            parts[fixed_split(fixed_hash(row, valid), splits)].push(row, valid);
+        let mut source = 0;
+        for block in run.rows.slices() {
+            for &row in block {
+                let valid = if all_valid { FixedRecord::ALL } else { run.validity[source] };
+                parts[fixed_split(fixed_hash(row, valid), splits)].push(row, valid);
+                source += 1;
+            }
         }
     }
     timing.stop(0);
@@ -5745,34 +5774,36 @@ fn dense_partition(
     dictionary: &Arc<Vector>,
     number: usize,
     partition: &mut DensePartition,
+    bound: Option<usize>,
     constants: &[Option<Value>],
     group_types: &[LogicalType],
 ) -> Result<Vec<Chunk>> {
     let width = dictionary.len().saturating_add(DENSE_PARTITIONS - 1 - number) / DENSE_PARTITIONS;
-    let rows: usize = partition.runs.iter().map(Vec::len).sum();
+    let rows: usize = partition.runs.iter().map(Blocks::len).sum();
     // The groups in code order either way, as a count per code of the partition's share of the
     // dictionary or, when far fewer rows arrived than there are codes, as the rows sorted and
     // counted in runs. ClickBench 38 groups by `Title`, whose dictionary is millions of codes, and a
     // filter leaves it a few thousand rows, so the array was megabytes of fresh pages to fault in
     // and zero and then read back to find those rows in.
-    let groups: Vec<(u32, i64)> = if rows.saturating_mul(SPARSE_DENSE) < width {
-        let mut sorted: Vec<u32> = partition.runs.iter().flatten().copied().collect();
+    let mut groups: Vec<(u32, i64)> = if rows.saturating_mul(SPARSE_DENSE) < width {
+        let mut sorted: Vec<u32> =
+            partition.runs.iter().flat_map(Blocks::slices).flatten().copied().collect();
         sorted.sort_unstable();
         sorted.chunk_by(|left, right| left == right).map(|run| (run[0], run.len() as i64)).collect()
+    } else if u32::try_from(rows).is_ok() {
+        dense_counts::<u32>(&partition.runs, width, number)
     } else {
-        let mut dense = vec![0_i64; width];
-        for run in &partition.runs {
-            for &code in run {
-                dense[code as usize / DENSE_PARTITIONS] += 1;
-            }
-        }
-        dense
-            .iter()
-            .enumerate()
-            .filter(|(_, count)| **count != 0)
-            .map(|(slot, &count)| ((slot * DENSE_PARTITIONS + number) as u32, count))
-            .collect()
+        dense_counts::<i64>(&partition.runs, width, number)
     };
+    // Under a TopN on the count only the `bound` largest groups of the partition can reach it, and
+    // building the rest into chunks is most of the finish: ClickBench 34 groups ten million rows of
+    // `URL` into millions of groups for a `LIMIT 10`. They stay in code order, which is the order
+    // the TopN would have seen them in and settles its ties by.
+    if let Some(bound) = bound.filter(|&bound| bound < groups.len()) {
+        let mut best = largest(groups.len(), bound, |slot| groups[slot].1);
+        best.sort_unstable();
+        groups = best.into_iter().map(|slot| groups[slot]).collect();
+    }
     let mut chunks = Vec::new();
     let mut codes = Vec::with_capacity(VECTOR_SIZE);
     let mut counts = Vec::with_capacity(VECTOR_SIZE);
@@ -5797,6 +5828,33 @@ fn dense_partition(
         chunks.push(dense_chunk(dictionary, &codes, &counts, &valid, constants, group_types)?);
     }
     Ok(chunks)
+}
+
+/// How many rows of `runs` hold each code of partition `number`'s share of the dictionary, as the
+/// codes seen and their counts in code order.
+///
+/// The counts are four bytes wide when the rows are few enough that no count can pass that, which
+/// is every partition of a file under four billion rows, and it halves the array: `URL` on
+/// ClickBench is seven million codes, so it is 14 MB against 28 for each of the four partitions
+/// finishing at once.
+fn dense_counts<C>(runs: &[Blocks<u32>], width: usize, number: usize) -> Vec<(u32, i64)>
+where
+    C: Copy + Default + PartialEq + std::ops::AddAssign + From<u8> + Into<i64>,
+{
+    let mut dense = vec![C::default(); width];
+    for run in runs {
+        for block in run.slices() {
+            for &code in block {
+                dense[code as usize / DENSE_PARTITIONS] += C::from(1);
+            }
+        }
+    }
+    dense
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count != C::default())
+        .map(|(slot, &count)| ((slot * DENSE_PARTITIONS + number) as u32, count.into()))
+        .collect()
 }
 
 fn dense_chunk(
@@ -6465,9 +6523,9 @@ mod tests {
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
         Distinct, EncodedCountPartition, EncodedCountRecord, EncodedCountRuns, FixedPartition,
-        FixedRecord, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed, WINDOW_RATE,
-        WINDOW_SLACK, bigint_distinct_partition, encoded_count_partition, fixed_partition,
-        slot_runs_of,
+        FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS, Share, Signed,
+        WINDOW_RATE, WINDOW_SLACK, bigint_distinct_partition, encoded_count_partition,
+        fixed_partition, slot_runs_of,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -7636,7 +7694,7 @@ mod tests {
 
     #[test]
     fn fixed_radix_partition_aggregates_collisions_and_nulls_exactly() {
-        let mut partition = FixedPartition::default();
+        let mut partition = FixedRun::default();
         let row = |first, second, sum, mean| FixedRecord { first, second, sum, mean };
         partition.push(row(1, 2, 3, 4), FixedRecord::ALL);
         partition
@@ -7716,7 +7774,7 @@ mod tests {
         // largest groups land in different splits and a group's rows come from both runs.
         let groups = super::FIXED_SPLIT_ROWS as i64 * 8;
         let row = |first: i64| FixedRecord { first, second: (first % 7) as i32, sum: 1, mean: 2 };
-        let (mut early, mut late) = (FixedPartition::default(), FixedPartition::default());
+        let (mut early, mut late) = (FixedRun::default(), FixedRun::default());
         for first in 0..groups {
             let times = if first % 5_000 == 0 { 3 + first / 5_000 } else { 1 };
             for time in 0..times {
@@ -7784,12 +7842,14 @@ mod tests {
             (0..1_000).map(|code| Value::Varchar(format!("v{code}"))).collect::<Vec<_>>();
         let dictionary =
             Arc::new(Vector::from_values(LogicalType::Varchar, &spellings).expect("a dictionary"));
-        let answer = |runs: Vec<Vec<u32>>| {
+        let bounded = |runs: Vec<Vec<u32>>, bound: Option<usize>| {
+            let runs = runs.into_iter().map(|run| run.into_iter().collect()).collect();
             let mut partition = super::DensePartition { runs, nulls: 0 };
             let chunks = super::dense_partition(
                 &dictionary,
                 1,
                 &mut partition,
+                bound,
                 &[None],
                 &[LogicalType::Varchar],
             )
@@ -7802,6 +7862,7 @@ mod tests {
             }
             rows
         };
+        let answer = |runs: Vec<Vec<u32>>| bounded(runs, None);
         let codes = [405, 9, 5, 9, 405, 405, 997];
         // Seven rows against 250 codes is the sorted path, and the same codes seven hundred times
         // over is the array. Both answer in code order.
@@ -7816,6 +7877,17 @@ mod tests {
         };
         assert_eq!(few, expected(1));
         assert_eq!(many, expected(100));
+        // A TopN bound keeps the largest groups of either path, still in code order.
+        let top = |times: i64| {
+            [(9, 2), (405, 3)]
+                .map(|(code, count)| {
+                    (Value::Varchar(format!("v{code}")), Value::BigInt(count * times))
+                })
+                .to_vec()
+        };
+        assert_eq!(bounded(vec![codes.to_vec()], Some(2)), top(1));
+        assert_eq!(bounded(vec![codes.repeat(100)], Some(2)), top(100));
+        assert_eq!(bounded(vec![codes.repeat(100)], Some(4)), expected(100));
     }
 
     #[test]

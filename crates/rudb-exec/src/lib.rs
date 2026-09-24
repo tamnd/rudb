@@ -80,6 +80,7 @@
 
 #![forbid(unsafe_code)]
 
+mod blocks;
 mod buffer;
 mod build;
 mod cutoff;
