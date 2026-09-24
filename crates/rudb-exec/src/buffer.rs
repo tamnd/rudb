@@ -15,7 +15,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rudb_common::{Error, Reservation, Result};
+use rudb_common::{Error, Result};
 use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_vector::Chunk;
 
@@ -23,9 +23,6 @@ use rudb_vector::Chunk;
 #[derive(Debug, Default)]
 struct Shared {
     chunks: Mutex<Vec<Chunk>>,
-    /// What the chunks are charged, where the operator that kept them handed the charge on with
-    /// them. It leaves with the chunks when they are taken, so the limit sees them go when they do.
-    charged: Mutex<Vec<Reservation>>,
 }
 
 /// Chunks somebody else built, read back out one at a time.
@@ -67,16 +64,6 @@ impl Buffered {
         Ok(())
     }
 
-    /// Hold what the chunks are charged for as long as the chunks are here.
-    ///
-    /// # Errors
-    ///
-    /// The same as [`Buffered::fill`].
-    pub(crate) fn charge(&self, charged: Vec<Reservation>) -> Result<()> {
-        self.shared.charged.lock().map_err(poisoned)?.extend(charged);
-        Ok(())
-    }
-
     /// How many chunks are in there.
     ///
     /// # Errors
@@ -84,21 +71,6 @@ impl Buffered {
     /// The same as [`Buffered::fill`].
     pub(crate) fn len(&self) -> Result<usize> {
         Ok(self.shared.chunks.lock().map_err(poisoned)?.len())
-    }
-
-    /// Every chunk, leaving nothing behind for any handle on the same list.
-    ///
-    /// For the one reader that turns the whole list into something else and never reads it again,
-    /// so that the list and what it was turned into are not both held. What the chunks are charged
-    /// comes with them, for the caller to drop when it drops them.
-    ///
-    /// # Errors
-    ///
-    /// The same as [`Buffered::fill`].
-    pub(crate) fn take(&self) -> Result<(Vec<Chunk>, Vec<Reservation>)> {
-        let chunks = std::mem::take(&mut *self.shared.chunks.lock().map_err(poisoned)?);
-        let charged = std::mem::take(&mut *self.shared.charged.lock().map_err(poisoned)?);
-        Ok((chunks, charged))
     }
 
     /// One chunk by position, or `None` past the end.
