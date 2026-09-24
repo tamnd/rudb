@@ -1343,6 +1343,9 @@ pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
     coded_within(keys, rows, &[], None)
 }
 
+/// The runs one key's window found, each a value and how many rows in a row hold it.
+type KeyRuns = Vec<(i64, usize)>;
+
 /// [`coded`], and an integer column with no places of its own read by its value against a window.
 ///
 /// `held` is what the map beside the caller was last built on, so that a column read by value keeps
@@ -1385,7 +1388,7 @@ pub(crate) fn coded_within<'a>(
         }
     }
     let mut windows = [None; KEYS];
-    let (values, runs): (&'a [Vec<i64>], &'a [Vec<(i64, usize)>]) = if wanting == 0 {
+    let (values, runs): (&'a [Vec<i64>], &'a [KeyRuns]) = if wanting == 0 {
         (&[], &[])
     } else {
         let Widened { values, runs } = widened?;
