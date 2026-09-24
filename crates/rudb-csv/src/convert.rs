@@ -1,4 +1,4 @@
-//! Fields into columns, a column at a time.
+//! Fields into columns, a block of rows at a time.
 //!
 //! A chunk arrives from [`crate::scan::records`] as ranges into the buffer, and each projected
 //! column is built from them straight into the run of values its type is stored as. The types the
@@ -15,6 +15,8 @@
 //! decimal number handed to the same `str::parse` the cast ends in, with `inf`, `nan` and anything
 //! with a space or an underscore left to the cast. A boolean is one of the ten spellings the cast
 //! knows, in any case, without spaces. A date is exactly `YYYY-MM-DD`.
+
+use std::ops::Range;
 
 use rudb_common::{Error, LogicalType, Result, Value, days_from_civil};
 use rudb_kernels::cast_value;
@@ -50,200 +52,314 @@ pub(crate) fn column(
     ty: &LogicalType,
     refuse: &dyn Fn(&str, usize) -> Error,
 ) -> Result<Vector> {
+    let rows = cells.records.len();
+    let mut build = builders(cells, &[(column, ty)]).pop().expect("one builder");
+    build.rows(cells, column, 0..rows, refuse)?;
+    build.finish()
+}
+
+/// A column being built a block of rows at a time.
+///
+/// The reader converts a chunk a block of rows at a time and every projected column within a
+/// block, rather than every row of one column and then the next, so that the block's ranges and
+/// the bytes they point at are still in the cache for the second column. A chunk's ranges are a
+/// megabyte and its bytes about as much again, and a column at a time over all of them was a cache
+/// miss for most fields.
+pub(crate) trait Build {
+    /// Adds `rows` of column `column` of `cells`, which come after the rows already added.
+    ///
+    /// # Errors
+    ///
+    /// The one `refuse` makes for the first value in `rows` that does not convert.
+    fn rows(
+        &mut self,
+        cells: &Cells<'_>,
+        column: usize,
+        rows: Range<usize>,
+        refuse: &dyn Fn(&str, usize) -> Error,
+    ) -> Result<()>;
+
+    /// The column, with every row added so far.
+    ///
+    /// # Errors
+    ///
+    /// If a cast gave a value that does not belong in the column, which is a bug in the cast.
+    fn finish(self: Box<Self>) -> Result<Vector>;
+}
+
+/// A builder for each of `columns`, a column of `cells` and its type, with room for every row.
+///
+/// A `VARCHAR` column's arena is taken at the size its long strings need, all in one allocation.
+/// They are counted here, every text column in one pass along the rows, which reads the ranges in
+/// the order they are laid out rather than a column's worth at a stride of a whole row.
+pub(crate) fn builders(
+    cells: &Cells<'_>,
+    columns: &[(usize, &LogicalType)],
+) -> Vec<Box<dyn Build>> {
+    let text: Vec<usize> = columns
+        .iter()
+        .filter(|(_, ty)| **ty == LogicalType::Varchar)
+        .map(|&(column, _)| column)
+        .collect();
+    let mut long = vec![0; text.len()];
+    if !text.is_empty() {
+        for row in 0..cells.records.len() {
+            for (sum, &column) in long.iter_mut().zip(&text) {
+                if let Some(span) = cells.at(row, column) {
+                    if span.len() > INLINE_LIMIT {
+                        *sum += span.len();
+                    }
+                }
+            }
+        }
+    }
+    let rows = cells.records.len();
+    let mut long = long.into_iter();
+    columns
+        .iter()
+        .map(|&(_, ty)| {
+            let long = if *ty == LogicalType::Varchar { long.next().unwrap_or(0) } else { 0 };
+            builder(ty, rows, long)
+        })
+        .collect()
+}
+
+/// A builder for a column of `ty`, with room for `rows` and, for text, `long` bytes of long strings.
+fn builder(ty: &LogicalType, rows: usize, long: usize) -> Box<dyn Build> {
     match ty {
-        LogicalType::Varchar => Ok(text(cells, column, ty)),
-        LogicalType::Boolean => fixed(cells, column, ty, refuse, truth, bool_of, Data::Bool),
+        LogicalType::Varchar => {
+            let mut strings = StringColumn::with_capacity(rows);
+            strings.reserve_bytes(long);
+            Box::new(Text { ty: ty.clone(), strings, valid: Vec::with_capacity(rows) })
+        }
+        LogicalType::Boolean => fixed(ty, rows, truth, bool_of, Data::Bool),
         LogicalType::TinyInt => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             |raw| whole(raw).and_then(|x| i8::try_from(x).ok()),
             |value| if let Value::TinyInt(x) = value { Some(*x) } else { None },
             Data::Int8,
         ),
         LogicalType::SmallInt => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             |raw| whole(raw).and_then(|x| i16::try_from(x).ok()),
             |value| if let Value::SmallInt(x) = value { Some(*x) } else { None },
             Data::Int16,
         ),
         LogicalType::Integer => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             |raw| whole(raw).and_then(|x| i32::try_from(x).ok()),
             |value| if let Value::Integer(x) = value { Some(*x) } else { None },
             Data::Int32,
         ),
         LogicalType::BigInt => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             whole,
             |value| if let Value::BigInt(x) = value { Some(*x) } else { None },
             Data::Int64,
         ),
         LogicalType::UTinyInt => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             |raw| natural(raw).and_then(|x| u8::try_from(x).ok()),
             |value| if let Value::UTinyInt(x) = value { Some(*x) } else { None },
             Data::UInt8,
         ),
         LogicalType::USmallInt => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             |raw| natural(raw).and_then(|x| u16::try_from(x).ok()),
             |value| if let Value::USmallInt(x) = value { Some(*x) } else { None },
             Data::UInt16,
         ),
         LogicalType::UInteger => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             |raw| natural(raw).and_then(|x| u32::try_from(x).ok()),
             |value| if let Value::UInteger(x) = value { Some(*x) } else { None },
             Data::UInt32,
         ),
         LogicalType::UBigInt => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             natural,
             |value| if let Value::UBigInt(x) = value { Some(*x) } else { None },
             Data::UInt64,
         ),
         LogicalType::Double => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             real,
             |value| if let Value::Double(x) = value { Some(*x) } else { None },
             Data::Float64,
         ),
         LogicalType::Float => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             |raw| real(raw).map(narrow),
             |value| if let Value::Float(x) = value { Some(*x) } else { None },
             Data::Float32,
         ),
         LogicalType::Date => fixed(
-            cells,
-            column,
             ty,
-            refuse,
+            rows,
             day,
             |value| if let Value::Date(x) = value { Some(*x) } else { None },
             Data::Int32,
         ),
-        _ => values(cells, column, ty, refuse),
+        _ => Box::new(Values { ty: ty.clone(), values: Vec::with_capacity(rows) }),
     }
+}
+
+/// A builder for a column of a fixed width type. See [`Fixed`].
+fn fixed<T, F, N>(
+    ty: &LogicalType,
+    rows: usize,
+    fast: F,
+    native: N,
+    wrap: fn(Buffer<T>) -> Data,
+) -> Box<dyn Build>
+where
+    T: Copy + Default + 'static,
+    F: Fn(&[u8]) -> Option<T> + 'static,
+    N: Fn(&Value) -> Option<T> + 'static,
+{
+    Box::new(Fixed {
+        ty: ty.clone(),
+        out: Vec::with_capacity(rows),
+        valid: Vec::with_capacity(rows),
+        fast,
+        native,
+        wrap,
+    })
 }
 
 /// A column of a fixed width type, parsed in place where `fast` can and cast where it cannot.
 ///
 /// `native` takes the value the cast produced back out of its `Value`, which for a cast to the
 /// column's own type is always the variant it names.
-fn fixed<T: Copy + Default>(
-    cells: &Cells<'_>,
-    column: usize,
-    ty: &LogicalType,
-    refuse: &dyn Fn(&str, usize) -> Error,
-    fast: impl Fn(&[u8]) -> Option<T>,
-    native: impl Fn(&Value) -> Option<T>,
-    wrap: impl FnOnce(Buffer<T>) -> Data,
-) -> Result<Vector> {
-    let rows = cells.records.len();
-    let mut out = Vec::with_capacity(rows);
-    let mut valid = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let Some(span) = cells.at(row, column) else {
-            out.push(T::default());
-            valid.push(false);
-            continue;
-        };
-        let parsed = if span.escaped() { None } else { fast(span.raw(cells.bytes)) };
-        let value = match parsed {
-            Some(value) => value,
-            None => {
-                let cast = cast(cells, span, ty, row, refuse)?;
-                native(&cast).ok_or_else(|| {
-                    Error::internal(format!("{cast:?} does not belong in a {ty} column"))
-                })?
-            }
-        };
-        out.push(value);
-        valid.push(true);
+struct Fixed<T, F, N> {
+    ty: LogicalType,
+    out: Vec<T>,
+    valid: Vec<bool>,
+    fast: F,
+    native: N,
+    wrap: fn(Buffer<T>) -> Data,
+}
+
+impl<T, F, N> Build for Fixed<T, F, N>
+where
+    T: Copy + Default,
+    F: Fn(&[u8]) -> Option<T>,
+    N: Fn(&Value) -> Option<T>,
+{
+    fn rows(
+        &mut self,
+        cells: &Cells<'_>,
+        column: usize,
+        rows: Range<usize>,
+        refuse: &dyn Fn(&str, usize) -> Error,
+    ) -> Result<()> {
+        for row in rows {
+            let Some(span) = cells.at(row, column) else {
+                self.out.push(T::default());
+                self.valid.push(false);
+                continue;
+            };
+            let parsed = if span.escaped() { None } else { (self.fast)(span.raw(cells.bytes)) };
+            let value = match parsed {
+                Some(value) => value,
+                None => {
+                    let cast = cast(cells, span, &self.ty, row, refuse)?;
+                    (self.native)(&cast).ok_or_else(|| {
+                        Error::internal(format!("{cast:?} does not belong in a {} column", self.ty))
+                    })?
+                }
+            };
+            self.out.push(value);
+            self.valid.push(true);
+        }
+        Ok(())
     }
-    Ok(Vector::flat(ty.clone(), wrap(Buffer::from_vec(out)))?
-        .with_validity(Validity::from_run(&valid)))
+
+    fn finish(self: Box<Self>) -> Result<Vector> {
+        let Self { ty, out, valid, wrap, .. } = *self;
+        Ok(Vector::flat(ty, wrap(Buffer::from_vec(out)))?.with_validity(Validity::from_run(&valid)))
+    }
 }
 
 /// A `VARCHAR` column, copied once from the buffer into the column's arena.
 ///
 /// A field that is valid UTF-8 and has no escape in it goes in as the bytes it is. The rest go in
 /// as the text [`Span::text`] makes of them, which is the text the cell used to be.
-fn text(cells: &Cells<'_>, column: usize, ty: &LogicalType) -> Vector {
-    let rows = cells.records.len();
-    let mut strings = StringColumn::with_capacity(rows);
-    let long: usize = (0..rows)
-        .filter_map(|row| cells.at(row, column))
-        .map(Span::len)
-        .filter(|&len| len > INLINE_LIMIT)
-        .sum();
-    strings.reserve_bytes(long);
-    let mut valid = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let Some(span) = cells.at(row, column) else {
-            strings.push("");
-            valid.push(false);
-            continue;
-        };
-        let raw = span.raw(cells.bytes);
-        if !span.escaped() && rudb_common::utf8::valid(raw) {
-            strings.push_bytes(raw);
-        } else {
-            strings.push(&span.text(cells.bytes, cells.dialect));
+struct Text {
+    ty: LogicalType,
+    strings: StringColumn,
+    valid: Vec<bool>,
+}
+
+impl Build for Text {
+    fn rows(
+        &mut self,
+        cells: &Cells<'_>,
+        column: usize,
+        rows: Range<usize>,
+        _refuse: &dyn Fn(&str, usize) -> Error,
+    ) -> Result<()> {
+        for row in rows {
+            let Some(span) = cells.at(row, column) else {
+                self.strings.push("");
+                self.valid.push(false);
+                continue;
+            };
+            let raw = span.raw(cells.bytes);
+            if !span.escaped() && rudb_common::utf8::valid(raw) {
+                self.strings.push_bytes(raw);
+            } else {
+                self.strings.push(&span.text(cells.bytes, cells.dialect));
+            }
+            self.valid.push(true);
         }
-        valid.push(true);
+        Ok(())
     }
-    Vector::flat(ty.clone(), Data::Varlen(strings))
-        .expect("a VARCHAR vector holds strings")
-        .with_validity(Validity::from_run(&valid))
+
+    fn finish(self: Box<Self>) -> Result<Vector> {
+        let Self { ty, strings, valid } = *self;
+        Ok(Vector::flat(ty, Data::Varlen(strings))
+            .expect("a VARCHAR vector holds strings")
+            .with_validity(Validity::from_run(&valid)))
+    }
 }
 
 /// A column of a type with no parser here, one `Value` at a time the way every column used to be.
-fn values(
-    cells: &Cells<'_>,
-    column: usize,
-    ty: &LogicalType,
-    refuse: &dyn Fn(&str, usize) -> Error,
-) -> Result<Vector> {
-    let rows = cells.records.len();
-    let mut out = Vec::with_capacity(rows);
-    for row in 0..rows {
-        out.push(match cells.at(row, column) {
-            None => Value::Null,
-            Some(span) => cast(cells, span, ty, row, refuse)?,
-        });
+struct Values {
+    ty: LogicalType,
+    values: Vec<Value>,
+}
+
+impl Build for Values {
+    fn rows(
+        &mut self,
+        cells: &Cells<'_>,
+        column: usize,
+        rows: Range<usize>,
+        refuse: &dyn Fn(&str, usize) -> Error,
+    ) -> Result<()> {
+        for row in rows {
+            self.values.push(match cells.at(row, column) {
+                None => Value::Null,
+                Some(span) => cast(cells, span, &self.ty, row, refuse)?,
+            });
+        }
+        Ok(())
     }
-    Vector::from_values(ty.clone(), &out)
+
+    fn finish(self: Box<Self>) -> Result<Vector> {
+        Vector::from_values(self.ty, &self.values)
+    }
 }
 
 /// One cell through the cast from `VARCHAR`, with the reader's error in place of the cast's.

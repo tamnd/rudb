@@ -38,6 +38,13 @@ const BLOCK: usize = 1 << 20;
 /// held, so a record that turns out to be long still arrives in a handful of reads.
 const TAIL: usize = 64 << 10;
 
+/// How many rows of a chunk are converted, every projected column of them, before the next.
+///
+/// A row's ranges are eight bytes a field, so for a sixteen column table like `lineitem` a thousand
+/// rows is an eighth of a megabyte of ranges and about as much again of the bytes they point at,
+/// which fits in a core's second level cache with room for the columns being written.
+const BLOCK_ROWS: usize = 1024;
+
 /// A CSV file, positioned at a record boundary.
 #[derive(Debug)]
 pub struct Reader {
@@ -217,15 +224,41 @@ impl Reader {
         let first = self.line;
         self.line += rows as u64;
         let cells = Cells { bytes: &self.buffer, records: &self.records, dialect: self.dialect };
-        let mut columns = Vec::with_capacity(self.projection.len());
-        for &at in &self.projection {
+        let projected: Vec<_> =
+            self.projection.iter().map(|&at| (at, &self.fields[at].ty)).collect();
+        let mut builders = convert::builders(&cells, &projected);
+        let mut start = 0;
+        while start < rows {
+            let end = rows.min(start + BLOCK_ROWS);
+            for (build, &at) in builders.iter_mut().zip(&self.projection) {
+                let field = &self.fields[at];
+                let refuse = |text: &str, row: usize| {
+                    Error::conversion(self.conversion_error(text, field, first + row as u64))
+                };
+                if let Err(error) = build.rows(&cells, at, start..end, &refuse) {
+                    return Err(self.first_bad_value(&cells, first).unwrap_or(error));
+                }
+            }
+            start = end;
+        }
+        let columns = builders.into_iter().map(|build| build.finish()).collect::<Result<_>>()?;
+        Ok(Some(Chunk::with_rows(columns, rows)?))
+    }
+
+    /// The error for the first projected column's first value that does not convert, found by
+    /// converting the chunk a column at a time the way it used to be.
+    ///
+    /// A chunk is converted a block of rows at a time, so the first value it trips on can be in a
+    /// later column than one with a bad value further down. This is only run once one has been
+    /// found, to name the same value the reader always named.
+    fn first_bad_value(&self, cells: &Cells<'_>, first: u64) -> Option<Error> {
+        self.projection.iter().find_map(|&at| {
             let field = &self.fields[at];
             let refuse = |text: &str, row: usize| {
                 Error::conversion(self.conversion_error(text, field, first + row as u64))
             };
-            columns.push(convert::column(&cells, at, &field.ty, &refuse)?);
-        }
-        Ok(Some(Chunk::with_rows(columns, rows)?))
+            convert::column(cells, at, &field.ty, &refuse).err()
+        })
     }
 
     /// Splits the next chunk's worth of records into [`Self::records`] and answers how many there
@@ -799,6 +832,25 @@ mod tests {
             "{error}"
         );
         assert!(error.message().contains("sample_size = 20480"), "{error}");
+    }
+
+    /// A chunk is converted a block of rows at a time, which meets the second column's bad value
+    /// in the first block before the first column's in a later one. The error still names the
+    /// first column's, as it did when a chunk was converted a column at a time.
+    #[test]
+    fn the_error_names_the_first_columns_bad_value_even_when_a_later_column_is_bad_sooner() {
+        let mut text = String::from("a,b\n");
+        for row in 0..infer::SAMPLE {
+            text.push_str(&format!("{row},{row}\n"));
+        }
+        text.push_str("1,late\n");
+        for row in 0..BLOCK_ROWS * 2 {
+            text.push_str(&format!("{row},{row}\n"));
+        }
+        text.push_str("early,1\n");
+        let mut reader = read(&text);
+        let error = all_or_error(&mut reader).unwrap_err();
+        assert!(error.message().contains("Could not convert string \"early\""), "{error}");
     }
 
     /// Measured. The header row becomes a row, so the names are the generated ones and the first
