@@ -6,6 +6,20 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.31
+
+A patch release of nineteen commits, on TPC-H under G10, ClickBench, the graph layer and DuckDB compatibility. The native directory format number stays at 29 and the storage format version at 9, but a table with keys now writes a directory block 0.4.30 does not know, and 0.4.30 refuses a file that has one.
+
+The graph layer can now be used on the TPC-H schema as it is written. #1784 keeps primary, unique and foreign keys in the native file, so a reopened database refuses what it refused before the checkpoint. #1785 makes every foreign key a declared relationship, so a checkpoint builds its link with no `graph_links` setting. #1799 pushes a set through a monotone link a parent at a time, which cut the reduction's push 2.4 to 13 times on q02, q03, q04, q05, q07 and q10. `graph_sections` stays off by default, because with it on most of TPC-H is still slower than with it off, see spec/perf/52-a-push-a-parent-at-a-time.md.
+
+On TPC-H, #1795 counts below a left join and drops the grouping above it where the key is unique, which is q13's shape. #1787 folds every aggregate call that can share it in one walk of the runs, and #1794 fills a chunk's slots from its runs only when something reads them. #1788 reads packed integer join keys into a run a block at a time.
+
+On ClickBench, #1781 starts a sparse key's map of values on the key's ends, #1782 and #1796 make the regexp_replace memo cheaper, #1789 hands out first the parts a top N wants most, #1791 picks the top counts of a dense group by out of the count array, and #1797 answers a grouped distinct count from a covering projection. #1792 and #1793 remove the CLI routes that answered some queries without the SQL engine, so every CLI query now goes through the parser, binder, optimizer and executor.
+
+On storage, #1783 writes a stripe's pages with one pwritev and checksums them on the worker that builds them, and #1786 lets a table open skip the frequency synopses nothing asks for.
+
+For DuckDB compatibility, #1790 adds `duckdb_constraints()` and #1798 adds `SET schema`, `SET search_path`, `USE` and `current_schemas()`.
+
 ## 0.4.30
 
 A patch release of six commits, four of them on the CSV load under W1. The native directory format number stays at 29 and the storage format version at 9.
