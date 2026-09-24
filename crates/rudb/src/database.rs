@@ -2119,8 +2119,12 @@ struct NativePlace {
     morsel: u64,
     chunk: u64,
     held: Vec<((u64, u64), Chunk)>,
-    /// What `held` was charged to the load profile, given back once its stripe is written.
+    /// What `held` was charged to the load profile, given back once it is encoded.
     holding: u64,
+    /// The stripe `held` goes into once there are [`FEED_PARTS`] of them, and how many parts it
+    /// has been handed so far.
+    building: Option<rudb_native::Building>,
+    fed: usize,
     started: Option<Span>,
     inside_wall: u64,
     inside_cpu: u64,
@@ -2165,6 +2169,15 @@ fn declared(
 /// two, because short stripes compress worse. The largest peaked at 6.46 GiB of memory against 3.37
 /// GiB, so this is the middle one: the file size and query speed of a full stripe at half its peak.
 const GATHER_ROWS: usize = 131_072;
+
+/// How many chunks a load instance holds before it encodes them into the stripe it is building.
+///
+/// A stripe is [`rudb_native::STRIPE_PARTS`] chunks, and an instance used to hold them all decoded
+/// until the stripe was full. Loading ClickBench `hits_0` at six threads on server2 peaked at about
+/// 1.03 GB that way and at about 0.89 GB feeding eight at a time, with the same file. Sixteen at a
+/// time peaked the same as eight. Eight keeps a batch big enough that spreading its columns over
+/// the encode workers is still worth starting them.
+const FEED_PARTS: usize = 8;
 
 /// The root of a file-backed initial insert.
 #[derive(Debug)]
@@ -2251,13 +2264,31 @@ impl NativeSink {
         )
     }
 
-    /// Hands whatever this instance is holding to the writer as one stripe.
-    fn hand_over(&self, place: &mut NativePlace) -> Result<()> {
+    /// Encodes the chunks this instance is holding into the stripe it is building, and lets them go.
+    fn feed(&self, place: &mut NativePlace) -> Result<()> {
         if place.held.is_empty() {
             return Ok(());
         }
         let parts = std::mem::take(&mut place.held);
         let holding = std::mem::take(&mut place.holding);
+        place.fed = place.fed.saturating_add(parts.len());
+        let inside = Span::start();
+        let building = place.building.get_or_insert_with(|| self.preparer.start());
+        let fed = self.preparer.feed(building, parts);
+        // The rows are charged until they are encoded, which is when they are let go. What the
+        // stripe has built from them so far is pages, a small fraction of the rows.
+        self.profile.release(holding);
+        let (wall, cpu) = inside.stop();
+        place.inside_wall = place.inside_wall.saturating_add(wall);
+        place.inside_cpu = place.inside_cpu.saturating_add(cpu);
+        fed
+    }
+
+    /// Hands the stripe this instance is building to the writer.
+    fn hand_over(&self, place: &mut NativePlace) -> Result<()> {
+        self.feed(place)?;
+        place.fed = 0;
+        let Some(building) = place.building.take() else { return Ok(()) };
         // Once a stripe, so both clocks. The waits for the lock are write waits: they are the time
         // one instance spent while another was writing its stripe, which is the cost of the writer
         // being one file behind one lock.
@@ -2267,15 +2298,12 @@ impl NativeSink {
         // once unless they want the same column at the same moment. That is what lets thirty two
         // instances keep going when one of them is merging `URL`.
         let inside = Span::start();
-        let appended = self.preparer.prepare(parts).and_then(|prepared| {
+        let appended = self.preparer.finish(building).and_then(|prepared| {
             let merged = self.merger.merge(prepared)?;
             let mut paged = merged.pages()?;
             self.merger.give_back(&mut paged)?;
             self.locked(|writer| writer.write(paged))
         });
-        // The rows are charged until their stripe is in the file, since the encode keeps them
-        // until every column is done and the pages it built are bytes on top of that.
-        self.profile.release(holding);
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
         place.inside_cpu = place.inside_cpu.saturating_add(cpu);
@@ -2337,7 +2365,10 @@ impl Sink for NativeSink {
         self.profile.hold(footprint);
         place.held.push(((place.morsel, place.chunk), chunk.clone()));
         place.chunk = place.chunk.saturating_add(1);
-        if place.held.len() == rudb_native::STRIPE_PARTS {
+        if place.held.len() == FEED_PARTS {
+            self.feed(place)?;
+        }
+        if place.fed.saturating_add(place.held.len()) == rudb_native::STRIPE_PARTS {
             self.hand_over(place)?;
         }
         Ok(Progress::More)
