@@ -10265,3 +10265,22 @@ fn an_enum_meets_a_number_and_another_enum_the_way_the_pin_does() {
     let err = db.execute("SELECT 'a'::ENUM").unwrap_err().to_string();
     assert!(err.contains("ENUM type requires at least one argument"), "{err}");
 }
+
+/// A `DOUBLE` setting takes a decimal literal, which is what `1.0` is, and reads back as the same
+/// number. The percentage is refused outside `[0, 1]` in the pin's words.
+#[test]
+fn a_double_setting_takes_a_decimal_literal() {
+    let db = database();
+    db.execute("SET index_scan_percentage = 1.0").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('index_scan_percentage')"),
+        vec![vec![Value::Double(1.0)]]
+    );
+    db.execute("SET index_scan_percentage = 0.000001").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT current_setting('index_scan_percentage')"),
+        vec![vec![Value::Double(0.000_001)]]
+    );
+    let err = db.execute("SET index_scan_percentage = 2.5").unwrap_err().to_string();
+    assert!(err.contains("the index scan percentage must be within [0, 1]"), "{err}");
+}
