@@ -968,7 +968,20 @@ enum Places<'a> {
         values: &'a [i64],
         /// The value that takes place zero.
         low: i64,
+        /// The runs of one value the pass that settled the window found on its way, each as the
+        /// value and the row it ends before, or empty when it did not keep them.
+        runs: &'a [(i64, usize)],
     },
+}
+
+/// Where the key columns a map reads by value are widened into, kept by the caller so that it is
+/// not allocated once a chunk.
+#[derive(Debug, Default)]
+pub(crate) struct Widened {
+    /// Each key column's values, one run per column.
+    values: Vec<Vec<i64>>,
+    /// Each key column's runs of one value, as [`Places::Values`] holds them.
+    runs: Vec<Vec<(i64, usize)>>,
 }
 
 /// What a direct map's places were built from, so a chunk under different ones rebuilds it.
@@ -1050,7 +1063,7 @@ impl CodedColumn<'_> {
                         *place += code * stride;
                     }
                 }
-                Places::Values { values, low } => {
+                Places::Values { values, low, .. } => {
                     for (row, place) in into.iter_mut().enumerate() {
                         let code = if column.is_null_at(row) {
                             nothing
@@ -1079,7 +1092,7 @@ impl CodedColumn<'_> {
                     *place += packed.code(at[row] as usize) as usize * stride;
                 }
             }
-            Places::Values { values, low } => {
+            Places::Values { values, low, .. } => {
                 for (place, &value) in into.iter_mut().zip(values) {
                     *place += value.wrapping_sub(low) as u64 as usize * stride;
                 }
@@ -1226,7 +1239,17 @@ impl<'a> Coded<'a> {
         }
         let stride = column.stride;
         match column.places {
-            Places::Values { values, low } => values.get(..rows).is_some_and(|values| {
+            // Runs the window already found are placed as they are, without a second look at the
+            // values. On ClickBench 28 the look was a fifth of the fold.
+            Places::Values { runs, low, .. } if runs.last().is_some_and(|run| run.1 == rows) => {
+                if runs.len() > most + 1 {
+                    return false;
+                }
+                let place = |value: i64| value.wrapping_sub(low) as u64 as usize * stride;
+                into.extend(runs.iter().map(|&(value, end)| (place(value), end)));
+                true
+            }
+            Places::Values { values, low, .. } => values.get(..rows).is_some_and(|values| {
                 runs_in(values, most, into, |value| {
                     value.wrapping_sub(low) as u64 as usize * stride
                 })
@@ -1323,15 +1346,14 @@ pub(crate) fn coded<'a>(keys: &'a [Vector], rows: usize) -> Option<Coded<'a>> {
 /// [`coded`], and an integer column with no places of its own read by its value against a window.
 ///
 /// `held` is what the map beside the caller was last built on, so that a column read by value keeps
-/// the window it had for as long as its chunks land inside it and the map lives on. `values` is
-/// where those columns are widened into, one run per key column, kept by the caller so that it is
-/// not allocated once a chunk. Without it a column read by value is refused the way [`coded`]
-/// refuses it.
+/// the window it had for as long as its chunks land inside it and the map lives on. `widened` is
+/// where those columns are widened into. Without it a column read by value is refused the way
+/// [`coded`] refuses it.
 pub(crate) fn coded_within<'a>(
     keys: &'a [Vector],
     rows: usize,
     held: &[Origin],
-    values: Option<&'a mut Vec<Vec<i64>>>,
+    widened: Option<&'a mut Widened>,
 ) -> Option<Coded<'a>> {
     if keys.is_empty() || keys.len() > KEYS {
         return None;
@@ -1351,7 +1373,7 @@ pub(crate) fn coded_within<'a>(
             // after the first when a key is sorted, since each packs against its own minimum. Its
             // codes would throw the map away, so it is read by value against the window instead,
             // and falls back on its codes only when the window will not have it.
-            Some(read) if values.is_some() && moved_off(&read.0, held.get(at)) => {
+            Some(read) if widened.is_some() && moved_off(&read.0, held.get(at)) => {
                 fallback[at] = Some(read);
                 wanting += 1;
             }
@@ -1363,17 +1385,20 @@ pub(crate) fn coded_within<'a>(
         }
     }
     let mut windows = [None; KEYS];
-    let values: &'a [Vec<i64>] = if wanting == 0 {
-        &[]
+    let (values, runs): (&'a [Vec<i64>], &'a [Vec<(i64, usize)>]) = if wanting == 0 {
+        (&[], &[])
     } else {
-        let values = values?;
+        let Widened { values, runs } = widened?;
         values.resize_with(keys.len(), Vec::new);
+        runs.resize_with(keys.len(), Vec::new);
         for (at, key) in keys.iter().enumerate() {
             if found[at].is_some() {
                 continue;
             }
-            let window =
-                window_of(key, rows, held.get(at), room / taken, wanting == 1, &mut values[at]);
+            let limit = room / taken;
+            // Only a key of one column is ever folded by its runs. See [`Coded::place_runs`].
+            let into = (&mut values[at], &mut runs[at], keys.len() == 1);
+            let window = window_of(key, rows, held.get(at), limit, wanting == 1, into);
             match (window, fallback[at]) {
                 (Some(window), _) => {
                     taken = taken.checked_mul(window.1).filter(|&taken| taken <= room)?;
@@ -1386,7 +1411,7 @@ pub(crate) fn coded_within<'a>(
                 (None, None) => return None,
             }
         }
-        values
+        (values, runs)
     };
     let mut columns = [None; KEYS];
     let mut combos: usize = 1;
@@ -1394,7 +1419,9 @@ pub(crate) fn coded_within<'a>(
         let (places, span, nullable) = match (found[at], windows[at]) {
             (Some(read), _) => read,
             (None, Some((low, span, nullable))) => {
-                (Places::Values { values: values.get(at)?.get(..rows)?, low }, span, nullable)
+                let runs = runs.get(at).map_or(&[][..], Vec::as_slice);
+                let values = values.get(at)?.get(..rows)?;
+                (Places::Values { values, low, runs }, span, nullable)
             }
             (None, None) => return None,
         };
@@ -1453,8 +1480,9 @@ fn window_of(
     held: Option<&Origin>,
     limit: usize,
     alone: bool,
-    into: &mut Vec<i64>,
+    (into, runs, keep_runs): (&mut Vec<i64>, &mut Vec<(i64, usize)>, bool),
 ) -> Option<(i64, usize, bool)> {
+    runs.clear();
     if !signed_rows(key, rows, into) {
         return None;
     }
@@ -1467,7 +1495,13 @@ fn window_of(
     // two 64 bit integers on the baseline x86 this is built for, so the lowest and highest are a
     // compare and a branch a value, where a test for equal is a vector compare. A sorted key such
     // as `CounterID` comes in runs of hundreds, and this pass was a third of its fold.
+    //
+    // Where the value changes is where a run ends, so the runs are kept on the way for
+    // [`Coded::place_runs`], up to one for every eight rows, when the key is this column alone.
+    // Past that the key is not in runs worth folding by and they are dropped.
     let mut current = into.first().copied().unwrap_or_default();
+    let mut keeping = keep_runs && !nullable;
+    let most_runs = into.len() / 8 + 1;
     for (block, values) in into.chunks(128).enumerate() {
         if nullable {
             for (row, &value) in values.iter().enumerate() {
@@ -1479,8 +1513,22 @@ fn window_of(
         } else {
             lowest = lowest.min(current);
             highest = highest.max(current);
-            for stretch in values.chunks(16) {
-                if stretch.iter().fold(false, |differ, &value| differ | (value != current)) {
+            for (at, stretch) in values.chunks(16).enumerate() {
+                if !stretch.iter().fold(false, |differ, &value| differ | (value != current)) {
+                    continue;
+                }
+                if keeping {
+                    for (row, &value) in stretch.iter().enumerate() {
+                        if value != current {
+                            runs.push((current, block * 128 + at * 16 + row));
+                            current = value;
+                            lowest = lowest.min(value);
+                            highest = highest.max(value);
+                        }
+                    }
+                    keeping = runs.len() < most_runs;
+                } else {
+                    // A key in no order, walked the way it was before the runs were kept.
                     for &value in stretch {
                         lowest = lowest.min(value);
                         highest = highest.max(value);
@@ -1492,6 +1540,11 @@ fn window_of(
         if lowest <= highest && (i128::from(highest) - i128::from(lowest)) >= limit as i128 {
             return None;
         }
+    }
+    if keeping && !into.is_empty() {
+        runs.push((current, into.len()));
+    } else {
+        runs.clear();
     }
     let kept = match held {
         Some(&Origin::Window(low, span)) => Some((low, span)),
@@ -4419,12 +4472,45 @@ mod tests {
         flat(LogicalType::Integer, &values)
     }
 
+    /// The runs a column read by value is placed in are the runs of its rows' places, across the
+    /// stretches and blocks the window reads it in, and a key in no order is not cut into runs.
+    #[test]
+    fn runs_found_by_the_window_are_the_runs_of_the_places() {
+        let lengths = [(10, 5), (12, 130), (10, 1), (11, 40), (20, 124), (12, 16)];
+        let rows: usize = lengths.iter().map(|&(_, length)| length).sum();
+        let sorted: Vec<Option<i32>> = lengths
+            .iter()
+            .flat_map(|&(value, length)| std::iter::repeat_n(Some(value), length))
+            .collect();
+        let keys = [integers(&sorted)];
+        let mut values = Widened::default();
+        let coded = coded_within(&keys, rows, &[], Some(&mut values)).expect("read by value");
+        let mut places = Vec::new();
+        coded.places(rows, &mut places);
+        let mut expected = Vec::new();
+        for (row, &place) in places.iter().enumerate() {
+            if row + 1 == rows || places[row + 1] != place {
+                expected.push((place, row + 1));
+            }
+        }
+        let mut runs = Vec::new();
+        assert!(coded.place_runs(rows, rows, &mut runs));
+        assert_eq!(runs, expected);
+        assert_eq!(runs.len(), lengths.len());
+        assert!(!coded.place_runs(rows, 2, &mut runs));
+        let scattered: Vec<Option<i32>> = (0..rows as i32).map(|row| Some(row * 7 % 13)).collect();
+        let keys = [integers(&scattered)];
+        let coded = coded_within(&keys, rows, &[], Some(&mut values)).expect("read by value");
+        assert!(!coded.place_runs(rows, rows / 8, &mut runs));
+        assert!(runs.is_empty());
+    }
+
     /// A flat column is read by its value once there is somewhere to widen it into, which is the
     /// shape `CounterID` arrives in after `URL <> ''` has copied out the rows it kept.
     #[test]
     fn a_flat_column_is_read_by_its_value_against_a_window() {
         let keys = [integers(&[Some(62), Some(1_000), Some(62), Some(-5)])];
-        let mut values = Vec::new();
+        let mut values = Widened::default();
         let coded = coded_within(&keys, 4, &[], Some(&mut values)).expect("read by value");
         let places = placed(&coded, 4);
         assert_eq!(places[0], places[2], "one value is one place");
@@ -4444,7 +4530,7 @@ mod tests {
     /// gets a window that takes the old one in, and the map is only rebuilt for the second.
     #[test]
     fn a_window_is_kept_for_as_long_as_the_chunks_land_inside_it() {
-        let mut values = Vec::new();
+        let mut values = Widened::default();
         let first = [integers(&[Some(100), Some(200)])];
         let mut held = Vec::new();
         coded_within(&first, 2, &[], Some(&mut values)).expect("read by value").hold(&mut held);
@@ -4471,7 +4557,7 @@ mod tests {
     /// whatever window there was.
     #[test]
     fn a_null_row_read_by_value_takes_the_place_past_the_window() {
-        let mut values = Vec::new();
+        let mut values = Widened::default();
         let keys = [integers(&[Some(7), None, Some(9), None])];
         let coded = coded_within(&keys, 4, &[], Some(&mut values)).expect("read by value");
         let places = placed(&coded, 4);
@@ -4491,7 +4577,7 @@ mod tests {
     /// windows multiply past the small bound.
     #[test]
     fn values_spread_wider_than_the_map_allows_are_refused() {
-        let mut values = Vec::new();
+        let mut values = Widened::default();
         let wide = [integers(&[Some(0), Some(WIDE_COMBOS as i32)])];
         assert!(coded_within(&wide, 2, &[], Some(&mut values)).is_none());
         let fits = [integers(&[Some(0), Some(WIDE_COMBOS as i32 - 2)])];
@@ -4511,7 +4597,7 @@ mod tests {
         let page = packed_numbers(&[17, 262_029, 62, 62], 18, 17);
         let kept = [Vector::dictionary(vec![2, 1, 3], page).expect("the rows a filter kept")];
         assert!(coded(&kept, 3).is_none(), "eighteen bits is too wide for places");
-        let mut values = Vec::new();
+        let mut values = Widened::default();
         let coded = coded_within(&kept, 3, &[], Some(&mut values)).expect("read by value");
         let places = placed(&coded, 3);
         assert_eq!(places[0], places[2]);
@@ -4525,7 +4611,7 @@ mod tests {
         let chunk = |values: &[Option<i32>], kept: Vec<u32>| {
             [Vector::dictionary(kept, integers(values)).expect("the rows a filter kept")]
         };
-        let mut values = Vec::new();
+        let mut values = Widened::default();
         let mut held = Vec::new();
         let first = chunk(&[Some(5), Some(9), None, Some(5)], vec![0, 2, 3]);
         let coded = coded_within(&first, 3, &held, Some(&mut values)).expect("codes of its own");
@@ -4564,7 +4650,7 @@ mod tests {
     #[test]
     fn a_packed_page_other_than_the_one_held_is_read_by_value() {
         let first = [packed_numbers(&[100, 101, 102, 101], 2, 100)];
-        let mut values = Vec::new();
+        let mut values = Widened::default();
         let mut held = Vec::new();
         let coded = coded_within(&first, 4, &held, Some(&mut values)).expect("places of its own");
         assert!(!coded.by_value(), "a first page keeps its codes");
@@ -4607,7 +4693,7 @@ mod tests {
             ],
         ];
         for keys in &forms {
-            let mut values = Vec::new();
+            let mut values = Widened::default();
             let coded = coded_within(keys, 4, &[], Some(&mut values)).expect("read by value");
             assert!(coded.by_value());
             let mut whole = Vec::new();
