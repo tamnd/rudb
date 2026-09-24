@@ -1040,15 +1040,27 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
             let stride = reader.u64()?;
             let steps = decode_chunk(reader, scratch)?;
             check_count(steps.len(), count)?;
-            let mut values = Vec::with_capacity(count);
-            for step in steps {
-                let step = u64::try_from(step)
-                    .map_err(|_| Error::internal("a negative number of strides"))?;
-                values.push(value_from(step.wrapping_mul(stride), base));
-            }
-            Ok(values)
+            strided(steps, stride, base)
         }
     }
+}
+
+/// The values of a strided chunk, `base` plus each step times `stride`, written over the steps.
+///
+/// Over the steps rather than into a run of their own, so a chunk is one allocation rather than
+/// two, and with the one check a chunk needs taken over the whole run first, so the loop that makes
+/// the values has nothing in it but a multiply and an add and the compiler does it four lanes at a
+/// time. A value pushed at a time with the check inside was about thirteen instructions a value,
+/// and a decimal column of whole numbers, which TPC-H's `l_quantity` is, is stored this way.
+fn strided(mut steps: Vec<i64>, stride: u64, base: i64) -> Result<Vec<i64>> {
+    // Every bit of every step or'ed together has its sign bit set exactly when some step is negative.
+    if steps.iter().fold(0, |held, &step| held | step) < 0 {
+        return Err(Error::internal("a negative number of strides"));
+    }
+    for step in &mut steps {
+        *step = base.wrapping_add((*step as u64).wrapping_mul(stride) as i64);
+    }
+    Ok(steps)
 }
 
 /// [`decode_chunk`] into `T`. See [`decode_as`].
@@ -1056,8 +1068,21 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
     let Some(&tag) = reader.rest().first() else {
         return Err(Error::internal("a chunk ended before its encoding tag"));
     };
-    if !matches!(Kind::from_tag(tag)?, Kind::Constant | Kind::Packed | Kind::Sparse | Kind::Rle) {
-        return decode_chunk(reader, scratch)?.into_iter().map(lane).collect();
+    match Kind::from_tag(tag)? {
+        Kind::Constant | Kind::Packed | Kind::Sparse | Kind::Rle => {}
+        // Made wide as the other kind is and narrowed after, but with the range of the chunk taken
+        // once so that a chunk whose ends fit is narrowed with no check a value.
+        Kind::Strided => {
+            let values = decode_chunk(reader, scratch)?;
+            let (low, high) = values.iter().fold((i64::MAX, i64::MIN), |(low, high), &value| {
+                (low.min(value), high.max(value))
+            });
+            if values.is_empty() || T::fit(low).is_some() && T::fit(high).is_some() {
+                return Ok(values.into_iter().map(T::wrap).collect());
+            }
+            return values.into_iter().map(lane).collect();
+        }
+        _ => return decode_chunk(reader, scratch)?.into_iter().map(lane).collect(),
     }
     let kind = Kind::from_tag(reader.u8()?)?;
     let count = reader.u32()? as usize;
@@ -2489,7 +2514,9 @@ mod tests {
         fn check<T: Lane + TryFrom<i64> + PartialEq + std::fmt::Debug>(edges: [i64; 2]) {
             for edge in edges {
                 for value in [edge - 1, edge, edge + 1] {
-                    for kind in [Kind::Constant, Kind::Packed, Kind::Rle, Kind::Sparse] {
+                    for kind in
+                        [Kind::Constant, Kind::Packed, Kind::Rle, Kind::Sparse, Kind::Strided]
+                    {
                         let values = [value, value, edges[0].max(0).min(edges[1]), value];
                         let Some(bytes) = encode_only(kind, &values).unwrap() else { continue };
                         let fits = values.iter().all(|&value| T::try_from(value).is_ok());
