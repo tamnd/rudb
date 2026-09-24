@@ -1934,10 +1934,9 @@ fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edg
         else {
             continue;
         };
-        let (Some(child_column), Some(parent_column)) = (
-            key_in(child_table, &link.child.columns),
-            key_in(parent_table, &link.parent.columns),
-        ) else {
+        let (Some(child_column), Some(parent_column)) =
+            (key_in(child_table, &link.child.columns), key_in(parent_table, &link.parent.columns))
+        else {
             continue;
         };
         edges.push(Edge {

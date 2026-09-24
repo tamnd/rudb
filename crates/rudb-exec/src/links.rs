@@ -244,7 +244,10 @@ fn verdict(
             };
         }
         if link.parent.columns.len() != 1 {
-            return (Cardinality::Unverified.label(), Some("no link is built over a key this wide"));
+            return (
+                Cardinality::Unverified.label(),
+                Some("no link is built over a key this wide"),
+            );
         }
         // A build that looked and decided against it is a fourth answer, and the note says so
         // without saying why, because the record keeps the size and not the reason. The two

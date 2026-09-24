@@ -2469,9 +2469,12 @@ fn marks_through(plan: &Plan, input: NodeRef, groups: Slice, aggregates: Slice) 
     }
     let keys = plan.expr_list(groups);
     let calls = plan.expr_list(aggregates);
-    let plain =
-        calls.iter().all(|&call| matches!(plan.expr(call), Expr::Aggregate { distinct: false, .. }));
-    !keys.is_empty() && plain && !keys.iter().chain(calls).any(|&expr| rudb_opt::volatile(plan, expr))
+    let plain = calls
+        .iter()
+        .all(|&call| matches!(plan.expr(call), Expr::Aggregate { distinct: false, .. }));
+    !keys.is_empty()
+        && plain
+        && !keys.iter().chain(calls).any(|&expr| rudb_opt::volatile(plan, expr))
 }
 
 #[cfg(test)]
