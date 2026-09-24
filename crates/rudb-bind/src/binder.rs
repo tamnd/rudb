@@ -20,9 +20,9 @@ use rudb_common::{
     Error, Field, LogicalType, Result, Semantics, Session, ShowBehavior, Span, Stat, Value,
 };
 use rudb_functions::{
-    Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TableFunction, csv_fields,
-    csv_given, files, is_file, is_pattern, kind_of, parquet_footers, parquet_outline, resolve,
-    resolve_pragma, resolve_table,
+    Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
+    csv_fields, csv_given, files, is_file, is_pattern, kind_of, parquet_footers, parquet_outline,
+    resolve, resolve_pragma, resolve_table,
 };
 use rudb_kernels::{percentage, row_count};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
@@ -262,6 +262,10 @@ pub(crate) struct Binder<'a> {
     /// The type and the default of each column an `INSERT` writes, handed to the `VALUES` right
     /// under it so that a `DEFAULT` item there can be the default of the column it lands in.
     pub(crate) insert_defaults: Option<Vec<(LogicalType, Option<String>)>>,
+    /// The columns a `COPY t FROM` loads, in the order the file holds them, handed to the
+    /// `read_csv` the statement was rewritten into so that the file is read as the table's types
+    /// under the table's names rather than as whatever the sniffer guessed.
+    pub(crate) copy_into: Option<Vec<Field>>,
     /// Whether a `DEFAULT` binds as a null that the statement replaces afterwards, which is what an
     /// `UPDATE` does with `SET c = DEFAULT`.
     pub(crate) default_as_null: bool,
@@ -337,6 +341,7 @@ impl<'a> Binder<'a> {
             want_ascending: false,
             upsert: false,
             insert_defaults: None,
+            copy_into: None,
             default_as_null: false,
             in_aggregate: false,
             in_filter: false,
@@ -2192,10 +2197,18 @@ impl<'a> Binder<'a> {
                         mirrorable = Some(path);
                     }
                 }
+                let copy_into = match columns {
+                    Columns::Csv => self.copy_into.take(),
+                    _ => None,
+                };
                 let mut fields = match columns {
+                    Columns::Csv if copy_into.is_some() => {
+                        let into = copy_into.unwrap_or_default();
+                        self.copy_fields(&paths, &options.given, &into, &mut written_options)?
+                    }
                     // Parquet takes the first file's footer as the answer and CSV sniffs all of
                     // them, which is not a choice made here. See `csv_fields`.
-                    Columns::Csv => csv_fields(&paths, options.given)?,
+                    Columns::Csv => csv_fields(&paths, options.given.clone())?,
                     _ => {
                         let footers = self.footers(&paths, mirrorable.as_deref())?;
                         if let Some(path) = mirrorable.as_deref() {
@@ -2259,6 +2272,54 @@ impl<'a> Binder<'a> {
             &label,
             &names,
         )
+    }
+
+    /// The columns of the `read_csv` a `COPY t FROM` became, which are the table's.
+    ///
+    /// The file is still sniffed, since the delimiter and whether the first line is a header are
+    /// still the file's to say when the statement did not, and so is how many columns it has. That
+    /// has to be how many the statement loads, and a file that disagrees gets the line of DuckDB's
+    /// sniffer error that says so. The rest of that error is a list of fixes for a sniffer this one
+    /// is not, and is left out.
+    ///
+    /// The names go into the plan as a `names` parameter and the flag that the types were set as
+    /// `types_set`, because the executor opens the file again from what the plan says, and the
+    /// columns it finds have to be the ones the plan was built against. The types need nothing,
+    /// since the executor already reads a CSV file as the types the plan holds.
+    fn copy_fields(
+        &mut self,
+        paths: &[String],
+        given: &Given,
+        into: &[Field],
+        written: &mut Vec<(&'static str, Value, ExprRef)>,
+    ) -> Result<Vec<Field>> {
+        let sniffed = csv_fields(paths, given.clone())?;
+        if sniffed.len() != into.len() {
+            let set: Vec<String> =
+                into.iter().map(|field| format!("'{}' : '{}'", field.name, field.ty)).collect();
+            return Err(Error::invalid_input(format!(
+                "Error when sniffing file \"{}\".\nIt was not possible to automatically detect the \
+                 CSV parsing dialect\n* Columns are set as: \"columns = {{ {}}}\", and they \
+                 contain: {} columns. It does not match the number of columns found by the \
+                 sniffer: {}. Verify the columns parameter is correctly set.",
+                paths.first().map_or("", String::as_str),
+                set.join(", "),
+                into.len(),
+                sniffed.len()
+            )));
+        }
+        let names: Vec<Value> =
+            into.iter().map(|field| Value::Varchar(field.name.clone())).collect();
+        let names = Value::List { element: LogicalType::Varchar, values: names };
+        let list = LogicalType::List(Box::new(LogicalType::Varchar));
+        for (parameter, value, ty) in
+            [("names", names, list), (TYPES_SET, Value::Boolean(true), LogicalType::Boolean)]
+        {
+            let reference = self.plan.add_value(value.clone());
+            let expr = self.plan.add_expr(Expr::Constant(reference), ty);
+            written.push((parameter, value, expr));
+        }
+        Ok(into.to_vec())
     }
 
     /// `pragma_table_info('t')` or `pragma_show('t')`, answered while it is bound.
@@ -2433,17 +2494,26 @@ impl<'a> Binder<'a> {
                 candidates.join("\n")
             )));
         };
-        let Expr::Constant(reference) = *self.plan.expr(expr) else {
+        // Folded rather than read off a literal, for the reason [`Binder::file_patterns`] gives: a
+        // list is a call to `list_value`, and `nullstr = ['NA', '-']` has to arrive as a list.
+        let Some(value) = fold::value_of(&self.plan, expr)? else {
             return Err(Error::not_implemented(format!(
                 "the named parameter {parameter} with a value that is not a constant"
             )));
         };
-        let value = self.plan.value(reference).clone();
         if value == Value::Null {
             return Err(Error::binder(null_parameter(function, parameter)));
         }
         let given = self.plan.expr_type(expr).clone();
-        if given != *wanted {
+        // `nullstr` takes one string or a list of them, which is the one parameter so far that
+        // takes two types, and the parameter table has room for one.
+        let listed = *parameter == "nullstr" && given == LogicalType::list(LogicalType::Varchar);
+        if *parameter == "nullstr" && given != *wanted && !listed {
+            return Err(Error::binder(
+                "CSV Reader function option \"nullstr\" requires a string or a list as input",
+            ));
+        }
+        if given != *wanted && !listed {
             return Err(Error::not_implemented(format!(
                 "the named parameter {parameter} given a {given} where a {wanted} was wanted"
             )));

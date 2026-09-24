@@ -494,6 +494,13 @@ pub struct Insert {
     pub returning: Option<QueryRef>,
     /// What an `INSERT` does with a row whose key the table already holds, when it said.
     pub conflict: Option<Conflict>,
+    /// Whether this is a `COPY t FROM 'file'`, held as `INSERT INTO t SELECT * FROM
+    /// read_csv('file', ...)`.
+    ///
+    /// The two differ in one way the rewrite cannot say by itself, which is that `COPY` reads the
+    /// file as the table's column types rather than as the ones the sniffer would pick and then
+    /// casts. The binder hands the table's columns to the `read_csv` under it when this is set.
+    pub copy: bool,
 }
 
 /// `ON CONFLICT`, `INSERT OR REPLACE` or `INSERT OR IGNORE`.

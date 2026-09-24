@@ -47,7 +47,12 @@ pub struct Dialect {
 /// A given value also changes the block DuckDB prints under a conversion error, where a line reads
 /// `(Set By User)` rather than `(Auto-Detected)`, which is why this is carried into the reader
 /// rather than folded into a [`Dialect`] and forgotten.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// The last three are not punctuation, and they are here because they travel the same road: the
+/// binder works them out from the call to sniff the file with and the executor works them out again
+/// from the plan to read it with, and a second struct beside this one would be a second thing for
+/// the two ends to keep in step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Given {
     /// The byte between two fields.
     pub delimiter: Option<u8>,
@@ -57,6 +62,24 @@ pub struct Given {
     pub escape: Option<u8>,
     /// Whether the first line names the columns.
     pub header: Option<bool>,
+    /// The strings that read as a null, which is `nullstr` on a call and `NULL` on a `COPY`.
+    ///
+    /// `None` is DuckDB's default, where an empty field is a null. A field is compared once its
+    /// quotes and escapes are gone, so `"NA"` is as much a null as `NA` is, and with any list here
+    /// an empty field is an empty string rather than a null. Both were measured on
+    /// `v2.0.0-dev84237`, where `allow_quoted_nulls` is on unless it is turned off, and it cannot
+    /// be turned off here.
+    pub nulls: Option<Vec<String>>,
+    /// What to call the columns, first column first, in place of what the header or the generator
+    /// called them. A list shorter than the file names the columns it reaches.
+    pub names: Option<Vec<String>>,
+    /// Whether the column types are the caller's rather than the sniffer's, which is what `COPY t
+    /// FROM` does with the table's.
+    ///
+    /// The reader converts to whatever types it is told either way. What this changes is the error
+    /// for a value that does not convert, which tells somebody who set the type to look at the data
+    /// and somebody who did not to set one.
+    pub typed: bool,
 }
 
 impl Given {
@@ -64,6 +87,17 @@ impl Given {
     #[must_use]
     pub fn shown(given: Option<u8>, sniffed: Option<u8>) -> String {
         format!("{} {}", Dialect::shown(sniffed), Self::source(given.is_some()))
+    }
+
+    /// The strings that read as a null, with DuckDB's default of the empty string written out as
+    /// `None` so that a caller who wrote `NULL ''` gets the same fast test as one who wrote nothing.
+    #[must_use]
+    pub fn null_strings(&self) -> Option<Vec<Vec<u8>>> {
+        match self.nulls.as_deref() {
+            None => None,
+            Some([only]) if only.is_empty() => None,
+            Some(nulls) => Some(nulls.iter().map(|text| text.as_bytes().to_vec()).collect()),
+        }
     }
 
     /// What the block calls a value the caller gave and one it worked out.

@@ -276,17 +276,24 @@ impl TableFunction {
             ("binary_as_string", LogicalType::Boolean),
             ("file_row_number", LogicalType::Boolean),
         ];
-        static READ_CSV: &[(&str, LogicalType)] = &[
-            ("all_varchar", LogicalType::Boolean),
-            ("delim", LogicalType::Varchar),
-            ("escape", LogicalType::Varchar),
-            ("header", LogicalType::Boolean),
-            ("quote", LogicalType::Varchar),
-            ("sep", LogicalType::Varchar),
-        ];
+        // Built on first use rather than written out as a constant, because `names` takes a list
+        // and a list type holds its element in a box, which a constant cannot make.
+        static READ_CSV: std::sync::LazyLock<Vec<(&str, LogicalType)>> =
+            std::sync::LazyLock::new(|| {
+                vec![
+                    ("all_varchar", LogicalType::Boolean),
+                    ("delim", LogicalType::Varchar),
+                    ("escape", LogicalType::Varchar),
+                    ("header", LogicalType::Boolean),
+                    ("names", LogicalType::list(LogicalType::Varchar)),
+                    ("nullstr", LogicalType::Varchar),
+                    ("quote", LogicalType::Varchar),
+                    ("sep", LogicalType::Varchar),
+                ]
+            });
         match self {
             Self::ReadParquet => READ_PARQUET,
-            Self::ReadCsv => READ_CSV,
+            Self::ReadCsv => READ_CSV.as_slice(),
             _ => &[],
         }
     }

@@ -1686,7 +1686,15 @@ fn insert(
         if matches!(ast.query(written.source).body, ast::QueryBody::Values(_)) {
             binder.insert_defaults = Some(targets.iter().map(|&at| defaults[at].clone()).collect());
         }
-        binder.bind_query(ast, written.source)?
+        // A `COPY t FROM 'file'` reads the file as the columns it lands in, the way DuckDB does,
+        // so a value that does not fit is the reader's conversion error on its line rather than a
+        // cast failing later with no line to point at. The `read_csv` under it takes the columns.
+        if written.copy {
+            binder.copy_into = Some(targets.iter().map(|&at| fields[at].clone()).collect());
+        }
+        let bound = binder.bind_query(ast, written.source)?;
+        binder.copy_into = None;
+        bound
     };
     let targets = if written.source == NONE { Vec::new() } else { targets };
     if scope.len() != targets.len() {
