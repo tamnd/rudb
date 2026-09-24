@@ -411,7 +411,7 @@ const fn slot_tag(hash: u64) -> u32 {
 }
 
 /// Cuts a chunk's slots into runs of one slot, each given as its slot and the row it ends before,
-/// when they come in runs at least [`RUN_ROWS`] long on average.
+/// when they come in runs long enough for the `users` calls that will read them to pay for the pass.
 ///
 /// One pass, and most of it sixteen slots at a time: a block that holds nothing but the slot of
 /// the run it is in is an or of sixteen differences the compiler does as a few vector
@@ -420,12 +420,18 @@ const fn slot_tag(hash: u64) -> u32 {
 /// instructions a row it cost more than the counting loop it was there to replace. A chunk of keys
 /// in no order is given up on as soon as it has more runs than it is allowed. `false`, with `into`
 /// empty, for a chunk that is not worth it.
-fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>) -> bool {
+///
+/// The budget is [`RUN_ROWS`] rows a run for each call that will read the runs, because the pass is
+/// paid once a chunk however many read it and each one that does saves a pass of its own. q01 reads
+/// them eight times over a mean run of 2.81 rows, and a flat eight rows a run gave up on every chunk
+/// of it, while q09 and q13 read them once and cutting their chunks costs more than it returns. See
+/// #1633.
+fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>, users: usize) -> bool {
     into.clear();
     let Some(&first) = slots.first() else {
         return false;
     };
-    let most = slots.len() / RUN_ROWS;
+    let most = slots.len().saturating_mul(users) / RUN_ROWS;
     let mut current = first;
     let mut row = 0;
     while row < slots.len() {
@@ -449,8 +455,9 @@ fn slot_runs_of(slots: &[usize], into: &mut Vec<(usize, usize)>) -> bool {
     true
 }
 
-/// How many rows a run of one slot has to hold on average for [`slot_runs_of`] to cut a chunk
-/// into runs, which is where folding a run at once costs less than the pass that finds them.
+/// How many rows a run of one slot has to hold on average, per call that will read the runs, for
+/// [`slot_runs_of`] to cut a chunk into runs, which is where folding a run at once costs less than
+/// the pass that finds them.
 const RUN_ROWS: usize = 8;
 
 /// A bucket for a group at this slot with this hash, or an error when the partition is too large.
@@ -2178,7 +2185,28 @@ impl<'a> Aggregate<'a> {
         // and then each aggregate takes a run of rows into one group at once rather than a row at
         // a time. The pass that finds out is one compare a row, so it is only taken where the
         // slots can come in runs at all, which is a key whose rows are grouped together.
-        let by_runs = runs_found || slot_runs_of(slots, slot_runs);
+        //
+        // How many of this chunk's calls would read the runs decides whether finding them pays, so
+        // it is counted here and handed to `slot_runs_of` as its budget. The count loop below reads
+        // them once, and a call that goes by vector, that is affine, that is `DISTINCT` or that
+        // carries a `FILTER` never reaches the run path at all.
+        let users = if self.count_only {
+            1
+        } else if self.compact_numeric {
+            0
+        } else {
+            self.calls
+                .iter()
+                .enumerate()
+                .filter(|&(at, call)| {
+                    !self.by_vector[at]
+                        && call.affine.is_none()
+                        && !call.distinct
+                        && filters[at].is_none()
+                })
+                .count()
+        };
+        let by_runs = runs_found || slot_runs_of(slots, slot_runs, users);
         if self.count_only {
             if by_runs {
                 let mut start = 0;
@@ -6352,7 +6380,7 @@ mod tests {
         let slots: Vec<usize> =
             lengths.iter().flat_map(|&(slot, length)| std::iter::repeat_n(slot, length)).collect();
         let mut runs = Vec::new();
-        assert!(slot_runs_of(&slots, &mut runs));
+        assert!(slot_runs_of(&slots, &mut runs, 1));
         let mut end = 0;
         let expected: Vec<(usize, usize)> = lengths
             .iter()
@@ -6363,12 +6391,27 @@ mod tests {
             .collect();
         assert_eq!(runs, expected);
         let one = vec![7; 1_000];
-        assert!(slot_runs_of(&one, &mut runs));
+        assert!(slot_runs_of(&one, &mut runs, 1));
         assert_eq!(runs, [(7, 1_000)]);
         let scattered: Vec<usize> = (0..1_000).map(|row| row * 7 % 13).collect();
-        assert!(!slot_runs_of(&scattered, &mut runs));
+        assert!(!slot_runs_of(&scattered, &mut runs, 1));
         assert!(runs.is_empty());
-        assert!(!slot_runs_of(&[], &mut runs));
+        assert!(!slot_runs_of(&[], &mut runs, 1));
+    }
+
+    /// The budget is per call that will read the runs, so slots one call gives up on are cut for
+    /// eight, which is the shape of q01: runs of one or two rows that eight aggregates all read.
+    #[test]
+    fn slots_too_broken_up_for_one_call_are_cut_for_eight_of_them() {
+        let scattered: Vec<usize> = (0..1_000).map(|row| row * 7 % 13).collect();
+        let mut runs = Vec::new();
+        assert!(!slot_runs_of(&scattered, &mut runs, 1));
+        assert!(slot_runs_of(&scattered, &mut runs, 8));
+        assert_eq!(runs.len(), 1_000);
+        assert_eq!(runs.last(), Some(&(scattered[999], 1_000)));
+        // No call reading them is a chunk nobody would pay the pass for.
+        assert!(!slot_runs_of(&scattered, &mut runs, 0));
+        assert!(runs.is_empty());
     }
 
     #[test]

@@ -1359,6 +1359,9 @@ pub fn update_runs(
             match data {
                 $(Data::$variant(values) => {
                     let values = &values.as_slice()[..rows];
+                    if few_runs(states, runs, stride, offset, values, feed)? {
+                        return Ok(true);
+                    }
                     let mut start = 0;
                     for &(slot, end) in runs {
                         let run = &values[start..end];
@@ -1906,6 +1909,119 @@ fn few<V: Fn(usize) -> i128>(
                 *seen += count;
             }
             _ => return Err(Error::internal("a total per group into another state".to_string())),
+        }
+    }
+    Ok(true)
+}
+
+/// [`few`] over runs rather than rows, for the shape where a chunk comes in runs and there are few
+/// groups to put them in.
+///
+/// [`update_runs`] reaches the accumulator once per run rather than once per row, which is the right
+/// first move and is not enough. Measured on server2 at SF1, TPC-H q01's mean run of equal
+/// `(l_returnflag, l_linestatus)` is 2.81 rows, so a fixed cost per run is a cost per three rows,
+/// and what `update_runs` pays per run is the slot resolved, the accumulator array indexed, the
+/// state enum matched, a call to [`run_total`] and a checked add into an `i128`. That came to more
+/// than the row at a time scatter it replaces, which is why lowering the threshold that lets
+/// `slot_runs_of` cut a chunk at all made q01 monotonically worse, up to nine percent at two rows a
+/// run. See #1633.
+///
+/// The fact that makes the fixed cost avoidable rather than merely smaller is that q01 has four
+/// groups. Two million runs are landing in four accumulators. So this keeps one `i64` local per
+/// group, adds each run into the local for its slot, and folds each local into its accumulator once
+/// for the whole call. Per run that is a slot, a bounds check and an add, and per row inside a run
+/// it is a load and an `i64` add.
+///
+/// `i64` rather than the `i128` the accumulators hold, because that halves the add and the traffic
+/// and because every add here is checked anyway: a local sum that would leave the range hands the
+/// whole call back to the loop below instead, which is where the `i128` lives. Handing back is free
+/// of consequence because nothing in `states` is written until every run has been read, so a call
+/// that gives up halfway leaves the accumulators exactly as it found them and the caller's loop
+/// reads the same runs again and reaches the same answer.
+///
+/// `false` for more groups than [`FEW`], for a call with too few rows to pay for clearing the
+/// locals, for anything but an exact total or an exact mean, and for a value that does not fit an
+/// `i64`, which is only ever a 128 bit column.
+///
+/// # Errors
+///
+/// The overflow the fold raises, as [`few`] raises it, and an internal error for a local total
+/// folded into a state whose feed does not fit, which is a bug in the caller rather than anything a
+/// query can cause.
+fn few_runs<T: Copy + TryInto<i64>>(
+    states: &mut [Accumulator],
+    runs: &[(usize, usize)],
+    stride: usize,
+    offset: usize,
+    values: &[T],
+    feed: Feed,
+) -> Result<bool> {
+    let groups = states.len().checked_div(stride).unwrap_or(usize::MAX);
+    if groups > FEW
+        || groups.saturating_mul(4) > values.len()
+        || !matches!(feed, Feed::Total | Feed::Whole { .. })
+    {
+        return Ok(false);
+    }
+    // A mean that has already gone inexact adds its rows one at a time, because it is a float by
+    // then and the order the rows reach it decides how it rounds. Folding a run's total into one
+    // would round differently, so a call that would touch one of those hands the whole thing back.
+    // The loop below then takes it a row at a time, which is what [`update_runs`] documents. Asked
+    // here rather than in the fold, because the fold writes as it goes and giving up there would
+    // leave some groups folded and some not.
+    if matches!(feed, Feed::Whole { .. }) {
+        for slot in 0..groups {
+            let Some(held) = states.get(slot * stride + offset) else { return Ok(false) };
+            if matches!(held.state, State::Mean { exact: false, .. }) {
+                return Ok(false);
+            }
+        }
+    }
+    let mut totals = vec![0_i64; groups];
+    // Separate from the totals because a mean needs how many rows it saw and a total needs only
+    // whether it saw one, and both are per run here rather than per row.
+    let mut counts = vec![0_i64; groups];
+    let mut start = 0;
+    for &(slot, end) in runs {
+        let Some(run) = values.get(start..end) else { return Ok(false) };
+        start = end;
+        if slot == NOWHERE {
+            continue;
+        }
+        // A slot past the groups is a bug elsewhere, and nothing has been folded yet, so the loop
+        // below gets to say so.
+        let (Some(total), Some(count)) = (totals.get_mut(slot), counts.get_mut(slot)) else {
+            return Ok(false);
+        };
+        let mut sum = *total;
+        for &value in run {
+            let Ok(value) = value.try_into() else { return Ok(false) };
+            let Some(next) = sum.checked_add(value) else { return Ok(false) };
+            sum = next;
+        }
+        *total = sum;
+        *count += run.len() as i64;
+    }
+    for (slot, &number) in totals.iter().enumerate() {
+        if counts[slot] == 0 {
+            continue;
+        }
+        let number = i128::from(number);
+        let index = slot * stride + offset;
+        match (&mut states[index].state, feed) {
+            (State::Whole { total, seen, .. } | State::Scaled { total, seen, .. }, Feed::Total) => {
+                *total = total.checked_add(number).ok_or_else(overflowed)?;
+                *seen = true;
+            }
+            (State::Mean { total, seen, exact, scale: held, .. }, Feed::Whole { scale }) => {
+                *held = scale;
+                match total.checked_add(number).filter(|_| *exact) {
+                    Some(sum) => *total = sum,
+                    None => widened(total, exact, number),
+                }
+                *seen += counts[slot];
+            }
+            _ => return Err(Error::internal("a run total into another state".to_string())),
         }
     }
     Ok(true)
@@ -3670,6 +3786,50 @@ mod tests {
                     if covered {
                         assert_eq!(taken, Some(true), "{note} is taken a run at a time");
                     }
+                }
+            }
+        }
+    }
+
+    /// [`few_runs`] keeps its per group total in an `i64`, and a column of 128 bit values is where
+    /// that runs out. Both ways it can run out are here: a single value too large to become an `i64`
+    /// at all, and a pile of values that each fit and whose total does not. Either hands the call
+    /// back to the run loop, and the answer has to be the same one a row at a time reaches, which is
+    /// what the handback being free of consequence means.
+    #[test]
+    fn a_total_too_large_for_an_i64_local_still_answers_what_a_row_at_a_time_answers() {
+        let rows = 40;
+        let slots: Vec<usize> = (0..rows).map(|row| row / 10).collect();
+        let runs: Vec<(usize, usize)> = (0..4).map(|group| (group, (group + 1) * 10)).collect();
+        let huge = i128::from(i64::MAX);
+        let cases = [
+            ("one value past an i64", vec![Value::HugeInt(huge + 1); rows]),
+            ("a total past an i64", vec![Value::HugeInt(huge / 4); rows]),
+        ];
+        for (note, values) in &cases {
+            let column = Vector::from_values(LogicalType::HugeInt, values).expect("huge integers");
+            for name in ["sum", "avg"] {
+                let returns = returns_of(name, &LogicalType::HugeInt);
+                let fresh = || {
+                    let mut states = Vec::new();
+                    for _ in 0..4 * STRIDE {
+                        states.push(Accumulator::new(name, &returns).expect("known"));
+                    }
+                    states
+                };
+                let (mut by_run, mut by_row) = (fresh(), fresh());
+                let took = update_runs(&mut by_run, &runs, STRIDE, OFFSET, Some(&column), rows)
+                    .expect("folds them in");
+                assert!(took, "{name} over {note} is still taken a run at a time");
+                update_scattered(&mut by_row, &slots, STRIDE, OFFSET, Some(&column), rows)
+                    .expect("folds them in");
+                for group in 0..4 {
+                    let at = group * STRIDE + OFFSET;
+                    assert_eq!(
+                        by_run[at].finish().expect("finishes"),
+                        by_row[at].finish().expect("finishes"),
+                        "{name} over {note}, group {group}"
+                    );
                 }
             }
         }
