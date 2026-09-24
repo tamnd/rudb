@@ -445,7 +445,7 @@ pub(crate) fn node_columns(
 ///
 /// Copying is where it matters. A pass that moves an expression somewhere else is fine either way,
 /// and a pass that writes it down twice has turned one call into two.
-pub(crate) fn volatile(plan: &Plan, expr: ExprRef) -> bool {
+pub fn volatile(plan: &Plan, expr: ExprRef) -> bool {
     match *plan.expr(expr) {
         Expr::Column(_) | Expr::Constant(_) | Expr::LambdaParam(_) => false,
         Expr::Cast { input, .. } | Expr::Lambda { body: input, .. } => volatile(plan, input),

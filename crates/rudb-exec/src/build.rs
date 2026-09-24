@@ -260,6 +260,7 @@ fn build_measured_with_sink<'a>(
         armed: Vec::new(),
         cutoff: None,
         top_counts: Vec::new(),
+        marking: None,
         held: Vec::new(),
     };
     let segment = building.node(plan.root())?;
@@ -1244,6 +1245,10 @@ struct Building<'a, 'b> {
     /// Aggregates whose parent TopN orders by COUNT descending, its count plus offset, and which
     /// call of the aggregate that count is.
     top_counts: Vec<(NodeRef, usize, usize)>,
+    /// The filter directly under an aggregate that reads a marked chunk, for the filter arm to tell
+    /// the scan or the filter operator to mark the rows it keeps rather than cut them. See
+    /// [`marks_through`].
+    marking: Option<NodeRef>,
     /// The materialisations whose bodies are being walked, innermost last.
     held: Vec<Held>,
 }
@@ -1804,7 +1809,10 @@ impl<'a> Building<'a, '_> {
                 return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
             }
         }
-        let below = self.node(input)?;
+        self.marking = marks_through(self.plan, input, groups, aggregates).then_some(input);
+        let below = self.node(input);
+        self.marking = None;
+        let below = below?;
         let (aggregate, out) =
             Aggregate::new(self.plan, &below.schema, index, groups, aggregates, self.memory)?;
         let aggregate = aggregate.in_session(self.session);
@@ -2124,6 +2132,7 @@ impl<'a> Building<'a, '_> {
                 below.then(Arc::new(Watched::new(fetch, counters)), schema)
             }
             Node::Filter { input, predicate } => {
+                let marks = self.marking == Some(reference);
                 self.pruning = rudb_opt::bounds::of(plan, input, predicate);
                 // Which filters can go is not decided here, because `EXPLAIN` has to say the same
                 // thing about the same plan and a second copy of the condition is a second chance
@@ -2133,6 +2142,7 @@ impl<'a> Building<'a, '_> {
                     predicate,
                     tests: moved.tests,
                     whole: moved.whole,
+                    marks,
                 });
                 // Whether there was an offer at all, held here because afterwards the field says
                 // only whether there is one now. Gone can mean taken or it can mean never made, and
@@ -2174,7 +2184,8 @@ impl<'a> Building<'a, '_> {
                 }
                 let schema = below.schema.clone();
                 let filter = Filter::new(plan, reference, predicate, &schema, self.seams)?
-                    .in_session(self.session);
+                    .in_session(self.session)
+                    .marking(marks);
                 let counters = self.watch(reference, id, pipeline, "Filter", None);
                 below.then(Arc::new(Watched::new(filter, counters)), schema)
             }
@@ -2419,6 +2430,25 @@ impl<'a> Building<'a, '_> {
         };
         Ok(segment)
     }
+}
+
+/// Whether the filter under an aggregate can mark the rows it keeps rather than cut them out.
+///
+/// The aggregate then reads its keys at the kept rows alone and its arguments over the whole chunk,
+/// and counts a dropped row into no group. That is sound only where reading an argument at a row
+/// the filter dropped changes nothing, so every key and argument has to be free of calls like
+/// `nextval` whose answer is not decided by their arguments. An argument that raises at a dropped
+/// row is read again at the kept rows alone, see `Aggregate::read`. A `DISTINCT` call and an
+/// aggregate with no groups read their rows through paths of their own and are left as they were.
+fn marks_through(plan: &Plan, input: NodeRef, groups: Slice, aggregates: Slice) -> bool {
+    if !matches!(plan.node(input), Node::Filter { .. }) {
+        return false;
+    }
+    let keys = plan.expr_list(groups);
+    let calls = plan.expr_list(aggregates);
+    let plain =
+        calls.iter().all(|&call| matches!(plan.expr(call), Expr::Aggregate { distinct: false, .. }));
+    !keys.is_empty() && plain && !keys.iter().chain(calls).any(|&expr| rudb_opt::volatile(plan, expr))
 }
 
 #[cfg(test)]
