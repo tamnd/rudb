@@ -523,6 +523,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rudb-qc-gen"
+version = "0.4.32"
+dependencies = [
+ "rudb-common",
+ "rudb-plan",
+ "rudb-qc-interp",
+ "rudb-qc-ir",
+ "rudb-qc-pipe",
+ "rudb-qc-plan",
+ "rudb-qc-rt",
+]
+
+[[package]]
 name = "rudb-qc-interp"
 version = "0.4.32"
 dependencies = [
@@ -532,6 +545,23 @@ dependencies = [
 [[package]]
 name = "rudb-qc-ir"
 version = "0.4.32"
+
+[[package]]
+name = "rudb-qc-pipe"
+version = "0.4.32"
+dependencies = [
+ "rudb-common",
+ "rudb-plan",
+ "rudb-qc-plan",
+]
+
+[[package]]
+name = "rudb-qc-plan"
+version = "0.4.32"
+dependencies = [
+ "rudb-common",
+ "rudb-plan",
+]
 
 [[package]]
 name = "rudb-qc-rt"

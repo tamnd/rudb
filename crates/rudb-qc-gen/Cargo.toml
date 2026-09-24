@@ -1,0 +1,27 @@
+[package]
+name = "rudb-qc-gen"
+description = "The query compiler's generator: one QIR function per pipeline, with the state layout the driver sets up for it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+rudb-common.workspace = true
+rudb-plan.workspace = true
+rudb-qc-ir.workspace = true
+rudb-qc-pipe.workspace = true
+rudb-qc-plan.workspace = true
+rudb-qc-rt.workspace = true
+
+[dev-dependencies]
+rudb-qc-interp.workspace = true
+
+[lints]
+workspace = true
