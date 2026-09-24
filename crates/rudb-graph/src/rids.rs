@@ -347,6 +347,9 @@ impl Rids {
         if self.is_full() && link.linked() == children {
             return Ok(Pushed { rids: Self::full(children), parts, skipped: 0, stopped: false });
         }
+        if let (Body::Sparse(members), Some(_)) = (&self.body, link.runs()) {
+            return Self::push_members(members, link, children, parts);
+        }
         if let Some(runs) = link.runs() {
             return Ok(self.push_runs(runs, children, parts, stopping));
         }
@@ -453,6 +456,56 @@ impl Rids {
         let skipped =
             count(words.chunks(per_part).filter(|part| part.iter().all(|&word| word == 0)).count());
         Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
+    }
+
+    /// The push of a sparse set over a monotone link, a member at a time.
+    ///
+    /// A member's children are one run that [`Link::backward`] finds with two selects, so this costs
+    /// what the set holds and not what the parent holds. On TPC-H q18 the set is the 57 orders over
+    /// 300 in quantity, and [`Self::push_runs`] stepped over all 1.5 million orders to find their
+    /// 399 lines. The early stop is not asked, since a sparse set holds at most one parent in
+    /// [`SPARSE_RATIO`] and the answer is exact either way.
+    fn push_members(members: &[Rid], link: &Link, children: u64, parts: u64) -> Result<Pushed> {
+        let mut kept = Vec::new();
+        for &member in members {
+            let children = link.backward(member).ok_or_else(|| {
+                Error::internal(format!("parent {member} has no run in a monotone link"))
+            })?;
+            kept.extend(children);
+        }
+        let part = count(PART_ROWS);
+        let reached = count(kept.chunk_by(|a, b| a / part == b / part).count());
+        Ok(Pushed {
+            rids: Self::settle_sparse(children, kept),
+            parts,
+            skipped: parts.saturating_sub(reached),
+            stopped: false,
+        })
+    }
+
+    /// The members from `first` for `len` rows, as offsets from `first`, in order.
+    ///
+    /// What a scan keeps of a part the set was pushed into. A sparse set answers from the members in
+    /// the range, which is one search and then the members, where testing each row of the part was
+    /// a search a row.
+    #[must_use]
+    pub fn offsets_in(&self, first: Rid, len: usize) -> Vec<u32> {
+        let end = first.saturating_add(count(len)).min(self.rows);
+        let offset = |rid: Rid| u32::try_from(rid - first).unwrap_or(u32::MAX);
+        match &self.body {
+            Body::Full => (first..end).map(offset).collect(),
+            Body::Sparse(members) => {
+                let from = members.partition_point(|&member| member < first);
+                members[from..]
+                    .iter()
+                    .take_while(|&&member| member < end)
+                    .map(|&m| offset(m))
+                    .collect()
+            }
+            Body::Dense { words, .. } => {
+                (first..end).filter(|&rid| bit(words, rid)).map(offset).collect()
+            }
+        }
     }
 
     /// Pushes a set of child rows backward through `link`, to the parents they point at.
@@ -825,6 +878,56 @@ mod tests {
                 .filter(|part| !expected.iter().any(|child| child / count(PART_ROWS) == *part))
                 .count();
             assert_eq!(pushed.skipped, count(untouched), "{:?}", set.form());
+        }
+    }
+
+    /// A sparse set over a monotone link is pushed a member at a time. The answer and the parts it
+    /// skips are the same as the definition's, including a member with no children, the last parent
+    /// and a member whose run crosses a part.
+    #[test]
+    fn a_sparse_push_a_member_at_a_time_keeps_exactly_the_children_of_its_members() {
+        let parents: u64 = 20 * SPARSE_RATIO;
+        let sizes: Vec<u64> =
+            (0..parents).map(|p| if p % 1000 == 42 { 3000 } else { p % 5 }).collect();
+        let of: Vec<Rid> =
+            (0..parents).flat_map(|p| std::iter::repeat_n(p, index(sizes[index(p)]))).collect();
+        let children = count(of.len());
+        let link = Link::build(&of, parents).expect("a link");
+        assert_eq!(link.form(), crate::link::Form::Monotone);
+        let set =
+            Rids::from_sorted(parents, vec![0, 5, 42, 7042, 7043, parents - 1]).expect("sorted");
+        assert_eq!(set.form(), Form::Sparse);
+        let pushed = set.forward_or_stop(&link).expect("the same table");
+        let expected: Vec<Rid> =
+            (0..children).filter(|&child| set.contains(of[index(child)])).collect();
+        assert_eq!(members(&pushed.rids), expected);
+        let parts = children.div_ceil(count(PART_ROWS));
+        let untouched = (0..parts)
+            .filter(|part| !expected.iter().any(|child| child / count(PART_ROWS) == *part))
+            .count();
+        assert_eq!(
+            (pushed.parts, pushed.skipped, pushed.stopped),
+            (parts, count(untouched), false)
+        );
+    }
+
+    /// The offsets a scan keeps out of a part are the members in it, for each of the three forms.
+    #[test]
+    fn the_offsets_in_a_range_are_its_members_counted_from_its_start() {
+        let rows = 10 * SPARSE_RATIO;
+        let sparse = Rids::from_sorted(rows, vec![3, 100, 101, 9999]).expect("sorted");
+        let dense = Rids::from_sorted(rows, (0..rows).step_by(3).collect()).expect("sorted");
+        for set in [sparse, dense, Rids::full(rows), Rids::none(rows)] {
+            for (first, len) in [(0, 200), (100, 2), (9990, 50), (rows, 10)] {
+                let expected: Vec<u32> =
+                    (0..len).filter(|&at| set.contains(first + u64::from(at))).collect();
+                assert_eq!(
+                    set.offsets_in(first, index(u64::from(len))),
+                    expected,
+                    "{:?}",
+                    set.form()
+                );
+            }
         }
     }
 
