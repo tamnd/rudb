@@ -68,7 +68,7 @@ pub use prepare::{Building, DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepare
 pub use projection::build_sorted_projection;
 pub use run_projection::build_run_projection;
 pub use section::Section;
-pub use zones::{Common, Stripes, ascending, distincts};
+pub use zones::{Common, Stripes, ascending, distincts, widths};
 
 const MAGIC: &[u8; 8] = b"RUDBNV10";
 const DIRECTORY: &[u8; 8] = b"RUDBDI10";

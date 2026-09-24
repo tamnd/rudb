@@ -215,6 +215,28 @@ pub fn ascending(reader: &Reader) -> Vec<String> {
         .collect()
 }
 
+/// How many bytes a value of each string column takes on average, by name.
+///
+/// Read off the column's summary, which counts the bytes of every value that is not null, so this is
+/// exact as an average and says nothing about how the lengths spread. A column with no summary, or
+/// with nothing in it but nulls, is left out, and a column left out is priced as the header a string
+/// always has.
+#[must_use]
+pub fn widths(reader: &Reader) -> Vec<(String, u64)> {
+    reader
+        .table()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.ty.physical() == rudb_common::PhysicalType::Varlen)
+        .filter_map(|(at, field)| {
+            let summary = crate::stats::summary(reader, at)?;
+            let values = summary.rows.checked_sub(summary.nulls).filter(|&values| values > 0)?;
+            Some((field.name.clone(), summary.bytes.div_ceil(values)))
+        })
+        .collect()
+}
+
 /// What a native table's frequency synopsis says about one value, as the planner asks for it.
 ///
 /// Holds the reader for the reason [`Stripes`] does. The synopsis is small where it exists at all,
