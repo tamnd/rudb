@@ -1848,6 +1848,11 @@ impl<'a> Building<'a, '_> {
             Some((low, values)) => aggregate.over_range(low, values),
             None => aggregate,
         };
+        // The ends of a key too sparse for that, which its map of values starts from.
+        let aggregate = match self.plan.key_ends(index) {
+            Some((low, values)) => aggregate.within(low, values),
+            None => aggregate,
+        };
         // Whether the key arrives in ascending order, where the planner could say so.
         let aggregate = if self.plan.clustered(index) { aggregate.clustered() } else { aggregate };
         let aggregate = match bound.top_counts {

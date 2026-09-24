@@ -298,6 +298,10 @@ pub(crate) struct Aggregate<'a> {
     /// that one is a grouped count over a stable dictionary, keyed by the storage code, and it
     /// replaces the hash table rather than sitting beside it.
     span: Option<(i128, u64)>,
+    /// The ends of the one integer grouping key where `span` was turned down for being sparse,
+    /// which the map a chunk's key values are placed in is built over from the start. See
+    /// [`Aggregate::within`].
+    ends: Option<(i128, u64)>,
     /// Whether the one grouping key arrives in ascending order, so a group whose key the rows have
     /// moved past is finished and can skip the table. `rudb_opt`'s `cluster` pass is where it comes
     /// from, and [`interior`] checks every chunk before believing it.
@@ -1239,6 +1243,7 @@ impl<'a> Aggregate<'a> {
             presize: None,
             reserve: false,
             span: None,
+            ends: None,
             clustered: false,
             agreed: Mutex::new(None),
             settled: AtomicBool::new(false),
@@ -1298,6 +1303,19 @@ impl<'a> Aggregate<'a> {
     /// The range the one integer grouping key lies in, from `rudb_opt`'s `dense` pass.
     pub(crate) fn over_range(mut self, low: i128, values: u64) -> Self {
         self.span = Some((low, values));
+        self
+    }
+
+    /// The ends the one integer grouping key lies in, from `rudb_opt`'s `dense` pass, where the
+    /// range was too sparse to be `over_range`.
+    ///
+    /// Left to itself the map of key values starts on the first chunk's window and grows as the
+    /// values climb out of it. A sorted `CounterID` built seven maps a query that way, copying the
+    /// old one at each step, and the last was a new map as wide as the range, because a window
+    /// whose bottom was not the column's could not take the top in. Filled and copied, those maps
+    /// were a tenth of ClickBench 28. Seeded with the ends, it is one map filled once.
+    pub(crate) fn within(mut self, low: i128, values: u64) -> Self {
+        self.ends = Some((low, values));
         self
     }
 
@@ -2144,6 +2162,17 @@ impl<'a> Aggregate<'a> {
             away: Vec::new(),
             failure: None,
         };
+        // Only where the table is the one an instance holds before it partitions, for the reason
+        // `span` is. A key a chunk has outside the ends builds a map of its own, as it did before,
+        // so the ends being wrong costs the map and never an answer.
+        let window = self
+            .ends
+            .filter(|_| share.before_the_split() && !self.alone)
+            .and_then(|(low, values)| crate::table::seeded_window(&types, low, values));
+        if let Some((low, places)) = window {
+            local.coded_on.push(Origin::Window(low, places));
+            local.coded_map.resize(places, NOWHERE);
+        }
         if self.alone {
             local.groups = 1;
             if let Err(error) = self.fresh(&mut local.states, &mut local.counts, &mut local.compact)

@@ -112,25 +112,39 @@ impl Pass for AggregateDense {
 fn densify(plan: &mut Plan, stats: &Facts) {
     let mut found = Vec::new();
     for node in top_down(plan) {
-        let Node::Aggregate { index, groups, .. } = *plan.node(node) else {
+        let Node::Aggregate { input, index, groups, .. } = *plan.node(node) else {
             continue;
         };
         // One column and one only, for the reason in the module doc.
         let &[key] = plan.expr_list(groups) else { continue };
         let &Expr::Column(binding) = plan.expr(key) else { continue };
-        let Some(values) = range(plan, binding, stats) else { continue };
-        found.push((index, values));
+        let Some((low, values, sparse)) = range(plan, binding, stats) else { continue };
+        // A sparse range is still the window the operator's own map would grow to, a chunk at a
+        // time, copying what it had at each step. Handed over, it is one map filled once. Only
+        // where the rows arriving are at least the places, since each place is written once.
+        if sparse && estimate::rows(plan, input, stats).is_none_or(|rows| rows < values) {
+            continue;
+        }
+        found.push((index, (low, values), sparse));
     }
-    for (index, (low, values)) in found {
-        plan.densify(index, low, values);
+    for (index, (low, values), sparse) in found {
+        if sparse {
+            plan.bound_key(index, low, values);
+        } else {
+            plan.densify(index, low, values);
+        }
     }
 }
 
-/// The smallest value the key column can hold and how many values its range covers.
+/// The smallest value the key column can hold, how many values its range covers, and whether a
+/// counted distinct value says the range describes the column badly.
 ///
-/// `None` where there is no range, where the range is wider than `WIDEST`, and where a counted
-/// distinct value says the range describes the column badly.
-fn range(plan: &Plan, binding: rudb_plan::ColumnBinding, stats: &Facts) -> Option<(i128, u64)> {
+/// `None` where there is no range and where the range is wider than `WIDEST`.
+fn range(
+    plan: &Plan,
+    binding: rudb_plan::ColumnBinding,
+    stats: &Facts,
+) -> Option<(i128, u64, bool)> {
     let (low, high) = extremes::span(plan, binding, 16)?;
     // The count is inclusive of both ends and cannot overflow the subtraction, because both came
     // out of an `i128` and the range of one of those fits in a `u128`.
@@ -140,12 +154,10 @@ fn range(plan: &Plan, binding: rudb_plan::ColumnBinding, stats: &Facts) -> Optio
     }
     // A counted column gets the second test. An uncounted one does not, since there is nothing to
     // compare the range against and the size test has already been passed.
-    if let Some(&distinct) = estimate::stated(plan, binding, stats).read(DISTINCT) {
-        if distinct > 0 && values > distinct.saturating_mul(SPARSEST) {
-            return None;
-        }
-    }
-    Some((low, values))
+    let sparse = estimate::stated(plan, binding, stats)
+        .read(DISTINCT)
+        .is_some_and(|&distinct| distinct > 0 && values > distinct.saturating_mul(SPARSEST));
+    Some((low, values, sparse))
 }
 
 #[cfg(test)]
@@ -303,6 +315,21 @@ mod tests {
         let mut plan = grouped(Stub::exact(0, 999));
         run(&mut plan, &counted(Some(10)));
         assert_eq!(plan.dense_count(), 0);
+        // Still the ends of the key, which the operator's map of values starts on.
+        assert_eq!(plan.key_ends(1), Some((0, 1_000)));
+    }
+
+    #[test]
+    fn a_sparse_range_wider_than_the_rows_gives_no_ends() {
+        // Two thousand values for a thousand rows, so the map would be written more than read.
+        let mut plan = grouped(Stub::exact(0, 1_999));
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "t", 1_000);
+        facts.record_distinct("memory", "main", "t", "a", 10, Provenance::Dictionary);
+        let mut context = Context::new();
+        context.measure(Arc::new(facts));
+        run(&mut plan, &context);
+        assert_eq!((plan.dense_count(), plan.key_ends(1)), (0, None));
     }
 
     #[test]
