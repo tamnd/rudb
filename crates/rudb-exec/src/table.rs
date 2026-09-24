@@ -1396,7 +1396,8 @@ pub(crate) fn coded_within<'a>(
                 continue;
             }
             let limit = room / taken;
-            let into = (&mut values[at], &mut runs[at]);
+            // Only a key of one column is ever folded by its runs. See [`Coded::place_runs`].
+            let into = (&mut values[at], &mut runs[at], keys.len() == 1);
             let window = window_of(key, rows, held.get(at), limit, wanting == 1, into);
             match (window, fallback[at]) {
                 (Some(window), _) => {
@@ -1479,7 +1480,7 @@ fn window_of(
     held: Option<&Origin>,
     limit: usize,
     alone: bool,
-    (into, runs): (&mut Vec<i64>, &mut Vec<(i64, usize)>),
+    (into, runs, keep_runs): (&mut Vec<i64>, &mut Vec<(i64, usize)>, bool),
 ) -> Option<(i64, usize, bool)> {
     runs.clear();
     if !signed_rows(key, rows, into) {
@@ -1496,10 +1497,10 @@ fn window_of(
     // as `CounterID` comes in runs of hundreds, and this pass was a third of its fold.
     //
     // Where the value changes is where a run ends, so the runs are kept on the way for
-    // [`Coded::place_runs`], up to one for every eight rows. Past that the key is not in runs
-    // worth folding by and they are dropped.
+    // [`Coded::place_runs`], up to one for every eight rows, when the key is this column alone.
+    // Past that the key is not in runs worth folding by and they are dropped.
     let mut current = into.first().copied().unwrap_or_default();
-    let mut keeping = !nullable;
+    let mut keeping = keep_runs && !nullable;
     let most_runs = into.len() / 8 + 1;
     for (block, values) in into.chunks(128).enumerate() {
         if nullable {
