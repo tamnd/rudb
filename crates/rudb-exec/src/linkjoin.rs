@@ -221,7 +221,10 @@ impl LinkJoin {
             })?;
             columns.push(match coded(&source, rids)? {
                 Some(codes) => codes,
-                None => Vector::gathered(source, Arc::clone(&ids))?,
+                None => match fixed(&source, rids)? {
+                    Some(values) => values,
+                    None => Vector::gathered(source, Arc::clone(&ids))?,
+                },
             });
         }
         *chunk = Chunk::with_rows(columns, rows)?;
@@ -410,6 +413,34 @@ fn coded(source: &Vector, rids: &[u32]) -> Result<Option<Vector>> {
     }))
 }
 
+/// The rows `rids` names of a parent column of fixed width values, copied, or `None` for any other
+/// column or when some row has no parent.
+///
+/// A gather of a number or a date is a copy of four or eight bytes a row, which is what the ids a
+/// lazy gather would hold cost anyway, and what comes out is flat. Left as a gather it reached the
+/// arithmetic and date kernels as a form none of them read in bulk, so each read it a value at a
+/// time, and on TPC-H q09 that made the link plan slower than the hash join it replaces. A row with
+/// no parent keeps the lazy form, which is what makes it null.
+fn fixed(source: &Vector, rids: &[u32]) -> Result<Option<Vector>> {
+    match source.data() {
+        Some(Data::Empty | Data::Varlen(_)) | None => return Ok(None),
+        Some(_) => {}
+    }
+    let len = source.len();
+    let mut missing = false;
+    for &rid in rids {
+        if rid == NO_ROW {
+            missing = true;
+        } else if rid as usize >= len {
+            return Err(Error::internal("a link join gathered past the end of a parent column"));
+        }
+    }
+    if missing {
+        return Ok(None);
+    }
+    source.gather(rids).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -423,7 +454,7 @@ mod tests {
     use rudb_storage::MemoryTable;
     use rudb_vector::{Chunk, NO_ROW, Validity, Vector};
 
-    use super::{LinkJoin, coded};
+    use super::{LinkJoin, coded, fixed};
     use crate::schema::Schema;
 
     /// A parent column of codes gathers as codes into the same values, with a missing parent and a
@@ -456,6 +487,21 @@ mod tests {
         assert!(coded(&source, &[4]).is_err(), "a row past the column");
         let flat = Vector::from_values(LogicalType::Integer, &[Value::Integer(1)]).expect("flat");
         assert!(coded(&flat, &[0]).expect("a flat column").is_none());
+    }
+
+    #[test]
+    fn a_fixed_width_parent_column_gathers_flat_unless_a_row_has_no_parent() {
+        let held: Vec<Value> = [7, 8, 9].into_iter().map(Value::Integer).collect();
+        let source = Vector::from_values(LogicalType::Integer, &held).expect("flat");
+        let taken = fixed(&source, &[2, 0, 0, 1]).expect("in range").expect("a flat column");
+        assert!(taken.data().is_some(), "not flat");
+        let read: Vec<Value> = (0..4).map(|row| taken.value_at(row)).collect();
+        assert_eq!(read, [9, 7, 7, 8].map(Value::Integer));
+        assert!(fixed(&source, &[0, NO_ROW]).expect("in range").is_none());
+        assert!(fixed(&source, &[3]).is_err(), "a row past the column");
+        let words = Vector::from_values(LogicalType::Varchar, &[Value::Varchar("a".into())])
+            .expect("words");
+        assert!(fixed(&words, &[0]).expect("a string column").is_none());
     }
 
     /// A parent of `rows` rows whose one column is its own row number, so that a gathered value
@@ -619,23 +665,19 @@ mod tests {
         );
     }
 
-    /// A gather is a pointer and not a copy, which is the reason the body exists. Eight columns
-    /// off one parent are one parent between them, and one column off it is not a second copy of
-    /// the parent either.
+    /// A column of fixed width values comes out copied, one value per child row, which is the same
+    /// size the ids of a gather would be, and never as a copy of the whole parent.
     #[test]
-    fn the_parent_is_pointed_at_rather_than_copied() {
+    fn a_fixed_width_parent_column_is_one_value_per_child_row() {
         let operator = operator(JoinKind::Inner, &[Some(0); 8], 4);
         let mut chunk = child(8);
         let mut local = operator.local();
         operator.push(&mut chunk, &mut local).expect("the push");
         let gathered = chunk.column(2).expect("the parent column");
-        let (source, rids) = gathered.gathered_parts().expect("it is a gather");
-        assert_eq!(source.len(), 4, "the source is the whole parent column");
-        assert_eq!(rids.len(), 8, "one id per child row");
-        assert!(
-            gathered.footprint() < source.footprint() + 8 * 4 + 64,
-            "the parent was copied rather than pointed at"
-        );
+        assert!(gathered.data().is_some(), "a fixed width column is copied flat");
+        assert_eq!(gathered.len(), 8, "one value per child row");
+        let read: Vec<Value> = (0..8).map(|row| gathered.value_at(row)).collect();
+        assert_eq!(read, vec![Value::Integer(0); 8], "every child points at parent row 0");
     }
 
     /// A row id the plan named that is not a row id is a plan that is wrong, and it is caught on
