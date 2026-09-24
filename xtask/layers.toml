@@ -81,3 +81,6 @@ rudb = 13
 rudb-extension = 14
 rudb-c-api = 15
 rudb-cli = 15
+# A command line tool over the native format that builds a file's optional sorted projections. It is
+# a surface like the shell, so it sits with them rather than beside the format it writes.
+rudb-projection = 15
