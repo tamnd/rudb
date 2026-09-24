@@ -82,11 +82,19 @@ rudb-bind = 10
 rudb-opt = 11
 rudb-exec = 12
 
-# The surfaces people actually touch.
-rudb = 13
-rudb-extension = 14
-rudb-c-api = 15
-rudb-cli = 15
+# The compiled engine above the planner, per spec/compiler/19-crate-layout.md. The physical plan
+# reads the optimized plan and must never be called by the optimizer, the pipelines read the
+# physical plan, and so on up to the engine entry that `rudb` routes to.
+rudb-qc-plan = 12
+rudb-qc-pipe = 13
+rudb-qc-gen = 14
+
+# The surfaces people actually touch. `rudb` is 16 and not 13 so that the compiled engine fits
+# under it, per spec/compiler/19-crate-layout.md.
+rudb = 16
+rudb-extension = 17
+rudb-c-api = 18
+rudb-cli = 18
 # A command line tool over the native format that builds a file's optional sorted projections. It is
 # a surface like the shell, so it sits with them rather than beside the format it writes.
-rudb-projection = 15
+rudb-projection = 18
