@@ -452,6 +452,8 @@ pub struct BuiltLink {
     pub form: Option<link::Form>,
     /// Rows in the child table.
     pub children: u64,
+    /// Rows in the parent table, or none when nothing was built.
+    pub parents: u64,
     /// Children that found a parent. Below `children` means the foreign key is not total, which is
     /// legal and is also what keeps the relationship out of the monotone form.
     pub linked: u64,
@@ -548,6 +550,7 @@ fn links_of_one_table(
                     edge: edge.clone(),
                     form: None,
                     children: child.table().rows() as u64,
+                    parents: 0,
                     linked: 0,
                     bytes: 0,
                     table_bytes: column_bytes,
@@ -561,12 +564,17 @@ fn links_of_one_table(
         }
     }
     let mut order = (0..report.len()).filter(|at| payloads[*at].is_some()).collect::<Vec<_>>();
-    // Most rows per byte first. A link over no rows is worth nothing per byte and sorts last
-    // rather than dividing by zero.
+    // Most rows saved per byte first. What a link saves is the hash table the join would build
+    // without it, and a hash join builds its smaller side, so the rows saved are the smaller of the
+    // child and the parent. Counting the children alone ranks every link of one table by its size
+    // and nothing else, since they all have the same children. On `lineitem` that kept the link to
+    // `part`, which saves a table of 200,000 rows, over the one to `partsupp`, which saves 800,000
+    // and costs a tenth more. A link over no rows is worth nothing per byte and sorts last rather
+    // than dividing by zero.
     order.sort_by(|left, right| {
         let value = |at: &usize| -> f64 {
             let bytes = report[*at].bytes.max(1);
-            report[*at].children as f64 / bytes as f64
+            report[*at].children.min(report[*at].parents) as f64 / bytes as f64
         };
         value(right).partial_cmp(&value(left)).unwrap_or(std::cmp::Ordering::Equal)
     });
@@ -688,6 +696,7 @@ fn one_link(
             edge: edge.clone(),
             form: Some(link.form()),
             children: link.children(),
+            parents: map.len(),
             linked: link.linked(),
             bytes: bytes.len(),
             table_bytes: 0,
@@ -1549,6 +1558,54 @@ mod tests {
         // What does survive is the size and the form, which is exit criterion 3 of G3: somebody
         // deciding whether to raise `graph_budget` reads this rather than rebuilding to find out.
         assert_eq!(refused_link(&child, 0), Some((link::Form::Packed, report[0].bytes as u64)));
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn the_budget_keeps_the_link_that_saves_the_larger_hash_table() {
+        // Two links out of one child that cannot both fit under the sixty four kilobyte floor. The
+        // one to a thousand parents is ten bits a child and about 57 kilobytes, the one to four is
+        // two bits and about 12. By child rows per byte the small one wins, and it saves a hash
+        // table of four rows. The large one saves a thousand, which is what the budget is for.
+        let path = table_of("rank", &(1..=1000).map(Some).collect::<Vec<_>>());
+        let small = [Field::new("key", LogicalType::BigInt)];
+        let mut writer = Writer::open(&path, "small", small.to_vec()).expect("a second table");
+        let keys = (1..=4).map(Value::BigInt).collect::<Vec<_>>();
+        let chunk =
+            Chunk::new(vec![Vector::from_values(LogicalType::BigInt, &keys).expect("keys")])
+                .expect("one column");
+        writer.append(&chunk).expect("a part");
+        writer.finish().expect("commit");
+        let rows = (0..45_000_i64)
+            .map(|child| (Some((child * 7) % 1000 + 1), Some(child % 4 + 1)))
+            .collect::<Vec<_>>();
+        let fields = vec![
+            Field::new("large", LogicalType::BigInt),
+            Field::new("small", LogicalType::BigInt),
+        ];
+        pairs_into(Writer::open(&path, "child", fields).expect("a third table"), &rows);
+        build_key_maps(&path, "parent", &[0]).expect("the large key map");
+        build_key_maps(&path, "small", &[0]).expect("the small key map");
+
+        let edges = [
+            edge(),
+            Edge {
+                child: "child".into(),
+                child_column: 1,
+                parent: "small".into(),
+                parent_column: 0,
+            },
+        ];
+        let report = build_links_within(&path, &edges, 0).expect("build");
+        assert!(report[1].bytes < report[0].bytes, "the small link is the cheaper one");
+        assert!(
+            (report[0].bytes + report[1].bytes) as u64 > BUDGET_FLOOR,
+            "the two have to not fit together for this to test anything"
+        );
+        assert_eq!((report[0].parents, report[1].parents), (1000, 4));
+        assert!(report[0].built, "the link that saves a thousand rows was turned away: {report:?}");
+        assert!(!report[1].built, "the link that saves four rows was kept instead");
 
         fs::remove_file(&path).expect("clean up");
     }
