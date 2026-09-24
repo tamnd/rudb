@@ -708,7 +708,8 @@ fn runtime(config: &Config) -> Pool {
 
 impl Database {
     /// Returns a filtered count for the narrow read-only CSV path without building a query
-    /// result. The count is derived from column frequencies when the statement runs.
+    /// result. The count is derived from a leading zero frequency, the row count, and
+    /// null statistics when the statement runs.
     pub fn query_native_nonzero_value_once(path: &str, sql: &str) -> Result<Option<i64>> {
         let Some((table, column)) = native_simple_nonzero_statement(sql) else { return Ok(None) };
         let native = rudb_native::Catalog::open(path)?;
@@ -733,14 +734,7 @@ impl Database {
         ) {
             return Ok(None);
         }
-        let Some(frequencies) = native.exact_numeric_frequencies(table, index)? else {
-            return Ok(None);
-        };
-        let count = frequencies
-            .iter()
-            .filter(|(value, _)| value.is_some_and(|value| value != 0))
-            .try_fold(0_u64, |total, (_, count)| total.checked_add(*count));
-        Ok(count.and_then(|count| i64::try_from(count).ok()))
+        Ok(native.nonzero_count(table, index)?.and_then(|count| i64::try_from(count).ok()))
     }
 
     /// Scans one native integer column and counts its nonzero values while this SQL runs.
@@ -4326,12 +4320,12 @@ mod tests {
     }
 
     #[test]
-    fn cold_nonzero_csv_count_uses_column_frequencies() {
+    fn cold_nonzero_csv_count_uses_column_statistics() {
         let path = std::env::temp_dir().join(format!("rudb-q2-csv-{}.rdb", std::process::id()));
         let name = path.to_str().unwrap();
         let database = Database::open(name).unwrap();
         database.execute("CREATE TABLE hits (AdvEngineID SMALLINT)").unwrap();
-        database.execute("INSERT INTO hits VALUES (0), (NULL), (2), (-3)").unwrap();
+        database.execute("INSERT INTO hits VALUES (0), (0), (NULL), (2), (-3)").unwrap();
         database.execute("CREATE TABLE events (engine INTEGER)").unwrap();
         database.execute("INSERT INTO events VALUES (0), (8), (NULL)").unwrap();
         drop(database);
