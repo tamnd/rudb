@@ -5357,8 +5357,14 @@ impl TextSource for NativeText {
     /// usually enough on its own. Until the table is worth building this is the row at a time read,
     /// the same as the default.
     fn bytes_lens_at(&self, indices: &[u32], into: &mut Vec<i64>) -> Result<()> {
-        self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed);
         into.reserve(indices.len());
+        // Once the table is built the count has nothing left to decide, and every thread of a scan
+        // adding to the one counter moves its cache line from core to core on every chunk.
+        if let Some(Some(lens)) = self.value_lens.get() {
+            lens.extend_at(indices, into);
+            return Ok(());
+        }
+        self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed);
         let Some(ends) = self.value_ends() else {
             for &index in indices {
                 into.push(

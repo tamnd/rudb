@@ -5915,7 +5915,18 @@ impl Sink for Aggregate<'_> {
             }
             drop(kept);
             drop(built);
-            self.merge(waiting, &mut arriving)?;
+            // The smaller table goes into the larger, because every group of the one merged in is
+            // a probe and every group it has that the other lacks is an insert and a fresh set of
+            // accumulators, while the groups of the one kept cost nothing. Instances that read
+            // different stretches of a sorted key hold mostly different groups, and on ClickBench
+            // 28 at six threads the merge was 121 of 1427 samples with a third of it inserts.
+            let (from, mut into) = if waiting.groups > arriving.groups {
+                (arriving, waiting)
+            } else {
+                (waiting, arriving)
+            };
+            self.merge(from, &mut into)?;
+            arriving = into;
         }
     }
 
