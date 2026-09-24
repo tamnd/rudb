@@ -305,6 +305,34 @@ impl Rids {
         self.push(link, true)
     }
 
+    /// How many parts of the child a push of this set would decode, and how many there are.
+    ///
+    /// The zone test the push makes before it decodes a part, made for every part and nothing else,
+    /// which is one range test per thousand child rows. A push saves the scan what it skips and
+    /// costs a decode of the link and a bit test for every row of what it does not, so this is how
+    /// a caller finds out which of the two it is before paying for either.
+    ///
+    /// # Errors
+    ///
+    /// If this set is not over the link's parent table.
+    pub fn reach(&self, link: &Link) -> Result<(u64, u64)> {
+        if self.rows != link.parents() {
+            return Err(Error::internal(format!(
+                "a set over {} rows reached through a link whose parent has {}",
+                self.rows,
+                link.parents()
+            )));
+        }
+        let parts = link.children().div_ceil(count(PART_ROWS));
+        let reached = (0..parts)
+            .filter(|&part| match link.part_bounds(index(part)) {
+                Some(Some((low, high))) => self.any_between(low, high),
+                _ => false,
+            })
+            .count();
+        Ok((count(reached), parts))
+    }
+
     fn push(&self, link: &Link, stopping: bool) -> Result<Pushed> {
         if self.rows != link.parents() {
             return Err(Error::internal(format!(
@@ -655,6 +683,23 @@ mod tests {
         assert_eq!(full.len(), 1_000_000);
         assert!(full.contains(999_999));
         assert!(!full.contains(1_000_000));
+    }
+
+    /// A part is reached when some child in it points at a parent in the set, which is the part a
+    /// push would decode, and one whose children all point elsewhere is not.
+    #[test]
+    fn reach_counts_the_parts_a_push_would_decode() {
+        let parents = 100;
+        let parents_of: Vec<Rid> = (0..count(PART_ROWS) * 4)
+            .map(|child| child * parents / (count(PART_ROWS) * 4))
+            .collect();
+        let link = Link::build(&parents_of, parents).expect("every parent exists");
+        let one = Rids::from_sorted(parents, vec![30]).expect("a parent that exists");
+        assert_eq!(one.reach(&link).expect("the same parent"), (1, 4));
+        let two = Rids::from_sorted(parents, vec![10, 90]).expect("parents that exist");
+        assert_eq!(two.reach(&link).expect("the same parent"), (2, 4));
+        assert_eq!(Rids::full(parents).reach(&link).expect("the same parent"), (4, 4));
+        assert!(Rids::full(parents + 1).reach(&link).is_err(), "a set over another table");
     }
 
     #[test]

@@ -278,19 +278,97 @@ impl Domain {
 /// the driving column is the child's stored link column, both read as they are with nothing
 /// computed over them. [`crate::build`] checks that, and the link it takes has already been checked
 /// against the parent's generation by [`rudb_native::graph::stored_link`].
+///
+/// The key map and the link are read out of the file the first time a build side asks for them
+/// rather than when the join is built. Reading one is a checksum and a decode of the whole section,
+/// the link of `lineitem` to `orders` is six million rows of it, and a join whose build side turns
+/// out to hold every parent never asks. See [`found_for`].
 #[derive(Debug)]
 pub(crate) struct Exact {
-    /// Which parent row holds a key.
-    keys: KeyMap,
+    /// Rows the parent has, which is known before anything is read.
+    parents: u64,
+    /// Rows the driving table has, when it is one file and so could have a link.
+    children: Option<u64>,
+    /// Which parent row holds a key, once read. `None` inside is a map that did not read.
+    keys: OnceLock<Option<KeyMap>>,
     /// Which parent row every driving row points at, when the link is in the file. Without it the
     /// build side's keys become a [`Domain`] instead.
-    link: Option<Link>,
+    link: OnceLock<Option<Link>>,
+    /// Where the two are read from, or nothing when they were handed over already read.
+    stored: Option<Stored>,
+}
+
+/// The files a join's [`Exact`] reads its key map and its link out of.
+#[derive(Debug)]
+pub(crate) struct Stored {
+    /// The parent's file and the column its key map is over.
+    pub(crate) parent: rudb_native::Reader,
+    pub(crate) column: usize,
+    /// The driving table's file and the edge its link is stored under, when it is one file.
+    pub(crate) child: Option<(rudb_native::Reader, rudb_native::graph::Edge)>,
 }
 
 impl Exact {
     /// The key map of the parent and the link from the driving table to it, if there is one.
+    #[cfg(test)]
     pub(crate) fn new(keys: KeyMap, link: Option<Link>) -> Self {
-        Self { keys, link }
+        Self {
+            parents: keys.len(),
+            children: link.as_ref().map(Link::children),
+            keys: OnceLock::from(Some(keys)),
+            link: OnceLock::from(link),
+            stored: None,
+        }
+    }
+
+    /// The same, read out of the files when a build side first asks.
+    pub(crate) fn stored(stored: Stored) -> Self {
+        Self {
+            parents: stored.parent.table().rows() as u64,
+            children: stored.child.as_ref().map(|(child, _)| child.table().rows() as u64),
+            keys: OnceLock::new(),
+            link: OnceLock::new(),
+            stored: Some(stored),
+        }
+    }
+
+    /// Whether a push of `held` of the parents could skip half the driving table's parts.
+    ///
+    /// Taken as if the parents held were spread evenly over the parent table. A part of the driving
+    /// table points at about `parents * PART_ROWS / children` parents, and it can be skipped only
+    /// when none of them is held, which for a spread set is `(1 - held / parents)` to that power.
+    /// On TPC-H q03 the orders a join keeps are one in ten and a part of `lineitem` points at about
+    /// two hundred and fifty of them, so no part could be skipped and the push was not worth the
+    /// lookups that find it out. A set that is not spread but gathered in one range of keys is
+    /// skipped by the range the scan is also handed, which is the bitmap's too. `true` when the
+    /// driving table is not one file, where there is no link and [`reduce`] finds that out first.
+    fn might_skip(&self, held: u64) -> bool {
+        let Some(children) = self.children.filter(|&children| children > 0) else { return true };
+        if self.parents == 0 {
+            return false;
+        }
+        let per_part = self.parents as f64 * rudb_graph::PART_ROWS as f64 / children as f64;
+        let missed = (1.0 - held as f64 / self.parents as f64).powf(per_part.max(1.0));
+        missed >= 0.5
+    }
+
+    fn keys(&self) -> Option<&KeyMap> {
+        self.keys
+            .get_or_init(|| {
+                let stored = self.stored.as_ref()?;
+                rudb_native::graph::key_map(&stored.parent, stored.column)
+            })
+            .as_ref()
+    }
+
+    fn link(&self) -> Option<&Link> {
+        self.link
+            .get_or_init(|| {
+                let stored = self.stored.as_ref()?;
+                let (child, edge) = stored.child.as_ref()?;
+                rudb_native::graph::stored_link(child, &stored.parent, edge)
+            })
+            .as_ref()
     }
 }
 
@@ -554,7 +632,25 @@ pub(crate) fn found_for(
     wanted: bool,
 ) -> Result<Found> {
     let (plan, exprs, schema, time_zone) = keyed.parts();
-    let pushed = exact.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten();
+    let rows: usize = chunks.iter().map(Chunk::len).sum();
+    // A build side with as many rows as the parent has keys is every parent or close to it, and
+    // then the exact set removes about nothing and finding that out costs a lookup in the key map
+    // for each of its rows. On TPC-H q09 that is the join with all 1.5 million orders, which cost
+    // 0.56 G instructions to learn that it held every one of them. It is left to the bitmap or the
+    // filter, which measure what they keep and stop paying when it is everything.
+    let exact = exact.filter(|exact| (rows as u64) < exact.parents);
+    // The bitmap over the key values first, because it is one bit a build row and the key map
+    // alone, and it counts the parents the side holds. That count says whether a push could skip
+    // enough of the driving table to pay for the lookups and the link, see [`Exact::might_skip`],
+    // and only then are those read.
+    let by_key = exact.map(|exact| domain_of(keyed, exact, chunks)).transpose()?.flatten();
+    let trying =
+        exact.filter(|exact| by_key.as_ref().is_none_or(|(_, held)| exact.might_skip(*held)));
+    let pushing = trying.map(|exact| reduce(keyed, exact, chunks)).transpose()?.flatten();
+    let pushed = match pushing {
+        Some(Pushing::Done(pushed)) => Some(pushed),
+        _ => None,
+    };
     let mut reduced = pushed.as_ref().map(|pushed| Reduced {
         kept: pushed.rids.len(),
         rows: pushed.rids.rows(),
@@ -562,10 +658,8 @@ pub(crate) fn found_for(
         by_key: false,
     });
     let mut domain = None;
-    if let Some((bitmap, held)) =
-        exact.map(|exact| domain_of(keyed, exact, chunks)).transpose()?.flatten()
-    {
-        let parents = exact.map_or(0, |exact| exact.keys.len());
+    if let (None, Some((bitmap, held))) = (&pushed, by_key) {
+        let parents = exact.and_then(Exact::keys).map_or(0, KeyMap::len);
         reduced = Some(Reduced { kept: held, rows: parents, stopped: false, by_key: true });
         // A side that holds every parent key removes only the rows whose key no parent holds, and
         // the join drops those as cheaply, so testing every row would buy nothing.
@@ -577,7 +671,6 @@ pub(crate) fn found_for(
     // and a filter over the same keys would pass the same rows at the price of a hash each.
     let stopped = pushed.as_ref().is_some_and(|pushed| pushed.stopped);
     let exact = pushed.filter(|pushed| !pushed.stopped).map(|pushed| pushed.rids);
-    let rows: usize = chunks.iter().map(Chunk::len).sum();
     let mut extremes = Extremes::default();
     let settled = exact.is_some() || stopped || reduced.is_some_and(|reduced| reduced.by_key);
     let mut keyed = Vec::with_capacity(chunks.len());
@@ -729,8 +822,17 @@ fn integer(ty: &LogicalType) -> bool {
 /// because the build side is a subset of the parent's rows and the map is over all of them. If one
 /// does, the join gets the filter instead, which is slower and is never wrong. The push stops early
 /// when the first third of the driving table all matches, see [`Rids::forward_or_stop`].
-fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushed>> {
-    let Some(link) = exact.link.as_ref() else { return Ok(None) };
+///
+/// Declined when the push would decode half the driving table's parts or more and the parent's key
+/// map spans a compact range, because then [`domain_of`] makes the same exact set as a bitmap over
+/// the key values. What a push buys over that bitmap is the parts it skips, since a part the push
+/// decodes costs the link and a bit test for every row and the scan then decodes it anyway to test
+/// the key. TPC-H is the case where it does not pay: the orders of one quarter are spread over the
+/// whole of `lineitem`, the push skipped no part of it, and with the push q04 took 0.94 G
+/// instructions against 0.52 G with the bitmap.
+fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<Pushing>> {
+    let Some(map) = exact.keys() else { return Ok(None) };
+    let Some(link) = exact.link() else { return Ok(None) };
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let parents = link.parents();
     let mut words = vec![0_u64; usize::try_from(parents.div_ceil(64)).unwrap_or(usize::MAX)];
@@ -744,7 +846,7 @@ fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<P
                 continue;
             }
             let Some(key) = keys.signed_at(row) else { return Ok(None) };
-            let Some(rid) = exact.keys.lookup(key)? else { return Ok(None) };
+            let Some(rid) = map.lookup(key)? else { return Ok(None) };
             let Some(word) = usize::try_from(rid / 64).ok().and_then(|at| words.get_mut(at)) else {
                 return Ok(None);
             };
@@ -752,20 +854,32 @@ fn reduce(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<P
         }
     }
     let held = Rids::from_words(parents, words)?;
-    Ok(Some(held.forward_or_stop(link)?))
+    if map.span().is_some() {
+        let (reached, parts) = held.reach(link)?;
+        if reached.saturating_mul(2) >= parts {
+            return Ok(Some(Pushing::Declined));
+        }
+    }
+    Ok(Some(Pushing::Done(held.forward_or_stop(link)?)))
+}
+
+/// What [`reduce`] made of a join armed with a link.
+enum Pushing {
+    /// The set pushed through the link.
+    Done(Pushed),
+    /// Not pushed, because the key map's bitmap is the same set for less. See [`reduce`].
+    Declined,
 }
 
 /// The build side's keys as a [`Domain`] over the parent's key range, and how many of them it holds.
 ///
-/// Only for a join armed with a key map and no link, and only when the map is one of the two forms
-/// with a compact range. `None` when a key does not read as an integer or falls outside the range,
-/// which is a key no parent holds and should not happen, and then the join gets the filter. The
-/// count is of distinct keys, which is of parents, because a bit is set rather than added to.
+/// Made for every join armed with a key map, before any push, and used unless a push is made. Only
+/// when the map is one of the two forms with a compact range. `None` when a key does not read as an
+/// integer or falls outside the range, which is a key no parent holds and should not happen, and
+/// then the join gets the filter. The count is of distinct keys, which is of parents, because a bit
+/// is set rather than added to.
 fn domain_of(keyed: &Keyed<'_>, exact: &Exact, chunks: &[Chunk]) -> Result<Option<(Domain, u64)>> {
-    if exact.link.is_some() {
-        return Ok(None);
-    }
-    let Some((base, range)) = exact.keys.span() else { return Ok(None) };
+    let Some((base, range)) = exact.keys().and_then(KeyMap::span) else { return Ok(None) };
     let Some(len) = words_for(range) else { return Ok(None) };
     let (plan, exprs, schema, time_zone) = keyed.parts();
     let mut words = vec![0_u64; len];
@@ -1128,16 +1242,17 @@ mod tests {
         assert_eq!(through(&found.filter.expect("a filter of no keys"), &[Some(1)]), [false]);
     }
 
-    /// Section 5.4 on the smallest case that shows it. Parents keyed 100 upwards, children pointing
-    /// at them in order, and a build side holding two of the keys: the rows kept are exactly the
-    /// children of those two parents, and no filter is built beside them.
+    /// Section 5.4 on the smallest case that shows it. Parents keyed 100 upwards, a thousand children
+    /// pointing at each in order, so a part of the driving table is about one parent's, and a build
+    /// side holding two of the keys: the rows kept are exactly the children of those two parents,
+    /// and no filter is built beside them.
     #[test]
     fn an_exact_side_keeps_the_children_of_the_parents_it_holds_and_no_others() {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
         let parent_keys: Vec<Option<i128>> = (0..50).map(|rid| Some(100 + rid)).collect();
-        let parents_of: Vec<u64> = (0..5_000).map(|child| child / 100).collect();
+        let parents_of: Vec<u64> = (0..50_000).map(|child| child / 1_000).collect();
         let exact = Exact::new(
             KeyMap::build(&parent_keys).expect("unique keys"),
             Some(Link::build(&parents_of, 50).expect("every parent exists")),
@@ -1149,7 +1264,7 @@ mod tests {
         assert!(found.filter.is_none(), "the exact rows make the filter redundant");
         let rows = found.rows.expect("an exact side");
         let kept: Vec<u64> = rows.iter().collect();
-        let expected: Vec<u64> = (300..400).chain(4_000..4_100).collect();
+        let expected: Vec<u64> = (3_000..4_000).chain(40_000..41_000).collect();
         assert_eq!(kept, expected);
         assert_eq!(found.range, Some((Bound::Int(103), Bound::Int(140))));
     }
@@ -1163,7 +1278,7 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
         let parent_keys: Vec<Option<i128>> = (0..50).map(|rid| Some(100 + rid)).collect();
-        let parents_of: Vec<u64> = (0..5_000).map(|child| child / 100).collect();
+        let parents_of: Vec<u64> = (0..50_000).map(|child| child / 1_000).collect();
         let exact = Exact::new(
             KeyMap::build(&parent_keys).expect("unique keys"),
             Some(Link::build(&parents_of, 50).expect("every parent exists")),
@@ -1207,8 +1322,8 @@ mod tests {
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
         let exact = Exact::new(
-            KeyMap::build(&[Some(1), Some(2)]).expect("unique keys"),
-            Some(Link::build(&[0, 1, 1], 2).expect("both parents exist")),
+            KeyMap::build(&[Some(1), Some(2), Some(3), Some(4)]).expect("unique keys"),
+            Some(Link::build(&[0, 1, 1, 2, 3], 4).expect("every parent exists")),
         );
 
         let found =
@@ -1241,19 +1356,56 @@ mod tests {
         assert_eq!(domain.keep(&driving.columns()[0], driving.len(), &mut block), [0, 3]);
     }
 
-    /// A side that holds every parent key would drop only rows no parent holds, which the join drops
-    /// as cheaply, so it reports what it found and hands the scan nothing to test.
+    /// A side with as many rows as the parent has keys holds about every parent, so the key map is
+    /// never read for it. It is handed what a join with no key map gets, which here is the bitmap
+    /// the scan measures and stops testing once it keeps everything.
     #[test]
-    fn a_side_that_holds_every_parent_key_tests_nothing() {
+    fn a_side_as_long_as_the_parent_does_not_read_the_key_map() {
         let mut plan = Plan::new();
         let (expr, schema) = key(&mut plan);
         let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
         let exact = Exact::new(KeyMap::build(&[Some(1), Some(2)]).expect("unique keys"), None);
+        let side = [chunk(&[Some(2), Some(1)])];
 
-        let found = found(&keyed, Some(&exact), &[chunk(&[Some(2), Some(1)])]).expect("integers");
+        let armed = found(&keyed, Some(&exact), &side).expect("integers");
 
-        assert!(found.domain.is_none() && found.filter.is_none());
-        assert_eq!(found.reduced.map(|reduced| reduced.kept), Some(2));
+        assert!(armed.reduced.is_none() && armed.rows.is_none(), "the key map is not asked");
+        let alone = found(&keyed, None, &side).expect("integers");
+        assert_eq!(armed.domain.is_some(), alone.domain.is_some());
+        assert!(exact.keys.get().is_some(), "handed over already read, so nothing was loaded");
+    }
+
+    /// A thousand parents with a hundred children each, so a part of the driving table points at
+    /// about ten of them. A side that holds every fifth parent leaves a part with none of them
+    /// about one time in ten, so a push would skip almost nothing and the bitmap over the keys is
+    /// what the scan gets. The same side holding two parents next to each other is pushed, and the
+    /// push skips every part but the one they are in.
+    #[test]
+    fn a_push_is_made_only_where_it_could_skip_parts() {
+        let mut plan = Plan::new();
+        let (expr, schema) = key(&mut plan);
+        let keyed = Keyed::new(&plan, expr, schema, SessionTimeZone::default());
+        let parent_keys: Vec<Option<i128>> = (0..1_000).map(|rid| Some(100 + rid)).collect();
+        let parents_of: Vec<u64> = (0..100_000).map(|child| child / 100).collect();
+        let exact = Exact::new(
+            KeyMap::build(&parent_keys).expect("unique keys"),
+            Some(Link::build(&parents_of, 1_000).expect("every parent exists")),
+        );
+
+        let spread: Vec<Option<i32>> = (0..1_000).step_by(5).map(|rid| Some(100 + rid)).collect();
+        let wide = found(&keyed, Some(&exact), &[chunk(&spread)]).expect("integers");
+        assert!(wide.rows.is_none(), "no push");
+        assert!(wide.domain.is_some() && wide.filter.is_none(), "the bitmap is the answer");
+        let reduced = wide.reduced.expect("a reduction to report");
+        assert_eq!((reduced.kept, reduced.rows, reduced.by_key), (200, 1_000, true));
+
+        let near =
+            found(&keyed, Some(&exact), &[chunk(&[Some(600), Some(601)])]).expect("integers");
+        let rows = near.rows.expect("a push");
+        assert_eq!(rows.iter().collect::<Vec<u64>>(), (50_000..50_200).collect::<Vec<u64>>());
+        assert!(near.domain.is_none());
+        let reduced = near.reduced.expect("a reduction to report");
+        assert!(!reduced.by_key);
     }
 
     /// A driving side written as plan text, which is how every other operator test in this crate
