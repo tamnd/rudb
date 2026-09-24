@@ -138,4 +138,6 @@ jemalloc is in that measurement because it is what DuckDB ships on Linux and it 
 
 **The cost, stated plainly.** mimalloc is a C library behind `libmimalloc-sys`, so the default build of the shell now wants a C compiler. `cargo build --no-default-features` gives the old build back, and that is the build the numbers above are measured against, so the flag is not decoration.
 
+Since then the default has gone back to the system allocator, and mimalloc is the `mimalloc` feature of `rudb-cli`. Measured again on server3 over the 43 ClickBench queries, glibc took 12 percent less CPU and 21 percent less peak memory on the native table and 10 and 17 percent less on Parquet, almost all of it page faults mimalloc took and glibc did not, and the loads above no longer favour mimalloc. `crates/rudb-cli/src/main.rs` has the numbers.
+
 **This is not a substitute for the page pool.** `crates/rudb-vector/src/buffer.rs` already describes the thing that would make the allocator matter less: a pool the vector sized runs are taken from and given back to, which is the buffer manager arriving from the other direction. An allocator that recycles well hides the cost of churning a few hundred thousand buffers. Not churning them is still better, and the measurement above is the reason to do it rather than a reason not to.
