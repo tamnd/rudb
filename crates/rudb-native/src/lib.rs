@@ -7295,6 +7295,35 @@ impl Reader {
         probes.iter().any(|probe| self.outside(place, probe) || self.sifted(place, probe))
     }
 
+    /// Whether `rule` rules out a part from what the stored range of one column says about it.
+    ///
+    /// The same two steps as [`Self::skips`] without the sieve, for a test no [`Probe`] can write.
+    /// A probe is one comparison against one constant, and the keys a join's build side holds are a
+    /// set, which rules a part out when none of them falls inside the part's two ends. Handing the
+    /// range to the caller is what lets the set stay with the join that knows what it is.
+    #[must_use]
+    pub fn ruled_by(&self, part: usize, column: usize, rule: impl Fn(&Range) -> bool) -> bool {
+        let Some(place) = self.places.get(part).copied() else { return false };
+        let Some(stripe) = self.table.stripes.get(place.stripe as usize) else { return false };
+        if stripe.zone.column(column).is_some_and(&rule) {
+            return true;
+        }
+        self.stripe_part_ranges(place.stripe as usize, column)
+            .and_then(|ranges| ranges.get(place.part as usize))
+            .is_some_and(rule)
+    }
+
+    /// The half of [`Self::ruled_by`] that reads nothing, asked about a whole stripe.
+    #[must_use]
+    pub fn stripe_ruled_by(
+        &self,
+        stripe: usize,
+        column: usize,
+        rule: impl Fn(&Range) -> bool,
+    ) -> bool {
+        self.table.stripes.get(stripe).and_then(|held| held.zone.column(column)).is_some_and(rule)
+    }
+
     /// Whether the bounds of one part rule out one probe.
     ///
     /// The part's own two ends, which are narrower than the stripe's and cost a page read the first

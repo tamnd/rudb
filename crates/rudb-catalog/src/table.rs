@@ -9,7 +9,7 @@ use rudb_native::{
     Common, FrequencyOccurrences, FrequencyPrefix, PairFrequencyCounts, Reader as NativeReader,
     StoredPart, Stripes,
 };
-use rudb_storage::{MemoryTable, Probe};
+use rudb_storage::{MemoryTable, Probe, Range};
 use rudb_vector::{Chunk, Form, VECTOR_SIZE, Vector, concat};
 
 use crate::catalog::DETACHED;
@@ -827,6 +827,53 @@ impl Rows {
                     reader.skips(at, probes)
                 } else {
                     rows.skips(at - reader.parts(), probes)
+                }
+            }
+        }
+    }
+
+    /// Whether `rule` rules out chunk `at` from what the stored range of one table column says.
+    ///
+    /// For a test that is not a [`Probe`], which today is a join's build side keys as a set. A chunk
+    /// with no range for the column is read, the same as for [`Self::skips`].
+    #[must_use]
+    pub fn ruled_by(&self, at: usize, column: usize, rule: &dyn Fn(&Range) -> bool) -> bool {
+        let memory = |rows: &MemoryTable, at| {
+            rows.zone(at).and_then(|zone| zone.column(column)).is_some_and(rule)
+        };
+        match self {
+            Self::Memory(rows) => memory(rows, at),
+            Self::Native(reader) => reader.ruled_by(at, column, rule),
+            Self::Grown(reader, rows) => {
+                if at < reader.parts() {
+                    reader.ruled_by(at, column, rule)
+                } else {
+                    memory(rows, at - reader.parts())
+                }
+            }
+        }
+    }
+
+    /// The same about a whole stripe, from the bounds that are already in memory.
+    #[must_use]
+    pub fn stripe_ruled_by(
+        &self,
+        stripe: usize,
+        column: usize,
+        rule: &dyn Fn(&Range) -> bool,
+    ) -> bool {
+        let memory = |rows: &MemoryTable, stripe| {
+            rows.group_zone(stripe).and_then(|zone| zone.column(column)).is_some_and(rule)
+        };
+        match self {
+            Self::Memory(rows) => memory(rows, stripe),
+            Self::Native(reader) => reader.stripe_ruled_by(stripe, column, rule),
+            Self::Grown(reader, rows) => {
+                let held = self.stripes_in_file();
+                if stripe < held {
+                    reader.stripe_ruled_by(stripe, column, rule)
+                } else {
+                    memory(rows, stripe - held)
                 }
             }
         }

@@ -78,18 +78,16 @@ fn a_filtered_parent_skips_the_child_parts_it_has_no_rows_in_and_answers_the_sam
 
     database.execute("SET graph_reduction = 'off'").expect("the rule has a switch");
     assert_eq!(rows(&database, QUERY), reduced, "the reduction changed an answer");
+    // The keys the join holds still skip the parts between them, so what says the reduction is off
+    // is that it reports nothing.
     let line = orders_scan(&database, QUERY);
-    assert!(
-        !line.contains("parts skipped"),
-        "with the reduction off the range covers every part, so nothing should be skipped, and a \
-         skip here means the test is not measuring the reduction: {line}"
-    );
+    assert!(!line.contains("link kept"), "the reduction is under its switch: {line}");
 
     database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
     database.execute("RESET graph_reduction").expect("resets");
     assert_eq!(rows(&database, QUERY), reduced, "the layer changed an answer");
     assert!(
-        !orders_scan(&database, QUERY).contains("parts skipped"),
+        !orders_scan(&database, QUERY).contains("link kept"),
         "the reduction is under the layer's switch"
     );
 

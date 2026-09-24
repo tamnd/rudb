@@ -219,3 +219,28 @@ fn an_answer_over_ruled_out_parts_agrees_however_many_workers_split_them() {
         assert_eq!(rows(&pair.file, &query), wanted, "at {threads} workers");
     }
 }
+
+#[test]
+fn a_join_whose_keys_are_scattered_reads_only_the_parts_that_hold_them() {
+    // Keys at both ends of `i` and one past it, so the range the join hands down covers every part
+    // and only the keys themselves can rule out the parts between them. The semi join and the inner
+    // join are the two kinds that arm the handoff.
+    let pair = Pair::new("keyed", &climbing(ROWS));
+    let keys = "CREATE TABLE u AS SELECT * FROM (VALUES (3), (40000), (40000), (299999), (400000)) \
+                AS v(key)";
+    pair.memory.execute(keys).expect("the key table is created");
+    pair.file.execute(keys).expect("the key table is created");
+    pair.gives("SELECT i FROM t WHERE i IN (SELECT key FROM u) ORDER BY i", &[3, 40_000, 299_999]);
+    pair.agree("SELECT t.i, t.j, u.key FROM t JOIN u ON t.i = u.key ORDER BY t.i, u.key");
+    pair.agree("SELECT COUNT(*), SUM(t.j) FROM t JOIN u ON t.i = u.key WHERE t.k = 0");
+    let plan =
+        rows(&pair.file, "EXPLAIN ANALYZE SELECT COUNT(*) FROM t WHERE i IN (SELECT key FROM u)");
+    let Some(Value::Varchar(text)) = plan.first().and_then(|row| row.get(1)) else {
+        panic!("the plan came back as {plan:?}");
+    };
+    let scan = text
+        .lines()
+        .find(|line| line.contains("Get ") && line.contains(" t "))
+        .expect("a scan of t");
+    assert!(scan.contains("parts skipped"), "the keys should rule out the middle of t: {scan}");
+}

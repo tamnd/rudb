@@ -462,6 +462,17 @@ impl MemoryTable {
         }
     }
 
+    /// The zone of group `index`, with the open run after the groups the way [`Self::group_skips`]
+    /// numbers it.
+    #[must_use]
+    pub fn group_zone(&self, index: usize) -> Option<&Zone> {
+        match self.groups.get(index) {
+            Some(group) => Some(&group.zone),
+            None if index == self.groups.len() => self.open_zone.as_ref(),
+            None => None,
+        }
+    }
+
     /// The open chunks as one page per column, or `None` if any column will not lay end to end.
     ///
     /// Collected a column at a time rather than a chunk at a time because that is the direction the
