@@ -1540,10 +1540,11 @@ fn packed_base(packed: &rudb_vector::Packed<'_>) -> Option<i64> {
 fn coded_runs(input: &Vector, rows: usize) -> Option<Vec<i64>> {
     if let Some(packed) = input.packed_parts() {
         let base = packed_base(&packed)?;
-        let mut codes = vec![0_u64; rows];
-        packed.unpack(0, &mut codes);
-        let mut out = Vec::with_capacity(rows);
-        out.extend(codes.iter().map(|&code| base.wrapping_add(code as i64)));
+        // One vector and one pass. Unpacking the codes and adding the base to them separately wanted a
+        // vector of codes zeroed before it was written and a second walk of every row, which showed up
+        // as a per chunk `memset` under this function in the q01 profile.
+        let mut out = Vec::new();
+        packed.unpack_mapped(0, rows, &mut out, |code| base.wrapping_add(code as i64));
         return Some(out);
     }
     let (codes, values) = input.positions()?;

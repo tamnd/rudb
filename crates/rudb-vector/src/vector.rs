@@ -3778,6 +3778,48 @@ impl Packed<'_> {
         }
     }
 
+    /// The codes of rows `from` to `from + rows`, each of them through `value`, appended to `out`.
+    ///
+    /// [`Self::unpack`] leaves its codes in a slice of `u64` that a caller wanting something else then
+    /// walks a second time, which costs a vector to allocate, that vector zeroed before a single code
+    /// is written into it, and a pass over every row that loads and stores it again. A caller reading a
+    /// whole chunk in order wants one vector and one pass, so the block this unpacks into is 64 codes
+    /// of stack that the next block writes over, and what reaches `out` is already the value asked
+    /// for. The vector grows into room it reserved once, so nothing here is zeroed at all.
+    ///
+    /// Unpacking a block at a time was tried for random rows and lost, see [`Self::codes_into`], but
+    /// that walk pays to ask which block each row falls in and this one goes straight through.
+    pub fn unpack_mapped<U: Copy>(
+        &self,
+        from: usize,
+        rows: usize,
+        out: &mut Vec<U>,
+        value: impl Fn(u64) -> U,
+    ) {
+        let width = self.width as usize;
+        let start = self.offset + from;
+        let end = start + rows;
+        let first = start.next_multiple_of(64).min(end);
+        out.reserve(rows);
+        for row in start..first {
+            out.push(value(code_at(self.words, row * width, self.width)));
+        }
+        let mut row = first;
+        let mut block = [0_u64; 64];
+        while row + 64 <= end {
+            let word = row / 64 * width;
+            let Some(words) = self.words.get(word..word + width) else { break };
+            unpack_block(words, self.width, &mut block);
+            out.extend(block.iter().map(|&code| value(code)));
+            row += 64;
+        }
+        // Whatever the blocks did not cover, which is the tail and also everything after a width that
+        // ran out of words, the same way [`Self::unpack`] leaves it to `code_at` to read as zero.
+        for row in row..end {
+            out.push(value(code_at(self.words, row * width, self.width)));
+        }
+    }
+
     /// The code of each of `rows` rows `at` names, in order.
     ///
     /// [`Self::codes_into`] into a vector of its own. A caller reading a column a chunk at a time
@@ -4913,6 +4955,14 @@ mod tests {
                     packed.unpack(from, &mut out);
                     let want: Vec<u64> = (from..from + rows).map(|row| packed.code(row)).collect();
                     assert_eq!(out, want, "width {width} offset {offset} from {from}");
+                    // The mapped unpack reads the same codes in one pass, and appends, so a vector
+                    // with something in it already keeps it and the rows land after.
+                    let mut mapped = vec![-1_i64];
+                    packed.unpack_mapped(from, rows, &mut mapped, |code| 7 - code as i64);
+                    let wanted: Vec<i64> = std::iter::once(-1)
+                        .chain(want.iter().map(|&code| 7 - code as i64))
+                        .collect();
+                    assert_eq!(mapped, wanted, "mapped width {width} offset {offset} from {from}");
                 }
                 let at = [5_usize, 9, 9, 70, 6, 200, 131];
                 let want: Vec<u64> = at.iter().map(|&row| packed.code(row)).collect();
