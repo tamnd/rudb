@@ -787,6 +787,9 @@ impl Database {
             return Ok(None);
         };
         let reader = catalog.table(name)?;
+        if let Some(rows) = reader.grouped_distinct_run_projection(distinct, group, limit)? {
+            return Ok(Some(rows));
+        }
         reader.grouped_distinct_projection(distinct, group, limit)
     }
 
