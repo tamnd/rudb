@@ -312,15 +312,15 @@ fn flat_kept(
     let len = left.len();
     let data = left.data()?;
     macro_rules! ordered {
-        ($left:expr, $right:expr) => {{
-            let (one, other) = ($left, $right);
+        ($values:expr, $side:expr) => {{
+            let (values, side) = ($values, $side);
             match op {
-                Comparison::Equal => kept_where(rows, len, |row| one(row) == other(row)),
-                Comparison::NotEqual => kept_where(rows, len, |row| one(row) != other(row)),
-                Comparison::Less => kept_where(rows, len, |row| one(row) < other(row)),
-                Comparison::LessOrEqual => kept_where(rows, len, |row| one(row) <= other(row)),
-                Comparison::Greater => kept_where(rows, len, |row| one(row) > other(row)),
-                Comparison::GreaterOrEqual => kept_where(rows, len, |row| one(row) >= other(row)),
+                Comparison::Equal => flat_where(rows, values, side, |a, b| a == b),
+                Comparison::NotEqual => flat_where(rows, values, side, |a, b| a != b),
+                Comparison::Less => flat_where(rows, values, side, |a, b| a < b),
+                Comparison::LessOrEqual => flat_where(rows, values, side, |a, b| a <= b),
+                Comparison::Greater => flat_where(rows, values, side, |a, b| a > b),
+                Comparison::GreaterOrEqual => flat_where(rows, values, side, |a, b| a >= b),
                 Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
             }
         }};
@@ -332,7 +332,7 @@ fn flat_kept(
                     $(
                         (Data::$variant(values), Data::$variant(others)) => {
                             let (values, others) = (values.get(..len)?, others.get(..len)?);
-                            Some(ordered!(|row: usize| values[row], |row: usize| others[row]))
+                            Some(ordered!(values, Side::Column(others)))
                         }
                     )+
                     _ => None,
@@ -343,7 +343,7 @@ fn flat_kept(
                     $(
                         (Data::$variant(values), Data::$variant(wanted)) => {
                             let (values, wanted) = (values.get(..len)?, *wanted.first()?);
-                            Some(ordered!(|row: usize| values[row], |_: usize| wanted))
+                            Some(ordered!(values, Side::Constant(wanted)))
                         }
                     )+
                     _ => None,
@@ -352,6 +352,57 @@ fn flat_kept(
         };
     }
     layouts!(Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UInt128)
+}
+
+/// The right side of a comparison [`flat_where`] runs, another column or one value for every row.
+#[derive(Clone, Copy)]
+enum Side<'a, T> {
+    Column(&'a [T]),
+    Constant(T),
+}
+
+/// The rows of `values` for which `test` holds against `side`, out of `rows` when there are some.
+///
+/// With no `rows` this hands [`kept_in_blocks`] the slices themselves, so a block's flags come from
+/// zipping 64 values with no index to check, which the compiler turns into vector compares. Through
+/// a closure over a row number each row was a load behind a bounds check and a compare on its own.
+fn flat_where<T: Copy>(
+    rows: Option<&[u32]>,
+    values: &[T],
+    side: Side<'_, T>,
+    test: impl Fn(T, T) -> bool,
+) -> Selection {
+    let len = values.len();
+    match (rows, side) {
+        (Some(rows), Side::Constant(wanted)) => {
+            kept_where(Some(rows), len, |row| test(values[row], wanted))
+        }
+        (Some(rows), Side::Column(others)) => {
+            kept_where(Some(rows), len, |row| test(values[row], others[row]))
+        }
+        (None, Side::Constant(wanted)) => kept_in_blocks(
+            len,
+            |base, flags| {
+                for (flag, &value) in flags.iter_mut().zip(&values[base..base + 64]) {
+                    *flag = u8::from(test(value, wanted));
+                }
+            },
+            |row| test(values[row], wanted),
+        ),
+        (None, Side::Column(others)) => {
+            let others = &others[..len];
+            kept_in_blocks(
+                len,
+                |base, flags| {
+                    let pairs = values[base..base + 64].iter().zip(&others[base..base + 64]);
+                    for (flag, (&value, &other)) in flags.iter_mut().zip(pairs) {
+                        *flag = u8::from(test(value, other));
+                    }
+                },
+                |row| test(values[row], others[row]),
+            )
+        }
+    }
 }
 
 /// The rows where one bit packed column with no nulls holds against another, in one pass.
@@ -440,32 +491,68 @@ fn packed_kept(
 
 /// The rows out of `rows`, or out of every row below `len` when there is no `rows`, that `held`
 /// keeps, written without a branch on the answer.
+#[inline]
+fn kept_where(rows: Option<&[u32]>, len: usize, held: impl Fn(usize) -> bool) -> Selection {
+    let Some(rows) = rows else {
+        let fill = |base: usize, flags: &mut [u8; 64]| {
+            for (bit, flag) in flags.iter_mut().enumerate() {
+                *flag = u8::from(held(base + bit));
+            }
+        };
+        return kept_in_blocks(len, fill, &held);
+    };
+    let mut kept = 0;
+    let mut out = vec![0_u32; rows.len()];
+    for &row in rows {
+        out[kept] = row;
+        kept += usize::from(held(row as usize));
+    }
+    out.truncate(kept);
+    Selection::from_indices(out)
+}
+
+/// [`kept_where`] over every row below `len`, a block of 64 rows at a time.
+///
+/// The branchless loop writes each row and then moves the end of the answer by the flag, so every
+/// row waits on the one before it through the count, and the compare can't be done in vector
+/// registers. ClickBench Q1, `AdvEngineID <> 0` over a SMALLINT, spent 1.5ns a row there, and the
+/// buffer the size of the chunk it zeroed first was another few percent. Here a block's 64 flags are
+/// worked out on their own, which the compiler does in vector registers, and folded into a mask.
+/// This is how ClickHouse filters a column: a block the mask says is empty is skipped, a full one
+/// is copied as a range, and only a mixed block walks its set bits. `fill` writes the flags of the
+/// 64 rows from the one it is given, and `held` answers for the rows after the last whole block.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the caller checked that the row count fits in a u32 before getting here"
 )]
 #[inline]
-fn kept_where(rows: Option<&[u32]>, len: usize, held: impl Fn(usize) -> bool) -> Selection {
-    let mut kept = 0;
-    let mut out = match rows {
-        None => {
-            let mut out = vec![0_u32; len];
-            for index in 0..len {
-                out[kept] = index as u32;
-                kept += usize::from(held(index));
-            }
-            out
+fn kept_in_blocks(
+    len: usize,
+    fill: impl Fn(usize, &mut [u8; 64]),
+    held: impl Fn(usize) -> bool,
+) -> Selection {
+    let mut out = Vec::with_capacity(len);
+    let mut base = 0;
+    while base + 64 <= len {
+        let mut flags = [0_u8; 64];
+        fill(base, &mut flags);
+        let mut mask = 0_u64;
+        for (lane, eight) in flags.chunks_exact(8).enumerate() {
+            let bytes = u64::from_le_bytes(eight.try_into().unwrap_or_default());
+            // Each byte is 0 or 1, and the multiply gathers byte i into bit 56 + i.
+            mask |= (bytes.wrapping_mul(0x0102_0408_1020_4080) >> 56) << (lane * 8);
         }
-        Some(rows) => {
-            let mut out = vec![0_u32; rows.len()];
-            for &row in rows {
-                out[kept] = row;
-                kept += usize::from(held(row as usize));
+        if mask == u64::MAX {
+            out.extend(base as u32..(base + 64) as u32);
+        } else {
+            while mask != 0 {
+                out.push((base + mask.trailing_zeros() as usize) as u32);
+                mask &= mask - 1;
             }
-            out
         }
-    };
-    out.truncate(kept);
+        base += 64;
+    }
+    out.extend((base..len).filter(|&index| held(index)).map(|index| index as u32));
     Selection::from_indices(out)
 }
 
@@ -2029,6 +2116,39 @@ mod tests {
         let fast = compare(op, left, right).expect("compares");
         let slow = oracle(op, left, right);
         assert_eq!(fast, slow, "{op:?} on a {:?} against a {:?}", left.form(), right.form());
+    }
+
+    /// Every row in blocks of 64 is the plain filter, over empty, full and mixed blocks, with and
+    /// without a tail, and through a flat column against a literal and against another column.
+    #[test]
+    fn rows_kept_in_blocks_are_the_rows_a_plain_filter_keeps() {
+        let shapes: [fn(usize) -> bool; 5] = [
+            |_| false,
+            |_| true,
+            |row| row % 7 == 3,
+            |row| (row / 64) % 3 == 1,
+            |row| (row / 64) % 2 == 0 || row % 61 == 0,
+        ];
+        for len in [0, 1, 63, 64, 65, 128, 1000, 2048] {
+            for held in shapes {
+                let blocks = kept_where(None, len, held);
+                let plain: Vec<u32> = (0..len)
+                    .filter(|&row| held(row))
+                    .map(|row| u32::try_from(row).expect("small"))
+                    .collect();
+                assert_eq!(blocks.indices(), plain.as_slice(), "{len} rows");
+            }
+        }
+        let values: Vec<Value> =
+            (0..2000).map(|row| Value::SmallInt(if row % 50 == 0 { 3 } else { 0 })).collect();
+        let column = Vector::from_values(LogicalType::SmallInt, &values).expect("smallints");
+        let zero = Vector::constant(LogicalType::SmallInt, Value::SmallInt(0), 2000);
+        let others: Vec<Value> = (0..2000).map(|row| Value::SmallInt(row % 5)).collect();
+        let others = Vector::from_values(LogicalType::SmallInt, &others).expect("smallints");
+        for op in [Comparison::NotEqual, Comparison::Equal, Comparison::Less] {
+            agrees_and_selects(op, &column, &zero);
+            agrees_and_selects(op, &column, &others);
+        }
     }
 
     /// [`agrees`], and the rows picked straight from the answers are the rows the flag vector
