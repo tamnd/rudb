@@ -308,7 +308,7 @@ impl Pass {
     /// One vector of the column, a vector at a time where the layout allows it and a row at a time
     /// where it does not.
     fn scan(&mut self, vector: &Vector) {
-        if self.scan_flat(vector) || self.scan_dictionary(vector) {
+        if self.scan_flat(vector) || self.scan_gathered(vector) || self.scan_dictionary(vector) {
             return;
         }
         self.scan_rows(vector);
@@ -345,22 +345,70 @@ impl Pass {
                             return false;
                         }
                         let spread = spread(rows, validity, |row| i128::from(held[row]));
-                        let width = self.fixed.unwrap_or(8);
-                        self.fold(Reduced {
-                            rows: spread.rows,
-                            nulls: spread.nulls,
-                            values: spread.values,
-                            bytes: width.saturating_mul(spread.values),
-                            widest: if spread.values > 0 { width } else { 0 },
-                            ascents: spread.ascents,
-                            descents: spread.descents,
-                            ends: (spread.values > 0).then(|| Ends {
-                                low: self.bound(spread.low),
-                                high: self.bound(spread.high),
-                                first: self.bound(spread.first),
-                                last: self.bound(spread.last),
-                            }),
-                        });
+                        self.fold_spread(&spread);
+                        return true;
+                    })+
+                    _ => false,
+                }
+            };
+        }
+        rudb_vector::for_each_layout!(signed, signed)
+    }
+
+    /// What [`spread`] made of one vector of a signed column, folded into the pass.
+    fn fold_spread(&mut self, spread: &Spread) {
+        let width = self.fixed.unwrap_or(8);
+        self.fold(Reduced {
+            rows: spread.rows,
+            nulls: spread.nulls,
+            values: spread.values,
+            bytes: width.saturating_mul(spread.values),
+            widest: if spread.values > 0 { width } else { 0 },
+            ascents: spread.ascents,
+            descents: spread.descents,
+            ends: (spread.values > 0).then(|| Ends {
+                low: self.bound(spread.low),
+                high: self.bound(spread.high),
+                first: self.bound(spread.first),
+                last: self.bound(spread.last),
+            }),
+        });
+    }
+
+    /// One vector of a signed column coded against a flat dictionary, read through its codes.
+    ///
+    /// `false` if the vector is not one of those, or if its dictionary holds a null, and the caller
+    /// tries [`Self::scan_dictionary`] and then [`Self::scan_rows`].
+    ///
+    /// A Parquet column chunk arrives with one dictionary for the whole row group, which is tens of
+    /// thousands of entries behind vectors of a couple of thousand rows. That is too big for
+    /// [`Self::scan_dictionary`] to order, so every one of those vectors went a row at a time, with
+    /// a code lookup, a `Bound` and four calls to [`Bound::order`] a row. On the `hits_0` load that
+    /// was about 5% of the write's cycles. A signed entry needs no ordering to be compared, so the
+    /// flat loop reads it through the code instead.
+    fn scan_gathered(&mut self, vector: &Vector) -> bool {
+        let Some((codes, values)) = vector.shared_dictionary_parts() else { return false };
+        let rows = vector.len();
+        if codes.len() < rows
+            || values.form() != Form::Flat
+            || values.validity().has_nulls(values.len())
+        {
+            return false;
+        }
+        let Some(data) = values.data() else { return false };
+        let codes = &codes[..rows];
+        let validity = vector.validity();
+        macro_rules! signed {
+            ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+                match data {
+                    $(Data::$variant(held) => {
+                        let held: &[$native] = held;
+                        if codes.iter().any(|&code| code as usize >= held.len()) {
+                            return false;
+                        }
+                        let spread =
+                            spread(rows, validity, |row| i128::from(held[codes[row] as usize]));
+                        self.fold_spread(&spread);
                         return true;
                     })+
                     _ => false,
@@ -1635,6 +1683,40 @@ mod tests {
                 let rows = drive(ty, &held, Pass::scan_rows);
                 assert_eq!(flat.summary, rows.summary, "flat: {label} {ty}");
                 assert_eq!(dictionary.summary, rows.summary, "dictionary: {label} {ty}");
+                // A signed column's dictionaries read through their codes, per vector and then as
+                // one dictionary of every distinct value, which is what a Parquet row group hands
+                // over and is too wide for the arm above. A dictionary holding a null is turned
+                // down and read a row at a time.
+                if *ty != LogicalType::Varchar {
+                    let mut distinct = values.clone();
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    distinct.reverse();
+                    let every = Arc::new(
+                        Vector::from_values(
+                            ty.clone(),
+                            &distinct.iter().map(|value| one(ty, *value)).collect::<Vec<_>>(),
+                        )
+                        .expect("values"),
+                    );
+                    let wide = values
+                        .chunks(60)
+                        .map(|part| {
+                            let codes = part.iter().map(|value| code(values, *value)).collect();
+                            Vector::dictionary_over(codes, Arc::clone(&every))
+                                .expect("a dictionary")
+                        })
+                        .collect::<Vec<_>>();
+                    for vectors in [&coded, &wide] {
+                        let gathered = drive(ty, vectors, |pass, vector| {
+                            if !pass.scan_gathered(vector) {
+                                assert!(values.contains(&None), "{label} {ty} is gathered");
+                                pass.scan_rows(vector);
+                            }
+                        });
+                        assert_eq!(gathered.summary, rows.summary, "gathered: {label} {ty}");
+                    }
+                }
                 // And again over one dictionary that every vector shares, which is what a Parquet
                 // load hands over and what the pass keeps its last dictionary for. Only for the
                 // shapes narrow enough to have one, since a dictionary wider than the vector it
