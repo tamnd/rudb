@@ -3664,7 +3664,8 @@ impl Writer {
                 (*section::SUMMARY, summary, summary.len() as u32),
                 (*section::SKETCHES, sketches, rudb_stats::sketches::HEADER_BYTES),
             ];
-            for (kind, bytes, header_bytes) in sections.into_iter().take(1 + usize::from(sketched)) {
+            let wanted = 1 + usize::from(sketched);
+            for (kind, bytes, header_bytes) in sections.into_iter().take(wanted) {
                 let written = write_section(
                     &*self.file,
                     &mut self.at,
