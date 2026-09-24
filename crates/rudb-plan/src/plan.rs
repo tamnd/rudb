@@ -115,6 +115,10 @@ pub struct Plan {
     /// group can be closed as soon as the key moves past it. A decision, like `dense`, written by
     /// one pass, `rudb_opt`'s `cluster`.
     clustered: BTreeSet<u32>,
+    /// The clustered aggregates whose key is grouped rather than ascending: each value's rows are
+    /// one run, in no particular order between runs. Written by the same pass as `clustered`, and a
+    /// subset of it.
+    grouped: BTreeSet<u32>,
     /// The Parquet files this plan read directly and could have read from a native mirror, each
     /// with whether its binary columns were read as text and how many rows its footer states.
     ///
@@ -171,6 +175,7 @@ impl Plan {
             ascending: BTreeSet::new(),
             widths: BTreeMap::new(),
             clustered: BTreeSet::new(),
+            grouped: BTreeSet::new(),
             mirrors: Vec::new(),
         }
     }
@@ -403,6 +408,20 @@ impl Plan {
     #[must_use]
     pub fn clustered(&self, index: u32) -> bool {
         self.clustered.contains(&index)
+    }
+
+    /// Records that the aggregate binding its output to `index` sees each value of its one key as
+    /// a single run of rows, in whatever order the runs come.
+    pub fn cluster_grouped(&mut self, index: u32) {
+        self.clustered.insert(index);
+        self.grouped.insert(index);
+    }
+
+    /// Whether the aggregate's key was clustered as grouped rather than as ascending, which is what
+    /// tells the operator not to expect the key to go up.
+    #[must_use]
+    pub fn grouped(&self, index: u32) -> bool {
+        self.grouped.contains(&index)
     }
 
     /// Records that the Parquet file at `path` was read directly and could have been mirrored.

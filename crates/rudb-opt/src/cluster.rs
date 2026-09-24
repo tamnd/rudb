@@ -23,6 +23,19 @@
 //! the hash table the way every chunk did before. A stale summary is a slower query and not a wrong
 //! one.
 //!
+//! # Grouped
+//!
+//! Ascending is one proof that a group is finished when the key moves past it, and it is not the
+//! only one. What the executor needs is that every value's rows are one run, and a table stored in
+//! date order has `l_orderkey` that way without having it ascending: each order's lines are
+//! together, and the orders come in date order. The file proves that with a forward link in the
+//! monotone form that every child row followed to exactly one parent, because that form is only
+//! taken when the children are in their parents' row order and the parent key is distinct. Such a
+//! key is clustered as grouped, and the executor then closes the runs strictly inside a chunk
+//! without asking the chunk to go up. That promise is not checked a chunk at a time, since no chunk
+//! can see whether a value comes back later, and it does not need to be: the link is checked
+//! against the table's generation when it is read, so it describes the rows being scanned.
+//!
 //! It is one key column and not several. A group by on two columns where the first is the sorted one
 //! closes the same way in principle, and the executor side of that is a separate piece of work.
 
@@ -30,6 +43,7 @@ use rudb_common::Result;
 use rudb_common::rules::Rule;
 use rudb_plan::{ColumnBinding, Expr, Node, NodeRef, Plan};
 
+use crate::link::Linked;
 use crate::pass::{Context, Pass, top_down};
 
 /// Marks every grouped aggregate whose one key arrives in ascending order.
@@ -47,14 +61,14 @@ impl Pass for AggregateCluster {
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
         if context.allows(Rule::ClosedGroups) {
-            cluster(plan);
+            cluster(plan, context.links());
         }
         Ok(())
     }
 }
 
 /// Records every aggregate in `plan` whose key the walk down to its scan keeps in order.
-fn cluster(plan: &mut Plan) {
+fn cluster(plan: &mut Plan, links: &[Linked]) {
     let mut found = Vec::new();
     for node in top_down(plan) {
         let Node::Aggregate { input, index, groups, .. } = *plan.node(node) else {
@@ -62,34 +76,65 @@ fn cluster(plan: &mut Plan) {
         };
         let &[key] = plan.expr_list(groups) else { continue };
         let &Expr::Column(binding) = plan.expr(key) else { continue };
-        if sorted(plan, input, binding, 16) {
-            found.push(index);
+        match sorted(plan, input, binding, links, 16) {
+            Some(Run::Ascending) => found.push((index, false)),
+            Some(Run::Grouped) => found.push((index, true)),
+            None => {}
         }
     }
-    for index in found {
-        plan.cluster(index);
+    for (index, grouped) in found {
+        if grouped {
+            plan.cluster_grouped(index);
+        } else {
+            plan.cluster(index);
+        }
     }
 }
 
-/// Whether `binding`, read off the output of `node`, is a stored column in ascending order.
+/// How a key arrives at an aggregate that can close its groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// Never going down, which each chunk is also checked for.
+    Ascending,
+    /// Each value one run of rows, the runs in no order.
+    Grouped,
+}
+
+/// Whether `binding`, read off the output of `node`, is a stored column in ascending order, or one
+/// the file proves grouped.
 ///
 /// The budget is against a malformed plan, the way it is in the estimator's walk.
-fn sorted(plan: &Plan, node: NodeRef, binding: ColumnBinding, depth: u32) -> bool {
-    let Some(depth) = depth.checked_sub(1) else { return false };
+fn sorted(
+    plan: &Plan,
+    node: NodeRef,
+    binding: ColumnBinding,
+    links: &[Linked],
+    depth: u32,
+) -> Option<Run> {
+    let depth = depth.checked_sub(1)?;
     match *plan.node(node) {
-        Node::Filter { input, .. } => sorted(plan, input, binding, depth),
+        Node::Filter { input, .. } => sorted(plan, input, binding, links, depth),
         Node::Project { input, index, exprs, .. } if index == binding.table => {
-            let Some(&carried) = plan.expr_list(exprs).get(binding.column as usize) else {
-                return false;
-            };
-            let &Expr::Column(carried) = plan.expr(carried) else { return false };
-            sorted(plan, input, carried, depth)
+            let &carried = plan.expr_list(exprs).get(binding.column as usize)?;
+            let &Expr::Column(carried) = plan.expr(carried) else { return None };
+            sorted(plan, input, carried, links, depth)
         }
-        Node::Get { index, columns, .. } if index == binding.table => plan
-            .field_list(columns)
-            .get(binding.column as usize)
-            .is_some_and(|field| plan.ascending(index, &field.name)),
-        _ => false,
+        Node::Get { index, table, columns, .. } if index == binding.table => {
+            let field = plan.field_list(columns).get(binding.column as usize)?;
+            if plan.ascending(index, &field.name) {
+                return Some(Run::Ascending);
+            }
+            let table = plan.string(table);
+            links
+                .iter()
+                .any(|link| {
+                    link.groups_child()
+                        && link.child.eq_ignore_ascii_case(table)
+                        && link.child_column.eq_ignore_ascii_case(&field.name)
+                })
+                .then_some(Run::Grouped)
+        }
+        _ => None,
     }
 }
 
@@ -144,6 +189,43 @@ mod tests {
         ));
         run(&mut plan, &Context::new());
         assert!(plan.clustered(1));
+    }
+
+    fn linked(link: crate::link::Linked) -> Context {
+        let mut context = Context::new();
+        context.relate(std::sync::Arc::new(vec![link]));
+        context
+    }
+
+    #[test]
+    fn a_key_a_monotone_total_link_proves_grouped_is_clustered_as_grouped() {
+        // Column `b` is not ascending. A link from it that every row followed, stored monotone, is
+        // what a date ordered `lineitem` has on `l_orderkey`.
+        let text = format!("Aggregate #1 groups=[#0.1::INTEGER] aggregates=[]\n  {SCAN}\n");
+        let proof = crate::link::Linked::verified("t", "b", "p", "k").monotone();
+        let mut marked = plan(&text);
+        run(&mut marked, &linked(proof.clone()));
+        assert!(marked.clustered(1));
+        assert!(marked.grouped(1), "grouped, so the operator does not expect it to go up");
+
+        // An ascending key stays ascending, and keeps its per chunk check.
+        let mut ascending =
+            plan(&format!("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  {SCAN}\n"));
+        run(&mut ascending, &linked(proof.clone()));
+        assert!(ascending.clustered(1) && !ascending.grouped(1));
+
+        // Each missing certificate leaves it alone: a packed link, a partial one, one over two
+        // columns, and one from another column.
+        for weaker in [
+            crate::link::Linked::verified("t", "b", "p", "k"),
+            crate::link::Linked::built("t", "b", "p", "k").monotone(),
+            proof.clone().and("a", "j"),
+            crate::link::Linked::verified("t", "a", "p", "k").monotone(),
+        ] {
+            let mut marked = plan(&text);
+            run(&mut marked, &linked(weaker.clone()));
+            assert!(!marked.clustered(1), "{weaker:?}");
+        }
     }
 
     #[test]

@@ -1593,7 +1593,8 @@ mod tests {
             link::Counts {
                 children: held.children(),
                 parents: held.parents(),
-                linked: held.linked()
+                linked: held.linked(),
+                form: held.form()
             }
         );
         assert_eq!((counts.children, counts.linked), (500, 500));

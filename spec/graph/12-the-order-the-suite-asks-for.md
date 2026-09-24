@@ -77,7 +77,7 @@ This is not tuned to the queries. It is chosen per table, once, from the schema,
 
 **Order stops being an accident that structures depend on.** Two facts and one form:
 
-- **Grouped.** A column is grouped when each of its values occupies one contiguous run of rows. Ascending implies it. The writer proves it on the pass it already makes, with a set of the values whose runs have closed, and stops tracking the first time a value comes back. The closed groups rule reads grouped instead of ascending.
+- **Grouped.** A column is grouped when each of its values occupies one contiguous run of rows. Ascending implies it, and so does a forward link in the monotone form that every child row followed to exactly one parent, since that form is only taken when the children are in their parents' row order and the parent key is distinct. The writer cannot prove it on the summary pass for a column like `l_orderkey`, because the distinct sketch stops being exact after a few thousand values and a set of every value seen is the size of a key map, but the link build already reads the column in row order against a key map and the form it picks is the proof. The closed groups rule reads either proof, and the executor closes a run with a different value on both sides of it without asking the chunk to go up.
 - **The permuted key map.** A key map over distinct keys that are dense in their range but not stored in key order: the dense form's bitmap and rank, and a permutation from rank to rid. 0.78 MB of bitmap and 3.9 MB of permutation for `o_orderkey` on the clustered file, half the sorted form, and it answers in constant time.
 - **The relationships the file holds are the relationships the planner sees.** A link the file verified and kept is a fact about the file, and a session that did not declare it still gets it. `graph_links` becomes what to build at the next checkpoint and stops being what to read on every statement.
 
@@ -89,7 +89,7 @@ This is not tuned to the queries. It is chosen per table, once, from the schema,
 
 Each item is measured against section 12.2 before it merges, on both files. The expected numbers are what the section 12.2 table implies and are there to be checked, not believed.
 
-1. **Grouped.** Writer proves it, summary carries it, closed groups reads it. Expected: q18 on the clustered file from 2.17 back to about 0.8, and nothing else moves.
+1. **Grouped.** A monotone total link proves it, the planner reads the form off the link's header, closed groups reads it. Expected: q18 on the clustered file with links from 2.17 back to about 0.8, and nothing else moves.
 2. **Permuted key map.** Expected: the `lineitem -> orders` link kept on the clustered file.
 3. **`graph_order` and the ordered checkpoint.** Expected: loading the base rows and declaring `orders(o_orderdate)` and `lineitem` through `orders` gives the clustered column of section 12.2 without an external sort, so about 10.3 for the suite with item 1 in.
 4. **Relationships from the file.** Expected: the 20 million per statement gone, so the layer-on column is never above the layer-off one on q02 and q11.
