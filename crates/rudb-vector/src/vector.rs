@@ -376,6 +376,29 @@ impl Data {
         }
     }
 
+    /// The runs of equal signed integers among rows `from..to` of the first `len`, each as its
+    /// value widened to `i64` and the row it ends before, appended to `out`.
+    ///
+    /// `false`, with `out` cleared, where [`Self::signed_block`] says `false`, for rows past `len`,
+    /// and once there are more than one run for every `every` rows read so far, give or take a
+    /// block, so that a column in no order is given up on after its first few blocks.
+    #[must_use]
+    pub fn signed_runs(
+        &self,
+        len: usize,
+        (from, to): (usize, usize),
+        every: usize,
+        out: &mut Vec<(i64, usize)>,
+    ) -> bool {
+        match self {
+            Self::Int8(v) => runs_widened(v.as_slice(), len, (from, to), every, out),
+            Self::Int16(v) => runs_widened(v.as_slice(), len, (from, to), every, out),
+            Self::Int32(v) => runs_widened(v.as_slice(), len, (from, to), every, out),
+            Self::Int64(v) => runs_widened(v.as_slice(), len, (from, to), every, out),
+            _ => false,
+        }
+    }
+
     /// An unsigned integer at `index`, widened.
     #[must_use]
     pub fn unsigned_at(&self, index: usize) -> Option<u128> {
@@ -2801,6 +2824,26 @@ impl Vector {
         }
     }
 
+    /// The runs of equal values among rows `from..to`, each as its value widened to `i64` and the
+    /// row it ends before, written into `out`.
+    ///
+    /// For a flat signed integer vector, the form a sorted key column is in under a filter's
+    /// selection. `false`, with `out` cleared, for every other form, and once the runs come more
+    /// often than one in every `every` rows. See [`Data::signed_runs`].
+    #[must_use]
+    pub fn signed_runs(
+        &self,
+        (from, to): (usize, usize),
+        every: usize,
+        out: &mut Vec<(i64, usize)>,
+    ) -> bool {
+        out.clear();
+        match &self.body {
+            Body::Flat(data) => data.signed_runs(self.len, (from, to), every, out),
+            _ => false,
+        }
+    }
+
     /// Every signed value in order, widened to `i64`, written into `out`.
     ///
     /// The bulk form of [`Self::signed_at`], for a caller that is going to read the whole vector
@@ -4032,6 +4075,44 @@ fn gather_widened<T: Copy + Into<i64>>(
         return false;
     }
     out.extend(at.iter().map(|&row| run[row as usize].into()));
+    true
+}
+
+/// See [`Data::signed_runs`]. Sixteen values are compared against the current one at once, which
+/// the compiler turns into a few vector compares, and only a block where something changed is
+/// walked a value at a time.
+fn runs_widened<T: Copy + Eq + Into<i64>>(
+    run: &[T],
+    len: usize,
+    (from, to): (usize, usize),
+    every: usize,
+    out: &mut Vec<(i64, usize)>,
+) -> bool {
+    out.clear();
+    let Some(values) = run.get(..len).and_then(|run| run.get(from..to)) else {
+        return false;
+    };
+    let Some(&first) = values.first() else {
+        return true;
+    };
+    let mut current = first;
+    for (block, stretch) in values.chunks(16).enumerate() {
+        if !stretch.iter().fold(false, |differ, &value| differ | (value != current)) {
+            continue;
+        }
+        let start = from + block * 16;
+        for (row, &value) in stretch.iter().enumerate() {
+            if value != current {
+                out.push((current.into(), start + row));
+                current = value;
+            }
+        }
+        if out.len() > (block * 16) / every.max(1) + 64 {
+            out.clear();
+            return false;
+        }
+    }
+    out.push((current.into(), to));
     true
 }
 
@@ -6260,6 +6341,25 @@ mod tests {
         assert!(out.is_empty());
         assert!(!Vector::sequence(100, 5, 4).signed_gather(&at, &mut out));
         assert!(integers(&[1]).signed_gather(&[], &mut out) && out.is_empty());
+    }
+
+    /// The runs of a flat column are its values where they change and the rows they end before,
+    /// counted from the row the runs were asked from, and a column that changes on every row is
+    /// given up on.
+    #[test]
+    fn the_runs_of_a_flat_column_end_where_its_values_change() {
+        let mut out = Vec::new();
+        let column =
+            Vector::flat(LogicalType::SmallInt, Data::Int16(vec![4, 4, 4, -1, -1, 4, 9].into()))
+                .unwrap();
+        assert!(column.signed_runs((1, 7), 1, &mut out));
+        assert_eq!(out, [(4, 3), (-1, 5), (4, 6), (9, 7)]);
+        assert!(!column.signed_runs((1, 8), 1, &mut out), "row 7 is past the end");
+        assert!(out.is_empty());
+        let changing = integers(&(0..1000).collect::<Vec<_>>());
+        assert!(!changing.signed_runs((0, 1000), 8, &mut out));
+        assert!(out.is_empty());
+        assert!(!Vector::sequence(100, 5, 4).signed_runs((0, 4), 8, &mut out));
     }
 
     /// The rows a filter kept out of a part's row numbers are a dictionary over the numbers of the
