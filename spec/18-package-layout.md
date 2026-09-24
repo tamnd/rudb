@@ -54,9 +54,7 @@ The failure mode being avoided is a crate tree that looks modular and is not: fo
 
 `rudb-exec`, operators, morsels, the scheduler, hash tables, sorting, spilling. It is also where the shim gets put around every operator, because building the tree is the one walk that sees all of them. The id and the pipeline number an operator reports under are not decided here, they are read off the shape `rudb-plan` works out, so that `EXPLAIN` can print an operator's number without building it.
 
-`rudb-ir`, the expression IR from document 8.5.
-
-`rudb-jit`, tiers 1 through 3: fusion, Cranelift lowering, the code cache. **Behind a feature flag that defaults on and that can be turned off**, so that the whole engine builds and passes its tests with no JIT at all. That is not a hypothetical configuration; it is what runs under Miri and what runs on a platform Cranelift does not target.
+`rudb-qc-ir` and the other `rudb-qc-*` crates, the compiled engine of `spec/compiler/`. Their ranks and what each may depend on are in `spec/compiler/19-crate-layout.md`. They replace `rudb-ir` and `rudb-jit`, which were nine line scaffolds for the four tier design of document 8.
 
 **Formats.**
 

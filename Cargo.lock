@@ -362,7 +362,6 @@ dependencies = [
  "rudb-functions",
  "rudb-graph",
  "rudb-io",
- "rudb-jit",
  "rudb-kernels",
  "rudb-metrics",
  "rudb-native",
@@ -392,7 +391,6 @@ dependencies = [
  "rudb-common",
  "rudb-csv",
  "rudb-io",
- "rudb-ir",
  "rudb-kernels",
  "rudb-parquet",
  "rudb-parse",
@@ -422,24 +420,6 @@ name = "rudb-io"
 version = "0.4.31"
 dependencies = [
  "rudb-common",
-]
-
-[[package]]
-name = "rudb-ir"
-version = "0.4.31"
-dependencies = [
- "rudb-common",
- "rudb-vector",
-]
-
-[[package]]
-name = "rudb-jit"
-version = "0.4.31"
-dependencies = [
- "rudb-common",
- "rudb-ir",
- "rudb-kernels",
- "rudb-vector",
 ]
 
 [[package]]
@@ -541,6 +521,17 @@ version = "0.4.31"
 dependencies = [
  "rudb-native",
 ]
+
+[[package]]
+name = "rudb-qc-interp"
+version = "0.4.31"
+dependencies = [
+ "rudb-qc-ir",
+]
+
+[[package]]
+name = "rudb-qc-ir"
+version = "0.4.31"
 
 [[package]]
 name = "rudb-regex"

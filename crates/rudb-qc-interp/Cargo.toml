@@ -1,6 +1,6 @@
 [package]
-name = "rudb-jit"
-description = "Fused kernels, Cranelift lowering and the compiled code cache."
+name = "rudb-qc-interp"
+description = "The query compiler's first tier: runs QIR pipeline functions without generating machine code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,10 +13,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-rudb-common.workspace = true
-rudb-vector.workspace = true
-rudb-ir.workspace = true
-rudb-kernels.workspace = true
+rudb-qc-ir.workspace = true
 
 [lints]
 workspace = true
