@@ -564,35 +564,62 @@ fn all_constant(plan: &Plan, slice: Slice) -> bool {
 /// A constant compares by value rather than by reference for the same reason, and a function by the
 /// name it resolved to rather than by where that name is interned.
 pub(crate) fn same(plan: &Plan, one: ExprRef, other: ExprRef) -> bool {
-    if one == other {
+    alike(plan, one, other, None)
+}
+
+/// Whether `other` is `one` once every column `other` reads is put through `map`.
+///
+/// The question two copies of one subquery ask, where the second copy reads the same tables under
+/// indexes of its own. `map` takes a column of `other`'s side to the column of `one`'s side it
+/// stands for, and a column it has nothing for makes the two different.
+pub(crate) fn same_mapped(
+    plan: &Plan,
+    one: ExprRef,
+    other: ExprRef,
+    map: &dyn Fn(ColumnBinding) -> Option<ColumnBinding>,
+) -> bool {
+    alike(plan, one, other, Some(map))
+}
+
+/// Type of the mapping [`alike`] carries, where `None` is every column standing for itself.
+type Map<'a> = Option<&'a dyn Fn(ColumnBinding) -> Option<ColumnBinding>>;
+
+fn alike(plan: &Plan, one: ExprRef, other: ExprRef, map: Map<'_>) -> bool {
+    if one == other && map.is_none() {
         return true;
     }
     if plan.expr_type(one) != plan.expr_type(other) {
         return false;
     }
     match (plan.expr(one), plan.expr(other)) {
-        (Expr::Column(left), Expr::Column(right)) => left == right,
+        (Expr::Column(left), Expr::Column(right)) => match map {
+            None => left == right,
+            Some(map) => map(*right) == Some(*left),
+        },
         (Expr::Constant(left), Expr::Constant(right)) => plan.value(*left) == plan.value(*right),
         (
             Expr::Cast { input: left, try_cast: left_try },
             Expr::Cast { input: right, try_cast: right_try },
-        ) => left_try == right_try && same(plan, *left, *right),
+        ) => left_try == right_try && alike(plan, *left, *right, map),
         (
             Expr::Compare { op: left_op, left: left_one, right: left_other },
             Expr::Compare { op: right_op, left: right_one, right: right_other },
         ) => {
             left_op == right_op
-                && same(plan, *left_one, *right_one)
-                && same(plan, *left_other, *right_other)
+                && alike(plan, *left_one, *right_one, map)
+                && alike(plan, *left_other, *right_other, map)
         }
         (
             Expr::Conjunction { op: left_op, children: left },
             Expr::Conjunction { op: right_op, children: right },
-        ) => left_op == right_op && same_list(plan, *left, *right),
+        ) => left_op == right_op && same_list(plan, *left, *right, map),
         (
             Expr::Function { name: left_name, args: left },
             Expr::Function { name: right_name, args: right },
-        ) => plan.string(*left_name) == plan.string(*right_name) && same_list(plan, *left, *right),
+        ) => {
+            plan.string(*left_name) == plan.string(*right_name)
+                && same_list(plan, *left, *right, map)
+        }
         (
             Expr::Aggregate {
                 name: left_name,
@@ -609,8 +636,8 @@ pub(crate) fn same(plan: &Plan, one: ExprRef, other: ExprRef) -> bool {
         ) => {
             plan.string(*left_name) == plan.string(*right_name)
                 && left_distinct == right_distinct
-                && same_list(plan, *left, *right)
-                && same_option(plan, *left_filter, *right_filter)
+                && same_list(plan, *left, *right, map)
+                && same_option(plan, *left_filter, *right_filter, map)
         }
         (
             Expr::Case { arms: left, otherwise: left_otherwise },
@@ -620,26 +647,26 @@ pub(crate) fn same(plan: &Plan, one: ExprRef, other: ExprRef) -> bool {
             let (left_otherwise, right_otherwise) = (*left_otherwise, *right_otherwise);
             left.len() == right.len()
                 && left.iter().zip(&right).all(|(one, other)| {
-                    same(plan, one.when, other.when) && same(plan, one.then, other.then)
+                    alike(plan, one.when, other.when, map) && alike(plan, one.then, other.then, map)
                 })
-                && same_option(plan, left_otherwise, right_otherwise)
+                && same_option(plan, left_otherwise, right_otherwise, map)
         }
         _ => false,
     }
 }
 
 /// Whether two runs of expressions are the same run.
-fn same_list(plan: &Plan, one: Slice, other: Slice) -> bool {
+fn same_list(plan: &Plan, one: Slice, other: Slice, map: Map<'_>) -> bool {
     let (one, other) = (plan.expr_list(one).to_vec(), plan.expr_list(other).to_vec());
     one.len() == other.len()
-        && one.iter().zip(&other).all(|(&left, &right)| same(plan, left, right))
+        && one.iter().zip(&other).all(|(&left, &right)| alike(plan, left, right, map))
 }
 
 /// Whether two optional expressions are the same, counting absent as the same as absent.
-fn same_option(plan: &Plan, one: Option<ExprRef>, other: Option<ExprRef>) -> bool {
+fn same_option(plan: &Plan, one: Option<ExprRef>, other: Option<ExprRef>, map: Map<'_>) -> bool {
     match (one, other) {
         (None, None) => true,
-        (Some(left), Some(right)) => same(plan, left, right),
+        (Some(left), Some(right)) => alike(plan, left, right, map),
         _ => false,
     }
 }
