@@ -1798,6 +1798,13 @@ fn comparison_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalTyp
         (LogicalType::Varchar, other) | (other, LogicalType::Varchar) if reads_a_string(other) => {
             Some(other.clone())
         }
+        // An enum is compared as whatever the other side is, read from its label, so `'1'::e = 1`
+        // is true and `'x'::e = 1` fails to convert `x`, which is the pin.
+        (LogicalType::Enum(_), other) | (other, LogicalType::Enum(_))
+            if reads_a_string(other) || matches!(other, LogicalType::Blob) =>
+        {
+            Some(other.clone())
+        }
         _ => None,
     }
 }

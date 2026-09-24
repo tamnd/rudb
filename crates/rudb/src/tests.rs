@@ -10238,3 +10238,30 @@ fn enum_types_follow_the_pin() {
     let err = db.execute("CREATE TYPE dup AS ENUM ('a', 'a')").unwrap_err().to_string();
     assert!(err.contains("duplicate value a"), "{err}");
 }
+
+/// An enum compared with a number is compared as that number, and a label one enum has and the
+/// other lacks names both enums in the error, which are the pin's answers. Per #468.
+#[test]
+fn an_enum_meets_a_number_and_another_enum_the_way_the_pin_does() {
+    let db = database();
+    db.execute("CREATE TYPE digits AS ENUM ('1', '2', 'x')").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT '1'::digits = 1, '2'::digits IN (1, 2)"),
+        vec![vec![Value::Boolean(true), Value::Boolean(true)]]
+    );
+    let err = db.execute("SELECT 'x'::digits = 1").unwrap_err().to_string();
+    assert!(err.contains("Could not convert string 'x' to INT32"), "{err}");
+    db.execute("CREATE TABLE digit_source (d digits)").unwrap();
+    db.execute("INSERT INTO digit_source VALUES ('1'), ('x')").unwrap();
+    db.execute("CREATE TABLE digit_sink (d ENUM('1', '2'))").unwrap();
+    let err = db.execute("INSERT INTO digit_sink SELECT * FROM digit_source").unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "Type ENUM('1', '2', 'x') with value x can't be cast to the destination type \
+             ENUM('1', '2')"
+        ),
+        "{err}"
+    );
+    let err = db.execute("SELECT 'a'::ENUM").unwrap_err().to_string();
+    assert!(err.contains("ENUM type requires at least one argument"), "{err}");
+}
