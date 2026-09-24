@@ -61,6 +61,7 @@ use crate::datetime::{self, Count, Part};
 use crate::fallback::{self, Kernel};
 use crate::lists;
 use crate::maps;
+use crate::math;
 use crate::number::{approximate, beyond, digits, fit, integral, pow10, rescale};
 use crate::prepare::{Hoisted, Recipe};
 use crate::regexp;
@@ -213,6 +214,12 @@ fn specialized<V: AsRef<Vector>>(
     if let Some(vector) = structs::vectorized(name, args, returns)? {
         return Ok(Some(vector));
     }
+    if let [value, digits] = args
+        && let Some(vector) =
+            math::rounded_column(name, value.as_ref(), digits.as_ref(), returns, rows)?
+    {
+        return Ok(Some(vector));
+    }
     match args {
         [only] => unary(name, only.as_ref(), returns, rows),
         [left, right] => {
@@ -361,7 +368,7 @@ fn one_of<A: Fn(usize) -> usize>(
         "make_date" => made_date(data, at, base, rows, returns),
         "epoch_ms" => made_timestamp(data, at, base, rows, returns),
         name if datetime::is_interval(name) => made_interval(name, data, at, base, rows, returns),
-        _ => Ok(None),
+        _ => math::vectorized(name, data, at, base, rows, returns),
     }
 }
 
@@ -3116,6 +3123,9 @@ pub fn call_values(
     if let Some(answer) = maps::value(name, args, returns) {
         return answer;
     }
+    if let Some(answer) = math::value(name, args, returns) {
+        return answer;
+    }
     // `list_aggr` over one list. The binder resolved the aggregate and put its name second, and
     // cast the list to the element type it takes, so this is the accumulator a `GROUP BY` would use
     // with the elements as its rows, and an empty list answers what an empty group does.
@@ -4198,9 +4208,9 @@ mod tests {
 
     #[test]
     fn a_function_nobody_has_written_says_which_one() {
-        let error = call_values("sqrt", &[Value::Double(4.0)], &LogicalType::Double, None)
-            .expect_err("sqrt is not written yet");
-        assert!(error.message().contains("the sqrt function"), "{error}");
+        let error = call_values("jaro_winkler", &[Value::Double(4.0)], &LogicalType::Double, None)
+            .expect_err("jaro_winkler is not written yet");
+        assert!(error.message().contains("the jaro_winkler function"), "{error}");
     }
 
     #[test]

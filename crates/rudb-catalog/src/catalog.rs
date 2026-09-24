@@ -721,7 +721,8 @@ impl Catalog {
             if same_name(&held, catalog) && same_name(&schema, name) {
                 // The pin writes the path back as a bare `main` rather than clearing it, so the
                 // setting reads `main` where a session that never set it reads empty.
-                let catalog = if same_name(&held, &self.default_catalog) { String::new() } else { held };
+                let catalog =
+                    if same_name(&held, &self.default_catalog) { String::new() } else { held };
                 self.search =
                     vec![crate::SearchEntry { catalog, schema: DEFAULT_SCHEMA.to_string() }];
             }

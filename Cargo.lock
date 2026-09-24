@@ -435,6 +435,7 @@ dependencies = [
 name = "rudb-kernels"
 version = "0.4.33"
 dependencies = [
+ "libm",
  "memchr",
  "rudb-common",
  "rudb-encoding",
