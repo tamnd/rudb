@@ -1,8 +1,8 @@
 //! `rudb_links()`, the table that says what the graph layer knows about this database.
 //!
-//! One row per declared relationship. What is declared comes from the session, because
-//! `SET graph_links` is where a relationship is declared for tables that arrived from Parquet and
-//! Parquet has no foreign keys to read one out of. What is stored comes from the tables themselves,
+//! One row per declared relationship. What is declared comes from the tables' foreign keys and from
+//! the session, because `SET graph_links` is where a relationship is declared for tables that
+//! arrived from Parquet and Parquet has no foreign keys to read one out of. What is stored comes from the tables themselves,
 //! so a row is a declaration on the left and a measurement on the right, and the two are never
 //! mixed: section 2.3 of spec/graph/02-the-data-model.md says a declaration is what somebody
 //! believes and a build is what is true.
@@ -39,12 +39,67 @@ pub(crate) fn links(
     // through. A session filled in by something other than the settings layer is the other caller,
     // and a declaration it could not parse is one no build will have acted on either, so the table
     // says nothing about it rather than refusing to be read.
-    let declared = parse_links(session.links()).unwrap_or_default();
+    let declared = declared(catalog, session.links());
     let mut rows = Vec::with_capacity(declared.len());
     for link in &declared {
         rows.push(row(catalog, link));
     }
     Metadata::new("rudb_links", &link_fields(), &rows, plan, index, columns)
+}
+
+/// Every relationship declared for this catalog: the ones `graph_links` names, then one for each
+/// foreign key a table was created with that the setting does not already name.
+///
+/// Section 2.5 of spec/graph/02-the-data-model.md lists the foreign keys first, as the path that
+/// needs nothing from the user, and the setting second, for data that arrived without constraints.
+/// The two are one list because nothing downstream cares where a relationship came from: the build
+/// verifies both the same way and a plan reads neither until it has.
+///
+/// A setting the parser refused contributes nothing, which is the silence `rudb_links()` has always
+/// given one. A foreign key over no columns or into a table of another schema is left out.
+#[must_use]
+pub fn declared(catalog: &Catalog, setting: &str) -> Vec<Relationship> {
+    let mut declared = parse_links(setting).unwrap_or_default();
+    for table in catalog.tables() {
+        for foreign in table.foreign() {
+            if !foreign.table.schema.eq_ignore_ascii_case(&table.name().schema) {
+                continue;
+            }
+            let Ok(parent) = catalog.table(&foreign.table) else { continue };
+            let named = |on: &Table, columns: &[usize]| {
+                columns
+                    .iter()
+                    .map(|&at| on.columns().get(at).map(|field| field.name.clone()))
+                    .collect::<Option<Vec<String>>>()
+            };
+            let (Some(child_columns), Some(parent_columns)) =
+                (named(table, &foreign.columns), named(parent, &foreign.referenced))
+            else {
+                continue;
+            };
+            let (Ok(child), Ok(parent)) = (
+                Side::composite(table.name().table.clone(), child_columns),
+                Side::composite(parent.name().table.clone(), parent_columns),
+            ) else {
+                continue;
+            };
+            let Ok(link) = Relationship::declare(child, parent) else { continue };
+            let named_already = declared.iter().any(|held| {
+                held.child.table.eq_ignore_ascii_case(&link.child.table)
+                    && held.parent.table.eq_ignore_ascii_case(&link.parent.table)
+                    && same_columns(&held.child.columns, &link.child.columns)
+                    && same_columns(&held.parent.columns, &link.parent.columns)
+            });
+            if !named_already {
+                declared.push(link);
+            }
+        }
+    }
+    declared
+}
+
+fn same_columns(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(l, r)| l.eq_ignore_ascii_case(r))
 }
 
 /// What one relationship reports.
