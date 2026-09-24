@@ -2168,6 +2168,14 @@ fn rebind(
 /// difference between loading eight TPC-H tables one statement at a time and loading one of them
 /// eight times over.
 ///
+/// A table the file holds with no rows counts as one of the ones that changed rather than as a
+/// disagreement, when the catalog has rows for it now. That is what a loading script leaves behind:
+/// the schema is committed empty by one statement and each table is filled by the next. A table
+/// with a primary key cannot stream into the file, because the sink does not check keys, so it
+/// fills in memory and arrives here. Before this, it arrived as a disagreement, and every one of
+/// those statements rewrote the whole database, which made loading the 21 tables of the JOB schema
+/// one at a time cost more than twenty times what loading them took.
+///
 /// It cannot when the file is not there, when nothing in the catalog is native yet, or when the two
 /// disagree about which tables exist, and the caller writes the whole file instead. A file that is
 /// there but is not a native file this build can read is an error either way, so the error from
@@ -2178,8 +2186,8 @@ fn appended(
     names: &[QualifiedName],
     views: &[rudb_native::ViewEntry],
 ) -> Result<bool> {
-    let Some(held) = committed(path)? else { return Ok(false) };
-    if held.tables.is_empty() {
+    let Some(held) = held_rows(path)? else { return Ok(false) };
+    if held.is_empty() {
         return Ok(false);
     }
     let native = names
@@ -2187,11 +2195,19 @@ fn appended(
         .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_native()))
         .map(|name| name.table.clone())
         .collect::<BTreeSet<_>>();
-    if held.tables != native {
-        return Ok(false);
-    }
     let dirty =
         names.iter().filter(|name| !native.contains(&name.table)).cloned().collect::<Vec<_>>();
+    // Every table the file holds is either carried forward as it is or is an empty one the new
+    // generation takes the place of, and the writer drops an empty entry of the same name when it
+    // starts that table. A table the file holds with rows in it that the catalog no longer has as
+    // native is rows this generation would have to rewrite, and that is the whole file path.
+    let replaced = |name: &String| held.get(name).is_some_and(|rows| *rows == 0);
+    let carried = held.keys().all(|name| {
+        native.contains(name) || (replaced(name) && dirty.iter().any(|d| &d.table == name))
+    });
+    if !carried || !native.iter().all(|name| held.contains_key(name)) {
+        return Ok(false);
+    }
     let mut writer: Option<rudb_native::Writer> = None;
     for name in &dirty {
         let table = catalog.table(name)?;
