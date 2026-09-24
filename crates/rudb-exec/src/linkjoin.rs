@@ -55,7 +55,7 @@ use rudb_graph::Link;
 use rudb_pipeline::{Compaction, Gauge, Lease, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, JoinKind, Plan};
 use rudb_seam::{Context, SeamId, Settings};
-use rudb_vector::{Chunk, Data, NO_ROW, Selection, Vector};
+use rudb_vector::{Chunk, Data, NO_ROW, Selection, Validity, Vector};
 
 use crate::pairs::together;
 use crate::prepared::{Prepared, Scratch};
@@ -219,7 +219,10 @@ impl LinkJoin {
                     "a link join could not hold the parent columns it gathers from".to_string(),
                 )
             })?;
-            columns.push(Vector::gathered(source, Arc::clone(&ids))?);
+            columns.push(match coded(&source, rids)? {
+                Some(codes) => codes,
+                None => Vector::gathered(source, Arc::clone(&ids))?,
+            });
         }
         *chunk = Chunk::with_rows(columns, rows)?;
         Ok(())
@@ -367,6 +370,46 @@ impl Stream for LinkJoin {
     }
 }
 
+/// The rows `rids` names of a parent column held as codes into the table's dictionary, as codes
+/// into the same dictionary, or `None` for a column held any other way.
+///
+/// Read now rather than left as a gather, because it is four bytes a row and what comes out is a
+/// stable dictionary, which every kernel above already reads a code at a time. A gather over the
+/// same codes is a form most of them flatten, and on TPC-H q12 the flatten of `o_orderpriority`
+/// out of a gather was most of what the link join cost. A row whose parent is [`NO_ROW`] or null is
+/// null.
+fn coded(source: &Vector, rids: &[u32]) -> Result<Option<Vector>> {
+    let Some((codes, values)) = source.stable_dictionary_parts() else { return Ok(None) };
+    // A dictionary with no values has no code to stand in for a null row.
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let parent = source.validity();
+    let mut nulls = false;
+    let mut taken = Vec::with_capacity(rids.len());
+    for &rid in rids {
+        if rid == NO_ROW {
+            nulls = true;
+            taken.push(0);
+            continue;
+        }
+        let Some(&code) = codes.get(rid as usize) else {
+            return Err(Error::internal("a link join gathered past the end of a parent column"));
+        };
+        nulls |= !parent.is_valid(rid as usize);
+        taken.push(code);
+    }
+    let vector = Vector::stable_dictionary(taken, Arc::clone(values))?;
+    Ok(Some(if nulls {
+        vector.with_validity(Validity::from_iter(rids.len(), |row| {
+            let rid = rids[row];
+            rid != NO_ROW && parent.is_valid(rid as usize)
+        }))
+    } else {
+        vector
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -378,10 +421,42 @@ mod tests {
     use rudb_plan::{ColumnBinding, Expr, JoinKind, Plan};
     use rudb_seam::Settings;
     use rudb_storage::MemoryTable;
-    use rudb_vector::{Chunk, Vector};
+    use rudb_vector::{Chunk, NO_ROW, Validity, Vector};
 
-    use super::LinkJoin;
+    use super::{LinkJoin, coded};
     use crate::schema::Schema;
+
+    /// A parent column of codes gathers as codes into the same values, with a missing parent and a
+    /// null parent both null, and any other column is left to the gather.
+    #[test]
+    fn a_coded_parent_column_gathers_as_codes() {
+        let words = ["1-URGENT", "2-HIGH", "5-LOW"];
+        let values: Vec<Value> = words.iter().map(|&word| Value::Varchar(word.into())).collect();
+        let values = Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("words"));
+        let source = Vector::stable_dictionary(vec![2, 0, 1, 1], Arc::clone(&values))
+            .expect("codes inside the dictionary")
+            .with_validity(Validity::from_iter(4, |row| row != 3));
+        let rids = [1, NO_ROW, 0, 3, 2, 0];
+        let taken = coded(&source, &rids).expect("in range").expect("a coded column");
+        let (_, held) = taken.stable_dictionary_parts().expect("still codes");
+        assert!(Arc::ptr_eq(held, &values), "the codes point somewhere else");
+        let text = |word: &str| Value::Varchar(word.into());
+        let read: Vec<Value> = (0..rids.len()).map(|row| taken.value_at(row)).collect();
+        assert_eq!(
+            read,
+            [
+                text("1-URGENT"),
+                Value::Null,
+                text("5-LOW"),
+                Value::Null,
+                text("2-HIGH"),
+                text("5-LOW")
+            ]
+        );
+        assert!(coded(&source, &[4]).is_err(), "a row past the column");
+        let flat = Vector::from_values(LogicalType::Integer, &[Value::Integer(1)]).expect("flat");
+        assert!(coded(&flat, &[0]).expect("a flat column").is_none());
+    }
 
     /// A parent of `rows` rows whose one column is its own row number, so that a gathered value
     /// says which parent row it came from and a wrong link shows up as a wrong number.
