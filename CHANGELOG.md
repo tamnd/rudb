@@ -6,6 +6,14 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.23
+
+A patch release of ten commits, most of them on the write path under W1. The native directory format number stays at 29 and the storage format version at 9.
+
+#1684 adds `rudb_codec_metrics()`, which counts how often the writer offered each codec, how often it kept it and what the offers cost, so W1's rule about codecs that cost more than they save can be read off a load. #1692 used it: the integer cascade now offers DELTA only where the differences pack narrower than the values or repeat where the values do not, and DICT only where its codes are narrower than the values, which took integer encode time on a TPC-H SF1 load from 8.6 s to 3.6 s for 83 more bytes in a 263 MB file. #1687 reads a signed column's shared dictionary through its codes in the statistics pass, 8.8% fewer instructions on the hits_0 load, and #1690 keeps a dictionary entry's count and hash in one slot in the distinct count. A later commit keeps complete numeric groups out of native frequency synopses.
+
+On the read side, #1691 checks a held page's parts once rather than on every read, #1689 compares a short IN list of whole numbers entry by entry instead of hashing every row (ClickBench q41 from about 243M to 197M user cycles), #1688 reads the hour, minute and second of a timestamp with the divisors fixed at compile time, and #1686 adds an optimizer pass that sums below a join that only brings in strings to group by, which is TPC-H q10's shape. #1683 refuses a foreign key that references a view with the error DuckDB gives.
+
 ## 0.4.22
 
 A patch release of seven commits, and the release 0.4.21 should have been. The 0.4.21 tag failed its verify job on three checks the gate runs, two loops in a crash test that read cells one at a time without saying why, an iterator flatten without its comment, and a let chain that the 1.85 compiler this project supports does not accept. So 0.4.21 never published. #1679 fixes all three, and everything listed under 0.4.21 ships in this release. The native directory format number stays at 29 and the storage format version at 9.
