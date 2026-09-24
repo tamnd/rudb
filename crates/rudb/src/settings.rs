@@ -1157,7 +1157,16 @@ fn typed(entry: &SettingEntry, value: &Value) -> Result<String> {
             }
             Ok(count.to_string())
         }
-        "DOUBLE" => Ok(double_of(value)?.to_string()),
+        // Written the way a `DOUBLE` prints, so `1.0` reads back as `1.0` and not as `1`.
+        "DOUBLE" => {
+            let number = double_of(value)?;
+            if entry.name == "index_scan_percentage" && !(0.0..=1.0).contains(&number) {
+                return Err(Error::invalid_input(
+                    "the index scan percentage must be within [0, 1]".to_string(),
+                ));
+            }
+            Ok(Value::Double(number).to_string())
+        }
         _ => Ok(text_of(value)),
     }
 }
@@ -1193,6 +1202,12 @@ fn double_of(value: &Value) -> Result<f64> {
     match value {
         Value::Float(number) => Ok(f64::from(*number)),
         Value::Double(number) => Ok(*number),
+        // `1.0` is a decimal literal before it is anything else, which is the value a `SET` of a
+        // fraction arrives as.
+        #[allow(clippy::cast_precision_loss)]
+        Value::Decimal { unscaled, scale, .. } => {
+            Ok(*unscaled as f64 / 10f64.powi(i32::from(*scale)))
+        }
         Value::Varchar(text) => text.trim().parse::<f64>().map_err(|_| {
             Error::invalid_input(format!(
                 "Failed to cast value: Could not convert string '{text}' to DOUBLE"
