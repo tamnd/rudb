@@ -477,14 +477,56 @@ fn packed_kept(
         reason = "both widths are at most 61 bits, so a code is well inside an i64"
     )]
     let kept = if dense {
+        // Unpacked into two runs of `i64` with the difference already on the right, and then
+        // compared as two flat columns are, so that a block of 64 is a zip the compiler does in
+        // vector registers. Compared through a closure over the row, each row reloaded both
+        // vectors behind the flag it had just stored, which could have been either of them for
+        // all the compiler knew, and that was a fifth of q12.
         let (mut a, mut b) = (vec![0_u64; len], vec![0_u64; len]);
         one.unpack(0, &mut a);
         other.unpack(0, &mut b);
-        ordered!(|row: usize| (a[row] as i64, b[row] as i64 + shift), rows)
+        // Codes of 30 bits or fewer, moved by less than 2^30, fit an `i32` on both sides, and a
+        // vector register holds twice as many of those and compares them signed in one step,
+        // where a signed compare of `i64` lanes is put together out of several on SSE2.
+        if one.width() <= 30 && other.width() <= 30 && shift.unsigned_abs() < 1 << 30 {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a code is below 2^30 and the shift is below 2^30 either way"
+            )]
+            let (a, b): (Vec<i32>, Vec<i32>) = (
+                a.into_iter().map(|code| code as i32).collect(),
+                b.into_iter().map(|code| (code as i64 + shift) as i32).collect(),
+            );
+            flat_by(op, rows, &a, &b)?
+        } else {
+            let a: Vec<i64> = a.into_iter().map(|code| code as i64).collect();
+            let b: Vec<i64> = b.into_iter().map(|code| code as i64 + shift).collect();
+            flat_by(op, rows, &a, &b)?
+        }
     } else {
         ordered!(|row: usize| (one.code(row) as i64, other.code(row) as i64 + shift), rows)
     };
     Some(kept)
+}
+
+/// The rows where `a` stands in `op` to `b`, row by row, or none for the two operators that are
+/// about nulls, which two flat runs of codes know nothing of.
+fn flat_by<T: Copy + PartialOrd>(
+    op: Comparison,
+    rows: Option<&[u32]>,
+    a: &[T],
+    b: &[T],
+) -> Option<Selection> {
+    let side = Side::Column(b);
+    Some(match op {
+        Comparison::Equal => flat_where(rows, a, side, |x, y| x == y),
+        Comparison::NotEqual => flat_where(rows, a, side, |x, y| x != y),
+        Comparison::Less => flat_where(rows, a, side, |x, y| x < y),
+        Comparison::LessOrEqual => flat_where(rows, a, side, |x, y| x <= y),
+        Comparison::Greater => flat_where(rows, a, side, |x, y| x > y),
+        Comparison::GreaterOrEqual => flat_where(rows, a, side, |x, y| x >= y),
+        Comparison::DistinctFrom | Comparison::NotDistinctFrom => return None,
+    })
 }
 
 /// The rows out of `rows`, or out of every row below `len` when there is no `rows`, that `held`
@@ -2987,6 +3029,31 @@ mod tests {
             (total * 2) as u64,
             "only the two total comparisons fall through"
         );
+    }
+
+    #[test]
+    fn two_long_packed_columns_sliced_off_a_word_answer_what_the_oracle_answers() {
+        // Past one block of 64 with a ragged tail, and sliced so that the rows do not start on a
+        // word, which are the two ways the unpacked runs could come out misaligned.
+        let one: Vec<i32> = (0..1000).map(|row| 9000 + (row * 37) % 500).collect();
+        let other: Vec<i32> = (0..1000).map(|row| 9200 + (row * 53) % 400).collect();
+        let packed = |values: Vec<i32>| {
+            Vector::flat(LogicalType::Integer, Data::Int32(values.into()))
+                .expect("integers are an i32 layout")
+                .bit_packed()
+                .expect("a narrow range packs")
+        };
+        let (left, right) = (packed(one), packed(other));
+        for (at, len) in [(0, 1000), (7, 900), (70, 129)] {
+            let (left, right) = (
+                left.slice(at, len).expect("inside the vector"),
+                right.slice(at, len).expect("inside the vector"),
+            );
+            for op in EVERY {
+                agrees(op, &left, &right);
+                agrees(op, &right, &left);
+            }
+        }
     }
 
     /// The rows the oracle's flags keep out of `kept`, or out of every row.
