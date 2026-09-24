@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.30
+
+A patch release of six commits, four of them on the CSV load under W1. The native directory format number stays at 29 and the storage format version at 9.
+
+The `lineitem` SF1 load from CSV with 6 threads on server3 takes fewer cycles after each of the four. #1774 buffers runs in the exact distinct count so their probes overlap. #1776 orders the statistics pass's strings from their views, so a row reads the arena only when two strings share their first four bytes, which took 2.8% off the load's cycles. #1778 inlines the sketch's threshold check and has the CSV reader build a string column from plain vectors, another 2.9%. #1779 starts each stripe's distinct count under the lowest ceiling an earlier stripe of the load reached, so a stripe no longer fills a sketch from empty only for the union to trim it, another 1.4%, with the table's sketch unchanged.
+
+#1775 filters the first conjunct of a scan a block of 64 rows at a time, which took ClickBench Q1 from 483 ms to 325 ms at 10M rows on server2.
+
+#1777 adds `CREATE INDEX`, `DROP INDEX` and `duckdb_indexes()`, with the refusals DuckDB v2.0 gives. A unique index is enforced on every insert, update and upsert. Indexes are not written to the native file yet, the same as keys.
+
 ## 0.4.29
 
 A patch release of two commits, made because 0.4.28 went out without three of the changes its notes describe. The native directory format number stays at 29 and the storage format version at 9.
