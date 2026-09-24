@@ -98,6 +98,8 @@ pub enum ErrorCode {
     MismatchType,
     /// A type cannot be used where it was put, for example a list as the key of an index.
     InvalidType,
+    /// Something is already held by somebody else, such as a file another database is attached to.
+    ResourceInUse,
     /// An invariant this code is responsible for does not hold. Always a bug here, never in the
     /// query.
     Internal,
@@ -132,6 +134,7 @@ impl ErrorCode {
             Self::ParameterNotAllowed => "Parameter Not Allowed Error",
             Self::MismatchType => "Mismatch Type Error",
             Self::InvalidType => "Invalid type Error",
+            Self::ResourceInUse => "Resource In Use Error",
             Self::Internal => "INTERNAL Error",
         }
     }
@@ -159,6 +162,7 @@ impl ErrorCode {
                 | Self::ParameterNotAllowed
                 | Self::MismatchType
                 | Self::InvalidType
+                | Self::ResourceInUse
         )
     }
 }
@@ -345,6 +349,11 @@ impl Error {
     ///
     /// Reaching this is always a bug in the database and never a bug in the query, which is why it
     /// reads differently from the others and why the fuzzer treats it as a finding.
+    /// Something another holder already has, such as a file attached under another name.
+    pub fn resource_in_use(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::ResourceInUse, message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
     }
@@ -381,6 +390,7 @@ impl ErrorCode {
             Self::ParameterNotAllowed => "Parameter Not Allowed",
             Self::MismatchType => "Mismatch Type",
             Self::InvalidType => "Invalid type",
+            Self::ResourceInUse => "Resource In Use",
             Self::Internal => "INTERNAL",
         }
     }

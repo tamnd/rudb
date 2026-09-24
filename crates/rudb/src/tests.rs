@@ -10284,3 +10284,80 @@ fn a_double_setting_takes_a_decimal_literal() {
     let err = db.execute("SET index_scan_percentage = 2.5").unwrap_err().to_string();
     assert!(err.contains("the index scan percentage must be within [0, 1]"), "{err}");
 }
+
+#[test]
+fn an_attached_file_keeps_its_tables_across_a_detach_and_holds_nothing_of_the_main_database() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-attach-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let file = path.to_str().expect("a UTF-8 temporary path");
+    let db = Database::new();
+    db.execute(&format!("ATTACH '{file}' AS side")).unwrap();
+    db.execute("CREATE TABLE side.kept AS SELECT range AS i FROM range(5)").unwrap();
+    db.execute("CREATE VIEW side.total AS SELECT sum(i) AS s FROM side.kept").unwrap();
+    db.execute("CREATE TABLE here (j INTEGER)").unwrap();
+    db.execute("DETACH side").unwrap();
+    let err = db.execute("SELECT * FROM side.kept").unwrap_err().to_string();
+    assert!(err.contains("side"), "{err}");
+    db.execute(&format!("ATTACH '{file}' AS again (READ_ONLY)")).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT count(*), sum(i) FROM again.kept"),
+        vec![vec![Value::BigInt(5), Value::HugeInt(10)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT table_name FROM duckdb_tables() WHERE database_name = 'again'"),
+        vec![vec![Value::Varchar("kept".into())]]
+    );
+    let err = db.execute("INSERT INTO again.kept VALUES (1)").unwrap_err().to_string();
+    assert!(
+        err.contains("Cannot execute statement of type \"INSERT\" on database \"again\""),
+        "{err}"
+    );
+    let err = db.execute(&format!("ATTACH '{file}' AS third")).unwrap_err().to_string();
+    assert!(err.starts_with("Resource In Use Error: Unique file handle conflict"), "{err}");
+    db.execute("DETACH again").unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn attach_and_detach_answer_the_way_the_pin_does() {
+    let db = Database::new();
+    db.execute("ATTACH ':memory:' AS db1").unwrap();
+    db.execute("CREATE TABLE db1.t (i INTEGER)").unwrap();
+    db.execute("INSERT INTO db1.t VALUES (1), (2)").unwrap();
+    let err = db.execute("ATTACH ':memory:' AS db1").unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "Binder Error: Failed to attach database: database with name \"\"db1\"\" already exists"
+    );
+    db.execute("ATTACH IF NOT EXISTS ':memory:' AS db1").unwrap();
+    db.execute("ATTACH OR REPLACE ':memory:' AS db1").unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM db1.t"), vec![vec![Value::BigInt(2)]]);
+    let err = db.execute("ATTACH ':memory:'").unwrap_err().to_string();
+    assert!(err.contains("database with name \"\"memory\"\" already exists"), "{err}");
+    let err = db.execute("ATTACH ':memory:' AS temp").unwrap_err().to_string();
+    assert!(err.contains("\"temp\" cannot be used because it is a reserved name"), "{err}");
+    let err = db.execute("ATTACH ':memory:' AS m (READ_ONLY)").unwrap_err().to_string();
+    assert_eq!(err, "Catalog Error: Cannot launch in-memory database in read-only mode!");
+    let err = db.execute("ATTACH ':memory:' AS m (BOGUS 1)").unwrap_err().to_string();
+    assert_eq!(err, "Binder Error: Unrecognized option for attach \"bogus\"");
+    db.execute("USE db1").unwrap();
+    assert_eq!(rows(&db, "SELECT current_database()"), vec![vec![Value::Varchar("db1".into())]]);
+    let err = db.execute("DETACH db1").unwrap_err().to_string();
+    assert!(err.contains("because it is the default database"), "{err}");
+    db.execute("USE memory").unwrap();
+    db.execute("DETACH DATABASE db1").unwrap();
+    db.execute("DETACH IF EXISTS db1").unwrap();
+    let err = db.execute("DETACH system").unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "Binder Error: Failed to detach database with name \"system\": database not found"
+    );
+    let err = db.execute("CHECKPOINT db1").unwrap_err().to_string();
+    assert_eq!(err, "Binder Error: Database \"db1\" not found");
+}

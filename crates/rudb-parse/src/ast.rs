@@ -75,6 +75,8 @@ pub type IndexRef = u32;
 pub type InsertRef = u32;
 /// An index into `Ast::settings`.
 pub type SettingRef = u32;
+/// An index into `Ast::attaches`.
+pub type AttachRef = u32;
 /// An index into `Ast::windows`.
 pub type WindowRef = u32;
 
@@ -118,8 +120,13 @@ pub enum Statement {
     Set(SettingRef),
     /// `RESET name`, which is the same shape with nothing on the right of it.
     Reset(SettingRef),
-    /// `CHECKPOINT` or `FORCE CHECKPOINT`.
-    Checkpoint,
+    /// `CHECKPOINT` or `FORCE CHECKPOINT`, and the database it names, which is `NONE` when it names
+    /// none and means the default one.
+    Checkpoint(StrRef),
+    /// `ATTACH`.
+    Attach(AttachRef),
+    /// `DETACH`, with the database it names and whether `IF EXISTS` was written.
+    Detach { name: StrRef, if_exists: bool },
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, under any of the spellings the grammar takes for each.
     Transaction(Transaction),
     /// `EXPLAIN` over a query, and whether `ANALYZE` was asked for.
@@ -161,6 +168,24 @@ pub struct Setting {
     /// and which word means what is the catalog's business rather than the parser's, so it arrives
     /// here as a name with no value and this flag to say that no value is not a `RESET`.
     pub pragma: bool,
+}
+
+/// `ATTACH [OR REPLACE] [IF NOT EXISTS] [DATABASE] path [AS alias] [(options)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Attach {
+    /// The path, as an expression, because the grammar takes any expression there and the pin folds
+    /// it to a string.
+    pub path: ExprRef,
+    /// The name after `AS`, or `NONE` when the name comes from the path.
+    pub alias: StrRef,
+    /// Whether `OR REPLACE` was written.
+    pub or_replace: bool,
+    /// Whether `IF NOT EXISTS` was written.
+    pub if_not_exists: bool,
+    /// The option names, in the name arena.
+    pub names: Slice,
+    /// The option values, parallel to `names`, with `NONE` for an option written without one.
+    pub values: Slice,
 }
 
 /// Which copy of a setting a statement means.
@@ -1341,6 +1366,8 @@ pub struct Ast {
     pub inserts: Vec<Insert>,
     /// The `SET` and `RESET` arena.
     pub settings: Vec<Setting>,
+    /// The `ATTACH` arena.
+    pub attaches: Vec<Attach>,
     /// Backing store for every [`Slice`] of column definitions.
     pub column_defs: Vec<ColumnDef>,
     /// Backing store for every [`Slice`] of names, which is a name list rather than a name.
@@ -1508,6 +1535,11 @@ impl Ast {
     /// One `SET` or `RESET`.
     pub fn setting(&self, index: SettingRef) -> Setting {
         self.settings[index as usize]
+    }
+
+    /// An `ATTACH` by index.
+    pub fn attach(&self, index: AttachRef) -> Attach {
+        self.attaches[index as usize]
     }
 
     /// The column definitions of a `CREATE TABLE`.

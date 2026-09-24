@@ -55,8 +55,12 @@ pub enum Bound {
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
     Setting(Setting),
-    /// Flushes a persistent database snapshot.
-    Checkpoint,
+    /// Flushes a persistent database snapshot, of the named database when one is named.
+    Checkpoint(Option<String>),
+    /// `ATTACH`.
+    Attach(Attach),
+    /// `DETACH`, with the name and whether `IF EXISTS` was written.
+    Detach { name: String, if_exists: bool },
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, which have nothing to bind and are carried as written.
     Transaction(ast::Transaction),
     /// `EXPLAIN` over a query, holding the plan of the query rather than the query.
@@ -95,6 +99,24 @@ pub struct Setting {
     pub value: Option<Value>,
     /// Whether the statement was written as a bare `PRAGMA name`, which carries its value in it.
     pub pragma: bool,
+}
+
+/// A bound `ATTACH`.
+///
+/// The path and the option values are constants, for the same reason a setting's value is: nothing
+/// that opens a file wants a plan, and the pin folds them to constants before it opens anything.
+#[derive(Debug)]
+pub struct Attach {
+    /// The path, which is `:memory:` or empty for a database with no file behind it.
+    pub path: String,
+    /// The name after `AS`, or `None` when the name comes from the path.
+    pub alias: Option<String>,
+    /// Whether `OR REPLACE` was written.
+    pub or_replace: bool,
+    /// Whether `IF NOT EXISTS` was written.
+    pub if_not_exists: bool,
+    /// The options, with the name as written and the value when one was.
+    pub options: Vec<(String, Option<Value>)>,
 }
 
 /// A bound `CREATE TABLE`.
@@ -494,7 +516,13 @@ fn bind_one(
         ast::Statement::Set(index) | ast::Statement::Reset(index) => {
             setting(ast, catalog, parameters, session, index)
         }
-        ast::Statement::Checkpoint => Ok(Bound::Checkpoint),
+        ast::Statement::Checkpoint(name) => {
+            Ok(Bound::Checkpoint((name != NONE).then(|| ast.string(name).to_string())))
+        }
+        ast::Statement::Attach(index) => attach(ast, catalog, parameters, session, index),
+        ast::Statement::Detach { name, if_exists } => {
+            Ok(Bound::Detach { name: ast.string(name).to_string(), if_exists })
+        }
         ast::Statement::Transaction(kind) => Ok(Bound::Transaction(kind)),
         ast::Statement::Explain { query, analyze, statistics } => {
             let mut binder = Binder::with(catalog, parameters, session);
@@ -1428,6 +1456,45 @@ fn setting(
         Some(binder.plan().value(value).clone())
     };
     Ok(Bound::Setting(Setting { name, scope: written.scope, value, pragma: written.pragma }))
+}
+
+/// Binds an `ATTACH`, folding the path and every option value to a constant.
+fn attach(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    index: ast::AttachRef,
+) -> Result<Bound> {
+    let written = ast.attach(index);
+    let mut binder = Binder::with(catalog, parameters, session);
+    let mut constant = |expr: ast::ExprRef, what: &str| -> Result<Value> {
+        let bound = binder.bind_setting_value(ast, expr)?;
+        let Expr::Constant(value) = *binder.plan().expr(bound) else {
+            return Err(Error::not_implemented(format!("{what} of ATTACH that is not a constant")));
+        };
+        Ok(binder.plan().value(value).clone())
+    };
+    let path = match constant(written.path, "a path")? {
+        Value::Null => {
+            return Err(Error::binder("ATTACH path expression must not evaluate to NULL"));
+        }
+        value => value.to_string(),
+    };
+    let names = ast.name(written.names).map(str::to_string).collect::<Vec<_>>();
+    let mut options = Vec::with_capacity(names.len());
+    for (name, &value) in names.into_iter().zip(ast.expr_list(written.values)) {
+        let value = if value == NONE { None } else { Some(constant(value, "an option")?) };
+        options.push((name, value));
+    }
+    let alias = (written.alias != NONE).then(|| ast.string(written.alias).to_string());
+    Ok(Bound::Attach(Attach {
+        path,
+        alias,
+        or_replace: written.or_replace,
+        if_not_exists: written.if_not_exists,
+        options,
+    }))
 }
 
 /// Sorts an insert's rows into the order the target table declared.

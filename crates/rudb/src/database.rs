@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Rw
 use std::time::Instant;
 
 use rudb_bind::{Bound, Parameters, Write};
-use rudb_catalog::{Catalog, Entry, QualifiedName, View};
+use rudb_catalog::{Catalog, DEFAULT_CATALOG, Entry, QualifiedName, View};
 use rudb_common::stat::Provenance;
 use rudb_common::{
     Cancel, Clustering, Error, Field, LogicalType, Memory, Result, Rule, Session, Value,
@@ -666,16 +666,20 @@ struct Open {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let Some(path) = self.path.as_ref().filter(|_| self.writable) else {
-            return;
-        };
         let catalog = self.catalog.get_mut().unwrap_or_else(PoisonError::into_inner);
         // A transaction still open when the database goes away never committed, so what it changed
         // is not what the file gets.
         if let Some(open) = self.open.get_mut().unwrap_or_else(PoisonError::into_inner).take() {
             catalog.restore(open.before);
         }
-        let _ = persist(path, catalog, &self.pages);
+        if let Some(path) = self.path.as_ref().filter(|_| self.writable) {
+            let _ = persist(path, catalog, &self.pages, DEFAULT_CATALOG);
+        }
+        // Every attached file gets the same write, which is what the pin does for one that was
+        // never detached.
+        for (name, path) in attached_files(catalog) {
+            let _ = persist(&path, catalog, &self.pages, &name);
+        }
     }
 }
 
@@ -1404,7 +1408,12 @@ impl Database {
         };
         let path = path.clone();
         let _writing = self.shared.writing();
-        persist(&path, &mut self.shared.write(), &self.shared.inner.pages)
+        let mut catalog = self.shared.write();
+        persist(&path, &mut catalog, &self.shared.inner.pages, DEFAULT_CATALOG)?;
+        for (name, path) in attached_files(&catalog) {
+            persist(&path, &mut catalog, &self.shared.inner.pages, &name)?;
+        }
+        Ok(())
     }
 
     /// Parses a statement so it can be run more than once, with values for its parameters.
@@ -1614,9 +1623,15 @@ impl Database {
 /// The tables are rebound afterwards. Without that the catalog would go on reading the generation
 /// before this one, which still answers correctly because its bytes are unchanged, but which would
 /// be kept alive by every checkpoint for as long as the database is open.
-fn persist(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) -> Result<()> {
-    let names = catalog.stored_tables().map(|table| table.name().clone()).collect::<Vec<_>>();
-    let views = views(catalog);
+fn persist(
+    path: &Path,
+    catalog: &mut Catalog,
+    pages: &rudb_native::PagePool,
+    database: &str,
+) -> Result<()> {
+    let names =
+        catalog.stored_tables_in(database).map(|table| table.name().clone()).collect::<Vec<_>>();
+    let views = views(catalog, database);
     // Nothing to write is every table already in the file and the file holding no other. The second
     // half is what a drop leaves behind: every table that is left is still native, and without
     // asking the file which tables it names the checkpoint would decide there was nothing to do and
@@ -1625,7 +1640,7 @@ fn persist(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) ->
     // catalog holds. The second half is what stops a `CLUSTER BY` on a table that was checkpointed
     // before the declaration existed from being decided as nothing to do and quietly lost.
     let clean = catalog
-        .stored_tables()
+        .stored_tables_in(database)
         .all(|table| table.rows().is_native() && table.clustering_is_stored());
     let held = committed(path)?;
     // The views are compared by what they are rather than by their whole record, because the column
@@ -1772,9 +1787,9 @@ fn wanted(names: &[QualifiedName]) -> BTreeSet<String> {
 ///
 /// The column list goes in as it stands, cache and all. See
 /// `rudb_catalog::Catalog::create_native_view` for why a file carries a cache at all.
-fn views(catalog: &Catalog) -> Vec<rudb_native::ViewEntry> {
+fn views(catalog: &Catalog, database: &str) -> Vec<rudb_native::ViewEntry> {
     catalog
-        .stored_views()
+        .stored_views_in(database)
         .map(|view| rudb_native::ViewEntry {
             name: view.name().table.clone(),
             sql: view.sql().to_string(),
@@ -1782,6 +1797,165 @@ fn views(catalog: &Catalog) -> Vec<rudb_native::ViewEntry> {
             aliases: view.aliases().to_vec(),
             columns: view.columns(),
         })
+        .collect()
+}
+
+/// What kind of write a statement is and the database it writes, in the words the pin's read only
+/// refusal uses, or `None` for a statement that writes no table.
+fn written_database(bound: &Bound) -> Option<(&'static str, &str)> {
+    match bound {
+        Bound::CreateTable(create) => Some(("CREATE", &create.name.catalog)),
+        Bound::CreateView(create) => Some(("CREATE", &create.name.catalog)),
+        Bound::DropTable(drop) => Some(("DROP", &drop.names.first()?.catalog)),
+        Bound::Insert(insert) => Some((
+            match insert.write {
+                Write::Append => "INSERT",
+                Write::Update => "UPDATE",
+                Write::Delete => "DELETE",
+            },
+            &insert.name.catalog,
+        )),
+        Bound::Alter(alter) => Some(("ALTER", &alter.name.as_ref()?.catalog)),
+        _ => None,
+    }
+}
+
+/// Runs an `ATTACH`.
+///
+/// A path of `:memory:` or nothing at all is a database held in memory, named `memory` unless the
+/// statement names it, which is why a second unnamed one clashes with the first the way it does in
+/// the pin. Any other path is a native file, named after the file without its extension unless
+/// the statement names it. Its tables and views are read in now and written back when it is
+/// detached, when it is checkpointed by name, and when the database closes. A file that is not
+/// there yet is made empty now, the way the pin makes one.
+fn attach_database(
+    attach: rudb_bind::Attach,
+    catalog: &mut Catalog,
+    pages: &rudb_native::PagePool,
+) -> Result<()> {
+    let memory = attach.path.is_empty() || attach.path == MEMORY;
+    let mut read_only = false;
+    for (name, value) in &attach.options {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "read_only" => read_only = value.as_ref().map_or(Ok(true), option_flag)?,
+            "read_write" => read_only = !value.as_ref().map_or(Ok(true), option_flag)?,
+            "type" => {
+                let kind = value.as_ref().map(Value::to_string).unwrap_or_default();
+                if !kind.eq_ignore_ascii_case("duckdb") {
+                    return Err(Error::not_implemented(format!(
+                        "ATTACH of a database of type {kind}, since only native files are read so far"
+                    )));
+                }
+            }
+            // How the pin lays out its own file, which a native file has no use for.
+            "block_size" | "storage_version" | "row_group_size" => {}
+            _ => return Err(Error::binder(format!("Unrecognized option for attach \"{name}\""))),
+        }
+    }
+    let name = match attach.alias {
+        Some(alias) => alias,
+        None if memory => DEFAULT_CATALOG.to_string(),
+        None => Path::new(&attach.path)
+            .file_stem()
+            .map_or_else(|| attach.path.clone(), |stem| stem.to_string_lossy().into_owned()),
+    };
+    if let Some(held) = catalog.attached(&name) {
+        if attach.if_not_exists {
+            return Ok(());
+        }
+        // The pin keeps a database that is attached again from the same place, contents and all,
+        // and only replaces one that came from somewhere else.
+        let place = held.path().unwrap_or(MEMORY);
+        let asked = if memory { MEMORY } else { attach.path.as_str() };
+        if attach.or_replace && place == asked {
+            return Ok(());
+        }
+        if attach.or_replace && !held.internal() {
+            let file = held.path().filter(|_| !held.read_only()).map(PathBuf::from);
+            let held = held.name().to_string();
+            if let Some(path) = file {
+                persist(&path, catalog, pages, &held)?;
+            }
+            catalog.detach(&held)?;
+        }
+    }
+    if memory {
+        if read_only {
+            return Err(Error::catalog("Cannot launch in-memory database in read-only mode!"));
+        }
+        return catalog.attach_file(&name, None, false);
+    }
+    let path = PathBuf::from(&attach.path);
+    let same = |held: &str| {
+        let held = Path::new(held);
+        held == path
+            || std::fs::canonicalize(held)
+                .ok()
+                .zip(std::fs::canonicalize(&path).ok())
+                .is_some_and(|(held, path)| held == path)
+    };
+    if let Some(holder) = catalog.databases().iter().find(|held| held.path().is_some_and(same)) {
+        return Err(Error::resource_in_use(format!(
+            "Unique file handle conflict: Cannot attach \"{name}\" - the database file \"{}\" is \
+             already attached by database \"{}\"",
+            attach.path,
+            holder.name()
+        )));
+    }
+    if !path.exists() {
+        if read_only {
+            return Err(Error::io(format!(
+                "Cannot open database \"{}\" in read-only mode: database does not exist",
+                attach.path
+            )));
+        }
+        // Made before the name goes in, so a path that cannot be written is refused with nothing
+        // left attached.
+        rudb_native::Writer::empty(&path, &[])?;
+    }
+    let native = rudb_native::Catalog::open_in(&path, pages)?;
+    catalog.attach_file(&name, Some(attach.path.clone()), read_only)?;
+    let tables = native.names().map(str::to_string).collect::<Vec<_>>();
+    for table in tables {
+        catalog.create_native_table_in(&name, native.table(&table)?)?;
+    }
+    for view in native.views().cloned().collect::<Vec<_>>() {
+        catalog.create_native_view_in(&name, &view)?;
+    }
+    Ok(())
+}
+
+/// The value of an option such as `READ_ONLY`, which is true or false written any way a setting
+/// can be.
+fn option_flag(value: &Value) -> Result<bool> {
+    match value {
+        Value::Boolean(flag) => Ok(*flag),
+        Value::Null => Ok(false),
+        other => match other.to_string().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" => Ok(true),
+            "false" | "0" | "off" => Ok(false),
+            text => Err(Error::binder(format!("Could not read \"{text}\" as a boolean"))),
+        },
+    }
+}
+
+/// Whether `database` is written to a file, which is the database the session opened when it has
+/// one and any attached database with a file behind it that is not read only.
+fn holds_a_file(inner: &Inner, catalog: &Catalog, database: &str) -> bool {
+    if database.eq_ignore_ascii_case(DEFAULT_CATALOG) {
+        return inner.path.is_some() && inner.writable;
+    }
+    catalog.attached(database).is_some_and(|held| held.path().is_some() && !held.read_only())
+}
+
+/// The attached databases with a file behind them that may be written, by name and path.
+fn attached_files(catalog: &Catalog) -> Vec<(String, PathBuf)> {
+    catalog
+        .databases()
+        .iter()
+        .filter(|database| !database.read_only())
+        .filter_map(|database| Some((database.name().to_string(), database.path()?.into())))
         .collect()
 }
 
@@ -3006,6 +3180,15 @@ impl Shared {
                 | Bound::Index(_)
                 | Bound::Insert(_)
         );
+        if let Some((kind, database)) = written_database(&bound) {
+            if let Some(held) = catalog.attached(database).filter(|held| held.read_only()) {
+                return Err(Error::invalid_input(format!(
+                    "Cannot execute statement of type \"{kind}\" on database \"{}\" which is \
+                     attached in read-only mode!",
+                    held.name()
+                )));
+            }
+        }
         if writes && self.open().as_ref().is_some_and(|open| open.read_only) {
             return Err(Error::transaction(format!(
                 "Cannot write to database \"\"{}\"\" - transaction is launched in read-only mode",
@@ -3058,13 +3241,50 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::Transaction(kind) => self.transaction(kind, &mut catalog),
-            Bound::Checkpoint => {
+            Bound::Checkpoint(name) => {
                 // A read only database answers this the way the pinned DuckDB does, which is by
                 // succeeding and writing nothing. It is not an error there and it is not one here.
+                if let Some(name) = name.filter(|name| !name.eq_ignore_ascii_case(DEFAULT_CATALOG))
+                {
+                    let Some(database) = catalog.attached(&name).filter(|held| !held.internal())
+                    else {
+                        return Err(Error::binder(format!("Database \"{name}\" not found")));
+                    };
+                    let file = database.path().filter(|_| !database.read_only()).map(PathBuf::from);
+                    let name = database.name().to_string();
+                    if let Some(path) = file {
+                        persist(&path, &mut catalog, &self.inner.pages, &name)?;
+                    }
+                    return Ok(QueryResult::empty());
+                }
                 if let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) {
-                    persist(path, &mut catalog, &self.inner.pages)?;
+                    persist(path, &mut catalog, &self.inner.pages, DEFAULT_CATALOG)?;
                     index(path, &mut catalog, &self.inner.settings.links(), &self.inner.pages)?;
                 }
+                Ok(QueryResult::empty())
+            }
+            Bound::Attach(attach) => {
+                attach_database(attach, &mut catalog, &self.inner.pages)?;
+                Ok(QueryResult::empty())
+            }
+            Bound::Detach { name, if_exists } => {
+                let Some(database) = catalog.attached(&name).filter(|held| !held.internal()) else {
+                    if if_exists {
+                        return Ok(QueryResult::empty());
+                    }
+                    catalog.detach(&name)?;
+                    return Ok(QueryResult::empty());
+                };
+                let file = database.path().filter(|_| !database.read_only()).map(PathBuf::from);
+                let name = database.name().to_string();
+                // Written before it goes, and not when it is the default database, which the
+                // detach below refuses.
+                if let Some(path) =
+                    file.filter(|_| !name.eq_ignore_ascii_case(catalog.default_catalog()))
+                {
+                    persist(&path, &mut catalog, &self.inner.pages, &name)?;
+                }
+                catalog.detach(&name)?;
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(mut create) => {
@@ -3083,8 +3303,11 @@ impl Shared {
                 // well it fits the shape otherwise, and neither does anything at all on a read only
                 // database, which is the one other way a statement writes the file without being a
                 // checkpoint.
-                let writable =
-                    self.inner.writable && !create.name.temporary() && !self.transacting();
+                // Only the database the file is behind, since an attached one is written when it is
+                // detached and a table in it has no business in this file.
+                let writable = self.inner.writable
+                    && create.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
+                    && !self.transacting();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| writable) {
                     let fresh = create.source.is_some() && catalog.table(&create.name).is_err();
                     let alone = fresh && !path.exists() && catalog.stored_tables().count() == 0;
@@ -3165,7 +3388,7 @@ impl Shared {
                 // The native file keeps every table under its bare name and has nowhere to say
                 // which schema one is in, so a schema other than `main` in it would come back as
                 // `main` on the next open. Refused until the file can say it.
-                if self.inner.path.is_some() && self.inner.writable {
+                if holds_a_file(&self.inner, &catalog, &change.catalog) {
                     return Err(Error::not_implemented(
                         "CREATE SCHEMA in a database file, which holds only the main schema so far",
                     ));
@@ -3191,7 +3414,7 @@ impl Shared {
                 }
                 // The native file has nowhere to keep a sequence yet, so one in it would be gone
                 // on the next open. Refused until the file can say it, the way a schema is.
-                if self.inner.path.is_some() && self.inner.writable && !name.temporary() {
+                if holds_a_file(&self.inner, &catalog, &name.catalog) {
                     return Err(Error::not_implemented(
                         "CREATE SEQUENCE in a database file, which cannot hold one so far",
                     ));
@@ -3207,7 +3430,7 @@ impl Shared {
                     return Ok(QueryResult::empty());
                 };
                 // The native file has nowhere to keep a type yet, the same as a sequence.
-                if self.inner.path.is_some() && self.inner.writable && !name.temporary() {
+                if holds_a_file(&self.inner, &catalog, &name.catalog) {
                     return Err(Error::not_implemented(
                         "CREATE TYPE in a database file, which cannot hold one so far",
                     ));
@@ -3263,8 +3486,9 @@ impl Shared {
                     timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
                 // Same as the create above: rows going into a temporary table are rows the file
                 // never sees, and a read only database writes no file at all.
-                let writable =
-                    self.inner.writable && !insert.name.temporary() && !self.transacting();
+                let writable = self.inner.writable
+                    && insert.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
+                    && !self.transacting();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| {
                     // A table with a key checks every row against the ones it holds, which the sink
                     // does not, so it takes the path through the table.

@@ -36,6 +36,11 @@ pub struct Database {
     schemas: Vec<Schema>,
     oid: i64,
     internal: bool,
+    /// The file an `ATTACH` named, and `None` for one held only in memory. The database a session
+    /// opened keeps its file outside the catalog and says `None` here too.
+    path: Option<String>,
+    /// Whether it was attached `READ_ONLY`.
+    read_only: bool,
 }
 
 impl Database {
@@ -70,6 +75,18 @@ impl Database {
     #[must_use]
     pub fn schemas(&self) -> &[Schema] {
         &self.schemas
+    }
+
+    /// The file an `ATTACH` named, if there is one.
+    #[must_use]
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    /// Whether it was attached `READ_ONLY`.
+    #[must_use]
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -310,6 +327,8 @@ impl Catalog {
                     schemas: vec![Schema::empty(DEFAULT_SCHEMA, 2)],
                     oid: 1,
                     internal: false,
+                    path: None,
+                    read_only: false,
                 },
                 system,
                 Database {
@@ -317,6 +336,8 @@ impl Catalog {
                     schemas: vec![Schema::empty(DEFAULT_SCHEMA, 8)],
                     oid: 7,
                     internal: true,
+                    path: None,
+                    read_only: false,
                 },
             ],
             default_catalog: DEFAULT_CATALOG.to_string(),
@@ -490,11 +511,29 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// If a database of that name is already attached.
+    /// If a database of that name is already attached, or the name is one the engine keeps.
     pub fn attach(&mut self, name: &str) -> Result<()> {
+        self.attach_file(name, None, false)
+    }
+
+    /// Attaches an empty database with a `main` schema in it, saying which file it stands for and
+    /// whether it may be written. Filling it from the file is the caller's business.
+    ///
+    /// # Errors
+    ///
+    /// If a database of that name is already attached, or the name is one the engine keeps, both
+    /// in the pin's words.
+    pub fn attach_file(&mut self, name: &str, path: Option<String>, read_only: bool) -> Result<()> {
         self.changed();
+        if [TEMP_CATALOG, SYSTEM_CATALOG, "main"].iter().any(|kept| same_name(kept, name)) {
+            return Err(Error::binder(format!(
+                "Attached database name \"{name}\" cannot be used because it is a reserved name"
+            )));
+        }
         if self.databases.iter().any(|held| same_name(&held.name, name)) {
-            return Err(Error::catalog(format!("Database with name \"{name}\" already exists!")));
+            return Err(Error::binder(format!(
+                "Failed to attach database: database with name \"\"{name}\"\" already exists"
+            )));
         }
         let oid = self.stamp();
         let schema = self.stamp();
@@ -503,8 +542,42 @@ impl Catalog {
             schemas: vec![Schema::empty(DEFAULT_SCHEMA, schema)],
             oid,
             internal: false,
+            path,
+            read_only,
         });
         Ok(())
+    }
+
+    /// Takes an attached database out of the catalog, with everything in it, and hands it back so
+    /// the caller can write it to its file first if it has one.
+    ///
+    /// # Errors
+    ///
+    /// If nothing a person attached has that name, or it is the database unqualified names go to.
+    pub fn detach(&mut self, name: &str) -> Result<Database> {
+        self.changed();
+        let Some(at) =
+            self.databases.iter().position(|held| !held.internal && same_name(&held.name, name))
+        else {
+            return Err(Error::binder(format!(
+                "Failed to detach database with name \"{name}\": database not found"
+            )));
+        };
+        if same_name(self.default_catalog(), name) {
+            return Err(Error::binder(format!(
+                "Cannot detach database \"{name}\" because it is the default database. Select a \
+                 different database using `USE` to allow detaching this database"
+            )));
+        }
+        let gone = self.databases.remove(at);
+        self.search.retain(|entry| !same_name(&entry.catalog, &gone.name));
+        Ok(gone)
+    }
+
+    /// The attached database of this name, if there is one.
+    #[must_use]
+    pub fn attached(&self, name: &str) -> Option<&Database> {
+        self.database(name).ok()
     }
 
     /// The database and the schema a written schema name means, for `CREATE SCHEMA` and `DROP
@@ -680,12 +753,19 @@ impl Catalog {
     ///
     /// If its name is already used or its stored schema is invalid.
     pub fn create_native_table(&mut self, reader: NativeReader) -> Result<()> {
+        let database = self.default_catalog.clone();
+        self.create_native_table_in(&database, reader)
+    }
+
+    /// Registers a table read back out of a native file in the `main` schema of `database`, which
+    /// is where an attached file's tables go.
+    ///
+    /// # Errors
+    ///
+    /// If the database is not attached or its name is already used by a table or a view.
+    pub fn create_native_table_in(&mut self, database: &str, reader: NativeReader) -> Result<()> {
         self.changed();
-        let name = QualifiedName::new(
-            self.default_catalog.clone(),
-            self.default_schema.clone(),
-            reader.table().name(),
-        );
+        let name = QualifiedName::new(database, DEFAULT_SCHEMA, reader.table().name());
         let mut table = Table::native(name.clone(), reader)?;
         table.stamp(self.stamp());
         let schema = self.schema_mut(&name.catalog, &name.schema)?;
@@ -709,11 +789,21 @@ impl Catalog {
     ///
     /// If its name is already used by a table or another view.
     pub fn create_native_view(&mut self, view: &rudb_native::ViewEntry) -> Result<()> {
-        let name = QualifiedName::new(
-            self.default_catalog.clone(),
-            self.default_schema.clone(),
-            view.name.clone(),
-        );
+        let database = self.default_catalog.clone();
+        self.create_native_view_in(&database, view)
+    }
+
+    /// Registers a view read back out of a native file in the `main` schema of `database`.
+    ///
+    /// # Errors
+    ///
+    /// If the database is not attached or its name is already used by a table or another view.
+    pub fn create_native_view_in(
+        &mut self,
+        database: &str,
+        view: &rudb_native::ViewEntry,
+    ) -> Result<()> {
+        let name = QualifiedName::new(database, DEFAULT_SCHEMA, view.name.clone());
         self.create_view(View::new(
             name,
             view.sql.clone(),
@@ -1543,6 +1633,16 @@ impl Catalog {
         self.tables().filter(|table| !table.name().temporary())
     }
 
+    /// The tables in one database, which is what that database's file holds.
+    pub fn stored_tables_in<'s>(&'s self, database: &'s str) -> impl Iterator<Item = &'s Table> {
+        self.tables().filter(move |table| same_name(&table.name().catalog, database))
+    }
+
+    /// The views in one database, which is what that database's file holds beside its tables.
+    pub fn stored_views_in<'s>(&'s self, database: &'s str) -> impl Iterator<Item = &'s View> {
+        self.views().filter(move |view| same_name(&view.name().catalog, database))
+    }
+
     /// Every table, in creation order within a schema.
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
         self.databases
@@ -1796,6 +1896,8 @@ fn system(mut oid: i64) -> (Database, i64) {
         schemas: vec![main, standard, postgres],
         oid: 3,
         internal: true,
+        path: None,
+        read_only: false,
     };
     (database, oid)
 }
