@@ -144,6 +144,14 @@ impl File for RealFile {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn write_parts_at(&self, offset: u64, parts: &[&[u8]]) -> Result<()> {
+        if !self.writable {
+            return Err(Error::io("this file was opened for reading"));
+        }
+        vectored::write_parts_at(&self.file, offset, parts)
+    }
+
     fn sync(&self) -> Result<()> {
         // `sync_all` and not `sync_data`. The difference is the metadata, and a file whose data is
         // durable while its length is not is a file that reads back short after a crash.
@@ -163,6 +171,81 @@ impl File for RealFile {
 
     fn len(&self) -> Result<u64> {
         Ok(self.file.metadata().map_err(|e| Error::io(format!("stat failed: {e}")))?.len())
+    }
+}
+
+/// `pwritev`, which std has no positional form of.
+#[cfg(unix)]
+#[allow(unsafe_code, reason = "pwritev has no wrapper in std")]
+mod vectored {
+    use std::ffi::{c_int, c_void};
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+
+    use rudb_common::{Error, Result};
+
+    #[repr(C)]
+    struct IoVec {
+        base: *const c_void,
+        len: usize,
+    }
+
+    unsafe extern "C" {
+        fn pwritev(fd: c_int, iov: *const IoVec, count: c_int, offset: i64) -> isize;
+    }
+
+    /// The most vectors one call is given. Linux and macOS both take 1024, and POSIX promises 16,
+    /// but a platform under 1024 answers `EINVAL` and the loop then has nothing to fall back on,
+    /// so this stays at what the two platforms the project builds on accept.
+    const MOST: usize = 1024;
+
+    /// Writes `parts` back to back from `offset`, going round again after a short write from the
+    /// first byte it did not take.
+    pub(super) fn write_parts_at(file: &File, offset: u64, parts: &[&[u8]]) -> Result<()> {
+        let mut parts = parts.iter().copied().filter(|part| !part.is_empty()).collect::<Vec<_>>();
+        let mut at = offset;
+        let mut first = 0;
+        let mut iov = Vec::with_capacity(parts.len().min(MOST));
+        while first < parts.len() {
+            iov.clear();
+            iov.extend(
+                parts[first..]
+                    .iter()
+                    .take(MOST)
+                    .map(|part| IoVec { base: part.as_ptr().cast(), len: part.len() }),
+            );
+            let position =
+                i64::try_from(at).map_err(|_| Error::io(format!("write at {at} is too far")))?;
+            // The count is at most `MOST`, which fits.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let count = iov.len() as c_int;
+            // SAFETY: the descriptor is open for as long as `file` is borrowed, and every vector
+            // points at a slice of `parts`, which is live and at least `len` bytes long for the
+            // whole call and is not touched until it returns.
+            let n = unsafe { pwritev(file.as_raw_fd(), iov.as_ptr(), count, position) };
+            let Ok(mut n) = usize::try_from(n) else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Error::io(format!("write at {at} failed: {error}")));
+            };
+            if n == 0 {
+                return Err(Error::io(format!("write at {at} wrote nothing")));
+            }
+            at += n as u64;
+            while n > 0 {
+                let part = parts[first];
+                if n >= part.len() {
+                    n -= part.len();
+                    first += 1;
+                } else {
+                    parts[first] = &part[n..];
+                    n = 0;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +275,25 @@ mod tests {
         let mut gap = [0xffu8; 11];
         file.read_exact_at(5, &mut gap).unwrap();
         assert_eq!(gap, [0u8; 11]);
+    }
+
+    #[test]
+    fn parts_written_together_read_back_joined_at_the_offset() {
+        let dir = TempDir::new("parts");
+        let fs = RealFilesystem::new();
+        let file = fs.open(&dir.join("data"), OpenMode::CreateNew).unwrap();
+        // More parts than one call takes, with empty ones among them, so the loop has to go round
+        // and has to skip what it has nothing to write for.
+        let parts = (0..2500_u32)
+            .map(|at| (0..at % 7).map(|byte| (at + byte) as u8).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let joined = parts.concat();
+        let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        file.write_parts_at(3, &slices).unwrap();
+        let mut back = vec![0u8; joined.len()];
+        file.read_exact_at(3, &mut back).unwrap();
+        assert_eq!(back, joined);
+        assert_eq!(file.len().unwrap(), 3 + joined.len() as u64);
     }
 
     #[test]
