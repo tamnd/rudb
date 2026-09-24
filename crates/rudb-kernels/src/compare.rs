@@ -262,10 +262,8 @@ pub fn select_prepared(
     // and so this does too rather than casting past it.
     if u32::try_from(len).is_ok() {
         if let Some(answers) = external_text_literal(op, left, right, len, identity, held)? {
-            return Ok(crate::select::picked(
-                &answers,
-                identity,
-                len,
+            return Ok(crate::select::picked_flat(
+                &answers[..len],
                 &left_valid.and(&right_valid, len),
             ));
         }
@@ -282,7 +280,7 @@ pub fn select_prepared(
         {
             let validity =
                 if op.is_total() { Validity::AllValid } else { left_valid.and(&right_valid, len) };
-            return Ok(crate::select::picked(&answers, identity, len, &validity));
+            return Ok(crate::select::picked_flat(&answers[..len], &validity));
         }
     }
     Ok(crate::select::selection(&compare_prepared(op, left, right, held)?, len))
@@ -526,7 +524,7 @@ fn kept_where(rows: Option<&[u32]>, len: usize, held: impl Fn(usize) -> bool) ->
     reason = "the caller checked that the row count fits in a u32 before getting here"
 )]
 #[inline]
-fn kept_in_blocks(
+pub(crate) fn kept_in_blocks(
     len: usize,
     fill: impl Fn(usize, &mut [u8; 64]),
     held: impl Fn(usize) -> bool,
