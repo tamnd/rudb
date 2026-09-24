@@ -52,6 +52,7 @@
 //! aggregate this is, and the match on which layout the column is in. All three of those are decided
 //! once per vector here and none of them per row.
 
+use std::mem;
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
@@ -1468,6 +1469,307 @@ pub fn update_runs(
     Ok(true)
 }
 
+/// Folds several calls of one chunk in one pass over its runs, rather than one pass each.
+///
+/// [`update_runs`] is asked about one call, so a chunk with five calls on the run path walks the same
+/// run list five times. What a run costs before any value of it is read, counted out of the
+/// disassembly on server2, is twenty one instructions: the run's end loaded, the slice of values it
+/// covers bounds checked, the slot read and checked against nothing and against the group count, the
+/// local for that slot indexed and loaded, the total stored back and the run pointer advanced. A value
+/// inside the run costs four. TPC-H q01's mean run of equal `(l_returnflag, l_linestatus)` is 2.81
+/// rows, so the twenty one is paid five times over 2.13 million runs to read eleven values each time,
+/// and eleven of the query's instructions per row are the same walk done over again.
+///
+/// So this reads each run once and folds every call that can share it inside, which leaves the walk,
+/// the slot and the row count paid once for the chunk and per call only a load, the adds and a store.
+/// The row count is one number for all of them because they all see the same runs, which is the other
+/// half of the saving: it was counted per call before.
+///
+/// `wanted` is the calls the caller is offering, as a bit per offset into a group's accumulators, and
+/// the answer is the calls this took. A call it did not take was not touched at all, so the caller
+/// folds that one the way it folded it before. Offsets past the width of the mask are never taken,
+/// which is nothing a plan reaches: sixty four folding aggregates in one `GROUP BY` is far past the
+/// point where finding runs pays for itself.
+///
+/// Only calls that read values of one layout share a pass, because the value loop is written once per
+/// layout and a loop that asked which layout it was reading, per call and per run, would spend more on
+/// the question than the sharing saves. The pass takes the layout the most of the offered calls have,
+/// and a caller with two layouts in its chunk asks again with what is left. q01 is that caller: it sums
+/// two `DECIMAL(15, 2)` columns, which are held in an `i64`, and two computed decimals wide enough to
+/// be held in an `i128`.
+///
+/// A count reads no value, so it goes on whichever pass is first and asks nothing of the layout. What a
+/// count wants out of a run is its length, and the walk is adding those up per group regardless, so a
+/// count costs the pass one add per group at the end and nothing at all per run. [`count_runs`] is what
+/// it would otherwise be, and that is a walk of its own for one add a run.
+///
+/// # Errors
+///
+/// The overflow a total raises, as [`update_runs`] raises it, and an internal error if the runs do not
+/// cover exactly the rows given.
+pub fn update_shared_runs(
+    states: &mut [Accumulator],
+    runs: &[(usize, usize)],
+    stride: usize,
+    inputs: &[Option<&Vector>],
+    wanted: u64,
+    rows: usize,
+) -> Result<u64> {
+    if wanted.count_ones() < 2 {
+        return Ok(0);
+    }
+    if runs.last().map_or(0, |&(_, end)| end) != rows {
+        return Err(Error::internal(format!("runs that do not end at the {rows} rows given")));
+    }
+    let groups = states.len().checked_div(stride).unwrap_or(usize::MAX);
+    if groups > FEW || groups.saturating_mul(4) > rows {
+        return Ok(0);
+    }
+    let mut ready = Vec::new();
+    let mut counting = Vec::new();
+    for (offset, input) in inputs.iter().enumerate().take(u64::BITS as usize) {
+        if wanted >> offset & 1 == 0 {
+            continue;
+        }
+        match shareable(states, stride, offset, *input, rows, groups) {
+            Some(Share::Counted) => counting.push(offset),
+            Some(Share::Folded(call)) => ready.push(call),
+            None => {}
+        }
+    }
+    // The layout the most of them read, since a pass covers one layout and the caller asks again for
+    // what is left. Counted the plain way because the list is as long as the query has aggregates.
+    let mut picked = None;
+    let mut most = 0;
+    for call in &ready {
+        let same =
+            ready.iter().filter(|other| mem::discriminant(other.data) == call.kind()).count();
+        if same > most {
+            most = same;
+            picked = Some(call);
+        }
+    }
+    // One call is not sharing anything. Two are, whichever two they are, because what the second one
+    // saves is a walk of the runs and the counts among them save a walk for an add.
+    if most + counting.len() < 2 {
+        return Ok(0);
+    }
+    let took = counting.iter().fold(0_u64, |took, &offset| took | 1 << offset);
+    let Some(picked) = picked else {
+        // Nothing but counts, so the pass is the walk and the lengths and there is no value loop to
+        // pick a layout for. The width the locals are asked for is zero, so which one this is has no
+        // bearing on anything past naming a type to write the loop that never runs.
+        return many_runs::<i64>(states, runs, stride, &[], &counting, groups)
+            .map(|shared| if shared { took } else { 0 });
+    };
+    macro_rules! shared {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match picked.data {
+                $(Data::$variant(_) => {
+                    let mut group = Vec::with_capacity(most);
+                    for call in &ready {
+                        if let Data::$variant(values) = call.data {
+                            group.push((call.offset, call.feed, &values.as_slice()[..rows]));
+                        }
+                    }
+                    if !many_runs(states, runs, stride, &group, &counting, groups)? {
+                        return Ok(0);
+                    }
+                    group.iter().fold(took, |took, &(offset, _, _)| took | 1 << offset)
+                })+
+                _ => 0,
+            }
+        };
+    }
+    Ok(rudb_vector::for_each_layout!(exact, shared))
+}
+
+/// What one call brings to a shared pass over the runs.
+enum Share<'r> {
+    /// A count of the rows, which the walk has the length of each run for already.
+    Counted,
+    /// A total of the values of a column, which is a loop inside each run.
+    Folded(Ready<'r>),
+}
+
+/// One value reading call the shared pass has resolved down to what its run walk needs from it.
+struct Ready<'r> {
+    /// Where this call's accumulator sits inside each group's run of them.
+    offset: usize,
+    feed: Feed,
+    data: &'r Data,
+}
+
+impl Ready<'_> {
+    /// Which layout the call's column is held in, to match it against another call's.
+    fn kind(&self) -> mem::Discriminant<Data> {
+        mem::discriminant(self.data)
+    }
+}
+
+/// What [`update_shared_runs`] needs to know about one call, or none for a call it cannot take.
+///
+/// These are [`update_runs`]'s own questions in [`update_runs`]'s order, asked of one call without
+/// touching anything, so that a call the shared pass turns down is a call the caller can still fold
+/// the old way. The one question it does not ask is the layout, which is the caller's to match up.
+fn shareable<'r>(
+    states: &[Accumulator],
+    stride: usize,
+    offset: usize,
+    input: Option<&'r Vector>,
+    rows: usize,
+    groups: usize,
+) -> Option<Share<'r>> {
+    let first = states.get(offset)?;
+    if first.kind() == Kind::General {
+        return None;
+    }
+    // A `COUNT(*)` has no argument to ask anything of, which is why it is asked about first here as it
+    // is there.
+    if first.kind() == Kind::CountStar {
+        return Some(Share::Counted);
+    }
+    let input = input?;
+    if input.form() != Form::Flat
+        || input.len() < rows
+        || !matches!(nulls_of(input), Validity::AllValid)
+    {
+        return None;
+    }
+    let feed = feed_of(first, input.logical_type())?;
+    match feed {
+        Feed::Total => {}
+        // A count of a column with no nulls in it is the length of each run whatever the column holds,
+        // so it wants the same thing a `COUNT(*)` wants and the values are never read.
+        Feed::Counted => return Some(Share::Counted),
+        // A mean that has already gone inexact adds its rows one at a time, for the reason
+        // [`few_runs`] gives, so a call that would reach one of those stays off this pass.
+        Feed::Whole { .. } => {
+            for slot in 0..groups {
+                let held = states.get(slot * stride + offset)?;
+                if matches!(held.state, State::Mean { exact: false, .. }) {
+                    return None;
+                }
+            }
+        }
+        Feed::Real { .. } | Feed::Extreme(_) => return None,
+    }
+    let data = input.data().filter(|data| data.len() >= rows)?;
+    Some(Share::Folded(Ready { offset, feed, data }))
+}
+
+/// [`few_runs`] for several calls at once, which is [`update_shared_runs`]'s whole point.
+///
+/// The locals are one array rather than one per call, a run of `width` totals per group followed by
+/// the group's row count, so that a run resolves its slot once and the totals it then adds into sit
+/// next to each other in one cache line for the whole of the inner loop. The count is last rather
+/// than first so that the totals are indexed the way the calls are.
+///
+/// `counting` is the calls that want the count and no total, so they are nowhere in the loop and read
+/// it off the locals at the end beside everything else.
+///
+/// `false` with nothing written for the same misses [`few_runs`] hands back on, which is a value that
+/// does not fit an `i64` and a total that leaves it. Nothing in `states` is written until every run
+/// has been read, so the caller can take every one of these calls the slower way and reach the same
+/// answer.
+///
+/// # Errors
+///
+/// The overflow folding a local into an accumulator raises, and an internal error for a local folded
+/// into a state whose feed does not fit, which is a bug here rather than anything a query can cause.
+fn many_runs<T: Copy + TryInto<i64>>(
+    states: &mut [Accumulator],
+    runs: &[(usize, usize)],
+    stride: usize,
+    group: &[(usize, Feed, &[T])],
+    counting: &[usize],
+    groups: usize,
+) -> Result<bool> {
+    let width = group.len();
+    let span = width + 1;
+    let Some(cells) = groups.checked_mul(span) else { return Ok(false) };
+    let mut folded = vec![0_i64; cells];
+    let mut start = 0;
+    for &(slot, end) in runs {
+        let from = start;
+        start = end;
+        if slot == NOWHERE {
+            continue;
+        }
+        // A slot past the groups is a bug elsewhere, and nothing has been folded yet, so the caller's
+        // loop gets to say so.
+        let Some(cells) = folded.get_mut(slot * span..).and_then(|rest| rest.get_mut(..span))
+        else {
+            return Ok(false);
+        };
+        for (total, &(_, _, values)) in cells.iter_mut().zip(group) {
+            let Some(run) = values.get(from..end) else { return Ok(false) };
+            let mut sum = *total;
+            for &value in run {
+                let Ok(value) = value.try_into() else { return Ok(false) };
+                let Some(next) = sum.checked_add(value) else { return Ok(false) };
+                sum = next;
+            }
+            *total = sum;
+        }
+        cells[width] += (end - from) as i64;
+    }
+    for (slot, cells) in folded.chunks_exact(span).enumerate() {
+        let Some(&count) = cells.last() else { return Ok(false) };
+        if count == 0 {
+            continue;
+        }
+        for (&number, &(offset, feed, _)) in cells.iter().zip(group) {
+            fold_local(states, slot * stride + offset, feed, number, count)?;
+        }
+        for &offset in counting {
+            fold_local(states, slot * stride + offset, Feed::Counted, 0, count)?;
+        }
+    }
+    Ok(true)
+}
+
+/// Adds one group's total of one call, and how many rows it came from, into that call's accumulator.
+///
+/// This is the end of a pass that kept its totals in locals, and it runs once per group per call
+/// rather than once per run, which is what lets it be the slow careful form while the loop above it is
+/// the fast one. `count` is what a mean divides by, what a count of the rows is, and what a total reads
+/// only as whether it saw a row at all.
+///
+/// # Errors
+///
+/// The overflow the add raises, and an internal error for a state whose feed does not fit or an offset
+/// past the accumulators, both of which are bugs in the caller.
+fn fold_local(
+    states: &mut [Accumulator],
+    index: usize,
+    feed: Feed,
+    number: i64,
+    count: i64,
+) -> Result<()> {
+    let number = i128::from(number);
+    let Some(held) = states.get_mut(index) else {
+        return Err(Error::internal(format!("an aggregate state at {index} is out of range")));
+    };
+    match (&mut held.state, feed) {
+        (State::Counted { count: held, .. }, Feed::Counted) => *held += count,
+        (State::Whole { total, seen, .. } | State::Scaled { total, seen, .. }, Feed::Total) => {
+            *total = total.checked_add(number).ok_or_else(overflowed)?;
+            *seen = true;
+        }
+        (State::Mean { total, seen, exact, scale: held, .. }, Feed::Whole { scale }) => {
+            *held = scale;
+            match total.checked_add(number).filter(|_| *exact) {
+                Some(sum) => *total = sum,
+                None => widened(total, exact, number),
+            }
+            *seen += count;
+        }
+        _ => return Err(Error::internal("a run total into another state".to_string())),
+    }
+    Ok(())
+}
+
 /// Adds the length of each run to the count of the group it belongs to.
 fn count_runs(
     states: &mut [Accumulator],
@@ -2055,26 +2357,11 @@ fn few_runs<T: Copy + TryInto<i64>>(
         *count += run.len() as i64;
     }
     for (slot, &number) in totals.iter().enumerate() {
-        if counts[slot] == 0 {
+        let count = counts[slot];
+        if count == 0 {
             continue;
         }
-        let number = i128::from(number);
-        let index = slot * stride + offset;
-        match (&mut states[index].state, feed) {
-            (State::Whole { total, seen, .. } | State::Scaled { total, seen, .. }, Feed::Total) => {
-                *total = total.checked_add(number).ok_or_else(overflowed)?;
-                *seen = true;
-            }
-            (State::Mean { total, seen, exact, scale: held, .. }, Feed::Whole { scale }) => {
-                *held = scale;
-                match total.checked_add(number).filter(|_| *exact) {
-                    Some(sum) => *total = sum,
-                    None => widened(total, exact, number),
-                }
-                *seen += counts[slot];
-            }
-            _ => return Err(Error::internal("a run total into another state".to_string())),
-        }
+        fold_local(states, slot * stride + offset, feed, number, count)?;
     }
     Ok(true)
 }
@@ -3905,6 +4192,138 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A chunk shaped like q01's: a sum and a mean of a column held in an `i64` and a sum and a mean
+    /// of one held in an `i128`, with a min and a `COUNT(*)` beside them that cannot share a walk.
+    ///
+    /// Two layouts is the case worth building, because a pass covers one and the caller is meant to
+    /// ask again for what is left. So this asserts which calls the sharing took as well as what they
+    /// answered: a pass that quietly took one call, or none, would answer exactly the same and would
+    /// be the whole of the change doing nothing.
+    #[test]
+    fn many_calls_over_one_walk_of_the_runs_answer_what_a_call_at_a_time_answers() {
+        let mut rng = Rng(0x5eed_c0de_5add_0050);
+        let rows = 97;
+        let groups = 4;
+        let money = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let wide = LogicalType::decimal(30, 4).expect("a legal decimal");
+        let calls = [
+            ("sum", &money),
+            ("avg", &money),
+            ("sum", &wide),
+            ("avg", &wide),
+            ("min", &money),
+            ("count_star", &LogicalType::BigInt),
+        ];
+        let stride = calls.len();
+        // A row in no group and a run of one row are both in here, and the runs are cut off the slots
+        // rather than written out, so the two paths are handed the same chunk however it comes out.
+        let slots: Vec<usize> =
+            (0..rows).map(|row| if row % 23 == 7 { NOWHERE } else { row / 7 % groups }).collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            match runs.last_mut() {
+                Some((held, end)) if *held == slot => *end = row + 1,
+                _ => runs.push((slot, row + 1)),
+            }
+        }
+        let columns: Vec<Option<Vector>> = calls
+            .iter()
+            .map(|&(name, ty)| (name != "count_star").then(|| flat(ty, rows, 0, &mut rng)))
+            .collect();
+        let inputs: Vec<Option<&Vector>> = columns.iter().map(Option::as_ref).collect();
+        let fresh = || {
+            let mut states = Vec::new();
+            for _ in 0..groups {
+                for &(name, ty) in &calls {
+                    states.push(Accumulator::new(name, &returns_of(name, ty)).expect("known"));
+                }
+            }
+            states
+        };
+        // A call at a time, which is what the sharing has to agree with. A min goes by neither run
+        // path, so it takes the row at a time route here as it does in the operator.
+        let mut alone = fresh();
+        for (at, &input) in inputs.iter().enumerate() {
+            if !update_runs(&mut alone, &runs, stride, at, input, rows).expect("folds them in") {
+                update_scattered(&mut alone, &slots, stride, at, input, rows)
+                    .expect("folds them in");
+            }
+        }
+        let mut together = fresh();
+        let offered = (1_u64 << stride) - 1;
+        let mut shared = 0;
+        loop {
+            let took =
+                update_shared_runs(&mut together, &runs, stride, &inputs, offered & !shared, rows)
+                    .expect("folds them in");
+            if took == 0 {
+                break;
+            }
+            assert_eq!(took & shared, 0, "a pass took a call another pass had already taken");
+            shared |= took;
+        }
+        // The two layouts take a pass each, the count rides on the first of them, and the min is left
+        // where it was because a run of values it has to compare is not a run it can add up.
+        assert_eq!(shared, 0b10_1111, "the wrong calls shared a walk");
+        for (at, &input) in inputs.iter().enumerate() {
+            if shared >> at & 1 == 1 {
+                continue;
+            }
+            if !update_runs(&mut together, &runs, stride, at, input, rows).expect("folds them in") {
+                update_scattered(&mut together, &slots, stride, at, input, rows)
+                    .expect("folds them in");
+            }
+        }
+        for group in 0..groups {
+            for (at, &(name, _)) in calls.iter().enumerate() {
+                let index = group * stride + at;
+                assert_eq!(
+                    together[index].finish().expect("finishes"),
+                    alone[index].finish().expect("finishes"),
+                    "{name} at {at} of group {group}"
+                );
+            }
+        }
+    }
+
+    /// A shared pass that runs out of room hands every call of it back untouched.
+    ///
+    /// The locals are `i64` and the column here is 128 bit values too large to become one, which is
+    /// the miss [`few_runs`] documents. It matters more here than there because the pass is holding
+    /// several calls: one column it cannot read has to leave the other calls of that pass exactly as
+    /// they were, or the caller folding them again would count their rows twice.
+    #[test]
+    fn a_shared_pass_that_runs_out_of_room_leaves_every_call_of_it_alone() {
+        let rows = 40;
+        let groups = 4;
+        let runs: Vec<(usize, usize)> =
+            (0..groups).map(|group| (group, (group + 1) * 10)).collect();
+        let huge = i128::from(i64::MAX) + 1;
+        let stride = 2;
+        let small = Vector::from_values(LogicalType::HugeInt, &vec![Value::HugeInt(7); rows])
+            .expect("huge integers");
+        let past = Vector::from_values(LogicalType::HugeInt, &vec![Value::HugeInt(huge); rows])
+            .expect("huge integers");
+        let returns = returns_of("sum", &LogicalType::HugeInt);
+        let mut states = Vec::new();
+        for _ in 0..groups * stride {
+            states.push(Accumulator::new("sum", &returns).expect("known"));
+        }
+        let inputs = [Some(&small), Some(&past)];
+        let took = update_shared_runs(&mut states, &runs, stride, &inputs, 0b11, rows)
+            .expect("gives up rather than failing");
+        assert_eq!(took, 0, "a pass that cannot read one of its columns took the other one anyway");
+        for (at, state) in states.iter().enumerate() {
+            assert_eq!(state.finish().expect("finishes"), Value::Null, "the state at {at} was fed");
+        }
+        // The column that fits shares a walk on its own, so what the case above proves is the
+        // handback and not that these two could never have shared one.
+        let fits = [Some(&small), Some(&small)];
+        let took = update_shared_runs(&mut states, &runs, stride, &fits, 0b11, rows)
+            .expect("folds them in");
+        assert_eq!(took, 0b11, "two columns that fit did not share a walk");
     }
 
     /// A sum read out of a mean's state over the same column is the sum a call of its own reaches,
