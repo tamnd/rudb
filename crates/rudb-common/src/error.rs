@@ -83,6 +83,8 @@ pub enum ErrorCode {
     /// An entry cannot go because others depend on it, for example a schema that still holds
     /// tables.
     Dependency,
+    /// A sequence was asked for a value it cannot give, for example one past its maximum.
+    Sequence,
     /// A conflict, an abort, or a statement issued outside a transaction that needs one.
     Transaction,
     /// A setting cannot be applied in the current engine configuration.
@@ -121,6 +123,7 @@ impl ErrorCode {
             Self::NotImplemented => "Not implemented Error",
             Self::Constraint => "Constraint Error",
             Self::Dependency => "Dependency Error",
+            Self::Sequence => "Sequence Error",
             Self::Transaction => "TransactionContext Error",
             Self::Settings => "Settings Error",
             Self::Interrupt => "Interrupt Error",
@@ -147,6 +150,7 @@ impl ErrorCode {
                 | Self::InvalidInput
                 | Self::Constraint
                 | Self::Dependency
+                | Self::Sequence
                 | Self::Transaction
                 | Self::Settings
                 | Self::ParameterNotAllowed
@@ -313,6 +317,11 @@ impl Error {
         Self::new(ErrorCode::Dependency, message)
     }
 
+    /// A sequence that cannot give what was asked of it.
+    pub fn sequence(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Sequence, message)
+    }
+
     /// Two types that cannot meet.
     pub fn mismatch_type(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::MismatchType, message)
@@ -356,6 +365,7 @@ impl ErrorCode {
             Self::NotImplemented => "Not implemented",
             Self::Constraint => "Constraint",
             Self::Dependency => "Dependency",
+            Self::Sequence => "Sequence",
             Self::Transaction => "TransactionContext",
             Self::Settings => "Settings",
             Self::Interrupt => "Interrupt",

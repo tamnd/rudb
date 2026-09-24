@@ -75,6 +75,7 @@ pub mod prepare;
 mod regexp;
 pub mod scalar;
 pub mod select;
+mod sequence;
 mod shape;
 mod structs;
 mod subscript;

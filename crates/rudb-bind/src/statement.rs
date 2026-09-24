@@ -43,6 +43,8 @@ pub enum Bound {
     DropTable(DropTable),
     /// `CREATE SCHEMA` or `DROP SCHEMA`.
     Schema(SchemaChange),
+    /// `CREATE SEQUENCE` or `DROP SEQUENCE`.
+    Sequence(SequenceChange),
     /// `INSERT INTO`.
     Insert(Insert),
     /// `SET name = value`, or `RESET name`, which is the same thing with no value.
@@ -107,6 +109,8 @@ pub struct CreateTable {
     pub keys: Vec<rudb_catalog::Key>,
     /// Each column's `DEFAULT` as the SQL of its expression, or `None` for a column with none.
     pub defaults: Vec<Option<String>>,
+    /// The sequences the defaults use, which the table depends on.
+    pub sequences: Vec<QualifiedName>,
     /// The SQL of each `CHECK`, in the order written.
     pub checks: Vec<String>,
     /// The foreign keys, in the order written.
@@ -164,6 +168,23 @@ pub struct SchemaChange {
     pub or_replace: bool,
     /// Whether a drop takes everything in the schema with it.
     pub cascade: bool,
+}
+
+/// A bound `CREATE SEQUENCE` or `DROP SEQUENCE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceChange {
+    /// The full name. `None` for a `DROP SEQUENCE IF EXISTS` of one that is not there.
+    pub name: Option<QualifiedName>,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Whether a create over a sequence that is there does nothing.
+    pub if_not_exists: bool,
+    /// Whether a create replaces a sequence that is there.
+    pub or_replace: bool,
+    /// Whether a drop takes the tables whose defaults use the sequence with it.
+    pub cascade: bool,
+    /// What a create settled.
+    pub options: rudb_common::sequence::Options,
 }
 
 /// A bound `DROP TABLE` or `DROP VIEW`.
@@ -353,6 +374,29 @@ fn bind_one(
                 cascade: written.cascade,
             }))
         }
+        ast::Statement::Sequence(index) => {
+            let written = ast.sequence(index);
+            let parts: Vec<&str> = ast.name(written.name).collect();
+            let name = if written.drop {
+                match catalog.resolve_sequence(&parts) {
+                    Ok(name) => Some(name),
+                    Err(_) if written.quiet => None,
+                    Err(error) => return Err(error),
+                }
+            } else if written.temporary {
+                Some(catalog.resolve_for_create_temporary(&parts)?)
+            } else {
+                Some(catalog.resolve_for_create(&parts)?)
+            };
+            Ok(Bound::Sequence(SequenceChange {
+                name,
+                drop: written.drop,
+                if_not_exists: written.quiet,
+                or_replace: written.or_replace,
+                cascade: written.cascade,
+                options: written.options,
+            }))
+        }
         ast::Statement::Insert(index) => insert(ast, catalog, parameters, session, index),
         ast::Statement::Update(index) => change(ast, catalog, parameters, session, index, false),
         ast::Statement::Delete(index) => change(ast, catalog, parameters, session, index, true),
@@ -444,11 +488,18 @@ fn create_table(
     };
     duplicate_check(&columns)?;
     let mut defaults = Vec::with_capacity(defs.len());
+    let mut sequences = Vec::new();
     for def in defs {
         defaults.push(if def.default == NONE {
             None
         } else {
-            Some(default_text(ast, def.default, catalog, parameters, session)?)
+            let (text, used) = default_text(ast, def.default, catalog, parameters, session)?;
+            for name in used {
+                if !sequences.contains(&name) {
+                    sequences.push(name);
+                }
+            }
+            Some(text)
         });
     }
     let mut checks = Vec::new();
@@ -497,6 +548,7 @@ fn create_table(
         defaults,
         checks,
         foreign,
+        sequences,
     }))
 }
 
@@ -692,7 +744,7 @@ fn default_text(
     catalog: &Catalog,
     parameters: &Parameters,
     session: &Session,
-) -> Result<String> {
+) -> Result<(String, Vec<QualifiedName>)> {
     if crate::expr::has_aggregate(ast, expr) {
         return Err(Error::binder("DEFAULT value cannot contain aggregates!"));
     }
@@ -710,7 +762,7 @@ fn default_text(
         Ok(_) if !binder.windows.is_empty() => {
             Err(Error::binder("DEFAULT value cannot contain window functions!"))
         }
-        Ok(_) => Ok(deparse::expression(ast, expr)),
+        Ok(_) => Ok((deparse::expression(ast, expr), binder.sequences)),
     }
 }
 

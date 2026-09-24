@@ -814,8 +814,208 @@ impl<'a> Transform<'a> {
                 };
                 Ok(self.schema_statement(schema))
             }
+            "CreateSequenceStmt" => self.create_sequence_statement(inner, or_replace, temporary),
             _ => self.unsupported(inner),
         }
+    }
+
+    /// `CreateSequenceStmt <- 'SEQUENCE' IfNotExists? QualifiedName SequenceOption*`.
+    ///
+    /// The options are settled here the way the pin's transformer settles them, which is where
+    /// every one of its refusals of a bad combination comes from.
+    fn create_sequence_statement(
+        &mut self,
+        inner: u32,
+        or_replace: bool,
+        temporary: bool,
+    ) -> Result<Statement> {
+        let name = self.name_parts(self.find(inner, "QualifiedName"));
+        let quiet = self.find(inner, "IfNotExists") != NONE;
+        // Each option under the key the pin files it under, with its value: `None` for a NULL,
+        // and 1 or 0 for `CYCLE` and `NO CYCLE`.
+        let mut given: Vec<(&'static str, Option<i64>)> = Vec::new();
+        let written: Vec<u32> =
+            self.kids(inner).filter(|&kid| self.name(kid) == "SequenceOption").collect();
+        for option in written {
+            let option = self.first(option);
+            let (key, value) = match self.name(option) {
+                "SeqSetCycle" => {
+                    ("cycle", Some(i64::from(self.name(self.first(option)) == "SeqCycle")))
+                }
+                "SeqSetIncrement" => {
+                    ("increment", self.sequence_value(self.find(option, "Expression"), true)?)
+                }
+                "SeqSetMinMax" => {
+                    let which = self.first(self.find(option, "SeqMinOrMax"));
+                    let key = if self.name(which) == "MinValue" { "minvalue" } else { "maxvalue" };
+                    (key, self.sequence_value(self.find(option, "Expression"), true)?)
+                }
+                "SeqNoMinMax" => {
+                    let which = self.first(self.find(option, "SeqMinOrMax"));
+                    let key =
+                        if self.name(which) == "MinValue" { "nominvalue" } else { "nomaxvalue" };
+                    (key, None)
+                }
+                "SeqStartWith" => {
+                    ("start", self.sequence_value(self.find(option, "Expression"), false)?)
+                }
+                "SeqOwnedBy" => ("owned", None),
+                _ => return self.unsupported(option),
+            };
+            if given.iter().any(|(held, _)| *held == key) {
+                let mut capital = key.to_string();
+                capital[..1].make_ascii_uppercase();
+                return Err(Error::parser(format!("{capital} should be passed at most once")));
+            }
+            given.push((key, value));
+        }
+        let has = |key: &str| given.iter().any(|(held, _)| *held == key);
+        let no_min = has("nominvalue");
+        if no_min && has("minvalue") {
+            return Err(Error::parser("Minvalue should be passed at most once"));
+        }
+        let no_max = has("nomaxvalue");
+        if no_max && has("maxvalue") {
+            return Err(Error::parser("Maxvalue should be passed at most once"));
+        }
+        if has("owned") {
+            return Err(Error::parser("Unrecognized option \"owned\" for CREATE SEQUENCE"));
+        }
+        let value =
+            |key: &str| given.iter().find(|(held, _)| *held == key).map(|(_, value)| *value);
+        let mut options = rudb_common::sequence::Options {
+            increment: 1,
+            min: 1,
+            max: i64::MAX,
+            start: 1,
+            cycle: value("cycle").flatten() == Some(1),
+        };
+        let min = if no_min { None } else { value("minvalue") };
+        let max = if no_max { None } else { value("maxvalue") };
+        if let Some(increment) = value("increment") {
+            let increment = increment.ok_or_else(|| Error::parser("INCREMENT must not be NULL"))?;
+            if increment == 0 {
+                return Err(Error::parser("Increment must not be zero"));
+            }
+            options.increment = increment;
+            if increment < 0 {
+                options.min = i64::MIN;
+                options.max = -1;
+            }
+        }
+        if let Some(min) = min {
+            options.min = min.ok_or_else(|| Error::parser("MINVALUE must not be NULL"))?;
+        }
+        if let Some(max) = max {
+            options.max = max.ok_or_else(|| Error::parser("MAXVALUE must not be NULL"))?;
+        }
+        options.start = match value("start") {
+            Some(start) => start.ok_or_else(|| Error::parser("START value must not be NULL"))?,
+            None if options.increment < 0 => options.max,
+            None => options.min,
+        };
+        if options.max <= options.min {
+            return Err(Error::parser(format!(
+                "MINVALUE ({}) must be less than MAXVALUE ({})",
+                options.min, options.max
+            )));
+        }
+        if options.start < options.min {
+            return Err(Error::parser(format!(
+                "START value ({}) cannot be less than MINVALUE ({})",
+                options.start, options.min
+            )));
+        }
+        if options.start > options.max {
+            return Err(Error::parser(format!(
+                "START value ({}) cannot be greater than MAXVALUE ({})",
+                options.start, options.max
+            )));
+        }
+        let sequence = crate::ast::Sequence {
+            name,
+            drop: false,
+            quiet,
+            or_replace,
+            temporary,
+            cascade: false,
+            options,
+        };
+        Ok(self.sequence_statement(sequence))
+    }
+
+    /// The value of one sequence option, `None` for a NULL.
+    ///
+    /// Only a constant is taken. `minus` says a minus in front of one is taken too, which the pin
+    /// allows for `INCREMENT`, `MINVALUE` and `MAXVALUE` and reads by negating the first thing the
+    /// minus applies to, so `5 - 1` is read as -5 there just as it is here.
+    fn sequence_value(&mut self, node: u32, minus: bool) -> Result<Option<i64>> {
+        let expr = self.expr(node)?;
+        self.constant_value(expr, minus)
+    }
+
+    fn constant_value(&self, expr: ExprRef, minus: bool) -> Result<Option<i64>> {
+        let negated = |operand: ExprRef| -> Result<Option<i64>> {
+            if !matches!(self.ast.expr(operand), Expr::Literal { .. }) {
+                return Err(Error::invalid_input(
+                    "Expected constant expression as child of minus function",
+                ));
+            }
+            Ok(self.constant_value(operand, false)?.map(i64::wrapping_neg))
+        };
+        match self.ast.expr(expr) {
+            Expr::Literal { kind: LiteralKind::Null, .. } => Ok(None),
+            Expr::Literal { kind: LiteralKind::True, .. } => Ok(Some(1)),
+            Expr::Literal { kind: LiteralKind::False, .. } => Ok(Some(0)),
+            Expr::Literal { kind: LiteralKind::Number, text } => {
+                let text = self.ast.string(text);
+                text.parse::<i64>()
+                    .ok()
+                    .or_else(|| {
+                        text.parse::<f64>()
+                            .ok()
+                            .filter(|value| value.abs() < 9.2e18)
+                            .map(|value| value.round() as i64)
+                    })
+                    .map(Some)
+                    .ok_or_else(|| {
+                        Error::conversion(format!(
+                            "Type DECIMAL with value {text} can't be cast because the value is out \
+                             of range for the destination type INT64"
+                        ))
+                    })
+            }
+            Expr::Literal { kind: LiteralKind::String, text } => {
+                let text = self.ast.string(text);
+                text.trim().parse::<i64>().map(Some).map_err(|_| {
+                    Error::invalid_input(format!("Could not convert string '{text}' to INT64"))
+                })
+            }
+            Expr::Unary { op: UnaryOp::Negate, operand } => negated(operand),
+            Expr::Binary { op: BinaryOp::Subtract, left, .. } if minus => negated(left),
+            Expr::Binary { op, .. } if minus => {
+                let name = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Multiply => "*",
+                    BinaryOp::Divide => "/",
+                    BinaryOp::IntegerDivide => "//",
+                    BinaryOp::Modulo => "%",
+                    BinaryOp::Power => "**",
+                    BinaryOp::Concat => "||",
+                    _ => return Err(Error::parser("Expected constant expression.")),
+                };
+                Err(Error::invalid_input(format!(
+                    "Expected a minus function instead of \"{name}\""
+                )))
+            }
+            _ => Err(Error::parser("Expected constant expression.")),
+        }
+    }
+
+    fn sequence_statement(&mut self, sequence: crate::ast::Sequence) -> Statement {
+        let index = self.ast.sequences.len() as u32;
+        self.ast.sequences.push(sequence);
+        Statement::Sequence(index)
     }
 
     /// `CreateTableStmt <- 'TABLE' IfNotExists? QualifiedName CreateTableDefinition`.
@@ -1195,6 +1395,23 @@ impl<'a> Transform<'a> {
                 cascade,
             };
             return Ok(self.schema_statement(schema));
+        }
+        if self.name(inner) == "DropSequence" {
+            let names: Vec<u32> =
+                self.kids(inner).filter(|&kid| self.name(kid) == "QualifiedSequenceName").collect();
+            let [name] = names[..] else {
+                return Err(Error::not_implemented("Can only drop one object at a time"));
+            };
+            let sequence = crate::ast::Sequence {
+                name: self.name_parts(name),
+                drop: true,
+                quiet: self.find(inner, "IfExists") != NONE,
+                or_replace: false,
+                temporary: false,
+                cascade,
+                options: rudb_common::sequence::Options::default(),
+            };
+            return Ok(self.sequence_statement(sequence));
         }
         if self.name(inner) != "DropTable" {
             return self.unsupported(inner);
@@ -4722,6 +4939,36 @@ mod tests {
                 }
                 out += &format!(" {}", ast.name_text(schema.name));
                 if schema.cascade {
+                    out += " CASCADE";
+                }
+                out
+            }
+            Statement::Sequence(index) => {
+                let sequence = ast.sequence(index);
+                let mut out = if sequence.drop { "DROP" } else { "CREATE" }.to_string();
+                if sequence.or_replace {
+                    out += " OR REPLACE";
+                }
+                if sequence.temporary {
+                    out += " TEMPORARY";
+                }
+                out += " SEQUENCE";
+                if sequence.quiet {
+                    out += if sequence.drop { " IF EXISTS" } else { " IF NOT EXISTS" };
+                }
+                out += &format!(" {}", ast.name_text(sequence.name));
+                if !sequence.drop {
+                    let options = sequence.options;
+                    out += &format!(
+                        " INCREMENT BY {} MINVALUE {} MAXVALUE {} START {}{}",
+                        options.increment,
+                        options.min,
+                        options.max,
+                        options.start,
+                        if options.cycle { " CYCLE" } else { " NO CYCLE" }
+                    );
+                }
+                if sequence.cascade {
                     out += " CASCADE";
                 }
                 out

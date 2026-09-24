@@ -9700,3 +9700,67 @@ fn a_schema_is_made_filled_and_dropped_the_way_the_pin_does_it() {
     db.execute("DROP SCHEMA empty").unwrap();
     assert!(refusal(&db, "SELECT * FROM s1.t").contains("because schema \"s1\" does not exist"));
 }
+
+#[test]
+fn a_sequence_counts_the_way_the_pin_counts() {
+    let db = scripted(&[
+        "CREATE SEQUENCE seq",
+        "CREATE SEQUENCE down INCREMENT BY -2 MINVALUE -5 MAXVALUE 5 CYCLE",
+        "CREATE TABLE u (id BIGINT DEFAULT nextval('seq'), v INT)",
+    ]);
+    let values = |sql: &str| -> Vec<String> {
+        db.query(sql).unwrap().rows().map(|row| row[0].to_string()).collect()
+    };
+    assert_eq!(values("SELECT nextval('seq') FROM range(3)"), ["1", "2", "3"]);
+    assert_eq!(values("SELECT currval('seq')"), ["3"]);
+    assert_eq!(values("SELECT setval('seq', 20, false)"), ["20"]);
+    assert_eq!(values("SELECT nextval('seq')"), ["20"]);
+    assert_eq!(
+        values("SELECT nextval('down') FROM range(8)"),
+        ["5", "3", "1", "-1", "-3", "-5", "5", "3"]
+    );
+    db.execute("INSERT INTO u (v) VALUES (1), (2)").unwrap();
+    assert_eq!(values("SELECT id FROM u"), ["21", "22"]);
+    // A value handed out inside a transaction that rolls back stays handed out.
+    db.execute("BEGIN").unwrap();
+    assert_eq!(values("SELECT nextval('seq')"), ["23"]);
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(values("SELECT nextval('seq')"), ["24"]);
+    assert_eq!(values("SELECT nextval(NULL)"), ["NULL"]);
+    for (statement, message) in [
+        ("CREATE SEQUENCE seq", "Sequence with name \"seq\" already exists!"),
+        ("CREATE SEQUENCE bad INCREMENT 0", "Increment must not be zero"),
+        ("CREATE SEQUENCE bad START 0", "START value (0) cannot be less than MINVALUE (1)"),
+        ("CREATE SEQUENCE bad CYCLE CYCLE", "Cycle should be passed at most once"),
+        ("CREATE SEQUENCE bad INCREMENT BY 1+1", "Expected a minus function instead of \"+\""),
+        ("SELECT nextval('nope')", "Sequence with name nope does not exist!"),
+        (
+            "SELECT setval('seq', 0)",
+            "setval: value 0 is out of bounds for sequence \"seq\" (1..9223372036854775807)",
+        ),
+        ("DROP SEQUENCE seq, down", "Can only drop one object at a time"),
+        ("SELECT setval('seq', 'abc')", "Could not convert string 'abc' to INT64"),
+        ("SELECT setval('seq', 5, 'maybe')", "Could not convert string 'maybe' to BOOL"),
+        (
+            "CREATE SEQUENCE bad INCREMENT 1 START -1",
+            "START value (-1) cannot be less than MINVALUE (1)",
+        ),
+        (
+            "SELECT nextval('a.b.c.d')",
+            "Sequence with name \"a.b.c.d\" does not exist because schema \"a.b.c\" does not \
+             exist.",
+        ),
+        (
+            "DROP SEQUENCE seq",
+            "Cannot drop entry \"seq\" because there are entries that depend on it.\ntable \"u\" \
+             depends on sequence \"seq\".\nUse DROP...CASCADE to drop all dependents.",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    assert!(refusal(&db, "SELECT setval('seq', 5.5)").starts_with("No function matches"));
+    assert!(refusal(&db, "SELECT setval('seq', 1, true, true)").starts_with("No function matches"));
+    db.execute("DROP SEQUENCE seq CASCADE").unwrap();
+    assert!(refusal(&db, "SELECT * FROM u").contains("Table with name u does not exist"));
+    db.execute("DROP SEQUENCE IF EXISTS seq").unwrap();
+}

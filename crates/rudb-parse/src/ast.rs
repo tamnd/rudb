@@ -63,6 +63,8 @@ pub type CreateViewRef = u32;
 pub type DropTableRef = u32;
 /// Index into [`Ast::schemas`].
 pub type SchemaRef = u32;
+/// Index into [`Ast::sequences`].
+pub type SequenceRef = u32;
 /// An index into `Ast::inserts`.
 pub type InsertRef = u32;
 /// An index into `Ast::settings`.
@@ -87,6 +89,8 @@ pub enum Statement {
     DropTable(DropTableRef),
     /// `CREATE SCHEMA` or `DROP SCHEMA`.
     Schema(SchemaRef),
+    /// `CREATE SEQUENCE` or `DROP SEQUENCE`.
+    Sequence(SequenceRef),
     /// `INSERT INTO`.
     Insert(InsertRef),
     /// `UPDATE`, held as an [`Insert`] whose columns are the ones `SET` names and whose source is
@@ -283,6 +287,28 @@ pub struct Schema {
     pub temporary: bool,
     /// Whether `CASCADE` was written, which only a drop can have.
     pub cascade: bool,
+}
+
+/// `CREATE SEQUENCE name options` or `DROP SEQUENCE name`.
+///
+/// The options are settled here rather than in the binder, defaults and all, because that is where
+/// the pin settles them and every refusal of a bad combination is a parser error there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sequence {
+    /// The name, as a run of parts, outermost first.
+    pub name: Slice,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Whether `IF NOT EXISTS` was written on a create or `IF EXISTS` on a drop.
+    pub quiet: bool,
+    /// Whether `OR REPLACE` was written, which only a create can have.
+    pub or_replace: bool,
+    /// Whether `TEMP` or `TEMPORARY` was written, which only a create can have.
+    pub temporary: bool,
+    /// Whether `CASCADE` was written, which only a drop can have.
+    pub cascade: bool,
+    /// What a create settled, and the defaults on a drop.
+    pub options: rudb_common::sequence::Options,
 }
 
 /// `INSERT INTO name (columns) query`.
@@ -1158,6 +1184,8 @@ pub struct Ast {
     pub drop_tables: Vec<DropTable>,
     /// The `CREATE SCHEMA` and `DROP SCHEMA` arena.
     pub schemas: Vec<Schema>,
+    /// The `CREATE SEQUENCE` and `DROP SEQUENCE` arena.
+    pub sequences: Vec<Sequence>,
     /// The `INSERT` arena.
     pub inserts: Vec<Insert>,
     /// The `SET` and `RESET` arena.
@@ -1297,6 +1325,11 @@ impl Ast {
     /// One `CREATE SCHEMA` or `DROP SCHEMA`.
     pub fn schema(&self, index: SchemaRef) -> Schema {
         self.schemas[index as usize]
+    }
+
+    /// One `CREATE SEQUENCE` or `DROP SEQUENCE`.
+    pub fn sequence(&self, index: SequenceRef) -> Sequence {
+        self.sequences[index as usize]
     }
 
     /// One `INSERT`.

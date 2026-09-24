@@ -1,7 +1,9 @@
 //! The catalog: attached databases, their schemas, and the tables in them.
 
 use std::fmt;
+use std::sync::Arc;
 
+use rudb_common::sequence::Counter;
 use rudb_common::{Error, Field, Result};
 
 use crate::name::{QualifiedName, same_name};
@@ -94,19 +96,65 @@ impl fmt::Display for Entry {
     }
 }
 
+/// One sequence.
+///
+/// Sequences have a namespace of their own, the way they do on the pin, so a table and a sequence
+/// can share a name. The counter is behind an [`Arc`] so that the copy of the catalog a transaction
+/// keeps to roll back to shares it, which is what makes a value `nextval` handed out stay handed
+/// out after a `ROLLBACK`.
+#[derive(Debug, Clone)]
+pub struct Sequence {
+    name: QualifiedName,
+    oid: i64,
+    counter: Arc<Counter>,
+}
+
+impl Sequence {
+    /// Its full name.
+    #[must_use]
+    pub fn name(&self) -> &QualifiedName {
+        &self.name
+    }
+
+    /// The number the catalog tables join on.
+    #[must_use]
+    pub fn oid(&self) -> i64 {
+        self.oid
+    }
+
+    /// Its counter.
+    #[must_use]
+    pub fn counter(&self) -> &Arc<Counter> {
+        &self.counter
+    }
+}
+
 /// One schema.
 #[derive(Debug, Clone)]
 pub struct Schema {
     name: String,
     tables: Vec<Table>,
     views: Vec<View>,
+    sequences: Vec<Sequence>,
     oid: i64,
 }
 
 impl Schema {
     /// A schema of that name with nothing in it.
     fn empty(name: &str, oid: i64) -> Self {
-        Self { name: name.to_string(), tables: Vec::new(), views: Vec::new(), oid }
+        Self {
+            name: name.to_string(),
+            tables: Vec::new(),
+            views: Vec::new(),
+            sequences: Vec::new(),
+            oid,
+        }
+    }
+
+    /// The sequences in it.
+    #[must_use]
+    pub fn sequences(&self) -> &[Sequence] {
+        &self.sequences
     }
 
     /// The schema name.
@@ -388,7 +436,11 @@ impl Catalog {
                 schema.name
             )));
         }
-        if !cascade && (!schema.tables.is_empty() || !schema.views.is_empty()) {
+        if !cascade
+            && (!schema.tables.is_empty()
+                || !schema.views.is_empty()
+                || !schema.sequences.is_empty())
+        {
             let mut message = format!(
                 "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
                 schema.name
@@ -405,6 +457,12 @@ impl Catalog {
                     "table \"{}\" depends on schema \"{}\".\n",
                     table.name().table,
                     schema.name
+                );
+            }
+            for sequence in schema.sequences.iter().rev() {
+                message += &format!(
+                    "sequence \"{}\" depends on schema \"{}\".\n",
+                    sequence.name.table, schema.name
                 );
             }
             message += "Use DROP...CASCADE to drop all dependents.";
@@ -579,6 +637,154 @@ impl Catalog {
                 Ok(())
             }
         }
+    }
+
+    /// Creates a sequence around a counter already made for it.
+    ///
+    /// With `replace` a sequence of that name is swapped for the new one, unless a table's default
+    /// uses it, and with `if_not_exists` it is kept and the new one thrown away.
+    ///
+    /// # Errors
+    ///
+    /// If the schema is missing, if a sequence of that name is there and neither was asked for, or
+    /// if one being replaced has a table depending on it.
+    pub fn create_sequence(
+        &mut self,
+        name: QualifiedName,
+        counter: Arc<Counter>,
+        replace: bool,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        self.changed();
+        let oid = self.stamp();
+        let held = self
+            .schema(&name.catalog, &name.schema)?
+            .sequences
+            .iter()
+            .find(|held| same_name(&held.name.table, &name.table))
+            .map(|held| held.name.clone());
+        if let Some(held) = held {
+            if if_not_exists {
+                return Ok(());
+            }
+            if !replace {
+                return Err(Error::catalog(format!(
+                    "Sequence with name \"{}\" already exists!",
+                    name.table
+                )));
+            }
+            self.sequence_dependents(&held)?;
+            self.schema_mut(&name.catalog, &name.schema)?
+                .sequences
+                .retain(|seq| !same_name(&seq.name.table, &name.table));
+        }
+        self.schema_mut(&name.catalog, &name.schema)?.sequences.push(Sequence {
+            name,
+            oid,
+            counter,
+        });
+        Ok(())
+    }
+
+    /// Turns the parts of a written name into the full name of a sequence that exists, reading it
+    /// the way a table name is read and the temporary schema first.
+    ///
+    /// # Errors
+    ///
+    /// If the name has more than three parts or no sequence has it.
+    pub fn resolve_sequence(&self, parts: &[&str]) -> Result<QualifiedName> {
+        if parts.len() > 3 {
+            return Err(Error::catalog(format!(
+                "Sequence with name \"{}\" does not exist because schema \"{}\" does not exist.",
+                parts.join("."),
+                parts[..parts.len() - 1].join(".")
+            )));
+        }
+        for candidate in self.candidates(parts)? {
+            if let Ok(schema) = self.schema(&candidate.catalog, &candidate.schema) {
+                if let Some(held) = schema
+                    .sequences
+                    .iter()
+                    .find(|held| same_name(&held.name.table, &candidate.table))
+                {
+                    return Ok(held.name.clone());
+                }
+            }
+        }
+        Err(Error::catalog(format!(
+            "Sequence with name {} does not exist!",
+            parts.last().copied().unwrap_or_default()
+        )))
+    }
+
+    /// A sequence by its full name.
+    ///
+    /// # Errors
+    ///
+    /// If the database, the schema or the sequence is missing.
+    pub fn sequence(&self, name: &QualifiedName) -> Result<&Sequence> {
+        self.schema(&name.catalog, &name.schema)?
+            .sequences
+            .iter()
+            .find(|held| same_name(&held.name.table, &name.table))
+            .ok_or_else(|| {
+                Error::catalog(format!("Sequence with name {} does not exist!", name.table))
+            })
+    }
+
+    /// Every sequence in every database, in the order they were made within each schema.
+    pub fn sequences(&self) -> impl Iterator<Item = &Sequence> {
+        self.databases
+            .iter()
+            .flat_map(|database| database.schemas.iter())
+            .flat_map(|schema| schema.sequences.iter())
+    }
+
+    /// Refuses when a table's default uses the sequence, in the pin's sentence, newest first.
+    fn sequence_dependents(&self, name: &QualifiedName) -> Result<()> {
+        let dependents: Vec<&Table> =
+            self.tables().filter(|table| table.sequences().contains(name)).collect();
+        if dependents.is_empty() {
+            return Ok(());
+        }
+        let mut message = format!(
+            "Cannot drop entry \"{}\" because there are entries that depend on it.\n",
+            name.table
+        );
+        for table in dependents.iter().rev() {
+            message += &format!(
+                "table \"{}\" depends on sequence \"{}\".\n",
+                table.name().table,
+                name.table
+            );
+        }
+        message += "Use DROP...CASCADE to drop all dependents.";
+        Err(Error::dependency(message))
+    }
+
+    /// Removes a sequence, and with `cascade` every table whose default uses it.
+    ///
+    /// # Errors
+    ///
+    /// If it is missing, or a table depends on it and `cascade` was not asked for.
+    pub fn drop_sequence(&mut self, name: &QualifiedName, cascade: bool) -> Result<()> {
+        self.sequence(name)?;
+        if !cascade {
+            self.sequence_dependents(name)?;
+        }
+        self.changed();
+        let dependents: Vec<QualifiedName> = self
+            .tables()
+            .filter(|table| table.sequences().contains(name))
+            .map(|table| table.name().clone())
+            .collect();
+        for table in &dependents {
+            self.drop_entry(table, Entry::Table)?;
+        }
+        self.schema_mut(&name.catalog, &name.schema)?
+            .sequences
+            .retain(|held| !same_name(&held.name.table, &name.table));
+        Ok(())
     }
 
     /// What a full name is, if it is anything.

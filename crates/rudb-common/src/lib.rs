@@ -30,6 +30,7 @@ pub mod clustering;
 pub mod error;
 pub mod memory;
 pub mod rules;
+pub mod sequence;
 pub mod session;
 pub mod slow;
 pub mod spread;
