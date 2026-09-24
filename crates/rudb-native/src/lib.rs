@@ -3995,7 +3995,9 @@ fn write_section(
     let mut extents = Vec::new();
     let mut first = 0_u64;
     let extent_size =
-        if one.kind == *section::SORTED_PROJECTION || one.kind == *section::RUN_PROJECTION {
+        if one.kind == *section::RUN_PROJECTION && one.flags == run_projection::RLE_PAGES {
+            run_projection::RLE_PAGE_BYTES
+        } else if one.kind == *section::SORTED_PROJECTION || one.kind == *section::RUN_PROJECTION {
             1 << 19
         } else {
             section::MAX_EXTENT as usize

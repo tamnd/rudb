@@ -1,8 +1,9 @@
 //! A row-preserving run codec for a sorted, covering integer projection.
 //!
-//! A page stores each sorted order value once with its run length, followed by the covered code
-//! for every original row. Duplicate `(order, covered)` rows are retained. Pages end between
-//! order values so query workers can count exact pairs independently.
+//! A page stores each sorted order value once with its run length. Raw runs keep every covered
+//! code; uniform runs keep one code and the row count already in the header. Both layouts retain
+//! duplicate `(order, covered)` rows. Pages end between order values so query workers can count
+//! exact pairs independently.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -13,16 +14,19 @@ use crate::projection::{eligible, id, integers};
 use crate::{Catalog, Reader, attach, invalid, section};
 
 const MAGIC: &[u8; 8] = b"RUDBRP1\0";
-const PAGE_BYTES: usize = 1 << 19;
+const LEGACY_PAGE_BYTES: usize = 1 << 19;
+pub(crate) const RLE_PAGE_BYTES: usize = 1 << 16;
+pub(crate) const RLE_PAGES: u32 = 1;
 const FIXED_HEADER: usize = 8 + 2 + 2 + 8 + 2 + 4 + 1;
 const PAGE_HEADER: usize = 4 + 4 + 8 + 8;
 const RUN_HEADER: usize = 8 + 4;
 
 /// Attach a row-preserving run projection to an existing native table.
 ///
-/// The builder stores one covered-value code for every source row. Consecutive equal order
-/// values share their eight-byte order value but retain their original multiplicities. The
-/// caller must include this explicit build in any indexed-load measurement. An append makes
+/// The builder retains every source row's covered value and multiplicity. Consecutive equal
+/// order values share their eight-byte order value, and uniform covered runs use lossless
+/// run-length encoding. The caller must include this explicit build in indexed-load measurements.
+/// An append makes
 /// the section stale until it is rebuilt.
 ///
 /// # Errors
@@ -87,10 +91,18 @@ pub fn build_run_projection(
     let covered_index =
         u16::try_from(covered).map_err(|_| invalid("run projection column index overflow"))?;
     let header = FIXED_HEADER + dictionary.len() * 4;
-    if header + PAGE_HEADER >= PAGE_BYTES {
+    if header + PAGE_HEADER >= LEGACY_PAGE_BYTES {
         return Err(invalid("run projection dictionary does not fit in its first page"));
     }
-    let mut bytes = vec![0_u8; PAGE_BYTES];
+    let longest_run =
+        rows.chunk_by(|left, right| left.0 == right.0).map(|run| run.len()).max().unwrap_or(0);
+    let raw_run_bytes =
+        longest_run.checked_mul(code_bytes).and_then(|bytes| bytes.checked_add(RUN_HEADER + 1));
+    let rle_fits = header + PAGE_HEADER < RLE_PAGE_BYTES
+        && raw_run_bytes.is_some_and(|bytes| bytes <= RLE_PAGE_BYTES - PAGE_HEADER - header);
+    let flags = if rle_fits { RLE_PAGES } else { 0 };
+    let page_bytes = if rle_fits { RLE_PAGE_BYTES } else { LEGACY_PAGE_BYTES };
+    let mut bytes = vec![0_u8; page_bytes];
     bytes[..8].copy_from_slice(MAGIC);
     bytes[8..10].copy_from_slice(&order_index.to_le_bytes());
     bytes[10..12].copy_from_slice(&covered_index.to_le_bytes());
@@ -115,19 +127,22 @@ pub fn build_run_projection(
         }
         let count = u32::try_from(end - at)
             .map_err(|_| invalid("run projection user run exceeds its page count"))?;
-        let run_bytes = RUN_HEADER + (end - at) * code_bytes;
-        if run_bytes > PAGE_BYTES - PAGE_HEADER {
+        let uniform = flags == RLE_PAGES
+            && rows[at..end].iter().all(|&(_, covered_value)| covered_value == rows[at].1);
+        let payload_bytes = if uniform { code_bytes } else { (end - at) * code_bytes };
+        let run_bytes = RUN_HEADER + usize::from(flags == RLE_PAGES) + payload_bytes;
+        if run_bytes > page_bytes - PAGE_HEADER {
             return Err(invalid("run projection user run exceeds a page"));
         }
-        if cursor + run_bytes > (page + 1) * PAGE_BYTES {
+        if cursor + run_bytes > (page + 1) * page_bytes {
             finish_page(&mut bytes, page, header, cursor, page_rows, page_first, page_last)?;
             page += 1;
-            bytes.resize((page + 1) * PAGE_BYTES, 0);
-            cursor = page * PAGE_BYTES + PAGE_HEADER;
+            bytes.resize((page + 1) * page_bytes, 0);
+            cursor = page * page_bytes + PAGE_HEADER;
             page_rows = 0;
             page_first = None;
         }
-        if cursor + run_bytes > (page + 1) * PAGE_BYTES {
+        if cursor + run_bytes > (page + 1) * page_bytes {
             return Err(invalid("run projection user run exceeds the first page"));
         }
         page_first.get_or_insert(user);
@@ -135,8 +150,13 @@ pub fn build_run_projection(
         bytes[cursor..cursor + 8].copy_from_slice(&user.to_le_bytes());
         bytes[cursor + 8..cursor + 12].copy_from_slice(&count.to_le_bytes());
         cursor += RUN_HEADER;
-        for &(_, group) in &rows[at..end] {
-            let code = codes[&group];
+        if flags == RLE_PAGES {
+            bytes[cursor] = u8::from(uniform);
+            cursor += 1;
+        }
+        let stored = if uniform { &rows[at..at + 1] } else { &rows[at..end] };
+        for &(_, covered_value) in stored {
+            let code = codes[&covered_value];
             if code_bytes == 1 {
                 bytes[cursor] = code as u8;
                 cursor += 1;
@@ -161,7 +181,7 @@ pub fn build_run_projection(
         &[section::Attachment {
             kind: *section::RUN_PROJECTION,
             id: id(order, covered)?,
-            flags: 0,
+            flags,
             header_bytes: header as u32,
             bytes: &bytes,
         }],
@@ -178,7 +198,8 @@ fn finish_page(
     first: Option<i64>,
     last: Option<i64>,
 ) -> Result<()> {
-    let prefix = page * PAGE_BYTES + if page == 0 { header } else { 0 };
+    let page_bytes = bytes.len() / (page + 1);
+    let prefix = page * page_bytes + if page == 0 { header } else { 0 };
     let used = u32::try_from(cursor - prefix - PAGE_HEADER)
         .map_err(|_| invalid("run projection page length overflow"))?;
     bytes[prefix..prefix + 4].copy_from_slice(&used.to_le_bytes());
@@ -205,6 +226,15 @@ pub struct RunProjectionScan<'a> {
     rows: u64,
     header: usize,
     code_bytes: usize,
+    rle: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ScanLayout {
+    header: usize,
+    dictionary: usize,
+    code_bytes: usize,
+    rle: bool,
 }
 
 impl RunProjectionScan<'_> {
@@ -224,9 +254,12 @@ impl RunProjectionScan<'_> {
             self.reader,
             &self.extents[begin..end],
             begin,
-            self.header,
-            self.dictionary.len(),
-            self.code_bytes,
+            ScanLayout {
+                header: self.header,
+                dictionary: self.dictionary.len(),
+                code_bytes: self.code_bytes,
+                rle: self.rle,
+            },
             (begin == 0).then(|| self.first_page.clone()),
         )
     }
@@ -287,8 +320,8 @@ impl Reader {
 
     /// Count exact distinct order values by covered value from a current run projection.
     ///
-    /// Returns `None` if no current matching section exists. Every covered code is read when
-    /// this query runs; the file contains no saved distinct pair or grouped count.
+    /// Returns `None` if no current matching section exists. Stored codes and run lengths are
+    /// decoded when this query runs; the file contains no saved distinct pair or grouped count.
     ///
     /// # Errors
     ///
@@ -335,9 +368,12 @@ impl Reader {
                 scan.reader,
                 &scan.extents,
                 0,
-                scan.header,
-                scan.dictionary.len(),
-                scan.code_bytes,
+                ScanLayout {
+                    header: scan.header,
+                    dictionary: scan.dictionary.len(),
+                    code_bytes: scan.code_bytes,
+                    rle: scan.rle,
+                },
                 Some(first_page),
             )?;
             return Ok(Some(scan.finish([part], limit)?));
@@ -382,10 +418,15 @@ impl Reader {
         }) else {
             return Ok(None);
         };
+        let page_bytes = match section.flags {
+            0 => LEGACY_PAGE_BYTES,
+            RLE_PAGES => RLE_PAGE_BYTES,
+            _ => return Err(invalid("run projection has unknown page layout flags")),
+        };
         let extents = self.extents(section)?;
         let first_extent = extents.first().ok_or_else(|| invalid("run projection has no page"))?;
         let first_page = self.extent(first_extent)?;
-        if first_page.len() != PAGE_BYTES || &first_page[..8] != MAGIC {
+        if first_page.len() != page_bytes || &first_page[..8] != MAGIC {
             return Err(invalid("run projection header differs"));
         }
         let stored_order = u16::from_le_bytes(first_page[8..10].try_into().unwrap());
@@ -407,7 +448,7 @@ impl Reader {
             return Err(invalid("run projection page count differs from its extents"));
         }
         let header = FIXED_HEADER + size * 4;
-        if header + PAGE_HEADER > PAGE_BYTES || section.header_bytes as usize != header {
+        if header + PAGE_HEADER > page_bytes || section.header_bytes as usize != header {
             return Err(invalid("run projection dictionary exceeds its first page"));
         }
         let dictionary = first_page[FIXED_HEADER..header]
@@ -419,10 +460,10 @@ impl Reader {
         }
         let base = first_extent.offset;
         for (at, extent) in extents.iter().enumerate() {
-            let offset = at as u64 * PAGE_BYTES as u64;
+            let offset = at as u64 * page_bytes as u64;
             if extent.first != offset
                 || extent.offset != base + offset
-                || extent.length as usize != PAGE_BYTES
+                || extent.length as usize != page_bytes
             {
                 return Err(invalid("run projection pages are not contiguous"));
             }
@@ -435,6 +476,7 @@ impl Reader {
             rows,
             header,
             code_bytes,
+            rle: section.flags == RLE_PAGES,
         }))
     }
 }
@@ -443,11 +485,12 @@ fn scan_pages(
     reader: &Reader,
     extents: &[section::Extent],
     first_index: usize,
-    header: usize,
-    dictionary: usize,
-    code_bytes: usize,
+    layout: ScanLayout,
     initial: Option<Vec<u8>>,
 ) -> Result<RunProjectionPart> {
+    let ScanLayout { header, dictionary, code_bytes, rle } = layout;
+    let page_bytes =
+        extents.first().ok_or_else(|| invalid("run projection has no page"))?.length as usize;
     let mut marks = vec![0_u32; dictionary];
     let mut counts = vec![0_u64; dictionary];
     let mut epoch = 0_u32;
@@ -455,13 +498,13 @@ fn scan_pages(
     let mut first = None;
     let mut last = None;
     let reused_first = initial.is_some();
-    let mut bytes = initial.unwrap_or_else(|| Vec::with_capacity(PAGE_BYTES));
+    let mut bytes = initial.unwrap_or_else(|| Vec::with_capacity(page_bytes));
     for (relative, extent) in extents.iter().enumerate() {
         if !reused_first || relative != 0 {
             reader.extent_into(extent, &mut bytes)?;
         }
         let prefix = if first_index + relative == 0 { header } else { 0 };
-        if bytes.len() != PAGE_BYTES || prefix + PAGE_HEADER > PAGE_BYTES {
+        if bytes.len() != page_bytes || prefix + PAGE_HEADER > page_bytes {
             return Err(invalid("run projection page length differs"));
         }
         let used = u32::from_le_bytes(bytes[prefix..prefix + 4].try_into().unwrap()) as usize;
@@ -472,7 +515,7 @@ fn scan_pages(
         let mut at = prefix + PAGE_HEADER;
         let end = at
             .checked_add(used)
-            .filter(|&end| end <= PAGE_BYTES)
+            .filter(|&end| end <= page_bytes)
             .ok_or_else(|| invalid("run projection page data exceeds its extent"))?;
         let mut page_rows = 0_u64;
         let mut page_first = None;
@@ -484,7 +527,22 @@ fn scan_pages(
             let user = i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
             let length = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
             at += RUN_HEADER;
-            if length == 0 || length > (end - at) / code_bytes {
+            let mode = if rle {
+                if at == end {
+                    return Err(invalid("run projection run is missing its mode"));
+                }
+                let mode = bytes[at];
+                at += 1;
+                mode
+            } else {
+                0
+            };
+            let payload_bytes = match mode {
+                0 => length * code_bytes,
+                1 => code_bytes,
+                _ => return Err(invalid("run projection run has an unknown mode")),
+            };
+            if length == 0 || payload_bytes > end - at {
                 return Err(invalid("run projection run length exceeds its page"));
             }
             if last.is_some_and(|previous| user <= previous) {
@@ -494,7 +552,17 @@ fn scan_pages(
             page_first.get_or_insert(user);
             page_last = Some(user);
             last = Some(user);
-            if code_bytes == 1 {
+            if mode == 1 {
+                let code = if code_bytes == 1 {
+                    usize::from(bytes[at])
+                } else {
+                    u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize
+                };
+                let count = counts
+                    .get_mut(code)
+                    .ok_or_else(|| invalid("run projection code is outside its dictionary"))?;
+                *count += 1;
+            } else if code_bytes == 1 {
                 epoch = epoch.wrapping_add(1);
                 if epoch == 0 {
                     marks.fill(0);
@@ -546,7 +614,7 @@ fn scan_pages(
                     }
                 }
             }
-            at += length * code_bytes;
+            at += payload_bytes;
             page_rows += length as u64;
         }
         if page_rows != stored_rows
@@ -571,7 +639,7 @@ mod tests {
 
     use crate::{Catalog, Writer};
 
-    use super::build_run_projection;
+    use super::{RLE_PAGES, build_run_projection};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -601,9 +669,71 @@ mod tests {
         writer.finish().expect("commit native file");
         build_run_projection(&path, "events", "user", "region").expect("build run projection");
         let reader = Catalog::open(&path).expect("catalog").table("events").expect("table");
+        assert!(reader.table().sections().iter().any(|section| {
+            section.kind == *crate::section::RUN_PROJECTION && section.flags == RLE_PAGES
+        }));
         assert_eq!(
             reader.grouped_distinct_run_projection(0, 1, 10).expect("valid projection"),
             Some(vec![(1, 4), (2, 3), (7, 1)]),
+        );
+        let scan = reader.run_projection_scan(0, 1).expect("open projection").expect("projection");
+        let mut reconstructed = Vec::new();
+        for (page, extent) in scan.extents.iter().enumerate() {
+            let bytes = reader.extent(extent).expect("read verified page");
+            let prefix = if page == 0 { scan.header } else { 0 };
+            let used = u32::from_le_bytes(bytes[prefix..prefix + 4].try_into().unwrap()) as usize;
+            let mut cursor = prefix + super::PAGE_HEADER;
+            let end = cursor + used;
+            while cursor < end {
+                let user = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                let length =
+                    u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+                cursor += super::RUN_HEADER;
+                let mode = if scan.rle {
+                    let mode = bytes[cursor];
+                    cursor += 1;
+                    mode
+                } else {
+                    0
+                };
+                let codes = if mode == 1 { 1 } else { length };
+                let mut covered = Vec::with_capacity(codes);
+                for _ in 0..codes {
+                    let code = if scan.code_bytes == 1 {
+                        let code = usize::from(bytes[cursor]);
+                        cursor += 1;
+                        code
+                    } else {
+                        let code = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap())
+                            as usize;
+                        cursor += 2;
+                        code
+                    };
+                    covered.push(scan.dictionary[code]);
+                }
+                if mode == 1 {
+                    reconstructed.extend(std::iter::repeat_n((user, covered[0]), length));
+                } else {
+                    reconstructed.extend(covered.into_iter().map(|value| (user, value)));
+                }
+            }
+        }
+        reconstructed.sort_unstable();
+        assert_eq!(
+            reconstructed,
+            vec![
+                (1, 2),
+                (2, 1),
+                (2, 2),
+                (2, 2),
+                (5, 1),
+                (5, 2),
+                (8, 1),
+                (8, 1),
+                (9, 1),
+                (9, 7),
+                (9, 7),
+            ]
         );
         std::fs::remove_file(path).expect("remove scratch file");
     }
@@ -672,6 +802,39 @@ mod tests {
         assert_eq!(
             scan.finish([left, right], usize::MAX).expect("merge pages"),
             vec![(1, 75_000), (2, 75_000)]
+        );
+        std::fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
+    fn long_order_runs_keep_the_legacy_page_width() {
+        let at = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("rudb-run-projection-long-{}-{at}.rdb", std::process::id()));
+        let fields = vec![
+            Field::required("user", LogicalType::BigInt),
+            Field::required("region", LogicalType::Integer),
+        ];
+        let users = vec![Value::BigInt(7); 1000];
+        let regions = vec![Value::Integer(1); 1000];
+        let chunk = Chunk::new(vec![
+            Vector::from_values(LogicalType::BigInt, &users).expect("users"),
+            Vector::from_values(LogicalType::Integer, &regions).expect("regions"),
+        ])
+        .expect("matching columns");
+        let mut writer = Writer::create(&path, "events", fields).expect("create native file");
+        for _ in 0..150 {
+            writer.append(&chunk).expect("append rows");
+        }
+        writer.finish().expect("commit native file");
+        build_run_projection(&path, "events", "user", "region").expect("build run projection");
+        let reader = Catalog::open(&path).expect("catalog").table("events").expect("table");
+        assert!(reader.table().sections().iter().any(|section| {
+            section.kind == *crate::section::RUN_PROJECTION && section.flags == 0
+        }));
+        assert_eq!(
+            reader.grouped_distinct_run_projection(0, 1, 10).expect("valid projection"),
+            Some(vec![(1, 1)])
         );
         std::fs::remove_file(path).expect("remove scratch file");
     }
