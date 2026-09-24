@@ -19,6 +19,7 @@ pub mod integer;
 mod lz;
 pub mod multi;
 mod reader;
+pub mod sequence;
 pub mod sketch;
 pub mod string;
 pub mod tally;

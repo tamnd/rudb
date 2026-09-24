@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rudb_catalog::Table;
 use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
 use rudb_csv::{Part, Reader as CsvReader, Split};
+use rudb_encoding::sequence::Sequence;
 use rudb_functions::{
     FILE_ROW_NUMBER, Given, TableFunction, csv_given, open_csv, open_parquet, series_length,
 };
@@ -556,6 +557,9 @@ struct Pushed {
     predicate: Prepared,
     /// A necessary single-column LIKE that can run before the other projected column is read.
     late: Option<Late>,
+    /// The whole predicate when it is a `LIKE` a compressed text page can answer without its
+    /// strings being read. See [`Scan::read_stored`].
+    stored: Option<Stored>,
     compaction: &'static dyn Compaction,
     passes: u32,
     /// Whether a chunk this keeps most of is marked rather than cut. See [`Pushdown::marks`].
@@ -629,6 +633,45 @@ impl Late {
         self.seen.fetch_add(rows, Ordering::Relaxed);
         self.kept.fetch_add(kept, Ordering::Relaxed);
     }
+}
+
+/// A filter that is one `LIKE '%a%b%'` on a string column, answered by the pages rather than by the
+/// strings.
+#[derive(Debug)]
+struct Stored {
+    /// The column, in the scan's numbering.
+    input: usize,
+    sequence: Sequence,
+    negated: bool,
+}
+
+/// The column, the pieces and whether it is a `NOT LIKE`, when `predicate` is a `LIKE` whose pattern
+/// is some pieces between `%` and nothing else.
+///
+/// Those are the patterns a string holds exactly when it holds the pieces in order, which is what a
+/// page can answer on its codes. A `_` is one character and not one byte, and a pattern anchored at
+/// either end asks where the pieces are and not only whether, so neither comes here.
+fn stored_like(plan: &Plan, schema: &Schema, predicate: ExprRef) -> Option<Stored> {
+    let Expr::Function { name, args } = *plan.expr(predicate) else { return None };
+    let negated = match plan.string(name) {
+        "~~" => false,
+        "!~~" => true,
+        _ => return None,
+    };
+    let [column, constant] = plan.expr_list(args) else { return None };
+    let Expr::Column(binding) = *plan.expr(*column) else { return None };
+    let Expr::Constant(value) = *plan.expr(*constant) else { return None };
+    let Value::Varchar(spelling) = plan.value(value) else { return None };
+    let inner = spelling.strip_prefix('%')?.strip_suffix('%')?;
+    if inner.contains('_') {
+        return None;
+    }
+    let input = schema.position_of(binding)?;
+    if schema.types().get(input) != Some(&LogicalType::Varchar) {
+        return None;
+    }
+    let pieces: Vec<&[u8]> = inner.split('%').map(str::as_bytes).collect();
+    Some(Stored { input, sequence: Sequence::new(&pieces)?, negated })
 }
 
 /// A LIKE conjunct followed by a simple comparison on another column.
@@ -720,9 +763,11 @@ impl Pushed {
         } else {
             None
         };
+        let stored = stored_like(plan, schema, pushdown.predicate);
         Ok(Self {
             predicate,
             late,
+            stored,
             compaction,
             passes: later_passes(plan, pushdown.node),
             marks: pushdown.marks,
@@ -1022,6 +1067,76 @@ impl<'a> Scan<'a> {
         }
         self.apply(at, out, mark)?;
         self.sift_hashed(out)
+    }
+
+    /// Reads a part whose filter is a `LIKE` only that filter reads, asking the column's pages which
+    /// rows pass rather than reading the strings.
+    ///
+    /// A compressed text page answers on its codes, see [`rudb_encoding::sequence`], and the column
+    /// comes back as nulls the way a column only the filter reads always does after narrowing. In
+    /// TPC-H q13 the orders scan decompressed every comment, laid it out and checked it was text to
+    /// search it for two words and then threw it away. A part the pages cannot answer, a join that
+    /// reads the column, or a reduction that names rows by where they were read, goes the usual way.
+    fn read_stored(&self, at: usize, out: &mut Chunk) -> Result<bool> {
+        let Some(pushed) = &self.pushed else { return Ok(false) };
+        let Some(stored) = &pushed.stored else { return Ok(false) };
+        if !self.unread.contains(&stored.input) || self.reduced(at).is_some() {
+            return Ok(false);
+        }
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        for sideways in joins {
+            let domain = sideways.domain(self.index).map(|(key, _)| key);
+            let sifting = sideways.sifting(self.index).map(|(key, _)| key);
+            if domain == Some(stored.input) || sifting == Some(stored.input) {
+                return Ok(false);
+            }
+        }
+        let Some(column) = self.columns[stored.input] else { return Ok(false) };
+        let rows = self.table.rows();
+        let Some(kept) = rows.rows_holding(at, column, &stored.sequence, stored.negated)? else {
+            return Ok(false);
+        };
+        let len = rows.chunk_len(at)?;
+        let others: Vec<usize> = (0..self.columns.len())
+            .filter(|&place| place != stored.input)
+            .filter_map(|place| self.columns[place])
+            .collect();
+        let read = if others.is_empty() { None } else { Some(rows.read(at, &others)?) };
+        let types = self.schema.types();
+        let mut held = Vec::with_capacity(self.columns.len());
+        let mut real = 0;
+        for (place, column) in self.columns.iter().enumerate() {
+            if place == stored.input {
+                held.push(Vector::constant(types[place].clone(), Value::Null, len));
+            } else if column.is_some() {
+                let read =
+                    read.as_ref().ok_or_else(|| Error::internal("a read column is missing"))?;
+                held.push(read.column(real)?.clone());
+                real += 1;
+            } else {
+                held.push(Vector::sequence(self.offsets[at], 1, len));
+            }
+        }
+        *out = Chunk::with_rows(held, len)?;
+        self.passed.saw(len, kept.len());
+        if kept.len() != len {
+            let kept = Selection::from_indices(kept);
+            let alone = self.sideways.is_none() && self.also.is_empty();
+            if alone && pushed.marks && marking_pays(kept.len(), len) {
+                let whole = std::mem::replace(out, Chunk::empty(&[]));
+                *out = whole.marked(kept);
+            } else {
+                let slot = reader();
+                let mut working = pushed.take(slot);
+                narrow(pushed.compaction, out, &kept, &mut working.gauge)?;
+                pushed.give(slot, working);
+            }
+        }
+        self.sift_exact(out)?;
+        if !out.is_empty() {
+            self.sift_hashed(out)?;
+        }
+        Ok(true)
     }
 
     /// Reads the first LIKE column before the other projected column when it can reject most rows.
@@ -1634,7 +1749,7 @@ impl Source for Scan<'_> {
         if let Some(counters) = &self.counters {
             counters.part_read();
         }
-        if self.read_late(at, out)? || self.read_deferring(at, out)? {
+        if self.read_stored(at, out)? || self.read_late(at, out)? || self.read_deferring(at, out)? {
             return Ok(more(morsel));
         }
         let projected: Vec<usize> = self.columns.iter().flatten().copied().collect();

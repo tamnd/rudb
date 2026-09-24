@@ -237,6 +237,17 @@ impl SymbolTable {
         self.symbols.is_empty()
     }
 
+    /// The bytes code `code` stands for, in the low end of eight, and how many of them there are.
+    ///
+    /// For a reader that walks codes rather than decompressing them, which needs to know what each
+    /// code spells once per table rather than once per string. `None` for a code past the table,
+    /// [`ESCAPE`] included.
+    #[must_use]
+    pub fn symbol(&self, code: u8) -> Option<([u8; MAX_SYMBOL_LEN], usize)> {
+        let symbol = self.symbols.get(code as usize)?;
+        Some((symbol.value.to_le_bytes(), symbol.len()))
+    }
+
     /// How many bytes [`serialize`](Self::serialize) writes. At most 2049 for a full table, and
     /// that is the number section 6.4 is weighing when it says a shared symbol table is cheaper
     /// than a shared dictionary.
