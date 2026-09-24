@@ -46,6 +46,8 @@ mod transitive;
 pub mod unnest;
 mod walk;
 
+pub use walk::volatile;
+
 use rudb_common::rules::Rule;
 use rudb_common::{Error, Result};
 use rudb_plan::{JoinKind, Node, NodeRef, Plan};

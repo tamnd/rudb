@@ -306,5 +306,5 @@ impl Measure {
 
 /// The rows in a chunk, as the counters want them.
 fn rows(chunk: &Chunk) -> u64 {
-    u64::try_from(chunk.len()).unwrap_or(u64::MAX)
+    u64::try_from(chunk.live()).unwrap_or(u64::MAX)
 }

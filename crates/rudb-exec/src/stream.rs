@@ -46,6 +46,8 @@ pub(crate) struct Filter {
     predicate: Prepared,
     compaction: &'static dyn Compaction,
     passes: u32,
+    /// Whether the aggregate this feeds reads a marked chunk. See [`Chunk::marked`].
+    marks: bool,
 }
 
 /// Everything one instance of a filter mutates, which is the predicate's scratch and the seam's.
@@ -60,6 +62,14 @@ impl Filter {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.predicate = self.predicate.in_session(session);
+        self
+    }
+
+    /// Marks the rows it keeps rather than cutting them, for a filter that feeds an aggregate that
+    /// reads a marked chunk.
+    #[must_use]
+    pub(crate) fn marking(mut self, marks: bool) -> Self {
+        self.marks = marks;
         self
     }
 
@@ -84,6 +94,7 @@ impl Filter {
             predicate: Prepared::one(plan, predicate, input)?,
             compaction,
             passes: later_passes(plan, node),
+            marks: false,
         })
     }
 }
@@ -98,7 +109,12 @@ impl Stream for Filter {
     fn push(&self, chunk: &mut Chunk, local: &mut Filtering) -> Result<Progress> {
         let kept = self.predicate.evaluate_filter(chunk, &mut local.scratch)?;
         if kept.len() != chunk.len() {
-            narrow(self.compaction, chunk, &kept, &mut local.gauge)?;
+            if self.marks && marking_pays(kept.len(), chunk.len()) {
+                let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+                *chunk = whole.marked(kept);
+            } else {
+                narrow(self.compaction, chunk, &kept, &mut local.gauge)?;
+            }
         }
         Ok(Progress::More)
     }
@@ -110,6 +126,16 @@ impl Stream for Filter {
     fn weight(&self) -> usize {
         self.predicate.passes()
     }
+}
+
+/// Whether a filter that feeds an aggregate should mark the rows it kept rather than cut them out.
+///
+/// Marking saves the copy of every column and costs the aggregate a pass over the dropped rows,
+/// which it counts into no group. On q01 a row the aggregate reads costs about what copying it
+/// costs, so marking wins while the filter keeps most rows and loses when it drops most. Three
+/// quarters is the line, which leaves the dropped rows at most a third of the kept ones.
+pub(crate) fn marking_pays(kept: usize, rows: usize) -> bool {
+    kept.saturating_mul(4) >= rows.saturating_mul(3)
 }
 
 /// How many more times the rows a filter keeps will be read, counted from the plan above it.

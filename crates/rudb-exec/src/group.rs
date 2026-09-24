@@ -21,6 +21,7 @@
 //! is built to be asked about. It is asked about once per row, so it matters, and it is not this
 //! change because a set per group is a different shape from a table over the whole input.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
@@ -35,7 +36,7 @@ use rudb_kernels::{
 };
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
-use rudb_vector::{Chunk, Data, Form, VECTOR_SIZE, Validity, Vector};
+use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Validity, Vector};
 
 use crate::buffer::Buffered;
 use crate::group_count;
@@ -1103,30 +1104,31 @@ impl<'a> Aggregate<'a> {
         folded: &mut u64,
     ) -> Result<()> {
         *folded += rows.rows as u64;
-        if let Some(table) = single {
-            if let Some(error) = table.failure.take() {
-                return Err(error);
+        let Some(table) = single else {
+            let rows = rows.settled()?;
+            if self.locally.load(Ordering::Relaxed) && self.still_local(*folded, spreading, own)? {
+                return self.spread_own(&*rows, spreading, own);
             }
-            if let Some(limit) = self.max_groups {
-                if !self.alone {
-                    self.agree(rows, limit, table, installed)?;
-                }
-            }
-            let timing = stage::Timing::start(Stage::Fold);
-            let done = self.fold(rows, table, None, None);
-            timing.stop(0);
-            done?;
-            if !self.ought_to_partition(table) {
-                return Ok(());
-            }
-            let handing = single.take().expect("the table was there a moment ago");
-            self.begin_partitioning(spreading, own)?;
-            return self.hand(handing, spreading, own);
+            return self.spread(&*rows, spreading);
+        };
+        if let Some(error) = table.failure.take() {
+            return Err(error);
         }
-        if self.locally.load(Ordering::Relaxed) && self.still_local(*folded, spreading, own)? {
-            return self.spread_own(rows, spreading, own);
+        if let Some(limit) = self.max_groups {
+            if !self.alone {
+                self.agree(rows, limit, table, installed)?;
+            }
         }
-        self.spread(rows, spreading)
+        let timing = stage::Timing::start(Stage::Fold);
+        let done = self.fold(rows, table, None, None);
+        timing.stop(0);
+        done?;
+        if !self.ought_to_partition(table) {
+            return Ok(());
+        }
+        let handing = single.take().expect("the table was there a moment ago");
+        self.begin_partitioning(spreading, own)?;
+        self.hand(handing, spreading, own)
     }
 
     /// The table closed groups go into, which is never probed, so it takes no room in advance.
@@ -1191,11 +1193,60 @@ impl<'a> Aggregate<'a> {
     /// The same shape a spill file is read back into, which is what lets one row loop serve a chunk
     /// that was pushed and a chunk that was written out and read again.
     fn read(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<Rows> {
-        let rows = chunk.len();
         let mut evaluated = Vec::new();
-        self.inputs.evaluate(chunk, scratch, &mut evaluated)?;
+        let Some(kept) = chunk.kept() else {
+            self.inputs.evaluate(chunk, scratch, &mut evaluated)?;
+            return self.rows_of(evaluated, chunk.len(), None);
+        };
+        // A marked chunk has every row still in its columns, and the arguments are read over all
+        // of them. One that raises there may be raising at a row the filter dropped, so the chunk
+        // is cut to the kept rows and read again, which raises exactly where a cut chunk would.
+        if self.reads_marked() && self.inputs.evaluate(chunk, scratch, &mut evaluated).is_ok() {
+            return self.rows_of(evaluated, chunk.len(), Some(kept));
+        }
+        self.read(&chunk.clone().settled()?, scratch)
+    }
+
+    /// Whether this aggregate can take a marked chunk, reading its arguments over every row and
+    /// counting the rows the filter dropped into no group. See [`Chunk::marked`].
+    ///
+    /// Only the fold into an instance's own table does that, so every aggregate that goes some other
+    /// way, which is a top count exchange, closed groups, a group limit, a `DISTINCT` call and the
+    /// shapes read a column at a time, has the chunk cut first the way a filter always cut it.
+    fn reads_marked(&self) -> bool {
+        !self.alone
+            && !self.sets
+            && !self.compact_numeric
+            && !self.distinct_count
+            && !self.mixed_numeric_distinct
+            && !self.radix_distinct_count
+            && !(self.count_only && self.keys.len() == 1)
+            && self.top_counts.is_none()
+            && self.max_groups.is_none()
+            && !self.closes()
+            && !self.by_vector.iter().any(|&yes| yes)
+            && self.calls.iter().all(|call| !call.distinct && call.affine.is_none())
+    }
+
+    /// The keys, arguments and filters out of what the expressions evaluated to over `rows` rows.
+    ///
+    /// For a marked chunk the keys are cut to the kept rows here, so that a row the filter dropped
+    /// never opens a group, and the arguments and filters stay whole.
+    fn rows_of(
+        &self,
+        evaluated: Vec<Vector>,
+        rows: usize,
+        kept: Option<&Selection>,
+    ) -> Result<Rows> {
         let mut values = evaluated.into_iter();
         let mut keys: Vec<Vector> = values.by_ref().take(self.keys.len()).collect();
+        let (rows, marked) = match kept {
+            Some(kept) => {
+                keys = Chunk::with_rows(keys, rows)?.select(kept)?.into_columns();
+                (kept.len(), Some((kept.clone(), rows)))
+            }
+            None => (rows, None),
+        };
         // An integer key a filter left as a dictionary over its page, or one still packed, is
         // opened into a flat run once for the chunk when there is more than one key. Every row is
         // hashed and then compared against a stored group once per probe step, and both read the
@@ -1226,7 +1277,7 @@ impl<'a> Aggregate<'a> {
             filters
                 .push(call.filter.map(|_| values.next().expect("a prepared filter has a value")));
         }
-        Ok(Rows { keys, arguments, filters, rows })
+        Ok(Rows { keys, arguments, filters, rows, marked })
     }
 
     /// Whether the fixed width radix exchange can own this aggregate.
@@ -1826,7 +1877,19 @@ impl<'a> Aggregate<'a> {
         } = local;
         let calls = self.calls.len();
         let alone = self.alone;
-        let Rows { keys, arguments, filters, rows: length } = seen_rows;
+        // Marked rows go through the probe below as they are, and the rest of this is left to the
+        // cut rows it was written for: a spill file writes a row's arguments beside its keys, and a
+        // partition's rows and a closed run come here already cut.
+        let settled;
+        let seen_rows = if seen_rows.marked.is_some()
+            && (over.is_some() || prehashed.is_some() || closed.is_some() || alone)
+        {
+            settled = seen_rows.settled()?;
+            &*settled
+        } else {
+            seen_rows
+        };
+        let Rows { keys, arguments, filters, rows: length, marked } = seen_rows;
         let mut aside = 0;
         for at in 0..calls {
             if self.calls[at].affine.is_some() {
@@ -2140,6 +2203,19 @@ impl<'a> Aggregate<'a> {
                 }
             }
         }
+        // The slots so far are one per kept row, and the arguments of a marked chunk are every row,
+        // so each slot moves to the row it was kept from and a dropped row lands in no group. Any
+        // runs found above were runs of kept rows, so they are found again over the moved slots.
+        let whole;
+        let length = match marked {
+            Some((picks, all)) => {
+                spread_slots(slots, picks.indices(), *all);
+                runs_found = false;
+                whole = *all;
+                &whole
+            }
+            None => length,
+        };
         if self.compact_numeric {
             let sum = arguments[1].first().expect("SUM has one argument");
             let mean = arguments[2].first().expect("AVG has one argument");
@@ -3568,14 +3644,54 @@ impl<'a> Aggregate<'a> {
 ///
 /// The same shape whether the rows came from the operator below or from a spill file, which is what
 /// lets one loop serve both.
+/// Moves the slot of each kept row to the row it was kept from, `all` rows long, and puts every
+/// row the filter dropped in no group.
+///
+/// Backwards and in place. The kept rows ascend and each is at least its own place in the list, so
+/// a slot is always read before anything is written over it.
+fn spread_slots(slots: &mut Vec<usize>, kept: &[u32], all: usize) {
+    slots.resize(all, NOWHERE);
+    for (place, &row) in kept.iter().enumerate().rev() {
+        let slot = std::mem::replace(&mut slots[place], NOWHERE);
+        slots[row as usize] = slot;
+    }
+}
+
+#[derive(Clone)]
 struct Rows {
     keys: Vec<Vector>,
     arguments: Vec<Vec<Vector>>,
     filters: Vec<Option<Vector>>,
     rows: usize,
+    /// For a marked chunk, the rows of the arguments and filters the keys stand for and how many
+    /// rows the arguments and filters have. The keys are `rows` long either way. See
+    /// [`Aggregate::reads_marked`].
+    marked: Option<(Selection, usize)>,
 }
 
 impl Rows {
+    /// The same rows with the arguments and filters cut to the kept rows, the way they would have
+    /// come had the filter cut the chunk. Rows that were not marked are handed back as they are.
+    fn settled(&self) -> Result<Cow<'_, Self>> {
+        let Some((kept, _)) = &self.marked else { return Ok(Cow::Borrowed(self)) };
+        let cut = |vector: &Vector| vector.gather(kept.indices());
+        Ok(Cow::Owned(Self {
+            keys: self.keys.clone(),
+            arguments: self
+                .arguments
+                .iter()
+                .map(|call| call.iter().map(cut).collect::<Result<_>>())
+                .collect::<Result<_>>()?,
+            filters: self
+                .filters
+                .iter()
+                .map(|filter| filter.as_ref().map(cut).transpose())
+                .collect::<Result<_>>()?,
+            rows: self.rows,
+            marked: None,
+        }))
+    }
+
     /// The rows from `at` for `len`, every column cut the same way.
     fn slice(&self, at: usize, len: usize) -> Result<Self> {
         let cut = |vector: &Vector| vector.slice(at, len);
@@ -3592,6 +3708,7 @@ impl Rows {
                 .map(|filter| filter.as_ref().map(cut).transpose())
                 .collect::<Result<_>>()?,
             rows: len,
+            marked: None,
         })
     }
 
@@ -3620,6 +3737,7 @@ impl Rows {
                 .map(|filter| filter.as_ref().map(|column| column.gather(rows)).transpose())
                 .collect::<Result<_>>()?,
             rows: rows.len(),
+            marked: None,
         })
     }
 }
@@ -4154,7 +4272,7 @@ impl<'s> Spilled<'s> {
         for call in &pass.calls {
             filters.push(if call.filter.is_some() { taking.next() } else { None });
         }
-        Ok(Some(Rows { keys, arguments, filters, rows }))
+        Ok(Some(Rows { keys, arguments, filters, rows, marked: None }))
     }
 }
 

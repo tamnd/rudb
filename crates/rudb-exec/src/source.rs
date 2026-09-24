@@ -35,7 +35,7 @@ use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
 use crate::schema::Schema;
 use crate::sideways::Sideways;
-use crate::stream::later_passes;
+use crate::stream::{later_passes, marking_pays};
 use crate::table::{Across, hash};
 
 /// One morsel per position, handed to whoever asks first.
@@ -466,6 +466,9 @@ pub(crate) struct Pushdown {
     pub(crate) tests: Vec<(usize, Op, Bound)>,
     /// Whether those tests are the whole predicate, which is what makes the zone shortcut sound.
     pub(crate) whole: bool,
+    /// Whether the scan feeds an aggregate that reads a marked chunk, so that a chunk the filter
+    /// keeps nearly all of is marked rather than cut. See [`Chunk::marked`].
+    pub(crate) marks: bool,
 }
 
 /// Everything the builder hands a scan that narrows what it reads.
@@ -553,6 +556,8 @@ struct Pushed {
     late: Option<Late>,
     compaction: &'static dyn Compaction,
     passes: u32,
+    /// Whether a chunk this keeps most of is marked rather than cut. See [`Pushdown::marks`].
+    marks: bool,
     /// The same conjuncts as probes, or `None` when they are not the whole predicate or one of them
     /// could not be moved onto the table's numbering.
     ///
@@ -698,6 +703,7 @@ impl Pushed {
             late,
             compaction,
             passes: later_passes(plan, pushdown.node),
+            marks: pushdown.marks,
             probes: (whole && probes.len() == wanted).then_some(probes),
             spare: (0..SLOTS).map(|_| Mutex::new(None)).collect(),
         })
@@ -849,7 +855,7 @@ impl<'a> Scan<'a> {
     /// # Errors
     ///
     /// Whatever evaluating the predicate or narrowing the chunk reports.
-    fn apply(&self, at: usize, chunk: &mut Chunk) -> Result<()> {
+    fn apply(&self, at: usize, chunk: &mut Chunk, mark: bool) -> Result<()> {
         let reduced = self.reduced(at).filter(|(rows, _)| !rows.is_full());
         let Some(pushed) = self.pushed.as_ref() else { return reduce(reduced, chunk) };
         let whole =
@@ -876,8 +882,17 @@ impl<'a> Scan<'a> {
                 .collect();
             kept = Selection::from_indices(held);
         }
+        // Marked rather than cut only where nothing after this reads the chunk before the aggregate
+        // does. A join's filter below narrows the chunk again, and a reduction has already moved
+        // the rows, so either one gets the chunk cut as before.
+        let alone = reduced.is_none() && self.sideways.is_none() && self.also.is_empty();
         if kept.len() != chunk.len() {
-            self.narrow_read_columns(pushed.compaction, chunk, &kept, &mut working.gauge)?;
+            if mark && alone && pushed.marks && marking_pays(kept.len(), chunk.len()) {
+                let whole = std::mem::replace(chunk, Chunk::empty(&[]));
+                *chunk = whole.marked(kept);
+            } else {
+                self.narrow_read_columns(pushed.compaction, chunk, &kept, &mut working.gauge)?;
+            }
         }
         pushed.give(slot, working);
         Ok(())
@@ -958,10 +973,14 @@ impl<'a> Scan<'a> {
     ///
     /// The graph reduction inside [`Self::apply`] names rows by their place in the part, so a part it
     /// narrows keeps the old order, which lets the reduction see the rows where they were read.
-    fn narrow_read(&self, at: usize, out: &mut Chunk) -> Result<()> {
+    ///
+    /// `mark` is whether the caller hands the chunk straight on, which is what lets the pushed
+    /// filter mark the rows it keeps rather than cut them. A caller that reads the rows afterwards
+    /// passes false.
+    fn narrow_read(&self, at: usize, out: &mut Chunk, mark: bool) -> Result<()> {
         let placed = self.reduced(at).is_some_and(|(rows, _)| !rows.is_full());
         if placed {
-            self.apply(at, out)?;
+            self.apply(at, out, false)?;
             return self.sift(out);
         }
         self.sift_exact(out)?;
@@ -973,9 +992,9 @@ impl<'a> Scan<'a> {
             if out.is_empty() {
                 return Ok(());
             }
-            return self.apply(at, out);
+            return self.apply(at, out, mark);
         }
-        self.apply(at, out)?;
+        self.apply(at, out, mark)?;
         self.sift_hashed(out)
     }
 
@@ -1025,7 +1044,7 @@ impl<'a> Scan<'a> {
         let second = fetched.column(0)?.clone();
         let columns = if late.input == 0 { vec![first, second] } else { vec![second, first] };
         *out = Chunk::with_rows(columns, selected.len())?;
-        self.apply(at, out)?;
+        self.apply(at, out, false)?;
         Ok(true)
     }
 
@@ -1083,7 +1102,7 @@ impl<'a> Scan<'a> {
         }
         held.push(Vector::sequence(0, 1, len));
         *out = Chunk::with_rows(held, len)?;
-        self.narrow_read(at, out)?;
+        self.narrow_read(at, out, false)?;
         let kept = out.len();
         self.deferring.saw(len, kept);
         let mut columns = std::mem::replace(out, Chunk::empty(&[])).into_columns();
@@ -1566,7 +1585,7 @@ impl Source for Scan<'_> {
         let read = self.table.rows().read(at, &projected)?;
         if self.columns.iter().all(Option::is_some) {
             *out = read;
-            self.narrow_read(at, out)?;
+            self.narrow_read(at, out, true)?;
             return Ok(more(morsel));
         }
         let mut held = Vec::with_capacity(self.columns.len());
@@ -1580,7 +1599,7 @@ impl Source for Scan<'_> {
             }
         }
         *out = Chunk::with_rows(held, read.len())?;
-        self.narrow_read(at, out)?;
+        self.narrow_read(at, out, true)?;
         Ok(more(morsel))
     }
 
@@ -3595,7 +3614,13 @@ mod tests {
             rudb_opt::bounds::into_scan(&plan, plan.root()).expect("a filter over a stored table");
         let pruning = rudb_opt::bounds::of(&plan, input, predicate);
         let pushdown =
-            Pushdown { node: plan.root(), predicate, tests: moved.tests, whole: moved.whole };
+            Pushdown {
+                node: plan.root(),
+                predicate,
+                tests: moved.tests,
+                whole: moved.whole,
+                marks: false,
+            };
         let filters = Filters { pruning, pushed: Some(pushdown), ..Filters::default() };
         let scan = Scan::new(
             &plan,
@@ -3644,7 +3669,13 @@ mod tests {
         let moved =
             rudb_opt::bounds::into_scan(&plan, plan.root()).expect("a filter over a stored table");
         let pushdown =
-            Pushdown { node: plan.root(), predicate, tests: moved.tests, whole: moved.whole };
+            Pushdown {
+                node: plan.root(),
+                predicate,
+                tests: moved.tests,
+                whole: moved.whole,
+                marks: false,
+            };
         let filters = Filters { pushed: Some(pushdown), ..Filters::default() };
         let scan = Scan::new(
             &plan,

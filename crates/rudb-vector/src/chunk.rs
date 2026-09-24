@@ -21,6 +21,9 @@ use crate::vector::{Form, VECTOR_SIZE, Vector};
 pub struct Chunk {
     columns: Vec<Vector>,
     rows: usize,
+    /// The rows a filter kept, when it marked them on the whole chunk rather than cutting them out.
+    /// See [`Chunk::marked`].
+    marked: Option<Selection>,
 }
 
 /// The scheduler's half of the data plane contract, imposed now rather than at layer eight.
@@ -70,7 +73,7 @@ impl Chunk {
                 )));
             }
         }
-        Ok(Self { columns, rows })
+        Ok(Self { columns, rows, marked: None })
     }
 
     /// A chunk of the given types with no rows in it.
@@ -82,7 +85,7 @@ impl Chunk {
     pub fn empty(types: &[LogicalType]) -> Self {
         let columns =
             types.iter().map(|ty| Vector::constant(ty.clone(), Value::Null, 0)).collect::<Vec<_>>();
-        Self { columns, rows: 0 }
+        Self { columns, rows: 0, marked: None }
     }
 
     /// The columns.
@@ -152,6 +155,46 @@ impl Chunk {
         Self {
             columns: self.columns.into_iter().map(Vector::into_pages).collect(),
             rows: self.rows,
+            marked: self.marked,
+        }
+    }
+
+    /// This chunk with the rows a filter kept marked on it, and every row still in its columns.
+    ///
+    /// Cutting the kept rows out of a chunk copies every column, and when a filter keeps nearly
+    /// all of them that copy is most of what the filter costs. In TPC-H q01 the date filter keeps
+    /// 98 percent of lineitem and the copy was a fifth of the query. An aggregate can read the
+    /// whole columns instead and count a dropped row into no group, so a filter that feeds one
+    /// directly marks the rows rather than cutting them. Only a consumer that asked for this is
+    /// handed a marked chunk, and [`Chunk::len`] is still the count of every row in the columns.
+    /// Anything that wants the kept rows alone calls [`Chunk::settled`].
+    #[must_use]
+    pub fn marked(mut self, kept: Selection) -> Self {
+        self.marked = Some(kept);
+        self
+    }
+
+    /// The rows a filter kept, when it marked them instead of cutting them out.
+    #[must_use]
+    pub fn kept(&self) -> Option<&Selection> {
+        self.marked.as_ref()
+    }
+
+    /// How many rows the chunk stands for, which is the kept rows of a marked chunk.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        self.marked.as_ref().map_or(self.rows, Selection::len)
+    }
+
+    /// The kept rows alone, cut out the way a filter that did not mark them would have cut them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Chunk::select`] raises.
+    pub fn settled(mut self) -> Result<Self> {
+        match self.marked.take() {
+            Some(kept) => self.select(&kept),
+            None => Ok(self),
         }
     }
 
@@ -212,6 +255,7 @@ impl Chunk {
     ///
     /// If the selection points past the end of the chunk.
     pub fn select(self, selection: &Selection) -> Result<Self> {
+        marked_twice(self.marked.as_ref())?;
         // See `below` for why this is not the largest position, and every filtered chunk comes
         // through here.
         if !crate::vector::below(selection.indices(), self.rows) {
@@ -273,6 +317,7 @@ impl Chunk {
     /// If the selection points past the end of the chunk, or if a column has a type there is no
     /// vector for, which today means `ARRAY` and `UNION`.
     pub fn compact(self, selection: &Selection) -> Result<Self> {
+        marked_twice(self.marked.as_ref())?;
         if let Some(bad) = selection.iter().find(|&index| index >= self.rows) {
             return Err(Error::internal(format!(
                 "a selection keeps row {bad} of a chunk that has {} rows",
@@ -363,6 +408,15 @@ impl Chunk {
             columns.push(column.into_flat()?);
         }
         Self::with_rows(columns, rows)
+    }
+}
+
+/// A selection over a chunk that is marked already would pick rows of the whole columns rather than
+/// of the kept ones, so it is refused rather than answered wrong. See [`Chunk::settled`].
+fn marked_twice(marked: Option<&Selection>) -> Result<()> {
+    match marked {
+        Some(_) => Err(Error::internal("a marked chunk was cut before it was settled".to_string())),
+        None => Ok(()),
     }
 }
 
