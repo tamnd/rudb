@@ -159,8 +159,8 @@ pub(crate) fn take(chunk: &Chunk, local: &mut Gathering) -> Result<()> {
 pub(crate) struct Keep<'a> {
     memory: Memory,
     chunks: Mutex<Vec<Chunk>>,
-    /// What the kept chunks are charged, until they are finished and the charge goes with them to
-    /// the [`Buffered`] that holds them from then on.
+    /// What the kept chunks are charged, held for as long as they are readable, which is as long as
+    /// the operator that depends on them is running.
     charged: Mutex<Vec<Reservation>>,
     out: Buffered,
     /// The runtime filter of the join this side is about to be looked up by, where the operator on
@@ -271,7 +271,6 @@ impl Sink for Keep<'_> {
         // Before the chunks are handed on, because handing them on is what lets the pipeline that
         // depends on this one start, and the scan in that pipeline reads the filter as it starts.
         self.fill(&chunks)?;
-        self.out.charge(std::mem::take(&mut *self.charged.lock().map_err(poisoned)?))?;
         self.out.fill(chunks)
     }
 }
@@ -372,27 +371,6 @@ mod tests {
         assert_eq!(out.len().expect("readable"), 2);
         assert_eq!(out.at(0).expect("readable").expect("the first").len(), 2);
         assert_eq!(out.at(1).expect("readable").expect("the second").len(), 1);
-    }
-
-    /// What a keep charged stays charged after it finishes, for as long as the chunks can be read,
-    /// and goes with them when the one reader that turns them into something else takes them.
-    #[test]
-    fn the_charge_for_kept_chunks_goes_with_them() {
-        let memory = Memory::unlimited();
-        let (keep, out) = Keep::new(&memory);
-
-        let mut local = keep.local();
-        keep.sink(&chunk(&[1, 2, 3]), &mut local).expect("three rows");
-        keep.combine(local).expect("the one instance");
-        keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
-        assert!(memory.used() > 0, "the chunks are still charged once they are finished");
-
-        let (chunks, charged) = out.take().expect("readable");
-        assert_eq!(chunks.len(), 1);
-        assert!(memory.used() > 0, "and until the caller lets them go");
-        drop((chunks, charged));
-        assert_eq!(memory.used(), 0);
-        assert_eq!(out.len().expect("readable"), 0, "nothing is left for another handle");
     }
 
     /// The pipeline asks its sink whether it may run twice, and a keep answers with what the

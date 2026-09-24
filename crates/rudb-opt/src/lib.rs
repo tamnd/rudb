@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Twenty nine passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Twenty eight passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -43,7 +43,6 @@ pub mod shared;
 pub mod sides;
 pub mod tables;
 pub mod topn;
-pub mod total;
 mod transitive;
 pub mod unnest;
 mod walk;
@@ -156,13 +155,6 @@ pub const RANK: u8 = 11;
 /// nobody is going to run. It is also the only pass here that writes a field rather than moving a
 /// node, so nothing after it would have anything to do with what it wrote.
 ///
-/// Reading a total off held groups is right after the average rewrite and before filter pushdown.
-/// It compares two subtrees node by node, and the binder writes two copies of one query the same
-/// way, so it looks while they are still as written. After filter pushdown and join order the two
-/// would most likely still match, but that is a promise about two other passes being deterministic
-/// over two inputs with different indexes, and there is nothing to gain by relying on it. It goes
-/// after the average rewrite so that an average beside a sum has already become the sum it can read.
-///
 /// Dropping an unread materialisation is after the empty result pullup and before everything that
 /// moves an operator around. After, because the pullup is what turns a body into an empty relation
 /// and a body that has become one reads nothing, so a run that looked before it would find the work
@@ -190,13 +182,12 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 29] = [
+pub static PASSES: [&(dyn Pass + Sync); 28] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
     &fromkey::AnswersFromTheKey,
     &shared::CommonAggregate,
-    &total::TotalFromGroups,
     &filter::FilterPushdown,
     &delim::Deliminator,
     &order::JoinOrder,

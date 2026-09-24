@@ -63,7 +63,6 @@ struct Call {
     returns: LogicalType,
     affine: Option<(usize, i64)>,
     reads_total: Option<usize>,
-    repeats: Option<usize>,
 }
 
 impl Call {
@@ -71,27 +70,8 @@ impl Call {
     ///
     /// A call that does not fold has no argument evaluated for it, no accumulator updated for it and
     /// no run at a time finish taken for it, so this is asked at each of those places rather than
-    /// each of them asking about the three ways a call can be derived.
+    /// each of them asking about the two ways a call can be derived.
     fn folds(&self) -> bool {
-        self.affine.is_none() && self.reads_total.is_none() && self.repeats.is_none()
-    }
-
-    /// The call whose state this one finishes out of, which is itself when it folds its own.
-    ///
-    /// A repeated call is the same accumulator as the one it repeats, so it finishes the same way
-    /// off the same state and the only difference is which state it reads. The other two derived
-    /// shapes finish differently from their source and are asked about where they are finished.
-    fn state_of(&self, at: usize) -> usize {
-        self.repeats.unwrap_or(at)
-    }
-
-    /// Whether this call's answer is a state finished the ordinary way, off whichever state it reads.
-    ///
-    /// True of a call that folds its own and of one that repeats an earlier one, and false of the two
-    /// that finish differently from the state they read: an affine call adds an offset per row to the
-    /// total it finds, and a sum read off a mean pulls the exact total out of it. So this is what the
-    /// run at a time finish asks, where every other place asks [`Call::folds`].
-    fn finishes_plainly(&self) -> bool {
         self.affine.is_none() && self.reads_total.is_none()
     }
 }
@@ -184,65 +164,6 @@ fn mark_sums_from_means(plan: &Plan, calls: &mut [Call]) {
                 && calls[source].filter.is_none()
                 && calls[source].folds()
                 && calls[source].args == calls[at].args
-        });
-    }
-}
-
-/// Marks calls that are the same call as an earlier one in the same aggregate, so it folds once.
-///
-/// TPC-H q01 asks for `count(*)` and for the average of two columns it also sums. The common
-/// aggregate pass reads each of those averages off its sum, which leaves a count of the summed
-/// column behind for the division, and both columns are `NOT NULL`, so the null free pass turns both
-/// of those counts into `count(*)` as well. The plan reaches here asking for the same row count
-/// three times, and three counters were kept and three answers written where one counter and three
-/// reads of it do.
-///
-/// Every duplicate that gets here comes out of a rewrite rather than out of a query. A query that
-/// writes the same call twice is bound to one slot in the aggregate and two references to it from the
-/// projection above, so the two never reach this. What the rewrites do is add a call after that,
-/// which is the count each shared average needs, and turn a call into another one, which is
-/// `count(x)` over a column with no nulls becoming `count(*)`. So the plainest case is a query that
-/// averages a column and counts it: `SUM(x), AVG(x), COUNT(x)` arrives here as `sum(x), count(x),
-/// count(x)`.
-///
-/// Nothing above the operator sees any of it. The output still has one column per call in the order
-/// the plan asked for them, and the repeated column is the same finish taken off the earlier call's
-/// state.
-///
-/// The same call means the same name, the same argument expressions, the same `FILTER` and the same
-/// declared return type, so the two accumulators would be built the same way and fed the same rows.
-/// Arguments are compared by expression reference the way [`mark_sums_from_means`] compares them,
-/// which is the conservative half of the question: two references to one expression are the same
-/// expression, and two expressions that happen to be spelled the same are left alone.
-///
-/// A `DISTINCT` call is refused. Its state is a set of values rather than an accumulator and the
-/// operator has three separate shapes for reading distinct counts a column at a time, so sharing
-/// one would have to be true of all of them rather than of the finish.
-///
-/// This runs after the other two markers and not before them. `sum(x), sum(x), avg(x)` has both sums
-/// reading the mean's total, which is one fold for all three, and a pass that pointed the second sum
-/// at the first one first would have pointed it at a call that then stopped folding.
-fn mark_repeated_calls(calls: &mut [Call]) {
-    for at in 0..calls.len() {
-        if calls[at].distinct || !calls[at].folds() {
-            continue;
-        }
-        // A call another one is derived from still has to fold, because what that call reads is this
-        // one's accumulator rather than its answer.
-        let source_of_another = calls.iter().any(|call| {
-            call.affine.is_some_and(|(source, _)| source == at) || call.reads_total == Some(at)
-        });
-        if source_of_another {
-            continue;
-        }
-        calls[at].repeats = (0..at).find(|&source| {
-            let earlier = &calls[source];
-            earlier.folds()
-                && !earlier.distinct
-                && earlier.name == calls[at].name
-                && earlier.args == calls[at].args
-                && earlier.filter == calls[at].filter
-                && earlier.returns == calls[at].returns
         });
     }
 }
@@ -1210,7 +1131,6 @@ impl<'a> Aggregate<'a> {
                 returns: plan.expr_type(reference).clone(),
                 affine: None,
                 reads_total: None,
-                repeats: None,
             });
         }
         if groups.is_empty() {
@@ -1283,7 +1203,6 @@ impl<'a> Aggregate<'a> {
         // then be asked for it anyway.
         if !compact_numeric && !distinct_count && !mixed_numeric_distinct && !radix_distinct_count {
             mark_sums_from_means(plan, &mut calls);
-            mark_repeated_calls(&mut calls);
         }
         let mut inputs = keys.clone();
         for call in &calls {
@@ -1508,16 +1427,13 @@ impl<'a> Aggregate<'a> {
             || self.mixed_numeric_distinct
         {
             self.top_counts = Some((bound, 0));
-        } else if self.calls.get(call).is_some_and(|held| {
-            held.name == "count_star"
-                && held.args.is_empty()
-                && !held.distinct
-                && held.filter.is_none()
+        } else if self.calls.get(call).is_some_and(|call| {
+            call.name == "count_star"
+                && call.args.is_empty()
+                && !call.distinct
+                && call.filter.is_none()
         }) {
-            // The state kept rather than the call named, because a call that repeats an earlier one
-            // has an accumulator nobody folded into and the running count is read straight out of a
-            // state here. See [`mark_repeated_calls`].
-            self.top_counts = Some((bound, self.calls[call].state_of(call)));
+            self.top_counts = Some((bound, call));
         }
         self
     }
@@ -1525,15 +1441,13 @@ impl<'a> Aggregate<'a> {
     /// Drops groups below an inclusive COUNT(*) bound before result vectors are materialized.
     #[must_use]
     pub(crate) fn having_count(mut self, call: usize, minimum: i64) -> Self {
-        if self.calls.get(call).is_some_and(|held| {
-            held.name == "count_star"
-                && held.args.is_empty()
-                && !held.distinct
-                && held.filter.is_none()
+        if self.calls.get(call).is_some_and(|call| {
+            call.name == "count_star"
+                && call.args.is_empty()
+                && !call.distinct
+                && call.filter.is_none()
         }) {
-            // The state kept rather than the call named, for the reason [`Aggregate::top_counts`]
-            // gives above.
-            self.having_count = Some((self.calls[call].state_of(call), minimum));
+            self.having_count = Some((call, minimum));
         }
         self
     }
@@ -2961,14 +2875,10 @@ impl<'a> Aggregate<'a> {
                 // costs, at 0.479 G of the 3.248 G two added calls spend on TPC-H SF1.
                 //
                 // Everything it does not cover falls through unchanged, which is a `min` or a `max`,
-                // whose state owns a value away from itself, an affine call and a sum read off a
-                // mean, which finish differently from the state they read, and the two compact
-                // shapes, which have no accumulators. A call that repeats an earlier one finishes
-                // exactly the way that one does, so it comes through here and the only difference is
-                // the state it is pointed at.
-                let held = self.calls[at].state_of(at);
-                if !self.count_only && !self.compact_numeric && self.calls[at].finishes_plainly() {
-                    if let Some(vector) = finish_run(&states, picked, calls, held, ty)? {
+                // whose state owns a value away from itself, an affine call, which finishes from
+                // another call's state, and the two compact shapes, which have no accumulators.
+                if !self.count_only && !self.compact_numeric && self.calls[at].folds() {
+                    if let Some(vector) = finish_run(&states, picked, calls, at, ty)? {
                         columns.push(vector);
                         continue;
                     }
@@ -3008,9 +2918,7 @@ impl<'a> Aggregate<'a> {
                                 &states[slot * calls + source],
                                 &self.calls[at].returns,
                             ),
-                            // `held` is this call's own state, and the earlier call's where this one
-                            // repeats it.
-                            (None, None) => states[slot * calls + held].finish(),
+                            (None, None) => states[slot * calls + at].finish(),
                         }
                     }?;
                     taken += rows::owned(&value);
@@ -8508,7 +8416,6 @@ mod tests {
                 returns: LogicalType::BigInt,
                 affine: None,
                 reads_total: None,
-                repeats: None,
             },
             Call {
                 name: "sum".into(),
@@ -8518,7 +8425,6 @@ mod tests {
                 returns: LogicalType::HugeInt,
                 affine: None,
                 reads_total: None,
-                repeats: None,
             },
             Call {
                 name: "avg".into(),
@@ -8528,7 +8434,6 @@ mod tests {
                 returns: LogicalType::Double,
                 affine: None,
                 reads_total: None,
-                repeats: None,
             },
         ];
 
@@ -8594,7 +8499,6 @@ mod tests {
             returns,
             affine: None,
             reads_total: None,
-            repeats: None,
         };
         let calls = [
             call("count_star", LogicalType::BigInt),

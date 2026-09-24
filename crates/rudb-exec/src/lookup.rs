@@ -68,6 +68,14 @@ pub(crate) const NONE: u32 = u32::MAX;
 /// values they span, and every other key it joins on is dense.
 const PLACES: u64 = 4;
 
+/// How many places a key may span for each gathered row in the ranked form, at most.
+///
+/// The ranked form costs a bit a place and a four byte count every sixty four places, which is
+/// under a fifth of a byte a place, so at this many places a row it is about 48 bytes a gathered
+/// row, level with what the hash table costs. The order keys of a filtered TPC-H side are the case:
+/// q21's 157 thousand late lines hold order keys spread over six million values, 38 a line.
+const RANKED: u64 = 256;
+
 /// Below this many rows a side is built on one thread.
 ///
 /// Partitioning costs a pass over the hashes per partition and a table per partition, and on a side
@@ -114,6 +122,61 @@ pub(crate) struct Lookup {
     /// The smallest key, when the key is its own place in `head` and there are no partitions. See
     /// the module documentation.
     low: Option<i64>,
+    /// Which places hold a key, when the keys are too sparse to be their own places in `head`.
+    ///
+    /// A key's slot is then how many keys sit below it rather than its place. See [`Ranked`].
+    ranked: Option<Ranked>,
+}
+
+/// The places that hold a key, one bit each, and how many keys sit before each word of them.
+///
+/// The slot of the key at a place is its rank among the keys, which is the count before its word
+/// and a popcount of the bits below it in the word. That is a perfect hash with no stored key, no
+/// hash to take and no collision to walk, and it is what the direct form becomes once the keys are
+/// too sparse for a place each in `head`: `head` stays one entry a key, and the places cost a bit.
+#[derive(Debug, Default)]
+struct Ranked {
+    words: Vec<u64>,
+    before: Vec<u32>,
+    /// How many keys there are, which is the count before any place past the last.
+    keys: usize,
+}
+
+impl Ranked {
+    /// The bits for the keyed rows' places, and the counts beside them.
+    fn new(places: usize, rows: impl Iterator<Item = usize>) -> Self {
+        let mut words = vec![0u64; places.div_ceil(64)];
+        for place in rows {
+            words[place / 64] |= 1 << (place % 64);
+        }
+        let mut before = Vec::with_capacity(words.len());
+        let mut count = 0u32;
+        for word in &words {
+            before.push(count);
+            count += word.count_ones();
+        }
+        Self { words, before, keys: count as usize }
+    }
+
+    /// The slot of the key at `place`, or nothing when no key is there.
+    fn slot(&self, place: u64) -> Option<usize> {
+        let word = usize::try_from(place / 64).ok()?;
+        let bits = *self.words.get(word)?;
+        let below = bits & ((1u64 << (place % 64)) - 1);
+        (bits >> (place % 64) & 1 == 1)
+            .then(|| self.before[word] as usize + below.count_ones() as usize)
+    }
+
+    /// How many keys sit at places before `place`, which is a multiple of sixty four or past the
+    /// last place.
+    fn below(&self, place: usize) -> usize {
+        self.before.get(place / 64).map_or(self.keys, |&count| count as usize)
+    }
+
+    /// What this holds.
+    fn footprint(&self) -> usize {
+        self.words.capacity() * size_of::<u64>() + self.before.capacity() * size_of::<u32>()
+    }
 }
 
 impl Lookup {
@@ -211,7 +274,7 @@ impl Lookup {
             kept += held;
         }
         let distinct = head.len();
-        Ok(Self { parts, bits, head, next, kept, distinct, low: None })
+        Ok(Self { parts, bits, head, next, kept, distinct, low: None, ranked: None })
     }
 
     /// The direct form, when the key is one integer column compared with `=` and its keyed values
@@ -251,15 +314,29 @@ impl Lookup {
         let Ok(places) = u64::try_from(i128::from(high) - i128::from(low) + 1) else {
             return Ok(None);
         };
-        if places > (rows as u64).saturating_mul(PLACES) || places >= u64::from(NONE) {
+        if places > (rows as u64).saturating_mul(RANKED) || places >= u64::from(NONE) {
             return Ok(None);
         }
         cancel.check()?;
         let places = places as usize;
         let place_of = |row: usize| block[row].wrapping_sub(low) as usize;
+        let ranked = (places as u64 > (rows as u64).saturating_mul(PLACES))
+            .then(|| Ranked::new(places, (0..rows).filter(|&row| keyed[row]).map(place_of)));
+        // A place's slot, which is the place itself in the direct form and its rank in the other,
+        // and the first slot at a place, which a partition's share of `head` starts at.
+        let slot_of = |row: usize| match &ranked {
+            Some(ranked) => ranked.slot(place_of(row) as u64).unwrap_or(0),
+            None => place_of(row),
+        };
+        let first_at = |place: usize| match &ranked {
+            Some(ranked) => ranked.below(place),
+            None => place.min(places),
+        };
         let next: Vec<AtomicU32> = (0..rows).map(|_| AtomicU32::new(NONE)).collect();
         let count = 1usize << split_into(rows, threads.degree());
-        let run = places.div_ceil(count);
+        // A whole number of words, so that where a partition starts is a count the ranked form
+        // keeps rather than one it has to work out.
+        let run = places.div_ceil(count).next_multiple_of(64);
         let mut starts = vec![0; count + 1];
         for row in (0..rows).filter(|&row| keyed[row]) {
             starts[place_of(row) / run + 1] += 1;
@@ -275,13 +352,13 @@ impl Lookup {
             at[part] += 1;
         }
         let one = |part: usize| -> Result<(Vec<u32>, usize)> {
-            let base = part * run;
-            let len = run.min(places.saturating_sub(base));
+            let base = first_at(part * run);
+            let len = first_at((part + 1) * run) - base;
             let mut head = vec![NONE; len];
             let mut tail = vec![NONE; len];
             let mut distinct = 0;
             for &row in &dealt[starts[part]..starts[part + 1]] {
-                let place = place_of(row) - base;
+                let place = slot_of(row) - base;
                 let at = row as u32;
                 if tail[place] == NONE {
                     head[place] = at;
@@ -294,14 +371,23 @@ impl Lookup {
             Ok((head, distinct))
         };
         let filled = in_parallel(threads, count, threads.degree(), "join index partition", one)?;
-        let mut head = Vec::with_capacity(places);
+        let mut head = Vec::with_capacity(first_at(places));
         let mut distinct = 0;
         for (mine, held) in filled {
             head.extend(mine);
             distinct += held;
         }
         let kept = dealt.len();
-        Ok(Some(Self { parts: Vec::new(), bits: 0, head, next, kept, distinct, low: Some(low) }))
+        Ok(Some(Self {
+            parts: Vec::new(),
+            bits: 0,
+            head,
+            next,
+            kept,
+            distinct,
+            low: Some(low),
+            ranked,
+        }))
     }
 
     /// Whether there is anything at all to look up.
@@ -318,8 +404,9 @@ impl Lookup {
     pub(crate) fn footprint(&self) -> u64 {
         let tables: u64 =
             self.parts.iter().map(|part| part.table.footprint() + part.table.owned()).sum();
-        let chain =
-            self.head.capacity() * size_of::<u32>() + self.next.capacity() * size_of::<AtomicU32>();
+        let chain = self.head.capacity() * size_of::<u32>()
+            + self.next.capacity() * size_of::<AtomicU32>()
+            + self.ranked.as_ref().map_or(0, Ranked::footprint);
         tables + u64::try_from(chain).unwrap_or(u64::MAX)
     }
 
@@ -398,9 +485,15 @@ impl Lookup {
         let [key] = keys else { return };
         which_are_keyed(keys, rows, nulls, &mut scratch.keyed);
         let places = self.head.len() as u64;
+        let ranked = self.ranked.as_ref();
         let hit = |value: i64| {
             let place = value.wrapping_sub(low) as u64;
-            (place < places && self.head[place as usize] != NONE).then_some(place as usize)
+            match ranked {
+                Some(ranked) => ranked.slot(place),
+                None => {
+                    (place < places && self.head[place as usize] != NONE).then_some(place as usize)
+                }
+            }
         };
         if key.signed_block(&mut scratch.block) && scratch.block.len() >= rows {
             for (row, &value) in scratch.block[..rows].iter().enumerate() {
@@ -874,7 +967,7 @@ mod tests {
     /// spread far apart so that the side takes the table rather than the direct form.
     #[test]
     fn a_side_built_in_partitions_answers_the_same_as_one_built_whole() {
-        let spread = 1_000_003;
+        let spread = 100_000_007;
         let values: Vec<Option<i32>> =
             (0..SPLIT as i32 + 1_000).map(|row| Some(row % 7 * spread)).collect();
         let pool = Pool::new(4);
@@ -882,6 +975,44 @@ mod tests {
         assert!(lookup.low.is_none(), "keys this far apart take the table");
         assert!(lookup.parts.len() > 1, "a side this long is split");
         answers_in_order(&lookup, &values, spread);
+    }
+
+    /// The ranked form over enough rows to be split, with repeats, gaps and nulls, and keys far
+    /// enough apart that a place each would cost too much. Each partition owns a run of words, and
+    /// a key's rows still come out in the order the side holds them.
+    #[test]
+    fn a_ranked_side_built_in_partitions_answers_in_order() {
+        let spread = 1_000_003;
+        let values: Vec<Option<i32>> = (0..SPLIT as i32 + 1_000)
+            .map(|row| (row % 11 != 5).then_some(row % 13 % 9 * spread))
+            .filter(|value| *value != Some(4 * spread))
+            .collect();
+        let pool = Pool::new(4);
+        let lookup = built_by(&values, &[false], &pool.lease(4));
+        assert_eq!(lookup.low, Some(0));
+        assert!(lookup.ranked.is_some(), "keys this far apart are ranked");
+        assert_eq!(lookup.head.len(), 8, "one slot a key, not one a place");
+        answers_in_order(&lookup, &values, spread);
+        let found = found(&lookup, &[Some(1), Some(spread - 1), Some(-spread), Some(9 * spread)]);
+        assert!(found.iter().all(Vec::is_empty), "a key between keys or past the ends is a miss");
+    }
+
+    /// The ranked form over one row a key, with keys either side of a word's edge, so that a slot
+    /// is the count before its word plus the bits below it in the word.
+    #[test]
+    fn a_ranked_side_counts_the_keys_below_across_words() {
+        let keys = [0, 63, 64, 65, 127, 128, 1_000, 1_900];
+        let values: Vec<Option<i32>> = keys.iter().rev().map(|&key| Some(key + 7)).collect();
+        let lookup = built(&values);
+        assert!(lookup.ranked.is_some());
+        assert!(lookup.single());
+        for (at, &key) in keys.iter().rev().enumerate() {
+            let row = u32::try_from(at).expect("a short side");
+            assert_eq!(found(&lookup, &[Some(key + 7)]), [vec![row]], "key {key}");
+            let next = found(&lookup, &[Some(key + 8)]).concat();
+            assert_eq!(next.is_empty(), !keys.contains(&(key + 1)), "key {}", key + 1);
+        }
+        assert_eq!(found(&lookup, &[Some(6), Some(1_908)]), [vec![], vec![]]);
     }
 
     /// The direct form over enough rows to be split, with repeats, gaps and nulls. Each partition
