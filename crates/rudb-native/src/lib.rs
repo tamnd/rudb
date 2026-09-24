@@ -2948,7 +2948,11 @@ impl Writer {
                 let mut first = Candidates::default();
                 let mut distinct: Option<distinct::ExactDistinct> = None;
                 let mut run = Run::default();
+                let counted = counted && std::env::var_os("RUDB_DEBUG_NODISTINCT").is_none();
+                let nomg = std::env::var_os("RUDB_DEBUG_NOMG").is_some();
+                let mut sink = 0_u64;
                 self.visit_numeric(column, signed, |_, bits| {
+                    if nomg { sink = sink.wrapping_add(bits.unwrap_or(1)); return; }
                     if let Some((ended, times)) = run.push(bits) {
                         count_from_full(&first, &mut distinct, ended, counted);
                         first.add(ended, times);
@@ -2968,7 +2972,7 @@ impl Writer {
                     None => Some(first.held as u64),
                 };
                 let (nulls, decrements) = (first.nulls, first.decrements);
-                if std::env::var_os("RUDB_DEBUG_FREQ").is_some() { eprintln!("FIRST {column} held={} decrements={decrements} ms={:.1}", first.held, dbg_t0.elapsed().as_secs_f64()*1e3); }
+                if std::env::var_os("RUDB_DEBUG_FREQ").is_some() { eprintln!("FIRST {column} held={} decrements={decrements} sink={sink} ms={:.1}", first.held, dbg_t0.elapsed().as_secs_f64()*1e3); }
                 let (exact, null_count) = if decrements == 0 {
                     let exact = first
                         .pairs()
