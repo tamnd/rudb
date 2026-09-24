@@ -2849,15 +2849,24 @@ impl Vector {
                 );
                 true
             }
+            // Sixty four codes at a time through [`Packed::unpack`], with the blocks lined up on the
+            // words so that every one after the first is the constant width loop rather than a
+            // code at a time. A code at a time was about twenty instructions a row, and q21 reads
+            // two packed columns of lineitem through here for every line of the orders it keeps.
             Body::Packed { words, width, base, offset } => match i64::try_from(*base) {
                 Ok(base) => {
-                    out.extend((0..self.len).map(|index| {
-                        base.wrapping_add(code_at(
-                            words,
-                            (*offset + index) * *width as usize,
-                            *width,
-                        ) as i64)
-                    }));
+                    let packed =
+                        Packed { words, width: *width, base: i128::from(base), offset: *offset };
+                    let mut block = [0u64; 64];
+                    let mut from = 0;
+                    out.reserve(self.len);
+                    while from < self.len {
+                        let rows = (64 - (*offset + from) % 64).min(self.len - from);
+                        let codes = &mut block[..rows];
+                        packed.unpack(from, codes);
+                        out.extend(codes.iter().map(|&code| base.wrapping_add(code as i64)));
+                        from += rows;
+                    }
                     true
                 }
                 Err(_) => false,
@@ -6940,6 +6949,27 @@ mod tests {
             packed.iter().collect::<Vec<_>>(),
             vec![Value::SmallInt(8), Value::SmallInt(9), Value::SmallInt(10), Value::SmallInt(11)]
         );
+    }
+
+    /// A packed column read as a block, cut at rows that do and do not start a word, at widths
+    /// that do and do not straddle, answers what a row at a time answers.
+    #[test]
+    fn a_packed_block_reads_what_each_row_reads() {
+        let words: Vec<u64> =
+            (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        for width in [1, 7, 13, 32, 33, 50] {
+            let whole = Vector::packed(LogicalType::BigInt, words.clone(), width, -1_000, 300)
+                .expect("enough words for 300 codes");
+            for (at, len) in [(0, 300), (1, 299), (63, 130), (64, 64), (100, 5), (250, 50)] {
+                let cut = whole.slice(at, len).expect("a cut inside the column");
+                let mut block = Vec::new();
+                assert!(cut.signed_block(&mut block));
+                let want: Vec<i64> = (0..len)
+                    .map(|row| i64::try_from(cut.signed_at(row).expect("a row")).expect("fits"))
+                    .collect();
+                assert_eq!(block, want, "width {width} cut at {at} for {len}");
+            }
+        }
     }
 
     #[test]

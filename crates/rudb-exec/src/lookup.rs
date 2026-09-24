@@ -764,9 +764,11 @@ fn which_are_keyed(keys: &[Vector], rows: usize, nulls: &[bool], keyed: &mut Vec
 /// with every row marked present in the mask beside them, so asking the mask about one of those
 /// gets a confident no about a column that is full of nulls. [`Vector::is_null_at`] is the one that
 /// reads through, and this is only here to say when the pass that calls it can be skipped.
+/// [`Vector::none_null`] reads through too, a look at the values' mask rather than a call per row,
+/// and a join's key after a filter is a dictionary over a stored column that has no nulls at all.
 pub(crate) fn has_nulls(column: &Vector, rows: usize) -> bool {
     match column.form() {
-        Form::Dictionary | Form::Rle => true,
+        Form::Dictionary | Form::Rle => !column.none_null(),
         _ => column.validity().has_nulls(rows),
     }
 }
