@@ -3762,14 +3762,33 @@ impl Packed<'_> {
     /// block it falls in, keeps less in the cache and was tried. The question of which block a row
     /// is in, asked for every row, cost more than the misses it saved, 40.2 G instructions for ten
     /// runs of q1 against 34.1 G this way.
+    ///
+    /// Rows that turn out to be a run, which is every row of the vector in order and is what a
+    /// comparison over a whole chunk asks for, are unpacked straight into the answer. The span and
+    /// the answer are the same rows in the same order there, so the buffer, the zeroing of it and
+    /// the pass copying it out are all a copy of a thing onto itself. A filter over a packed `DATE`
+    /// column of six million rows spent 37 percent of the query in here and the compare it fed 4.8
+    /// percent, which is the shape of paying three passes for one. Whether the rows are a run is one
+    /// compare a row in the pass that was already reading them.
     pub fn codes_at<M: Fn(usize) -> usize>(&self, at: M, rows: usize) -> Vec<u64> {
-        let (mut low, mut high) = (usize::MAX, 0);
-        for index in 0..rows {
+        if rows == 0 {
+            return Vec::new();
+        }
+        let first = at(0);
+        let (mut low, mut high) = (first, first);
+        let mut ascends = true;
+        for index in 1..rows {
             let row = at(index);
             low = low.min(row);
             high = high.max(row);
+            ascends &= row == first + index;
         }
-        if rows == 0 || high - low >= rows.saturating_mul(4) {
+        if ascends {
+            let mut codes = vec![0; rows];
+            self.unpack(first, &mut codes);
+            return codes;
+        }
+        if high - low >= rows.saturating_mul(4) {
             return (0..rows).map(|index| self.code(at(index))).collect();
         }
         let mut run = vec![0; high - low + 1];
@@ -4835,6 +4854,26 @@ mod tests {
                 let far = [0_usize, 5000];
                 let want: Vec<u64> = far.iter().map(|&row| packed.code(row)).collect();
                 assert_eq!(packed.codes_at(|index| far[index], far.len()), want);
+                // A run, which is the shape unpacked straight into the answer, and two shapes that
+                // cover the same rows and are not one: reversed and with a row repeated. All three
+                // have to answer what a code at a time answers, whichever path they take.
+                for start in [0_usize, 1, 63, 64, 65, 130] {
+                    for rows in [1_usize, 2, 63, 64, 65, 200] {
+                        let run: Vec<usize> = (start..start + rows).collect();
+                        let back: Vec<usize> = run.iter().rev().copied().collect();
+                        let mut same = run.clone();
+                        same[rows - 1] = start;
+                        for shape in [&run, &back, &same] {
+                            let want: Vec<u64> =
+                                shape.iter().map(|&row| packed.code(row)).collect();
+                            assert_eq!(
+                                packed.codes_at(|index| shape[index], shape.len()),
+                                want,
+                                "width {width} offset {offset} start {start} rows {rows}"
+                            );
+                        }
+                    }
+                }
                 for rows in [&[][..], &[5, 9, 9, 70, 6, 200, 131], &[0, 5000], &[3, 4, 5, 6]] {
                     let want: Vec<u64> =
                         rows.iter().map(|&row| packed.code(row as usize)).collect();
