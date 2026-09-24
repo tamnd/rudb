@@ -286,31 +286,56 @@ struct Memo {
 /// One group of values: the code standing for each one's answer, and the answers of the values
 /// that are their own code, with where in the group each of those sits.
 ///
-/// An answer is the one the table of answers seen so far holds, shared rather than copied. On q29
-/// the answers come to 37 MB, and a copy here as well as the one the table looks them up by was
-/// that much again.
+/// The answers the group was the first to give are copied once, end to end, into `bytes`, and the
+/// table of answers seen so far points into that same block rather than holding a copy. On q29 the
+/// answers come to 37 MB. Held one allocation apiece they were 2.7 million blocks for the
+/// allocator to take and later give back one at a time, and the giving back at the end of the
+/// query was a quarter of its cycles.
 #[derive(Debug)]
 struct Replaced {
     firsts: Box<[u32]>,
     owns: Box<[u16]>,
-    answers: Box<[Arc<[u8]>]>,
+    /// Where each owned answer starts and ends in `bytes`, in the order of `owns`.
+    spans: Box<[(u32, u32)]>,
+    bytes: Arc<[u8]>,
 }
 
 impl Replaced {
     /// The answer at `index` within the group, which is empty unless that value is its own code.
     fn get(&self, index: usize) -> &[u8] {
         let Ok(index) = u16::try_from(index) else { return &[] };
-        self.owns.binary_search(&index).map_or(&[], |at| &self.answers[at])
+        self.owns.binary_search(&index).map_or(&[], |at| {
+            let (start, end) = self.spans[at];
+            &self.bytes[start as usize..end as usize]
+        })
     }
 
     fn footprint(&self) -> usize {
         self.firsts.len() * size_of::<u32>()
-            + self.owns.len() * (size_of::<u16>() + size_of::<Arc<[u8]>>())
+            + self.owns.len() * (size_of::<u16>() + size_of::<(u32, u32)>())
+            + self.bytes.len()
     }
+}
+
+/// An answer a group gave that the shared table did not hold when the group looked, waiting for the
+/// group to finish before it goes in.
+#[derive(Debug)]
+struct Pending {
+    hash: u64,
+    start: u32,
+    end: u32,
+    /// Where in the group the value that gave it first sits.
+    index: u16,
 }
 
 impl Memo {
     /// The group holding `code`, deciding it first where nothing has.
+    ///
+    /// An answer the shared table does not hold is given the code of the value that gave it, and
+    /// only goes in once the whole group is decided, so that every answer the group owns can point
+    /// into one block. Another group can give the same answer in between. Whichever registers it
+    /// first keeps its code, and the other group's values are moved onto that code before its
+    /// group is published, so no two codes ever stand for one answer.
     fn group(&self, code: usize) -> Result<&Replaced> {
         let slot = self
             .groups
@@ -323,9 +348,8 @@ impl Memo {
         let last = (first + REPLACE_GROUP).min(self.dictionary.len());
         let mut buffer = String::new();
         let mut firsts = Vec::with_capacity(last - first);
-        let mut owns = Vec::new();
-        let mut answers = Vec::new();
-        let mut added = 0;
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut mine: Vec<u8> = Vec::new();
         let mut previous = Vec::new();
         let mut previous_found = None;
         let mut local = Local::default();
@@ -333,7 +357,8 @@ impl Memo {
         let mut at = first;
         while at < last {
             let stopped = self.dictionary.sweep_text(at, last, &mut |_, text: &[u8]| {
-                let own = u32::try_from(first + firsts.len())
+                let index = firsts.len();
+                let own = u32::try_from(first + index)
                     .map_err(|_| Error::internal("a dictionary past four billion values"))?;
                 let answer = replace_one(
                     &self.regex,
@@ -354,33 +379,42 @@ impl Memo {
                     Some(found) if previous.as_slice() == answer => found,
                     _ => {
                         let hash = hash_of(answer);
-                        let (found, shared) = match local.get(&hash) {
+                        let found = match local.get(&hash) {
                             Some(&(start, end, found))
                                 if kept.get(start as usize..end as usize) == Some(answer) =>
                             {
-                                (found, None)
+                                found
                             }
-                            Some(_) => self.first_of(hash, answer, own, &mut added)?,
-                            None => {
-                                let (found, shared) =
-                                    self.first_of(hash, answer, own, &mut added)?;
-                                let start = kept.len();
-                                kept.extend_from_slice(answer);
-                                if let (Ok(start), Ok(end)) =
-                                    (u32::try_from(start), u32::try_from(kept.len()))
-                                {
-                                    local.insert(hash, (start, end, found));
+                            known => {
+                                let found = match self.first_of(hash, answer)? {
+                                    Some(found) => found,
+                                    None => {
+                                        let (Ok(start), Ok(end), Ok(index)) = (
+                                            u32::try_from(mine.len()),
+                                            u32::try_from(mine.len() + answer.len()),
+                                            u16::try_from(index),
+                                        ) else {
+                                            return Err(Error::internal(
+                                                "a replaced group too large",
+                                            ));
+                                        };
+                                        mine.extend_from_slice(answer);
+                                        pending.push(Pending { hash, start, end, index });
+                                        own
+                                    }
+                                };
+                                if known.is_none() {
+                                    let start = kept.len();
+                                    kept.extend_from_slice(answer);
+                                    if let (Ok(start), Ok(end)) =
+                                        (u32::try_from(start), u32::try_from(kept.len()))
+                                    {
+                                        local.insert(hash, (start, end, found));
+                                    }
                                 }
-                                (found, shared)
+                                found
                             }
                         };
-                        if let Some(shared) = shared {
-                            owns.push(
-                                u16::try_from(firsts.len())
-                                    .map_err(|_| Error::internal("a replaced group too large"))?,
-                            );
-                            answers.push(shared);
-                        }
                         previous.clear();
                         previous.extend_from_slice(answer);
                         previous_found = Some(found);
@@ -395,10 +429,33 @@ impl Memo {
             }
             at = stopped;
         }
+        let bytes: Arc<[u8]> = mine.into();
+        let mut owns = Vec::with_capacity(pending.len());
+        let mut spans = Vec::with_capacity(pending.len());
+        let mut moved: HashMap<u32, u32> = HashMap::new();
+        let mut added = 0;
+        for waiting in &pending {
+            let own = (first + usize::from(waiting.index)) as u32;
+            let found = self.register(waiting, &bytes, own, &mut added)?;
+            if found == own {
+                owns.push(waiting.index);
+                spans.push((waiting.start, waiting.end));
+            } else {
+                moved.insert(own, found);
+            }
+        }
+        if !moved.is_empty() {
+            for code in &mut firsts {
+                if let Some(&found) = moved.get(code) {
+                    *code = found;
+                }
+            }
+        }
         let out = Replaced {
             firsts: firsts.into_boxed_slice(),
             owns: owns.into_boxed_slice(),
-            answers: answers.into_boxed_slice(),
+            spans: spans.into_boxed_slice(),
+            bytes,
         };
         let held = out.footprint();
         if slot.set(out).is_ok() {
@@ -408,29 +465,42 @@ impl Memo {
         slot.get().ok_or_else(|| Error::internal("a replaced group was set and is not there"))
     }
 
-    /// The code standing for `answer`, which is `own` when no value before it gave that answer, and
-    /// the answer as the table holds it when it is `own`.
+    /// The code the shared table holds for `answer`, if it holds one.
+    fn first_of(&self, hash: u64, answer: &[u8]) -> Result<Option<u32>> {
+        let seen = self.firsts[shard_of(hash)]
+            .lock()
+            .map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
+        Ok(seen.get(&(hash, answer) as &dyn Answer).copied())
+    }
+
+    /// Puts a group's answer in the shared table under `own`, and the code it stands for, which is
+    /// `own` unless another group put the same answer in first.
     ///
     /// A thread deciding a group another has decided already finds its own values in the table
-    /// under their own codes, and takes the same shared answers the first one did.
-    fn first_of(
+    /// under their own codes, so both reach the same codes whichever publishes its group.
+    fn register(
         &self,
-        hash: u64,
-        answer: &[u8],
+        waiting: &Pending,
+        bytes: &Arc<[u8]>,
         own: u32,
         added: &mut usize,
-    ) -> Result<(u32, Option<Arc<[u8]>>)> {
-        let shard = &self.firsts[(hash >> 32) as usize % REPLACE_SHARDS];
-        let mut seen =
-            shard.lock().map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
-        let probe = (hash, answer);
-        if let Some((held, &found)) = seen.get_key_value(&probe as &dyn Answer) {
-            return Ok((found, (found == own).then(|| Arc::clone(&held.bytes))));
+    ) -> Result<u32> {
+        let mut seen = self.firsts[shard_of(waiting.hash)]
+            .lock()
+            .map_err(|_| Error::internal("a replace memo lock is poisoned"))?;
+        let answer = &bytes[waiting.start as usize..waiting.end as usize];
+        if let Some(&found) = seen.get(&(waiting.hash, answer) as &dyn Answer) {
+            return Ok(found);
         }
-        let held: Arc<[u8]> = answer.into();
-        seen.insert(Held { hash, bytes: Arc::clone(&held) }, own);
-        *added += answer.len() + 48;
-        Ok((own, Some(held)))
+        let held = Held {
+            hash: waiting.hash,
+            bytes: Arc::clone(bytes),
+            start: waiting.start,
+            end: waiting.end,
+        };
+        seen.insert(held, own);
+        *added += size_of::<(Held, u32)>() + 8;
+        Ok(own)
     }
 
     /// The code standing for the answer of the value at `code`.
@@ -443,6 +513,11 @@ impl Memo {
         let first = self.first(code)? as usize;
         Ok(self.group(first)?.get(first % REPLACE_GROUP))
     }
+}
+
+/// The lock an answer's hash is filed under. Bits from the middle, for the reason [`Words`] gives.
+fn shard_of(hash: u64) -> usize {
+    (hash >> 32) as usize % REPLACE_SHARDS
 }
 
 /// The hash an answer is filed under, in the shared table and in a group's own.
@@ -468,7 +543,10 @@ type Seen = HashMap<Held, u32, BuildHasherDefault<Stored>>;
 #[derive(Debug)]
 struct Held {
     hash: u64,
+    /// The block of the group that first gave the answer, which the answer is a span of.
     bytes: Arc<[u8]>,
+    start: u32,
+    end: u32,
 }
 
 /// An answer the table can look up, whether held or only borrowed for the lookup.
@@ -483,7 +561,7 @@ impl Answer for Held {
     }
 
     fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[self.start as usize..self.end as usize]
     }
 }
 
@@ -525,7 +603,7 @@ impl Hash for Held {
 
 impl PartialEq for Held {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && self.bytes == other.bytes
+        self.hash == other.hash && Answer::bytes(self) == Answer::bytes(other)
     }
 }
 
@@ -908,6 +986,57 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Threads deciding different groups at once, all giving the same few answers, still reach one
+    /// code per answer. Each group finds the answers new and holds them back until it is done, so
+    /// every answer is registered by more than one group and all but the first are moved.
+    #[test]
+    fn groups_decided_at_once_agree_on_one_code_per_answer() {
+        let values: Vec<Value> = (0..8_192)
+            .map(|index| Value::Varchar(format!("http://h{}.ru/{index}", index % 13)))
+            .collect();
+        let dictionary =
+            Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("builds"));
+        let constants = [
+            Value::Varchar("^https?://(?:www\\.)?([^/]+)/.*$".into()),
+            Value::Varchar("\\1".into()),
+        ];
+        let call = Call::read("regexp_replace", &constants.iter().collect::<Vec<_>>())
+            .expect("compiles")
+            .expect("a shape this file handles");
+        let answers: Vec<Vector> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8_u32)
+                .map(|thread| {
+                    let (call, dictionary) = (&call, &dictionary);
+                    scope.spawn(move || {
+                        let codes: Vec<u32> = (0..1_024).map(|row| thread * 1_024 + row).collect();
+                        let column = Vector::stable_dictionary(codes, Arc::clone(dictionary))
+                            .expect("codes are in range");
+                        vectorized(
+                            "regexp_replace",
+                            Some(call),
+                            &[&column],
+                            &LogicalType::Varchar,
+                            1_024,
+                        )
+                        .expect("the call is written")
+                        .expect("text in this form has a loop")
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|thread| thread.join().expect("no panic")).collect()
+        });
+        let mut code_of = std::collections::HashMap::new();
+        for (thread, got) in answers.iter().enumerate() {
+            let (codes, _) = got.stable_dictionary_parts().expect("answered as codes");
+            for (row, &code) in codes.iter().enumerate() {
+                let index = thread * 1_024 + row;
+                let want = Value::Varchar(format!("h{}.ru", index % 13));
+                assert_eq!(got.value_at(row), want, "row {index}");
+                assert_eq!(code, *code_of.entry(index % 13).or_insert(code), "row {index}");
             }
         }
     }
