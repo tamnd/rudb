@@ -111,7 +111,8 @@ use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Valu
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{
-    Chunk, VECTOR_SIZE, Vector, interleave_placed, placed_string_rows, strings_placeable,
+    Buffer, Chunk, Data, VECTOR_SIZE, Validity, Vector, interleave_placed, placed_string_rows,
+    strings_placeable,
 };
 
 use crate::merged::{ORDER, Sorted, order_of, ordering};
@@ -164,6 +165,9 @@ pub(crate) struct Sort {
     /// `None` is the `Value` path, and it is what a string key, a float key or a key list that does
     /// not fit gets. See [`crate::normal::layout`].
     widths: Option<Vec<usize>>,
+    /// How wide each key writes with its strings as ranks, when the list has no layout without
+    /// them and has one with them. See [`Ranked`].
+    ranked: Option<Vec<(usize, bool)>>,
     /// The key expressions, evaluated against the input's schema.
     exprs: Prepared,
     /// The input's types, which are also the output's, since a sort changes no column.
@@ -235,6 +239,8 @@ impl Combined {
 enum Keyed {
     /// Keys as bytes, which is the fast path and covers the fixed width types.
     Normal(Vec<Normalized>),
+    /// Keys as bytes with every string written as its rank, which waits for the last row.
+    Ranked(Ranked),
     /// Keys as values, which handles every type including the ones with no fixed width.
     Valued(Vec<Sortable>),
 }
@@ -245,11 +251,129 @@ impl Default for Keyed {
     }
 }
 
+/// The rows of a sort whose string keys are written as their ranks.
+///
+/// A string orders by its bytes, so the sort only needs to know where each one falls among the
+/// strings of the same key, and that is four bytes. With the strings written that way the key list
+/// of TPC-H q16, a count and two strings and a size, is 24 bytes and sorts as bytes, where it used
+/// to be a `Vec<Value>` a row compared through the `Value` enum, a fifth of the query for 18,314
+/// rows.
+///
+/// A rank is only known once every row is in, so the key columns are kept a chunk at a time as
+/// they arrive and the keys are written in [`Keyed::sort`]. Ranking a key is one sort of its
+/// strings, which is what the comparisons of the old path did anyway, and what it saves is doing
+/// them again inside every comparison of the rows.
+#[derive(Debug)]
+struct Ranked {
+    /// How wide each key encodes and whether it is ranked, from [`normal::ranked_layout`].
+    layout: Vec<(usize, bool)>,
+    /// Each chunk's key columns, in the order the chunks are in.
+    keys: Vec<Vec<Vector>>,
+    /// Where each row arrived, the rows of each chunk after the one before.
+    arrivals: Vec<Arrival>,
+    /// The rows with their keys written, in order, once they have been sorted.
+    rows: Vec<Normalized>,
+}
+
+impl Ranked {
+    fn new(layout: Vec<(usize, bool)>) -> Self {
+        Self { layout, keys: Vec::new(), arrivals: Vec::new(), rows: Vec::new() }
+    }
+
+    /// Writes every row's keys and puts the rows in order.
+    fn sort(&mut self, keys: &[SortKey]) -> Result<()> {
+        let mut rows: Vec<Normalized> = Vec::with_capacity(self.arrivals.len());
+        for (chunk, columns) in self.keys.iter().enumerate() {
+            let chunk = u32::try_from(chunk).map_err(|_| too_many())?;
+            let len = columns.first().map_or(0, Vector::len);
+            let first = rows.len();
+            let arrivals = self.arrivals.get(first..first + len).ok_or_else(mismatched)?;
+            rows.extend(
+                arrivals
+                    .iter()
+                    .zip(0..)
+                    .map(|(&arrival, row)| ([0; normal::WIDTH], arrival, (chunk, row))),
+            );
+        }
+        if rows.len() != self.arrivals.len() {
+            return Err(mismatched());
+        }
+        let mut written = 0;
+        for (position, &(wide, ranked)) in self.layout.iter().enumerate() {
+            let key = *keys.get(position).ok_or_else(mismatched)?;
+            let ranks = if ranked { Some(self.ranks(position)?) } else { None };
+            let mut first = 0;
+            for columns in &self.keys {
+                let column = columns.get(position).ok_or_else(mismatched)?;
+                let len = column.len();
+                let into = rows.get_mut(first..first + len).ok_or_else(mismatched)?;
+                let into = into.iter_mut().map(|row| &mut row.0);
+                match &ranks {
+                    Some(ranks) => {
+                        let ranks = ranks.get(first..first + len).ok_or_else(mismatched)?;
+                        let ranks = Buffer::from_vec(ranks.to_vec());
+                        let valid = Validity::from_iter(len, |at| !column.is_null_at(at));
+                        let ranked = Vector::flat(LogicalType::UInteger, Data::UInt32(ranks))?
+                            .with_validity(valid);
+                        normal::write_column(into, written, wide, &ranked, key)?;
+                    }
+                    None => normal::write_column(into, written, wide, column, key)?,
+                }
+                first += len;
+            }
+            written += wide;
+        }
+        rows.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        self.rows = rows;
+        Ok(())
+    }
+
+    /// Where each row's value of key `position` falls among the distinct values of that key, the
+    /// rows of each chunk after the one before, and zero for a null.
+    fn ranks(&self, position: usize) -> Result<Vec<u32>> {
+        let mut values: Vec<(&[u8], u32)> = Vec::with_capacity(self.arrivals.len());
+        let mut row = 0_u32;
+        for columns in &self.keys {
+            let column = columns.get(position).ok_or_else(mismatched)?;
+            for at in 0..column.len() {
+                match column.bytes_at(at) {
+                    Some(bytes) => values.push((bytes, row)),
+                    None if column.is_null_at(at) => {}
+                    None => return Err(Error::internal("a ranked sort key with no bytes")),
+                }
+                row = row.checked_add(1).ok_or_else(too_many)?;
+            }
+        }
+        values.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut ranks = vec![0_u32; row as usize];
+        let mut rank = 0_u32;
+        let mut last: Option<&[u8]> = None;
+        for (bytes, row) in values {
+            if last.is_some_and(|last| last != bytes) {
+                rank += 1;
+            }
+            last = Some(bytes);
+            ranks[row as usize] = rank;
+        }
+        Ok(ranks)
+    }
+
+    /// What the rows were charged when they arrived: their key columns and an arrival a row.
+    fn footprint(&self) -> u64 {
+        let keys: usize = self.keys.iter().flatten().map(Vector::footprint).sum();
+        let arrivals = self.arrivals.len().saturating_mul(size_of::<Arrival>());
+        u64::try_from(keys.saturating_add(arrivals)).unwrap_or(u64::MAX)
+    }
+}
+
 impl Keyed {
     /// An empty set of rows of the same arm as this one.
     fn empty(&self) -> Self {
         match self {
             Self::Normal(_) => Self::Normal(Vec::new()),
+            Self::Ranked(ranked) => Self::Ranked(Ranked::new(ranked.layout.clone())),
             Self::Valued(_) => Self::Valued(Vec::new()),
         }
     }
@@ -272,6 +396,16 @@ impl Keyed {
                 }));
                 Ok(())
             }
+            // Nothing is sorted yet, and the chunks go in the order the key columns do, so another
+            // instance's key columns start exactly where the chunks they came with do.
+            (Self::Ranked(into), Self::Ranked(from)) => {
+                if into.keys.len() != base as usize || !from.rows.is_empty() {
+                    return Err(mismatched());
+                }
+                into.keys.extend(from.keys);
+                into.arrivals.extend(from.arrivals);
+                Ok(())
+            }
             _ => Err(Error::internal("two instances of one sort holding their keys differently")),
         }
     }
@@ -289,6 +423,7 @@ impl Keyed {
                 });
                 Ok(())
             }
+            Self::Ranked(ranked) => ranked.sort(keys),
             Self::Valued(rows) => {
                 let mut failure: Option<Error> = None;
                 rows.sort_by(|left, right| settled(keys, left, right, &mut failure));
@@ -301,6 +436,7 @@ impl Keyed {
     fn sources(&self) -> Box<dyn ExactSizeIterator<Item = Source> + '_> {
         match self {
             Self::Normal(rows) => Box::new(rows.iter().map(|row| row.2)),
+            Self::Ranked(ranked) => Box::new(ranked.rows.iter().map(|row| row.2)),
             Self::Valued(rows) => Box::new(rows.iter().map(|row| row.2)),
         }
     }
@@ -309,6 +445,7 @@ impl Keyed {
     fn len(&self) -> usize {
         match self {
             Self::Normal(rows) => rows.len(),
+            Self::Ranked(ranked) => ranked.arrivals.len(),
             Self::Valued(rows) => rows.len(),
         }
     }
@@ -325,7 +462,7 @@ impl Keyed {
             Self::Normal(rows) => {
                 Ok(rows.iter().map(|(key, arrival, _)| order_of(key, *arrival)).collect())
             }
-            Self::Valued(_) => {
+            Self::Ranked(_) | Self::Valued(_) => {
                 Err(Error::internal("a sort holding its keys as values cannot spill"))
             }
         }
@@ -342,6 +479,7 @@ impl Keyed {
             Self::Normal(rows) => {
                 u64::try_from(rows.len()).unwrap_or(u64::MAX).saturating_mul(NORMALIZED)
             }
+            Self::Ranked(ranked) => ranked.footprint(),
             Self::Valued(rows) => rows.iter().map(|row| rows::footprint(&row.0) + BESIDE).sum(),
         }
     }
@@ -407,10 +545,11 @@ impl Sort {
         let types: Vec<_> = exprs.iter().map(|&expr| plan.expr_type(expr).clone()).collect();
         let out = Sorted::new();
         let widths = normal::layout(&types);
-        let rows =
-            if widths.is_some() { Keyed::Normal(Vec::new()) } else { Keyed::Valued(Vec::new()) };
+        let ranked = if widths.is_some() { None } else { normal::ranked_layout(&types) };
+        let rows = keyed(widths.as_ref(), ranked.as_ref());
         let sort = Self {
             widths,
+            ranked,
             exprs: Prepared::new(plan, &exprs, input)?,
             keys,
             types: input.types(),
@@ -535,11 +674,7 @@ impl Sink for Sort {
     type Local = Gathered;
 
     fn local(&self) -> Gathered {
-        let rows = if self.widths.is_some() {
-            Keyed::Normal(Vec::new())
-        } else {
-            Keyed::Valued(Vec::new())
-        };
+        let rows = keyed(self.widths.as_ref(), self.ranked.as_ref());
         self.instances.fetch_add(1, Atomic::Relaxed);
         Gathered {
             held: Combined { chunks: Vec::new(), rows, sorted: Vec::new() },
@@ -590,6 +725,14 @@ impl Sink for Sort {
                 }
                 taken += NORMALIZED * chunk.len() as u64;
             }
+            (None, Keyed::Ranked(ranked)) => {
+                // The columns as they are, since a rank needs every row and is written at the end.
+                taken += keys.iter().map(|column| column.footprint() as u64).sum::<u64>();
+                taken += (size_of::<Arrival>() * chunk.len()) as u64;
+                let place = &local.place;
+                ranked.arrivals.extend((0..chunk.len()).map(|row| place.of(row)));
+                ranked.keys.push(keys);
+            }
             (None, Keyed::Valued(rows)) => {
                 // row at a time: the keys as values, which is the path for a key list with a string
                 // or a float in it and has no fixed width bytes to write a column at a time.
@@ -632,7 +775,7 @@ impl Sink for Sort {
         let base = u32::try_from(gathered.chunks.len()).map_err(|_| too_many())?;
         match local.held.rows {
             Keyed::Normal(rows) => gathered.sorted.push((base, rows)),
-            valued @ Keyed::Valued(_) => gathered.rows.absorb(valued, base)?,
+            held @ (Keyed::Ranked(_) | Keyed::Valued(_)) => gathered.rows.absorb(held, base)?,
         }
         gathered.chunks.extend(local.held.chunks);
         self.charged.lock().map_err(poisoned)?.push(local.charged);
@@ -671,7 +814,7 @@ impl Sink for Sort {
                     sorted.iter().map(|(base, run)| (*base, run.as_slice())).collect();
                 merged(&runs, total, &starts(&chunks), threads)?
             }
-            Keyed::Valued(_) => {
+            Keyed::Ranked(_) | Keyed::Valued(_) => {
                 rows.sort(&self.keys)?;
                 order(&chunks, &rows)?
             }
@@ -689,6 +832,15 @@ impl Sink for Sort {
         let out = gathered(&self.types, chunks, order, total, &mut held, &mut charged, threads)?;
         self.out.hold(out)?;
         Ok(())
+    }
+}
+
+/// No rows yet, in the arm the layouts a key list has decide.
+fn keyed(widths: Option<&Vec<usize>>, ranked: Option<&Vec<(usize, bool)>>) -> Keyed {
+    match (widths, ranked) {
+        (Some(_), _) => Keyed::Normal(Vec::new()),
+        (None, Some(layout)) => Keyed::Ranked(Ranked::new(layout.clone())),
+        (None, None) => Keyed::Valued(Vec::new()),
     }
 }
 
