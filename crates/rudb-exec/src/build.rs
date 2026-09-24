@@ -2169,6 +2169,7 @@ impl<'a> Building<'a, '_> {
                     predicate,
                     tests: moved.tests,
                     whole: moved.whole,
+                    conjuncts: moved.conjuncts,
                     marks,
                 });
                 // Whether there was an offer at all, held here because afterwards the field says

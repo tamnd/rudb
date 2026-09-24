@@ -66,6 +66,14 @@ pub struct Moved {
     pub tests: Vec<Test>,
     /// Whether `tests` is the whole of the predicate.
     pub whole: bool,
+    /// For each operand of a top level `AND`, in the order the predicate lists them, the tests that
+    /// are the whole of that operand, or `None` for an operand that does not read as tests.
+    ///
+    /// Empty when the predicate is not an `AND`. This is what lets a scan leave out one conjunct on
+    /// a stretch whose bounds prove it, when the stretch cannot prove the rest. ClickBench 42 reads
+    /// only parts where the counter and the date hold on every row, and compared both on every row
+    /// anyway because its two flag columns could not be settled the same way.
+    pub conjuncts: Vec<Option<Vec<Test>>>,
 }
 
 /// The filter a stored table directly below it can apply itself instead of having one above it.
@@ -97,13 +105,25 @@ pub fn into_scan(plan: &Plan, filter: rudb_plan::NodeRef) -> Option<Moved> {
         return None;
     }
     let index = scanned(plan, input)?;
+    let conjuncts = match *plan.expr(predicate) {
+        Expr::Conjunction { op: ConjunctionOp::And, children } => plan
+            .expr_list(children)
+            .iter()
+            .map(|&child| {
+                let mut tests = Vec::new();
+                (every_conjunct(plan, child, index, &mut tests) && !tests.is_empty())
+                    .then_some(tests)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     let mut tests = Vec::new();
     // Thrown away rather than kept when the walk stopped early, because a half read predicate is a
     // list of tests that prove the wrong thing and the only safe use of it is none.
     if !every_conjunct(plan, predicate, index, &mut tests) {
-        return Some(Moved { tests: Vec::new(), whole: false });
+        return Some(Moved { tests: Vec::new(), whole: false, conjuncts });
     }
-    Some(Moved { whole: !tests.is_empty(), tests })
+    Some(Moved { whole: !tests.is_empty(), tests, conjuncts })
 }
 
 /// The table index of a scan, or `None` for a node that has no bounds to ask about.
@@ -278,5 +298,20 @@ mod tests {
             panic!("the root is the filter");
         };
         assert_eq!(of(&plan, input, predicate), Vec::new());
+    }
+
+    /// Each operand of the top level `AND` answers for itself, so the `<>` that stops the whole
+    /// predicate reading as tests does not stop the comparison beside it.
+    #[test]
+    fn each_conjunct_of_a_moved_filter_reads_as_tests_of_its_own() {
+        let text = "Filter ((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER <> 9::INTEGER)::BOOLEAN)::BOOLEAN\n  Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n";
+        let plan = Plan::parse(text).expect("parses");
+        let moved = super::into_scan(&plan, plan.root()).expect("a filter over a stored table");
+        assert!(!moved.whole);
+        assert_eq!(moved.conjuncts, vec![Some(vec![test(0, Op::Greater, 1)]), None]);
+        let one = "Filter (#0.0::INTEGER > 1::INTEGER)::BOOLEAN\n  Get memory.main.t AS t #0 [a::INTEGER]\n";
+        let plan = Plan::parse(one).expect("parses");
+        let moved = super::into_scan(&plan, plan.root()).expect("a filter over a stored table");
+        assert!(moved.whole && moved.conjuncts.is_empty(), "no `AND`, nothing to split");
     }
 }

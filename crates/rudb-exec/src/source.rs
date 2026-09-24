@@ -466,6 +466,8 @@ pub(crate) struct Pushdown {
     pub(crate) tests: Vec<(usize, Op, Bound)>,
     /// Whether those tests are the whole predicate, which is what makes the zone shortcut sound.
     pub(crate) whole: bool,
+    /// The tests of each operand of a top level `AND`, see [`rudb_opt::bounds::Moved::conjuncts`].
+    pub(crate) conjuncts: Vec<Option<Vec<(usize, Op, Bound)>>>,
     /// Whether the scan feeds an aggregate that reads a marked chunk, so that a chunk the filter
     /// keeps nearly all of is marked rather than cut. See [`Chunk::marked`].
     pub(crate) marks: bool,
@@ -568,6 +570,13 @@ struct Pushed {
     ///
     /// [`Zone::certain`]: rudb_storage::Zone::certain
     probes: Option<Vec<Probe>>,
+    /// For each operand of the predicate's top level `AND`, the probes that are the whole of it, or
+    /// `None` for one they are not. `None` altogether when no operand has any, or when the prepared
+    /// predicate does not number its operands the way the plan does.
+    ///
+    /// The per operand half of `probes`. A part that cannot prove the whole predicate can still
+    /// prove some of it, and the operands it proves are left out of the comparison for that part.
+    settles: Option<Vec<Option<Vec<Probe>>>>,
     /// Working space kept per reader rather than in one free list they all queue for.
     ///
     /// A [`Source`] has no per instance state to keep this in, which a [`Stream`] does, so the scan
@@ -684,6 +693,19 @@ impl Pushed {
         let whole = pushdown.whole;
         let wanted = pushdown.tests.len();
         let probes = onto(columns, pushdown.tests);
+        let settles: Vec<Option<Vec<Probe>>> = pushdown
+            .conjuncts
+            .into_iter()
+            .map(|tests| {
+                let tests = tests?;
+                let wanted = tests.len();
+                Some(onto(columns, tests)).filter(|probes| probes.len() == wanted)
+            })
+            .collect();
+        let predicate = Prepared::one(plan, pushdown.predicate, schema)?.in_session(session);
+        let settles = (predicate.conjuncts() == Some(settles.len())
+            && settles.iter().any(Option::is_some))
+        .then_some(settles);
         let late = if columns.len() == 2 && columns.iter().all(Option::is_some) {
             late_like(plan, schema, pushdown.predicate)
                 .map(|(input, expr)| {
@@ -699,12 +721,13 @@ impl Pushed {
             None
         };
         Ok(Self {
-            predicate: Prepared::one(plan, pushdown.predicate, schema)?.in_session(session),
+            predicate,
             late,
             compaction,
             passes: later_passes(plan, pushdown.node),
             marks: pushdown.marks,
             probes: (whole && probes.len() == wanted).then_some(probes),
+            settles,
             spare: (0..SLOTS).map(|_| Mutex::new(None)).collect(),
         })
     }
@@ -868,7 +891,17 @@ impl<'a> Scan<'a> {
         // is holding one, which is a reader that has not had a turn yet rather than an error.
         let slot = reader();
         let mut working = pushed.take(slot);
-        let mut kept = pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?;
+        let mut kept = match &pushed.settles {
+            Some(settles) => {
+                let rows = self.table.rows();
+                let settled: Vec<bool> = settles
+                    .iter()
+                    .map(|probes| probes.as_deref().is_some_and(|probes| rows.certain(at, probes)))
+                    .collect();
+                pushed.predicate.evaluate_settled(chunk, &mut working.scratch, &settled)?
+            }
+            None => pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?,
+        };
         self.passed.saw(chunk.len(), kept.len());
         // After the filter and on its answer rather than on the chunk, so that the filter's kernels
         // read the columns flat as they came off the disk and the chunk is narrowed once. Narrowing
@@ -3611,6 +3644,7 @@ mod tests {
             predicate,
             tests: moved.tests,
             whole: moved.whole,
+            conjuncts: moved.conjuncts,
             marks: false,
         };
         let filters = Filters { pruning, pushed: Some(pushdown), ..Filters::default() };
@@ -3665,6 +3699,7 @@ mod tests {
             predicate,
             tests: moved.tests,
             whole: moved.whole,
+            conjuncts: moved.conjuncts,
             marks: false,
         };
         let filters = Filters { pushed: Some(pushdown), ..Filters::default() };
@@ -3732,6 +3767,31 @@ mod tests {
         assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5 - cutoff);
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 2, "the first two hold nothing wanted");
         assert_eq!(scan.waved.load(Ordering::Relaxed), 2, "the last two are all of them wanted");
+    }
+
+    /// A predicate the zone maps cannot prove as a whole, because one conjunct is `<>`, still has
+    /// its other conjunct left out on the chunks that prove that one. The rows are what the whole
+    /// predicate keeps either way, which is the thing that could go wrong.
+    #[test]
+    fn a_conjunct_a_chunk_proves_is_left_out_and_the_rest_still_runs() {
+        let table = counted(VECTOR_SIZE * 5);
+        let cutoff = VECTOR_SIZE * 2 + VECTOR_SIZE / 2;
+        let odd = VECTOR_SIZE * 4 + 3;
+        let (_plan, scan) = applying(
+            &table,
+            &format!(
+                "((#0.0::INTEGER >= {cutoff}::INTEGER)::BOOLEAN AND \
+                 (#0.0::INTEGER <> {odd}::INTEGER)::BOOLEAN)::BOOLEAN"
+            ),
+        );
+        let pushed = scan.pushed.as_ref().expect("the filter moved into the scan");
+        assert!(pushed.probes.is_none(), "the `<>` is not a test, so no chunk is proved whole");
+        let settles = pushed.settles.as_ref().expect("the other conjunct is");
+        assert_eq!(settles.iter().map(Option::is_some).collect::<Vec<_>>(), [true, false]);
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 5 - cutoff - 1);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 2, "the first two hold nothing wanted");
+        assert_eq!(scan.waved.load(Ordering::Relaxed), 0, "and none is wanted whole");
     }
 
     /// Every part of the table is counted exactly once, as read or as ruled out.

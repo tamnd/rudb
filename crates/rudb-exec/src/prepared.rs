@@ -672,6 +672,49 @@ impl Prepared {
         self.thread(root, 0, chunk, scratch, None)
     }
 
+    /// How many operands the top level `AND` of a filter has, or `None` when it has no such `AND`.
+    ///
+    /// Operand `i` is the `i`th child of the conjunction in the plan, which is the numbering
+    /// [`evaluate_settled`](Self::evaluate_settled) takes. `None` as well for an expression built
+    /// to share its steps, since a step an operand shares with a later one is a step that has to run
+    /// whether or not the first operand does.
+    #[must_use]
+    pub fn conjuncts(&self) -> Option<usize> {
+        let [root] = self.roots[..] else { return None };
+        match self.steps[root] {
+            Step::Conjunction { op: Connective::And, len, .. } if !self.share => Some(len),
+            _ => None,
+        }
+    }
+
+    /// [`evaluate_filter`](Self::evaluate_filter) with some operands of the top level `AND` known
+    /// to hold on every row of the chunk, which are not run at all.
+    ///
+    /// `settled[i]` is operand `i` in the numbering of [`conjuncts`](Self::conjuncts). What settles
+    /// one is the caller's business and it has to be a proof: an operand left out here is an
+    /// operand that keeps every row, nulls included, so a caller that is wrong about it gets rows
+    /// the query threw away. A scan knows it from the bounds of the part it read.
+    ///
+    /// # Errors
+    ///
+    /// As [`evaluate_filter`](Self::evaluate_filter).
+    pub fn evaluate_settled(
+        &self,
+        chunk: &Chunk,
+        scratch: &mut Scratch,
+        settled: &[bool],
+    ) -> Result<Selection> {
+        if self.conjuncts() != Some(settled.len()) || !settled.contains(&true) {
+            return self.evaluate_filter(chunk, scratch);
+        }
+        let [root] = self.roots[..] else {
+            return Err(Error::internal("a settled filter over several roots"));
+        };
+        scratch.slots.clear();
+        scratch.slots.resize_with(self.steps.len(), || None);
+        self.branches(root, 0, chunk, scratch, None, settled)
+    }
+
     /// The operands of one connective, run in order, each over the rows the ones before it left.
     ///
     /// `live` is the rows this connective has to decide about and `None` means every row of the
@@ -696,6 +739,7 @@ impl Prepared {
         chunk: &Chunk,
         scratch: &mut Scratch,
         live: Option<&Selection>,
+        settled: &[bool],
     ) -> Result<Selection> {
         let Step::Conjunction { op, start, len } = self.steps[index] else {
             return Err(Error::internal("a connective walk over a step that is not a connective"));
@@ -715,6 +759,10 @@ impl Prepared {
                 break;
             }
             let which = order.at(slot);
+            // Known to keep every row, so running it would hand back the rows it was given.
+            if settled.get(which) == Some(&true) {
+                continue;
+            }
             let operand = operands[which];
             // The array is in post order and an operand's whole subtree sits between the operand
             // before it and the operand itself, which is a range the run order cannot move. That is
@@ -822,7 +870,7 @@ impl Prepared {
         live: Option<&Selection>,
     ) -> Result<Selection> {
         if matches!(self.steps[index], Step::Conjunction { .. }) {
-            return self.branches(index, begin, chunk, scratch, live);
+            return self.branches(index, begin, chunk, scratch, live, &[]);
         }
         for step in begin..index {
             self.run_step(step, chunk, scratch)?;
@@ -2036,6 +2084,42 @@ mod tests {
              AND (#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN AND (#0.0::INTEGER <> 2::INTEGER)\
              ::BOOLEAN)::BOOLEAN",
         );
+    }
+
+    /// An operand the caller says is settled is not run, which shows as the rows it would have
+    /// thrown away coming through: the answer is the other operand's alone. Settling nothing, or
+    /// handing over the wrong number of operands, is the plain filter.
+    #[test]
+    fn a_settled_conjunct_is_left_out_of_the_filter() {
+        let (schema, chunk) = input();
+        let both = "((#0.0::INTEGER > 1::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 3::INTEGER)::BOOLEAN)\
+                    ::BOOLEAN AS p";
+        let (plan, list) = projection(both);
+        let prepared = Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+        assert_eq!(prepared.conjuncts(), Some(2));
+        let mut scratch = prepared.scratch();
+        let wanted = |predicate: &str| {
+            let (plan, list) = projection(&format!("{predicate} AS p"));
+            let flags = evaluate(&plan, list[0], &schema, &chunk).expect("the tree walk runs");
+            Selection::from_predicate(chunk.len(), |row| is_true(&flags.value_at(row)))
+        };
+        let second = prepared.evaluate_settled(&chunk, &mut scratch, &[true, false]);
+        assert_eq!(
+            second.expect("the filter runs"),
+            wanted("(#0.0::INTEGER < 3::INTEGER)::BOOLEAN")
+        );
+        let first = prepared.evaluate_settled(&chunk, &mut scratch, &[false, true]);
+        assert_eq!(
+            first.expect("the filter runs"),
+            wanted("(#0.0::INTEGER > 1::INTEGER)::BOOLEAN")
+        );
+        let neither = prepared.evaluate_settled(&chunk, &mut scratch, &[true, true]);
+        assert_eq!(neither.expect("the filter runs"), Selection::identity(chunk.len()));
+        let whole = wanted(&both[..both.len() - " AS p".len()]);
+        let none = prepared.evaluate_settled(&chunk, &mut scratch, &[false, false]);
+        assert_eq!(none.expect("the filter runs"), whole);
+        let short = prepared.evaluate_settled(&chunk, &mut scratch, &[true]);
+        assert_eq!(short.expect("the filter runs"), whole, "a list that does not fit is ignored");
     }
 
     /// A conjunct that rejects every row, in front of one that would have kept some. The rows are
