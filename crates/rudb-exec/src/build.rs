@@ -1307,6 +1307,8 @@ struct Linked {
     projected: Vec<(usize, LogicalType)>,
     /// Those same columns as the schema the bindings above this join resolve against.
     parent_schema: Schema,
+    /// The equalities the join is on, each as the child's column and the parent's.
+    keys: Vec<(ColumnBinding, ColumnBinding)>,
 }
 
 /// A materialised `WITH` that has been built, for the reads of it under the body being walked.
@@ -2112,6 +2114,7 @@ impl<'a> Building<'a, '_> {
             parent: Arc::new(Parent::new(parent_table.rows().clone(), budget)),
             projected,
             parent_schema: Schema::numbered(fields, parent_index),
+            keys: oriented,
         })
     }
 
@@ -2433,6 +2436,19 @@ impl<'a> Building<'a, '_> {
             Node::LinkJoin { child, parent, kind, conditions, rid } => {
                 let found = self.linked(reference, child, parent, conditions)?;
                 let below = self.node(child)?;
+                // A parent key column is the child's key column over the rows an inner join keeps,
+                // when both are the same type, so it is taken from the child rather than gathered.
+                let child_types = below.schema.types();
+                let parent_types = found.parent_schema.types();
+                let keys: Vec<(usize, usize)> = found
+                    .keys
+                    .iter()
+                    .filter_map(|&(child_key, parent_key)| {
+                        let at = below.schema.position_of(child_key)?;
+                        let taken = found.parent_schema.position_of(parent_key)?;
+                        (child_types.get(at)? == parent_types.get(taken)?).then_some((taken, at))
+                    })
+                    .collect();
                 let operator = LinkJoin::new(
                     plan,
                     kind,
@@ -2446,6 +2462,7 @@ impl<'a> Building<'a, '_> {
                     memory,
                     self.cancel.clone(),
                 )?
+                .taking_keys(&keys)
                 .in_session(self.session);
                 let schema = operator.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "LinkJoin", None);

@@ -78,6 +78,9 @@ pub(crate) struct LinkJoin {
     /// Empty for a semi or an anti join, which is not a special case here but the reason those two
     /// never touch the parent: the loop below is the same loop and the list it walks is empty.
     projected: Vec<(usize, LogicalType)>,
+    /// For each projected parent column, the child column it equals row for row when it is a key
+    /// the join is on, and `None` for one that has to be gathered. See [`Self::taking_keys`].
+    keys: Vec<Option<usize>>,
     /// The child column holding the row id, which the plan named.
     rid: Prepared,
     schema: Schema,
@@ -139,6 +142,7 @@ impl LinkJoin {
             kind,
             link,
             parent,
+            keys: vec![None; projected.len()],
             projected,
             rid,
             // The child's columns and then the parent's, which is the order a join binds its
@@ -148,6 +152,27 @@ impl LinkJoin {
             held: Mutex::new(memory.reservation()),
             cancel,
         })
+    }
+
+    /// Takes each projected parent column in `keys` from the child column it names instead of out
+    /// of the parent, as pairs of a position in the projection and a position in the child.
+    ///
+    /// For an inner join only, and only for a parent key the join is on and a child key of the same
+    /// type. The link was built by looking each child key up in the parent's key map, so a child row
+    /// that kept a parent has that parent's key as its own, and gathering the parent's copy of it is
+    /// a random read into the parent for a value the chunk already holds. On TPC-H q09 that was two
+    /// of the three columns gathered out of `partsupp`. A left join would need the key null where
+    /// no parent was found, and is left to the gather.
+    #[must_use]
+    pub(crate) fn taking_keys(mut self, keys: &[(usize, usize)]) -> Self {
+        if self.kind == JoinKind::Inner {
+            for &(parent, child) in keys {
+                if let Some(slot) = self.keys.get_mut(parent) {
+                    *slot = Some(child);
+                }
+            }
+        }
+        self
     }
 
     /// What this operator produces.
@@ -208,10 +233,24 @@ impl LinkJoin {
             return Ok(());
         }
         let rows = chunk.len();
-        let placement = self.parent.place(rids)?;
+        let placement = if self.keys.iter().all(Option::is_some) {
+            None
+        } else {
+            Some(self.parent.place(rids)?)
+        };
         let mut columns: Vec<Vector> = chunk.columns().to_vec();
-        for (column, ty) in &self.projected {
-            let gathered = self.parent.gather(*column, ty, &placement)?.ok_or_else(|| {
+        for ((column, ty), key) in self.projected.iter().zip(&self.keys) {
+            if let Some(child) = *key {
+                let same = chunk.columns().get(child).ok_or_else(|| {
+                    Error::internal("a link join took a key from a child column it does not have")
+                })?;
+                columns.push(same.clone());
+                continue;
+            }
+            let Some(placement) = &placement else {
+                return Err(Error::internal("a link join gathered with nothing placed"));
+            };
+            let gathered = self.parent.gather(*column, ty, placement)?.ok_or_else(|| {
                 Error::out_of_memory(
                     "a link join could not hold the parent columns it gathers from".to_string(),
                 )
@@ -495,6 +534,34 @@ mod tests {
                 vec![Value::Integer(102), Value::BigInt(2)],
             ]
         );
+    }
+
+    /// A parent key column the join equated with a child column is the child's column on every row
+    /// an inner join keeps, so it is taken from the child. The child's prices stand in for the key
+    /// here, which is what shows the value came from the child and not from the parent.
+    #[test]
+    fn an_inner_link_join_takes_a_key_column_from_the_child() {
+        let operator =
+            operator(JoinKind::Inner, &[None, Some(1), None, Some(0)], 2).taking_keys(&[(0, 0)]);
+        let rows = run(&operator, child(4));
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(101), Value::BigInt(1), Value::Integer(101)],
+                vec![Value::Integer(103), Value::BigInt(3), Value::Integer(103)],
+            ]
+        );
+    }
+
+    /// A left join keeps rows with no parent, where the key is null and the child's is not, so it
+    /// still gathers.
+    #[test]
+    fn a_left_link_join_still_gathers_a_key_column() {
+        let operator =
+            operator(JoinKind::Left, &[None, Some(1), None, Some(0)], 2).taking_keys(&[(0, 0)]);
+        let rows = run(&operator, child(4));
+        assert_eq!(rows[0], vec![Value::Integer(100), Value::BigInt(0), Value::Null]);
+        assert_eq!(rows[1], vec![Value::Integer(101), Value::BigInt(1), Value::Integer(1)]);
     }
 
     /// A gather reads the one part the ids land in and takes the rows asked for out of it, so what
