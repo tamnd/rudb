@@ -2896,7 +2896,11 @@ impl Shared {
         }
         let writes = matches!(
             bound,
-            Bound::CreateTable(_) | Bound::CreateView(_) | Bound::DropTable(_) | Bound::Insert(_)
+            Bound::CreateTable(_)
+                | Bound::CreateView(_)
+                | Bound::DropTable(_)
+                | Bound::Schema(_)
+                | Bound::Insert(_)
         );
         if writes && self.open().as_ref().is_some_and(|open| open.read_only) {
             return Err(Error::transaction(format!(
@@ -3043,6 +3047,31 @@ impl Shared {
                         Entry::View => catalog.drop_view(name)?,
                     }
                 }
+                Ok(QueryResult::empty())
+            }
+            Bound::Schema(change) => {
+                let there = catalog.has_schema(&change.catalog, &change.name);
+                if change.drop {
+                    if there || !change.quiet {
+                        catalog.drop_schema(&change.catalog, &change.name, change.cascade)?;
+                    }
+                    return Ok(QueryResult::empty());
+                }
+                // The native file keeps every table under its bare name and has nowhere to say
+                // which schema one is in, so a schema other than `main` in it would come back as
+                // `main` on the next open. Refused until the file can say it.
+                if self.inner.path.is_some() && self.inner.writable {
+                    return Err(Error::not_implemented(
+                        "CREATE SCHEMA in a database file, which holds only the main schema so far",
+                    ));
+                }
+                if there && change.quiet {
+                    return Ok(QueryResult::empty());
+                }
+                if there && change.or_replace {
+                    catalog.drop_schema(&change.catalog, &change.name, false)?;
+                }
+                catalog.create_schema(&change.catalog, &change.name)?;
                 Ok(QueryResult::empty())
             }
             Bound::Insert(mut insert) => {

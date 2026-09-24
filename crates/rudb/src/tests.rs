@@ -9646,3 +9646,57 @@ fn a_key_refuses_a_write_that_would_repeat_it_the_way_the_pin_does() {
         .collect();
     assert_eq!(described, vec![vec![Value::Null], vec![text("PRI")], vec![Value::Null]]);
 }
+
+#[test]
+fn a_schema_is_made_filled_and_dropped_the_way_the_pin_does_it() {
+    let db = scripted(&[
+        "CREATE SCHEMA s1",
+        "CREATE SCHEMA IF NOT EXISTS s1",
+        "CREATE TABLE s1.t (i INT)",
+        "CREATE VIEW s1.v AS SELECT 1 AS one",
+        "INSERT INTO s1.t VALUES (1), (2)",
+        "CREATE SCHEMA empty",
+        "CREATE OR REPLACE SCHEMA empty",
+        "DROP SCHEMA IF EXISTS gone",
+    ]);
+    let count =
+        db.query("SELECT count(*) FROM s1.t").unwrap().rows().next().unwrap()[0].to_string();
+    assert_eq!(count, "2");
+    for (statement, message) in [
+        ("CREATE SCHEMA s1", "Schema with name \"s1\" already exists!"),
+        ("CREATE SCHEMA nodb.s3", "\"nodb\" is not a catalog or schema"),
+        ("CREATE SCHEMA memory.a.b", "\"a\" is not a catalog or schema"),
+        ("CREATE TEMP SCHEMA s4", "Temporary schemas are not supported"),
+        ("CREATE SCHEMA pg_catalog", "Cannot create schema in system catalog"),
+        ("CREATE SCHEMA system.x", "Cannot create schema in system catalog"),
+        ("CREATE SCHEMA temp.x", "Cannot create non-temporary entry \"x\" in temporary catalog"),
+        ("DROP SCHEMA gone", "Schema with name gone does not exist!"),
+        ("DROP SCHEMA main", "Cannot drop entry \"main\" because it is an internal system entry"),
+        (
+            "DROP SCHEMA system.pg_catalog",
+            "Cannot drop entry \"pg_catalog\" because it is an internal system entry",
+        ),
+        ("DROP SCHEMA s1, empty", "Can only drop one object at a time"),
+        (
+            "SELECT * FROM s2.t",
+            "Table with name \"s2.t\" does not exist because schema \"s2\" does not exist.",
+        ),
+        (
+            "DROP SCHEMA s1",
+            "Cannot drop entry \"s1\" because there are entries that depend on it.\nview \"v\" \
+             depends on schema \"s1\".\ntable \"t\" depends on schema \"s1\".\nUse DROP...CASCADE \
+             to drop all dependents.",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    let error = db.execute("CREATE OR REPLACE SCHEMA s1").unwrap_err();
+    assert_eq!(error.code(), rudb_common::ErrorCode::Dependency);
+    db.execute("BEGIN").unwrap();
+    db.execute("DROP SCHEMA s1 CASCADE").unwrap();
+    db.execute("ROLLBACK").unwrap();
+    db.execute("SELECT * FROM s1.v").unwrap();
+    db.execute("DROP SCHEMA s1 CASCADE").unwrap();
+    db.execute("DROP SCHEMA empty").unwrap();
+    assert!(refusal(&db, "SELECT * FROM s1.t").contains("because schema \"s1\" does not exist"));
+}

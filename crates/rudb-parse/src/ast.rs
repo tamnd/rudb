@@ -61,6 +61,8 @@ pub type CreateTableRef = u32;
 pub type CreateViewRef = u32;
 /// An index into `Ast::drop_tables`.
 pub type DropTableRef = u32;
+/// Index into [`Ast::schemas`].
+pub type SchemaRef = u32;
 /// An index into `Ast::inserts`.
 pub type InsertRef = u32;
 /// An index into `Ast::settings`.
@@ -83,6 +85,8 @@ pub enum Statement {
     CreateView(CreateViewRef),
     /// `DROP TABLE` or `DROP VIEW`, which are one rule in the grammar and one statement here.
     DropTable(DropTableRef),
+    /// `CREATE SCHEMA` or `DROP SCHEMA`.
+    Schema(SchemaRef),
     /// `INSERT INTO`.
     Insert(InsertRef),
     /// `UPDATE`, held as an [`Insert`] whose columns are the ones `SET` names and whose source is
@@ -262,6 +266,23 @@ pub struct DropTable {
     /// Whether `VIEW` was written where `TABLE` could have been. Dropping one as the other is an
     /// error rather than a synonym, so which word was written has to survive the transform.
     pub view: bool,
+}
+
+/// `CREATE SCHEMA name` or `DROP SCHEMA name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Schema {
+    /// The name, as a run of parts, outermost first.
+    pub name: Slice,
+    /// Whether this is a `DROP` rather than a `CREATE`.
+    pub drop: bool,
+    /// Whether `IF NOT EXISTS` was written on a create or `IF EXISTS` on a drop.
+    pub quiet: bool,
+    /// Whether `OR REPLACE` was written, which only a create can have.
+    pub or_replace: bool,
+    /// Whether `TEMP` or `TEMPORARY` was written, which only a create can have.
+    pub temporary: bool,
+    /// Whether `CASCADE` was written, which only a drop can have.
+    pub cascade: bool,
 }
 
 /// `INSERT INTO name (columns) query`.
@@ -1135,6 +1156,8 @@ pub struct Ast {
     pub create_views: Vec<CreateView>,
     /// The `DROP TABLE` arena.
     pub drop_tables: Vec<DropTable>,
+    /// The `CREATE SCHEMA` and `DROP SCHEMA` arena.
+    pub schemas: Vec<Schema>,
     /// The `INSERT` arena.
     pub inserts: Vec<Insert>,
     /// The `SET` and `RESET` arena.
@@ -1269,6 +1292,11 @@ impl Ast {
     /// One `DROP TABLE`.
     pub fn drop_table(&self, index: DropTableRef) -> DropTable {
         self.drop_tables[index as usize]
+    }
+
+    /// One `CREATE SCHEMA` or `DROP SCHEMA`.
+    pub fn schema(&self, index: SchemaRef) -> Schema {
+        self.schemas[index as usize]
     }
 
     /// One `INSERT`.
