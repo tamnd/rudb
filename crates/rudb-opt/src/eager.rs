@@ -72,10 +72,11 @@
 //! ```
 //!
 //! Where that join is the only one on the path, it says nothing but that K equals columns of the
-//! other side, and a group key is a column of that side that a built link names as a parent key,
-//! each group above has one row in it and there is nothing left to add up. The top aggregate is a
-//! projection then, of the group keys and each partial answer, with the same `coalesce` a padded
-//! count needs. On q13 with the links declared that is a grouping of 150,000 customers gone.
+//! other side, and a group key is a column of that side that a built link or the side's key map
+//! says is a key, each group above has one row in it and there is nothing left to add up. The top
+//! aggregate is a projection then, of the group keys and each partial answer, with the same
+//! `coalesce` a padded count needs. On q13 with the relationships declared that is a grouping of
+//! 150,000 customers gone.
 //!
 //! The top node keeps the aggregate's index and its output order, so nothing above it moves. A second run
 //! finds an aggregate where B was and stops, so the pass settles after one.
@@ -330,10 +331,11 @@ fn covers(
     kept.iter().all(|(binding, _)| met.contains(binding))
 }
 
-/// Whether a group key is a column of the scan at `beside` that a built link names as the parent
-/// key, so that no two rows of the scan are in one group.
+/// Whether a group key is a column of the scan at `beside` that a relationship certifies as the
+/// parent key, so that no two rows of the scan are in one group.
 ///
-/// A link is only written over a parent key the build found distinct, but the build lets nulls
+/// That is a built link or the parent's key map, both only written over a key the build found
+/// distinct. The build lets nulls
 /// through, and every null lands in one group. So the column has to be declared `NOT NULL`, or the
 /// file has to say it holds no nulls, or the join has to be an inner one that compares it, which
 /// drops a null before it gets to the group.
@@ -359,7 +361,7 @@ fn keyed(plan: &Plan, join: NodeRef, beside: NodeRef, keys: &[ExprRef], links: &
             || (kind == JoinKind::Inner && compared(binding));
         never_null
             && links.iter().any(|link| {
-                link.built
+                link.unique
                     && link.second.is_none()
                     && link.parent.eq_ignore_ascii_case(table)
                     && link.parent_column.eq_ignore_ascii_case(&field.name)
@@ -592,13 +594,13 @@ mod tests {
         assert_eq!(plan.to_string(), once, "a second run moved the plan again");
     }
 
-    /// `c(k)` is the parent key of a built link, and an inner join on it drops a null key, so each
+    /// `c(k)` is a certified parent key, and an inner join on it drops a null key, so each
     /// customer is a group of its own and the aggregate above has nothing to add up. A left join
     /// keeps a null key, and nothing here says there is none, so that one keeps its aggregate.
     #[test]
     fn a_group_key_a_link_says_is_unique_makes_the_top_a_projection() {
         let stats = counted(1_500_000, 100_000);
-        let link = |built: bool| Linked { built, ..Linked::declared("o", "c", "c", "k") };
+        let link = |unique: bool| Linked { unique, ..Linked::declared("o", "c", "c", "k") };
         let inner = PADDED.replace("Join LEFT", "Join INNER");
         let mut plan = Plan::parse(&inner).expect("parses");
         push(&mut plan, &stats, &[link(true)]);

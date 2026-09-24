@@ -154,6 +154,13 @@ pub struct Linked {
     /// a relationship with no link gets, since totality is a fact about the children and the thing
     /// that counted them is the link.
     pub total: bool,
+    /// Whether the parent's key column is certified distinct, nulls aside.
+    ///
+    /// A built link says so, and so does a key map the parent's file holds over the column, since
+    /// the build writes one only over distinct values. The second is what is left when the child's
+    /// link did not fit its budget: nothing can be followed, but the parent is still known to have
+    /// one row per key, which is what an aggregate over that key needs to hear.
+    pub unique: bool,
     /// The second key column of each side, child then parent, for a key over two columns.
     ///
     /// `partsupp(ps_partkey, ps_suppkey)` is the one TPC-H has. A link over one is stored the same
@@ -170,7 +177,11 @@ impl Linked {
         parent: impl Into<String>,
         parent_column: impl Into<String>,
     ) -> Self {
-        Self { built: true, ..Self::declared(child, child_column, parent, parent_column) }
+        Self {
+            built: true,
+            unique: true,
+            ..Self::declared(child, child_column, parent, parent_column)
+        }
     }
 
     /// A relationship the file holds a link for whose every child row found a parent.
@@ -200,8 +211,15 @@ impl Linked {
             parent_column: parent_column.into(),
             built: false,
             total: false,
+            unique: false,
             second: None,
         }
+    }
+
+    /// The same relationship with the parent's key certified distinct by its key map.
+    #[must_use]
+    pub fn keyed(self) -> Self {
+        Self { unique: true, ..self }
     }
 
     /// The same relationship over a second pair of key columns.
