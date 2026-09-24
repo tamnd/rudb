@@ -33,9 +33,9 @@ libmimalloc-sys = { workspace = true, optional = true }
 rudb.workspace = true
 
 [features]
-default = ["mimalloc"]
-# Off gives a build with no C in it, which is what a packager that wants one asks for and what the
-# measurement is taken against.
+default = []
+# Off by default since the system allocator measured ahead on the queries, see `main.rs`. On gives
+# the mimalloc build back for a workload that is mostly cross thread frees.
 mimalloc = ["dep:libmimalloc-sys"]
 
 [lints]
