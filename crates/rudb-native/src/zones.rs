@@ -207,7 +207,7 @@ pub fn ascending(reader: &Reader) -> Vec<String> {
         .iter()
         .enumerate()
         .filter(|&(at, _)| {
-            crate::stats::summary(reader, at).is_some_and(|summary| {
+            crate::stats::held_summary(reader, at).is_some_and(|summary| {
                 summary.nulls == 0 && summary.order == rudb_stats::summary::Order::Ascending
             })
         })
@@ -230,7 +230,7 @@ pub fn widths(reader: &Reader) -> Vec<(String, u64)> {
         .enumerate()
         .filter(|(_, field)| field.ty.physical() == rudb_common::PhysicalType::Varlen)
         .filter_map(|(at, field)| {
-            let summary = crate::stats::summary(reader, at)?;
+            let summary = crate::stats::held_summary(reader, at)?;
             let values = summary.rows.checked_sub(summary.nulls).filter(|&values| values > 0)?;
             Some((field.name.clone(), summary.bytes.div_ceil(values)))
         })

@@ -1721,8 +1721,24 @@ fn held_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
 /// planned before summaries existed.
 #[must_use]
 pub fn summary(reader: &Reader, column: usize) -> Option<Summary> {
-    let bytes = payload(reader, column, section::SUMMARY)?;
-    Summary::decode(&bytes).ok()
+    held_summary(reader, column).map(|summary| Summary::clone(&summary))
+}
+
+/// [`summary`] without the copy, read and decoded the first time anything asks and kept for as long
+/// as the table is open.
+///
+/// Binding a native table asks for the summary of every column, to find the ones in ascending order
+/// and the average width of the strings, and that was a read and a checksum of the section and a
+/// decode for each of them on every statement. On the 105 columns of ClickBench it was 50 of the 881
+/// samples of ClickBench 28 on one thread. The reader's table is a snapshot that never changes, so
+/// what its sections say does not either.
+pub(crate) fn held_summary(reader: &Reader, column: usize) -> Option<Arc<Summary>> {
+    let slot = reader.summaries.get(column)?;
+    slot.get_or_init(|| {
+        let bytes = payload(reader, column, section::SUMMARY)?;
+        Summary::decode(&bytes).ok().map(Arc::new)
+    })
+    .clone()
 }
 
 /// The sketches this table carries for a column, same.
