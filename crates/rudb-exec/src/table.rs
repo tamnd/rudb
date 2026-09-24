@@ -1184,7 +1184,7 @@ impl<'a> Coded<'a> {
     /// row's place is worked out in a register and used at once. The rows that found nothing are
     /// the first of each combination and need their place again, so when there are any the caller
     /// asks [`Self::places`] for them the long way. `None` is a key this does not answer.
-    pub(crate) fn look_up(&self, map: &[usize], slots: &mut [usize]) -> Option<bool> {
+    pub(crate) fn look_up(&self, map: &[u32], slots: &mut [usize]) -> Option<bool> {
         let mut plain = self.columns.iter().flatten().map(|column| match column.places {
             Places::Codes { codes, .. } if !column.nullable => Some((codes, column.stride)),
             _ => None,
@@ -1199,16 +1199,16 @@ impl<'a> Coded<'a> {
             None => {
                 for (slot, &code) in slots.iter_mut().zip(first) {
                     let found = map[code as usize * stride];
-                    missed |= found == NOWHERE;
-                    *slot = found;
+                    missed |= found == UNSEEN;
+                    *slot = slot_at(found);
                 }
             }
             Some(second) => {
                 let (other, across) = second?;
                 for ((slot, &code), &next) in slots.iter_mut().zip(first).zip(other) {
                     let found = map[code as usize * stride + next as usize * across];
-                    missed |= found == NOWHERE;
-                    *slot = found;
+                    missed |= found == UNSEEN;
+                    *slot = slot_at(found);
                 }
             }
         }
@@ -1442,6 +1442,33 @@ pub(crate) fn coded_within<'a>(
         combos *= span;
     }
     Some(Coded { columns, combos })
+}
+
+/// What a place of the aggregate's map of codes holds before a group is found for it.
+///
+/// The map holds a slot in 32 bits rather than a `usize`. Every instance clears a map seeded on a
+/// key's ends, up to a quarter of a million places, and a sorted key hands each instance a stretch
+/// of the values, so the clear is most of what the map costs on six threads. Half the width is half
+/// of that, and half the cache lines a key in no order reads its slots out of. A table that could
+/// take a group past [`UNSEEN`] is not given a map. See [`fits_the_map`].
+pub(crate) const UNSEEN: u32 = u32::MAX;
+
+/// The slot a place of the map holds, `NOWHERE` for [`UNSEEN`].
+#[inline(always)]
+pub(crate) fn slot_at(held: u32) -> usize {
+    if held == UNSEEN { NOWHERE } else { held as usize }
+}
+
+/// What a place of the map holds for `slot`, [`UNSEEN`] for `NOWHERE`.
+#[inline(always)]
+pub(crate) fn held_at(slot: usize) -> u32 {
+    u32::try_from(slot).unwrap_or(UNSEEN)
+}
+
+/// Whether every slot a table of `groups` groups can give out over `rows` more rows fits a place of
+/// the map, which is under [`UNSEEN`].
+pub(crate) fn fits_the_map(groups: usize, rows: usize) -> bool {
+    groups.saturating_add(rows) < UNSEEN as usize
 }
 
 /// The window a map of one integer key column's values starts on when the planner knows the
