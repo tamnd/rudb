@@ -130,15 +130,37 @@ pub struct SymbolTable {
     lookup: OnceLock<Lookup>,
 }
 
-/// The three tables the matcher reads, all of them built from the symbols and holding nothing else.
+/// The tables the matcher reads, all of them built from the symbols and holding nothing else.
 struct Lookup {
-    /// First byte to code, or [`ESCAPE`] when no one byte symbol covers it.
+    /// First byte to code, or [`ESCAPE`] when no one byte symbol covers it. Only read for the last
+    /// byte of a string, where `short` would be looking at a padding byte as the second one.
     single: Vec<u8>,
-    /// First two bytes to code, or `u16::MAX` when there is no two byte symbol for them.
-    pair: Vec<u16>,
-    /// Open addressed, keyed on the first three bytes, holding every symbol of three bytes or more.
-    hash: Vec<Option<(Symbol, u8)>>,
+    /// First two bytes to what matches there when no longer symbol does: the code in the low byte
+    /// and the length in the high one. That is the two byte symbol when there is one, and otherwise
+    /// what `single` says for the first byte with a length of one, so that the fallback is one load
+    /// rather than two lookups and a branch between them.
+    short: Vec<u16>,
+    /// Open addressed on the first three bytes, one slot for each three bytes that some symbol of
+    /// three bytes or more starts with, pointing at that symbol's group in `long`.
+    heads: Vec<Head>,
+    /// Every symbol of three bytes or more that a match can reach, grouped by their first three
+    /// bytes and longest first inside a group, so the first one in a group that matches is the one
+    /// to take.
+    long: Vec<(Symbol, u8)>,
 }
+
+/// One slot of [`Lookup::heads`].
+#[derive(Debug, Clone, Copy)]
+struct Head {
+    /// The first three bytes, or [`NO_HEAD`] for an empty slot.
+    key: u32,
+    /// Where the group starts in [`Lookup::long`] and how many symbols it has.
+    first: u16,
+    count: u16,
+}
+
+/// The key of an empty [`Head`], which no three bytes can be.
+const NO_HEAD: u32 = u32::MAX;
 
 impl std::fmt::Debug for SymbolTable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -178,8 +200,9 @@ impl SymbolTable {
             + self.symbols.capacity() * size_of::<Symbol>()
             + self.lookup.get().map_or(0, |lookup| {
                 lookup.single.capacity()
-                    + lookup.pair.capacity() * size_of::<u16>()
-                    + lookup.hash.capacity() * size_of::<Option<(Symbol, u8)>>()
+                    + lookup.short.capacity() * size_of::<u16>()
+                    + lookup.heads.capacity() * size_of::<Head>()
+                    + lookup.long.capacity() * size_of::<(Symbol, u8)>()
             })
     }
 
@@ -285,9 +308,10 @@ impl SymbolTable {
     /// because that is what keeps random access, which is the first of the two reasons this encoding
     /// was chosen at all.
     pub fn compress(&self, input: &[u8], out: &mut Vec<u8>) {
+        let lookup = self.lookup();
         let mut at = 0;
         while at < input.len() {
-            let (code, len) = self.match_at(input, at);
+            let (code, len) = lookup.match_at(input, at);
             if code == ESCAPE {
                 out.push(ESCAPE);
                 out.push(input[at]);
@@ -381,60 +405,14 @@ impl SymbolTable {
         Ok(at)
     }
 
-    /// The code and how many input bytes it covers. [`ESCAPE`] and 1 when nothing matches.
-    fn match_at(&self, input: &[u8], at: usize) -> (u8, usize) {
-        let remaining = input.len() - at;
-        let word = load(input, at);
-        // Written as a nested `if` rather than as a chained `if let` because the minimum supported
-        // Rust version is 1.85 and let chains landed in 1.88.
-        if remaining >= 3 {
-            if let Some((symbol, code)) = self.probe(word, remaining) {
-                return (code, symbol.len());
-            }
-        }
-        if remaining >= 2 {
-            let code = self.lookup().pair[(word & 0xffff) as usize];
-            if code != u16::MAX {
-                return (code as u8, 2);
-            }
-        }
-        let code = self.lookup().single[(word & 0xff) as usize];
-        if code == ESCAPE { (ESCAPE, 1) } else { (code, 1) }
-    }
-
-    /// The longest symbol of three bytes or more matching here, if any.
-    ///
-    /// Longest rather than first, because several symbols share a three byte prefix and taking
-    /// whichever the probe reached first would make the compression ratio depend on the order the
-    /// table was built in.
-    fn probe(&self, word: u64, remaining: usize) -> Option<(Symbol, u8)> {
-        let hash = &self.lookup().hash;
-        let mut slot = hash_of(word);
-        let mut best: Option<(Symbol, u8)> = None;
-        for _ in 0..PROBE {
-            match hash[slot] {
-                None => break,
-                Some((symbol, code)) => {
-                    if symbol.len() <= remaining
-                        && word & symbol.mask() == symbol.value
-                        && best.is_none_or(|(found, _)| symbol.len() > found.len())
-                    {
-                        best = Some((symbol, code));
-                    }
-                }
-            }
-            slot = (slot + 1) & (HASH_SLOTS - 1);
-        }
-        best
-    }
-
     /// Runs the matcher over a sample without producing output, recording what it used. This is the
     /// counting half of a training generation.
     fn count(&self, input: &[u8], counts: &mut Counts) {
+        let lookup = self.lookup();
         let mut at = 0;
         let mut previous: Option<u16> = None;
         while at < input.len() {
-            let (code, len) = self.match_at(input, at);
+            let (code, len) = lookup.match_at(input, at);
             let id = if code == ESCAPE { 256 + u16::from(input[at]) } else { u16::from(code) };
             counts.one(id);
             if let Some(previous) = previous {
@@ -456,11 +434,15 @@ impl SymbolTable {
 
 impl Lookup {
     fn of(symbols: &[Symbol]) -> Self {
-        let mut table = Self {
-            single: vec![ESCAPE; 256],
-            pair: vec![u16::MAX; 65536],
-            hash: vec![None; HASH_SLOTS],
-        };
+        let mut single = vec![ESCAPE; 256];
+        let mut pair = vec![u16::MAX; 65536];
+        // Where each long symbol would sit in a table probed PROBE slots from the hash of its first
+        // three bytes. That table is not kept, since a match only needs the groups below, but it
+        // is what decides which long symbols a match can reach at all: one that finds no free slot
+        // in its window is never matched, and that has to stay true for a string to compress to
+        // the same bytes it always has.
+        let mut placed: Vec<Option<(Symbol, u8)>> = vec![None; HASH_SLOTS];
+        let mut long = Vec::new();
         // Longest first, so that a short symbol never displaces a long one out of the probe window
         // and the flat tables get the lowest code for a duplicate.
         let mut order: Vec<(Symbol, u8)> =
@@ -470,21 +452,22 @@ impl Lookup {
             match symbol.len() {
                 1 => {
                     let index = (symbol.value & 0xff) as usize;
-                    if table.single[index] == ESCAPE {
-                        table.single[index] = code;
+                    if single[index] == ESCAPE {
+                        single[index] = code;
                     }
                 }
                 2 => {
                     let index = (symbol.value & 0xffff) as usize;
-                    if table.pair[index] == u16::MAX {
-                        table.pair[index] = u16::from(code);
+                    if pair[index] == u16::MAX {
+                        pair[index] = u16::from(code);
                     }
                 }
                 _ => {
                     let mut slot = hash_of(symbol.value);
                     for _ in 0..PROBE {
-                        if table.hash[slot].is_none() {
-                            table.hash[slot] = Some((symbol, code));
+                        if placed[slot].is_none() {
+                            placed[slot] = Some((symbol, code));
+                            long.push((symbol, code));
                             break;
                         }
                         slot = (slot + 1) & (HASH_SLOTS - 1);
@@ -492,7 +475,87 @@ impl Lookup {
                 }
             }
         }
-        table
+        // `long` is in the order the symbols went in, longest first and then by code, and a stable
+        // sort on the first three bytes keeps that order inside each group. The probe used to keep
+        // the longest match and the first of equals, which is the first match in that order.
+        long.sort_by_key(|(symbol, _)| symbol.value & 0xff_ffff);
+        let mut heads = vec![Head { key: NO_HEAD, first: 0, count: 0 }; HASH_SLOTS];
+        let mut start = 0;
+        while start < long.len() {
+            let key = long[start].0.value & 0xff_ffff;
+            let mut end = start + 1;
+            while end < long.len() && long[end].0.value & 0xff_ffff == key {
+                end += 1;
+            }
+            // There are at most 255 symbols, so there are fewer groups than slots and the probe
+            // finds a free one.
+            let mut slot = hash_of(key);
+            while heads[slot].key != NO_HEAD {
+                slot = (slot + 1) & (HASH_SLOTS - 1);
+            }
+            heads[slot] =
+                Head { key: key as u32, first: start as u16, count: (end - start) as u16 };
+            start = end;
+        }
+        let short = (0..65536usize)
+            .map(|index| {
+                if pair[index] == u16::MAX {
+                    u16::from(single[index & 0xff]) | 1 << 8
+                } else {
+                    pair[index] | 2 << 8
+                }
+            })
+            .collect();
+        Self { single, short, heads, long }
+    }
+
+    /// The code and how many input bytes it covers. [`ESCAPE`] and 1 when nothing matches.
+    ///
+    /// Always inlined, because as a call the saving and restoring of registers around it cost as
+    /// much as a lookup that finds its symbol in the first slot.
+    #[inline(always)]
+    fn match_at(&self, input: &[u8], at: usize) -> (u8, usize) {
+        let remaining = input.len() - at;
+        let word = load(input, at);
+        // Written as a nested `if` rather than as a chained `if let` because the minimum supported
+        // Rust version is 1.85 and let chains landed in 1.88.
+        if remaining >= 3 {
+            if let Some(found) = self.long_at(word, remaining) {
+                return found;
+            }
+        }
+        if remaining >= 2 {
+            let entry = self.short[(word & 0xffff) as usize];
+            return ((entry & 0xff) as u8, usize::from(entry >> 8));
+        }
+        (self.single[(word & 0xff) as usize], 1)
+    }
+
+    /// The longest symbol of three bytes or more matching here, if any, as its code and length.
+    ///
+    /// Longest rather than first, because several symbols share a three byte prefix and taking
+    /// whichever came first would make the compression ratio depend on the order the table was
+    /// built in. The group is in longest first order, so the first match is the longest.
+    #[inline]
+    fn long_at(&self, word: u64, remaining: usize) -> Option<(u8, usize)> {
+        let key = (word & 0xff_ffff) as u32;
+        let mut slot = hash_of(word);
+        loop {
+            let head = self.heads[slot];
+            if head.key == key {
+                let group = &self.long[usize::from(head.first)..][..usize::from(head.count)];
+                return group
+                    .iter()
+                    .find(|(symbol, _)| {
+                        symbol.len() <= remaining && word & symbol.mask() == symbol.value
+                    })
+                    .map(|(symbol, code)| (*code, symbol.len()));
+            }
+            if head.key == NO_HEAD {
+                return None;
+            }
+            slot = (slot + 1) & (HASH_SLOTS - 1);
+        }
     }
 }
 
@@ -500,10 +563,20 @@ impl Lookup {
 ///
 /// The padding is why every match checks the remaining length as well as the mask. Without that
 /// check a two byte symbol ending in a zero byte would match the last byte of a string.
+///
+/// Near the end of a string that is at least eight bytes long, the word is the last eight bytes
+/// shifted down past the ones before `at`, which is one load where reading the tail a byte at a
+/// time was a loop at seven places in every string.
+#[inline]
 fn load(input: &[u8], at: usize) -> u64 {
     if at + 8 <= input.len() {
         let bytes: [u8; 8] = input[at..at + 8].try_into().expect("eight bytes were checked");
         u64::from_le_bytes(bytes)
+    } else if input.len() >= 8 {
+        let bytes: [u8; 8] = input[input.len() - 8..].try_into().expect("eight bytes were checked");
+        // `at` is inside the last eight bytes and not at their start, so this shifts by eight to
+        // fifty six bits.
+        u64::from_le_bytes(bytes) >> (8 * (at + 8 - input.len()))
     } else {
         let mut word = 0u64;
         for (index, byte) in input[at..].iter().enumerate() {
@@ -940,6 +1013,99 @@ mod tests {
         assert_eq!(out, vec![1, ESCAPE, b'c', ESCAPE, b'd']);
     }
 
+    /// The matcher the way it was before the long symbols were grouped by their first three bytes:
+    /// a probe of up to eight slots from the hash, keeping the longest match, then the pair table,
+    /// then the single one.
+    fn match_by_probe(symbols: &[Symbol], input: &[u8], at: usize) -> (u8, usize) {
+        let mut single = vec![ESCAPE; 256];
+        let mut pair = vec![u16::MAX; 65536];
+        let mut hash: Vec<Option<(Symbol, u8)>> = vec![None; HASH_SLOTS];
+        let mut order: Vec<(Symbol, u8)> =
+            symbols.iter().enumerate().map(|(code, symbol)| (*symbol, code as u8)).collect();
+        order.sort_by_key(|(symbol, code)| (std::cmp::Reverse(symbol.len()), *code));
+        for (symbol, code) in order {
+            match symbol.len() {
+                1 if single[(symbol.value & 0xff) as usize] == ESCAPE => {
+                    single[(symbol.value & 0xff) as usize] = code;
+                }
+                2 if pair[(symbol.value & 0xffff) as usize] == u16::MAX => {
+                    pair[(symbol.value & 0xffff) as usize] = u16::from(code);
+                }
+                1 | 2 => {}
+                _ => {
+                    let mut slot = hash_of(symbol.value);
+                    for _ in 0..PROBE {
+                        if hash[slot].is_none() {
+                            hash[slot] = Some((symbol, code));
+                            break;
+                        }
+                        slot = (slot + 1) & (HASH_SLOTS - 1);
+                    }
+                }
+            }
+        }
+        let remaining = input.len() - at;
+        let word = load(input, at);
+        if remaining >= 3 {
+            let mut slot = hash_of(word);
+            let mut best: Option<(Symbol, u8)> = None;
+            for _ in 0..PROBE {
+                let Some((symbol, code)) = hash[slot] else { break };
+                if symbol.len() <= remaining
+                    && word & symbol.mask() == symbol.value
+                    && best.is_none_or(|(found, _)| symbol.len() > found.len())
+                {
+                    best = Some((symbol, code));
+                }
+                slot = (slot + 1) & (HASH_SLOTS - 1);
+            }
+            if let Some((symbol, code)) = best {
+                return (code, symbol.len());
+            }
+        }
+        if remaining >= 2 {
+            let code = pair[(word & 0xffff) as usize];
+            if code != u16::MAX {
+                return (code as u8, 2);
+            }
+        }
+        (single[(word & 0xff) as usize], 1)
+    }
+
+    #[test]
+    fn grouping_the_long_symbols_matches_what_the_probe_matched() {
+        // A small alphabet and a full table, so that many long symbols share their first three
+        // bytes, some clusters overflow the probe window, and a symbol can end in a zero byte.
+        let alphabet = b"ab\0c";
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for round in 0..40 {
+            let mut symbols = Vec::new();
+            while symbols.len() < MAX_SYMBOLS {
+                let len = 1 + next(MAX_SYMBOL_LEN);
+                let bytes: Vec<u8> = (0..len).map(|_| alphabet[next(alphabet.len())]).collect();
+                symbols.push(Symbol::new(&bytes));
+            }
+            let table = SymbolTable::build(symbols.clone());
+            for _ in 0..50 {
+                let input: Vec<u8> =
+                    (0..next(40)).map(|_| alphabet[next(alphabet.len())]).collect();
+                for at in 0..input.len() {
+                    assert_eq!(
+                        table.lookup().match_at(&input, at),
+                        match_by_probe(&symbols, &input, at),
+                        "round {round}, {input:?} at {at}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn concatenation_stops_at_eight_bytes() {
         let long = Symbol::new(b"abcdef");
@@ -959,7 +1125,7 @@ mod tests {
                 let mut at = 0;
                 let mut previous: Option<u16> = None;
                 while at < sample.len() {
-                    let (code, len) = table.match_at(sample, at);
+                    let (code, len) = table.lookup().match_at(sample, at);
                     let id =
                         if code == ESCAPE { 256 + u16::from(sample[at]) } else { u16::from(code) };
                     single[id as usize] += 1;
