@@ -177,6 +177,26 @@ impl Sketch {
         self.add_hash(hash64(value));
     }
 
+    /// A hash no sketch this one is unioned with needs from anything else, once this one holds its k.
+    ///
+    /// The union keeps the k smallest hashes of everything in it, and this sketch alone has k at or
+    /// below this, so a hash above it can never be one the union keeps. `None` while the sketch is
+    /// still exact, when it keeps everything.
+    #[must_use]
+    pub fn ceiling(&self) -> Option<u64> {
+        self.full.then_some(self.threshold)
+    }
+
+    /// Keeps nothing at or above `ceiling` from here on.
+    ///
+    /// For a sketch of part of a column whose other parts will be unioned with it, with the ceiling
+    /// one of those parts reported through [`Self::ceiling`]. Every hash turned away is one the union
+    /// would drop, so the union comes out the same, but this sketch on its own no longer describes its
+    /// part and must not be asked for an estimate.
+    pub fn cap_at(&mut self, ceiling: u64) {
+        self.threshold = self.threshold.min(ceiling);
+    }
+
     /// Adds a value that has already been hashed, for a caller that is hashing anyway.
     ///
     /// The first line is the whole of it for all but a few thousand values of a large column, and
