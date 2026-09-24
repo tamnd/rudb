@@ -1595,16 +1595,15 @@ fn coded_runs(input: &Vector, rows: usize) -> Option<Vec<i64>> {
 /// Only calls that read values of one layout share a pass, because the value loop is written once per
 /// layout and a loop that asked which layout it was reading, per call and per run, would spend more on
 /// the question than the sharing saves. The pass takes the layout the most of the offered calls have,
-/// and a caller with two layouts in its chunk asks again with what is left. q01 is that caller: it sums
-/// two `DECIMAL(15, 2)` columns, which are held in an `i64`, and two computed decimals wide enough to
-/// be held in an `i128`.
+/// and a caller with two layouts in its chunk asks again with what is left.
 ///
-/// A column that points somewhere else is read out into a run of `i64` by [`coded_runs`] first, and
-/// those calls share a pass of their own, since what they hold once they are read is one layout whatever
-/// they were held in. The reading costs a pass and an allocation, so it happens only for the calls whose
-/// pass is the one being taken, and a chunk whose flat calls outnumber them pays nothing for it. q01 is
-/// three calls over stored decimals, which arrive as dictionaries over packed runs, and two over
-/// decimals its own arithmetic computed, which are flat because nothing stored them.
+/// A column that points somewhere else is read out into a run of `i64` by [`coded_runs`] first, and a
+/// flat column of `i64` joins that pass, since a read out column and a flat one read the same way once
+/// the reading is done. The reading costs a pass and an allocation, so it happens only for the calls
+/// whose pass is the one being taken, and a chunk whose flat calls of another layout outnumber them
+/// pays nothing for it. q01 is that chunk the other way about: three calls over stored decimals, which
+/// arrive packed, and two over decimals its own arithmetic computed, which are flat and `i64` because
+/// `DECIMAL(18, 4)` and `DECIMAL(18, 6)` both fit one, so all five walk the runs together.
 ///
 /// A count reads no value, so it goes on whichever pass is first and asks nothing of the layout. What a
 /// count wants out of a run is its length, and the walk is adding those up per group regardless, so a
@@ -1665,25 +1664,40 @@ pub fn update_shared_runs(
         return Ok(0);
     }
     let took = counting.iter().fold(0_u64, |took, &offset| took | 1 << offset);
-    // The columns that point somewhere else are read out into runs of `i64` and share a pass of their
-    // own, since what they hold once they are read is one layout whatever they were held in. Read only
-    // when there are more of them than of the widest flat layout, so that a chunk whose flat calls are
-    // the pass this time pays nothing for the reading, and the caller asks again for what is left.
+    // A flat column of `i64` reads exactly as a column read out into a run of `i64` does, so it joins
+    // that pass rather than waiting for one of its own. What that is worth is the walk it does not
+    // make: the run itself, and not what is read inside it, is most of what a pass costs, so two
+    // passes of three columns and two cost half as much again as one pass of five. q01 is that chunk.
+    let flat: Vec<(usize, Feed, &[i64])> = ready
+        .iter()
+        .filter_map(|call| match call.data {
+            Data::Int64(values) => Some((call.offset, call.feed, &values.as_slice()[..rows])),
+            _ => None,
+        })
+        .collect();
+    // The columns that point somewhere else are read out into runs of `i64` and share a pass with the
+    // flat `i64` ones, since what they hold once they are read is one layout whatever they were held
+    // in. Read only when the two together outnumber the widest flat layout, so that a chunk whose flat
+    // calls are the pass this time pays nothing for the reading, and the caller asks again for what is
+    // left.
     let mut read = Vec::with_capacity(coded.len());
-    if coded.len() > most {
+    if coded.len() + flat.len() > most {
         for &(offset, feed, input) in &coded {
             if let Some(values) = coded_runs(input, rows) {
                 read.push((offset, feed, values));
             }
         }
     }
-    if read.len() > most && read.len() + counting.len() >= 2 {
-        let group: Vec<(usize, Feed, &[i64])> =
+    if !read.is_empty() && read.len() + flat.len() > most {
+        let mut group: Vec<(usize, Feed, &[i64])> =
             read.iter().map(|(offset, feed, values)| (*offset, *feed, values.as_slice())).collect();
-        if !many_runs(states, runs, stride, &group, &counting, groups)? {
-            return Ok(0);
+        group.extend_from_slice(&flat);
+        if group.len() + counting.len() >= 2 {
+            if !many_runs(states, runs, stride, &group, &counting, groups)? {
+                return Ok(0);
+            }
+            return Ok(group.iter().fold(took, |took, &(offset, _, _)| took | 1 << offset));
         }
-        return Ok(group.iter().fold(took, |took, &(offset, _, _)| took | 1 << offset));
     }
     if most + counting.len() < 2 {
         return Ok(0);
@@ -4535,6 +4549,103 @@ mod tests {
                 let answer = alone[index].finish().expect("finishes");
                 assert_eq!(apiece[index].finish().expect("finishes"), answer, "{note}, apiece");
                 assert_eq!(together[index].finish().expect("finishes"), answer, "{note}, together");
+            }
+        }
+    }
+
+    /// q01's real shape walks the runs once. Its stored decimals are packed and its computed ones are
+    /// flat, and both are held in an `i64`, so the read out columns and the flat ones are one pass.
+    ///
+    /// The walk itself is most of what a pass costs, so what this asserts is the pass count. Two passes
+    /// over three columns and two would read the same values and walk the same runs twice.
+    #[test]
+    fn a_flat_column_of_i64_walks_the_runs_with_the_columns_read_out_into_one() {
+        let mut rng = Rng(0x5eed_c0de_dbca_0071);
+        let rows = 89;
+        let groups = 4;
+        let money = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let computed = LogicalType::decimal(18, 4).expect("a legal decimal");
+        let calls = [
+            ("sum", &money, "packed"),
+            ("avg", &money, "packed"),
+            ("sum", &money, "coded"),
+            ("sum", &computed, "flat"),
+            ("sum", &computed, "flat"),
+            ("count", &money, "packed"),
+            ("count_star", &LogicalType::BigInt, "none"),
+        ];
+        let stride = calls.len();
+        let slots: Vec<usize> =
+            (0..rows).map(|row| if row % 19 == 5 { NOWHERE } else { row / 3 % groups }).collect();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            match runs.last_mut() {
+                Some((held, end)) if *held == slot => *end = row + 1,
+                _ => runs.push((slot, row + 1)),
+            }
+        }
+        let distinct = 11;
+        let columns: Vec<Option<Vector>> = calls
+            .iter()
+            .map(|&(_, ty, held)| match held {
+                "packed" => {
+                    let values =
+                        flat(ty, rows, 0, &mut rng).bit_packed().expect("packs or hands it back");
+                    assert_eq!(values.form(), Form::BitPacked, "the values of {ty} did not pack");
+                    Some(values)
+                }
+                "coded" => {
+                    let values = flat(ty, distinct, 0, &mut rng)
+                        .bit_packed()
+                        .expect("packs or hands it back");
+                    let codes: Vec<u32> =
+                        (0..rows).map(|row| (row * 5 % distinct) as u32).collect();
+                    Some(Vector::dictionary(codes, values).expect("codes are in range"))
+                }
+                "flat" => {
+                    let values = flat(ty, rows, 0, &mut rng);
+                    assert_eq!(values.form(), Form::Flat);
+                    Some(values)
+                }
+                _ => None,
+            })
+            .collect();
+        let inputs: Vec<Option<&Vector>> = columns.iter().map(Option::as_ref).collect();
+        let fresh = || {
+            let mut states = Vec::new();
+            for _ in 0..groups {
+                for &(name, ty, _) in &calls {
+                    states.push(Accumulator::new(name, &returns_of(name, ty)).expect("known"));
+                }
+            }
+            states
+        };
+        let mut alone = fresh();
+        for (at, &input) in inputs.iter().enumerate() {
+            update_scattered(&mut alone, &slots, stride, at, input, rows).expect("folds them in");
+        }
+        let mut together = fresh();
+        let offered = (1_u64 << stride) - 1;
+        let mut shared = 0;
+        let mut passes = 0;
+        loop {
+            let took =
+                update_shared_runs(&mut together, &runs, stride, &inputs, offered & !shared, rows)
+                    .expect("folds them in");
+            if took == 0 {
+                break;
+            }
+            shared |= took;
+            passes += 1;
+        }
+        assert_eq!(shared, 0b111_1111, "the wrong calls shared a walk");
+        assert_eq!(passes, 1, "the flat i64 calls did not walk the runs with the read out ones");
+        for group in 0..groups {
+            for (at, &(name, _, _)) in calls.iter().enumerate() {
+                let index = group * stride + at;
+                let answer = alone[index].finish().expect("finishes");
+                let note = format!("{name} at {at} of group {group}");
+                assert_eq!(together[index].finish().expect("finishes"), answer, "{note}");
             }
         }
     }
