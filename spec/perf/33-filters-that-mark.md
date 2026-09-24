@@ -1,10 +1,10 @@
 # Filters that mark
 
-Notes written on 24 September 2026, after [note 25](25-arithmetic-in-one-loop.md) and the packed reads that followed it left the filter's compaction as about a fifth of q01's instructions.
+Notes written on 24 September 2026, after [note 32](32-columns-the-filter-read-last.md) stopped the scan unpacking the ship date after q01's filter had read it, which still left the filter cutting the other six columns.
 
 ## The question
 
-q01 filters lineitem on `l_shipdate <= date '1998-09-02'`, which keeps about 98 percent of the rows, and then groups what is left by two flags and sums and averages four columns. The filter is pushed into the scan, and when it kept fewer rows than a chunk held it cut every column the query reads down to the kept rows before handing the chunk up. For q01 that means copying seven columns of nearly 8192 rows each to drop about 150 of them. The question was whether a filter that keeps most of a chunk can tell the operator above it which rows it kept and leave the columns as they are.
+q01 filters lineitem on `l_shipdate <= date '1998-09-02'`, which keeps about 98 percent of the rows, and then groups what is left by two flags and sums and averages four columns. The filter is pushed into the scan, and when it kept fewer rows than a chunk held it cut every column the query reads down to the kept rows before handing the chunk up. For q01 that means copying six columns of nearly 8192 rows each, the packed ones unpacked at every kept row, to drop about 150 of them. The question was whether a filter that keeps most of a chunk can tell the operator above it which rows it kept and leave the columns as they are.
 
 ## What changed
 
@@ -16,21 +16,21 @@ Any path in the aggregate that cannot work this way, such as a distinct count, a
 
 ## Numbers
 
-Ten q01 runs on one thread on server3, which was under a load of about 40 on 8 cores, three runs each:
+Ten q01 runs on one thread on server3, against main with note 32 in it, three runs each. The machine was under a load of between 5 and 18 while these ran:
 
 | | cycles | instructions |
 |---|---|---|
-| main | 10.86 G to 11.24 G | 29.23 G |
-| this change | 9.87 G to 10.09 G | 26.12 G |
+| main | 10.20 G to 10.34 G | 27.65 G |
+| this change | 9.76 G to 9.87 G | 25.84 G |
 
-Instructions fell 10.6 percent and cycles about 10 percent. DuckDB on the same file and one thread takes about 6.8 G cycles and 11.4 G instructions for the ten runs.
+Instructions fell 6.6 percent and cycles about 4.5 percent. Before note 32 was merged the same change took the ten runs from 29.23 G to 26.12 G, so the two overlap on the ship date and each still saves on its own. DuckDB on the same file and one thread takes about 6.8 G cycles and 11.4 G instructions for the ten runs. The wall time moved too much with the load on the machine to be worth reporting.
 
 The 22 TPC-H queries on server3 against the native file, best of three, instructions over all threads:
 
 | | q01 | total |
 |---|---|---|
-| main | 3.020 G | 28.824 G |
-| this change | 2.709 G | 28.551 G |
+| main | 2.869 G | 28.386 G |
+| this change | 2.686 G | 28.314 G |
 
 The other 21 queries moved by less than one percent either way, which is the noise of counting over all threads, as none of them has a filter that keeps most rows directly under a grouping. Every one of the 22 answers is the same as main's.
 
