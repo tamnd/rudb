@@ -819,13 +819,12 @@ fn traced(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Option<ColumnBi
     }
 }
 
-/// The two columns one equality holds equal, when that is what the conditions are.
+/// The two columns one condition holds equal, when it is an equality between two columns.
 ///
 /// Anything else is `None`, including one equality between a column and something computed, because
 /// a link is indexed by a column and an expression over one is not that column.
-fn equated_pair(plan: &Plan, conditions: Slice) -> Option<[ColumnBinding; 2]> {
-    let [condition] = plan.expr_list(conditions) else { return None };
-    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(*condition) else {
+fn equated(plan: &Plan, condition: ExprRef) -> Option<[ColumnBinding; 2]> {
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
         return None;
     };
     match (plan.expr(left), plan.expr(right)) {
@@ -1905,9 +1904,9 @@ impl<'a> Building<'a, '_> {
     /// Everything a link join needs out of the catalog, or the reason it cannot be built.
     ///
     /// The edge is derived here rather than carried in the plan, and the derivation is the reason
-    /// `Plan::check` insists on exactly one equality. That equality names two columns, each of them
-    /// a binding into a table index, and a table index reaches the `Get` that introduced it, and a
-    /// `Get` names a stored table whose columns have positions. So the four fields of the
+    /// `Plan::check` insists on one equality per key column. Each equality names two columns, each
+    /// of them a binding into a table index, and a table index reaches the `Get` that introduced
+    /// it, and a `Get` names a stored table whose columns have positions. So the four fields of the
     /// [`rudb_native::graph::Edge`] a stored link is looked up by are read out of the plan rather
     /// than written into it, and there is no second spelling of the relationship that could
     /// disagree with the first.
@@ -1931,15 +1930,27 @@ impl<'a> Building<'a, '_> {
         else {
             return Err(refuse("a parent that is not a stored table"));
         };
-        let [first, second] = equated_pair(plan, conditions)
-            .ok_or_else(|| refuse("something other than one equality between two columns"))?;
+        let keys = plan
+            .expr_list(conditions)
+            .iter()
+            .map(|&condition| equated(plan, condition))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| refuse("something other than equalities between two columns"))?;
         // Either way round is the same edge, since an equality has no sides.
-        let (child_key, parent_key) =
-            match (first.table == parent_index, second.table == parent_index) {
+        let mut oriented = Vec::with_capacity(keys.len());
+        for [first, second] in keys {
+            oriented.push(match (first.table == parent_index, second.table == parent_index) {
                 (false, true) => (first, second),
                 (true, false) => (second, first),
                 _ => return Err(refuse("an equality that does not read both of its inputs")),
-            };
+            });
+        }
+        let Some(&(child_key, _)) = oriented.first() else {
+            return Err(refuse("no equality at all"));
+        };
+        if oriented.iter().any(|(key, _)| key.table != child_key.table) {
+            return Err(refuse("a key whose child columns come from two tables"));
+        }
         let Some((child_table, child_columns)) = scanned(plan, catalog, child, child_key.table)?
         else {
             return Err(refuse("a child that is not a stored table"));
@@ -1949,27 +1960,39 @@ impl<'a> Building<'a, '_> {
         else {
             return Err(refuse("a table that is not one committed file"));
         };
-        let edge = rudb_native::graph::Edge {
-            child: child_table.name().table.clone(),
-            child_column: stored_column(
-                plan,
-                child_table,
-                child_key.table,
-                child_columns,
-                child_key,
-            )
-            .ok_or_else(|| refuse("a child key that is not a stored column"))?,
-            parent: parent_table.name().table.clone(),
-            parent_column: stored_column(
-                plan,
-                parent_table,
-                parent_index,
-                parent_columns,
-                parent_key,
-            )
-            .ok_or_else(|| refuse("a parent key that is not a stored column"))?,
+        // The key numbers the file names a relationship by, one column or a pair of them, in the
+        // order of the equalities. The rule accepted either order, and the link was stored under
+        // the declared one, so the pair is tried both ways round before it is refused.
+        let mut child_at = Vec::with_capacity(oriented.len());
+        let mut parent_at = Vec::with_capacity(oriented.len());
+        for &(child_key, parent_key) in &oriented {
+            child_at.push(
+                stored_column(plan, child_table, child_key.table, child_columns, child_key)
+                    .ok_or_else(|| refuse("a child key that is not a stored column"))?,
+            );
+            parent_at.push(
+                stored_column(plan, parent_table, parent_index, parent_columns, parent_key)
+                    .ok_or_else(|| refuse("a parent key that is not a stored column"))?,
+            );
+        }
+        let edge = |child_at: &[usize], parent_at: &[usize]| {
+            Some(rudb_native::graph::Edge {
+                child: child_table.name().table.clone(),
+                child_column: rudb_native::graph::key_of(child_at)?,
+                parent: parent_table.name().table.clone(),
+                parent_column: rudb_native::graph::key_of(parent_at)?,
+            })
         };
-        let link = rudb_native::graph::stored_link(child_rows, parent_rows, &edge)
+        let mut edges = vec![edge(&child_at, &parent_at)];
+        child_at.reverse();
+        parent_at.reverse();
+        if child_at.len() == 2 {
+            edges.push(edge(&child_at, &parent_at));
+        }
+        let link = edges
+            .into_iter()
+            .flatten()
+            .find_map(|edge| rudb_native::graph::stored_link(child_rows, parent_rows, &edge))
             .ok_or_else(|| refuse("a relationship the child's file has no link for"))?;
         // A semi or an anti join reads no column of the parent, which is not a special case here so
         // much as the reason those two are nearly free: the list below is empty, so the operator

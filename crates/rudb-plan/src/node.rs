@@ -472,8 +472,8 @@ pub enum Node {
         /// Inner, left, semi or anti. Section 5.2 handles no others: right and full need the
         /// parent rows nothing pointed at, which is the backward direction.
         kind: JoinKind,
-        /// The join condition, into the expression list pool. Exactly one equality, which is what
-        /// makes this shape recognizable at all.
+        /// The join condition, into the expression list pool. One equality per key column, which
+        /// is one or two, and is what makes this shape recognizable at all.
         conditions: Slice,
         /// The child column holding the row id the link is indexed by, which has to be `BIGINT`.
         ///

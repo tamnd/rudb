@@ -1942,9 +1942,6 @@ fn index(
 fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edge> {
     let mut edges = Vec::new();
     for link in declared {
-        let ([child], [parent]) = (&link.child.columns[..], &link.parent.columns[..]) else {
-            continue;
-        };
         let find = |name: &str| {
             catalog.tables().find(|table| table.name().table.eq_ignore_ascii_case(name))
         };
@@ -1954,7 +1951,7 @@ fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edg
             continue;
         };
         let (Some(child_column), Some(parent_column)) =
-            (child_table.column_index(child), parent_table.column_index(parent))
+            (key_in(child_table, &link.child.columns), key_in(parent_table, &link.parent.columns))
         else {
             continue;
         };
@@ -1966,6 +1963,16 @@ fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edg
         });
     }
     edges
+}
+
+/// The number the graph sections name a key over these columns by, when there is one.
+///
+/// One column is its index and two are a pair, which is `rudb_native::graph::key_of`. The columns
+/// have to be of the same count on both sides of a relationship, and the parser already refuses one
+/// whose sides differ, so this does not check it again.
+fn key_in(table: &rudb_catalog::Table, columns: &[String]) -> Option<usize> {
+    let at = columns.iter().map(|column| table.column_index(column)).collect::<Option<Vec<_>>>()?;
+    rudb_native::graph::key_of(&at)
 }
 
 /// Points every table at the generation the file now holds.
@@ -2817,22 +2824,32 @@ impl Shared {
     fn related(catalog: &Catalog, declared: &str) -> Vec<rudb_opt::link::Linked> {
         let mut found = Vec::new();
         for link in rudb_graph::parse_links(declared).unwrap_or_default() {
-            // One column each. A composite relationship is two key maps over a folded key and
-            // nothing folds one yet, so there is no link stored for one and nothing to plan over.
-            let ([child_key], [parent_key]) = (&link.child.columns[..], &link.parent.columns[..])
+            // One column each, or two each for a key like `partsupp`'s. Anything wider has no
+            // stored form, so there is nothing to plan over.
+            let (child_keys, parent_keys) = (&link.child.columns, &link.parent.columns);
+            let (Some(child_key), Some(parent_key)) = (child_keys.first(), parent_keys.first())
             else {
                 continue;
             };
+            let second = match (&child_keys[1..], &parent_keys[1..]) {
+                ([], []) => None,
+                ([child], [parent]) => Some((child, parent)),
+                _ => continue,
+            };
             let built = stored_link(
                 catalog,
-                (&link.child.table, child_key),
-                (&link.parent.table, parent_key),
+                (&link.child.table, child_keys),
+                (&link.parent.table, parent_keys),
             );
             let sides = (&link.child.table, child_key, &link.parent.table, parent_key);
-            found.push(match built {
+            let linked = match built {
                 Some(true) => rudb_opt::link::Linked::verified(sides.0, sides.1, sides.2, sides.3),
                 Some(false) => rudb_opt::link::Linked::built(sides.0, sides.1, sides.2, sides.3),
                 None => rudb_opt::link::Linked::declared(sides.0, sides.1, sides.2, sides.3),
+            };
+            found.push(match second {
+                Some((child, parent)) => linked.and(child, parent),
+                None => linked,
             });
         }
         found
@@ -3533,7 +3550,11 @@ fn planned(
 /// that named a parent in another file would only be resolvable by a reader that had both open and
 /// had checked that neither had moved. The binding check inside `stored_link` is what catches a
 /// parent that was rewritten since the link was built.
-fn stored_link(catalog: &Catalog, child: (&str, &str), parent: (&str, &str)) -> Option<bool> {
+fn stored_link(
+    catalog: &Catalog,
+    child: (&str, &[String]),
+    parent: (&str, &[String]),
+) -> Option<bool> {
     let child_table = table_named(catalog, child.0)?;
     let parent_table = table_named(catalog, parent.0)?;
     let (
@@ -3544,7 +3565,7 @@ fn stored_link(catalog: &Catalog, child: (&str, &str), parent: (&str, &str)) -> 
         return None;
     };
     let (Some(child_column), Some(parent_column)) =
-        (child_table.column_index(child.1), parent_table.column_index(parent.1))
+        (key_in(child_table, child.1), key_in(parent_table, parent.1))
     else {
         return None;
     };
