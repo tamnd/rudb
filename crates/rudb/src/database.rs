@@ -744,6 +744,19 @@ fn page_budget(limit: Option<u64>) -> usize {
     limit.map_or(usize::MAX, |limit| usize::try_from(limit / 2).unwrap_or(usize::MAX))
 }
 
+/// What a load's global dictionaries may hold between them before the fastest growing one stops
+/// taking values, which is a quarter of the memory limit.
+///
+/// The cap is there so a load cannot run out of memory on its dictionaries, and a fixed one was
+/// wrong both ways. At 512 MB it demoted `URL` on ten million rows of ClickBench on a machine with
+/// gigabytes to spare, and a demoted column is flattened on every read, which took `GROUP BY URL`
+/// from 0.09 s to 2.2 s and every `URL` filter from about 0.1 s to 0.8 s. A quarter sits next to
+/// the half [`page_budget`] gives the pages, so a tight limit still demotes early. No limit never
+/// demotes for size.
+fn dictionary_budget(limit: Option<u64>) -> u64 {
+    limit.map_or(u64::MAX, |limit| limit / 4)
+}
+
 fn runtime(config: &Config) -> Pool {
     keep_pages();
     Pool::new(config.threads())
@@ -2206,6 +2219,7 @@ impl NativeSink {
         name: String,
         fields: Vec<Field>,
         clustering: Option<Clustering>,
+        limit: Option<u64>,
     ) -> Result<Self> {
         let temporary = target.with_extension(format!("{}.tmp", std::process::id()));
         if temporary.exists() {
@@ -2213,7 +2227,8 @@ impl NativeSink {
         }
         let profile = LoadProfile::begin(name.clone());
         let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?
-            .with_profile(Arc::clone(&profile));
+            .with_profile(Arc::clone(&profile))
+            .with_dictionary_cap(dictionary_budget(limit));
         let mut writer = declared(writer, clustering)?;
         Ok(Self {
             preparer: writer.preparer(),
@@ -2234,10 +2249,12 @@ impl NativeSink {
         name: String,
         fields: Vec<Field>,
         clustering: Option<Clustering>,
+        limit: Option<u64>,
     ) -> Result<Self> {
         let profile = LoadProfile::begin(name.clone());
         let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?
-            .with_profile(Arc::clone(&profile));
+            .with_profile(Arc::clone(&profile))
+            .with_dictionary_cap(dictionary_budget(limit));
         let mut writer = declared(writer, clustering)?;
         Ok(Self {
             preparer: writer.preparer(),
@@ -3092,10 +3109,11 @@ impl Shared {
                         let fields = create.columns.clone();
                         // No declaration to carry. The table is being created by this statement, so
                         // there is nowhere a declaration could have come from yet.
+                        let limit = self.inner.memory.limit();
                         let sink = Arc::new(if alone {
-                            NativeSink::create(path, table.clone(), fields, None)?
+                            NativeSink::create(path, table.clone(), fields, None, limit)?
                         } else {
-                            NativeSink::open(path, table.clone(), fields, None)?
+                            NativeSink::open(path, table.clone(), fields, None, limit)?
                         });
                         // The rows go in under a read lock, so queries run while they do. Nothing
                         // else can change the catalog in the gap between the two locks, because
@@ -3219,10 +3237,11 @@ impl Shared {
                         // file has to say so, because the table is rebound to what the file says as
                         // soon as this returns.
                         let clustering = target.clustering().cloned();
+                        let limit = self.inner.memory.limit();
                         let sink = Arc::new(if alone {
-                            NativeSink::create(path, table.clone(), fields, clustering)?
+                            NativeSink::create(path, table.clone(), fields, clustering, limit)?
                         } else {
-                            NativeSink::open(path, table.clone(), fields, clustering)?
+                            NativeSink::open(path, table.clone(), fields, clustering, limit)?
                         });
                         let query = rudb_exec::build_measured_into(
                             &insert.source,
