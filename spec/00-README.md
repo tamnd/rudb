@@ -106,6 +106,8 @@ Read 02 first, then 03, then 01. Document 02 decides whether the project is hone
 
 `spec/planner/`, `spec/storage-v3/`, `spec/perf/`, `spec/engine-v2/` and `spec/storage-v2/` are the working notes those three directories are built on, landed here so that every reference in them resolves. They are older than the G series and they are not all consistent with each other. Where one of them disagrees with `spec/engine/` or with `spec/graph/`, the newer document wins and says so in its own text.
 
+`spec/compiler/` is a second execution engine, written after TPC-H and ClickBench showed that the vectorized engine's remaining cost is interpretation overhead and not storage. It compiles each pipeline of the rewritten logical plan into one machine code function, keeps the vectorized engine as the oracle and the fallback, and sets one budget that everything else depends on: a query's compile time is at most 1 ms at the median. The engine sits behind `SET engine = 'compiled'` until milestone C12 makes it the default. Its milestones are the C series in the issue tracker, #1828 to #1840, and `spec/compiler/18-milestones.md` says how the filed order differs from the order the folder was written in.
+
 ## What this is not
 
 Not a transactional database. rudb has MVCC and ACID because DuckDB does and compatibility requires it, but it is tuned for one writer and many readers over columnar data, and document 11 is explicit that OLTP throughput is not an axis.
