@@ -258,8 +258,8 @@ impl Run {
     ///
     /// It only ever runs when the run reaches its limit, so it costs a pass over what the run holds
     /// once per limit. When it frees less than a quarter, the limit doubles, which is what a vector
-    /// would have done anyway, so a run of pairs that never repeat pays for a deduplication once per
-    /// doubling and no more.
+    /// would have done anyway. When it frees less than a sixteenth, the run stops compacting, so a
+    /// run of pairs that never repeat pays for one deduplication and no more.
     ///
     /// It is called with every row in `full` and the tail empty, and leaves the last chunk it kept
     /// as the tail.
@@ -304,8 +304,18 @@ impl Run {
         self.tail.truncate(kept - self.full.len() * CHUNK);
         self.validity.truncate(kept);
         // A run that folded away less than a quarter would fill again within a few pushes and be
-        // walked again, so it grows instead, and the next compaction waits for twice as many.
-        self.limit = if kept * 4 > len * 3 { len * 2 } else { len };
+        // walked again, so it grows instead, and the next compaction waits for twice as many. One
+        // that folded away almost nothing is holding pairs that do not repeat, and every later
+        // walk would find the same, so it is not walked again. On the million row ClickBench file
+        // a user has 1.1 rows, and `COUNT(DISTINCT UserID) GROUP BY RegionID` spent a sixth of its
+        // time in walks like that. The pass that finishes the partition still deduplicates it.
+        self.limit = if kept * 16 > len * 15 {
+            usize::MAX
+        } else if kept * 4 > len * 3 {
+            len * 2
+        } else {
+            len
+        };
     }
 
     fn valid_at(&self, row: usize) -> bool {
@@ -741,6 +751,24 @@ mod tests {
         assert_eq!(counted.splits[0].len(), 200);
         let nulls = counted.splits[0].iter().filter(|pair| !pair.valid).count();
         assert_eq!(nulls, 100);
+    }
+
+    /// A run whose pairs do not repeat is walked once and then left to grow, and still hands every
+    /// pair on.
+    #[test]
+    fn a_run_whose_pairs_do_not_repeat_stops_compacting() {
+        let mut run = Run::default();
+        let users = COMPACT_FROM * 3;
+        for user in 0..users as i64 {
+            let pair_hash = folded(spread(mix(group_seed(1, true), user as u64)));
+            run.push(Record { user, group: 1, pair_hash }, true);
+        }
+        assert_eq!(run.limit, usize::MAX);
+        assert_eq!(run.len(), users);
+        let mut partition = Held { runs: vec![run] };
+        let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
+            .expect("a pair partition");
+        assert_eq!(counted.splits[0].len(), users);
     }
 
     /// A run that holds more pairs than one chunk keeps every one of them through its compactions,
