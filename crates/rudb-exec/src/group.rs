@@ -1053,6 +1053,10 @@ fn spare(memory: &Memory, room: u64) -> bool {
 /// same peak memory. Both numbers were measured in the same sweep and the lower one won everywhere.
 const PARTITION_FROM: usize = 4_096;
 
+/// How many rows a partitioned instance puts aside before it splits them, which is a few hundred
+/// rows to each of the [`RADIX_PARTITIONS`]. See [`Aggregate::drain`].
+const GATHER_ROWS: usize = 16_384;
+
 /// How many places a map read by value may clear for each row the table has folded.
 ///
 /// Clearing a place is a store, and a row the map answers is a hash and a probe it did not do, so a
@@ -1369,11 +1373,12 @@ impl<'a> Aggregate<'a> {
     ) -> Result<()> {
         *folded += rows.rows as u64;
         let Some(table) = single else {
-            let rows = rows.settled()?;
-            if self.locally.load(Ordering::Relaxed) && self.still_local(*folded, spreading, own)? {
-                return self.spread_own(&rows, spreading, own);
+            spreading.gathered += rows.rows;
+            spreading.pending.push(rows.settled()?.into_owned());
+            if spreading.gathered < GATHER_ROWS {
+                return Ok(());
             }
-            return self.spread(&rows, spreading);
+            return self.drain(*folded, spreading, own);
         };
         if let Some(error) = table.failure.take() {
             return Err(error);
@@ -3661,6 +3666,37 @@ impl<'a> Aggregate<'a> {
         Ok(())
     }
 
+    /// The chunks put aside by [`Aggregate::open`], joined and split among the partitions.
+    ///
+    /// A chunk split sixty four ways leaves each partition a few dozen rows, and the fold of a few
+    /// dozen rows is mostly the fold's own fixed cost: a gathered copy of every column, a probe
+    /// setup, and a table to reach. On ClickBench 29 that made the multi threaded aggregate cost
+    /// sixty percent more CPU than the same query on one thread. Joining [`GATHER_ROWS`] rows first
+    /// gives each partition a few hundred rows a fold, which is what the fold is sized for.
+    ///
+    /// Columns that cannot be joined into one flat vector, which a dictionary from another page is,
+    /// leave the chunks to be split one at a time the way they always were.
+    fn drain(
+        &self,
+        folded: u64,
+        spreading: &mut Spreading,
+        own: &mut [Option<Building>],
+    ) -> Result<()> {
+        if spreading.pending.is_empty() {
+            return Ok(());
+        }
+        let pieces = std::mem::take(&mut spreading.pending);
+        spreading.gathered = 0;
+        for rows in Rows::joined(pieces)? {
+            if self.locally.load(Ordering::Relaxed) && self.still_local(folded, spreading, own)? {
+                self.spread_own(&rows, spreading, own)?;
+            } else {
+                self.spread(&rows, spreading)?;
+            }
+        }
+        Ok(())
+    }
+
     /// One batch of rows divided by the high bits of its group hash, ready to be folded.
     ///
     /// Both halves of the fold want the same three things and neither wants to hash twice, so the
@@ -4171,7 +4207,7 @@ fn spread_runs(
 ///
 /// The same shape whether the rows came from the operator below or from a spill file, which is what
 /// lets one loop serve both.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Rows {
     keys: Vec<Vector>,
     arguments: Vec<Vec<Vector>>,
@@ -4234,6 +4270,53 @@ impl Rows {
             + self.filters.iter().flatten().count()
     }
 
+    /// The pieces as one batch when every column of them can be laid end to end, and as they came
+    /// when one of them cannot.
+    fn joined(pieces: Vec<Self>) -> Result<Vec<Self>> {
+        if pieces.len() < 2 {
+            return Ok(pieces);
+        }
+        let first = &pieces[0];
+        let mut keys = Vec::with_capacity(first.keys.len());
+        for at in 0..first.keys.len() {
+            let Some(laid) = lay(&pieces, |piece| piece.keys.get(at))? else { return Ok(pieces) };
+            keys.push(laid);
+        }
+        let mut arguments = Vec::with_capacity(first.arguments.len());
+        for (call, columns) in first.arguments.iter().enumerate() {
+            let mut laid_call = Vec::with_capacity(columns.len());
+            for at in 0..columns.len() {
+                let column = |piece| Self::argument(piece, call, at);
+                let Some(laid) = lay(&pieces, column)? else { return Ok(pieces) };
+                laid_call.push(laid);
+            }
+            arguments.push(laid_call);
+        }
+        let mut filters = Vec::with_capacity(first.filters.len());
+        for (call, filter) in first.filters.iter().enumerate() {
+            if filter.is_none() {
+                if pieces.iter().any(|piece| piece.filters.get(call).is_none_or(Option::is_some)) {
+                    return Ok(pieces);
+                }
+                filters.push(None);
+                continue;
+            }
+            let column = |piece| Self::filter(piece, call);
+            let Some(laid) = lay(&pieces, column)? else { return Ok(pieces) };
+            filters.push(Some(laid));
+        }
+        let rows = pieces.iter().map(|piece| piece.rows).sum();
+        Ok(vec![Self { keys, arguments, filters, rows, marked: None }])
+    }
+
+    fn argument(&self, call: usize, at: usize) -> Option<&Vector> {
+        self.arguments.get(call)?.get(at)
+    }
+
+    fn filter(&self, call: usize) -> Option<&Vector> {
+        self.filters.get(call)?.as_ref()
+    }
+
     /// Copy the selected rows into vectors one radix partition can fold independently.
     fn gather(&self, rows: &[u32]) -> Result<Self> {
         Ok(Self {
@@ -4254,6 +4337,20 @@ impl Rows {
             marked: None,
         })
     }
+}
+
+/// One column of every piece laid end to end, or `None` when a piece lacks it or it has no flat
+/// layout.
+fn lay<'a>(
+    pieces: &'a [Rows],
+    column: impl Fn(&'a Rows) -> Option<&'a Vector>,
+) -> Result<Option<Vector>> {
+    let mut columns = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        let Some(vector) = column(piece) else { return Ok(None) };
+        columns.push(vector);
+    }
+    rudb_vector::concat(columns[0].logical_type(), &columns)
 }
 
 /// The groups a pushed down limit keeps, shared by every instance of the aggregate.
@@ -4406,6 +4503,10 @@ struct Spreading {
     /// was happening anyway. What it is for is in [`keys_arrive_together`].
     split_rows: u64,
     runs: u64,
+    /// Chunks put aside until there are [`GATHER_ROWS`] rows of them to split at once, and how many
+    /// rows that is. See [`Aggregate::drain`].
+    pending: Vec<Rows>,
+    gathered: usize,
 }
 
 impl Spreading {
@@ -4418,6 +4519,8 @@ impl Spreading {
             waiting: Vec::new(),
             split_rows: 0,
             runs: 0,
+            pending: Vec::new(),
+            gathered: 0,
         }
     }
 }
@@ -5425,8 +5528,10 @@ impl Sink for Aggregate<'_> {
             ran_memory,
             mut spreading,
             mut own,
+            folded,
             ..
         } = local;
+        self.drain(folded, &mut spreading, &mut own)?;
         if !ran.is_empty() {
             let mut built = self.built.lock().map_err(poisoned)?;
             built.chunks.append(&mut ran);
