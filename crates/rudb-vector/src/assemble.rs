@@ -234,6 +234,127 @@ pub fn concat<V: AsRef<Vector>>(ty: &LogicalType, pieces: &[V]) -> Result<Option
     laid(ty, &pieces)
 }
 
+/// One row out of one of several vectors per pick, into one flat vector.
+///
+/// What a link join does with a chunk whose parent rows are in several parts of the parent. Each
+/// pick names a source and a row of it, and a source past the end of `sources`, such as
+/// [`crate::NO_ROW`], is a null. A source is flat or a dictionary over flat values, which is what a
+/// gather out of a stored part hands back for every form the writer uses. The copy is one typed
+/// loop over the picks, so a chunk that lands in a hundred parts costs what a chunk that lands in
+/// one does, rather than a vector and a lay per part.
+///
+/// Sources that are all codes into one stable dictionary give codes into it, because a table keeps
+/// a column of few distinct strings that way and the kernels above compare codes where they would
+/// otherwise compare strings. That was most of TPC-H q12's link join, see
+/// `spec/perf/64-parent-codes-through-the-link.md`.
+///
+/// `None` when a source is in some other form or the type has no flat layout, which the caller
+/// answers by flattening what it has. A string is copied a string at a time, since the sources have
+/// arenas of their own and a view can point into only one.
+///
+/// # Errors
+///
+/// If a source's layout is not the one the type calls for.
+pub fn picked(
+    ty: &LogicalType,
+    sources: &[&Vector],
+    picks: &[(u32, u32)],
+) -> Result<Option<Vector>> {
+    if let Some(codes) = picked_codes(sources, picks)? {
+        return Ok(Some(codes));
+    }
+    // Each source as the flat run its values are in, and the codes into that run for a dictionary.
+    let mut leaves: Vec<(&Vector, Option<&[u32]>)> = Vec::with_capacity(sources.len());
+    for source in sources {
+        match source.form() {
+            Form::Flat => leaves.push((source, None)),
+            Form::Dictionary => match source.dictionary_parts() {
+                Some((codes, values)) if values.form() == Form::Flat => {
+                    leaves.push((values, Some(codes)));
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        }
+    }
+    let mut datas = Vec::with_capacity(leaves.len());
+    for (leaf, _) in &leaves {
+        let Some(data) = leaf.data() else { return Ok(None) };
+        datas.push(data);
+    }
+    // Every pick resolved to a row of its leaf once, so the typed loop below is a load and nothing
+    // else. A pick that is null anywhere on the way down is `NO_ROW` from here on.
+    let mut live = Vec::with_capacity(picks.len());
+    let picks: Vec<(u32, u32)> = picks
+        .iter()
+        .map(|&(source, row)| {
+            let found = sources.get(source as usize).zip(leaves.get(source as usize)).and_then(
+                |(held, (leaf, codes))| {
+                    let row = row as usize;
+                    if row >= held.len() || !held.validity().is_valid(row) {
+                        return None;
+                    }
+                    let at =
+                        codes.map_or(Some(row), |codes| codes.get(row).map(|&c| c as usize))?;
+                    (at < leaf.len() && leaf.validity().is_valid(at)).then_some(at)
+                },
+            );
+            live.push(found.is_some());
+            // Under the leaf's length, which a vector keeps under `u32::MAX` rows.
+            found.map_or((crate::NO_ROW, 0), |at| (source, at as u32))
+        })
+        .collect();
+    let first = datas.first().copied();
+    macro_rules! picking {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match first {
+                None | Some(Data::Empty) => return Ok(Some(Vector::constant(ty.clone(), Value::Null, picks.len()))),
+                $(Some(Data::$variant(_)) => {
+                    let mut runs = Vec::with_capacity(datas.len());
+                    for data in &datas {
+                        let Data::$variant(values) = data else {
+                            return Ok(None);
+                        };
+                        runs.push(values.as_slice());
+                    }
+                    let mut out: Vec<$native> = Vec::with_capacity(picks.len());
+                    out.extend(picks.iter().map(|&(source, row)| {
+                        runs.get(source as usize)
+                            .and_then(|run| run.get(row as usize))
+                            .copied()
+                            .unwrap_or($zero)
+                    }));
+                    Data::$variant(Buffer::from_vec(out))
+                })+
+                Some(Data::Varlen(_)) => {
+                    let mut runs = Vec::with_capacity(datas.len());
+                    for data in &datas {
+                        let Data::Varlen(values) = data else {
+                            return Ok(None);
+                        };
+                        runs.push(values);
+                    }
+                    let mut out = StringColumn::with_capacity(picks.len());
+                    for &(source, row) in &picks {
+                        match runs.get(source as usize) {
+                            Some(run) => out.push_from(run, row as usize),
+                            None => out.push(""),
+                        };
+                    }
+                    Data::Varlen(out)
+                }
+            }
+        };
+    }
+    let data = crate::for_each_layout!(fixed, picking);
+    let vector = Vector::flat(ty.clone(), data)?;
+    Ok(Some(if live.iter().all(|&alive| alive) {
+        vector
+    } else {
+        vector.with_validity(Validity::from_run(&live))
+    }))
+}
+
 /// The same, copying the pieces of a string column on whatever threads `spread` has.
 ///
 /// # Why this exists at all
@@ -1075,6 +1196,40 @@ fn extend(into: &mut Data, from: &Data, arenas: &mut Arenas) -> Result<usize> {
 /// armed. Three tests failed and no others: the one that is a `CASE` by name, the one that runs the
 /// catalog views the engine ships with, and the one over the native frequency synopsis. All three
 /// have a `CASE` in them and nothing else in the suite does.
+/// The picks as codes into the one stable dictionary every source shares, or `None` when they do
+/// not all share one. A pick that names no source, or a row that is null, is null.
+fn picked_codes(sources: &[&Vector], picks: &[(u32, u32)]) -> Result<Option<Vector>> {
+    let mut shared: Option<&Arc<Vector>> = None;
+    let mut runs = Vec::with_capacity(sources.len());
+    for source in sources {
+        let Some((codes, values)) = source.stable_dictionary_parts() else { return Ok(None) };
+        if shared.is_some_and(|held| !Arc::ptr_eq(held, values)) {
+            return Ok(None);
+        }
+        shared = Some(values);
+        runs.push(codes);
+    }
+    // A dictionary with no values has no code to stand in for a null row.
+    let Some(values) = shared.filter(|values| !values.is_empty()) else { return Ok(None) };
+    let mut live = Vec::with_capacity(picks.len());
+    let mut codes = Vec::with_capacity(picks.len());
+    for &(source, row) in picks {
+        let code = sources.get(source as usize).and_then(|held| {
+            let row = row as usize;
+            let code = runs[source as usize].get(row)?;
+            held.validity().is_valid(row).then_some(*code)
+        });
+        live.push(code.is_some());
+        codes.push(code.unwrap_or(0));
+    }
+    let vector = Vector::stable_dictionary(codes, Arc::clone(values))?;
+    Ok(Some(if live.iter().all(|&alive| alive) {
+        vector
+    } else {
+        vector.with_validity(Validity::from_run(&live))
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,5 +1941,68 @@ mod tests {
             values(&got),
             vec![word("a word long enough to leave the inline view"), word("MAIL")]
         );
+    }
+
+    #[test]
+    fn a_pick_takes_each_row_from_the_source_it_names_and_is_null_where_none_is_named() {
+        let ty = LogicalType::Integer;
+        let left =
+            Vector::from_values(ty.clone(), &[Value::Integer(1), Value::Null, Value::Integer(3)])
+                .expect("left");
+        let right = Vector::from_values(ty.clone(), &[Value::Integer(10), Value::Integer(20)])
+            .expect("right");
+        let picks = [(1, 1), (0, 0), (crate::NO_ROW, 0), (0, 1), (1, 0), (0, 2)];
+        let out = picked(&ty, &[&left, &right], &picks).expect("picks").expect("flat sources");
+        assert_eq!(
+            values(&out),
+            vec![
+                Value::Integer(20),
+                Value::Integer(1),
+                Value::Null,
+                Value::Null,
+                Value::Integer(10),
+                Value::Integer(3),
+            ]
+        );
+        let word = |text: &str| Value::Varchar(text.to_string());
+        let words =
+            Vector::from_values(LogicalType::Varchar, &[word("a"), word("bb")]).expect("words");
+        let out = picked(&LogicalType::Varchar, &[&words], &[(0, 1), (0, 0), (0, 1)])
+            .expect("picks")
+            .expect("flat source");
+        assert_eq!(values(&out), vec![word("bb"), word("a"), word("bb")]);
+        let coded = Vector::dictionary(vec![1, 1, 0], words.clone()).expect("a dictionary");
+        let out = picked(&LogicalType::Varchar, &[&words, &coded], &[(1, 2), (0, 0), (1, 0)])
+            .expect("picks")
+            .expect("flat and dictionary sources");
+        assert_eq!(values(&out), vec![word("a"), word("a"), word("bb")]);
+    }
+
+    /// Sources that are codes into one stable dictionary give codes into it, with a pick of no
+    /// source and a null row both null, and two dictionaries give strings.
+    #[test]
+    fn picks_over_one_shared_dictionary_stay_codes() {
+        let word = |text: &str| Value::Varchar(text.to_string());
+        let words = Arc::new(
+            Vector::from_values(LogicalType::Varchar, &[word("a"), word("bb")]).expect("words"),
+        );
+        let first = Vector::stable_dictionary(vec![1, 0], Arc::clone(&words)).expect("codes");
+        let second = Vector::stable_dictionary(vec![0, 1], Arc::clone(&words))
+            .expect("codes")
+            .with_validity(Validity::from_run(&[true, false]));
+        let picks = [(1, 0), (0, 0), (crate::NO_ROW, 0), (1, 1), (0, 1)];
+        let out = picked(&LogicalType::Varchar, &[&first, &second], &picks)
+            .expect("picks")
+            .expect("coded sources");
+        let (_, held) = out.stable_dictionary_parts().expect("still codes");
+        assert!(Arc::ptr_eq(held, &words), "the codes point somewhere else");
+        assert_eq!(values(&out), vec![word("a"), word("bb"), Value::Null, Value::Null, word("a")]);
+        let other = Arc::new(Vector::clone(&words));
+        let apart = Vector::stable_dictionary(vec![1, 0], other).expect("codes");
+        let out = picked(&LogicalType::Varchar, &[&first, &apart], &[(1, 0), (0, 0)])
+            .expect("picks")
+            .expect("dictionary sources");
+        assert!(out.stable_dictionary_parts().is_none(), "two dictionaries are not one");
+        assert_eq!(values(&out), vec![word("bb"), word("bb")]);
     }
 }
