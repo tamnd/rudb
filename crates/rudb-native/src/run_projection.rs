@@ -325,9 +325,9 @@ fn scan_pages(
     dictionary: usize,
     code_bytes: usize,
 ) -> Result<Scan> {
-    let mut marks = vec![0_u64; dictionary];
+    let mut marks = vec![0_u32; dictionary];
     let mut counts = vec![0_u64; dictionary];
-    let mut epoch = 0_u64;
+    let mut epoch = 0_u32;
     let mut rows = 0_u64;
     let mut first = None;
     let mut last = None;
@@ -367,8 +367,12 @@ fn scan_pages(
             page_first.get_or_insert(user);
             page_last = Some(user);
             last = Some(user);
-            epoch = epoch.checked_add(1).ok_or_else(|| invalid("run projection epoch overflow"))?;
             if code_bytes == 1 {
+                epoch = epoch.wrapping_add(1);
+                if epoch == 0 {
+                    marks.fill(0);
+                    epoch = 1;
+                }
                 for &code in &bytes[at..at + length] {
                     let code = usize::from(code);
                     let mark = marks
@@ -380,14 +384,38 @@ fn scan_pages(
                     }
                 }
             } else {
-                for code_bytes in bytes[at..at + length * 2].chunks_exact(2) {
-                    let code = u16::from_le_bytes(code_bytes.try_into().unwrap()) as usize;
-                    let mark = marks
-                        .get_mut(code)
+                if length <= 2 {
+                    let first_code =
+                        u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+                    let first_count = counts
+                        .get_mut(first_code)
                         .ok_or_else(|| invalid("run projection code is outside its dictionary"))?;
-                    if *mark != epoch {
-                        *mark = epoch;
-                        counts[code] += 1;
+                    *first_count += 1;
+                    if length == 2 {
+                        let second_code =
+                            u16::from_le_bytes(bytes[at + 2..at + 4].try_into().unwrap()) as usize;
+                        if second_code != first_code {
+                            let second_count = counts.get_mut(second_code).ok_or_else(|| {
+                                invalid("run projection code is outside its dictionary")
+                            })?;
+                            *second_count += 1;
+                        }
+                    }
+                } else {
+                    epoch = epoch.wrapping_add(1);
+                    if epoch == 0 {
+                        marks.fill(0);
+                        epoch = 1;
+                    }
+                    for code_bytes in bytes[at..at + length * 2].chunks_exact(2) {
+                        let code = u16::from_le_bytes(code_bytes.try_into().unwrap()) as usize;
+                        let mark = marks.get_mut(code).ok_or_else(|| {
+                            invalid("run projection code is outside its dictionary")
+                        })?;
+                        if *mark != epoch {
+                            *mark = epoch;
+                            counts[code] += 1;
+                        }
                     }
                 }
             }
@@ -432,7 +460,7 @@ mod tests {
         let mut writer = Writer::create(&path, "events", fields).expect("create native file");
         for (users, regions) in [
             (vec![9_i64, 2, 9, 1], vec![7_i32, 1, 7, 2]),
-            (vec![2_i64, 2, 5, 9], vec![2_i32, 2, 1, 1]),
+            (vec![2_i64, 2, 5, 9, 5, 8, 8], vec![2_i32, 2, 1, 1, 2, 1, 1]),
         ] {
             let users = users.into_iter().map(Value::BigInt).collect::<Vec<_>>();
             let regions = regions.into_iter().map(Value::Integer).collect::<Vec<_>>();
@@ -448,7 +476,7 @@ mod tests {
         let reader = Catalog::open(&path).expect("catalog").table("events").expect("table");
         assert_eq!(
             reader.grouped_distinct_run_projection(0, 1, 10).expect("valid projection"),
-            Some(vec![(1, 3), (2, 2), (7, 1)]),
+            Some(vec![(1, 4), (2, 3), (7, 1)]),
         );
         std::fs::remove_file(path).expect("remove scratch file");
     }
