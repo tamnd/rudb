@@ -1,4 +1,5 @@
-//! An exact distinct count for an integer column, taken by the writer on a pass it already makes.
+//! An exact distinct count for an integer column, and the rows holding each value, taken by the
+//! writer on a pass it already makes.
 //!
 //! A string column's distinct count is free, because the global dictionary hands out one code per
 //! value and the writer counts the codes. An integer column has no dictionary, so until this the
@@ -17,6 +18,8 @@
 //! column nobody counted and the reader already handles it by counting the rows. The cap is per
 //! column rather than shared across the frequency workers, so the file a load writes does not depend
 //! on which worker reached which column first.
+
+use std::collections::HashMap;
 
 /// The most slots one column's sets may hold between them, which is 256 MiB of keys.
 ///
@@ -90,61 +93,87 @@ pub(crate) fn bytes_for(estimate: f64) -> usize {
     (slots + BUFFERED) * SETS * size_of::<u64>()
 }
 
-/// An exact set of one column's distinct non-null values, or the record that there were too many.
+/// The low bits of a slot, which hold how many rows have the slot's value.
+///
+/// A slot is one `u64`. The top eight bits of a hash choose its set, so every hash in a set has the
+/// same top eight bits, and shifted up by them the other fifty six fill the slot and leave eight at
+/// the bottom free. Those hold the count, so a set that counts is no larger than one that only told
+/// values apart. A count that reaches [`SPILLED`] moves to a map beside the sets, and on a column of
+/// `n` rows at most `n / 255` values ever get there.
+const COUNT_BITS: u32 = 8;
+const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
+
+/// The count a slot reads when its real count is in [`ExactCounts::spilled`].
+const SPILLED: u64 = COUNT_MASK;
+
+/// The inverse of the multiplier in [`hash`], so a hash turns back into the value it came from.
+const UNHASH: u64 = inverse(0x9E37_79B9_7F4A_7C15);
+
+/// The inverse of an odd number modulo two to the sixty four, by Newton's iteration. An odd number
+/// is its own inverse in the low three bits, and each step doubles the bits that are right.
+const fn inverse(odd: u64) -> u64 {
+    let mut inverse = odd;
+    let mut step = 0;
+    while step < 5 {
+        inverse = inverse.wrapping_mul(2_u64.wrapping_sub(odd.wrapping_mul(inverse)));
+        step += 1;
+    }
+    inverse
+}
+
+/// Every distinct non-null value of one column and how many rows hold it, or the record that there
+/// were too many values to keep.
+///
+/// Counting the rows beside each value is what lets the close take a column's frequencies from the
+/// same pass that counts its distinct values. Before this, a column past the thirty two thousand
+/// values of the candidate table went through a Misra-Gries table and this set side by side, and
+/// then through a second read of every page to recount the candidates. On the `hits_0` load that
+/// was most of the close for the dozen columns with hundreds of thousands of values.
 #[derive(Debug)]
-pub(crate) struct ExactDistinct {
-    /// One open addressed set per top eight bits of the hash. Zero marks an empty slot, so a zero
-    /// value is held in [`Self::zero`] instead.
+pub(crate) struct ExactCounts {
+    /// One open addressed set per top eight bits of the hash, each slot the rest of the hash above
+    /// its count. Zero marks an empty slot, which no held value is, since its count is at least one.
     sets: Vec<Vec<u64>>,
-    /// How many hashes each set holds.
+    /// How many values each set holds.
     held: Vec<usize>,
     /// [`BUFFERED`] hashes per set waiting to go in, and how many of each are there.
     buffered: Vec<u64>,
     waiting: Vec<u8>,
-    zero: bool,
+    /// The counts too large for a slot, by hash.
+    spilled: HashMap<u64, u64, crate::Spread>,
     len: usize,
     /// Set when the cap was passed. The sets are released at that point rather than at the end.
     gave_up: bool,
 }
 
-impl ExactDistinct {
+impl ExactCounts {
     pub(crate) fn new() -> Self {
         Self {
             sets: vec![vec![0; FIRST_SLOTS]; SETS],
             held: vec![0; SETS],
             buffered: vec![0; SETS * BUFFERED],
             waiting: vec![0; SETS],
-            zero: false,
+            spilled: HashMap::default(),
             len: 0,
             gave_up: false,
         }
     }
 
-    /// A set that has already given up, for a column [`beyond`] turned away. It holds nothing and
-    /// counts nothing.
-    pub(crate) fn declined() -> Self {
-        Self {
-            sets: Vec::new(),
-            held: Vec::new(),
-            buffered: Vec::new(),
-            waiting: Vec::new(),
-            zero: false,
-            len: 0,
-            gave_up: true,
-        }
-    }
-
-    /// Adds one value's bits.
-    pub(crate) fn insert(&mut self, value: u64) {
-        if self.gave_up {
-            return;
-        }
-        if value == 0 {
-            self.zero = true;
+    /// Adds `times` rows of one value's bits.
+    ///
+    /// A single row waits in its set's buffer. A run of equal rows goes straight in, since it is
+    /// one probe for all of them and there is no order among the adds to keep.
+    pub(crate) fn insert(&mut self, value: u64, times: u32) {
+        if self.gave_up || times == 0 {
             return;
         }
         let hash = hash(value);
         let set = (hash >> (64 - SET_BITS)) as usize;
+        if times > 1 {
+            self.add(set, hash, u64::from(times));
+            self.check_cap();
+            return;
+        }
         let waiting = usize::from(self.waiting[set]);
         self.buffered[set * BUFFERED + waiting] = hash;
         self.waiting[set] = (waiting + 1) as u8;
@@ -153,15 +182,39 @@ impl ExactDistinct {
         }
     }
 
-    /// The count, or `None` for a column that went past the cap.
+    /// The count of distinct values, or `None` for a column that went past the cap.
     pub(crate) fn count(&mut self) -> Option<u64> {
+        self.drain_all();
+        (!self.gave_up).then_some(self.len as u64)
+    }
+
+    /// Hands every value and the rows holding it to `visit`, in no particular order, or does nothing
+    /// and says `false` for a column that went past the cap.
+    pub(crate) fn visit(&mut self, mut visit: impl FnMut(u64, u64)) -> bool {
+        self.drain_all();
+        if self.gave_up {
+            return false;
+        }
+        for (set, slots) in self.sets.iter().enumerate() {
+            for &slot in slots.iter().filter(|&&slot| slot != 0) {
+                let hash = ((set as u64) << (64 - SET_BITS)) | ((slot & !COUNT_MASK) >> SET_BITS);
+                let count = match slot & COUNT_MASK {
+                    SPILLED => self.spilled.get(&hash).copied().unwrap_or(SPILLED),
+                    count => count,
+                };
+                visit(hash.wrapping_mul(UNHASH), count);
+            }
+        }
+        true
+    }
+
+    fn drain_all(&mut self) {
         for set in 0..SETS {
             if self.gave_up {
                 break;
             }
             self.drain(set);
         }
-        (!self.gave_up).then(|| self.len as u64 + u64::from(self.zero))
     }
 
     /// Moves one set's waiting hashes into it.
@@ -174,23 +227,59 @@ impl ExactDistinct {
         touch(&self.sets[set], &self.buffered[from..from + waiting]);
         for at in from..from + waiting {
             let hash = self.buffered[at];
-            if !place(&mut self.sets[set], hash) {
-                continue;
-            }
-            self.held[set] += 1;
-            self.len += 1;
-            if full(self.held[set], self.sets[set].len()) {
-                let wanted = self.sets[set].len() * 2;
-                let old = std::mem::replace(&mut self.sets[set], vec![0; wanted]);
-                for hash in old.into_iter().filter(|&hash| hash != 0) {
-                    place(&mut self.sets[set], hash);
-                }
-            }
+            self.add(set, hash, 1);
         }
-        if self.len >= MAX_DISTINCT {
+        self.check_cap();
+    }
+
+    /// Adds `times` rows of the value with this hash to its set, growing the set when it fills.
+    fn add(&mut self, set: usize, hash: u64, times: u64) {
+        let key = hash << SET_BITS;
+        let slots = &mut self.sets[set];
+        let mask = slots.len() - 1;
+        let mut at = home(slots, key);
+        loop {
+            let slot = slots[at];
+            if slot == 0 {
+                slots[at] = if times >= SPILLED {
+                    self.spilled.insert(hash, times);
+                    key | SPILLED
+                } else {
+                    key | times
+                };
+                self.held[set] += 1;
+                self.len += 1;
+                if full(self.held[set], slots.len()) {
+                    let wanted = slots.len() * 2;
+                    let old = std::mem::replace(slots, vec![0; wanted]);
+                    for slot in old.into_iter().filter(|&slot| slot != 0) {
+                        place(slots, slot);
+                    }
+                }
+                return;
+            }
+            if slot & !COUNT_MASK == key {
+                let count = slot & COUNT_MASK;
+                if count == SPILLED {
+                    *self.spilled.entry(hash).or_insert(SPILLED) += times;
+                } else if count + times >= SPILLED {
+                    self.spilled.insert(hash, count + times);
+                    slots[at] = key | SPILLED;
+                } else {
+                    slots[at] = slot + times;
+                }
+                return;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    fn check_cap(&mut self) {
+        if self.len > MAX_DISTINCT {
             self.gave_up = true;
             self.sets = Vec::new();
             self.buffered = Vec::new();
+            self.spilled = HashMap::default();
         }
     }
 }
@@ -198,71 +287,94 @@ impl ExactDistinct {
 /// Reads the slot each of `hashes` starts at, before any of them is placed.
 ///
 /// A set of a column that is near unique is half a megabyte, so the slot a hash starts at is a
-/// cache miss nearly every time, and [`place`] took them one after another, since each insert
-/// waits on its own load before the next one begins. These loads do not depend on each other, so
-/// the processor has all of them in flight at once, and the inserts after them find their lines in
-/// cache. On a column of ten million distinct values that took the count from about half a second
-/// to about 350 milliseconds.
+/// cache miss nearly every time, and [`ExactCounts::add`] took them one after another, since each
+/// insert waits on its own load before the next one begins. These loads do not depend on each
+/// other, so the processor has all of them in flight at once, and the inserts after them find their
+/// lines in cache. On a column of ten million distinct values that took the count from about half a
+/// second to about 350 milliseconds.
 fn touch(slots: &[u64], hashes: &[u64]) {
     let mut seen = 0_u64;
     for &hash in hashes {
-        seen ^= slots[home(slots, hash)];
+        seen ^= slots[home(slots, hash << SET_BITS)];
     }
     std::hint::black_box(seen);
 }
 
-/// The slot a search for `hash` starts at.
-fn home(slots: &[u64], hash: u64) -> usize {
-    ((hash << SET_BITS) >> (64 - slots.len().trailing_zeros())) as usize
+/// The slot a search for a slot's key, the hash shifted past the bits that chose its set, starts at.
+fn home(slots: &[u64], key: u64) -> usize {
+    (key >> (64 - slots.len().trailing_zeros())) as usize
 }
 
-/// Puts a nonzero hash in its slot and says whether it was new.
-///
-/// The slot comes from the bits under the ones that chose the set, which every hash in the set
-/// shares.
-fn place(slots: &mut [u64], hash: u64) -> bool {
+/// Puts a held slot, key and count, in the first empty place from its home, for a set that grew.
+fn place(slots: &mut [u64], slot: u64) {
     let mask = slots.len() - 1;
-    let mut at = home(slots, hash);
-    loop {
-        match slots[at] {
-            0 => {
-                slots[at] = hash;
-                return true;
-            }
-            held if held == hash => return false,
-            _ => at = (at + 1) & mask,
-        }
+    let mut at = home(slots, slot & !COUNT_MASK);
+    while slots[at] != 0 {
+        at = (at + 1) & mask;
     }
+    slots[at] = slot;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn counted(set: &mut ExactCounts) -> HashMap<u64, u64> {
+        let mut counts = HashMap::new();
+        assert!(set.visit(|value, count| assert!(counts.insert(value, count).is_none())));
+        counts
+    }
+
     #[test]
-    fn counts_each_value_once_across_growth_and_counts_zero() {
-        let mut set = ExactDistinct::new();
-        let mut oracle = std::collections::HashSet::new();
+    fn a_hash_turns_back_into_its_value() {
+        for value in [0, 1, 2, u64::MAX, 1 << 63, 0x0123_4567_89AB_CDEF] {
+            assert_eq!(hash(value).wrapping_mul(UNHASH), value);
+        }
+    }
+
+    #[test]
+    fn counts_each_value_and_its_rows_across_growth_and_counts_zero() {
+        let mut set = ExactCounts::new();
+        let mut oracle = HashMap::new();
         for round in 0..3 {
             for value in 0..50_000_u64 {
                 // Spread across the whole width, and negative numbers as their two's complement bits,
                 // which is how a signed column arrives here. The two runs share zero and a few hundred
                 // other values, which is what the oracle is for.
                 for bits in [value.wrapping_mul(0x0123_4567_89AB_CDEF), (-(value as i64)) as u64] {
-                    set.insert(bits);
-                    oracle.insert(bits);
+                    set.insert(bits, 1);
+                    *oracle.entry(bits).or_insert(0) += 1;
                 }
             }
             assert_eq!(set.count(), Some(oracle.len() as u64), "round {round} counted wrong");
+            assert_eq!(counted(&mut set), oracle, "round {round} counted the rows wrong");
         }
+    }
+
+    #[test]
+    fn a_count_past_a_slot_moves_beside_the_set_and_keeps_counting() {
+        let mut set = ExactCounts::new();
+        for _ in 0..300 {
+            set.insert(7, 1);
+        }
+        set.insert(9, 254);
+        set.insert(9, 1);
+        set.insert(11, 1_000);
+        set.insert(11, 3);
+        for _ in 0..254 {
+            set.insert(13, 1);
+        }
+        let counts = counted(&mut set);
+        assert_eq!(counts, [(7, 300), (9, 255), (11, 1_003), (13, 254)].into_iter().collect());
+        assert_eq!(set.count(), Some(4));
     }
 
     #[test]
     fn the_estimate_covers_what_a_set_holds_and_not_much_more() {
         for distinct in [0_usize, 1, 1_000, 40_000, 300_000, 1_000_000] {
-            let mut set = ExactDistinct::new();
+            let mut set = ExactCounts::new();
             for value in 1..=distinct as u64 {
-                set.insert(value.wrapping_mul(0x0123_4567_89AB_CDEF));
+                set.insert(value.wrapping_mul(0x0123_4567_89AB_CDEF), 1);
             }
             assert_eq!(set.count(), Some(distinct as u64));
             let held = (set.sets.iter().map(Vec::len).sum::<usize>() + set.buffered.len()) * 8;
@@ -277,30 +389,22 @@ mod tests {
             bytes_for(1e12) <= (512 << 20) + (1 << 20),
             "past the cap is not the most a set holds"
         );
-    }
-
-    #[test]
-    fn a_declined_set_counts_nothing() {
-        let mut set = ExactDistinct::declined();
-        set.insert(7);
-        set.insert(0);
-        assert_eq!(set.count(), None);
         assert!(beyond(3.0 * MAX_DISTINCT as f64));
         assert!(!beyond(MAX_DISTINCT as f64));
     }
 
     #[test]
     fn a_column_past_the_cap_records_nothing() {
-        // One short of the cap is counted, and the value that reaches it is not, whichever order
-        // the buffers happened to drain in.
-        let mut set = ExactDistinct::new();
-        for value in 1..MAX_DISTINCT as u64 {
-            set.insert(value);
+        // The cap is counted, and the value past it is not, whichever order the buffers happened to
+        // drain in.
+        let mut set = ExactCounts::new();
+        for value in 0..MAX_DISTINCT as u64 {
+            set.insert(value, 1);
         }
-        set.insert(0);
         assert_eq!(set.count(), Some(MAX_DISTINCT as u64), "gave up before the cap");
-        set.insert(MAX_DISTINCT as u64);
+        set.insert(MAX_DISTINCT as u64, 2);
         assert_eq!(set.count(), None, "counted past the cap");
         assert!(set.sets.is_empty(), "a column that gave up still holds its table");
+        assert!(!set.visit(|_, _| panic!("a column that gave up handed over a value")));
     }
 }
