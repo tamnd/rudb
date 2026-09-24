@@ -1444,6 +1444,35 @@ pub(crate) fn coded_within<'a>(
     Some(Coded { columns, combos })
 }
 
+/// The window a map of one integer key column's values starts on when the planner knows the
+/// column's ends, being its bottom and its places with the null place counted, or `None` for a key
+/// of another shape or a range wider than [`coded_within`] would give one column.
+///
+/// Only the integer types a chunk widens to their own values, so that a place is the value less
+/// the bottom here the way it is in [`window_of`].
+pub(crate) fn seeded_window(
+    types: &[rudb_common::LogicalType],
+    low: i128,
+    values: u64,
+) -> Option<(i64, usize)> {
+    use rudb_common::LogicalType;
+    let [ty] = types else { return None };
+    if !matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+    ) {
+        return None;
+    }
+    let places = usize::try_from(values).ok()?.checked_add(1)?;
+    (places <= WIDE_COMBOS).then_some((i64::try_from(low).ok()?, places))
+}
+
 /// Whether a column's own places come from a packed page other than the one `held` was built on.
 ///
 /// Only once there is a map, since a first page is as good a place as any to start one. A shared

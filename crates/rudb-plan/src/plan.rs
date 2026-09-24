@@ -100,6 +100,11 @@ pub struct Plan {
     /// to be is narrower than the column, which is why the pass that writes it takes nothing but an
     /// exact pair of ends.
     dense: BTreeMap<u32, (i128, u64)>,
+    /// The ends of the one integer grouping key of an aggregate, in the shape of `dense`, where
+    /// `dense` turned the range down for being sparse but it is still narrow enough for the
+    /// operator to address its values in a map of its own. Also a decision, written by the same
+    /// pass.
+    ends: BTreeMap<u32, (i128, u64)>,
     /// The columns a table is stored in ascending order of, by table index and name, as the binder
     /// read them off the store's own summaries. A fact about the file, like `distincts`.
     ascending: BTreeSet<(u32, String)>,
@@ -162,6 +167,7 @@ impl Plan {
             frequencies: BTreeMap::new(),
             presized: BTreeMap::new(),
             dense: BTreeMap::new(),
+            ends: BTreeMap::new(),
             ascending: BTreeSet::new(),
             widths: BTreeMap::new(),
             clustered: BTreeSet::new(),
@@ -344,6 +350,18 @@ impl Plan {
     #[must_use]
     pub fn dense(&self, index: u32) -> Option<(i128, u64)> {
         self.dense.get(&index).copied()
+    }
+
+    /// Records the ends of the one integer grouping key of the aggregate at `index`, in the shape
+    /// [`Plan::densify`] takes, for a range too sparse for that but narrow enough to be a map.
+    pub fn bound_key(&mut self, index: u32, low: i128, values: u64) {
+        self.ends.insert(index, (low, values));
+    }
+
+    /// The ends that aggregate's grouping key lies inside, where anybody said.
+    #[must_use]
+    pub fn key_ends(&self, index: u32) -> Option<(i128, u64)> {
+        self.ends.get(&index).copied()
     }
 
     /// How many aggregates carry a key range, which is what a test about this asks.
