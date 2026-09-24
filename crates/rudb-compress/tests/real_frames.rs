@@ -72,6 +72,11 @@ fn check(frame: &[u8], expected: &[u8]) {
     // And through `Codec`, because that is the path a page reader takes and the length check it
     // adds is the one that must not reject a frame that is right.
     assert_eq!(Codec::Zstd.decompress(frame, expected.len()).unwrap(), expected);
+    // And into a buffer a reader kept from a bigger page, which it hands over still holding that
+    // page. A copy that could reach into what was there would decode wrong here.
+    let mut kept = vec![0xA5; expected.len() + 70_000];
+    Codec::Zstd.decompress_into(frame, expected.len(), &mut kept).unwrap();
+    assert_eq!(&kept[..expected.len()], expected);
 }
 
 #[test]

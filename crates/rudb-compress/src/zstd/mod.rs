@@ -68,11 +68,23 @@ const CEILING: u64 = 1 << 34;
 /// checksum does not match what came out of it.
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
+    decompress_onto(input, &mut out)?;
+    Ok(out)
+}
+
+/// [`decompress`] onto the end of a buffer the caller keeps.
+///
+/// Whatever is already in `out` stays, and a copy can never reach back into it.
+///
+/// # Errors
+///
+/// As [`decompress`]. Some of the output may have been appended when it fails.
+pub fn decompress_onto(input: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let mut rest = input;
     while !rest.is_empty() {
-        rest = frame(rest, &mut out)?;
+        rest = frame(rest, out)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decompresses one frame onto the end of `out` and gives back whatever follows it.
