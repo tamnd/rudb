@@ -7,7 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rudb_common::{LogicalType, Result, Value};
+use rudb_common::{LogicalType, Result};
+use rudb_vector::Vector;
 
 use crate::{Catalog, Reader, attach, invalid, section};
 
@@ -23,18 +24,22 @@ fn id(order: usize, covered: usize) -> Result<u64> {
     Ok((u64::from(order) << 32) | u64::from(covered))
 }
 
-fn signed(value: Value) -> Result<i64> {
-    match value {
-        Value::TinyInt(value) => Ok(i64::from(value)),
-        Value::SmallInt(value) => Ok(i64::from(value)),
-        Value::Integer(value) => Ok(i64::from(value)),
-        Value::BigInt(value) => Ok(value),
-        _ => Err(invalid("sorted projection requires non-null signed integers")),
+/// Every value of a non-null signed integer column, as a block where the vector hands one over and
+/// through `signed_at` for the forms it does not.
+fn integers(vector: &Vector, out: &mut Vec<i64>) -> Result<()> {
+    if vector.signed_block(out) && out.len() == vector.len() {
+        return Ok(());
     }
-}
-
-fn narrow(value: Value) -> Result<i32> {
-    i32::try_from(signed(value)?).map_err(|_| invalid("projection covered value exceeds INTEGER"))
+    out.clear();
+    // row at a time: the run and compressed forms have no block to hand over.
+    for row in 0..vector.len() {
+        let value = vector
+            .signed_at(row)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| invalid("sorted projection requires non-null signed integers"))?;
+        out.push(value);
+    }
+    Ok(())
 }
 
 fn eligible(order: &LogicalType, covered: &LogicalType) -> bool {
@@ -81,11 +86,14 @@ pub fn build_sorted_projection(
     }
     let mut rows = Vec::<(i64, i32)>::with_capacity(reader.table().rows());
     let mut values = HashSet::<i32>::new();
+    let (mut users, mut groups) = (Vec::new(), Vec::new());
     for part in 0..reader.parts() {
         let chunk = reader.read(part, &[order, covered])?;
-        for row in 0..chunk.len() {
-            let user = signed(chunk.value_at(row, 0))?;
-            let group = narrow(chunk.value_at(row, 1))?;
+        integers(chunk.column(0)?, &mut users)?;
+        integers(chunk.column(1)?, &mut groups)?;
+        for (&user, &group) in users.iter().zip(&groups) {
+            let group = i32::try_from(group)
+                .map_err(|_| invalid("projection covered value exceeds INTEGER"))?;
             rows.push((user, group));
             values.insert(group);
         }
