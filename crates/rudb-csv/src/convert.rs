@@ -20,7 +20,7 @@ use std::ops::Range;
 
 use rudb_common::{Error, LogicalType, Result, Value, days_from_civil};
 use rudb_kernels::cast_value;
-use rudb_vector::{Buffer, Data, INLINE_LIMIT, StringColumn, Validity, Vector};
+use rudb_vector::{Buffer, Data, INLINE_LIMIT, StringColumn, StringView, Validity, Vector};
 
 use crate::dialect::Dialect;
 use crate::scan::{Records, Span};
@@ -127,11 +127,12 @@ pub(crate) fn builders(
 /// A builder for a column of `ty`, with room for `rows` and, for text, `long` bytes of long strings.
 fn builder(ty: &LogicalType, rows: usize, long: usize) -> Box<dyn Build> {
     match ty {
-        LogicalType::Varchar => {
-            let mut strings = StringColumn::with_capacity(rows);
-            strings.reserve_bytes(long);
-            Box::new(Text { ty: ty.clone(), strings, valid: Vec::with_capacity(rows) })
-        }
+        LogicalType::Varchar => Box::new(Text {
+            ty: ty.clone(),
+            views: Vec::with_capacity(rows),
+            arena: Vec::with_capacity(long),
+            valid: Vec::with_capacity(rows),
+        }),
         LogicalType::Boolean => fixed(ty, rows, truth, bool_of, Data::Bool),
         LogicalType::TinyInt => fixed(
             ty,
@@ -295,10 +296,27 @@ where
 ///
 /// A field that is valid UTF-8 and has no escape in it goes in as the bytes it is. The rest go in
 /// as the text [`Span::text`] makes of them, which is the text the cell used to be.
+///
+/// The views and the arena are plain vectors until [`Build::finish`] makes them a column. Pushing
+/// through the column's buffer asked whether it was a shared page on every row, and the compiler
+/// kept that push out of line, which was about 2% of a `lineitem` load's samples.
 struct Text {
     ty: LogicalType,
-    strings: StringColumn,
+    views: Vec<StringView>,
+    arena: Vec<u8>,
     valid: Vec<bool>,
+}
+
+impl Text {
+    /// One string, laid the way [`StringColumn::push_bytes`] lays it.
+    #[inline]
+    fn push(&mut self, bytes: &[u8]) {
+        let offset = self.arena.len() as u64;
+        if bytes.len() > INLINE_LIMIT {
+            self.arena.extend_from_slice(bytes);
+        }
+        self.views.push(StringView::over(bytes, offset));
+    }
 }
 
 impl Build for Text {
@@ -311,15 +329,15 @@ impl Build for Text {
     ) -> Result<()> {
         for row in rows {
             let Some(span) = cells.at(row, column) else {
-                self.strings.push("");
+                self.views.push(StringView::empty());
                 self.valid.push(false);
                 continue;
             };
             let raw = span.raw(cells.bytes);
             if !span.escaped() && rudb_common::utf8::valid(raw) {
-                self.strings.push_bytes(raw);
+                self.push(raw);
             } else {
-                self.strings.push(&span.text(cells.bytes, cells.dialect));
+                self.push(span.text(cells.bytes, cells.dialect).as_bytes());
             }
             self.valid.push(true);
         }
@@ -327,7 +345,8 @@ impl Build for Text {
     }
 
     fn finish(self: Box<Self>) -> Result<Vector> {
-        let Self { ty, strings, valid } = *self;
+        let Self { ty, views, arena, valid } = *self;
+        let strings = StringColumn::from_parts(views, arena.into());
         Ok(Vector::flat(ty, Data::Varlen(strings))
             .expect("a VARCHAR vector holds strings")
             .with_validity(Validity::from_run(&valid)))

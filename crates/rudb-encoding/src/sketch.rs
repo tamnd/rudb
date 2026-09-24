@@ -181,10 +181,19 @@ impl Sketch {
     ///
     /// The first line is the whole of it for all but a few thousand values of a large column, and
     /// the rest is off the hot path on purpose.
+    ///
+    /// The check is inlined into the caller's row loop and the insert is not. A call a row just to
+    /// turn the row away was 2% of a `lineitem` load's samples.
+    #[inline]
     pub fn add_hash(&mut self, hash: u64) {
-        if hash >= self.threshold {
-            return;
+        if hash < self.threshold {
+            self.insert(hash);
         }
+    }
+
+    /// The part of [`Self::add_hash`] a hash below the threshold gets to.
+    #[inline(never)]
+    fn insert(&mut self, hash: u64) {
         if self.slots.is_empty() {
             self.slots = vec![EMPTY; capacity(self.k)];
         }
