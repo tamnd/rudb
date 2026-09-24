@@ -231,27 +231,24 @@ fn a_column_that_is_nothing_but_nulls_has_no_distinct_values_at_all() {
 fn one_comparison_against_a_constant_is_counted_out_of_the_frequency_synopsis() {
     let pair =
         Pair::new("filtered", "SELECT i % 7 AS n, 'v' || (i % 13) AS s FROM range(5000) r(i)");
-    // Seven values and thirteen values, both far inside the budget the synopsis keeps, so neither
-    // column ever had to drop one and both lists are the whole column with an exact count.
+    // Seven values and thirteen values, both far inside the budget the synopsis keeps. The string
+    // list is the whole column with an exact count. A numeric column keeps only its two leading
+    // counts once it has more than one value, so the whole list is never a grouped count read out
+    // of the file, and a comparison on `n` is counted off the rows. It still has to agree.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = 1"), Value::BigInt(715));
-    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n = 1"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n <> 1"), Value::BigInt(4285));
-    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n <> 1"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), Value::BigInt(4615));
     assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s = 'v0'"), Value::BigInt(385));
     assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE s = 'v0'"), "the rows were read anyway");
     // Written the other way round is the same question and neither side depends on the other.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE 1 = n"), Value::BigInt(715));
-    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE 1 = n"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE 'v0' <> s"), Value::BigInt(4615));
     assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE 'v0' <> s"), "the rows were read anyway");
     // A value the column does not have is the same walk and the answer is none of the rows, which
     // is worth asking because it is the one case where the count comes out of an empty sum.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = 99"), Value::BigInt(0));
-    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n = 99"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n <> 99"), Value::BigInt(5000));
-    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n <> 99"), "the rows were read anyway");
     // A grouped count is a different question and the synopsis answers that one too.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t GROUP BY n LIMIT 1"), Value::BigInt(715));
 }
@@ -265,10 +262,9 @@ fn a_filter_over_a_column_with_nulls_leaves_the_nulls_out_of_both_comparisons() 
     );
     // The synopsis counts a null as a value of its own rather than skipping it, so a count over its
     // entries that just compared would hand the 455 null rows to `<>` and SQL hands them to neither.
+    // Only the string column is counted out of it, since a numeric one keeps two leading counts.
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n = 1"), Value::BigInt(650));
-    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n = 1"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE n <> 1"), Value::BigInt(3895));
-    assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE n <> 1"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s = 'v0'"), Value::BigInt(350));
     assert!(pair.summarised("SELECT COUNT(*) FROM t WHERE s = 'v0'"), "the rows were read anyway");
     assert_eq!(pair.agree("SELECT COUNT(*) FROM t WHERE s <> 'v0'"), Value::BigInt(4195));
