@@ -36,7 +36,7 @@ pub use index::Index;
 pub use keys::{Constraint, ForeignKey, Key};
 pub use mirror::{FileStamp, MIRROR_CATALOG};
 pub use name::{QualifiedName, same_name};
-pub use parent::Parent;
+pub use parent::{Parent, Placement};
 pub use rudb_native::StoredPart;
 pub use search::SearchEntry;
 pub use system::{INFORMATION_SCHEMA, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG};

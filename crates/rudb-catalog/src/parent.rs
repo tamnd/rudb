@@ -46,22 +46,49 @@
 //!
 //! [`Parent::column`] answers `None` rather than an error when a column would not fit, which is a
 //! memory limit being reached and not a bug. What the caller does with it is the caller's: the link
-//! join operator reports it, on the argument in `LinkJoin::read_parent` that a parent whose
-//! projection will not fit is one whose hash join would not have fit either.
+//! join operator reports it, on the argument that a parent whose projection will not fit is one
+//! whose hash join would not have fit either.
 //!
 //! The budget is counted over what is held rather than estimated before the read, because a column
 //! is compressed in the file and the number that matters is what it costs once it is a vector. A
 //! column that turns out not to fit is dropped rather than kept, so the next query is not refused
 //! because of a column this one could not use anyway.
+//!
+//! # By part
+//!
+//! The whole column is what a link join used to gather from, and it made the join cost what a hash
+//! join costs: every value of the parent decoded, and then laid end to end, before the first child
+//! row arrived. On TPC-H q12 at scale factor one that was 1.5 million `o_orderpriority` values for
+//! 30,988 surviving children. [`Parent::place`] and [`Parent::gather`] are the other way to do it.
+//! A part is decoded the first time a chunk's row ids land in it and kept, and a part nothing
+//! landed in is never read. A chunk that takes a real share of a part reads it whole, in the form
+//! the writer stored it in, and keeps it for the chunks after; a chunk that takes a few rows of a
+//! part reads those rows and keeps nothing. A chunk that lands in one part, which is what a
+//! child stored in its parent's order does, is one gather out of that part. A chunk that lands in
+//! several is one gather per part it reached and then one typed copy per row to put the rows back
+//! in the chunk's order, which is [`rudb_vector::picked`].
+//!
+//! Nothing here is laid end to end and nothing is decoded that no survivor asked for, so the worst
+//! case, a child whose survivors reach every part, reads every part and decodes one value per
+//! survivor. The whole column read decoded every value of the parent in that case and in every
+//! other.
+//!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use rudb_common::{LogicalType, Result, Spread, serially};
-use rudb_vector::{Form, Validity, Vector, concat_on};
+use rudb_common::{Error, LogicalType, Result, Spread, Value, serially};
+use rudb_vector::{Form, NO_ROW, Validity, Vector, concat_on, picked};
 
 use crate::table::Rows;
+
+/// How few of a part's rows a chunk has to take for the part to be read at those rows alone rather
+/// than whole: fewer than one in this many.
+const SPARSE: usize = 16;
+
+/// One slot per part of one column, each empty until a gather reads that part whole.
+type Slots = Arc<[Mutex<Option<Arc<Vector>>>]>;
 
 /// The projected columns of one table, each held whole, each read at most once.
 ///
@@ -76,13 +103,275 @@ pub struct Parent {
     held: Mutex<HashMap<usize, Option<Arc<Vector>>>>,
     /// What every column held here may cost together, in bytes.
     budget: usize,
+    /// The first row of each part and then the row count, worked out on first use.
+    starts: OnceLock<Vec<u64>>,
+    /// The parts read so far for [`Self::gather`], by column and then by part, in stored form.
+    parts: Mutex<HashMap<usize, Slots>>,
+    /// What the parts held in `parts` cost between them.
+    spent_parts: AtomicUsize,
+    /// The parts, by column and then by part, that a chunk has read a few rows of already.
+    visited: Mutex<HashSet<(usize, usize)>>,
+}
+
+/// Where the parent rows one chunk asked for are, worked out once and used for every column.
+#[derive(Debug)]
+pub struct Placement {
+    rows: usize,
+    shape: Shape,
+}
+
+#[derive(Debug)]
+enum Shape {
+    /// No row has a parent.
+    Nowhere,
+    /// Every row with a parent has it in this part, at these offsets into it.
+    One(usize, Arc<Vec<u32>>),
+    /// Several parts, each with the offsets of the rows that landed in it in the order they landed,
+    /// and for each row which of those parts and which of its offsets, with [`NO_ROW`] as the part
+    /// of a row that has no parent.
+    Many(Vec<(usize, Vec<u32>)>, Vec<(u32, u32)>),
+}
+
+impl Placement {
+    /// How many parts the chunk landed in.
+    #[must_use]
+    pub fn parts(&self) -> usize {
+        match &self.shape {
+            Shape::Nowhere => 0,
+            Shape::One(..) => 1,
+            Shape::Many(parts, _) => parts.len(),
+        }
+    }
 }
 
 impl Parent {
     /// A parent whose columns may cost `budget` bytes between them.
     #[must_use]
     pub fn new(rows: Rows, budget: usize) -> Self {
-        Self { rows, held: Mutex::new(HashMap::new()), budget }
+        Self {
+            rows,
+            held: Mutex::new(HashMap::new()),
+            budget,
+            starts: OnceLock::new(),
+            parts: Mutex::new(HashMap::new()),
+            spent_parts: AtomicUsize::new(0),
+            visited: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Where the parent rows `rids` name are, with [`NO_ROW`] for a row that has no parent.
+    ///
+    /// # Errors
+    ///
+    /// If a part cannot say how many rows it has, or if a row id is past the end of the table.
+    pub fn place(&self, rids: &[u32]) -> Result<Placement> {
+        let starts = self.starts()?;
+        let total = starts.last().copied().unwrap_or(0);
+        let mut found = Vec::with_capacity(rids.len());
+        // The part of the row before, tried first, because a child stored in its parent's order asks
+        // for the same part a couple of thousand times in a row and a search per row would be most
+        // of the cost of this.
+        let mut last = 0;
+        for &rid in rids {
+            if rid == NO_ROW {
+                found.push(None);
+                continue;
+            }
+            let at = u64::from(rid);
+            if at >= total {
+                return Err(Error::internal(format!(
+                    "a gathered row id is past the {total} rows of its parent"
+                )));
+            }
+            if !(starts[last] <= at && at < starts[last + 1]) {
+                last = starts.partition_point(|&start| start <= at) - 1;
+            }
+            // In a part, so under its row count, which is a `usize` the part was read into.
+            found.push(Some((last, (at - starts[last]) as u32)));
+        }
+        let mut touched = found.iter().flatten().map(|&(part, _)| part);
+        let shape = match touched.next() {
+            None => Shape::Nowhere,
+            Some(first) if touched.all(|part| part == first) => Shape::One(
+                first,
+                Arc::new(found.iter().map(|hit| hit.map_or(NO_ROW, |(_, row)| row)).collect()),
+            ),
+            Some(_) => {
+                // Numbered in the order they are first reached. A child walking its parent forwards
+                // reaches them in part order, and nothing below depends on it either way.
+                let mut parts: Vec<(usize, Vec<u32>)> = Vec::new();
+                let mut numbered: HashMap<usize, u32> = HashMap::new();
+                let picks = found
+                    .iter()
+                    .map(|hit| match *hit {
+                        None => (NO_ROW, 0),
+                        Some((part, row)) => {
+                            let at = *numbered.entry(part).or_insert_with(|| {
+                                parts.push((part, Vec::new()));
+                                // Under the chunk's length, which is a `u32` because a row id is.
+                                (parts.len() - 1) as u32
+                            });
+                            let offsets = &mut parts[at as usize].1;
+                            offsets.push(row);
+                            // The same bound, since a part gets no more rows than the chunk has.
+                            (at, (offsets.len() - 1) as u32)
+                        }
+                    })
+                    .collect();
+                Shape::Many(parts, picks)
+            }
+        };
+        Ok(Placement { rows: rids.len(), shape })
+    }
+
+    /// One column of the parent at the rows `placement` holds, or `None` if the parts it needs
+    /// would go past the budget.
+    ///
+    /// # Errors
+    ///
+    /// If a part cannot be read, or if the pieces of a chunk that landed in several parts do not
+    /// lay end to end.
+    pub fn gather(
+        &self,
+        column: usize,
+        ty: &LogicalType,
+        placement: &Placement,
+    ) -> Result<Option<Vector>> {
+        match &placement.shape {
+            Shape::Nowhere => Ok(Some(Vector::constant(ty.clone(), Value::Null, placement.rows))),
+            Shape::One(part, offsets) => self.rows_in(column, *part, offsets),
+            Shape::Many(parts, picks) => {
+                // Each part's own rows first, which is where the part's form is dealt with: a
+                // packed part unpacks the rows asked for and no others, and a dictionary keeps its
+                // values and gathers its codes. What is left to interleave is a few rows a part.
+                let mut pieces = Vec::with_capacity(parts.len());
+                for (part, offsets) in parts {
+                    let Some(piece) = self.rows_in(column, *part, offsets)? else {
+                        return Ok(None);
+                    };
+                    pieces.push(piece);
+                }
+                let held: Vec<&Vector> = pieces.iter().collect();
+                if let Some(picked) = picked(ty, &held, picks)? {
+                    return Ok(Some(picked));
+                }
+                // A form or a type the pick does not read, a list or a struct or string views, a
+                // value at a time. Nothing a link join has been asked to gather so far is one.
+                let values: Vec<Value> = picks
+                    .iter()
+                    .map(|&(piece, row)| {
+                        held.get(piece as usize)
+                            .map_or(Value::Null, |piece| piece.value_at(row as usize))
+                    })
+                    .collect();
+                Vector::from_values(ty.clone(), &values).map(Some)
+            }
+        }
+    }
+
+    /// The first row of each part, and the row count after the last.
+    fn starts(&self) -> Result<&[u64]> {
+        if let Some(starts) = self.starts.get() {
+            return Ok(starts);
+        }
+        let parts = self.rows.chunk_count();
+        let mut starts = Vec::with_capacity(parts + 1);
+        let mut at = 0u64;
+        starts.push(at);
+        for part in 0..parts {
+            at += self.rows.chunk_len(part)? as u64;
+            starts.push(at);
+        }
+        Ok(self.starts.get_or_init(|| starts))
+    }
+
+    /// The rows of one part at `offsets`, with [`NO_ROW`] as a null, or `None` past the budget.
+    ///
+    /// A part already held is gathered from. A part the offsets take a real share of, or one an
+    /// earlier chunk already came to, is read whole and held, since the chunks after are likely to
+    /// want it too: that is a child stored in its parent's order, or one whose survivors come back
+    /// to the same parts chunk after chunk. A part a chunk takes a few rows of the first time it
+    /// comes to it is read at those rows alone and not held, which is a filtered child walking
+    /// forwards through its parent and leaving each part behind. Reading a whole string part there
+    /// decoded every value of it for the one or two a chunk wanted, and on TPC-H q12 that was every
+    /// `o_orderpriority` of `orders` again. A second visit reads whole because a read of a few rows
+    /// still reads and checks the part's pages, and on q09 each chunk took a few rows of every
+    /// `partsupp` part, so reading them a few at a time read every page once per chunk.
+    fn rows_in(&self, column: usize, part: usize, offsets: &[u32]) -> Result<Option<Vector>> {
+        if let Some(held) = self.held_part(column, part) {
+            return held.gather(offsets).map(Some);
+        }
+        let mut positions: Vec<u32> =
+            offsets.iter().copied().filter(|&offset| offset != NO_ROW).collect();
+        positions.sort_unstable();
+        positions.dedup();
+        let length = self.rows.chunk_len(part)?;
+        let first = {
+            let mut visited = self.visited.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            visited.insert((column, part))
+        };
+        if !first || positions.len() * SPARSE >= length {
+            let Some(source) = self.part(column, part)? else {
+                return Ok(None);
+            };
+            return source.gather(offsets).map(Some);
+        }
+        let read = self.rows.read_selected(part, &[column], &positions)?;
+        let read = read.column(0)?;
+        // Each offset as its place among the positions read, which rise, so a search finds it.
+        let places: Vec<u32> = offsets
+            .iter()
+            .map(|offset| {
+                // Under the chunk's length, which is a `u32` because a row id is.
+                positions.binary_search(offset).map_or(NO_ROW, |place| place as u32)
+            })
+            .collect();
+        read.gather(&places).map(Some)
+    }
+
+    /// One part of one column, if a gather has already read it whole.
+    fn held_part(&self, column: usize, part: usize) -> Option<Arc<Vector>> {
+        let slots = {
+            let parts = self.parts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(parts.get(&column)?)
+        };
+        let slot = slots.get(part)?.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.as_ref().map(Arc::clone)
+    }
+
+    /// One part of one column as the writer stored it, read at most once.
+    fn part(&self, column: usize, part: usize) -> Result<Option<Arc<Vector>>> {
+        let slots = {
+            let mut parts = self.parts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let count = self.rows.chunk_count();
+            Arc::clone(
+                parts
+                    .entry(column)
+                    .or_insert_with(|| (0..count).map(|_| Mutex::new(None)).collect()),
+            )
+        };
+        let slot =
+            slots.get(part).ok_or_else(|| Error::internal("a gather named a missing part"))?;
+        // Held across the read, so two instances that want the same part read it once.
+        let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(found) = slot.as_ref() {
+            return Ok(Some(Arc::clone(found)));
+        }
+        // Kept in the form it was stored in. Decoding a whole part here cost TPC-H q12 more than
+        // the whole column read it replaced, since its survivors reach every part of `orders` and
+        // each of them wants one value out of a part of thousands.
+        let piece = self.rows.read(part, &[column])?.column(0)?.clone();
+        let cost = piece.footprint();
+        let before = self.spent_parts.fetch_add(cost, Ordering::Relaxed);
+        let held = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if before.saturating_add(cost).saturating_add(spent(&held)) > self.budget {
+            self.spent_parts.fetch_sub(cost, Ordering::Relaxed);
+            return Ok(None);
+        }
+        drop(held);
+        let piece = Arc::new(piece);
+        *slot = Some(Arc::clone(&piece));
+        Ok(Some(piece))
     }
 
     /// The whole of one column, or `None` if reading it would go past the budget.
@@ -136,7 +425,7 @@ impl Parent {
     #[must_use]
     pub fn footprint(&self) -> usize {
         let held = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        spent(&held)
+        spent(&held) + self.spent_parts.load(Ordering::Relaxed)
     }
 
     /// Reads every part of one column and lays them end to end.
@@ -313,7 +602,7 @@ mod tests {
 
     use rudb_common::{LogicalType, Result, Value};
     use rudb_storage::MemoryTable;
-    use rudb_vector::{Chunk, Validity, Vector};
+    use rudb_vector::{Chunk, NO_ROW, Validity, Vector};
 
     use super::Parent;
     use crate::table::Rows;
@@ -537,5 +826,110 @@ mod tests {
             "a column far past the budget is refused"
         );
         assert_eq!(parent.footprint(), 0, "and nothing is held on to afterwards");
+    }
+
+    /// A chunk whose ids all land in one part reads that part alone, and a chunk
+    /// whose ids land in several comes back with every row in the place it asked for.
+    #[test]
+    fn a_gather_by_part_reads_the_rows_asked_for_in_the_order_asked() {
+        let values: Vec<i32> = (0..1000).collect();
+        let parent = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let one = parent.place(&[130, NO_ROW, 129, 255]).expect("placed");
+        assert_eq!(one.parts(), 1);
+        let column = parent.gather(0, &LogicalType::Integer, &one).expect("read").expect("fits");
+        assert_eq!(column.len(), 4, "the rows asked for and not the part");
+        let want = [Value::Integer(130), Value::Null, Value::Integer(129), Value::Integer(255)];
+        for (row, want) in want.iter().enumerate() {
+            assert_eq!(&column.value_at(row), want, "row {row}");
+        }
+
+        let ids = [999, 0, NO_ROW, 500, 1, 998, 128];
+        let many = parent.place(&ids).expect("placed");
+        assert_eq!(many.parts(), 4);
+        let column = parent.gather(0, &LogicalType::Integer, &many).expect("read").expect("fits");
+        assert_eq!(column.len(), ids.len());
+        for (row, &id) in ids.iter().enumerate() {
+            let want = if id == NO_ROW { Value::Null } else { Value::Integer(id as i32) };
+            assert_eq!(column.value_at(row), want, "row {row}");
+        }
+    }
+
+    /// A chunk that takes a few rows of a part leaves nothing held, and one that takes a share of
+    /// it leaves the part held for the next.
+    #[test]
+    fn a_gather_by_part_holds_a_part_it_takes_a_share_of_and_not_one_it_takes_a_few_rows_of() {
+        let values: Vec<i32> = (0..1024).collect();
+        let parent = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let few = parent.place(&[3, 5, 7]).expect("placed");
+        let column = parent.gather(0, &LogicalType::Integer, &few).expect("read").expect("fits");
+        assert_eq!(column.value_at(2), Value::Integer(7));
+        assert_eq!(parent.footprint(), 0, "a few rows are read and not held");
+        let ids: Vec<u32> = (256..384).rev().collect();
+        let share = parent.place(&ids).expect("placed");
+        let column = parent.gather(0, &LogicalType::Integer, &share).expect("read").expect("fits");
+        assert_eq!(column.value_at(0), Value::Integer(383));
+        assert!(parent.footprint() > 0, "a whole part is held for the chunks after");
+        let again = parent.place(&[300]).expect("placed");
+        let column = parent.gather(0, &LogicalType::Integer, &again).expect("read").expect("fits");
+        assert_eq!(column.value_at(0), Value::Integer(300), "and gathered from once held");
+    }
+
+    /// A second chunk that comes back to a part it took a few rows of reads it whole and holds it,
+    /// which is a child whose survivors come back to the same parts every chunk.
+    #[test]
+    fn a_gather_by_part_holds_a_part_a_second_chunk_comes_back_to() {
+        let values: Vec<i32> = (0..1024).collect();
+        let parent = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        for (chunk, id) in [4u32, 8, 12].into_iter().enumerate() {
+            let placed = parent.place(&[id]).expect("placed");
+            let column =
+                parent.gather(0, &LogicalType::Integer, &placed).expect("read").expect("fits");
+            assert_eq!(column.value_at(0), Value::Integer(id as i32));
+            assert_eq!(parent.footprint() > 0, chunk > 0, "held from the second chunk on");
+        }
+    }
+
+    /// Only the parts asked for are read, which is the whole point of reading by part.
+    #[test]
+    fn a_gather_by_part_reads_no_part_it_was_not_asked_for() {
+        let values: Vec<i32> = (0..1024).collect();
+        let parent = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let placed = parent.place(&[3, 5]).expect("placed");
+        parent.gather(0, &LogicalType::Integer, &placed).expect("read").expect("fits");
+        let one = parent.footprint();
+        let whole = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        whole.column(0, &LogicalType::Integer).expect("read").expect("fits");
+        assert!(one * 4 < whole.footprint(), "{one} bytes read for one part of eight");
+    }
+
+    /// A chunk with no parent at all is nulls, and a string column over several parts comes back
+    /// right too, since strings are the one layout the pick copies a value at a time.
+    #[test]
+    fn a_gather_by_part_of_nothing_is_null_and_of_strings_is_the_strings() {
+        let values = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
+        let held: Vec<&str> = (0..500).map(|row| values[row % values.len()]).collect();
+        let parent = Parent::new(strings(&held, 64), 64 * 1024 * 1024);
+        let none = parent.place(&[NO_ROW, NO_ROW]).expect("placed");
+        let column = parent.gather(0, &LogicalType::Varchar, &none).expect("read").expect("fits");
+        assert_eq!(column.len(), 2);
+        assert_eq!(column.value_at(1), Value::Null);
+        let ids = [499, 3, 64, 200];
+        let placed = parent.place(&ids).expect("placed");
+        let column = parent.gather(0, &LogicalType::Varchar, &placed).expect("read").expect("fits");
+        for (row, &id) in ids.iter().enumerate() {
+            assert_eq!(column.value_at(row), Value::Varchar(held[id as usize].into()), "row {row}");
+        }
+    }
+
+    /// Past the end of the table is an error and not a read of some other row.
+    #[test]
+    fn a_gather_by_part_past_the_end_is_refused() {
+        let parent = Parent::new(table(&(0..100).collect::<Vec<i32>>(), 32), 64 * 1024 * 1024);
+        assert!(parent.place(&[100]).is_err());
+        let tight = Parent::new(table(&(0..4096).collect::<Vec<i32>>(), 512), 64);
+        // Every row of the first part, so the part is read whole and the budget is asked.
+        let placed = tight.place(&(0..512).collect::<Vec<u32>>()).expect("placed");
+        assert_eq!(tight.gather(0, &LogicalType::Integer, &placed).expect("no error"), None);
+        assert_eq!(tight.footprint(), 0, "a refused part is not held");
     }
 }

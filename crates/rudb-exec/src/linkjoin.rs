@@ -9,18 +9,17 @@
 //! check, and a `u32` written into a buffer. What a hash join spends on the same row is a hash, a
 //! probe, a compare and a gather, on top of a build that read the parent side into a table first.
 //!
-//! # Why the parent columns come out as gathers and not as rows
+//! # Why the parent columns are gathered as the chunk passes
 //!
-//! Because most of them are never read. A `Gathered` vector is an `Arc` to the parent's column and
-//! the row ids to take from it, so a parent column the query projects but never touches before the
-//! final output costs one pointer per chunk rather than one value per child row. On TPC-H Q3 that
-//! is `o_orderdate` and `o_shippriority`, both of which are only grouped on.
-//!
-//! The other half is section 8.2's dispatch rule. A kernel handed a gathered column can fold over
-//! the distinct parent rows that were actually reached rather than over one value per child row,
-//! which on a many to one join is the same argument the engine already makes for dictionaries. The
-//! operator does not have to do anything to get that: it hands out the form and the kernels read
-//! it.
+//! Because the parts they are gathered out of are stored parts, and a stored part is bit packed or
+//! dictionary coded almost always. A `Gathered` vector over one of those, handed up for a kernel to
+//! read later, was tried first: it costs one pointer per chunk, and every kernel above it then read
+//! it a value at a time, since the kernels fold over a gather of a flat run and fall back over a
+//! gather of anything else. On TPC-H q09 that was 1,466 fallbacks in one projection. A gather out of
+//! the part as the chunk passes decodes the rows the chunk takes and no others, which for a packed
+//! part is a shift and a mask per row, and a dictionary keeps its values and gathers its codes, so
+//! what goes up is a form every kernel reads at full speed. How the rows of one chunk are found in
+//! the parts they land in is [`Parent::place`].
 //!
 //! # The four kinds
 //!
@@ -41,12 +40,11 @@
 //! on the section matches the parent it was built against. [`rudb_catalog::Rows::stored`] is the
 //! first of those and [`rudb_native::graph::stored_link`] is the second.
 //!
-//! And every row id this operator writes is checked against the length of the column it points
-//! into, by [`Vector::gathered`], on every chunk. That check is the only thing between a link built
+//! And every row id this operator writes is checked against the length of the table it points
+//! into, by [`Parent::place`], on every chunk. That check is the only thing between a link built
 //! against a table that has since been rewritten and a read of whatever happens to be at that
 //! offset.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Parent;
@@ -55,9 +53,8 @@ use rudb_graph::Link;
 use rudb_pipeline::{Compaction, Gauge, Lease, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, JoinKind, Plan};
 use rudb_seam::{Context, SeamId, Settings};
-use rudb_vector::{Chunk, Data, NO_ROW, Selection, Validity, Vector};
+use rudb_vector::{Chunk, Data, NO_ROW, Selection, Vector};
 
-use crate::pairs::together;
 use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
 use crate::schema::Schema;
@@ -203,86 +200,35 @@ impl LinkJoin {
 
     /// Puts the gathered parent columns beside the child's.
     ///
-    /// Nothing is read out of the parent here. What is built is one `Arc` per projected column over
-    /// the ids that were just resolved, and the values are read by whichever operator above first
-    /// asks for them, which for a column that is only grouped on is never.
+    /// Only the parts of the parent the chunk's ids land in are read, in the form they were
+    /// stored, and only the rows asked for are decoded out of them. See `rudb_catalog::parent` on
+    /// why, and on what a chunk that lands in several parts costs.
     fn gather(&self, chunk: &mut Chunk, rids: &[u32]) -> Result<()> {
         if self.projected.is_empty() {
             return Ok(());
         }
         let rows = chunk.len();
-        let ids = Arc::new(rids.to_vec());
+        let placement = self.parent.place(rids)?;
         let mut columns: Vec<Vector> = chunk.columns().to_vec();
         for (column, ty) in &self.projected {
-            let source = self.parent.column(*column, ty)?.ok_or_else(|| {
+            let gathered = self.parent.gather(*column, ty, &placement)?.ok_or_else(|| {
                 Error::out_of_memory(
                     "a link join could not hold the parent columns it gathers from".to_string(),
                 )
             })?;
-            columns.push(match coded(&source, rids)? {
-                Some(codes) => codes,
-                None => Vector::gathered(source, Arc::clone(&ids))?,
-            });
+            columns.push(gathered);
         }
         *chunk = Chunk::with_rows(columns, rows)?;
-        Ok(())
+        self.charge()
     }
 
-    /// Reads the parent's projected columns, so that no instance is the one that pays for it.
+    /// Grows the reservation to what the parent holds now, which only ever goes up.
     ///
-    /// The same argument [`crate::join::Probe::prepare`] makes, with a smaller thing being read: an
-    /// instance that found the column missing would read it behind a lock while the rest of the
-    /// lease slept on it.
-    ///
-    /// A column that does not fit is an error here rather than a fall back, and this is the one
-    /// place in the graph layer where that is the right answer. A hash join over the same parent
-    /// materialises the same columns and then builds a table over them, so it costs strictly more
-    /// than this does. A parent whose projection will not fit here is a parent whose hash join
-    /// would not have fit either, and reporting it is what the hash join would have done.
-    ///
-    /// # Why the lease goes down into the read
-    ///
-    /// Because this happens with the pipeline stopped. It is called from [`Stream::prepare`], which
-    /// runs before the instances are handed out, so a read on the calling thread is one thread
-    /// decoding a column while the rest of the lease is parked, and the whole of it lands on the
-    /// pipeline's wall clock.
-    ///
-    /// That was measured, and it was most of the operator. On TPC-H q12 at scale factor one the link
-    /// plan's one pipeline took 158 ms of wall clock, of which the slowest instance was 56 ms and the
-    /// stagger 3 ms: about 100 ms was this function, reading 1.5 million rows of one string column on
-    /// one thread. The hash join it is compared against reads the same column as an ordinary pipeline
-    /// and so reads it on six, which is why the rule looked like it was choosing the slower plan when
-    /// what it was choosing was the same work done serially.
-    ///
-    /// The columns are still read one after another, because a projection is a handful of columns and
-    /// the parts of one column are hundreds of pieces. The parallelism that matters is inside.
-    fn read_parent(&self, threads: &Lease<'_>) -> Result<()> {
-        // Off a counter rather than by dealing the parts out in advance, because the parts of a real
-        // table are not the same size and a thread that drew a cheap one should take the next one
-        // instead of finishing early. Not [`in_parallel`], which is the same loop with a slot per
-        // piece to bring a result back in: the pieces here come back through the catalog's own
-        // slots, so a second set of them holding units would be an allocation per part for nothing.
-        let spread = |count: usize, task: &(dyn Fn(usize) + Sync)| -> Result<()> {
-            let next = AtomicUsize::new(0);
-            let step = || {
-                loop {
-                    let at = next.fetch_add(1, Ordering::Relaxed);
-                    if at >= count {
-                        return;
-                    }
-                    task(at);
-                }
-            };
-            together(threads, threads.degree().min(count), &step)
-        };
-        for (column, ty) in &self.projected {
-            self.cancel.check()?;
-            if self.parent.column_on(*column, ty, &spread)?.is_none() {
-                return Err(Error::out_of_memory(
-                    "a link join could not hold the parent columns it gathers from".to_string(),
-                ));
-            }
-        }
+    /// A part is charged once it is read rather than the whole projection being charged before the
+    /// first chunk, because the point of reading by part is that most parts of a filtered join are
+    /// never read. A parent that goes past the budget part way through is reported the way a hash
+    /// join whose table went past it would be.
+    fn charge(&self) -> Result<()> {
         let footprint = u64::try_from(self.parent.footprint()).unwrap_or(u64::MAX);
         let mut held = self.held.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let already = held.bytes();
@@ -300,8 +246,12 @@ impl Stream for LinkJoin {
         Linking { scratch: self.rid.scratch(), rids: Vec::new(), gauge: Gauge::new(1) }
     }
 
-    fn prepare(&self, threads: &Lease<'_>) -> Result<()> {
-        self.read_parent(threads)
+    fn prepare(&self, _threads: &Lease<'_>) -> Result<()> {
+        // Nothing is read up front. The parts come in as the chunks that need them arrive, on
+        // whichever instance got there first, which is how the reading ends up spread over the
+        // lease without a step of its own. Working out where the parts start is done here so that
+        // no instance pays for it while the others wait.
+        self.parent.place(&[]).map(drop)
     }
 
     fn push(&self, chunk: &mut Chunk, local: &mut Linking) -> Result<Progress> {
@@ -370,46 +320,6 @@ impl Stream for LinkJoin {
     }
 }
 
-/// The rows `rids` names of a parent column held as codes into the table's dictionary, as codes
-/// into the same dictionary, or `None` for a column held any other way.
-///
-/// Read now rather than left as a gather, because it is four bytes a row and what comes out is a
-/// stable dictionary, which every kernel above already reads a code at a time. A gather over the
-/// same codes is a form most of them flatten, and on TPC-H q12 the flatten of `o_orderpriority`
-/// out of a gather was most of what the link join cost. A row whose parent is [`NO_ROW`] or null is
-/// null.
-fn coded(source: &Vector, rids: &[u32]) -> Result<Option<Vector>> {
-    let Some((codes, values)) = source.stable_dictionary_parts() else { return Ok(None) };
-    // A dictionary with no values has no code to stand in for a null row.
-    if values.is_empty() {
-        return Ok(None);
-    }
-    let parent = source.validity();
-    let mut nulls = false;
-    let mut taken = Vec::with_capacity(rids.len());
-    for &rid in rids {
-        if rid == NO_ROW {
-            nulls = true;
-            taken.push(0);
-            continue;
-        }
-        let Some(&code) = codes.get(rid as usize) else {
-            return Err(Error::internal("a link join gathered past the end of a parent column"));
-        };
-        nulls |= !parent.is_valid(rid as usize);
-        taken.push(code);
-    }
-    let vector = Vector::stable_dictionary(taken, Arc::clone(values))?;
-    Ok(Some(if nulls {
-        vector.with_validity(Validity::from_iter(rids.len(), |row| {
-            let rid = rids[row];
-            rid != NO_ROW && parent.is_valid(rid as usize)
-        }))
-    } else {
-        vector
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -421,42 +331,10 @@ mod tests {
     use rudb_plan::{ColumnBinding, Expr, JoinKind, Plan};
     use rudb_seam::Settings;
     use rudb_storage::MemoryTable;
-    use rudb_vector::{Chunk, NO_ROW, Validity, Vector};
+    use rudb_vector::{Chunk, Vector};
 
-    use super::{LinkJoin, coded};
+    use super::LinkJoin;
     use crate::schema::Schema;
-
-    /// A parent column of codes gathers as codes into the same values, with a missing parent and a
-    /// null parent both null, and any other column is left to the gather.
-    #[test]
-    fn a_coded_parent_column_gathers_as_codes() {
-        let words = ["1-URGENT", "2-HIGH", "5-LOW"];
-        let values: Vec<Value> = words.iter().map(|&word| Value::Varchar(word.into())).collect();
-        let values = Arc::new(Vector::from_values(LogicalType::Varchar, &values).expect("words"));
-        let source = Vector::stable_dictionary(vec![2, 0, 1, 1], Arc::clone(&values))
-            .expect("codes inside the dictionary")
-            .with_validity(Validity::from_iter(4, |row| row != 3));
-        let rids = [1, NO_ROW, 0, 3, 2, 0];
-        let taken = coded(&source, &rids).expect("in range").expect("a coded column");
-        let (_, held) = taken.stable_dictionary_parts().expect("still codes");
-        assert!(Arc::ptr_eq(held, &values), "the codes point somewhere else");
-        let text = |word: &str| Value::Varchar(word.into());
-        let read: Vec<Value> = (0..rids.len()).map(|row| taken.value_at(row)).collect();
-        assert_eq!(
-            read,
-            [
-                text("1-URGENT"),
-                Value::Null,
-                text("5-LOW"),
-                Value::Null,
-                text("2-HIGH"),
-                text("5-LOW")
-            ]
-        );
-        assert!(coded(&source, &[4]).is_err(), "a row past the column");
-        let flat = Vector::from_values(LogicalType::Integer, &[Value::Integer(1)]).expect("flat");
-        assert!(coded(&flat, &[0]).expect("a flat column").is_none());
-    }
 
     /// A parent of `rows` rows whose one column is its own row number, so that a gathered value
     /// says which parent row it came from and a wrong link shows up as a wrong number.
@@ -619,23 +497,17 @@ mod tests {
         );
     }
 
-    /// A gather is a pointer and not a copy, which is the reason the body exists. Eight columns
-    /// off one parent are one parent between them, and one column off it is not a second copy of
-    /// the parent either.
+    /// A gather reads the one part the ids land in and takes the rows asked for out of it, so what
+    /// goes up is one value a child row and not the part.
     #[test]
-    fn the_parent_is_pointed_at_rather_than_copied() {
+    fn the_parent_rows_asked_for_are_taken_out_of_the_part() {
         let operator = operator(JoinKind::Inner, &[Some(0); 8], 4);
         let mut chunk = child(8);
         let mut local = operator.local();
         operator.push(&mut chunk, &mut local).expect("the push");
         let gathered = chunk.column(2).expect("the parent column");
-        let (source, rids) = gathered.gathered_parts().expect("it is a gather");
-        assert_eq!(source.len(), 4, "the source is the whole parent column");
-        assert_eq!(rids.len(), 8, "one id per child row");
-        assert!(
-            gathered.footprint() < source.footprint() + 8 * 4 + 64,
-            "the parent was copied rather than pointed at"
-        );
+        assert_eq!(gathered.len(), 8, "one row per child row");
+        assert!(gathered.gathered_parts().is_none(), "taken out rather than pointed at");
     }
 
     /// A row id the plan named that is not a row id is a plan that is wrong, and it is caught on

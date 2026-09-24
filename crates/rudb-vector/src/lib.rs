@@ -53,7 +53,7 @@ pub mod validity;
 pub mod vector;
 
 pub use assemble::{
-    Assembly, concat, concat_on, interleave, interleave_placed, placed_string_rows,
+    Assembly, concat, concat_on, interleave, interleave_placed, picked, placed_string_rows,
     strings_placeable,
 };
 pub use buffer::{Buffer, Pin};

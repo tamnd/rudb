@@ -2103,7 +2103,7 @@ impl<'a> Building<'a, '_> {
         }
         // What is left of the query's budget, since the columns are held for as long as anything
         // above can still read through them. A parent that will not fit in it is reported by the
-        // operator rather than here, for the reason on `LinkJoin::read_parent`.
+        // operator rather than here, as the parts it needs are read.
         let budget = self.memory.limit().map_or(usize::MAX, |limit| {
             usize::try_from(limit.saturating_sub(self.memory.used())).unwrap_or(usize::MAX)
         });
