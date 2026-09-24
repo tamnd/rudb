@@ -144,6 +144,46 @@ pub(crate) struct Found {
     /// What the exact reduction came to, for the scan to report, including one that stopped early
     /// and so left `rows` empty.
     reduced: Option<Reduced>,
+    /// The build side's keys themselves, when they are integers and few enough to keep. See
+    /// [`Keys`].
+    keys: Option<Keys>,
+}
+
+/// The most keys a build side keeps as a sorted list, which is half a megabyte of them.
+const KEYS: usize = 1 << 16;
+
+/// The build side's keys, sorted and each once, for the scan to rule out parts with.
+///
+/// The range says a part is worth reading when any of its keys could fall between the smallest and
+/// the largest the build side holds. That is the right question for a filter on the parent that
+/// keeps one stretch of it, and the wrong one for a filter that keeps keys scattered over the whole
+/// of it. TPC-H q18 is the case: the orders over three hundred in quantity are fifty seven keys
+/// spread over six million, so the range covers all of `lineitem` and `orders` and both scans read
+/// every part, and the filter drops all but a handful of rows only after each part was decoded. Both
+/// tables are stored in order key order, so a part covers a few thousand keys and almost none of
+/// them holds one of the fifty seven. Asking for the first key at or past the part's smallest and
+/// checking it against the part's largest is a binary search a part, and it rules out the part
+/// before a byte of it is read.
+///
+/// Kept only beside the filter, because the exact rows and the bitmap over the parent already skip
+/// what they can, and only up to [`KEYS`], where a part covering a few thousand keys would rarely
+/// fall between two of them anyway.
+#[derive(Debug)]
+pub(crate) struct Keys {
+    keys: Vec<i64>,
+}
+
+impl Keys {
+    /// Whether no key falls inside a part whose column spans `range`.
+    ///
+    /// `false` for a range with an open end or one that is not an integer, which keeps the part.
+    pub(crate) fn misses(&self, range: &Range) -> bool {
+        let (Some(Bound::Int(low)), Some(Bound::Int(high))) = (&range.low, &range.high) else {
+            return false;
+        };
+        let at = self.keys.partition_point(|&key| i128::from(key) < *low);
+        self.keys.get(at).is_none_or(|&key| i128::from(key) > *high)
+    }
 }
 
 /// The keys a build side holds, as one bit per key value over the range the parent's keys span.
@@ -398,6 +438,16 @@ impl<'a> Sideways<'a> {
         self.found.get()?.reduced
     }
 
+    /// The build side's keys as a sorted list the scan of `index` rules out parts with, and which of
+    /// its columns holds the key. See [`Keys`].
+    pub(crate) fn keys(&self, index: u32) -> Option<(usize, &Keys)> {
+        let binding = self.binding.get()?;
+        if binding.table != index {
+            return None;
+        }
+        Some((binding.column as usize, self.found.get()?.keys.as_ref()?))
+    }
+
     /// The build side's keys as a bitmap the scan of `index` tests its rows against, and which of
     /// its columns holds the key. See [`Domain`].
     pub(crate) fn domain(&self, index: u32) -> Option<(usize, &Domain)> {
@@ -536,6 +586,7 @@ pub(crate) fn found_for(
     let held = if wanted && domain.is_none() { dense(&keyed, rows) } else { None };
     let settled = settled || domain.is_some();
     let mut filter = if settled { None } else { Blocked::sized(rows, BUDGET) };
+    let keys = if filter.is_some() && rows <= KEYS { sorted(&keyed) } else { None };
     let mut hashes = Vec::new();
     for (keys, len) in &keyed {
         let (Some(keys), len) = (keys, *len) else { continue };
@@ -553,7 +604,7 @@ pub(crate) fn found_for(
             filter.add(word);
         }
     }
-    Ok(Found { range: extremes.into_range(), filter, rows: exact, domain, held, reduced })
+    Ok(Found { range: extremes.into_range(), filter, rows: exact, domain, held, reduced, keys })
 }
 
 /// The build side's keys as a [`Domain`] over their own range, when that range is small enough.
@@ -579,21 +630,12 @@ pub(crate) fn found_for(
 /// fewer, because the scan reads the driving column through the same widening and the join has
 /// already made the two sides one type. `None` for anything else, and the filter is built instead.
 fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
-    let narrow = |ty: &LogicalType| {
-        matches!(
-            ty,
-            LogicalType::TinyInt
-                | LogicalType::SmallInt
-                | LogicalType::Integer
-                | LogicalType::BigInt
-        )
-    };
     let mut block = Vec::new();
     let mut low = i64::MAX;
     let mut high = i64::MIN;
     for (keys, len) in keyed {
         let Some(keys) = keys else { continue };
-        if !narrow(keys.logical_type()) || !keys.signed_block(&mut block) || block.len() < *len {
+        if !integer(keys.logical_type()) || !keys.signed_block(&mut block) || block.len() < *len {
             return None;
         }
         let nullable = has_nulls(keys, *len);
@@ -629,6 +671,36 @@ fn dense(keyed: &[(Option<Vector>, usize)], rows: usize) -> Option<Domain> {
         }
     }
     Some(Domain { base: i128::from(low), range, words })
+}
+
+/// The build side's keys sorted and each once, or `None` when one is not an integer [`dense`] reads.
+fn sorted(keyed: &[(Option<Vector>, usize)]) -> Option<Keys> {
+    let mut block = Vec::new();
+    let mut keys = Vec::new();
+    for (column, len) in keyed {
+        let Some(column) = column else { continue };
+        if !integer(column.logical_type()) || !column.signed_block(&mut block) || block.len() < *len
+        {
+            return None;
+        }
+        let nullable = has_nulls(column, *len);
+        for (row, &key) in block[..*len].iter().enumerate() {
+            if !(nullable && column.is_null_at(row)) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Some(Keys { keys })
+}
+
+/// The four signed integer types a key is read through a widening for, on both sides of the join.
+fn integer(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer | LogicalType::BigInt
+    )
 }
 
 /// The driving rows whose link points at a parent row the build side holds.
@@ -750,13 +822,28 @@ impl Found {
     /// A build side that turned out to hold this, for the tests that stand in for one.
     #[cfg(test)]
     pub(crate) fn of(range: Option<(Bound, Bound)>, filter: Option<Blocked>) -> Self {
-        Self { range, filter, rows: None, domain: None, held: None, reduced: None }
+        Self { range, filter, rows: None, domain: None, held: None, reduced: None, keys: None }
+    }
+
+    /// The same, with the keys as a sorted list beside the range.
+    #[cfg(test)]
+    pub(crate) fn listing(range: Option<(Bound, Bound)>, mut keys: Vec<i64>) -> Self {
+        keys.sort_unstable();
+        Self { keys: Some(Keys { keys }), ..Self::of(range, None) }
     }
 
     /// The same, with an exact set of driving rows.
     #[cfg(test)]
     pub(crate) fn exactly(range: Option<(Bound, Bound)>, rows: Rids) -> Self {
-        Self { range, filter: None, rows: Some(rows), domain: None, held: None, reduced: None }
+        Self {
+            range,
+            filter: None,
+            rows: Some(rows),
+            domain: None,
+            held: None,
+            reduced: None,
+            keys: None,
+        }
     }
 }
 

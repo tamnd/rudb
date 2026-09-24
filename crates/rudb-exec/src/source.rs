@@ -34,7 +34,7 @@ use crate::expr::{evaluate_all, evaluate_all_in_time_zone};
 use crate::prepared::{Prepared, Scratch};
 use crate::register::compaction;
 use crate::schema::Schema;
-use crate::sideways::Sideways;
+use crate::sideways::{Keys, Sideways};
 use crate::stream::{later_passes, marking_pays};
 use crate::table::{Across, hash};
 
@@ -1301,6 +1301,23 @@ impl<'a> Scan<'a> {
         (!probes.is_empty() && rows.skips(at, probes))
             || (!cutoff.is_empty() && rows.skips(at, cutoff))
             || self.reduced_away(at)
+            || self.keyed_away(at)
+    }
+
+    /// The key lists the joins above handed down, each with the table column it is about.
+    fn keyed(&self) -> impl Iterator<Item = (usize, &Keys)> {
+        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        joins.filter_map(|sideways| {
+            let (at, keys) = sideways.keys(self.index)?;
+            Some((self.columns.get(at).copied().flatten()?, keys))
+        })
+    }
+
+    /// Whether a join above holds no key inside part `at`, so the part is never read. See [`Keys`].
+    fn keyed_away(&self, at: usize) -> bool {
+        self.keyed().any(|(column, keys)| {
+            self.table.rows().ruled_by(at, column, &|range| keys.misses(range))
+        })
     }
 
     /// The exact rows a join above handed down, and where part `at` starts, when there are some.
@@ -1351,12 +1368,18 @@ impl<'a> Scan<'a> {
         let (mut live, rows) = self.bounded();
         let working = live.iter().filter(|stripe| !stripe.parts.is_empty()).count();
         let probes = self.testing();
-        if probes.is_empty() || !worth_sifting(working, threads, rows, weight) {
+        // A key list is asked whatever the spread, because it is what turns a scan of every part
+        // into a scan of a handful, and the instance count should be taken from the handful.
+        let keyed = self.keyed().next().is_some();
+        let sifting = !probes.is_empty() && worth_sifting(working, threads, rows, weight);
+        if !keyed && !sifting {
             return (live, rows);
         }
         let mut sifted = 0;
         for stripe in &mut live {
-            stripe.parts.retain(|&at| !self.table.rows().skips(at, probes));
+            stripe.parts.retain(|&at| {
+                !(sifting && self.table.rows().skips(at, probes)) && !self.keyed_away(at)
+            });
             stripe.rows =
                 stripe.parts.iter().map(|&at| self.table.rows().chunk_len(at).unwrap_or(0)).sum();
             sifted += stripe.rows;
@@ -1378,7 +1401,14 @@ impl<'a> Scan<'a> {
         let mut rows = 0;
         let mut live = Vec::with_capacity(self.stripes.len());
         for (stripe, parts) in self.stripes.iter().enumerate() {
-            if !probes.is_empty() && self.table.rows().stripe_skips(stripe, probes) {
+            let keyed_away = || {
+                self.keyed().any(|(column, keys)| {
+                    self.table.rows().stripe_ruled_by(stripe, column, &|range| keys.misses(range))
+                })
+            };
+            if (!probes.is_empty() && self.table.rows().stripe_skips(stripe, probes))
+                || keyed_away()
+            {
                 live.push(Live::default());
                 continue;
             }
@@ -3955,6 +3985,22 @@ mod tests {
 
         assert_eq!(counted_rows(&scan), VECTOR_SIZE, "one chunk's worth");
         assert_eq!(scan.skipped.load(Ordering::Relaxed), 4);
+    }
+
+    /// The keys themselves, for a build side whose range covers the whole table. Five chunks hold 0
+    /// to 10239 and the build side held 100 and 9000, so the three chunks between are never read.
+    #[test]
+    fn a_scan_skips_the_chunks_between_a_joins_keys() {
+        let table = counted(VECTOR_SIZE * 5);
+        let sideways = Sideways::new();
+        sideways.about(ColumnBinding::new(0, 0));
+        let range = Some((Bound::Int(100), Bound::Int(9_000)));
+        sideways.found(Found::listing(range, vec![9_000, 100]));
+        let mut scan = scanning(&table, Vec::new());
+        scan.sideways = Some(sideways);
+
+        assert_eq!(counted_rows(&scan), VECTOR_SIZE * 2, "the first chunk and the last");
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), 3);
     }
 
     /// The exact tier, which answers by position rather than by value. Five chunks, and the join
