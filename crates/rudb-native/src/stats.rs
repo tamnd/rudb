@@ -348,11 +348,50 @@ impl Pass {
                         self.fold_spread(&spread);
                         return true;
                     })+
+                    Data::Float64(held) => self.scan_reals(rows, validity, held),
+                    Data::Float32(held) => self.scan_reals(rows, validity, held),
                     _ => false,
                 }
             };
         }
         rudb_vector::for_each_layout!(signed, signed)
+    }
+
+    /// One vector of a flat float column, which [`Self::scan_rows`] read by building a `Value` a row
+    /// and comparing it as a [`Bound`] four times.
+    ///
+    /// On a `lineitem` load from CSV the four price and quantity columns come in as `DOUBLE`, and
+    /// that was about 5% of the load's cycles. `false` when the vector holds a NaN, and the caller
+    /// reads it a row at a time as before.
+    fn scan_reals<T: Copy + Into<f64>>(
+        &mut self,
+        rows: usize,
+        validity: &Validity,
+        held: &[T],
+    ) -> bool {
+        if held.len() < rows {
+            return false;
+        }
+        let Some(spread) = real_spread(rows, validity, |row| held[row].into()) else {
+            return false;
+        };
+        let width = self.fixed.unwrap_or(8);
+        self.fold(Reduced {
+            rows: spread.rows,
+            nulls: spread.nulls,
+            values: spread.values,
+            bytes: width.saturating_mul(spread.values),
+            widest: if spread.values > 0 { width } else { 0 },
+            ascents: spread.ascents,
+            descents: spread.descents,
+            ends: (spread.values > 0).then_some(Ends {
+                low: Bound::Real(spread.low),
+                high: Bound::Real(spread.high),
+                first: Bound::Real(spread.first),
+                last: Bound::Real(spread.last),
+            }),
+        });
+        true
     }
 
     /// What [`spread`] made of one vector of a signed column, folded into the pass.
@@ -995,16 +1034,16 @@ fn bound_of(entries: &[Option<(Bound, u64)>], at: usize) -> &Bound {
 /// Everything a [`Pass`] needs from a vector that is not about the vector before it. The two ends,
 /// the two rows at the edges so that the joining comparison can be made, and the counts.
 #[derive(Debug)]
-struct Spread {
+struct Spread<T = i128> {
     /// Rows in the vector, nulls included.
     rows: u64,
     nulls: u64,
     /// The ends, meaningless when `values` is zero.
-    low: i128,
-    high: i128,
+    low: T,
+    high: T,
     /// The first and last non-null values, for joining to the vectors either side.
-    first: i128,
-    last: i128,
+    first: T,
+    last: T,
     /// Adjacent non-null pairs where the later value is the smaller, which is what starts a run.
     descents: u64,
     /// And where it is the larger, which is what rules out a descending column.
@@ -1056,6 +1095,63 @@ fn spread(rows: usize, validity: &Validity, get: impl Fn(usize) -> i128) -> Spre
         out.values += 1;
     }
     out
+}
+
+/// [`spread`] for a float column, or `None` when a value is NaN.
+///
+/// NaN is the one float with no order, and the row at a time path has its own answers for it, so a
+/// vector holding one goes back there rather than this path making up another. Every other pair of
+/// floats compares the way [`Bound::order`] compares them. The ends move only on a strictly smaller
+/// or larger value, which keeps the first of `0.0` and `-0.0` the way the row path does.
+fn real_spread(
+    rows: usize,
+    validity: &Validity,
+    get: impl Fn(usize) -> f64,
+) -> Option<Spread<f64>> {
+    let mut out = Spread {
+        rows: rows as u64,
+        nulls: 0,
+        low: 0.0,
+        high: 0.0,
+        first: 0.0,
+        last: 0.0,
+        descents: 0,
+        ascents: 0,
+        values: 0,
+    };
+    let nullable = validity.has_nulls(rows);
+    // row at a time: the same loop as `spread`, for the same reason, over an `f64` read out of a
+    // typed slice.
+    for row in 0..rows {
+        if nullable && !validity.is_valid(row) {
+            out.nulls += 1;
+            continue;
+        }
+        let value = get(row);
+        if value.is_nan() {
+            return None;
+        }
+        if out.values == 0 {
+            out.low = value;
+            out.high = value;
+            out.first = value;
+        } else {
+            if value < out.last {
+                out.descents += 1;
+            } else if value > out.last {
+                out.ascents += 1;
+            }
+            if value < out.low {
+                out.low = value;
+            }
+            if value > out.high {
+                out.high = value;
+            }
+        }
+        out.last = value;
+        out.values += 1;
+    }
+    Some(out)
 }
 
 fn takes(held: &Option<Bound>, bound: &Bound, want: Ordering) -> bool {
@@ -1739,6 +1835,62 @@ mod tests {
                     assert!(pass.scan_dictionary(vector), "{label} {ty} is dictionary coded");
                 });
                 assert_eq!(held.summary, rows.summary, "one dictionary: {label} {ty}");
+            }
+        }
+    }
+
+    /// A float column read a vector at a time says what it says read a row at a time, and a vector
+    /// holding a NaN goes back to the row at a time pass.
+    #[test]
+    fn a_float_column_a_vector_at_a_time_says_what_it_says_a_row_at_a_time() {
+        let shuffled = (0..500_i64).map(|at| Some((1 + at * 307 % 500) as f64 / 4.0)).collect();
+        let shapes: [(&str, Vec<Option<f64>>); 6] = [
+            ("ascending", (1..=500).map(|at| Some(f64::from(at) * 0.5)).collect()),
+            ("descending", (1..=500).rev().map(|at| Some(f64::from(at) * 0.5)).collect()),
+            ("shuffled", shuffled),
+            (
+                "signed zeros",
+                (0..500).map(|at| Some(if at % 2 == 0 { 0.0 } else { -0.0 })).collect(),
+            ),
+            (
+                "every third null",
+                (1..=500).map(|at| (at % 3 != 0).then_some(f64::from(at))).collect(),
+            ),
+            (
+                "a NaN in one vector",
+                (0..500).map(|at| Some(if at == 130 { f64::NAN } else { f64::from(at) })).collect(),
+            ),
+        ];
+        for ty in [LogicalType::Double, LogicalType::Float] {
+            for (label, values) in &shapes {
+                let held = values
+                    .chunks(60)
+                    .map(|part| {
+                        let values = part
+                            .iter()
+                            .map(|value| match (value, &ty) {
+                                (None, _) => Value::Null,
+                                (Some(value), LogicalType::Float) => Value::Float(*value as f32),
+                                (Some(value), _) => Value::Double(*value),
+                            })
+                            .collect::<Vec<_>>();
+                        Vector::from_values(ty.clone(), &values).expect("values")
+                    })
+                    .collect::<Vec<_>>();
+                let mut fell_back = 0;
+                let flat = drive(&ty, &held, |pass, vector| {
+                    if !pass.scan_flat(vector) {
+                        fell_back += 1;
+                        pass.scan_rows(vector);
+                    }
+                });
+                let rows = drive(&ty, &held, Pass::scan_rows);
+                assert_eq!(
+                    format!("{:?}", flat.summary),
+                    format!("{:?}", rows.summary),
+                    "{label} {ty}"
+                );
+                assert_eq!(fell_back, usize::from(label.contains("NaN")), "{label} {ty}");
             }
         }
     }
