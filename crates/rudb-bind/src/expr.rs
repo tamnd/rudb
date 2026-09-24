@@ -664,6 +664,9 @@ impl Binder<'_> {
         if let Some(call) = self.sequence_call(&written, &bound)? {
             return Ok(call);
         }
+        if let Some(call) = self.enum_call(&written, &bound)? {
+            return Ok(call);
+        }
         // `typeof` is answered here rather than by a kernel, because the type is settled the moment
         // its argument is bound and nothing about it changes per row. The argument still has to be
         // a legal expression where it was written, so it goes through the aggregate rules first and
@@ -959,6 +962,89 @@ impl Binder<'_> {
         Ok(self.add_expr(Expr::Function { name, args }, returns))
     }
 
+    /// `enum_code`, `enum_first`, `enum_last`, `enum_range` and `enum_range_boundary`.
+    ///
+    /// All but the first are about the type rather than the value, so they fold here into the
+    /// strings of the list, which is what the pin does too: `enum_first(NULL::mood)` is the first
+    /// string and not a null. `enum_range_boundary` reads its two ends once, as the pin does, and
+    /// an end that is null is that end of the list. `enum_code` is the position of each value, and
+    /// is left for the kernel.
+    fn enum_call(&mut self, written: &str, bound: &[ExprRef]) -> Result<Option<ExprRef>> {
+        let Some(name) =
+            ["enum_code", "enum_first", "enum_last", "enum_range", "enum_range_boundary"]
+                .into_iter()
+                .find(|name| rudb_catalog::same_name(written, name))
+        else {
+            return Ok(None);
+        };
+        let needs = || Error::binder("This function needs an ENUM as an argument");
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        let listed = |labels: &[String]| Value::List {
+            element: LogicalType::Varchar,
+            values: labels.iter().cloned().map(Value::Varchar).collect(),
+        };
+        if name == "enum_range_boundary" {
+            let [start, end] = bound else { return Ok(None) };
+            let ty = match (types[0].labels(), types[1].labels()) {
+                (None, None) => return Err(needs()),
+                (Some(_), Some(_)) if types[0] != types[1] => {
+                    return Err(Error::binder(
+                        "The parameters need to link to ONLY one enum OR be NULL ",
+                    ));
+                }
+                (Some(_), _) => types[0].clone(),
+                (None, Some(_)) => types[1].clone(),
+            };
+            let labels = ty.labels().unwrap_or_default();
+            let mut ends = [0, labels.len().saturating_sub(1)];
+            for (at, &arg) in [*start, *end].iter().enumerate() {
+                match fold::value_of(self.plan(), arg) {
+                    Ok(Some(Value::Varchar(label))) => {
+                        ends[at] = labels.iter().position(|one| *one == label).unwrap_or(0);
+                    }
+                    Ok(Some(_)) => {}
+                    _ => {
+                        return Err(Error::not_implemented(
+                            "enum_range_boundary over values that change from row to row",
+                        ));
+                    }
+                }
+            }
+            let [from, to] = ends;
+            let slice = if from <= to && !labels.is_empty() { &labels[from..=to] } else { &[] };
+            return Ok(Some(self.add_constant(listed(slice))));
+        }
+        let [only] = bound else { return Ok(None) };
+        let Some(labels) = types[0].labels() else { return Err(needs()) };
+        let first =
+            |at: Option<&String>| at.map_or(Value::Null, |label| Value::Varchar(label.clone()));
+        let value = match name {
+            "enum_first" => first(labels.first()),
+            "enum_last" => first(labels.last()),
+            "enum_range" => listed(labels),
+            _ => return Ok(Some(self.enum_code(*only))),
+        };
+        Ok(Some(self.add_constant(value)))
+    }
+
+    /// Where each value of an `ENUM` sits in its list, as the unsigned integer it is stored in.
+    ///
+    /// Also what an enum is ordered and compared by, which is the reason it is not a cast: the pin
+    /// refuses to cast an enum to a number other than through its string.
+    pub(crate) fn enum_code(&mut self, expr: ExprRef) -> ExprRef {
+        let returns = rudb_vector::enum_code_type(self.plan().expr_type(expr));
+        let args = self.plan_mut().add_expr_list(&[expr]);
+        let name = self.plan_mut().intern("enum_code");
+        self.add_expr(Expr::Function { name, args }, returns)
+    }
+
+    /// An expression that orders the way this one should, which is itself unless it is an `ENUM`,
+    /// whose order is the order of its list and not of its strings.
+    pub(crate) fn by_position(&mut self, expr: ExprRef) -> ExprRef {
+        if self.plan().expr_type(expr).labels().is_some() { self.enum_code(expr) } else { expr }
+    }
+
     /// `nextval`, `currval` and `setval`, with the sequence they name looked up here.
     ///
     /// The name has to be a constant, which is the pin's rule too, and it is read as a qualified
@@ -1240,6 +1326,7 @@ impl Binder<'_> {
         })?;
         let left = self.checked_cast_to(left, &common, false)?;
         let right = self.checked_cast_to(right, &common, false)?;
+        let (left, right) = (self.by_position(left), self.by_position(right));
         Ok(self.add_expr(Expr::Compare { op, left, right }, LogicalType::Boolean))
     }
 
@@ -1557,7 +1644,15 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         }
         ast::Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
-            format!("{word}({} AS {})", describe(ast, operand, semantics), ast.string(ty))
+            // An inline enum is named with its labels spaced out the way the pin prints them, and
+            // every other type keeps the spelling it was written with.
+            let written = ast.string(ty);
+            let ty = if written.get(..4).is_some_and(|head| head.eq_ignore_ascii_case("enum")) {
+                rudb_parse::deparse::typename(written)
+            } else {
+                written.to_string()
+            };
+            format!("{word}({} AS {ty})", describe(ast, operand, semantics))
         }
         // A CASE is named as the searched form it becomes, whichever form was written, with every
         // condition and every result in brackets of their own and the `ELSE` without them. A

@@ -854,13 +854,15 @@ impl<'a> Transform<'a> {
             }
             "CreateSequenceStmt" => self.create_sequence_statement(inner, or_replace, temporary),
             "CreateTypeStmt" => {
-                // `CreateType <- EnumSelectType / EnumStringLiteralList / CreateTypeFromType`, and
-                // only the last of the three is a type this engine has.
+                // `CreateType <- EnumSelectType / EnumStringLiteralList / CreateTypeFromType`. A
+                // list of strings is the text of an `ENUM` type as it stands, and an `ENUM` over a
+                // query is not something this engine makes yet.
                 let made = self.first(self.find(inner, "CreateType"));
-                if self.name(made) != "CreateTypeFromType" {
-                    return self.unsupported(made);
-                }
-                let text = self.text(self.first(made)).to_string();
+                let text = match self.name(made) {
+                    "CreateTypeFromType" => self.text(self.first(made)).to_string(),
+                    "EnumStringLiteralList" => self.text(made).to_string(),
+                    _ => return self.unsupported(made),
+                };
                 let made = crate::ast::TypeDef {
                     name: self.name_parts(self.find(inner, "QualifiedName")),
                     drop: false,

@@ -1461,6 +1461,7 @@ impl<'a> Binder<'a> {
             .into_iter()
             .map(|(binding, ty)| {
                 let expr = self.plan.add_expr(Expr::Column(binding), ty);
+                let expr = self.by_position(expr);
                 let descending = self.semantics.default_descending();
                 SortKey { expr, descending, nulls_first: self.semantics.nulls_first(descending) }
             })
@@ -1468,7 +1469,8 @@ impl<'a> Binder<'a> {
     }
 
     /// A sort key with the session defaults filled in.
-    fn sort_key(&self, expr: ExprRef, item: ast::OrderItem) -> SortKey {
+    fn sort_key(&mut self, expr: ExprRef, item: ast::OrderItem) -> SortKey {
+        let expr = self.by_position(expr);
         let descending = match item.order {
             Order::Unstated => self.semantics.default_descending(),
             Order::Ascending => false,

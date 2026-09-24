@@ -86,6 +86,18 @@ pub(crate) fn typenames(
             made.sort_by_key(|held| held.name().table.to_lowercase());
             for held in made {
                 let logical_type = canonical(held.ty());
+                // An enum is the one made type with something to say in `labels`, and the one
+                // whose size is its own rather than its kind's, since it is as wide as its list.
+                let (size, labels) = match held.ty().labels() {
+                    Some(labels) => (
+                        i64::try_from(held.ty().physical().size()).ok(),
+                        Value::List {
+                            element: LogicalType::Varchar,
+                            values: labels.iter().map(|label| text(label)).collect(),
+                        },
+                    ),
+                    None => (type_size(&logical_type), Value::Null),
+                };
                 rows.push(vec![
                     text(database.name()),
                     Value::BigInt(database.oid()),
@@ -93,14 +105,14 @@ pub(crate) fn typenames(
                     Value::BigInt(schema.oid()),
                     Value::BigInt(held.oid()),
                     text(&held.name().table),
-                    type_size(&logical_type).map_or(Value::Null, Value::BigInt),
+                    size.map_or(Value::Null, Value::BigInt),
                     text(&logical_type),
                     type_category(&logical_type).map_or(Value::Null, text),
                     Value::Null,
                     Value::map(LogicalType::Varchar, LogicalType::Varchar, Vec::new()),
                     Value::Boolean(false),
                     Value::Null,
-                    Value::Null,
+                    labels,
                     Value::List { element: LogicalType::Varchar, values: Vec::new() },
                     Value::List { element: LogicalType::Varchar, values: Vec::new() },
                     Value::Null,

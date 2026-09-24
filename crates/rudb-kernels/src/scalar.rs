@@ -151,6 +151,11 @@ fn run<V: AsRef<Vector>>(
     if let Some(vector) = crate::sequence::call(name, args, rows)? {
         return Ok(vector);
     }
+    // The one call whose answer is how its argument is stored rather than what it says, so it is
+    // answered off the vector before anything reads a value out of it as a string.
+    if let ("enum_code", [only]) = (name, args) {
+        return only.as_ref().enum_codes();
+    }
 
     // Every argument constant is one call rather than 1024 of them. This is `3 * 4` surviving
     // constant folding, and it is also every correlated scalar the optimizer has already evaluated.

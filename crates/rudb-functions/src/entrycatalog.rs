@@ -260,6 +260,7 @@ pub fn canonical(ty: &LogicalType) -> String {
         LogicalType::Map(_, _) => "MAP".to_string(),
         LogicalType::Struct(_) => "STRUCT".to_string(),
         LogicalType::Union(_) => "UNION".to_string(),
+        LogicalType::Enum(_) => "ENUM".to_string(),
         other => other.to_string(),
     }
 }

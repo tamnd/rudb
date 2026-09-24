@@ -951,6 +951,13 @@ fn convert(value: &Value, target: &LogicalType) -> Result<Value> {
         LogicalType::Timestamp => to_timestamp(value),
         LogicalType::TimestampTz => to_timestamp_tz(value),
         LogicalType::Interval => to_interval(value),
+        // An enum value is its string, so a string that is one of the list is already the answer
+        // and anything else that is not a string has no cast here, as it has none in the pin.
+        LogicalType::Enum(labels) => match value {
+            Value::Varchar(text) if labels.contains(text) => Ok(value.clone()),
+            Value::Varchar(text) => Err(not_convertible(text, target)),
+            other => Err(no_cast(other, target)),
+        },
         other => {
             Err(Error::not_implemented(format!("a cast from {} to {other}", value.logical_type())))
         }

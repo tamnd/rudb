@@ -1361,7 +1361,7 @@ pub fn update_general(
 /// group already holds.
 ///
 /// A flat column is read where it lies. A dictionary, which is the form every stored decimal of
-/// TPC-H arrives in, is read into a run of `i64` first by [`coded_runs`] and then folded exactly as a
+/// TPC-H arrives in, is read into a run of `i64` first by `coded_runs` and then folded exactly as a
 /// flat column is. A count needs no values at all, so it covers every form there is.
 ///
 /// A mean that has already gone inexact takes its run a row at a time for the same reason. An
@@ -1599,7 +1599,7 @@ fn coded_runs(input: &Vector, rows: usize) -> Option<Vec<i64>> {
 /// the question than the sharing saves. The pass takes the layout the most of the offered calls have,
 /// and a caller with two layouts in its chunk asks again with what is left.
 ///
-/// A column that points somewhere else is read out into a run of `i64` by [`coded_runs`] first, and a
+/// A column that points somewhere else is read out into a run of `i64` by `coded_runs` first, and a
 /// flat column of `i64` joins that pass, since a read out column and a flat one read the same way once
 /// the reading is done. The reading costs a pass and an allocation, so it happens only for the calls
 /// whose pass is the one being taken, and a chunk whose flat calls of another layout outnumber them

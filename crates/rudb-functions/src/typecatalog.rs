@@ -1,16 +1,16 @@
 //! What `duckdb_types()` says about each type name this engine knows.
 //!
-//! One entry per name, and one row per entry per modifier signature, which is why 73 names produce 93
+//! One entry per name, and one row per entry per modifier signature, which is why 74 names produce 94
 //! rows. The list, the oids, the modifier signatures and the row order were all read off the pinned
 //! binary rather than worked out from first principles, because every one of them turned out to have
 //! something in it that reading the type system would not have told you.
 //!
 //! # The table lists the types this engine has
 //!
-//! The pinned binary returns 104 rows in the `memory` schema and this returns 93. The eleven that are
-//! not here are ten names for types rudb does not have at all, `array`, `bignum`, `enum`,
-//! `geometry`, `timestamptz_ns`, `time_ns`, `tuple`, `type`, `variant` and `varint`, plus `geometry`
-//! a second time for its `crs` modifier. A catalog table that listed a type you cannot make a value
+//! The pinned binary returns 104 rows in the `memory` schema and this returns 94. The ten that are
+//! not here are nine names for types rudb does not have at all, `array`, `bignum`, `geometry`,
+//! `timestamptz_ns`, `time_ns`, `tuple`, `type`, `variant` and `varint`, plus `geometry` a second
+//! time for its `crs` modifier. A catalog table that listed a type you cannot make a value
 //! of would be a table that lies, and the point of this one is that a client can read it to find out
 //! what the engine supports. The names come back when the types do.
 //!
@@ -102,6 +102,7 @@ pub static TYPE_NAMES: &[TypeEntry] = &[
     TypeEntry { signatures: WIDTH_SCALE, oid: Some(21), ..entry("dec", "DECIMAL", None) },
     TypeEntry { signatures: WIDTH_SCALE, ..entry("decimal", "DECIMAL", None) },
     entry("double", "DOUBLE", Some(23)),
+    TypeEntry { varargs: Some("VARCHAR"), oid: Some(104), ..entry("enum", "ENUM", None) },
     entry("float", "FLOAT", Some(22)),
     entry("float4", "FLOAT", None),
     entry("float8", "DOUBLE", None),
@@ -335,8 +336,8 @@ mod tests {
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
         let rows: usize = TYPE_NAMES.iter().map(|entry| entry.signatures.len()).sum();
-        assert_eq!(TYPE_NAMES.len(), 73, "names");
-        assert_eq!(rows, 93, "rows, which is the pin's 104 less the eleven for types we lack");
+        assert_eq!(TYPE_NAMES.len(), 74, "names");
+        assert_eq!(rows, 94, "rows, which is the pin's 104 less the ten for types we lack");
         assert_eq!(type_fields().len(), 17);
     }
 
@@ -366,7 +367,7 @@ mod tests {
         let total = oids.len();
         oids.dedup();
         assert_eq!(oids.len(), total, "two names claim the same oid");
-        assert_eq!(total, 32, "one oid per type this engine has");
+        assert_eq!(total, 33, "one oid per type this engine has");
     }
 
     #[test]
@@ -392,6 +393,7 @@ mod tests {
             }
             let spelled = match entry.logical_type {
                 "DECIMAL" => format!("{}(9, 2)", entry.name),
+                "ENUM" => format!("{}('a')", entry.name),
                 "MAP" => format!("{}(VARCHAR, VARCHAR)", entry.name),
                 "STRUCT" | "UNION" => format!("{}(a INTEGER)", entry.name),
                 _ => entry.name.to_string(),
