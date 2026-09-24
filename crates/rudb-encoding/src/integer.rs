@@ -952,54 +952,24 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
         }
         Kind::Delta => {
             let first = reader.i64()?;
-            let deltas = decode_chunk(reader, scratch)?;
-            let mut values = Vec::with_capacity(count);
-            values.push(first);
+            let mut values = decode_chunk(reader, scratch)?;
+            check_count(values.len() + 1, count)?;
+            // Each value is written over the difference that follows it, so the sums go into the
+            // vector the differences came in and only the last one is pushed on the end. Pushing
+            // every value into a second vector asked it for room once a value.
             let mut current = first;
-            for delta in deltas {
-                current = current.wrapping_add(unzigzag(delta as u64));
-                values.push(current);
+            for value in &mut values {
+                let delta = unzigzag(*value as u64);
+                *value = current;
+                current = current.wrapping_add(delta);
             }
-            check_count(values.len(), count)?;
+            values.push(current);
             Ok(values)
         }
         Kind::Rle => {
             let run_values = decode_chunk(reader, scratch)?;
             let run_lengths = decode_chunk(reader, scratch)?;
-            if run_values.len() != run_lengths.len() {
-                return Err(Error::internal("an RLE chunk has more runs than run lengths"));
-            }
-            // A chunk whose runs are long on average, the way a sorted column's are thousands of
-            // rows each, has every run appended into reserved room, so that each value is written
-            // once by the run it belongs to. Zeroing the chunk first was a second write of all of
-            // it. Short runs are cheaper the other way, with room for one run past the end so that
-            // the write below never has to ask how much of its fixed width landed inside the chunk,
-            // and appending those cost a few percent more on ClickBench 15, 17 and 31.
-            let long = run_values.len().saturating_mul(LONG_RUN) <= count;
-            let mut values = if long { Vec::with_capacity(count) } else { vec![0; count + RUN] };
-            let mut at = 0usize;
-            for (value, length) in run_values.into_iter().zip(run_lengths) {
-                let length = usize::try_from(length)
-                    .map_err(|_| Error::internal("a negative RLE run length"))?;
-                let end = at
-                    .checked_add(length)
-                    .filter(|end| *end <= count)
-                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
-                if long {
-                    values.resize(end, value);
-                } else {
-                    let short =
-                        if length <= RUN { values[at..].first_chunk_mut::<RUN>() } else { None };
-                    match short {
-                        Some(window) => window.fill(value),
-                        None => values[at..end].fill(value),
-                    }
-                }
-                at = end;
-            }
-            check_count(at, count)?;
-            values.truncate(count);
-            Ok(values)
+            expanded(&run_values, &run_lengths, count)
         }
         Kind::Dict => {
             let dictionary = decode_chunk(reader, scratch)?;
@@ -1061,6 +1031,73 @@ fn strided(mut steps: Vec<i64>, stride: u64, base: i64) -> Result<Vec<i64>> {
         *step = base.wrapping_add((*step as u64).wrapping_mul(stride) as i64);
     }
     Ok(steps)
+}
+
+/// The runs of an RLE chunk laid out one after another, in the type the chunk is decoded into.
+///
+/// Every check a run could fail is made once over all of them before anything is written: that no
+/// length is negative, that the lengths add up to the chunk, and that the lowest and highest value
+/// fit `T`. Made a run at a time they were a conversion, a checked add and a lane check between
+/// every two writes, about twenty five instructions a run against the four stores of the run
+/// itself, and `l_orderkey` is a million and a half runs. After the checks every run lands inside
+/// the chunk, so the loop is the write and the step.
+///
+/// A chunk whose runs are long on average, the way a sorted column's are thousands of rows each,
+/// has every run appended into reserved room, so that each value is written once by the run it
+/// belongs to. Zeroing the chunk first was a second write of all of it. Short runs are cheaper the
+/// other way, with room for one run past the end so that the write never has to ask how much of
+/// its fixed width landed inside the chunk, and appending those cost a few percent more on
+/// ClickBench 15, 17 and 31.
+fn expanded<T: Lane>(run_values: &[i64], run_lengths: &[i64], count: usize) -> Result<Vec<T>> {
+    if run_values.len() != run_lengths.len() {
+        return Err(Error::internal("an RLE chunk has more runs than run lengths"));
+    }
+    let (signs, longest, total) =
+        run_lengths.iter().fold((0, 0, 0u128), |(signs, longest, total), &length| {
+            (signs | length, longest.max(length), total + u128::from(length as u64))
+        });
+    if signs < 0 {
+        return Err(Error::internal("a negative RLE run length"));
+    }
+    if total > count as u128 {
+        return Err(Error::internal("an RLE run ends past its chunk"));
+    }
+    check_count(total as usize, count)?;
+    // A type that holds all of `i64` needs no look at the values, and the test folds away for it.
+    let wide = T::fit(i64::MIN).is_some() && T::fit(i64::MAX).is_some();
+    if !wide {
+        let (low, high) = run_values
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(low, high), &value| (low.min(value), high.max(value)));
+        if !run_values.is_empty() {
+            lane::<T>(low)?;
+            lane::<T>(high)?;
+        }
+    }
+    let runs = run_values.iter().zip(run_lengths);
+    if run_values.len().saturating_mul(LONG_RUN) <= count {
+        let mut values = Vec::with_capacity(count);
+        for (&value, &length) in runs {
+            values.resize(values.len() + length as usize, T::wrap(value));
+        }
+        return Ok(values);
+    }
+    let mut values = vec![T::default(); count + RUN];
+    let mut at = 0;
+    if longest as usize <= RUN {
+        for (&value, &length) in runs {
+            values[at..at + RUN].fill(T::wrap(value));
+            at += length as usize;
+        }
+    } else {
+        for (&value, &length) in runs {
+            let length = length as usize;
+            values[at..at + length.max(RUN)].fill(T::wrap(value));
+            at += length;
+        }
+    }
+    values.truncate(count);
+    Ok(values)
 }
 
 /// [`decode_chunk`] into `T`. See [`decode_as`].
@@ -1143,37 +1180,7 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
         Kind::Rle => {
             let run_values = decode_chunk(reader, scratch)?;
             let run_lengths = decode_chunk(reader, scratch)?;
-            if run_values.len() != run_lengths.len() {
-                return Err(Error::internal("an RLE chunk has more runs than run lengths"));
-            }
-            // The two shapes [`decode_chunk`] has, for the reasons it gives.
-            let long = run_values.len().saturating_mul(LONG_RUN) <= count;
-            let mut values =
-                if long { Vec::with_capacity(count) } else { vec![T::default(); count + RUN] };
-            let mut at = 0usize;
-            for (value, length) in run_values.into_iter().zip(run_lengths) {
-                let value = lane::<T>(value)?;
-                let length = usize::try_from(length)
-                    .map_err(|_| Error::internal("a negative RLE run length"))?;
-                let end = at
-                    .checked_add(length)
-                    .filter(|end| *end <= count)
-                    .ok_or_else(|| Error::internal("an RLE run ends past its chunk"))?;
-                if long {
-                    values.resize(end, value);
-                } else {
-                    let short =
-                        if length <= RUN { values[at..].first_chunk_mut::<RUN>() } else { None };
-                    match short {
-                        Some(window) => window.fill(value),
-                        None => values[at..end].fill(value),
-                    }
-                }
-                at = end;
-            }
-            check_count(at, count)?;
-            values.truncate(count);
-            Ok(values)
+            expanded(&run_values, &run_lengths, count)
         }
         Kind::Sparse => {
             let value = lane::<T>(reader.i64()?)?;
