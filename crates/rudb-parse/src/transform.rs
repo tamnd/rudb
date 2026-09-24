@@ -468,6 +468,7 @@ impl<'a> Transform<'a> {
             }
             "SetStatement" => self.set_statement(inner),
             "ResetStatement" => self.reset_statement(inner),
+            "UseStatement" => self.use_statement(inner),
             "PragmaStatement" => self.pragma_statement(inner),
             "ExplainStatement" => self.explain_statement(inner),
             "CheckpointStatement" => Ok(Statement::Checkpoint),
@@ -582,14 +583,16 @@ impl<'a> Transform<'a> {
 
     /// `SetStatement <- 'SET' SetAssignmentOrTimeZone`.
     ///
-    /// Of the three assignments, `StandardAssignment` is the one that is done. `SET SCHEMA` and
-    /// `SET TIME ZONE` are each a setting this database has nothing to do with yet, and they are a
-    /// refusal rather than a silent success, because a statement that says where to look for a
-    /// table and is ignored is a statement that changes an answer.
+    /// `SET SCHEMA 'name'` is the `schema` setting written another way, and `SET TIME ZONE` is the
+    /// `TimeZone` one.
     fn set_statement(&mut self, node: u32) -> Result<Statement> {
         let inner = self.first(self.find(node, "SetAssignmentOrTimeZone"));
         if self.name(inner) == "SetTimeZone" {
             return self.set_time_zone(inner);
+        }
+        if self.name(inner) == "SetSchema" {
+            let text = self.string_value(self.find(inner, "StringLiteral"))?;
+            return Ok(self.set_schema(&text));
         }
         if self.name(inner) != "StandardAssignment" {
             return self.unsupported(inner);
@@ -607,15 +610,44 @@ impl<'a> Transform<'a> {
         for kid in kids {
             values.push(self.expr(kid)?);
         }
-        // The grammar takes a list because `SET search_path = a, b` is a list in postgres. Nothing
-        // here has a setting that reads one, and taking the first of several would be worse than
-        // saying so.
+        // The grammar takes a list because `SET search_path = a, b` is a list in postgres. The pin
+        // refuses one from the parser, and `search_path` takes its list as one string instead.
         let [value] = values[..] else {
-            return self.unsupported(list);
+            return Err(Error::parser("SET can only contain a single value"));
         };
         let index = self.ast.settings.len() as u32;
         self.ast.settings.push(Setting { name, scope, value, pragma: false });
         Ok(Statement::Set(index))
+    }
+
+    /// A `SET schema` to this text, which is what `SET SCHEMA 'name'` and `USE` both come to.
+    fn set_schema(&mut self, text: &str) -> Statement {
+        let name = self.intern("schema");
+        let text = self.intern(text);
+        let value = self.push(Expr::Literal { kind: LiteralKind::String, text });
+        let index = self.ast.settings.len() as u32;
+        self.ast.settings.push(Setting { name, scope: Scope::Unwritten, value, pragma: false });
+        Statement::Set(index)
+    }
+
+    /// `UseStatement <- 'USE' UseTarget`, which the pin turns into a `SET schema` to the name
+    /// written back out, so `USE db` and `USE db.s` land where `SET schema` would.
+    fn use_statement(&mut self, node: u32) -> Result<Statement> {
+        let target = self.first(self.find(node, "UseTarget"));
+        let mut parts = Vec::new();
+        if self.name(target) == "UseTargetCatalogSchema" {
+            if self.contains(target, "DotIdentifier") {
+                return Err(Error::parser("Expected \"USE database\" or \"USE database.schema\""));
+            }
+            for rule in ["CatalogName", "ReservedSchemaName"] {
+                let part = self.identifier(self.find(target, rule));
+                parts.push(crate::quoted(self.ast.string(part)));
+            }
+        } else {
+            let part = self.identifier(target);
+            parts.push(crate::quoted(self.ast.string(part)));
+        }
+        Ok(self.set_schema(&parts.join(".")))
     }
 
     /// `SET TIME ZONE value`, normalized to the `TimeZone` setting DuckDB exposes beside it.
@@ -5571,20 +5603,27 @@ mod tests {
     }
 
     #[test]
-    fn the_two_other_things_the_word_set_starts_are_refused_rather_than_read_as_settings() {
-        // `SET VARIABLE x = 1` declares a session variable and `SET SCHEMA` picks where an
-        // unqualified name is looked up. Neither is a knob on the engine and reading either as one
-        // would change an answer quietly.
-        for statement in ["SET VARIABLE x = 1", "SET SCHEMA 'main'"] {
-            let error = parse_ast(statement).expect_err(statement);
-            assert_eq!(error.code().duckdb_name(), "Not implemented Error", "{statement}");
-        }
+    fn a_session_variable_is_refused_rather_than_read_as_a_setting() {
+        // `SET VARIABLE x = 1` declares a session variable, which is not a knob on the engine, and
+        // reading it as one would change an answer quietly.
+        let error = parse_ast("SET VARIABLE x = 1").expect_err("a variable");
+        assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+    }
+
+    #[test]
+    fn set_schema_and_use_are_the_schema_setting() {
+        assert_eq!(round_statement("SET SCHEMA 'main'"), "SET schema = 'main'");
+        assert_eq!(round_statement("USE s1"), "SET schema = 's1'");
+        assert_eq!(round_statement("USE memory.s1"), "SET schema = 'memory.s1'");
+        assert_eq!(round_statement("USE \"a.b\""), "SET schema = '\"a.b\"'");
+        let error = parse_ast("USE a.b.c").expect_err("three parts");
+        assert_eq!(error.message(), "Expected \"USE database\" or \"USE database.schema\"");
     }
 
     #[test]
     fn a_setting_written_with_a_list_of_values_is_refused_rather_than_taking_the_first() {
         let error = parse_ast("SET search_path = a, b").expect_err("a list of two");
-        assert_eq!(error.code().duckdb_name(), "Not implemented Error");
+        assert_eq!(error.message(), "SET can only contain a single value");
     }
 
     #[test]

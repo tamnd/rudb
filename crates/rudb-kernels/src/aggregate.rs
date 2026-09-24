@@ -1500,7 +1500,7 @@ pub fn update_runs(
 ///
 /// A count reads no value, so it goes on whichever pass is first and asks nothing of the layout. What a
 /// count wants out of a run is its length, and the walk is adding those up per group regardless, so a
-/// count costs the pass one add per group at the end and nothing at all per run. [`count_runs`] is what
+/// count costs the pass one add per group at the end and nothing at all per run. `count_runs` is what
 /// it would otherwise be, and that is a walk of its own for one add a run.
 ///
 /// # Errors

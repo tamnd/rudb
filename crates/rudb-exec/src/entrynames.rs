@@ -315,10 +315,15 @@ fn constraint_row(catalog: &Catalog, table: &Table, held: Constraint) -> Vec<Val
             let wanted: Vec<String> =
                 foreign.referenced.iter().map(|&at| target.columns()[at].name.clone()).collect();
             let names: Vec<String> = foreign.columns.iter().map(|&at| name_of(at)).collect();
+            // The pin names the schema of the held table unless it is `main`.
+            let mut held = quoted(&foreign.table.table);
+            if !foreign.table.schema.eq_ignore_ascii_case("main") {
+                held = format!("{}.{held}", quoted(&foreign.table.schema));
+            }
             let text = format!(
                 "FOREIGN KEY ({}) REFERENCES {}({})",
                 list(&names).join(", "),
-                quoted(&foreign.table.table),
+                held,
                 list(&wanted).join(", ")
             );
             let referenced = (foreign.table.table.clone(), wanted);

@@ -593,16 +593,16 @@ fn a_set_arrives_with_its_value_already_a_value() {
 }
 
 #[test]
-fn a_setting_name_is_not_looked_up_and_a_bare_word_on_the_right_is() {
+fn a_setting_name_is_not_looked_up_and_a_bare_word_on_the_right_is_its_text() {
     // The binder has no idea what settings exist, so a name that is not one gets through here and
-    // is refused by the engine. A bare word as the value is a column reference and there is nothing
-    // in scope for it to be, which is better than guessing that an unquoted word meant itself.
+    // is refused by the engine. A bare word as the value is the text of its name, which is what
+    // the pin makes of `SET schema = s1`.
     let Bound::Setting(setting) = bound("SET nothing_of_the_sort = 1") else { panic!("a setting") };
     assert_eq!(setting.name, "nothing_of_the_sort");
-    assert!(
-        statement_failure("SET disabled_optimizers = expression_rewriter")
-            .contains("expression_rewriter")
-    );
+    let Bound::Setting(setting) = bound("SET disabled_optimizers = expression_rewriter") else {
+        panic!("a setting")
+    };
+    assert_eq!(setting.value, Some(rudb_common::Value::Varchar("expression_rewriter".to_string())));
 }
 
 #[test]

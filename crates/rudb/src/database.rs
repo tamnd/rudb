@@ -1263,6 +1263,11 @@ impl Database {
         if crate::settings::is_clustering(name) {
             return Ok(self.shared.read().clustering());
         }
+        match crate::settings::search_setting(name) {
+            Some(true) => return Ok(self.shared.read().default_schema().to_string()),
+            Some(false) => return Ok(self.shared.read().search_path()),
+            None => {}
+        }
         self.shared.inner.settings.value(name)
     }
 
