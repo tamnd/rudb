@@ -6,6 +6,16 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.35
+
+A patch release of fifteen commits. The compiled engine now answers all 43 ClickBench queries the same as the first engine at ten million rows, the join build runs on every thread, and a setting turns off answers read from load time summaries. The native directory format number stays at 30 and the storage format version at 9.
+
+For the query compiler, #1911 reads wide rows back after a top N, which was the last ClickBench query the compiled engine answered wrong. #1916 runs any scalar function with no translator of its own through a vcall to the first engine's kernel, so the answers and the error messages are the first engine's. #1919 keeps q33 at ten million rows inside memory, in the compiled top N and in the check. #1914 adds `cargo xtask refusals`, which counts the JOB and TPC-H queries the compiled engine refuses and why, and #1915 lists the facts the compiled physical plan relies on and which of them rudb records.
+
+On joins and the graph layer, #1912 builds a join table on every thread and narrows its side before the layout, #1913 answers a chunk's children off a monotone link by walking the bitmap, and #1917 gives key maps a budget share of their own, so the map over `o_orderkey` is kept on the clustered SF1 file. On aggregation, #1908 counts a run of one key in the encoded count scatter as one weighted record, which helps ClickBench 17.
+
+#1907 adds `SET stored_answers = false`, which stops the engine answering from numbers the native writer stored at load time, for benchmark runs that must not pre-aggregate. #1910 adds random, setseed, TRY and the if macro, and #1920 expands the pin's built-in macros and adds error(). #1905 raises the MSRV to 1.88.0. #1918 corrects the note on which instructions counter is immune to load, and #1906 is changelog only.
+
 ## 0.4.34
 
 A patch release of sixteen commits, led by the backward adjacency on the graph layer, with COPY FROM for CSV, the math and bitwise functions, the device card in the database file, and the compiled engine driver. The native directory format number goes from 29 to 30 with #1889, which keeps the device card at the end of the catalog, and format 29 files still open. The storage format version stays at 9.
