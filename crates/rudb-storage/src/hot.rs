@@ -17,12 +17,20 @@
 //! writes over values that a scan may be reading at the same moment, and the undo chain is what
 //! corrects such a read. With plain memory that race would be undefined behaviour; with relaxed
 //! atomics it is a plain load or store on every machine rudb runs on, so the cells pay nothing for
-//! being sound. Text columns and their arena come separately.
+//! being sound.
+//!
+//! A text column holds 16-byte views, the layout of Umbra, DuckDB and Arrow's `StringView`: the
+//! length and the first 4 bytes, then either the next 8 bytes inline, for strings up to 12 bytes,
+//! or the chunk and offset of the whole string in the stripe's [`Arena`]. An update writes a new
+//! view in place and the column never shifts.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use rudb_common::Error;
+
+use crate::arena::{Arena, Place, Space};
 use crate::deletes::{PART_ROWS, PART_WORDS, Refusal, STRIPE_ROWS, UNCOMMITTED};
 
 /// Parts in a stripe.
@@ -53,6 +61,8 @@ pub enum Width {
     Eight,
     /// 128-bit integers, wide decimals, and intervals.
     Sixteen,
+    /// Text and blobs, as 16-byte views.
+    Text,
 }
 
 impl Width {
@@ -64,7 +74,7 @@ impl Width {
             Self::Two => 2,
             Self::Four => 4,
             Self::Eight => 8,
-            Self::Sixteen => 16,
+            Self::Sixteen | Self::Text => 16,
         }
     }
 }
@@ -111,7 +121,7 @@ impl Cells {
             Width::Two => Self::Two(Parts::new(ROWS)),
             Width::Four => Self::Four(Parts::new(ROWS)),
             Width::Eight => Self::Eight(Parts::new(ROWS)),
-            Width::Sixteen => Self::Sixteen(Parts::new(2 * ROWS)),
+            Width::Sixteen | Width::Text => Self::Sixteen(Parts::new(2 * ROWS)),
         }
     }
 
@@ -193,6 +203,7 @@ fn place(slot: u32) -> (usize, usize) {
 
 #[derive(Debug)]
 struct Column {
+    text: bool,
     cells: Cells,
     /// One bit a slot, set when the value is not null.
     valid: Parts<AtomicU64>,
@@ -208,6 +219,7 @@ pub struct HotStripe {
     columns: Box<[Column]>,
     created: Parts<AtomicU64>,
     deleted: Parts<AtomicU64>,
+    arena: Arena,
 }
 
 impl HotStripe {
@@ -216,7 +228,11 @@ impl HotStripe {
     pub fn new(id: u32, widths: &[Width]) -> Self {
         let columns = widths
             .iter()
-            .map(|&width| Column { cells: Cells::new(width), valid: Parts::new(PART_WORDS) })
+            .map(|&width| Column {
+                text: width == Width::Text,
+                cells: Cells::new(width),
+                valid: Parts::new(PART_WORDS),
+            })
             .collect();
         Self {
             id,
@@ -224,6 +240,7 @@ impl HotStripe {
             columns,
             created: Parts::new(ROWS),
             deleted: Parts::new(ROWS),
+            arena: Arena::new(),
         }
     }
 
@@ -304,6 +321,70 @@ impl HotStripe {
         let valid =
             column.valid.get(part)?[at / 64].load(Ordering::Relaxed) & (1 << (at % 64)) != 0;
         valid.then(|| column.cells.load(slot))
+    }
+
+    /// Writes the text `value` into the text column `column` at `slot`, a slot of the caller's
+    /// lease that is not stamped yet, copying a string longer than 12 bytes into the arena from
+    /// the worker's `space`. `None` is null.
+    ///
+    /// # Errors
+    ///
+    /// When the arena is full, after 64 GiB of strings in the stripe, or the string is longer than
+    /// 4 GiB.
+    ///
+    /// # Panics
+    ///
+    /// If the slot was never leased or the column does not exist.
+    pub fn write_text(
+        &self,
+        slot: u32,
+        column: usize,
+        value: Option<&[u8]>,
+        space: &mut Space,
+    ) -> rudb_common::Result<()> {
+        debug_assert!(self.columns[column].text, "column {column} holds fixed-width values");
+        let Some(value) = value else {
+            self.write(slot, column, None);
+            return Ok(());
+        };
+        let place = if value.len() > INLINE {
+            let place = self.arena.put(space, value).ok_or_else(|| {
+                Error::out_of_memory(format!(
+                    "a string of {} bytes does not fit in the strings arena of stripe {}",
+                    value.len(),
+                    self.id
+                ))
+            })?;
+            Some(place)
+        } else {
+            None
+        };
+        self.write(slot, column, Some(view(value, place)));
+        Ok(())
+    }
+
+    /// Appends the text of `column` at `slot` to `out`, as it is now, and says whether it is not
+    /// null. Visibility is [`Self::visible`]'s question.
+    ///
+    /// # Panics
+    ///
+    /// If the column does not exist.
+    pub fn read_text(&self, slot: u32, column: usize, out: &mut Vec<u8>) -> bool {
+        debug_assert!(self.columns[column].text, "column {column} holds fixed-width values");
+        let Some(view) = self.read(slot, column) else { return false };
+        let head = view as u64;
+        let tail = (view >> 64) as u64;
+        let len = head as u32;
+        if len as usize > INLINE {
+            let place = Place { chunk: (tail >> 32) as u32, offset: tail as u32 };
+            self.arena.read(place, len, out);
+        } else {
+            let mut inline = [0_u8; 12];
+            inline[..4].copy_from_slice(&(head >> 32).to_le_bytes()[..4]);
+            inline[4..].copy_from_slice(&tail.to_le_bytes());
+            out.extend_from_slice(&inline[..len as usize]);
+        }
+        true
     }
 
     /// Publishes the rows at `slots`, written by `txn`, as its uncommitted inserts. The values are
@@ -434,8 +515,31 @@ impl HotStripe {
                     + column.valid.allocated() * PART_WORDS * 8
             })
             .sum();
-        columns + (self.created.allocated() + self.deleted.allocated()) * PART_ROWS as usize * 8
+        let stamps = (self.created.allocated() + self.deleted.allocated()) * ROWS * 8;
+        columns + stamps + usize::try_from(self.arena.bytes()).unwrap_or(usize::MAX)
     }
+}
+
+/// The longest string a view holds inline.
+const INLINE: usize = 12;
+
+/// The 16-byte view of `value`: its length and first 4 bytes, then the next 8 bytes, or `place`
+/// when it is longer than [`INLINE`].
+fn view(value: &[u8], place: Option<Place>) -> u128 {
+    let mut prefix = [0_u8; 4];
+    let first = value.len().min(4);
+    prefix[..first].copy_from_slice(&value[..first]);
+    let head = value.len() as u64 | (u64::from(u32::from_le_bytes(prefix)) << 32);
+    let tail = match place {
+        Some(place) => (u64::from(place.chunk) << 32) | u64::from(place.offset),
+        None => {
+            let mut rest = [0_u8; 8];
+            let more = value.get(4..).unwrap_or_default();
+            rest[..more.len()].copy_from_slice(more);
+            u64::from_le_bytes(rest)
+        }
+    };
+    u128::from(head) | (u128::from(tail) << 64)
 }
 
 /// The visibility rule of `07-the-head.md` section 7.4, with `me` the reader's id with the top bit
@@ -452,13 +556,15 @@ pub struct Lease {
     next: u32,
     end: u32,
     size: u32,
+    /// The worker's carve of the stripe's arena.
+    space: Space,
 }
 
 impl Lease {
     /// A worker's lease in `stripe`, which takes no slots until it is asked for some.
     #[must_use]
     pub fn new(stripe: Arc<HotStripe>) -> Self {
-        Self { stripe, next: 0, end: 0, size: FIRST_LEASE }
+        Self { stripe, next: 0, end: 0, size: FIRST_LEASE, space: Space::default() }
     }
 
     /// The stripe it leases from.
@@ -482,6 +588,24 @@ impl Lease {
         let first = self.next;
         self.next = self.end.min(first.saturating_add(want));
         first..self.next
+    }
+
+    /// [`HotStripe::write_text`] from the worker's carve of the arena.
+    ///
+    /// # Errors
+    ///
+    /// When the arena is full.
+    ///
+    /// # Panics
+    ///
+    /// If the slot was never leased or the column does not exist.
+    pub fn write_text(
+        &mut self,
+        slot: u32,
+        column: usize,
+        value: Option<&[u8]>,
+    ) -> rudb_common::Result<()> {
+        self.stripe.write_text(slot, column, value, &mut self.space)
     }
 
     /// Slots leased and not filled, which become holes if the lease is dropped.
@@ -601,6 +725,49 @@ mod tests {
         assert_eq!(stripe.reserved(), STRIPE_ROWS);
         assert_eq!(FIRST_LEASE, 64);
         assert_eq!(LARGEST_LEASE, 1024);
+    }
+
+    #[test]
+    fn text_comes_back_short_long_empty_and_null() {
+        let stripe = Arc::new(HotStripe::new(3, &[Width::Text, Width::Eight]));
+        let mut lease = Lease::new(Arc::clone(&stripe));
+        let values: Vec<Option<Vec<u8>>> = vec![
+            Some(Vec::new()),
+            Some(b"abc".to_vec()),
+            Some(b"four".to_vec()),
+            Some(b"twelve bytes".to_vec()),
+            Some(b"thirteen byte".to_vec()),
+            None,
+            Some(vec![0xFF; 100_000]),
+            Some("unicode \u{00e9}t\u{00e9} caf\u{00e9}".as_bytes().to_vec()),
+        ];
+        let slots = lease.take(values.len() as u32);
+        for (slot, value) in slots.clone().zip(&values) {
+            lease.write_text(slot, 0, value.as_deref()).expect("room");
+        }
+        for (slot, value) in slots.zip(&values) {
+            let mut out = b"kept".to_vec();
+            assert_eq!(stripe.read_text(slot, 0, &mut out), value.is_some());
+            assert_eq!(&out[..4], b"kept", "appended, not replaced");
+            assert_eq!(out[4..], value.clone().unwrap_or_default()[..]);
+        }
+    }
+
+    #[test]
+    fn a_text_update_in_place_leaves_the_old_bytes_readable() {
+        let stripe = Arc::new(HotStripe::new(3, &[Width::Text]));
+        let mut lease = Lease::new(Arc::clone(&stripe));
+        let slot = lease.take(1).start;
+        lease.write_text(slot, 0, Some(b"the first long value")).expect("room");
+        let old = stripe.read(slot, 0).expect("a view");
+        lease.write_text(slot, 0, Some(b"a second, longer value than before")).expect("room");
+        let mut out = Vec::new();
+        stripe.read_text(slot, 0, &mut out);
+        assert_eq!(out, b"a second, longer value than before");
+        stripe.write(slot, 0, Some(old));
+        out.clear();
+        stripe.read_text(slot, 0, &mut out);
+        assert_eq!(out, b"the first long value", "an undo image is still good");
     }
 
     #[test]

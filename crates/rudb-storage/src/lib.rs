@@ -9,6 +9,7 @@
 //! What is here today is [`MemoryTable`], which is the M0 answer to where rows live. The format
 //! itself is M2 work and it replaces the inside of that type rather than the shape of it.
 
+pub mod arena;
 pub mod count;
 pub mod deletes;
 pub mod hot;
@@ -19,7 +20,7 @@ pub mod zone;
 
 pub use count::{Counting, Counts, Partial};
 pub use deletes::{DeleteVector, Refusal};
-pub use hot::{HotStripe, Lease};
+pub use hot::{HotStripe, Lease, Width};
 pub use memory::MemoryTable;
 pub use sieve::{Blocked, Sieve};
 pub use tally::{TALLY_VALUES, Tally};
