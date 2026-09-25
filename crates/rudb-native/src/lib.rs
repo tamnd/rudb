@@ -145,6 +145,15 @@ const HOST_GROUPS: &[u8; 8] = b"RUDBHG1\0";
 /// predate it still understand every earlier directory, and a table without a pair worth keeping
 /// writes no block at all.
 const PAIR_FREQUENCIES: &[u8; 8] = b"RUDBPF1\0";
+/// The columns whose synopsis keeps the rows of its leading entries only, with a bound on the rest.
+///
+/// A column whose listed values hold too many rows between them to keep every one of those rows
+/// keeps the rows of the longest leading run of entries that fits instead, which is what answers a
+/// grouping of it with a second column when the few commonest values are far above the others. A
+/// reader that took those rows for the rows of every listed value would bound what it left out by
+/// the synopsis bound, which is too small, so the tighter claim lives in a block of its own and a
+/// reader that predates it refuses the directory rather than trusting it.
+const ORDINAL_BOUNDS: &[u8; 8] = b"RUDBFO1\0";
 /// The clustering declaration, written after the frequencies and only when there is one.
 ///
 /// No format bump for this, which is the convention the frequency section set in #728: a new
@@ -864,6 +873,9 @@ struct FrequencySummary {
     omitted_max: u64,
     ordinals: Vec<u64>,
     ordinal_entries: Vec<u16>,
+    /// Zero when `ordinals` holds the rows of every entry. Otherwise it holds the rows of a leading
+    /// run of them, and this is how many rows any value outside that run holds at most.
+    ordinal_bound: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -885,6 +897,9 @@ struct PairFrequencySummary {
     entries: Vec<PairFrequencyEntry>,
     omitted_max: u64,
 }
+
+/// The entries of a frequency synopsis and how many rows any value it left out can hold.
+type FrequencyHead = (Vec<FrequencyEntry>, u64);
 
 /// One column's frequency synopsis, in memory or left where it is in the file.
 ///
@@ -1079,6 +1094,9 @@ pub struct Table {
     /// same reason `dictionary_payloads` is.
     demoted: Vec<bool>,
     frequencies: Vec<Option<Frequencies>>,
+    /// What [`ORDINAL_BOUNDS`] says about each column, read with `get`, and zero for a column whose
+    /// synopsis keeps the rows of every entry it lists or keeps no rows at all.
+    ordinal_bounds: Vec<u64>,
     pair_frequencies: Vec<PairFrequencySummary>,
     /// String spellings aligned with each column's frequency entries.
     ///
@@ -2273,6 +2291,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                ordinal_bounds: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
                 host_groups: None,
@@ -2350,6 +2369,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                ordinal_bounds: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
                 host_groups: None,
@@ -2477,6 +2497,7 @@ impl Writer {
                 stripes: Vec::new(),
                 rows: 0,
                 frequencies: Vec::new(),
+                ordinal_bounds: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
                 host_groups: None,
@@ -3133,15 +3154,28 @@ impl Writer {
             omitted_max = entries[retained].count;
             entries.truncate(retained);
         }
-        let kept_rows = entries.iter().try_fold(0_u64, |total, entry| {
-            total.checked_add(entry.count).filter(|&total| total <= FREQUENCY_ORDINALS as u64)
-        });
+        // The rows of every listed value when they fit, and otherwise the rows of the longest leading
+        // run that fits, but only when the tenth listed value is held by more rows than the first
+        // one left out, because a bound no smaller than the leading counts vouches for nothing.
+        let mut covered = 0;
+        let mut kept_rows = 0_u64;
+        for entry in &entries {
+            match kept_rows.checked_add(entry.count) {
+                Some(total) if total <= FREQUENCY_ORDINALS as u64 => kept_rows = total,
+                _ => break,
+            }
+            covered += 1;
+        }
+        let ordinal_bound = entries.get(covered).map_or(0, |entry| entry.count);
+        let worth_keeping = covered == entries.len()
+            || (covered >= FREQUENCY_BUILD_RANK
+                && entries[FREQUENCY_BUILD_RANK - 1].count > ordinal_bound.max(omitted_max));
         let mut ordinals = Vec::new();
         let mut ordinal_entries = Vec::new();
-        if let Some(kept_rows) = kept_rows {
+        if worth_keeping {
             let mut kept = FrequencyMap::default();
             let mut null_kept = None;
-            for (at, entry) in entries.iter().enumerate() {
+            for (at, entry) in entries.iter().enumerate().take(covered) {
                 let at = u16::try_from(at)
                     .map_err(|_| invalid("too many retained frequency entries"))?;
                 match entry.value {
@@ -3166,7 +3200,13 @@ impl Writer {
             })?;
         }
         Ok((
-            Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries }),
+            Some(FrequencySummary {
+                entries,
+                omitted_max,
+                ordinals,
+                ordinal_entries,
+                ordinal_bound: if worth_keeping { ordinal_bound } else { 0 },
+            }),
             distinct_count,
         ))
     }
@@ -3472,6 +3512,7 @@ impl Writer {
                 .filter(|summary| {
                     !summary.ordinals.is_empty()
                         && summary.ordinal_entries.len() == summary.ordinals.len()
+                        && summary.ordinal_bound == 0
                 })
                 .cloned()
                 .map(|summary| (column, summary))
@@ -4240,6 +4281,10 @@ pub struct Reader {
     /// summary inline, but a larger one otherwise rereads and decodes the same section on every
     /// plan and every summary-backed aggregate.
     frequency_summaries: Arc<Vec<OnceLock<Arc<FrequencySummary>>>>,
+    /// The entries of each stored synopsis and the bound on what they leave out, read without the
+    /// row ordinals behind them. A one column count reads only these, and the ordinals of a column
+    /// like `UserID` are most of a megabyte.
+    frequency_heads: Arc<Vec<OnceLock<Arc<FrequencyHead>>>>,
     /// Each column's summary, the first time anything asks for it. See `stats::held_summary`.
     summaries: Arc<Vec<OnceLock<Option<Arc<rudb_stats::Summary>>>>>,
     /// How many global dictionaries have been opened. A scan of a dictionary column should open its
@@ -6391,6 +6436,7 @@ impl Reader {
             loading: Arc::new((0..table_fields).map(|_| Mutex::new(())).collect()),
             frequency_values: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             frequency_summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
+            frequency_heads: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             summaries: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
             opened: Arc::new(AtomicUsize::new(0)),
             sieves: Arc::new(sieves),
@@ -6585,18 +6631,17 @@ impl Reader {
             .fields
             .get(column)
             .ok_or_else(|| invalid("frequency column index out of range"))?;
-        let Some(summary) = self.frequency_summary(column)? else {
+        let Some((entries, omitted_max)) = self.frequency_head(column)? else {
             return Ok(None);
         };
-        if top == 0 || summary.entries.len() < top {
+        if top == 0 || entries.len() < top {
             return Ok(None);
         }
-        let boundary = summary.entries[top - 1].count;
-        if boundary <= summary.omitted_max {
+        let boundary = entries[top - 1].count;
+        if boundary <= omitted_max {
             return Ok(None);
         }
-        self.decode_frequencies(column, &field.ty, &summary.entries)
-            .map(|values| Some(Vec::clone(&values)))
+        self.decode_frequencies(column, &field.ty, &entries).map(|values| Some(Vec::clone(&values)))
     }
 
     /// Exact leading counts for a numeric key paired with a stable-dictionary string key.
@@ -6684,11 +6729,50 @@ impl Reader {
             .fields
             .get(column)
             .ok_or_else(|| invalid("frequency column index out of range"))?;
-        let Some(summary) = self.frequency_summary(column)? else {
+        let Some((entries, omitted_max)) = self.frequency_head(column)? else {
             return Ok(None);
         };
-        let entries = self.decode_frequencies(column, &field.ty, &summary.entries)?;
-        Ok(Some((entries, summary.omitted_max)))
+        let entries = self.decode_frequencies(column, &field.ty, &entries)?;
+        Ok(Some((entries, omitted_max)))
+    }
+
+    /// One column's synopsis entries and the bound on what they leave out. A synopsis left in the
+    /// file is read only as far as its entries go, unless all of it was already read.
+    fn frequency_head(&self, column: usize) -> Result<Option<(Cow<'_, [FrequencyEntry]>, u64)>> {
+        let (span, count) = match self.table.frequencies.get(column) {
+            None | Some(None) => return Ok(None),
+            Some(Some(Frequencies::Held(summary))) => {
+                return Ok(Some((Cow::Borrowed(&summary.entries), summary.omitted_max)));
+            }
+            Some(Some(Frequencies::Stored { span, entries, .. })) => (span, *entries),
+        };
+        if let Some(summary) = self.frequency_summaries.get(column).and_then(OnceLock::get) {
+            return Ok(Some((Cow::Borrowed(&summary.entries), summary.omitted_max)));
+        }
+        let slot = self
+            .frequency_heads
+            .get(column)
+            .ok_or_else(|| invalid("frequency column index out of range"))?;
+        if slot.get().is_none() {
+            let field = self
+                .table
+                .fields
+                .get(column)
+                .ok_or_else(|| invalid("frequency column index out of range"))?;
+            // A tag, the bound, the entry count, and then at most a tag, sixteen value bytes and
+            // an eight byte count for each entry.
+            let length = (span.length as usize).min(13 + count * 25);
+            let mut bytes = vec![0; length];
+            read_at(&self.file, span.offset, &mut bytes)?;
+            let head = decode_summary_head(&mut Cursor::new(&bytes), field, self.table.rows)?
+                .ok_or_else(|| invalid("a stored synopsis is missing"))?;
+            if head.0.len() != count {
+                return Err(invalid("a stored synopsis differs from its directory span"));
+            }
+            let _ = slot.set(Arc::new(head));
+        }
+        let (entries, omitted_max) = slot.get().expect("the synopsis head was stored").as_ref();
+        Ok(Some((Cow::Borrowed(entries), *omitted_max)))
     }
 
     /// One column's synopsis, read back from the file when the directory left it there.
@@ -6879,8 +6963,11 @@ impl Reader {
         } else {
             (Vec::new(), Vec::new())
         };
+        // The rows kept may be those of the leading entries alone, and then a value outside them is
+        // bounded by the first entry left out rather than by the synopsis.
+        let stored = self.table.ordinal_bounds.get(column).copied().unwrap_or(0);
         Ok(Some(FrequencyOccurrences {
-            omitted_max: summary.omitted_max,
+            omitted_max: summary.omitted_max.max(summary.ordinal_bound).max(stored),
             ordinals: summary.ordinals.clone(),
             anchors,
             anchor_indices,
@@ -8239,6 +8326,7 @@ fn code_frequency(
             omitted_max,
             ordinals: Vec::new(),
             ordinal_entries: Vec::new(),
+            ordinal_bound: 0,
         },
         texts,
     ))
@@ -8433,6 +8521,28 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
         let length = u32::try_from(out.len() - start)
             .map_err(|_| invalid("a frequency synopsis is too long"))?;
         out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
+    }
+    let bounds = table
+        .frequencies
+        .iter()
+        .enumerate()
+        .filter_map(|(column, summary)| match summary {
+            Some(Frequencies::Held(summary)) if summary.ordinal_bound != 0 => {
+                Some((column, summary.ordinal_bound))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !bounds.is_empty() {
+        out.extend_from_slice(ORDINAL_BOUNDS);
+        put_u16(&mut out, u16::try_from(bounds.len()).map_err(|_| invalid("too many bounds"))?);
+        for (column, bound) in bounds {
+            put_u16(
+                &mut out,
+                u16::try_from(column).map_err(|_| invalid("bound column overflows"))?,
+            );
+            put_u64(&mut out, bound);
+        }
     }
     if !table.pair_frequencies.is_empty() {
         out.extend_from_slice(PAIR_FREQUENCIES);
@@ -8771,11 +8881,13 @@ fn reader_complete_numeric_frequencies(reader: &Reader) -> Result<Vec<StoredNume
             if !integer_or_date(&field.ty) {
                 return Ok(None);
             }
-            let Some(summary) = reader.frequency_summary(column)? else { return Ok(None) };
-            if summary.omitted_max != 0 || summary.entries.len() > MAX_CATALOG_FREQUENCIES {
+            let Some((entries, omitted_max)) = reader.frequency_head(column)? else {
+                return Ok(None);
+            };
+            if omitted_max != 0 || entries.len() > MAX_CATALOG_FREQUENCIES {
                 return Ok(None);
             }
-            let entries = reader.decode_frequencies(column, &field.ty, &summary.entries)?;
+            let entries = reader.decode_frequencies(column, &field.ty, &entries)?;
             let Some(entries) = entries
                 .iter()
                 .map(|(value, count)| Some((numeric_frequency_value(value)?, *count)))
@@ -9553,6 +9665,57 @@ fn decode_summary(
     rows: usize,
     values: bool,
 ) -> Result<Option<FrequencySummary>> {
+    let Some((entries, omitted_max)) = decode_summary_head(cur, field, rows)? else {
+        return Ok(None);
+    };
+    let ordinals = {
+        let ordinal_count = cur.u32()? as usize;
+        if ordinal_count > FREQUENCY_ORDINALS || ordinal_count > rows {
+            return Err(invalid("frequency ordinal count exceeds its bound"));
+        }
+        let mut ordinals = Vec::with_capacity(ordinal_count);
+        let mut previous = 0_u64;
+        for at in 0..ordinal_count {
+            let delta = cur.var_u64()?;
+            if at != 0 && delta == 0 {
+                return Err(invalid("frequency ordinals are not increasing"));
+            }
+            let ordinal = if at == 0 {
+                delta
+            } else {
+                previous.checked_add(delta).ok_or_else(|| invalid("frequency ordinal overflows"))?
+            };
+            if ordinal >= rows as u64 {
+                return Err(invalid("frequency ordinal is outside the table"));
+            }
+            ordinals.push(ordinal);
+            previous = ordinal;
+        }
+        ordinals
+    };
+    let ordinal_entries = if values {
+        let mut ordinal_entries = Vec::with_capacity(ordinals.len());
+        for _ in 0..ordinals.len() {
+            let entry = cur.u16()?;
+            if entry as usize >= entries.len() {
+                return Err(invalid("frequency ordinal value is outside its entries"));
+            }
+            ordinal_entries.push(entry);
+        }
+        ordinal_entries
+    } else {
+        Vec::new()
+    };
+    Ok(Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries, ordinal_bound: 0 }))
+}
+
+/// The entries of one column's frequency synopsis and the bound on what they leave out, without
+/// the row ordinals that follow them, which only a pair count reads.
+fn decode_summary_head(
+    cur: &mut Cursor<'_>,
+    field: &Field,
+    rows: usize,
+) -> Result<Option<(Vec<FrequencyEntry>, u64)>> {
     Ok(match cur.u8()? {
         0 => None,
         1 => {
@@ -9602,47 +9765,7 @@ fn decode_summary(
             if entries.windows(2).any(|pair| pair[0].count < pair[1].count) {
                 return Err(invalid("frequency entries are not descending"));
             }
-            let ordinals = {
-                let ordinal_count = cur.u32()? as usize;
-                if ordinal_count > FREQUENCY_ORDINALS || ordinal_count > rows {
-                    return Err(invalid("frequency ordinal count exceeds its bound"));
-                }
-                let mut ordinals = Vec::with_capacity(ordinal_count);
-                let mut previous = 0_u64;
-                for at in 0..ordinal_count {
-                    let delta = cur.var_u64()?;
-                    if at != 0 && delta == 0 {
-                        return Err(invalid("frequency ordinals are not increasing"));
-                    }
-                    let ordinal = if at == 0 {
-                        delta
-                    } else {
-                        previous
-                            .checked_add(delta)
-                            .ok_or_else(|| invalid("frequency ordinal overflows"))?
-                    };
-                    if ordinal >= rows as u64 {
-                        return Err(invalid("frequency ordinal is outside the table"));
-                    }
-                    ordinals.push(ordinal);
-                    previous = ordinal;
-                }
-                ordinals
-            };
-            let ordinal_entries = if values {
-                let mut ordinal_entries = Vec::with_capacity(ordinals.len());
-                for _ in 0..ordinals.len() {
-                    let entry = cur.u16()?;
-                    if entry as usize >= entries.len() {
-                        return Err(invalid("frequency ordinal value is outside its entries"));
-                    }
-                    ordinal_entries.push(entry);
-                }
-                ordinal_entries
-            } else {
-                Vec::new()
-            };
-            Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries })
+            Some((entries, omitted_max))
         }
         _ => return Err(invalid("frequency summary tag differs")),
     })
@@ -10303,6 +10426,8 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut sections = Vec::new();
     let mut pair_frequencies = Vec::new();
     let mut seen_pair_frequencies = false;
+    let mut ordinal_bounds = Vec::new();
+    let mut seen_ordinal_bounds = false;
     let mut frequency_texts = vec![Vec::new(); width];
     let mut seen_frequency_texts = false;
     let mut host_groups = None;
@@ -10376,6 +10501,27 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                     return Err(invalid("pair frequency entries are not descending"));
                 }
                 pair_frequencies.push(PairFrequencySummary { first, second, entries, omitted_max });
+            }
+        } else if &tag == ORDINAL_BOUNDS {
+            if seen_ordinal_bounds {
+                return Err(invalid("directory names two ordinal bound blocks"));
+            }
+            seen_ordinal_bounds = true;
+            ordinal_bounds = vec![0; width];
+            let count = cur.u16()? as usize;
+            if count > width {
+                return Err(invalid("ordinal bound count exceeds the columns"));
+            }
+            for _ in 0..count {
+                let column = cur.u16()? as usize;
+                let bound = cur.u64()?;
+                if column >= width || frequencies.get(column).and_then(Option::as_ref).is_none() {
+                    return Err(invalid("ordinal bound names a column with no synopsis"));
+                }
+                if bound == 0 || bound > rows as u64 || ordinal_bounds[column] != 0 {
+                    return Err(invalid("ordinal bound is outside the table or repeated"));
+                }
+                ordinal_bounds[column] = bound;
             }
         } else if &tag == FREQUENCY_TEXTS {
             if seen_frequency_texts {
@@ -10617,6 +10763,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         demoted,
         distincts,
         frequencies,
+        ordinal_bounds,
         pair_frequencies,
         frequency_texts,
         host_groups,
@@ -13620,6 +13767,7 @@ mod tests {
             demoted: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
+            ordinal_bounds: Vec::new(),
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
             host_groups: None,
@@ -16840,12 +16988,12 @@ mod tests {
             assert!(stored >= 2, "only {stored} synopses were left in the file");
         }
         let reader = catalog.table("items").expect("the table");
-        assert!(reader.frequency_summaries[1].get().is_none());
+        assert!(reader.frequency_heads[1].get().is_none());
         assert!(reader.top_frequencies(1, 1).expect("a readable synopsis").is_some());
-        let first = reader.frequency_summaries[1].get().expect("decoded synopsis");
+        let first = reader.frequency_heads[1].get().expect("decoded synopsis");
         let clone = reader.clone();
         assert!(clone.top_frequencies(1, 1).expect("cached synopsis").is_some());
-        assert!(Arc::ptr_eq(first, clone.frequency_summaries[1].get().expect("same synopsis")));
+        assert!(Arc::ptr_eq(first, clone.frequency_heads[1].get().expect("same synopsis")));
         fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -17658,6 +17806,7 @@ mod tests {
             demoted: Vec::new(),
             distincts: vec![None],
             frequencies: vec![None],
+            ordinal_bounds: Vec::new(),
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
             host_groups: None,

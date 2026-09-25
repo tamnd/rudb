@@ -28,17 +28,21 @@ struct Pair {
 
 impl Pair {
     fn new(name: &str) -> Self {
+        Self::of(name, &TABLES)
+    }
+
+    fn of(name: &str, tables: &[&str]) -> Self {
         let path = std::env::temp_dir()
             .join(format!("rudb-value-frequencies-{name}-{}.rudb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let memory = Database::new();
-        for sql in TABLES {
+        for sql in tables {
             memory.execute(sql).expect("the memory table is made");
         }
         let name = path.to_str().expect("a UTF-8 temporary path");
         {
             let writing = Database::open(name).expect("a file name starts a native database");
-            for sql in TABLES {
+            for sql in tables {
                 writing.execute(sql).expect("the file table is made");
             }
             writing.execute("CHECKPOINT").expect("the file table is committed");
@@ -115,4 +119,31 @@ fn rows_changed_after_the_synopsis_was_written_are_counted() {
     }
     pair.agree("SELECT u, COUNT(*) AS c FROM hits GROUP BY u ORDER BY c DESC LIMIT 10");
     pair.agree("SELECT ip, COUNT(*) AS c FROM hits GROUP BY ip ORDER BY c DESC LIMIT 10");
+}
+
+#[test]
+fn a_pair_is_counted_over_the_rows_of_the_leading_values_when_all_of_them_do_not_fit() {
+    // Twenty heavy users held by 500 to 10,000 rows each, then 600 users of 300 rows each, which
+    // is more rows between the listed values than the synopsis keeps, then a tail of users held by
+    // one row each. The rows kept are those of the heavy users and the first of the others.
+    let pair = Pair::of(
+        "prefix",
+        &[
+            "CREATE TABLE hits(u BIGINT, phrase VARCHAR)",
+            "INSERT INTO hits SELECT CASE WHEN i < 105000 THEN floor((sqrt(8 * (i // 500) + 1) - 1) \
+             / 2)::BIGINT WHEN i < 285000 THEN 1000 + i % 600 ELSE 1000000 + i END, CASE WHEN i >= \
+             105000 THEN 'm' || (i % 7)::VARCHAR WHEN i % 5 = 0 THEN 'p' || (i % 3)::VARCHAR ELSE '' \
+             END FROM range(600000) r(i)",
+        ],
+    );
+    let query = "SELECT u, phrase, COUNT(*) FROM hits GROUP BY u, phrase ORDER BY COUNT(*) DESC \
+                 LIMIT 10";
+    assert_eq!(pair.agree(query).len(), 10);
+    assert!(pair.unread(query));
+    pair.agree("SELECT u, COUNT(*) AS c FROM hits GROUP BY u ORDER BY c DESC LIMIT 10");
+    // Past the heavy users the pairs are no longer above what the kept rows leave out.
+    let query = "SELECT u, phrase, COUNT(*) FROM hits GROUP BY u, phrase ORDER BY COUNT(*) DESC, \
+                 u, phrase LIMIT 5 OFFSET 60";
+    assert!(!pair.unread(query));
+    pair.agree(query);
 }
