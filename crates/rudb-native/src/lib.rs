@@ -79,8 +79,9 @@ const AGGREGATE_SUMS: &[u8; 8] = b"RUDBAG10";
 const DISTINCT_COUNTS: &[u8; 8] = b"RUDBDC10";
 const INTEGER_EXTREMES: &[u8; 8] = b"RUDBEX10";
 const COMPLETE_FREQUENCIES: &[u8; 8] = b"RUDBFQ10";
+const DEVICE_CARD: &[u8; 8] = b"RUDBDV10";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
-const FORMAT: u32 = 29;
+const FORMAT: u32 = 30;
 
 /// Formats this build can open.
 ///
@@ -109,10 +110,14 @@ const FORMAT: u32 = 29;
 /// signature four times as wide, which a dictionary says with [`DICTIONARY_WIDE_GRAMS`], and a
 /// format 28 file is read with the narrow ones it has.
 ///
+/// Format 30 lets the catalog end with the device card of the device the file is on, which a
+/// format 29 catalog has no room for and a format 29 reader would call trailing bytes. A catalog
+/// that ends before it is a file with no card, which is every older file.
+///
 /// This is not a general compatibility promise. Seven formats are readable because there was a
 /// specific reason for each, and the list shrinks again the moment the older ones stop being worth
 /// carrying.
-const READABLE: &[u32] = &[22, 23, 24, 25, 26, 27, 28, FORMAT];
+const READABLE: &[u32] = &[22, 23, 24, 25, 26, 27, 28, 29, FORMAT];
 
 const HEADER: u64 = 80;
 const SLOT_BYTES: usize = 28;
@@ -2005,6 +2010,8 @@ pub struct Writer {
     /// Carried forward from the committed generation by [`Writer::open`], so a writer that was only
     /// opened to append a table does not have to know about views to avoid dropping them.
     views: Vec<ViewEntry>,
+    /// The device card the next commit writes down, which is [`card_for`] the file.
+    card: Option<KeptCard>,
     /// Where the stages this writer runs are charged, which [`Writer::with_profile`] sets.
     ///
     /// The writer runs the page builder, the dictionary blocks, the writes and the publish, and it
@@ -2207,7 +2214,8 @@ impl Writer {
         let file = fs.open(path.as_ref(), OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (mut closed, views) = decode_catalog(&bytes, size)?;
+        let (mut closed, views, card) = decode_catalog(&bytes, size)?;
+        let card = card_for(path.as_ref(), card);
         // A table already in the file under this name is only in the way if it holds rows. One that
         // holds none has no pages for this generation to carry and no reader that could lose
         // anything, so the table being started here takes its place in the catalog rather than
@@ -2269,6 +2277,7 @@ impl Writer {
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed,
             views,
+            card,
             profile: None,
         })
     }
@@ -2344,6 +2353,7 @@ impl Writer {
             pending: Vec::with_capacity(STRIPE_PARTS),
             closed: Vec::new(),
             views: Vec::new(),
+            card: card_for(path.as_ref(), None),
             profile: None,
         })
     }
@@ -2375,7 +2385,7 @@ impl Writer {
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
         file.write_at(0, &header)?;
-        let catalog = encode_catalog(&[], views)?;
+        let catalog = encode_catalog(&[], views, card_for(path.as_ref(), None).as_ref())?;
         file.write_at(HEADER, &catalog)?;
         // The same two syncs in the same order as [`Writer::finish`], and for the same reason. The
         // catalog is on the disk before the slot names it, so a file this is interrupted in the
@@ -2420,7 +2430,7 @@ impl Writer {
             }
             self.closed.remove(at);
         }
-        let Self { file, at, generation, mut closed, views, .. } = self;
+        let Self { file, at, generation, mut closed, views, card, .. } = self;
         closed.push(entry);
         Ok(Self {
             file,
@@ -2429,6 +2439,7 @@ impl Writer {
             generation,
             closed,
             views,
+            card,
             profile: None,
             dictionaries: fields
                 .iter()
@@ -3860,7 +3871,7 @@ impl Writer {
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
         tables.push(entry);
-        let catalog = encode_catalog(&tables, &self.views)?;
+        let catalog = encode_catalog(&tables, &self.views, self.card.as_ref())?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -3908,12 +3919,12 @@ impl Writer {
         let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (closed, _) = decode_catalog(&bytes, size)?;
+        let (closed, _, card) = decode_catalog(&bytes, size)?;
         let generation = slot
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("native file generation overflow"))?;
-        let catalog = encode_catalog(&closed, views)?;
+        let catalog = encode_catalog(&closed, views, card_for(path.as_ref(), card).as_ref())?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -3930,12 +3941,32 @@ impl Writer {
         Ok(())
     }
 
+    /// Commits a generation that writes down the device card this process has for the device the
+    /// file is on, and changes nothing else. It writes nothing when the file already holds that
+    /// card or the process has none.
+    ///
+    /// This is what `PRAGMA device_card_refresh` calls after it measures. Any other commit writes
+    /// the card too, but a refresh that changes nothing else has no commit to ride on.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::restate`].
+    pub fn keep_device_card(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let (_, size, _, bytes, _) = slot_bytes(path)?;
+        let (_, views, held) = decode_catalog(&bytes, size)?;
+        if card_for(path, held.clone()) == held {
+            return Ok(());
+        }
+        Self::restate(path, &views)
+    }
+
     /// Adds exact count, sum, distinct, bound, and bounded frequency certificates to an older file without
     /// rewriting table pages. The old slot remains readable until the new catalog is synced.
     pub fn certify_summaries(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
-        let (mut entries, views) = decode_catalog(&bytes, size)?;
+        let (mut entries, views, card) = decode_catalog(&bytes, size)?;
         let native = Catalog::open(path)?;
         for entry in &mut entries {
             let reader = native.table(&entry.name)?;
@@ -3951,7 +3982,7 @@ impl Writer {
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("native file generation overflow"))?;
-        let catalog = encode_catalog(&entries, &views)?;
+        let catalog = encode_catalog(&entries, &views, card_for(path, card).as_ref())?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -4076,7 +4107,8 @@ pub fn attach(
     let file = &*file;
     let size = file.len()?;
     let (slot, bytes, _) = committed_slot(file, size)?;
-    let (mut entries, views) = decode_catalog(&bytes, size)?;
+    let (mut entries, views, card) = decode_catalog(&bytes, size)?;
+    let card = card_for(path.as_ref(), card);
     let at = entries
         .iter()
         .position(|entry| entry.name == table)
@@ -4122,7 +4154,7 @@ pub fn attach(
     };
     // The views the file already had, written back unchanged. Attaching a section to a table says
     // nothing about a view and must not drop one.
-    let catalog = encode_catalog(&entries, &views)?;
+    let catalog = encode_catalog(&entries, &views, card.as_ref())?;
     if catalog.len() > MAX_DIRECTORY {
         return Err(invalid("catalog exceeds the configured bound"));
     }
@@ -5852,8 +5884,10 @@ impl Catalog {
     ///
     /// If the file has no valid committed catalog or a catalog pointer is out of bounds.
     pub fn open_in(path: impl AsRef<Path>, pool: &PagePool) -> Result<Self> {
+        let path = path.as_ref();
         let (file, size, _, bytes, opening) = slot_bytes(path)?;
-        let (entries, views) = decode_catalog(&bytes, size)?;
+        let (entries, views, card) = decode_catalog(&bytes, size)?;
+        remember_card(path, card.as_ref());
         Ok(Self {
             file: Arc::new(file),
             size,
@@ -8613,7 +8647,11 @@ fn reader_aggregate_sums(reader: &Reader) -> Result<Vec<Option<(i128, u64)>>> {
         .collect()
 }
 
-fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
+fn encode_catalog(
+    entries: &[Entry],
+    views: &[ViewEntry],
+    card: Option<&KeptCard>,
+) -> Result<Vec<u8>> {
     let mut out = CATALOG.to_vec();
     put_u32(&mut out, u32::try_from(entries.len()).map_err(|_| invalid("too many tables"))?);
     for entry in entries {
@@ -8780,6 +8818,14 @@ fn encode_catalog(entries: &[Entry], views: &[ViewEntry]) -> Result<Vec<u8>> {
             }
         }
     }
+    if let Some(card) = card {
+        out.extend_from_slice(DEVICE_CARD);
+        let device = card.device.as_bytes();
+        put_u16(&mut out, u16::try_from(device.len()).map_err(|_| invalid("device id too long"))?);
+        out.extend_from_slice(device);
+        put_u32(&mut out, u32::try_from(card.bytes.len()).map_err(|_| invalid("card too long"))?);
+        out.extend_from_slice(&card.bytes);
+    }
     Ok(out)
 }
 
@@ -8793,7 +8839,7 @@ fn put_long_text(out: &mut Vec<u8>, text: &str, what: &str) -> Result<()> {
 
 /// Reads the catalog directory back, checking every span against the file before anything is
 /// allocated for it.
-fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>)> {
+fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
     let mut cur = Cursor::new(bytes);
     if cur.take(8)? != CATALOG {
         return Err(invalid("catalog magic differs"));
@@ -9033,10 +9079,74 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<(Vec<Entry>, Vec<ViewEntry>
             }
         }
     }
+    let mut card = None;
+    if !cur.done() {
+        if cur.take(8)? != DEVICE_CARD {
+            return Err(invalid("device card catalog extension magic differs"));
+        }
+        let device = cur.text()?;
+        let len = cur.u32()? as usize;
+        if len > MAX_CARD {
+            return Err(invalid("device card is longer than any card"));
+        }
+        card = Some(KeptCard { device, bytes: cur.take(len)?.to_vec() });
+    }
     if !cur.done() {
         return Err(invalid("catalog has trailing bytes"));
     }
-    Ok((entries, views))
+    Ok((entries, views, card))
+}
+
+/// What [`decode_catalog`] reads: the tables, the views and the device card.
+type Decoded = (Vec<Entry>, Vec<ViewEntry>, Option<KeptCard>);
+
+/// The most a kept device card can take, which is many times what one holds.
+const MAX_CARD: usize = 64 << 10;
+
+/// The device card a file keeps, as `rudb_io::device` encodes it, and the device it was measured
+/// on.
+///
+/// `16-measurement.md` section 16.3 keeps the card in the file so that a process opening the file
+/// does not measure the device again. It is only good on that device, so it carries the device id
+/// and a file copied somewhere else keeps its card but nobody takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeptCard {
+    device: String,
+    bytes: Vec<u8>,
+}
+
+/// The directory a database file is in, which is the one its device card is about.
+fn directory_of(path: &Path) -> &Path {
+    path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."))
+}
+
+/// The card the next commit of the file at `path` writes down.
+///
+/// The one this process has for the device the file is on when there is one, since it was either
+/// measured here or read out of a file on the same device, and otherwise whatever the file already
+/// kept. A file never makes a process measure: the card is measured when something asks for it,
+/// and this only writes down what is already known.
+fn card_for(path: &Path, held: Option<KeptCard>) -> Option<KeptCard> {
+    let Ok(device) = rudb_io::device::device_key(directory_of(path)) else {
+        return held;
+    };
+    match rudb_io::device::kept(&device) {
+        Some(card) => Some(KeptCard { device, bytes: card.encode() }),
+        None => held,
+    }
+}
+
+/// Hands the card a file kept to this process, when the file is still on the device it describes.
+fn remember_card(path: &Path, card: Option<&KeptCard>) {
+    let Some(card) = card else { return };
+    let dir = directory_of(path);
+    let Ok(device) = rudb_io::device::device_key(dir) else { return };
+    if device != card.device {
+        return;
+    }
+    if let Ok(decoded) = rudb_io::device::Card::decode(&card.bytes, dir) {
+        rudb_io::device::remember(&device, decoded);
+    }
 }
 
 /// Reads the fields of a directory or a catalog in order, off bytes in memory or out of the file.
@@ -13921,6 +14031,28 @@ mod tests {
         fs::remove_file(&path).expect("clean up");
     }
 
+    #[test]
+    fn a_device_card_rides_the_catalog_and_an_older_catalog_has_none() {
+        let entry = || Entry {
+            name: "items".to_string(),
+            fields: vec![Field::required("id", LogicalType::Integer)],
+            rows: 1,
+            directory: Page { offset: HEADER, length: 8, hash: 0 },
+            nonzero: vec![None],
+            aggregates: vec![None],
+            distincts: vec![None],
+            extremes: vec![None],
+            frequencies: vec![None],
+        };
+        let card = KeptCard { device: "dev:42".to_string(), bytes: vec![1, 2, 3] };
+        let bytes = encode_catalog(&[entry()], &[], Some(&card)).expect("encodes");
+        let (entries, views, kept) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
+        assert_eq!((entries.len(), views.len()), (1, 0));
+        assert_eq!(kept, Some(card));
+        let bytes = encode_catalog(&[entry()], &[], None).expect("encodes");
+        assert_eq!(decode_catalog(&bytes, HEADER + 8).expect("decodes").2, None);
+    }
+
     /// A view, with everything about it that a reopened catalog has to be able to answer from.
     fn sample_view(name: &str) -> ViewEntry {
         ViewEntry {
@@ -14014,6 +14146,7 @@ mod tests {
                 frequencies: vec![None],
             }],
             &[sample_view("items")],
+            None,
         )
         .expect("it encodes, because encoding does not look");
         let error = decode_catalog(&bytes, HEADER + 8).expect_err("and decoding does");

@@ -5,10 +5,11 @@
 //! before the first chunk goes out. That also means `EXPLAIN` alone does not probe: it never builds
 //! the operator.
 //!
-//! The card is not written into the database yet. `engine-v4/09-the-log.md` keeps it next to the
-//! log so that opening a database does not measure again, and that lands with the log in W3. Until
-//! then a process measures a device once and every later call on that device gets the kept card
-//! back, and a call that names an iteration count measures again at that count.
+//! A process measures a device once and every later call on that device gets the kept card back,
+//! and a call that names an iteration count measures again at that count. A database file keeps
+//! the card of the device it is on in its catalog, so a process that opens a file there starts with
+//! that card and does not measure at all, and `PRAGMA device_card_refresh` measures again and
+//! writes the new card into the file.
 
 use std::path::Path;
 

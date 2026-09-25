@@ -96,6 +96,7 @@ fn is_statement(name: &str) -> bool {
         || folded.starts_with("disable_")
         || folded == "force_checkpoint"
         || folded == "verify_parallelism"
+        || folded == "device_card_refresh"
 }
 
 /// One `FOREIGN KEY` as the transform collects it: the columns, the referenced table's name parts

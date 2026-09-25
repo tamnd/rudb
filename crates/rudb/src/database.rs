@@ -2694,6 +2694,31 @@ impl Shared {
         self.inner.writer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// `PRAGMA device_card_refresh`: measures the device the database file is on again and keeps
+    /// the card in the file, so the next process to open it reads the card rather than measuring.
+    ///
+    /// Only a database with a file it may write has a device to measure. `16-measurement.md`
+    /// section 16.3 says the card never runs on a read only open or in memory, and this is the one
+    /// place that runs it on purpose, so it says no there rather than doing nothing. The caller
+    /// holds the catalog, which is what `CHECKPOINT` holds to write the file too.
+    fn refresh_device_card(&self) -> Result<()> {
+        let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) else {
+            return Err(Error::invalid_input(
+                "PRAGMA device_card_refresh measures the device a database file is on, and this \
+                 database has no file it can write",
+            ));
+        };
+        let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+        let dir = dir.unwrap_or(Path::new("."));
+        rudb_io::device::card(dir, Some(rudb_io::device::Options::default().iterations))?;
+        // A database nothing has been written to yet has no file. Its first commit writes the card
+        // down along with everything else.
+        if path.exists() {
+            rudb_native::Writer::keep_device_card(path)?;
+        }
+        Ok(())
+    }
+
     /// The memory and the threads this database will lend a query.
     fn budget(&self) -> Budget<'_> {
         Budget { memory: &self.inner.memory, pool: &self.inner.pool }
@@ -3338,6 +3363,12 @@ impl Shared {
                     sql,
                     Planning { parse_ns, bind_ns, optimize_ns },
                 )
+            }
+            Bound::Setting(setting)
+                if setting.pragma && setting.name.eq_ignore_ascii_case("device_card_refresh") =>
+            {
+                self.refresh_device_card()?;
+                Ok(QueryResult::empty())
             }
             Bound::Setting(setting) if setting.pragma => {
                 self.inner.settings.toggle(&setting.name)?;

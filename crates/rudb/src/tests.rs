@@ -4361,6 +4361,14 @@ fn a_name_that_exists_only_after_the_word_pragma_is_not_a_table_function() {
     assert!(message.ends_with("\tPRAGMA \"show_tables\"\n"), "{message}");
 }
 
+/// An in memory database has no device to measure, and saying so beats a pragma that did nothing.
+#[test]
+fn a_device_card_refresh_needs_a_file() {
+    let db = database();
+    let error = db.execute("PRAGMA device_card_refresh").unwrap_err();
+    assert!(error.to_string().contains("no file it can write"), "{error}");
+}
+
 /// What a pragma says when it is not one, and when it is one and was called wrongly.
 #[test]
 fn a_pragma_that_is_wrong_is_complained_about_in_the_spelling_it_was_written_in() {
