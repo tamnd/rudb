@@ -549,12 +549,14 @@ name = "rudb-qc-gen"
 version = "0.4.34"
 dependencies = [
  "rudb-common",
+ "rudb-kernels",
  "rudb-plan",
  "rudb-qc-interp",
  "rudb-qc-ir",
  "rudb-qc-pipe",
  "rudb-qc-plan",
  "rudb-qc-rt",
+ "rudb-vector",
 ]
 
 [[package]]
