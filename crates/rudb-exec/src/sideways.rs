@@ -37,7 +37,9 @@
 //!
 //! **The kind.** An inner join and a semi join throw away a driving row that matches nothing, so
 //! dropping it earlier is the same answer. A left, an anti and a single join all answer with that
-//! row, so dropping it is a row missing from the result. Only the first two arm this.
+//! row, so dropping it is a row missing from the result. Only the first two arm this, and a right
+//! join, which keeps the gathered side and drops a driving row with no match the way an inner one
+//! does.
 //!
 //! **The null rule.** `NULL = NULL` is null, so a driving row whose key is null matches nothing and
 //! dropping it is dropping a row that was going to go. `IS NOT DISTINCT FROM` is the other rule for

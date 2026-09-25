@@ -2231,18 +2231,19 @@ impl<'a> Padding<'a> {
         self.probe.schema()
     }
 
-    /// The key this join can hand to the scan under its driving side.
+    /// The key this join can hand to the scan under its driving side, which is the probe's.
     ///
-    /// Nothing at all, and this is the one place where turning a join around costs something. A
-    /// runtime filter over the driving side drops rows the gathered side has no key for, and a
-    /// driving row this operator drops is one that marked no bit, so for the pairs it would be
-    /// sound. It is not sound for the padding: the filter would be built from the gathered side
-    /// and the rows it removes are exactly the ones that were going to match nothing, which is the
-    /// half of a full join's answer that comes out of the drain. A right join could have it and
-    /// does not, because the two kinds share this operator and a filter that is right for one of
-    /// them and wrong for the other is worse than none.
+    /// A runtime filter over the driving side drops rows the gathered side has no key for. For a
+    /// right join the probe is an inner one, which drops those rows anyway, and a row dropped early
+    /// is one that would have marked no bit, so the padding comes out the same. For a full join the
+    /// probe is a left one, which pads those rows, and [`Probe::sideways`] refuses a left join, so
+    /// nothing is handed down. That is how the question is answered per kind with one operator.
+    ///
+    /// The right join is the one TPC-H q21 has once its `NOT EXISTS` is a left join against the
+    /// extremes of each order's lines: the order side is gathered and kept, and the grouping of
+    /// lineitem under it is the driving side, which without this read every late line in the file.
     pub(crate) fn sideways(&self) -> Vec<(ExprRef, ColumnBinding)> {
-        Vec::new()
+        self.probe.sideways()
     }
 
     /// Note that every one of these gathered rows has now been matched.
