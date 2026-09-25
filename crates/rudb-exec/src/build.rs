@@ -259,6 +259,8 @@ fn build_measured_with_sink<'a>(
         pruning: Vec::new(),
         pushing: None,
         sideways: None,
+        filling: None,
+        grouped: None,
         above: Vec::new(),
         armed: Vec::new(),
         cutoff: None,
@@ -1300,6 +1302,14 @@ struct Building<'a, 'b> {
     /// that drops rows under a `LIMIT` changes which rows reach the limit. [`Builder::node`] clears
     /// it for every node that is not a scan, a filter or a projection.
     sideways: Option<Arc<Sideways<'a>>>,
+    /// The pipeline that fills `sideways`, which is the join's build side.
+    filling: Option<PipelineRef>,
+    /// A join's runtime filter handed through a grouping, for the scan under it, and the pipeline
+    /// that fills it. A key the join drops is a group it drops, so the rows of that group can go
+    /// before they are grouped, see `sideways::beneath`. The grouping ends a pipeline, so the one
+    /// under it would start as soon as the join's did, and it is made to wait for the build side
+    /// instead, since before that there is no filter to read.
+    grouped: Option<(Arc<Sideways<'a>>, PipelineRef)>,
     /// The runtime filters of joins further up, for the same scan.
     ///
     /// A join's own filter stops at the next join down, and these are the ones that went on through
@@ -1751,9 +1761,11 @@ impl<'a> Building<'a, '_> {
         // Offered to the driving side while it is built, which is how it reaches the scan
         // down there. Cleared afterwards so that nothing built later picks it up.
         self.sideways = Some(Arc::clone(&sideways));
+        self.filling = Some(gathering);
         let from = self.armed.len();
         let mut left = self.node(driving)?;
         self.sideways = None;
+        self.filling = None;
         self.above.clear();
         // The filters of the joins on the driving side, which are the only ones this join may use
         // on its own table, and then its own for the joins above it.
@@ -1893,6 +1905,7 @@ impl<'a> Building<'a, '_> {
         aggregates: Slice,
         bound: AggregateBound,
     ) -> Result<Segment<'a>> {
+        let grouped = self.grouped.take();
         if bound.max_groups.is_none()
             && bound.having_count.is_none()
             && let Some((reader, order, covered, group_type)) =
@@ -1931,9 +1944,15 @@ impl<'a> Building<'a, '_> {
             return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
         }
         self.marking = marks_through(self.plan, input, groups, aggregates).then_some(input);
+        let waits = grouped.map(|(sideways, filling)| {
+            self.sideways = Some(sideways);
+            self.filling = Some(filling);
+            filling
+        });
         let below = self.node(input);
         self.marking = None;
-        let below = below?;
+        let mut below = below?;
+        below.after.extend(waits);
         let (aggregate, out) =
             Aggregate::new(self.plan, &below.schema, index, groups, aggregates, self.memory)?;
         let aggregate = aggregate.in_session(self.session);
@@ -2182,6 +2201,9 @@ impl<'a> Building<'a, '_> {
                 self.above.extend(inherited);
             } else {
                 self.above.clear();
+                if matches!(plan.node(reference), Node::Aggregate { .. }) {
+                    self.grouped = inherited.zip(self.filling);
+                }
             }
         }
         // A cutoff travels the same way and stops one node short of it, for the reason on the field.

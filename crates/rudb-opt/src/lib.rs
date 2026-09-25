@@ -24,6 +24,7 @@ pub mod eager;
 pub mod eliminate;
 pub mod empty;
 pub mod estimate;
+pub mod exists;
 pub mod explain;
 pub mod extremes;
 pub mod filter;
@@ -199,7 +200,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 30] = [
+pub static PASSES: [&(dyn Pass + Sync); 31] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -214,6 +215,7 @@ pub static PASSES: [&(dyn Pass + Sync); 30] = [
     &semi::DistinctToSemi,
     &keys::GroupKeyPushdown,
     &semi::SemiPushdown,
+    &exists::ExistsAsExtremes,
     &eliminate::JoinElimination,
     &nonulls::NoNulls,
     &empty::EmptyResultPullup,

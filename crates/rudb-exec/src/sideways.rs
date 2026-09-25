@@ -649,6 +649,17 @@ pub(crate) fn beneath(plan: &Plan, node: NodeRef, binding: ColumnBinding) -> Opt
                 at = input;
             }
             ref node @ Node::Join { .. } => at = through(node)?,
+            // A key the join drops is a group it drops whole, so the rows of that group can go
+            // before they are grouped. Only a group key, since an aggregate's value is not a value
+            // any row below it had. The pipeline under the grouping waits for the join's build side
+            // for this, see `Builder::aggregate`.
+            Node::Aggregate { input, index, groups, .. } if binding.table == index => {
+                let groups = plan.expr_list(groups);
+                let key = groups.get(binding.column as usize)?;
+                let Expr::Column(inner) = *plan.expr(*key) else { return None };
+                binding = inner;
+                at = input;
+            }
             _ => return None,
         }
     }
