@@ -22,6 +22,7 @@ use crate::arg_extreme::{ArgExtreme, Key};
 use crate::compare::order_with_nulls;
 use crate::number::{approximate, fit, integral};
 use crate::quantile::{self, Column, Held, Holistic};
+use crate::statistics::{Moment, Paired, Pairing, Powers};
 
 /// A running aggregate that is not one of the five the aggregate module keeps inline.
 #[derive(Debug, Clone)]
@@ -58,6 +59,10 @@ pub(crate) enum General {
     /// The `arg_min` and `arg_max` spellings, which keep the row with the least or greatest key,
     /// or the best `n` of them when the call passes a count, and answer in [`crate::arg_extreme`].
     Arg { state: ArgExtreme, returns: LogicalType },
+    /// `corr`, the covariances and the `regr_*` family, over pairs, in [`crate::statistics`].
+    Paired(Paired),
+    /// `skewness`, `kurtosis` and `kurtosis_pop`, in [`crate::statistics`].
+    Powers(Powers),
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -86,6 +91,8 @@ pub(crate) enum Measure {
     VarPop,
     StddevSamp,
     StddevPop,
+    /// `sem`, the standard error of the mean.
+    Sem,
 }
 
 impl General {
@@ -96,6 +103,12 @@ impl General {
         let moments = |measure| Self::Moments { count: 0, mean: 0.0, squared: 0.0, measure };
         if let Some(state) = ArgExtreme::named(name) {
             return Some(Self::Arg { state, returns: returns.clone() });
+        }
+        if let Some(measure) = Pairing::named(name) {
+            return Some(Self::Paired(Paired::new(measure)));
+        }
+        if let Some(measure) = Moment::named(name) {
+            return Some(Self::Powers(Powers::new(measure)));
         }
         if let Some(measure) = Holistic::named(name) {
             let returns = returns.clone();
@@ -122,6 +135,7 @@ impl General {
             "var_pop" => moments(Measure::VarPop),
             "stddev_samp" => moments(Measure::StddevSamp),
             "stddev_pop" => moments(Measure::StddevPop),
+            "sem" => moments(Measure::Sem),
             "string_agg" => {
                 Self::Joined { text: String::new(), seen: false, separator: String::new() }
             }
@@ -153,7 +167,11 @@ impl General {
             // The rows of an ordered call are kept whole, nulls and all, and the aggregate it wraps
             // decides what to skip once they are in order.
             Self::Ordered { rows, .. } => rows.push(args.to_vec()),
+            Self::Paired(state) => state.update(args)?,
             _ if value.is_null() => {}
+            Self::Powers(state) => {
+                state.add(approximate(value).ok_or_else(|| unexpected("skewness", value))?);
+            }
             Self::Holistic { values, fraction, .. } => {
                 if fraction.is_none() {
                     *fraction = args.get(1).cloned();
@@ -298,6 +316,8 @@ impl General {
                     (here, there) => here.or(there),
                 };
             }
+            (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
+            (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (Self::Product { total, seen }, Self::Product { total: theirs, seen: any }) => {
                 *total *= theirs;
                 *seen |= any;
@@ -317,7 +337,8 @@ impl General {
                     let total = here + there;
                     let delta = theirs - *mean;
                     *squared = their_squared + *squared + delta * delta * there * here / total;
-                    *mean = (there * theirs + here * *mean) / total;
+                    // The pin moves the mean with a fused multiply and add, which rounds once.
+                    *mean = (there / total).mul_add(delta, *mean);
                     *count += more;
                 }
             }
@@ -378,6 +399,13 @@ impl General {
                     reason = "the count of rows in one group is well inside the exact range"
                 )]
                 let rows = *count as f64;
+                if *measure == Measure::Sem {
+                    return Ok(if *count == 0 {
+                        Value::Null
+                    } else {
+                        Value::Double((squared / rows).sqrt() / rows.sqrt())
+                    });
+                }
                 let sample = matches!(measure, Measure::VarSamp | Measure::StddevSamp);
                 let variance = match (*count, sample) {
                     (0, _) | (1, true) => return Ok(Value::Null),
@@ -387,9 +415,13 @@ impl General {
                 };
                 match measure {
                     Measure::VarSamp | Measure::VarPop => Value::Double(variance),
-                    Measure::StddevSamp | Measure::StddevPop => Value::Double(variance.sqrt()),
+                    Measure::StddevSamp | Measure::StddevPop | Measure::Sem => {
+                        Value::Double(variance.sqrt())
+                    }
                 }
             }
+            Self::Paired(state) => state.finish(),
+            Self::Powers(state) => state.finish()?,
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
             Self::Ordered { .. } | Self::Holistic { .. } | Self::Arg { .. } => {

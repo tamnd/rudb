@@ -11176,6 +11176,51 @@ fn unnest_of_a_struct_is_a_column_per_field_the_way_the_pin_does() {
     );
 }
 
+/// The pair statistics and the higher moments, every digit probed on the pinned binary.
+#[test]
+fn the_regression_family_and_the_moments_answer_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(
+        text(
+            "SELECT regr_count(y, x), typeof(regr_count(y, x)), corr(y, x), regr_intercept(y, x), regr_slope(y, x), covar_samp(y, x) FROM (VALUES (1, 2), (5, 7), (2, 1), (9, 3), (NULL, 4), (6, NULL)) t(y, x)"
+        ),
+        "4,UINTEGER,0.37910853355951357,2.5662650602409633,0.5180722891566266,3.5833333333333335"
+    );
+    assert_eq!(
+        text(
+            "SELECT regr_count(y, x), corr(y, x), covar_samp(y, x) FROM (VALUES (1, 2)) t(y, x) WHERE y > 5"
+        ),
+        "0,NULL,NULL"
+    );
+    assert_eq!(
+        text(
+            "SELECT corr(y, x), regr_slope(y, x), regr_intercept(y, x), regr_r2(y, x), regr_r2(x, y) FROM (VALUES (1, 3), (2, 3)) t(y, x)"
+        ),
+        "nan,nan,NULL,NULL,1.0"
+    );
+    assert_eq!(
+        text(
+            "SELECT skewness(x), kurtosis(x), kurtosis_pop(x), sem(x) FROM (VALUES (1), (2), (4), (8), (9)) t(x)"
+        ),
+        "0.2717687582352626,-2.680265360530715,-1.6700663401326787,1.4254823744964369"
+    );
+    assert_eq!(
+        text(
+            "SELECT g, skewness(x), regr_slope(x, g) FROM (VALUES (1, 1.5), (1, 2.5), (1, 7.0), (2, 3.0), (2, 3.0), (2, 3.0)) t(g, x) GROUP BY g ORDER BY g"
+        ),
+        "1,1.5078084839697168,nan;2,NULL,nan"
+    );
+    let error = db.execute("SELECT corr('a'::VARCHAR, 1)").unwrap_err().to_string();
+    assert!(error.contains("No function matches"), "{error}");
+}
+
 #[test]
 fn arg_min_and_arg_max_answer_the_way_the_pin_does() {
     let db = Database::new();

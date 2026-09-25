@@ -4126,9 +4126,9 @@ mod tests {
 
     #[test]
     fn an_aggregate_nobody_has_written_says_which_one() {
-        let error = Accumulator::new("kurtosis", &LogicalType::Double)
-            .expect_err("kurtosis is not written yet");
-        assert!(error.message().contains("the kurtosis aggregate"), "{error}");
+        let error = Accumulator::new("entropy", &LogicalType::Double)
+            .expect_err("entropy is not written yet");
+        assert!(error.message().contains("the entropy aggregate"), "{error}");
     }
 
     /// The row at a time path, which is the answer the one pass path has to reach.

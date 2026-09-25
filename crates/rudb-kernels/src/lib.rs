@@ -83,6 +83,7 @@ pub mod select;
 mod sequence;
 mod shape;
 mod split;
+mod statistics;
 mod structs;
 mod subscript;
 mod text;
