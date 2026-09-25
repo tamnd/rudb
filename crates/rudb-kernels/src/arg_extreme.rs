@@ -356,6 +356,7 @@ impl Key {
         match column {
             Column::Wholes(_, numbers) => Self::Whole(numbers.at(row)),
             Column::Reals(reals) => Self::Real(reals[row]),
+            Column::Flags(flags) => Self::Whole(i64::from(flags[row])),
         }
     }
 

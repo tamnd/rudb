@@ -23,6 +23,7 @@ use crate::compare::order_with_nulls;
 use crate::number::{approximate, fit, integral};
 use crate::quantile::{self, Column, Held, Holistic};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
+use crate::tally::Tally;
 
 /// A running aggregate that is not one of the five the aggregate module keeps inline.
 #[derive(Debug, Clone)]
@@ -63,6 +64,12 @@ pub(crate) enum General {
     Paired(Paired),
     /// `skewness`, `kurtosis` and `kurtosis_pop`, in [`crate::statistics`].
     Powers(Powers),
+    /// `fsum` and `favg`, a sum with Kahan's running error, in the pin's steps.
+    Kahan { value: f64, err: f64, count: u64, average: bool },
+    /// `count_if`, the rows that were true, and whether any row was not null.
+    CountIf { count: i128, seen: bool },
+    /// `entropy`, which counts each distinct value rather than holding them all.
+    Tally(Tally),
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -136,6 +143,10 @@ impl General {
             "stddev_samp" => moments(Measure::StddevSamp),
             "stddev_pop" => moments(Measure::StddevPop),
             "sem" => moments(Measure::Sem),
+            "fsum" => Self::Kahan { value: 0.0, err: 0.0, count: 0, average: false },
+            "favg" => Self::Kahan { value: 0.0, err: 0.0, count: 0, average: true },
+            "count_if" => Self::CountIf { count: 0, seen: false },
+            "entropy" => Self::Tally(Tally::Empty),
             "string_agg" => {
                 Self::Joined { text: String::new(), seen: false, separator: String::new() }
             }
@@ -198,6 +209,18 @@ impl General {
                 *total *= approximate(value).ok_or_else(|| unexpected("product", value))?;
                 *seen = true;
             }
+            Self::Kahan { value: summed, err, count, .. } => {
+                kahan(approximate(value).ok_or_else(|| unexpected("fsum", value))?, summed, err);
+                *count += 1;
+            }
+            Self::Tally(tally) => tally.push(value)?,
+            Self::CountIf { count, seen } => {
+                let Value::Boolean(flag) = *value else {
+                    return Err(unexpected("count_if", value));
+                };
+                *count += i128::from(flag);
+                *seen = true;
+            }
             Self::Moments { count, mean, squared, .. } => {
                 let input = approximate(value).ok_or_else(|| unexpected("stddev", value))?;
                 *count += 1;
@@ -247,7 +270,10 @@ impl General {
 
     /// Whether this state skips nulls and takes the rest of a column through [`Self::push_column`].
     pub(crate) fn takes_columns(&self) -> bool {
-        matches!(self, Self::Holistic { .. })
+        matches!(
+            self,
+            Self::Holistic { .. } | Self::Tally(_) | Self::Kahan { .. } | Self::CountIf { .. }
+        )
     }
 
     /// Adds the row of a column a [`Column`] reads, with the fraction read off `args` the first
@@ -258,6 +284,23 @@ impl General {
         row: usize,
         args: &[rudb_vector::Vector],
     ) -> Result<()> {
+        match (&mut *self, column) {
+            (Self::Tally(tally), column) => return tally.push_column(column, row),
+            (Self::CountIf { count, seen }, Column::Flags(flags)) => {
+                *count += i128::from(flags[row]);
+                *seen = true;
+                return Ok(());
+            }
+            (Self::Kahan { value, err, count, .. }, Column::Reals(reals)) => {
+                kahan(reals[row], value, err);
+                *count += 1;
+                return Ok(());
+            }
+            (Self::CountIf { .. } | Self::Kahan { .. }, column) => {
+                return self.update(&[column.value(row)]);
+            }
+            _ => {}
+        }
         let Self::Holistic { values, fraction, .. } = self else {
             return Ok(());
         };
@@ -318,6 +361,19 @@ impl General {
             }
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
+            (
+                Self::Kahan { value, err, count, .. },
+                Self::Kahan { value: theirs, err: their_err, count: more, .. },
+            ) => {
+                kahan(*theirs, value, err);
+                kahan(*their_err, value, err);
+                *count += more;
+            }
+            (Self::Tally(tally), Self::Tally(theirs)) => tally.append(theirs)?,
+            (Self::CountIf { count, seen }, Self::CountIf { count: more, seen: any }) => {
+                *count += more;
+                *seen |= any;
+            }
             (Self::Product { total, seen }, Self::Product { total: theirs, seen: any }) => {
                 *total *= theirs;
                 *seen |= any;
@@ -364,6 +420,15 @@ impl General {
         Ok(())
     }
 
+    /// The answer of an aggregate with no `GROUP BY`. The pin combines its one state into an empty
+    /// one before finishing it and a grouped state is finished as it stands, which only `fsum` and
+    /// `favg` can tell apart.
+    pub(crate) fn finish_ungrouped(&self) -> Result<Value> {
+        let Self::Kahan { value, err, count, average } = self else { return self.finish() };
+        let (value, err) = settled(*value, *err);
+        Self::Kahan { value, err, count: *count, average: *average }.finish()
+    }
+
     /// The answer.
     pub(crate) fn finish(&self) -> Result<Value> {
         if let Self::Ordered { keys, rows, inner } = self {
@@ -393,6 +458,18 @@ impl General {
                 })?
             }
             Self::Product { total, .. } => Value::Double(*total),
+            Self::Kahan { count: 0, .. } | Self::CountIf { seen: false, .. } => Value::Null,
+            Self::Kahan { value, average: false, .. } => Value::Double(*value),
+            Self::Kahan { value, err, count, average: true } => {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "the pin divides by the count the same way"
+                )]
+                let rows = *count as f64;
+                Value::Double(value / rows + err / rows)
+            }
+            Self::CountIf { count, .. } => Value::HugeInt(*count),
+            Self::Tally(tally) => tally.entropy()?,
             Self::Moments { count, squared, measure, .. } => {
                 #[expect(
                     clippy::cast_precision_loss,
@@ -463,6 +540,25 @@ fn ordered(keys: &[(bool, bool)], rows: &[Vec<Value>], inner: &Accumulator) -> R
         fresh.update(&row[..row.len() - keys.len()])?;
     }
     fresh.finish()
+}
+
+/// One step of the pin's Kahan sum. The pin's `fsum` answers with the sum alone and never adds
+/// the error back in, so the error only matters for the next step.
+fn kahan(input: f64, summed: &mut f64, err: &mut f64) {
+    let diff = input - *err;
+    let next = *summed + diff;
+    *err = (next - *summed) - diff;
+    *summed = next;
+}
+
+/// A Kahan state combined into an empty one the way the pin does it, which adds the running error
+/// in as if it were a value, so an overflowing sum ends as NaN rather than infinity and a finite
+/// one picks up its error.
+fn settled(value: f64, err: f64) -> (f64, f64) {
+    let (mut summed, mut next_err) = (0.0, 0.0);
+    kahan(value, &mut summed, &mut next_err);
+    kahan(err, &mut summed, &mut next_err);
+    (summed, next_err)
 }
 
 /// A value of a type the binder should not have let through to this aggregate.

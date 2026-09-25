@@ -86,6 +86,7 @@ mod split;
 mod statistics;
 mod structs;
 mod subscript;
+mod tally;
 mod text;
 
 pub use aggregate::{
