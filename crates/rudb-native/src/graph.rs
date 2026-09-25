@@ -275,6 +275,18 @@ pub const BUDGET_SHARE: u64 = 10;
 /// queries that filter `part` and `supplier` hard read, and the ranking below decides which two.
 pub const ADJACENCY_SHARE: u64 = 25;
 
+/// The share of a table's stored column bytes its key maps are allowed to cost together.
+///
+/// Section 3.7. Apart from `BUDGET_SHARE` for the same reason the adjacencies are: a key map is
+/// what every reduction into its table starts from, and out of one share with the table's own
+/// links it lost to them. On SF1 `orders` stored in date order the map over `o_orderkey` has to
+/// be the permuted form, a bitmap and a row id per key, 4.7 MB. The link from `orders` to
+/// `customer` already held 3.4 MB of the 10 percent, so the map was refused, and without it no
+/// join keyed on an order could reduce `lineitem` at all. A map over distinct keys costs at most a
+/// row id and a bit per row, which is a quarter or less of the columns of any table with more than
+/// its key in it.
+pub const KEY_MAP_SHARE: u64 = 25;
+
 /// The size below which a table's graph sections always fit, whatever the share works out to.
 ///
 /// A percentage of the stored bytes is the right rule for a structure whose size is worth arguing
@@ -299,7 +311,7 @@ pub const BUDGET_FLOOR: u64 = 64 * 1024;
 ///
 /// If the file cannot be opened, a column cannot be mapped, or the attach fails.
 pub fn build_key_maps(path: &Path, table: &str, columns: &[usize]) -> Result<Vec<Built>> {
-    build_key_maps_within(path, table, columns, BUDGET_SHARE)
+    build_key_maps_within(path, table, columns, KEY_MAP_SHARE)
 }
 
 /// The same, against a budget of `share` percent of the table's stored column bytes.
@@ -394,17 +406,18 @@ pub fn build_key_maps_within(
     Ok(report)
 }
 
-/// What the table's existing graph sections cost, leaving out the key maps this build is replacing.
+/// What the table's existing key maps cost, leaving out the ones this build is replacing.
 ///
-/// Graph sections only. The statistics layer has its own two percent per `spec/stats` section 3.8,
-/// and a budget that counted the other layer's sections would be a budget the other layer eats,
-/// which is the thing the two shares being separate numbers exists to prevent.
+/// Key maps only. The statistics layer has its own two percent per `spec/stats` section 3.8, and
+/// the links and the adjacencies have their own shares here, and a budget that counted another
+/// share's sections would be a budget the other one eats, which is the thing the shares being
+/// separate numbers exists to prevent.
 ///
 /// Reading the extent tables is what this costs, which is one small read per section and not a read
 /// of a payload. A section whose extent table does not checksum is counted as nothing, because it
 /// is a section that is already not there.
 fn held_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
-    held_bytes_except(reader, &[*section::KEY_MAP], replacing)
+    held_kind_bytes(reader, *section::KEY_MAP, replacing)
 }
 
 /// The key map this table carries for a column, when it carries one this build can use.
@@ -549,8 +562,8 @@ fn links_of_one_table(
     let allowance = (column_bytes.saturating_mul(share) / 100).max(BUDGET_FLOOR);
     let replacing = edges.iter().map(|edge| edge.child_column).collect::<Vec<usize>>();
     let index_allowance = (column_bytes.saturating_mul(ADJACENCY_SHARE) / 100).max(BUDGET_FLOOR);
-    let mut spent = held_bytes_except(&child, &[*section::FORWARD_LINK], &replacing)?;
-    let mut indexed = held_adjacency_bytes(&child, &replacing)?;
+    let mut spent = held_kind_bytes(&child, *section::FORWARD_LINK, &replacing)?;
+    let mut indexed = held_kind_bytes(&child, *section::ADJACENCY, &replacing)?;
     let mut report = Vec::with_capacity(edges.len());
     let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
     let mut adjacencies: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
@@ -1049,32 +1062,15 @@ fn refused(reader: &Reader, kind: [u8; 8], id: usize) -> Option<(u8, u64)> {
     Some((u8::try_from(held.flags).ok()?, held.refused()?))
 }
 
-/// What the table's sections of one kind cost, leaving out the ids this build is replacing.
-fn held_bytes_except(reader: &Reader, kinds: &[[u8; 8]], replacing: &[usize]) -> Result<u64> {
-    let mut total = 0;
-    for held in reader.table().sections() {
-        if !held.among(section::GRAPH_KINDS) || held.kind == *section::ADJACENCY {
-            continue;
-        }
-        let replaced = kinds.contains(&held.kind)
-            && replacing.iter().any(|&id| u64::try_from(id) == Ok(held.id));
-        if replaced || !held.usable(reader.table().generation()) {
-            continue;
-        }
-        let Ok(extents) = reader.extents(held) else { continue };
-        total += extents.iter().map(|extent| u64::from(extent.length)).sum::<u64>();
-    }
-    Ok(total)
-}
-
-/// The bytes the adjacencies of a table already hold, leaving out the columns about to be rebuilt.
+/// The bytes the sections of one kind a table already holds cost, leaving out the columns about to
+/// be rebuilt.
 ///
-/// Adjacencies are paid for out of their own share, so they are counted apart from the other
-/// graph sections and `held_bytes_except` leaves them out.
-fn held_adjacency_bytes(reader: &Reader, replacing: &[usize]) -> Result<u64> {
+/// Each of key maps, links and adjacencies is paid for out of its own share, so each counts only
+/// what it owns.
+fn held_kind_bytes(reader: &Reader, kind: [u8; 8], replacing: &[usize]) -> Result<u64> {
     let mut total = 0;
     for held in reader.table().sections() {
-        if held.kind != *section::ADJACENCY || !held.usable(reader.table().generation()) {
+        if held.kind != kind || !held.usable(reader.table().generation()) {
             continue;
         }
         if replacing.iter().any(|&id| u64::try_from(id) == Ok(held.id)) {
@@ -1790,6 +1786,28 @@ mod tests {
         let wrong = Edge { child_column: 1, ..edge() };
         assert!(stored_link(&child, &parent, &wrong).is_none(), "a different child column");
         assert!(stored_link_counts(&child, &parent, &wrong).is_none(), "a different child column");
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_link_does_not_count_against_the_key_maps_of_its_table() {
+        // `orders` is the case: a child of `customer` whose link to it is 3.4 MB, and a parent of
+        // `lineitem` whose key map is 4.7 MB stored in date order. Out of one share the link took
+        // the room the map needed, so each kind is counted against its own.
+        let foreign = (0..20_000_i64).map(|child| Some((child * 7) % 1000 + 1)).collect::<Vec<_>>();
+        let path = related("apart_kinds", 1000, &foreign);
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert!(report[0].built, "{:?}", report[0].note);
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let link = held_kind_bytes(&child, *section::FORWARD_LINK, &[]).expect("held");
+        assert!(link > 0, "the link is in the file");
+        assert_eq!(held_bytes(&child, &[]).expect("held"), 0, "and costs the key maps nothing");
+        // The adjacency built beside the link is its own kind again and counted on its own.
+        assert!(held_kind_bytes(&child, *section::ADJACENCY, &[]).expect("held") > 0);
+        assert_eq!(held_kind_bytes(&child, *section::FORWARD_LINK, &[0]).expect("held"), 0);
 
         fs::remove_file(&path).expect("clean up");
     }
