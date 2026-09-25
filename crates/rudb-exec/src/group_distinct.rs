@@ -629,53 +629,34 @@ fn count_groups(
     let split = piece.split;
     let parts = &counted[piece.parts.clone()];
     let reserving = stage::Timing::start(Stage::Reserve);
-    let input = parts.iter().map(|part| part.splits[split].len()).sum::<usize>();
+    let input = parts
+        .iter()
+        .map(|part| part.splits[split].len() + part.tallied[split].len())
+        .sum::<usize>();
     let ceiling = input.saturating_mul(2).max(SPLIT_SEED).next_power_of_two();
-    let mut capacity = SPLIT_SEED.min(ceiling);
+    let capacity = SPLIT_SEED.min(ceiling);
     let mut working = memory.reservation();
     working.grow(width(capacity * size_of::<u32>()))?;
-    let mut buckets = vec![EMPTY; capacity];
-    let mut mask = capacity - 1;
-    let mut groups: Vec<Grouped> = Vec::new();
-    let mut counts: Vec<i64> = Vec::new();
+    let mut table = Counts {
+        buckets: vec![EMPTY; capacity],
+        capacity,
+        ceiling,
+        groups: Vec::new(),
+        counts: Vec::new(),
+    };
     reserving.stop(0);
 
     let timing = stage::Timing::start(Stage::Count);
     for part in parts {
         for pair in &part.splits[split] {
-            let mut at = pair.hash() as usize & mask;
-            loop {
-                let slot = buckets[at];
-                if slot == EMPTY {
-                    buckets[at] = u32::try_from(groups.len()).map_err(|_| {
-                        Error::out_of_memory("a grouped distinct radix split is too large")
-                    })?;
-                    groups.push(*pair);
-                    counts.push(1);
-                    if groups.len().saturating_mul(2) > capacity && capacity < ceiling {
-                        capacity *= 2;
-                        mask = capacity - 1;
-                        working.grow(width(capacity * size_of::<u32>()))?;
-                        buckets = rehashed(capacity, &groups)?;
-                    }
-                    break;
-                }
-                let slot = slot as usize;
-                // One index into each vector rather than three and two. The comparison used to name
-                // `groups[slot]` once a field and the count named `counts[slot]` on both sides of
-                // its own assignment, and each of those is a bounds check and a load that the one
-                // before it already paid for. See [`Grouped`].
-                if groups[slot] == *pair {
-                    let count = &mut counts[slot];
-                    *count = count
-                        .checked_add(1)
-                        .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
-                    break;
-                }
-                at = (at + 1) & mask;
-            }
+            table.add(*pair, 1, &mut working)?;
+        }
+        // A tallied group stands for as many pairs as its partition counted.
+        for (pair, by) in &part.tallied[split] {
+            table.add(*pair, i64::from(*by), &mut working)?;
         }
     }
+    let Counts { buckets, groups, counts, .. } = table;
     let kept =
         width(groups.capacity() * size_of::<Grouped>() + counts.capacity() * size_of::<i64>());
     working.grow(kept)?;
@@ -692,6 +673,60 @@ fn count_groups(
         return Ok(Tallied::Part(Partial { split, groups, counts, held }));
     }
     emit(&groups, &counts, shape, bound, memory).map(Tallied::Whole)
+}
+
+/// The table [`count_groups`] counts a split's groups into.
+struct Counts {
+    buckets: Vec<u32>,
+    capacity: usize,
+    /// The size the input could need, past which the table is not grown.
+    ceiling: usize,
+    groups: Vec<Grouped>,
+    counts: Vec<i64>,
+}
+
+impl Counts {
+    /// Adds `by` pairs to `pair`'s group, opening it if this is the first of them.
+    ///
+    /// Always inlined, because it is the whole of the counting loop and it is called from two
+    /// places. As a closure it was left out of line, which cost four percent of the instructions
+    /// of `COUNT(DISTINCT UserID) GROUP BY SearchPhrase`.
+    #[inline(always)]
+    fn add(&mut self, pair: Grouped, by: i64, working: &mut Reservation) -> Result<()> {
+        let mask = self.capacity - 1;
+        let mut at = pair.hash() as usize & mask;
+        loop {
+            let slot = self.buckets[at];
+            if slot == EMPTY {
+                self.buckets[at] = u32::try_from(self.groups.len()).map_err(|_| {
+                    Error::out_of_memory("a grouped distinct radix split is too large")
+                })?;
+                self.groups.push(pair);
+                self.counts.push(by);
+                if self.groups.len().saturating_mul(2) > self.capacity
+                    && self.capacity < self.ceiling
+                {
+                    self.capacity *= 2;
+                    working.grow(width(self.capacity * size_of::<u32>()))?;
+                    self.buckets = rehashed(self.capacity, &self.groups)?;
+                }
+                return Ok(());
+            }
+            let slot = slot as usize;
+            // One index into each vector rather than three and two. The comparison used to name
+            // `groups[slot]` once a field and the count named `counts[slot]` on both sides of its
+            // own assignment, and each of those is a bounds check and a load that the one before
+            // it already paid for. See [`Grouped`].
+            if self.groups[slot] == pair {
+                let count = &mut self.counts[slot];
+                *count = count
+                    .checked_add(by)
+                    .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+                return Ok(());
+            }
+            at = (at + 1) & mask;
+        }
+    }
 }
 
 /// The best `bound` groups of a finished tally, as the rows they stand for.
@@ -752,7 +787,7 @@ fn sizes_of(counted: &[Counted], splits: usize) -> Vec<usize> {
     let mut sizes = vec![0_usize; splits];
     for part in counted {
         for (split, held) in part.splits.iter().enumerate().take(splits) {
-            sizes[split] += held.len();
+            sizes[split] += held.len() + part.tallied[split].len();
         }
     }
     sizes

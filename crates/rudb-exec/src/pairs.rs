@@ -502,9 +502,14 @@ pub(crate) fn together(threads: &Lease<'_>, degree: usize, work: &(dyn Fn() + Sy
 }
 
 /// What one pair partition found, split by group hash so the count can take one split each.
+///
+/// A group arrives either once per pair, in `splits`, or once with how many pairs it had, in
+/// `tallied`. See [`Tally`] for which.
 #[derive(Debug)]
 pub(crate) struct Counted {
     pub(crate) splits: Vec<Vec<Grouped>>,
+    /// Groups already counted by the partition, each with its number of distinct pairs.
+    pub(crate) tallied: Vec<Vec<(Grouped, u32)>>,
     /// What the splits cost, given back when the counting pass has read the last of them.
     pub(crate) held: Reservation,
 }
@@ -523,6 +528,111 @@ impl Grouped {
     #[inline]
     pub(crate) fn hash(self) -> u32 {
         group_hash(self.group, self.valid)
+    }
+}
+
+/// The groups of one partition's new pairs, counted as they are found while there are few of them.
+///
+/// Every distinct pair used to go into its split as a record of its own, and a pass after this one
+/// counted them. On `COUNT(DISTINCT UserID) GROUP BY RegionID` over the million row ClickBench file
+/// that is a million pushes into growing vectors and a million probes later, for about four
+/// thousand groups, and on six threads the pushes were a third of the deduplication and the count
+/// another tenth of the query. A partition whose pairs fall into few groups counts them here
+/// instead, in a table small enough to stay in cache, and hands on one entry a group.
+///
+/// That is the wrong trade when a group has about one pair, which is `GROUP BY SearchPhrase`,
+/// because then the table is as big as the pairs and every entry is counted twice. So the table
+/// gives up the first time it has to grow with fewer than [`TALLY_FOLD`] pairs a group behind it,
+/// or when it would pass [`TALLY_MOST`] slots, and the rest of the partition goes into the splits
+/// one pair at a time the way it always did.
+struct Tally {
+    buckets: Vec<u32>,
+    groups: Vec<Grouped>,
+    hashes: Vec<u32>,
+    counts: Vec<u32>,
+    /// Pairs counted so far, which is what the group count is weighed against.
+    pairs: usize,
+    open: bool,
+}
+
+/// The slots a [`Tally`] starts with.
+const TALLY_SEED: usize = 256;
+
+/// The most slots a [`Tally`] grows to, sixty four kilobytes of buckets, past which it stops.
+const TALLY_MOST: usize = 16_384;
+
+/// How many pairs a group needs on average for a [`Tally`] to be worth growing.
+const TALLY_FOLD: usize = 2;
+
+impl Tally {
+    fn new() -> Self {
+        Self {
+            buckets: vec![EMPTY; TALLY_SEED],
+            groups: Vec::new(),
+            hashes: Vec::new(),
+            counts: Vec::new(),
+            pairs: 0,
+            open: true,
+        }
+    }
+
+    /// Counts one pair for `group`, or says the table has given up and the pair is the caller's.
+    #[inline]
+    fn add(&mut self, group: Grouped, hash: u32) -> bool {
+        let mask = self.buckets.len() - 1;
+        let mut at = hash as usize & mask;
+        loop {
+            let slot = self.buckets[at];
+            if slot == EMPTY {
+                return self.open_group(at, group, hash);
+            }
+            let slot = slot as usize;
+            if self.groups[slot] == group {
+                // A partition holds fewer than `u32::MAX` rows, checked before this runs.
+                self.counts[slot] += 1;
+                self.pairs += 1;
+                return true;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Opens a group the table has not seen, growing the table or giving up when it is full.
+    #[cold]
+    #[inline(never)]
+    fn open_group(&mut self, at: usize, group: Grouped, hash: u32) -> bool {
+        if (self.groups.len() + 1) * 2 > self.buckets.len() {
+            let grown = self.buckets.len() * 2;
+            if grown > TALLY_MOST || self.groups.len() * TALLY_FOLD > self.pairs {
+                self.open = false;
+                return false;
+            }
+            self.buckets = vec![EMPTY; grown];
+            let mask = grown - 1;
+            for (slot, &held) in self.hashes.iter().enumerate() {
+                let mut at = held as usize & mask;
+                while self.buckets[at] != EMPTY {
+                    at = (at + 1) & mask;
+                }
+                self.buckets[at] = slot as u32;
+            }
+            return self.add(group, hash);
+        }
+        self.buckets[at] = self.groups.len() as u32;
+        self.groups.push(group);
+        self.hashes.push(hash);
+        self.counts.push(1);
+        self.pairs += 1;
+        true
+    }
+
+    /// Every group counted, each into the split its hash picks.
+    fn into_splits(self, splits: usize) -> Vec<Vec<(Grouped, u32)>> {
+        let mut out: Vec<Vec<(Grouped, u32)>> = vec![Vec::new(); splits];
+        for ((group, hash), count) in self.groups.into_iter().zip(self.hashes).zip(self.counts) {
+            out[split_of(hash, splits)].push((group, count));
+        }
+        out
     }
 }
 
@@ -593,9 +703,11 @@ pub(crate) fn distinct_pairs(
     // bytes a pair. The share is measured against the rows the partition holds rather than against
     // the pairs it will find, since the pairs are not counted yet, and a partition whose rows are
     // mostly duplicates of each other gives the difference back below.
-    let even = held_rows.div_ceil(splits);
-    let share = (even + even.isqrt() * 4).min(held_rows);
-    let mut parts: Vec<Vec<Grouped>> = (0..splits).map(|_| Vec::with_capacity(share)).collect();
+    //
+    // The splits are only asked for once the tally has given up, since until then nothing goes
+    // into them, and what is asked for then is a share of the rows still to come.
+    let mut parts: Vec<Vec<Grouped>> = vec![Vec::new(); splits];
+    let mut tally = Tally::new();
     reserving.stop(0);
 
     let timing = stage::Timing::start(Stage::Fold);
@@ -611,8 +723,17 @@ pub(crate) fn distinct_pairs(
                 if slot == EMPTY {
                     pair_buckets[at] = tag | (start + source) as u32;
                     let group_hash = group_hash(row.group, valid);
-                    let split = split_of(group_hash, splits);
-                    parts[split].push(Grouped { group: row.group, valid });
+                    let grouped = Grouped { group: row.group, valid };
+                    if !(tally.open && tally.add(grouped, group_hash)) {
+                        if parts[0].capacity() == 0 {
+                            let even = (held_rows - start - source).div_ceil(splits);
+                            let share = even + even.isqrt() * 4;
+                            for split in &mut parts {
+                                split.reserve(share);
+                            }
+                        }
+                        parts[split_of(group_hash, splits)].push(grouped);
+                    }
                     break;
                 }
                 if slot & tag_mask == tag {
@@ -648,12 +769,17 @@ pub(crate) fn distinct_pairs(
             split.shrink_to_fit();
         }
     }
+    let tallied = tally.into_splits(splits);
     let mut held = memory.reservation();
     held.grow(width(
-        parts.iter().map(|split| split.capacity() * size_of::<Grouped>()).sum::<usize>(),
+        parts.iter().map(|split| split.capacity() * size_of::<Grouped>()).sum::<usize>()
+            + tallied
+                .iter()
+                .map(|split| split.capacity() * size_of::<(Grouped, u32)>())
+                .sum::<usize>(),
     ))?;
     reserving.stop(0);
-    Ok(Counted { splits: parts, held })
+    Ok(Counted { splits: parts, tallied, held })
 }
 
 fn width(value: usize) -> u64 {
@@ -669,10 +795,20 @@ mod tests {
     use std::mem::size_of;
 
     use super::{
-        CHUNK, COMPACT_FROM, Grouped, Held, PARTITIONS, ROWS_PER_PARTITION, Record, Repeat, Run,
-        distinct_pairs, folded, group_hash, group_seed, merged, mix, scatter, scatter_seeded,
-        shift, spread, used,
+        CHUNK, COMPACT_FROM, Counted, Grouped, Held, PARTITIONS, ROWS_PER_PARTITION, Record,
+        Repeat, Run, distinct_pairs, folded, group_hash, group_seed, merged, mix, scatter,
+        scatter_seeded, shift, spread, used,
     };
+
+    /// Every pair a split was handed, with a tallied group standing in for as many pairs as it
+    /// counted.
+    fn pairs_of(counted: &Counted, split: usize) -> Vec<Grouped> {
+        let mut out = counted.splits[split].clone();
+        for &(group, count) in &counted.tallied[split] {
+            out.extend(std::iter::repeat_n(group, count as usize));
+        }
+        out
+    }
 
     /// The fan out the finishing pass picks, and that what it drops is merged rather than lost.
     ///
@@ -729,7 +865,7 @@ mod tests {
         let mut partition = Held { runs: vec![left, right] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("colliding pairs");
-        assert_eq!(counted.splits[0].len(), 3);
+        assert_eq!(pairs_of(&counted, 0).len(), 3);
     }
 
     /// A run that fills up with repeats keeps one row per pair, keeps its capacity, and keeps the
@@ -748,8 +884,8 @@ mod tests {
         let mut partition = Held { runs: vec![run] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("a pair partition");
-        assert_eq!(counted.splits[0].len(), 200);
-        let nulls = counted.splits[0].iter().filter(|pair| !pair.valid).count();
+        assert_eq!(pairs_of(&counted, 0).len(), 200);
+        let nulls = pairs_of(&counted, 0).iter().filter(|pair| !pair.valid).count();
         assert_eq!(nulls, 100);
     }
 
@@ -768,7 +904,7 @@ mod tests {
         let mut partition = Held { runs: vec![run] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("a pair partition");
-        assert_eq!(counted.splits[0].len(), users);
+        assert_eq!(pairs_of(&counted, 0).len(), users);
     }
 
     /// A run that holds more pairs than one chunk keeps every one of them through its compactions,
@@ -789,7 +925,30 @@ mod tests {
         let mut partition = Held { runs: vec![run] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("a pair partition");
-        assert_eq!(counted.splits[0].len(), users * 2);
+        assert_eq!(pairs_of(&counted, 0).len(), users * 2);
+    }
+
+    /// A partition with few groups counts them as it goes, and one whose groups do not repeat stops
+    /// counting and hands its pairs on one at a time, and both come to the same pairs.
+    #[test]
+    fn a_partition_tallies_its_groups_only_while_they_repeat() {
+        let partition = |groups: i64| {
+            let mut run = Run::default();
+            for user in 0..20_000_i64 {
+                let group = (user % groups) as i32;
+                let pair_hash = folded(spread(mix(group_seed(group, true), user as u64)));
+                run.push(Record { user, group, pair_hash }, true);
+            }
+            let mut held = Held { runs: vec![run] };
+            distinct_pairs(&mut held, 4, &rudb_common::Memory::unlimited()).expect("a partition")
+        };
+        let few = partition(100);
+        assert_eq!((0..4).map(|split| pairs_of(&few, split).len()).sum::<usize>(), 20_000);
+        assert_eq!(few.tallied.iter().map(Vec::len).sum::<usize>(), 100);
+        assert!(few.splits.iter().all(Vec::is_empty));
+        let many = partition(20_000);
+        assert_eq!((0..4).map(|split| pairs_of(&many, split).len()).sum::<usize>(), 20_000);
+        assert!(many.tallied.iter().map(Vec::len).sum::<usize>() < 256, "it gave up early");
     }
 
     /// The null group and the group whose key really is zero are two groups, not one.
@@ -801,7 +960,7 @@ mod tests {
         let mut partition = Held { runs: vec![run] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("a pair partition");
-        let mut found: Vec<bool> = counted.splits[0].iter().map(|pair| pair.valid).collect();
+        let mut found: Vec<bool> = pairs_of(&counted, 0).iter().map(|pair| pair.valid).collect();
         found.sort_unstable();
         assert_eq!(found, [false, true]);
     }
