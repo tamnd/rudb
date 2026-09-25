@@ -80,6 +80,7 @@ impl Pass for ConsistentExtremes {
         if !context.allows(Rule::Consistent) {
             return Ok(());
         }
+        crate::eliminate::inner_joins(plan, context);
         let mut changed = false;
         let root = plan.root();
         let mut next = walk::fresh_index(plan);

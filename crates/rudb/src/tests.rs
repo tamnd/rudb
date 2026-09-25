@@ -7260,14 +7260,14 @@ fn rudb_links_says_what_a_structure_it_decided_against_would_have_cost() {
         ]],
         "a structure that is not there has no form and still has a size"
     );
-    // The size is the point of the row: somebody reading it is deciding whether the structure is
-    // worth having, and a null would leave them building it to find out. It is the payload the
-    // build actually encoded and not an estimate of one, which for eight thousand unsorted keys is
-    // a few bytes each.
+    // The size is the payload the build actually encoded and not an estimate of one. These keys
+    // fit a range of four thousand, so the build takes the permuted form, which stops at the first
+    // key it has seen before and keeps the empty map it had. That is the header and nothing else,
+    // and it is the honest size: a key that repeats is refused before anything is paid for.
     let Value::BigInt(bytes) = rows(&db, "SELECT key_map_bytes FROM rudb_links()")[0][0] else {
         panic!("a size");
     };
-    assert!(bytes > 8000, "eight thousand keys do not encode in {bytes} bytes");
+    assert!(bytes < 100, "a map abandoned at the first repeat is {bytes} bytes");
 
     // And the join answers the same question it would have with the map, which is section 3.1.
     assert_eq!(
@@ -8384,10 +8384,12 @@ fn a_join_a_certificate_says_changes_nothing_is_deleted_and_the_row_counts_agree
 
     // And the outer join over the total relationship is an inner join, which is a cheaper operator
     // answering the same question. The parent's column is read here, and read for its value rather
-    // than counted, so the join stays and only its kind changes.
+    // than counted, so the join is not deleted. Being inner, it is a MIN or MAX over an acyclic
+    // inner join, which the semijoin reduction answers without running the join at all.
     let outer = "SELECT max(c_name) FROM orders LEFT JOIN customer ON o_custkey = c_custkey";
     let plan = explained(outer);
-    assert!(plan.contains("Join INNER"), "nothing was padded, so nothing was preserved:\n{plan}");
+    assert!(!plan.contains("Join LEFT"), "nothing was padded, so nothing was preserved:\n{plan}");
+    assert!(plan.contains("Consistent"), "an inner join under a MAX is reduced:\n{plan}");
     assert_eq!(rows(&db, outer), vec![vec![Value::Varchar("c999".into())]]);
     // The one that is not total keeps its left join, and the difference in the answer is the row
     // the left join pads and the inner join would have dropped.

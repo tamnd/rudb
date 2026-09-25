@@ -104,6 +104,33 @@ pub(crate) fn sweep(plan: &mut Plan, context: &Context) {
     }
 }
 
+/// Only the outer becomes inner rewrite, over every join, for [`crate::consistent`].
+///
+/// That pass runs before this one and takes regions of inner joins, so a left join it saw first and
+/// this pass turned inner afterwards was one it declined, and the next run of the sequence took it.
+/// That is a plan one run away from settling. Changing the kind costs one field and needs nothing
+/// above the join to hold, so it is safe to do this early, and the sweep here finds nothing left to
+/// do when it gets there.
+pub(crate) fn inner_joins(plan: &mut Plan, context: &Context) {
+    if context.links().is_empty() || !context.allows(Rule::JoinElimination) {
+        return;
+    }
+    for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        let Node::Join { left, right, kind: JoinKind::Left, conditions, .. } = *plan.node(at)
+        else {
+            continue;
+        };
+        let Some(keys) = equated_pair(plan, conditions) else {
+            continue;
+        };
+        if verified(plan, left, right, keys, context) {
+            if let Node::Join { kind, .. } = plan.node_mut(at) {
+                *kind = JoinKind::Inner;
+            }
+        }
+    }
+}
+
 /// One join, deleted or narrowed if a certificate says the plan reads the same either way.
 fn rewrite(plan: &mut Plan, at: NodeRef, consumers: &[Option<NodeRef>], context: &Context) {
     let Node::Join { left, right, kind, conditions, .. } = *plan.node(at) else {
