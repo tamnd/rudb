@@ -513,7 +513,7 @@ fn packed_kept(
 
 /// One end of a range a filter asks for: the comparison that sets it, the literal it compares
 /// against, and the column that literal was built into early, if one was.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Bound<'a> {
     /// `>` or `>=` for the low end, `<` or `<=` for the high one.
     pub op: Comparison,
@@ -531,8 +531,8 @@ pub struct Bound<'a> {
 /// for a selection of half the chunk that the second one then walks again. Together they keep a
 /// seventh of it. A value is in the range when its distance above the low end, read unsigned, is at
 /// most the width of the range, which is one subtraction and one compare a row and a loop the
-/// compiler does in vector registers. TPC-H q6 asks this twice and q4, q5, q10, q12, q14, q15 and
-/// q20 ask it once. See `spec/perf/65-one-range-one-pass.md`.
+/// compiler does in vector registers. TPC-H q6 asks this twice and q4, q5, q10, q12, q14 and q15
+/// ask it once. See `spec/perf/65-one-range-one-pass.md`.
 ///
 /// `None` for anything this has no loop for, a column with nulls, a form other than flat or bit
 /// packed, a type wider than 64 bits, a literal that is null or of another type, so that the caller
