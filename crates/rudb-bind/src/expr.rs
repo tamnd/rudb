@@ -17,7 +17,7 @@ use rudb_common::{
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, NONE};
-use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
+use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Plan};
 
 use crate::binder::{Binder, PendingSubquery, WindowCall};
 use crate::fold;
@@ -82,6 +82,9 @@ impl Binder<'_> {
             )
         {
             return Err(Error::binder("subqueries in lambda expressions are not supported"));
+        }
+        if self.trying && matches!(written, ast::Expr::Subquery { .. } | ast::Expr::Exists { .. }) {
+            return Err(Error::binder("TRY can not be used in combination with a scalar subquery"));
         }
         match written {
             ast::Expr::Star { .. } => {
@@ -608,6 +611,14 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "count") && arguments.is_empty() {
             return self.bind_aggregate(ast, "count_star", &[], false, filter, scope);
         }
+        // `TRY(1, 2)` is not the grammar's `TryExpression`, so it arrives as a call, and the pin's
+        // parser is what refuses it there.
+        if rudb_catalog::same_name(&written, "try") {
+            let [only] = arguments[..] else {
+                return Err(Error::parser("Wrong number of arguments provided to TRY expression"));
+            };
+            return self.bind_try(ast, only, scope);
+        }
         if kind_of(&written) == Some(FunctionKind::Aggregate) {
             return self.bind_aggregate(ast, &written, &arguments, distinct, filter, scope);
         }
@@ -643,6 +654,9 @@ impl Binder<'_> {
         }
         if let Some(expanded) = self.list_macro(&written, &bound)? {
             return Ok(expanded);
+        }
+        if rudb_catalog::same_name(&written, "if") {
+            return self.bind_if(&bound);
         }
         if let Some(aggregated) = self.list_aggregate(&written, &bound)? {
             return Ok(aggregated);
@@ -785,6 +799,23 @@ impl Binder<'_> {
         Ok(self.add_expr(Expr::Case { arms, otherwise: fallback }, result))
     }
 
+    /// `if(a, b, c)`, which the pin has as the macro `CASE WHEN (a) THEN (b) ELSE c END`.
+    fn bind_if(&mut self, bound: &[ExprRef]) -> Result<ExprRef> {
+        let &[condition, then, otherwise] = bound else {
+            return Err(Error::binder(
+                "Macro \"if\"() does not support the supplied arguments. You might need to add \
+                 explicit type casts.\nCandidate macros:\n\t\"if\"(a, b, c)",
+            ));
+        };
+        let when = self.as_boolean(condition, "CASE")?;
+        let result = meet(&LogicalType::Null, self.plan().expr_type(then))?;
+        let result = meet(&result, self.plan().expr_type(otherwise))?;
+        let then = self.checked_cast_to(then, &result, false)?;
+        let otherwise = self.checked_cast_to(otherwise, &result, false)?;
+        let arms = self.plan_mut().add_arms(&[Arm { when, then }]);
+        Ok(self.add_expr(Expr::Case { arms, otherwise: Some(otherwise) }, result))
+    }
+
     fn bind_between(
         &mut self,
         ast: &Ast,
@@ -913,6 +944,28 @@ impl Binder<'_> {
     }
 
     /// Resolves a scalar call, casts the arguments to what the overload wants, and records it.
+    /// `TRY(x)`, which answers null on a row where `x` raises a conversion, range or input error.
+    ///
+    /// It stays a call to `try` around its one argument, of the argument's type, and it is the
+    /// executor and the folding that know what that means. The pin refuses an aggregate, a window
+    /// function or a subquery inside it, since none of those can be run again for one row, and a
+    /// volatile call, since running it again would not give the row the answer it first got.
+    fn bind_try(&mut self, ast: &Ast, operand: ast::ExprRef, scope: &Scope) -> Result<ExprRef> {
+        let outer = std::mem::replace(&mut self.trying, true);
+        let bound = self.bind_expr(ast, operand, scope);
+        self.trying = outer;
+        let bound = bound?;
+        if volatile(self.plan(), bound) {
+            return Err(Error::binder(
+                "TRY can not be used in combination with a volatile function",
+            ));
+        }
+        let ty = self.plan().expr_type(bound).clone();
+        let args = self.plan_mut().add_expr_list(&[bound]);
+        let name = self.plan_mut().intern("try");
+        Ok(self.add_expr(Expr::Function { name, args }, ty))
+    }
+
     pub(crate) fn call(&mut self, name: &str, args: Vec<ExprRef>) -> Result<ExprRef> {
         self.call_recorded_as(name, None, args)
     }
@@ -1660,6 +1713,8 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             // come back as a column called `COALESCE(NULL, 1)`.
             let name = if rudb_catalog::same_name(written, "coalesce") {
                 "COALESCE".to_string()
+            } else if rudb_catalog::same_name(written, "try") {
+                "TRY".to_string()
             } else {
                 quoted(&written.to_ascii_lowercase())
             };
@@ -2110,6 +2165,26 @@ const STRICT_MATH: &[&str] = &[
     "sqrt", "ln", "log", "log10", "log2", "sin", "cos", "tan", "cot", "asin", "acos", "atanh",
     "gamma", "lgamma", "pow",
 ];
+
+/// Whether a bound expression calls anything in [`fold::VOLATILE`], anywhere in it.
+fn volatile(plan: &Plan, expr: ExprRef) -> bool {
+    let within = |slice| plan.expr_list(slice).iter().any(|&child| volatile(plan, child));
+    match *plan.expr(expr) {
+        Expr::Function { name, args } => {
+            fold::VOLATILE.contains(&plan.string(name)) || within(args)
+        }
+        Expr::Cast { input, .. } => volatile(plan, input),
+        Expr::Compare { left, right, .. } => volatile(plan, left) || volatile(plan, right),
+        Expr::Conjunction { children, .. } => within(children),
+        Expr::Case { arms, otherwise } => {
+            plan.arm_list(arms)
+                .iter()
+                .any(|arm| volatile(plan, arm.when) || volatile(plan, arm.then))
+                || otherwise.is_some_and(|otherwise| volatile(plan, otherwise))
+        }
+        _ => false,
+    }
+}
 
 #[cfg(test)]
 mod tests {

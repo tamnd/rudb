@@ -1028,7 +1028,6 @@ fn a_function_that_is_not_implemented_does_not_answer_its_own_argument() {
     let message = failure(&db, "SELECT unnest([1], recursive := true)");
     assert!(message.contains("not supported yet"), "{message}");
     assert!(message.starts_with("recursive := true is not supported yet"), "{message}");
-    assert!(failure(&db, "SELECT length(try('a'))").contains("not supported yet"));
 }
 
 /// The four string functions with a grammar rule of their own, end to end. Per #314.
@@ -2357,6 +2356,80 @@ fn the_math_functions_answer_with_the_pins_types() {
         .execute("SELECT round(x, n) FROM (VALUES (1.25, 1)) t(x, n)")
         .expect_err("the precision is a column");
     assert!(error.message().contains("must be a constant expression"), "{error}");
+}
+
+#[test]
+fn a_seeded_random_repeats_the_pins_numbers_and_every_row_draws_its_own() {
+    let db = database();
+    // The only test that seeds, since the generator belongs to the process. The numbers are the
+    // pin's after `SELECT setseed(0.5)`.
+    let seeded = |sql: &str| {
+        assert_eq!(rows(&db, "SELECT setseed(0.5)"), vec![vec![Value::Null]]);
+        rows(&db, sql)
+    };
+    assert_eq!(
+        seeded("SELECT random() FROM range(3)"),
+        [0.851_113_188_628_732_5, 0.564_860_018_730_782_4, 0.064_130_513_197_432_43]
+            .map(|value| vec![Value::Double(value)])
+    );
+    assert_eq!(
+        seeded("SELECT random(), random()"),
+        [[Value::Double(0.851_113_188_628_732_5), Value::Double(0.002_978_387_269_385_594)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(DISTINCT random()), min(random()) >= 0, max(random()) < 1 FROM range(5000)"
+        ),
+        [[Value::BigInt(5000), Value::Boolean(true), Value::Boolean(true)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT typeof(random()), typeof(setseed(0.1)), setseed(NULL)"),
+        [[Value::Varchar("DOUBLE".into()), Value::Varchar("\"NULL\"".into()), Value::Null]]
+    );
+    let error = db.query("SELECT setseed(1.5)").unwrap_err().to_string();
+    assert!(
+        error.contains("SETSEED accepts seed values between -1.0 and 1.0, inclusive"),
+        "{error}"
+    );
+}
+
+/// `TRY` answers NULL for the rows that fail a cast or go out of range and keeps the rest, refuses
+/// what the pin refuses, and `if` is the CASE the pin's macro expands to.
+#[test]
+fn try_nulls_the_rows_that_fail_and_if_is_a_case() {
+    let db = database();
+    assert_eq!(
+        rows(&db, "SELECT TRY(CAST(x AS INTEGER)) FROM (VALUES ('1'), ('two'), ('3')) t(x)"),
+        [Value::Integer(1), Value::Null, Value::Integer(3)].map(|value| vec![value])
+    );
+    assert_eq!(
+        rows(&db, "SELECT TRY(CAST(300 AS TINYINT)), TRY(CAST('x' AS INTEGER)), TRY(1 + 1)"),
+        [[Value::Null, Value::Null, Value::Integer(2)]]
+    );
+    for (sql, message) in [
+        ("SELECT TRY((SELECT 1))", "TRY can not be used in combination with a scalar subquery"),
+        ("SELECT TRY(random())", "TRY can not be used in combination with a volatile function"),
+        ("SELECT TRY(sum(1))", "aggregates are not allowed inside the TRY expression"),
+        ("SELECT TRY(row_number() OVER ())", "window functions are not allowed in try"),
+        ("SELECT TRY(1, 2)", "Wrong number of arguments provided to TRY expression"),
+    ] {
+        let error = db.query(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT if(1 < 2, 'yes', 'no'), if(NULL, 1, 2.5)::VARCHAR, typeof(if(true, 1, 2.5))"
+        ),
+        [[
+            Value::Varchar("yes".into()),
+            Value::Varchar("2.5".into()),
+            Value::Varchar("DECIMAL(11,1)".into())
+        ]]
+    );
+    let error = db.query("SELECT if(true, 1)").unwrap_err().to_string();
+    assert!(error.contains("Macro \"if\"() does not support the supplied arguments"), "{error}");
 }
 
 /// The bitwise operators, `xor`, `bit_count`, `binom` and the operator spellings of `pow` and

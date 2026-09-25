@@ -34,7 +34,7 @@
 //! count, and at 1024 rows the intermediate vectors are eight kilobytes and stay in L1.
 
 use rudb_common::{
-    Error, LogicalType, PhysicalType, Result, Session, SessionTimeZone, Span, Value,
+    Error, ErrorCode, LogicalType, PhysicalType, Result, Session, SessionTimeZone, Span, Value,
 };
 use rudb_kernels::{
     Comparison, Connective, Found, Held, Lookup, Members, Recipe, cast_in_time_zone, combine,
@@ -196,6 +196,12 @@ enum Step {
         otherwise: Option<Prepared>,
         /// How to answer it as codes, for the shape that can be. Absent means read the values.
         blend: Option<Blend>,
+    },
+    /// `TRY(x)`, whose operand is a prepared expression of its own because it may have to be run
+    /// again one row at a time.
+    Try {
+        /// The operand.
+        inner: Box<Prepared>,
     },
     /// A tree of decimal arithmetic over columns and literals, run as one loop when the columns'
     /// ranges prove it cannot overflow.
@@ -393,7 +399,11 @@ impl Prepared {
         match &self.steps[index] {
             // A case's branches are arrays of their own and read nothing out of this one, and a
             // fused tree reads its columns straight out of the chunk.
-            Step::Column(_) | Step::Constant(_) | Step::Case { .. } | Step::Fused { .. } => {}
+            Step::Column(_)
+            | Step::Constant(_)
+            | Step::Case { .. }
+            | Step::Fused { .. }
+            | Step::Try { .. } => {}
             Step::Cast { input, .. } | Step::InSet { input, .. } => visit(*input),
             Step::Lambda { inputs, .. } => inputs.iter().for_each(|&input| visit(input)),
             Step::Compare { left, right, .. } => {
@@ -935,6 +945,8 @@ impl Prepared {
             // not look inside. Charging for the arms alone understates it and says the right thing
             // about the order, which is that a `CASE` is not what you want in front.
             Step::Case { arms, .. } => 4.0 * arms.len() as f64,
+            // The operand once, which is what it costs on every chunk that raises nothing.
+            Step::Try { inner } => (0..inner.steps.len()).map(|step| inner.weight(step)).sum(),
             // A run of the body per element, which is several a row, and a list to take apart and
             // put back together around it.
             Step::Lambda { .. } => 16.0,
@@ -1086,6 +1098,10 @@ impl Prepared {
             }
             Step::Case { arms, otherwise, blend } => {
                 Some(self.case(chunk, arms, otherwise.as_ref(), blend.as_ref(), ty)?)
+            }
+            Step::Try { inner } => {
+                let mut scratch = inner.scratch();
+                Some(attempt(chunk, ty, |rows| inner.evaluate_one(rows, &mut scratch).cloned())?)
             }
             Step::Fused { fused, fallback } => Some(match fused.run(chunk) {
                 Some(answer) => answer,
@@ -1349,6 +1365,12 @@ impl Prepared {
                 return Err(Error::internal(
                     "a lambda was evaluated outside the function that takes it",
                 ));
+            }
+            Expr::Function { name, args } if plan.string(name) == "try" => {
+                let [only] = plan.expr_list(args)[..] else {
+                    return Err(Error::internal("a TRY without exactly one operand"));
+                };
+                Step::Try { inner: Box::new(Self::one(plan, only, schema)?) }
             }
             Expr::Function { name, args } => {
                 let (start, len) = self.push_list(plan, plan.expr_list(args), schema)?;
@@ -1715,6 +1737,39 @@ fn named(prepared: &Prepared, literals: &mut Vec<(String, Lookup)>) -> Option<Br
 /// and picking afterwards. `CASE WHEN x <> 0 THEN 1 // x ELSE 0 END` divides by zero on the rows the
 /// arm does not apply to if the arm is evaluated for them, and a `CASE` that raises on a row it was
 /// written to exclude is the classic wrong answer this shape prevents.
+/// `TRY(x)` over a chunk, where `run` evaluates `x` over whatever chunk it is given.
+///
+/// The whole chunk first, and only if that raises one of the errors `TRY` catches is it run again a
+/// row at a time with a null for each row that raises, which is the pin's order. A chunk that
+/// raises nothing pays for nothing, and any other error goes out as it came in.
+pub(crate) fn attempt(
+    chunk: &Chunk,
+    ty: &LogicalType,
+    mut run: impl FnMut(&Chunk) -> Result<Vector>,
+) -> Result<Vector> {
+    match run(chunk) {
+        Err(error) if caught(&error) => {}
+        answer => return answer,
+    }
+    let mut values = Vec::with_capacity(chunk.len());
+    // row at a time: this is the path for a chunk in which some row raised, and finding which one
+    // is the whole of what it does.
+    for row in 0..chunk.len() {
+        values.push(match run(&narrow(chunk, &[row])?) {
+            Ok(one) => one.try_value_at(0)?,
+            Err(error) if caught(&error) => Value::Null,
+            Err(error) => return Err(error),
+        });
+    }
+    Vector::from_values(ty.clone(), &values)
+}
+
+/// Whether `TRY` answers null for this error rather than passing it on, which is the pin's three
+/// kinds of error a value can cause. The binder's folding has the same list.
+fn caught(error: &Error) -> bool {
+    matches!(error.code(), ErrorCode::Conversion | ErrorCode::OutOfRange | ErrorCode::InvalidInput)
+}
+
 pub(crate) fn narrow(chunk: &Chunk, rows: &[usize]) -> Result<Chunk> {
     let mut selection = Selection::with_capacity(rows.len());
     for &row in rows {

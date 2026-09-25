@@ -768,6 +768,9 @@ fn operator(ast: &Ast, name: Slice, written: &str) -> String {
     if alone && (one.eq_ignore_ascii_case("coalesce") || one.eq_ignore_ascii_case("ifnull")) {
         return "COALESCE".to_string();
     }
+    if alone && one.eq_ignore_ascii_case("try") {
+        return "TRY".to_string();
+    }
     written.to_string()
 }
 

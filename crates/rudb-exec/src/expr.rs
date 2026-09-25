@@ -25,7 +25,7 @@ use rudb_kernels::{cast_in_time_zone, combine, compare, is_true};
 use rudb_plan::{Expr, ExprRef, Plan};
 use rudb_vector::{Chunk, Vector};
 
-use crate::prepared::{comparison, connective, narrow};
+use crate::prepared::{attempt, comparison, connective, narrow};
 use crate::schema::Schema;
 use crate::written::written;
 
@@ -95,6 +95,12 @@ pub(crate) fn evaluate_in_time_zone(
             combine(connective(op), &children)
         }
         Expr::Function { name, args } => {
+            if let ("try", [only]) = (plan.string(name), plan.expr_list(args)) {
+                let only = *only;
+                return attempt(chunk, &ty, |rows| {
+                    evaluate_in_time_zone(plan, only, schema, rows, time_zone)
+                });
+            }
             if let Some((lambda, inputs)) = crate::lambda::lambda_call(plan, args) {
                 let runner =
                     crate::lambda::Lambda::new(plan, plan.string(name), lambda, &inputs, schema)?;
