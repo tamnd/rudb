@@ -10859,3 +10859,60 @@ fn unnest_makes_a_row_per_element_the_way_the_pin_does() {
         "UNNEST requires a single list or array as input"
     );
 }
+
+#[test]
+fn unnest_of_a_struct_is_a_column_per_field_the_way_the_pin_does() {
+    let db = Database::new();
+    db.execute(
+        "CREATE TABLE s AS SELECT i % 2 AS k, {'n': i, 'm': i * 10} AS r FROM range(4) t(i)",
+    )
+    .unwrap();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let names = |sql: &str| db.query(sql).unwrap().names().to_vec();
+    assert_eq!(text("SELECT unnest({'a': 1, 'b': 'x'}), 5"), "1,x,5");
+    assert_eq!(names("SELECT unnest(r) AS z FROM s"), ["n", "m"]);
+    assert_eq!(text("SELECT unnest(r) FROM s ORDER BY 1"), "0,0;1,10;2,20;3,30");
+    assert_eq!(text("SELECT unnest(NULL::STRUCT(a INT, b INT))"), "NULL,NULL");
+    assert_eq!(text("SELECT unnest([{'a': 1}, NULL], recursive := true)"), "1;NULL");
+    assert_eq!(
+        text("SELECT unnest([{'a': 1}, {'a': 2}], recursive := true), unnest([7])"),
+        "1,7;2,NULL"
+    );
+    assert_eq!(text("SELECT unnest({'a': 1}), unnest([1, 2])"), "1,1;1,2");
+    assert_eq!(text("SELECT unnest([{'a': 1}])"), "{'a': 1}");
+    assert_eq!(text("SELECT unnest([[{'a': 1}]], max_depth := 3)"), "1");
+    assert_eq!(text("SELECT k, unnest({'s': sum(r.n)}) FROM s GROUP BY k ORDER BY k"), "0,2;1,4");
+    assert_eq!(
+        text("SELECT unnest(list(r), recursive := true) FROM s ORDER BY 1"),
+        "0,0;1,10;2,20;3,30"
+    );
+    assert_eq!(text("SELECT unnest({'a': [1, 2]}, recursive := true)"), "[1, 2]");
+    assert_eq!(names("SELECT unnest({'a': {'x': 1}, 'b': 2}, recursive := true)"), ["x", "b"]);
+    assert_eq!(names("SELECT unnest({'a': {'x': 1}, 'b': 2})"), ["a", "b"]);
+    assert_eq!(names("SELECT unnest({'a': {'x': 1}, 'b': 2}, max_depth := 2)"), ["x", "b"]);
+    assert_eq!(
+        names(
+            "SELECT unnest({'a': {'x': 1, 'y': {'z': 2}}, 'b': 2}, recursive := true, \
+             keep_parent_names := true)"
+        ),
+        ["a.x", "a.y.z", "b"]
+    );
+    assert_eq!(
+        names("SELECT unnest(row(1, row(2, 3)), recursive := true, keep_parent_names := true)"),
+        ["element1", "element1", "element2"]
+    );
+    assert_eq!(
+        failure(&db, "SELECT unnest({'a': 1}) + 1"),
+        "UNNEST() on a struct column can only be applied as the root element of a SELECT expression"
+    );
+    assert_eq!(
+        failure(&db, "SELECT {'': 1}"),
+        "Need named argument for struct pack, e.g. STRUCT_PACK(a := b)"
+    );
+}

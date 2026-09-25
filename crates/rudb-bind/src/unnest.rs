@@ -14,8 +14,14 @@
 //! why `unnest([[1, 2], [3]], recursive := true), unnest([10, 20])` pairs 3 with 10 and then null
 //! with 20, rather than making its rows before the other list has made any.
 //!
-//! A struct is the one argument the pin takes that this does not yet. It is turned down rather than
-//! guessed at.
+//! A struct is taken apart into columns rather than rows, one per field, and only where the call is
+//! the whole of a select target, which is the one place a single expression can stand for several
+//! columns. The depth a call is allowed counts the struct levels after the list levels, so
+//! `recursive := true` over a list of structs makes a row per element and a column per field, and
+//! goes on into a struct inside a struct but not into a list inside one. A struct level makes no
+//! rows, so a call that takes apart only a struct is a `struct_extract` per field and no operator at
+//! all. `keep_parent_names := true` names a field inside a field by the path to it, `a.x`, and the
+//! fields of the struct the call was given by their own names.
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_parse::{Ast, ast};
@@ -24,6 +30,16 @@ use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
 use crate::binder::Binder;
 use crate::fold;
 use crate::scope::Scope;
+use crate::structs::STRUCT_EXTRACT;
+
+/// A struct a root `unnest` left to be taken apart into columns by the target it is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnnestStruct {
+    /// How many levels of struct to take apart.
+    pub(crate) depth: usize,
+    /// Whether a field inside a field is named by the path to it.
+    pub(crate) keep_parent_names: bool,
+}
 
 /// One `unnest` call a select block wrote, waiting to be planned under the block's projection.
 #[derive(Debug, Clone)]
@@ -89,7 +105,9 @@ impl Binder<'_> {
                  [true/false], max_depth := # or keep_parent_names := [true/false]",
             ));
         };
+        let root = std::mem::take(&mut self.unnest_root);
         let mut recursive = false;
+        let mut keep_parent_names = false;
         let mut max_depth = None;
         for target in ast.named_args(call).to_vec() {
             let name = ast.string(target.alias).to_ascii_lowercase();
@@ -120,6 +138,7 @@ impl Binder<'_> {
             };
             match (name.as_str(), value) {
                 ("recursive", Value::Boolean(on)) => recursive = on,
+                ("keep_parent_names", Value::Boolean(on)) => keep_parent_names = on,
                 ("max_depth", Value::BigInt(0)) => {
                     return Err(Error::binder("UNNEST cannot have a max depth of 0"));
                 }
@@ -134,31 +153,51 @@ impl Binder<'_> {
         let outer = std::mem::replace(&mut self.in_unnest, true);
         let bound = self.bind_expr(ast, *arg, scope);
         self.in_unnest = outer;
-        let bound = self.over_aggregate(bound?, scope)?;
+        let bound = bound?;
         let ty = self.plan().expr_type(bound).clone();
-        let (arg, depth) = match &ty {
-            LogicalType::List(_) => (bound, 1),
+        if !matches!(
+            ty,
+            LogicalType::List(_)
+                | LogicalType::Array(..)
+                | LogicalType::Struct(_)
+                | LogicalType::Null
+        ) {
+            return Err(Error::binder(format!(
+                "UNNEST() can only be applied to lists, structs and NULL, not {ty}"
+            )));
+        }
+        // The depth the call is allowed, spent on the list levels first and then on the struct
+        // levels under them.
+        let allowed = match max_depth {
+            Some(most) => most,
+            None if recursive => usize::MAX,
+            None => 1,
+        };
+        let lists = allowed.min(nesting(&ty));
+        let produced = element_at(&ty, lists);
+        let structs = allowed - lists;
+        if structs > 0 && matches!(produced, LogicalType::Struct(_)) {
+            if !root {
+                return Err(Error::binder(
+                    "UNNEST() on a struct column can only be applied as the root element of a \
+                     SELECT expression",
+                ));
+            }
+            self.unnest_struct = Some(UnnestStruct { depth: structs, keep_parent_names });
+        }
+        if lists == 0 && !matches!(ty, LogicalType::Null) {
+            // Only a struct, which makes no rows, so the call is the struct itself for the target
+            // to take apart.
+            return Ok(bound);
+        }
+        let bound = self.over_aggregate(bound, scope)?;
+        let arg = match &ty {
             LogicalType::Array(inner, _) => {
-                let list = LogicalType::List(inner.clone());
-                (self.checked_cast_to(bound, &list, false)?, 1)
+                self.checked_cast_to(bound, &LogicalType::List(inner.clone()), false)?
             }
-            LogicalType::Null => (bound, 1),
-            LogicalType::Struct(_) => {
-                return Err(Error::not_implemented("UNNEST of a STRUCT is not supported yet"));
-            }
-            other => {
-                return Err(Error::binder(format!(
-                    "UNNEST() can only be applied to lists, structs and NULL, not {other}"
-                )));
-            }
+            _ => bound,
         };
-        let depth = if let Some(most) = max_depth {
-            most.min(nesting(&ty)).max(1)
-        } else if recursive {
-            nesting(&ty).max(1)
-        } else {
-            depth
-        };
+        let depth = lists.max(1);
         let index = match self.unnest_index {
             Some(index) => index,
             None => {
@@ -169,9 +208,49 @@ impl Binder<'_> {
         };
         let position = self.unnests.len();
         self.unnests.push(UnnestCall { arg, depth });
-        let produced = element_at(&ty, depth);
         let binding = ColumnBinding::new(index, position as u32);
         Ok(self.add_expr(Expr::Column(binding), produced))
+    }
+
+    /// The columns a root `unnest` of a struct stands for, each a `struct_extract` of `input`, and
+    /// their names, taking apart `depth` levels of struct.
+    pub(crate) fn unnest_fields(
+        &mut self,
+        input: ExprRef,
+        taking: UnnestStruct,
+        prefix: Option<&str>,
+        exprs: &mut Vec<ExprRef>,
+        names: &mut Vec<String>,
+    ) -> Result<()> {
+        let LogicalType::Struct(fields) = self.plan().expr_type(input).clone() else {
+            return Err(Error::internal("a struct unnest of something that is not a struct"));
+        };
+        let recorded = self.plan_mut().intern(STRUCT_EXTRACT);
+        for (at, field) in fields.iter().enumerate() {
+            let key = self.add_constant(Value::BigInt(at as i64 + 1));
+            let args = self.plan_mut().add_expr_list(&[input, key]);
+            let expr = self.add_expr(Expr::Function { name: recorded, args }, field.ty.clone());
+            // The fields of an unnamed struct, `row(1, 2)`, are named by their place.
+            let own = if field.name.is_empty() {
+                format!("element{}", at + 1)
+            } else {
+                field.name.clone()
+            };
+            let name = match prefix {
+                Some(prefix) if taking.keep_parent_names => format!("{prefix}.{own}"),
+                _ => own,
+            };
+            if taking.depth > 1 && matches!(field.ty, LogicalType::Struct(_)) {
+                let deeper = UnnestStruct { depth: taking.depth - 1, ..taking };
+                // An unnamed field has no name to put in front of its own fields'.
+                let prefix = (!field.name.is_empty()).then_some(name.as_str());
+                self.unnest_fields(expr, deeper, prefix, exprs, names)?;
+            } else {
+                exprs.push(expr);
+                names.push(name);
+            }
+        }
+        Ok(())
     }
 
     /// Whether a column is one an `unnest` of the block being bound produces.

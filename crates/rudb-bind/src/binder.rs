@@ -287,6 +287,11 @@ pub(crate) struct Binder<'a> {
     pub(crate) unnest_here: bool,
     /// Set while an `unnest` call's own argument is being bound, so nesting is caught.
     pub(crate) in_unnest: bool,
+    /// Set while a select target that is an `unnest` call and nothing more is being bound, which is
+    /// the one place an `unnest` of a struct may be written.
+    pub(crate) unnest_root: bool,
+    /// The struct such a target left to be taken apart into columns.
+    pub(crate) unnest_struct: Option<crate::unnest::UnnestStruct>,
     /// The sequences a `nextval`, `currval` or `setval` named, which a table's default depends on.
     pub(crate) sequences: Vec<QualifiedName>,
     /// Set while a window call's own arguments and keys are being bound, so nesting is caught.
@@ -365,6 +370,8 @@ impl<'a> Binder<'a> {
             unnest_index: None,
             unnest_here: false,
             in_unnest: false,
+            unnest_root: false,
+            unnest_struct: None,
             sequences: Vec::new(),
             in_window: false,
             scalar_subqueries: Vec::new(),
@@ -1318,8 +1325,18 @@ impl<'a> Binder<'a> {
                 continue;
             }
             let before = self.scalar_subqueries.len();
-            let expr = self.bind_expr(ast, target.expr, input)?;
+            self.unnest_root = matches!(ast.expr(target.expr), ast::Expr::Function { name, .. }
+                if name.len == 1 && same_name(ast.name(name).last().unwrap_or_default(), "unnest"));
+            let expr = self.bind_expr(ast, target.expr, input);
+            self.unnest_root = false;
+            let expr = expr?;
             self.lift_over_aggregate(before, above, input)?;
+            if let Some(taking) = self.unnest_struct.take() {
+                // A struct is a column per field, named by the fields whatever the target's alias.
+                let expr = self.over_aggregate(expr, input)?;
+                self.unnest_fields(expr, taking, None, &mut exprs, &mut names)?;
+                continue;
+            }
             exprs.push(self.over_aggregate(expr, input)?);
             names.push(if target.alias == NONE {
                 self.output_name(ast, target.expr, input)
