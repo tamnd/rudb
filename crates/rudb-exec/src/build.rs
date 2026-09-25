@@ -535,6 +535,66 @@ fn native_host_groups(
     Ok(Some(records))
 }
 
+/// The leading groups of a one column count, read out of the column's frequency synopsis.
+///
+/// The synopsis lists the most common values of the column with the exact number of rows holding
+/// each, and bounds every value it left out. So the `n` largest groups of `GROUP BY c` with a
+/// `COUNT(*)` are all in the list whenever the `n`th count in it is strictly above that bound, and
+/// then the answer is the list, with no row read and no table of a million groups built to throw
+/// all but ten of them away. Every listed value that ties the `n`th count comes along, so the TopN
+/// above still decides the ties the way it would have over the whole table.
+fn native_value_frequencies(
+    plan: &Plan,
+    catalog: &Catalog,
+    input: NodeRef,
+    groups: Slice,
+    aggregates: Slice,
+    top: usize,
+) -> Result<Option<NativePairFrequencies>> {
+    let Some((table, index, columns)) = whole_table(plan, catalog, input)? else {
+        return Ok(None);
+    };
+    let [group] = plan.expr_list(groups) else { return Ok(None) };
+    let Expr::Column(binding) = *plan.expr(*group) else { return Ok(None) };
+    let [aggregate] = plan.expr_list(aggregates) else { return Ok(None) };
+    let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(*aggregate) else {
+        return Ok(None);
+    };
+    if top == 0
+        || binding.table != index
+        || plan.string(name) != "count_star"
+        || !plan.expr_list(args).is_empty()
+        || distinct
+        || filter.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(field) = plan.field_list(columns).get(binding.column as usize) else {
+        return Ok(None);
+    };
+    let Some(column) = table.column_index(&field.name) else { return Ok(None) };
+    if table.columns().get(column).map(|stored| &stored.ty) != Some(plan.expr_type(*group)) {
+        return Ok(None);
+    }
+    let Some(prefix) = table.rows().frequency_prefix(column)? else { return Ok(None) };
+    let mut counts = prefix.entries.iter().map(|(_, count)| *count).collect::<Vec<_>>();
+    if counts.len() < top {
+        return Ok(None);
+    }
+    counts.select_nth_unstable_by(top - 1, |left, right| right.cmp(left));
+    let boundary = counts[top - 1];
+    if boundary <= prefix.omitted_max {
+        return Ok(None);
+    }
+    let entries = prefix
+        .entries
+        .into_iter()
+        .filter(|(_, count)| *count >= boundary)
+        .map(|(value, count)| (vec![value], count))
+        .collect();
+    Ok(Some(NativePairFrequencies { entries }))
+}
+
 /// Exact two-key counts over bounded heavy-hitter rows, certified against the omitted maximum.
 fn native_pair_frequencies(
     plan: &Plan,
@@ -2007,6 +2067,26 @@ impl<'a> Building<'a, '_> {
         }
         if bound.max_groups.is_none() && bound.having_count.is_none() {
             let top = bound.top_counts.map(|(bound, _)| bound);
+            if let Some(top) = top
+                && let Some(frequencies) = native_value_frequencies(
+                    self.plan,
+                    self.catalog,
+                    input,
+                    groups,
+                    aggregates,
+                    top,
+                )?
+            {
+                let source = Frequencies::grouped(schema.clone(), frequencies.entries)?;
+                let counters = self.watch(
+                    reference,
+                    id,
+                    pipeline,
+                    "Aggregate",
+                    Some("native value frequencies"),
+                );
+                return Ok(Segment::new(Arc::new(Watched::new(source, counters)), schema));
+            }
             if let Some(top) = top
                 && let Some(frequencies) = native_pair_frequencies(
                     self.plan,
