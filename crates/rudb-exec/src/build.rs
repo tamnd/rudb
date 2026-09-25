@@ -2556,9 +2556,12 @@ impl<'a> Building<'a, '_> {
                 for (at, leaf) in tree.leaves.iter().enumerate() {
                     let own = self.shape.pipeline(leaf.input);
                     let mut below = self.node(leaf.input)?;
-                    let position = u32::try_from(at)
-                        .map_err(|_| Error::internal("a join tree of more than u32::MAX relations"))?;
-                    below.after.extend(tree.children(position).map(|(child, _)| filled[child as usize]));
+                    let position = u32::try_from(at).map_err(|_| {
+                        Error::internal("a join tree of more than u32::MAX relations")
+                    })?;
+                    below
+                        .after
+                        .extend(tree.children(position).map(|(child, _)| filled[child as usize]));
                     self.close(below, own, Arc::new(Collect::new(Arc::clone(&shared), at)));
                     filled.push(own);
                 }

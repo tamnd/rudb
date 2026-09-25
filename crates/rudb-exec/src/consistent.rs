@@ -300,7 +300,9 @@ impl Sink for Collect {
         let role = &self.shared.roles[self.at];
         let mut kept: Vec<u32> = match chunk.kept() {
             Some(selection) => selection.indices().to_vec(),
-            None => (0..u32::try_from(rows).map_err(|_| Error::internal("a huge chunk"))?).collect(),
+            None => {
+                (0..u32::try_from(rows).map_err(|_| Error::internal("a huge chunk"))?).collect()
+            }
         };
         for (key, &column) in role.keys.iter().enumerate() {
             let vector = chunk.column(column)?;
@@ -418,7 +420,9 @@ fn read(vector: &Vector, rows: usize, out: &mut Vec<i64>, nulls: &mut Vec<bool>)
                 Value::Integer(key) => i128::from(key),
                 Value::BigInt(key) => i128::from(key),
                 other => {
-                    return Err(Error::internal(format!("a join key that is not an integer: {other}")));
+                    return Err(Error::internal(format!(
+                        "a join key that is not an integer: {other}"
+                    )));
                 }
             },
         };

@@ -116,7 +116,11 @@ const FIRING: &[&str] = &[
 fn every_query_it_fires_on_answers_as_the_join_does() {
     let database = database();
     for sql in FIRING {
-        assert!(fires(&database, sql), "the rewrite did not fire on {sql}:\n{}", explain(&database, sql));
+        assert!(
+            fires(&database, sql),
+            "the rewrite did not fire on {sql}:\n{}",
+            explain(&database, sql)
+        );
         both(&database, sql);
     }
 }
@@ -126,7 +130,10 @@ fn the_answers_are_the_ones_the_join_gives() {
     let database = database();
     // The two edge cases worth a literal answer rather than only an agreement: an empty join is one
     // row of nulls, and a key that only matches rows whose argument is null is a null minimum.
-    let empty = both(&database, "SELECT min(a.name), max(lonely.label) FROM a, lonely WHERE a.id = lonely.id");
+    let empty = both(
+        &database,
+        "SELECT min(a.name), max(lonely.label) FROM a, lonely WHERE a.id = lonely.id",
+    );
     assert_eq!(empty, vec![vec![Value::Null, Value::Null]]);
     let skipped = both(&database, "SELECT min(a.score) FROM a, b WHERE a.id = b.a_id AND a.id = 5");
     assert_eq!(skipped, vec![vec![Value::Null]]);
@@ -159,8 +166,14 @@ const DECLINED: &[(&str, &str)] = &[
     ("SELECT count(*) FROM a, b WHERE a.id = b.a_id", "not a MIN or a MAX"),
     ("SELECT sum(a.score) FROM a, b WHERE a.id = b.a_id", "not a MIN or a MAX"),
     ("SELECT min(a.score), count(*) FROM a, b WHERE a.id = b.a_id", "not a MIN or a MAX"),
-    ("SELECT string_agg(a.name, ',') FROM a, b WHERE a.id = b.a_id AND a.id < 3", "not a MIN or a MAX"),
-    ("SELECT b.c_id, min(a.score) FROM a, b WHERE a.id = b.a_id GROUP BY b.c_id", "groups by a key"),
+    (
+        "SELECT string_agg(a.name, ',') FROM a, b WHERE a.id = b.a_id AND a.id < 3",
+        "not a MIN or a MAX",
+    ),
+    (
+        "SELECT b.c_id, min(a.score) FROM a, b WHERE a.id = b.a_id GROUP BY b.c_id",
+        "groups by a key",
+    ),
     ("SELECT min(a.score) FROM a LEFT JOIN b ON a.id = b.a_id", "not an inner join"),
     ("SELECT min(a.score) FROM a, b WHERE a.id < b.a_id AND b.id < 20", "not an equality"),
     ("SELECT min(a.name) FROM a, b WHERE a.name = b.note", "not an equality"),
