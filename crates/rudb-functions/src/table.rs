@@ -995,8 +995,10 @@ pub fn strategy_fields() -> Vec<Field> {
 /// The four frontend phases are milestone C0's: `parse_ns`, `bind_ns`, `rewrite_ns`, which is the
 /// optimizer passes in front of join ordering, and `optimize_ns`, which is the rest of the
 /// optimizer. They do not overlap and `frontend_ns` is the four added up. `physical_ns` is building
-/// the operator tree and `execute_ns` is running it, and `total_ns` is the whole statement. A
-/// statement that did not run a plan, `CREATE TABLE` or `SET`, has its parse, bind and total and
+/// the operator tree, or on the compiled engine generating and compiling its code, which
+/// `codegen_ns` repeats so that the compile time of a query stands out, zero on the first engine.
+/// `execute_ns` is running it and `total_ns` is the whole statement. A statement that did not
+/// run a plan, `CREATE TABLE` or `SET`, has its parse, bind and total and
 /// zero for the rest. `cpu_ns` is the CPU time of every thread the plan ran on.
 ///
 /// The last eight are the execution split by kind of work, which is the operators' own time summed
@@ -1015,6 +1017,7 @@ pub fn statement_metric_fields() -> Vec<Field> {
         Field::new("optimize_ns", LogicalType::BigInt),
         Field::new("frontend_ns", LogicalType::BigInt),
         Field::new("physical_ns", LogicalType::BigInt),
+        Field::new("codegen_ns", LogicalType::BigInt),
         Field::new("execute_ns", LogicalType::BigInt),
         Field::new("total_ns", LogicalType::BigInt),
         Field::new("cpu_ns", LogicalType::BigInt),

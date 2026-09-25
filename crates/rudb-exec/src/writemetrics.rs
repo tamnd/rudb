@@ -107,6 +107,7 @@ pub(crate) fn statement_metrics(plan: &Plan, index: u32, columns: Slice) -> Resu
                 count(statement.optimize_ns),
                 count(statement.frontend_ns()),
                 count(statement.physical_ns),
+                count(statement.codegen_ns),
                 count(statement.execute_ns),
                 count(statement.total_ns),
                 count(statement.cpu_ns),

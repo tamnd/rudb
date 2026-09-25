@@ -127,6 +127,7 @@ impl Document {
             out.count("optimize_ns", self.timing.optimize_ns);
             out.count("rewrite_ns", self.timing.rewrite_ns);
             out.count("physical_ns", self.timing.physical_ns);
+            out.count("codegen_ns", self.timing.codegen_ns);
             out.count("execute_ns", self.timing.execute_ns);
             out.count("result_ns", self.timing.result_ns);
             out.count("total_ns", self.timing.total_ns);
@@ -470,6 +471,9 @@ pub struct Timing {
     pub rewrite_ns: u64,
     /// The physical plan and the operator tree.
     pub physical_ns: u64,
+    /// The part of `physical_ns` the compiled engine spent turning the plan into QIR and the QIR
+    /// into code for its tier, which is the whole of its physical phase. Zero on the first engine.
+    pub codegen_ns: u64,
     /// Running it.
     pub execute_ns: u64,
     /// The part of `execute_ns` that went on turning the answer into flat columns for the caller.

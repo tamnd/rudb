@@ -2818,6 +2818,11 @@ impl Shared {
         Ok(())
     }
 
+    /// The tier and the switching the compiled engine is set to.
+    fn qc_options(&self) -> rudb_qc::Options {
+        rudb_qc::Options { tier: self.inner.settings.tier(), switch: self.inner.settings.switch() }
+    }
+
     /// The memory and the threads this database will lend a query.
     fn budget(&self) -> Budget<'_> {
         Budget { memory: &self.inner.memory, pool: &self.inner.pool }
@@ -3019,16 +3024,14 @@ impl Shared {
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 if self.inner.settings.engine() == COMPILED_ENGINE {
-                    let options = rudb_qc::Options {
-                        tier: self.inner.settings.tier(),
-                        switch: self.inner.settings.switch(),
-                    };
-                    match rudb_qc::compile_with(&plan, cancel, options) {
+                    let compiling = Span::start();
+                    let compiled = rudb_qc::compile_with(&plan, cancel, self.qc_options());
+                    let (codegen_ns, _) = compiling.stop();
+                    match compiled {
                         Ok(compiled) => {
                             let switches = &self.inner.switches;
-                            return run_compiled(
-                                sql, &plan, &catalog, cancel, compiled, under, switches,
-                            );
+                            let compiled = Codegen { compiled, codegen_ns, switches };
+                            return run_compiled(sql, &plan, &catalog, cancel, compiled, under);
                         }
                         Err(refusal) => self.refused(sql, &refusal),
                     }
@@ -3038,7 +3041,7 @@ impl Shared {
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
-                    return explained_codegen(&plan, cancel);
+                    return explained_codegen(&plan, cancel, self.qc_options());
                 }
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -3488,7 +3491,7 @@ impl Shared {
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
-                    return explained_codegen(&plan, cancel);
+                    return explained_codegen(&plan, cancel, self.qc_options());
                 }
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
@@ -4514,10 +4517,10 @@ fn run_compiled(
     plan: &Plan,
     catalog: &Catalog,
     cancel: &Cancel,
-    compiled: rudb_qc::Compiled,
+    compiled: Codegen<'_>,
     under: Under<'_>,
-    switches: &Mutex<rudb_qc::Switches>,
 ) -> Result<QueryResult> {
+    let Codegen { compiled, codegen_ns, switches } = compiled;
     let Under { budget: Budget { memory, pool }, seams, session, planning, .. } = under;
     memory.forget_peak();
     let driving = Span::start();
@@ -4544,8 +4547,13 @@ fn run_compiled(
     metrics.timing.bind_ns = planning.bind_ns;
     metrics.timing.optimize_ns = planning.optimize_ns;
     metrics.timing.rewrite_ns = planning.rewrite_ns;
+    // The compiled engine builds no operator tree: generating and compiling its code is its
+    // physical phase, so the time goes in both fields and `total_ns` counts it once.
+    metrics.timing.physical_ns = codegen_ns;
+    metrics.timing.codegen_ns = codegen_ns;
     metrics.timing.execute_ns = ran_wall;
-    metrics.timing.total_ns = planning.total_ns().saturating_add(ran_wall);
+    metrics.timing.total_ns =
+        planning.total_ns().saturating_add(codegen_ns).saturating_add(ran_wall);
     metrics.resource.cpu_ns = ran_cpu;
     metrics.resource.peak_bytes = memory.peak();
     rudb_metrics::remember(&metrics);
@@ -4602,13 +4610,29 @@ fn explaining(
     explained("analyzed_plan", &text)
 }
 
-/// What the compiled engine makes of a plan, for `EXPLAIN (CODEGEN)`: its stages and the QIR of
-/// every pipeline, or the refusal it would log.
+/// A query the compiled engine took, with how long taking it took and where its tier switches are
+/// counted.
+struct Codegen<'a> {
+    /// The query.
+    compiled: rudb_qc::Compiled,
+    /// The wall time `rudb_qc::compile_with` took, generation and the tier's compile together.
+    codegen_ns: u64,
+    /// The database's count of tier switches, which the run adds to.
+    switches: &'a Mutex<rudb_qc::Switches>,
+}
+
+/// What the compiled engine makes of a plan, for `EXPLAIN (CODEGEN)`: its stages, the QIR of
+/// every pipeline and what the tier did with it and how long that took, or the refusal it would
+/// log.
 ///
 /// A refusal is an answer here and not an error, because the question was what the compiled engine
 /// does with the query and refusing it is what it does.
-fn explained_codegen(plan: &Plan, cancel: &Cancel) -> Result<QueryResult> {
-    match rudb_qc::compile(plan, cancel) {
+fn explained_codegen(
+    plan: &Plan,
+    cancel: &Cancel,
+    options: rudb_qc::Options,
+) -> Result<QueryResult> {
+    match rudb_qc::compile_with(plan, cancel, options) {
         Ok(compiled) => explained("codegen", &compiled.explain()),
         Err(refusal) => explained("codegen", &format!("refused: {refusal}")),
     }

@@ -25,6 +25,8 @@ mod feed;
 mod finish;
 mod tier;
 
+use std::time::Instant;
+
 use rudb_catalog::Catalog;
 use rudb_common::{Cancel, LogicalType, Memory, Result, Session};
 use rudb_pipeline::{Pool, Progress};
@@ -83,12 +85,15 @@ pub fn compile_with(
     cancel: &Cancel,
     options: Options,
 ) -> std::result::Result<Compiled, Refusal> {
+    let started = Instant::now();
     let rel = rudb_qc_plan::lower(plan)?;
     let graph = rudb_qc_pipe::split(&rel);
     check(&graph)?;
     let mut rt = Rt::new(cancel.clone());
     let query = rudb_qc_gen::generate(&graph, &mut rt)?;
-    let tiers = Tiers::new(&query.module, options);
+    let generated = started.elapsed();
+    let mut tiers = Tiers::new(&query.module, options);
+    tiers.generated_in(generated);
     Ok(Compiled { graph, query, tiers, rt })
 }
 
@@ -131,10 +136,15 @@ pub struct Under<'a> {
 }
 
 impl Compiled {
-    /// The stages, one line each, and the generated module, for `EXPLAIN (CODEGEN)`.
+    /// The stages, one line each, the generated module and the [`Report`], for `EXPLAIN (CODEGEN)`.
     #[must_use]
     pub fn explain(&self) -> String {
-        format!("{}\n{}", self.graph, rudb_qc_ir::print::print(&self.query.module))
+        format!(
+            "{}\n{}\n{}",
+            self.graph,
+            rudb_qc_ir::print::print(&self.query.module),
+            self.report()
+        )
     }
 
     /// What the second tier did with the module.
