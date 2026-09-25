@@ -292,6 +292,12 @@ pub(crate) struct Binder<'a> {
     pub(crate) unnest_root: bool,
     /// The struct such a target left to be taken apart into columns.
     pub(crate) unnest_struct: Option<crate::unnest::UnnestStruct>,
+    /// Set while the block's `GROUP BY` is being bound, where an `unnest` runs under the grouping.
+    /// It is `Some(true)` for `GROUP BY ALL`, which is not allowed to group on one.
+    pub(crate) unnest_grouping: Option<bool>,
+    /// The `unnest` calls the block's `GROUP BY` wrote, so the same call in the select list reads
+    /// the grouped column rather than taking the list apart a second time.
+    pub(crate) grouped_unnests: Vec<crate::unnest::GroupedUnnest>,
     /// The sequences a `nextval`, `currval` or `setval` named, which a table's default depends on.
     pub(crate) sequences: Vec<QualifiedName>,
     /// Set while a window call's own arguments and keys are being bound, so nesting is caught.
@@ -372,6 +378,8 @@ impl<'a> Binder<'a> {
             in_unnest: false,
             unnest_root: false,
             unnest_struct: None,
+            unnest_grouping: None,
+            grouped_unnests: Vec::new(),
             sequences: Vec::new(),
             in_window: false,
             scalar_subqueries: Vec::new(),
@@ -991,6 +999,8 @@ impl<'a> Binder<'a> {
         let outer_unnest_index = self.unnest_index.take();
         let outer_unnest_here = std::mem::replace(&mut self.unnest_here, false);
         let outer_in_unnest = std::mem::replace(&mut self.in_unnest, false);
+        let outer_unnest_grouping = self.unnest_grouping.take();
+        let outer_grouped_unnests = std::mem::take(&mut self.grouped_unnests);
         // Same argument for the queries lifted over this block's grouping. They are recorded while
         // the select list is being bound and read until the sort keys are done, and a block bound
         // inside that stretch has its own set, so the outer block's is put aside rather than left
@@ -1018,9 +1028,20 @@ impl<'a> Binder<'a> {
             || targets.iter().any(|target| has_aggregate(ast, target.expr));
         if aggregating {
             self.clause = "GROUP BY clause";
+            // An unnest in a grouping key runs under the grouping, over the rows of the `FROM`,
+            // and makes the rows that are grouped. `SELECT unnest(tags) AS tag, count(*) ... GROUP
+            // BY tag` counts the rows each tag appears in.
+            self.unnest_here = true;
+            self.unnest_grouping = Some(written.group_by_all);
             let mut groups = Vec::with_capacity(group_items.len());
             for item in &group_items {
                 groups.push(self.bind_expr(ast, *item, &input)?);
+            }
+            self.unnest_here = false;
+            self.unnest_grouping = None;
+            let unnests = std::mem::take(&mut self.unnests);
+            if let Some(index) = self.unnest_index.take() {
+                node = self.plan_unnests(node, index, &unnests)?;
             }
             let index = self.fresh_index();
             self.aggregation = Some(Aggregation { index, groups, aggregates: Vec::new() });
@@ -1076,6 +1097,8 @@ impl<'a> Binder<'a> {
         )?;
         self.unnest_here = outer_unnest_here;
         self.in_unnest = outer_in_unnest;
+        self.unnest_grouping = outer_unnest_grouping;
+        self.grouped_unnests = outer_grouped_unnests;
         self.joined_above = outer_joined_above;
         if !extra.is_empty() && written.distinct != Distinct::No {
             return Err(Error::binder(
@@ -2180,6 +2203,7 @@ impl<'a> Binder<'a> {
         };
         let written = ast.target_list(args).to_vec();
         let empty = Scope::empty();
+        let waiting = self.scalar_subqueries.len();
         let previous = std::mem::replace(&mut self.clause, "table function arguments");
         let mut bound = Vec::new();
         let mut written_options = Vec::new();
@@ -2317,14 +2341,52 @@ impl<'a> Binder<'a> {
             ast.string(alias).to_string()
         };
         let names: Vec<&str> = ast.name(columns).collect();
-        self.table_function_source(
+        let (node, scope) = self.table_function_source(
             resolved.function,
             &cast,
             &written_options,
             Read { fields, rows: measured, distincts: counted, zones: bounded },
             &label,
             &names,
-        )
+        )?;
+        Ok((self.lateral_over_subqueries(node, waiting), scope))
+    }
+
+    /// A series or an unnest whose arguments read a query, `range((SELECT 3))`, as the same call
+    /// made laterally over the one row that query makes.
+    ///
+    /// The query cannot be joined in above the call the way it is above a table, because the call
+    /// is what reads it. So it is joined into a row with nothing in it, and the call runs over that
+    /// row the way it runs over the rows of a table to its left.
+    fn lateral_over_subqueries(&mut self, node: NodeRef, waiting: usize) -> NodeRef {
+        if self.scalar_subqueries.len() <= waiting {
+            return node;
+        }
+        let Node::TableFunction { index, function, args, options, settings, columns } =
+            self.plan.node(node).clone()
+        else {
+            return node;
+        };
+        let series = matches!(
+            TableFunction::lookup(self.plan.string(function)),
+            Some(TableFunction::Range | TableFunction::GenerateSeries | TableFunction::Unnest)
+        );
+        if !series {
+            return node;
+        }
+        let mut input = self.add_node(Node::Dummy);
+        for pending in self.scalar_subqueries.split_off(waiting) {
+            input = self.attach_subquery(input, pending);
+        }
+        self.add_node(Node::LateralFunction {
+            input,
+            index,
+            function,
+            args,
+            options,
+            settings,
+            columns,
+        })
     }
 
     /// The columns of the `read_csv` a `COPY t FROM` became, which are the table's.
@@ -3211,10 +3273,9 @@ impl<'a> Binder<'a> {
             )));
         }
         if self.aggregation.is_none() {
-            return Err(Error::binder(format!(
-                "aggregate function calls cannot be used in the {}",
-                self.clause
-            )));
+            // A join condition is the `WHERE` clause here too, the way it is for a window.
+            let clause = if self.clause == "JOIN condition" { "WHERE clause" } else { self.clause };
+            return Err(Error::binder(format!("{clause} cannot contain aggregates!")));
         }
         // The predicate goes first, which is the order the messages come out in upstream: a call
         // whose argument and whose filter both name columns that are not there is refused over the

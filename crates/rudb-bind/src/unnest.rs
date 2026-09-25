@@ -41,6 +41,16 @@ pub(crate) struct UnnestStruct {
     pub(crate) keep_parent_names: bool,
 }
 
+/// An `unnest` a block's `GROUP BY` wrote, which runs under the grouping.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GroupedUnnest {
+    /// The list as it was written, before anything was done to it.
+    arg: ExprRef,
+    depth: usize,
+    /// The column the call was bound to.
+    column: ExprRef,
+}
+
 /// One `unnest` call a select block wrote, waiting to be planned under the block's projection.
 #[derive(Debug, Clone)]
 pub(crate) struct UnnestCall {
@@ -176,7 +186,15 @@ impl Binder<'_> {
         let lists = allowed.min(nesting(&ty));
         let produced = element_at(&ty, lists);
         let structs = allowed - lists;
-        if structs > 0 && matches!(produced, LogicalType::Struct(_)) {
+        let expands = structs > 0 && matches!(produced, LogicalType::Struct(_));
+        match self.unnest_grouping {
+            Some(true) => return Err(Error::binder("Cannot group on an UNNEST or UNLIST clause")),
+            Some(false) if expands => {
+                return Err(Error::binder("UNNEST of struct cannot be used in GROUP BY clause"));
+            }
+            _ => {}
+        }
+        if expands {
             if !root {
                 return Err(Error::binder(
                     "UNNEST() on a struct column can only be applied as the root element of a \
@@ -190,6 +208,18 @@ impl Binder<'_> {
             // to take apart.
             return Ok(bound);
         }
+        let depth = lists.max(1);
+        if self.unnest_grouping.is_none() {
+            // The same call as one the block groups on is the grouped column, which the grouping
+            // rule then finds among the keys.
+            let grouped = self.grouped_unnests.clone();
+            if let Some(found) =
+                grouped.iter().find(|held| held.depth == depth && self.same_expr(held.arg, bound))
+            {
+                return Ok(found.column);
+            }
+        }
+        let written = bound;
         let bound = self.over_aggregate(bound, scope)?;
         let arg = match &ty {
             LogicalType::Array(inner, _) => {
@@ -197,7 +227,6 @@ impl Binder<'_> {
             }
             _ => bound,
         };
-        let depth = lists.max(1);
         let index = match self.unnest_index {
             Some(index) => index,
             None => {
@@ -209,7 +238,11 @@ impl Binder<'_> {
         let position = self.unnests.len();
         self.unnests.push(UnnestCall { arg, depth });
         let binding = ColumnBinding::new(index, position as u32);
-        Ok(self.add_expr(Expr::Column(binding), produced))
+        let column = self.add_expr(Expr::Column(binding), produced);
+        if self.unnest_grouping.is_some() {
+            self.grouped_unnests.push(GroupedUnnest { arg: written, depth, column });
+        }
+        Ok(column)
     }
 
     /// The columns a root `unnest` of a struct stands for, each a `struct_extract` of `input`, and
