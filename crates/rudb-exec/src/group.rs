@@ -505,11 +505,36 @@ struct EncodedCountExchange<S = i64> {
     /// that keeps its nulls somewhere other than its own mask counts as holding one, since the mask
     /// is then not the whole answer and the scatter has to ask the vector row by row.
     dictionary_nulls: bool,
+    /// How many low bits of a record's string code are the code, the rest being a [`Tucked`]
+    /// second key. All 32 for the other shapes.
+    code_bits: u32,
     partitions: Vec<Mutex<EncodedCountRuns<S>>>,
     held: Mutex<Vec<Reservation>>,
 }
 
 impl<S: Second> EncodedCountExchange<S> {
+    /// An exchange with nothing in it yet, over this dictionary, with these leading key types,
+    /// whether the dictionary holds nulls and how many bits of a string code are the code.
+    fn new(
+        (dictionary, leading, dictionary_nulls, code_bits): (
+            Arc<Vector>,
+            Vec<LogicalType>,
+            bool,
+            u32,
+        ),
+    ) -> Self {
+        Self {
+            dictionary,
+            leading,
+            dictionary_nulls,
+            code_bits,
+            partitions: (0..RADIX_PARTITIONS)
+                .map(|_| Mutex::new(EncodedCountRuns::default()))
+                .collect(),
+            held: Mutex::new(Vec::new()),
+        }
+    }
+
     /// One instance's runs, each handed to the partition it was scattered for, and its charge with
     /// them.
     fn take(&self, runs: &mut [EncodedCountRun<S>], memory: Reservation) -> Result<()> {
@@ -706,50 +731,42 @@ struct EncodedCountRecord<S = i64> {
 /// on ClickBench 17 and 18 the zero was a third of every byte scattered, compacted and folded. The
 /// key count is fixed when the aggregate is planned, so the two shapes never meet.
 trait Second: Copy + PartialEq + std::fmt::Debug + Default + Send + 'static {
-    fn of(value: i64) -> Self;
-    fn value(self) -> i64;
-    /// The exchange of this shape, built the first time a chunk arrives.
-    fn wrap(exchange: EncodedCountExchange<Self>) -> EncodedExchange;
-    fn exchange(exchange: &EncodedExchange) -> Option<&EncodedCountExchange<Self>>;
+    /// The second key and the string code of a record whose string code is `third`, for an
+    /// exchange whose codes take the low `code_bits` bits of it.
+    fn keys(self, third: u32, code_bits: u32) -> (i64, u32);
 }
 
 impl Second for i64 {
-    fn of(value: i64) -> Self {
-        value
-    }
-
-    fn value(self) -> i64 {
-        self
-    }
-
-    fn wrap(exchange: EncodedCountExchange<Self>) -> EncodedExchange {
-        EncodedExchange::Three(exchange)
-    }
-
-    fn exchange(exchange: &EncodedExchange) -> Option<&EncodedCountExchange<Self>> {
-        match exchange {
-            EncodedExchange::Three(exchange) => Some(exchange),
-            EncodedExchange::Two(_) => None,
-        }
+    fn keys(self, third: u32, _: u32) -> (i64, u32) {
+        (self, third)
     }
 }
 
 impl Second for () {
-    fn of(_: i64) -> Self {}
-
-    fn value(self) -> i64 {
-        0
+    fn keys(self, third: u32, _: u32) -> (i64, u32) {
+        (0, third)
     }
+}
 
-    fn wrap(exchange: EncodedCountExchange<Self>) -> EncodedExchange {
-        EncodedExchange::Two(exchange)
-    }
+/// A second key tucked into the bits of the string code its dictionary does not use.
+///
+/// `GROUP BY UserID, extract(minute FROM EventTime), SearchPhrase` is ClickBench 19, and a minute
+/// is six bits where the record gave it eight bytes. The `SearchPhrase` dictionary on the ten
+/// million row file needs about twenty one bits for its codes, so the minute fits in the eleven
+/// above them and the record is 16 bytes rather than 24. q19 is five million groups, and the
+/// eight bytes were a third of every one of them held until the fold.
+///
+/// Whether a value fits is only known once it arrives, so a row whose second key does not fit, or
+/// whose keys are not all valid, goes to a wide record instead. Whether a row fits depends only on
+/// its keys, so every row of a group goes the same way and the two kinds of record never hold the
+/// same group.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Tucked;
 
-    fn exchange(exchange: &EncodedExchange) -> Option<&EncodedCountExchange<Self>> {
-        match exchange {
-            EncodedExchange::Two(exchange) => Some(exchange),
-            EncodedExchange::Three(_) => None,
-        }
+impl Second for Tucked {
+    fn keys(self, third: u32, code_bits: u32) -> (i64, u32) {
+        let third = u64::from(third);
+        ((third >> code_bits) as i64, (third & ((1 << code_bits) - 1)) as u32)
     }
 }
 
@@ -757,24 +774,95 @@ impl Second for () {
 #[derive(Debug)]
 enum EncodedExchange {
     Two(EncodedCountExchange<()>),
-    Three(EncodedCountExchange<i64>),
+    Three { tucked: EncodedCountExchange<Tucked>, wide: EncodedCountExchange<i64> },
+}
+
+impl EncodedExchange {
+    /// The exchange the checks every chunk goes through are made against, which all of them agree
+    /// about.
+    fn first(&self) -> (&Arc<Vector>, &[LogicalType], bool) {
+        match self {
+            Self::Two(exchange) => {
+                (&exchange.dictionary, &exchange.leading, exchange.dictionary_nulls)
+            }
+            Self::Three { wide, .. } => (&wide.dictionary, &wide.leading, wide.dictionary_nulls),
+        }
+    }
 }
 
 /// One instance's runs, in the same shape as the exchange they are handed to.
 #[derive(Debug)]
 enum EncodedRecords {
     Two(Vec<EncodedCountRun<()>>),
-    Three(Vec<EncodedCountRun<i64>>),
+    Three { tucked: Vec<EncodedCountRun<Tucked>>, wide: Vec<EncodedCountRun<i64>> },
 }
 
 impl EncodedRecords {
     fn new(keys: usize) -> Self {
-        if keys == 2 {
-            Self::Two((0..RADIX_PARTITIONS).map(|_| EncodedCountRun::default()).collect())
-        } else {
-            Self::Three((0..RADIX_PARTITIONS).map(|_| EncodedCountRun::default()).collect())
+        if keys == 2 { Self::Two(runs()) } else { Self::Three { tucked: runs(), wide: runs() } }
+    }
+
+    fn footprint(&self) -> usize {
+        match self {
+            Self::Two(runs) => runs.iter().map(EncodedCountRun::footprint).sum(),
+            Self::Three { tucked, wide } => {
+                tucked.iter().map(EncodedCountRun::footprint).sum::<usize>()
+                    + wide.iter().map(EncodedCountRun::footprint).sum::<usize>()
+            }
         }
     }
+}
+
+/// A run for every radix partition, all of them empty.
+fn runs<S>() -> Vec<EncodedCountRun<S>> {
+    (0..RADIX_PARTITIONS).map(|_| EncodedCountRun::default()).collect()
+}
+
+/// Where the scatter puts a row's record, which is the one shape of record for two keys and one of
+/// two for three.
+trait Put {
+    fn put(&mut self, partition: usize, record: EncodedCountRecord, valid: u8);
+}
+
+impl Put for Vec<EncodedCountRun<()>> {
+    #[inline]
+    fn put(&mut self, partition: usize, record: EncodedCountRecord, valid: u8) {
+        let EncodedCountRecord { first, hash, third, .. } = record;
+        self[partition].scatter(EncodedCountRecord { first, second: (), hash, third }, valid);
+    }
+}
+
+/// The two kinds of record for three keys, and how many of the string code's bits are the code.
+struct Tucking<'a> {
+    tucked: &'a mut [EncodedCountRun<Tucked>],
+    wide: &'a mut [EncodedCountRun<i64>],
+    code_bits: u32,
+    /// The first second key that does not fit above the code, zero when none does.
+    limit: u64,
+}
+
+impl Put for Tucking<'_> {
+    #[inline]
+    fn put(&mut self, partition: usize, record: EncodedCountRecord, valid: u8) {
+        let EncodedCountRecord { first, second, hash, third } = record;
+        if valid == EncodedValid::ALL && (second as u64) < self.limit {
+            let third = third | ((second as u64) << self.code_bits) as u32;
+            self.tucked[partition]
+                .scatter(EncodedCountRecord { first, second: Tucked, hash, third }, valid);
+        } else {
+            self.wide[partition].scatter(record, valid);
+        }
+    }
+}
+
+/// How many bits the codes of a dictionary of `len` strings take.
+fn code_bits(len: usize) -> u32 {
+    usize::BITS - len.saturating_sub(1).leading_zeros()
+}
+
+/// The first second key that does not fit above codes of `code_bits` bits in a `u32`.
+fn tuck_limit(code_bits: u32) -> u64 {
+    if code_bits >= u32::BITS { 0 } else { 1 << (u32::BITS - code_bits) }
 }
 
 #[derive(Debug, Default)]
@@ -2030,12 +2118,68 @@ impl<'a> Aggregate<'a> {
         memory.grow(width_of(after.saturating_sub(before)))
     }
 
-    fn buffer_encoded_count<S: Second>(
+    fn buffer_encoded_count(
         &self,
         rows: &Rows,
-        partitions: &mut [EncodedCountRun<S>],
+        records: &mut EncodedRecords,
         memory: &mut Reservation,
     ) -> Result<bool> {
+        let [.., third] = rows.keys.as_slice() else {
+            return Err(Error::internal("an encoded count exchange received no keys"));
+        };
+        let dictionary = third.stable_dictionary_parts();
+        let state = self.encoded_count.get_or_init(|| {
+            dictionary.as_ref().map(|(_, dictionary)| {
+                let leading: Vec<LogicalType> = self.keys[..self.keys.len() - 1]
+                    .iter()
+                    .map(|&key| self.plan.expr_type(key).clone())
+                    .collect();
+                let nulls = dictionary.validity().has_nulls(dictionary.len())
+                    || !nulls_are_in_the_mask(dictionary);
+                let fresh = |code_bits| (Arc::clone(dictionary), leading.clone(), nulls, code_bits);
+                if self.keys.len() == 2 {
+                    EncodedExchange::Two(EncodedCountExchange::new(fresh(u32::BITS)))
+                } else {
+                    EncodedExchange::Three {
+                        tucked: EncodedCountExchange::new(fresh(code_bits(dictionary.len()))),
+                        wide: EncodedCountExchange::new(fresh(u32::BITS)),
+                    }
+                }
+            })
+        });
+        let Some(state) = state else { return Ok(false) };
+        let before = records.footprint();
+        let buffered = match (state, &mut *records) {
+            (EncodedExchange::Two(_), EncodedRecords::Two(runs)) => {
+                self.scatter_encoded_count(rows, state, runs)
+            }
+            (
+                EncodedExchange::Three { tucked, .. },
+                EncodedRecords::Three { tucked: into, wide },
+            ) => {
+                let mut tucking = Tucking {
+                    tucked: into,
+                    wide,
+                    code_bits: tucked.code_bits,
+                    limit: tuck_limit(tucked.code_bits),
+                };
+                self.scatter_encoded_count(rows, state, &mut tucking)
+            }
+            _ => Err(Error::internal("an encoded count exchange changed key width")),
+        };
+        buffered?;
+        let after = records.footprint();
+        memory.grow(width_of(after.saturating_sub(before)))?;
+        Ok(true)
+    }
+
+    /// Every row of a chunk as an encoded count record, into the run its hash picks.
+    fn scatter_encoded_count(
+        &self,
+        rows: &Rows,
+        state: &EncodedExchange,
+        partitions: &mut impl Put,
+    ) -> Result<()> {
         let (first, second, third) = match rows.keys.as_slice() {
             [first, third] => (first, None, third),
             [first, second, third] => (first, Some(second), third),
@@ -2045,41 +2189,20 @@ impl<'a> Aggregate<'a> {
                 ));
             }
         };
-        let dictionary = third.stable_dictionary_parts();
-        let state = self.encoded_count.get_or_init(|| {
-            dictionary.as_ref().map(|(_, dictionary)| {
-                S::wrap(EncodedCountExchange {
-                    dictionary: Arc::clone(dictionary),
-                    leading: self.keys[..self.keys.len() - 1]
-                        .iter()
-                        .map(|&key| self.plan.expr_type(key).clone())
-                        .collect(),
-                    dictionary_nulls: dictionary.validity().has_nulls(dictionary.len())
-                        || !nulls_are_in_the_mask(dictionary),
-                    partitions: (0..RADIX_PARTITIONS)
-                        .map(|_| Mutex::new(EncodedCountRuns::default()))
-                        .collect(),
-                    held: Mutex::new(Vec::new()),
-                })
-            })
-        });
-        let Some(state) = state else { return Ok(false) };
-        let state = S::exchange(state)
-            .ok_or_else(|| Error::internal("an encoded count exchange changed key width"))?;
-        let Some((codes, dictionary)) = dictionary else {
+        let (dictionary_of_state, leading, dictionary_nulls) = state.first();
+        let Some((codes, dictionary)) = third.stable_dictionary_parts() else {
             return Err(Error::internal(
                 "an encoded count exchange changed from dictionary to flat strings",
             ));
         };
-        if !Arc::ptr_eq(&state.dictionary, dictionary) {
+        if !Arc::ptr_eq(dictionary_of_state, dictionary) {
             return Err(Error::internal(
                 "an encoded count exchange received two string code spaces",
             ));
         }
-        if state.leading.len() + 1 != rows.keys.len() {
+        if leading.len() + 1 != rows.keys.len() {
             return Err(Error::internal("an encoded count exchange changed key width"));
         }
-        let before = partitions.iter().map(EncodedCountRun::footprint).sum::<usize>();
         let shift = u32::BITS - RADIX_PARTITIONS.ilog2();
         const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
         // Every key of this chunk read the way the chunk holds it, once, and `None` as soon as one
@@ -2092,9 +2215,7 @@ impl<'a> Aggregate<'a> {
             None => Some(None),
         });
         let plain = plain.filter(|_| {
-            !state.dictionary_nulls
-                && third.len() >= rows.rows
-                && !third.validity().has_nulls(rows.rows)
+            !dictionary_nulls && third.len() >= rows.rows && !third.validity().has_nulls(rows.rows)
         });
         if let Some((first, second)) = plain {
             for (row, &third_code) in codes.iter().enumerate().take(rows.rows) {
@@ -2110,19 +2231,18 @@ impl<'a> Aggregate<'a> {
                     u64::from(third_code),
                 ));
                 let hash = (wide ^ (wide >> 32)) as u32;
-                partitions[(hash >> shift) as usize].scatter(
+                partitions.put(
+                    (hash >> shift) as usize,
                     EncodedCountRecord {
                         first: first_value,
-                        second: S::of(second_value),
+                        second: second_value,
                         hash,
                         third: third_code,
                     },
                     EncodedValid::ALL,
                 );
             }
-            let after = partitions.iter().map(EncodedCountRun::footprint).sum::<usize>();
-            memory.grow(width_of(after.saturating_sub(before)))?;
-            return Ok(true);
+            return Ok(());
         }
         for (row, &third_code) in codes.iter().enumerate().take(rows.rows) {
             let mut valid = if second.is_none() { EncodedValid::SECOND } else { 0 };
@@ -2165,19 +2285,18 @@ impl<'a> Aggregate<'a> {
                 if valid & EncodedValid::THIRD != 0 { u64::from(third_value) } else { NOTHING };
             let wide = spread(mix(mix(mix(0, first_word), second_word), third_word));
             let hash = (wide ^ (wide >> 32)) as u32;
-            partitions[(hash >> shift) as usize].scatter(
+            partitions.put(
+                (hash >> shift) as usize,
                 EncodedCountRecord {
                     first: first_value,
-                    second: S::of(second_value),
+                    second: second_value,
                     hash,
                     third: third_value,
                 },
                 valid,
             );
         }
-        let after = partitions.iter().map(EncodedCountRun::footprint).sum::<usize>();
-        memory.grow(width_of(after.saturating_sub(before)))?;
-        Ok(true)
+        Ok(())
     }
 
     /// Every value of one chunk into the radix partition its hash picks.
@@ -5720,12 +5839,7 @@ impl Sink for Aggregate<'_> {
         }
         if self.encoded_top_count() {
             let timing = stage::Timing::start(Stage::Scatter);
-            let buffered = match encoded_records {
-                EncodedRecords::Two(runs) => self.buffer_encoded_count(&rows, runs, encoded_memory),
-                EncodedRecords::Three(runs) => {
-                    self.buffer_encoded_count(&rows, runs, encoded_memory)
-                }
-            };
+            let buffered = self.buffer_encoded_count(&rows, encoded_records, encoded_memory);
             timing.stop(0);
             if buffered? {
                 *encoded = true;
@@ -5956,8 +6070,12 @@ impl Sink for Aggregate<'_> {
                 (EncodedExchange::Two(state), EncodedRecords::Two(runs)) => {
                     state.take(runs, encoded_memory)?;
                 }
-                (EncodedExchange::Three(state), EncodedRecords::Three(runs)) => {
-                    state.take(runs, encoded_memory)?;
+                (
+                    EncodedExchange::Three { tucked, wide },
+                    EncodedRecords::Three { tucked: tucked_runs, wide: wide_runs },
+                ) => {
+                    tucked.take(tucked_runs, encoded_memory)?;
+                    wide.take(wide_runs, self.memory.reservation())?;
                 }
                 _ => return Err(Error::internal("an encoded count exchange changed key width")),
             }
@@ -6125,8 +6243,17 @@ impl Sink for Aggregate<'_> {
         }
         if let Some(Some(encoded)) = self.encoded_count.get() {
             return match encoded {
-                EncodedExchange::Two(encoded) => self.finalize_encoded(encoded, threads),
-                EncodedExchange::Three(encoded) => self.finalize_encoded(encoded, threads),
+                EncodedExchange::Two(encoded) => {
+                    let chunks = self.finalize_encoded(encoded, threads)?;
+                    self.out.fill(chunks)
+                }
+                // Each side holds groups the other does not, so its best are candidates beside
+                // the other's, and the limit above the aggregate picks among them.
+                EncodedExchange::Three { tucked, wide } => {
+                    let mut chunks = self.finalize_encoded(tucked, threads)?;
+                    chunks.append(&mut self.finalize_encoded(wide, threads)?);
+                    self.out.fill(chunks)
+                }
             };
         }
         if let Some(distinct) = self.bigint_distinct.get() {
@@ -6277,7 +6404,14 @@ fn finish_encoded_count<S: Second>(
             return;
         };
         let done = partition.lock().map_err(poisoned).and_then(|mut rows| {
-            encoded_count_partition(&mut rows, &encoded.dictionary, &encoded.leading, bound, memory)
+            encoded_count_partition(
+                &mut rows,
+                &encoded.dictionary,
+                &encoded.leading,
+                encoded.code_bits,
+                bound,
+                memory,
+            )
         });
         if let Ok(mut slot) = slots[at].lock() {
             *slot = Some(done);
@@ -6341,6 +6475,7 @@ fn encoded_count_partition<S: Second>(
     runs: &mut EncodedCountRuns<S>,
     dictionary: &Vector,
     leading: &[LogicalType],
+    code_bits: u32,
     bound: usize,
     memory: &Memory,
 ) -> Result<Part> {
@@ -6436,6 +6571,7 @@ fn encoded_count_partition<S: Second>(
         let best = largest(counts.len(), bound, |slot| counts[slot]);
         for slot in best {
             let key = partition.rows[slot];
+            let (second, code) = key.second.keys(key.third, code_bits);
             let valid = if all_valid { EncodedValid::ALL } else { partition.validity[slot] };
             let first = if valid & EncodedValid::FIRST != 0 {
                 signed_value(&leading[0], key.first)?
@@ -6443,7 +6579,7 @@ fn encoded_count_partition<S: Second>(
                 Value::Null
             };
             let third = if valid & EncodedValid::THIRD != 0 {
-                dictionary.try_value_at(key.third as usize)?
+                dictionary.try_value_at(code as usize)?
             } else {
                 Value::Null
             };
@@ -6451,7 +6587,7 @@ fn encoded_count_partition<S: Second>(
             row.push(first);
             if keys == 3 {
                 row.push(if valid & EncodedValid::SECOND != 0 {
-                    signed_value(&leading[1], key.second.value())?
+                    signed_value(&leading[1], second)?
                 } else {
                     Value::Null
                 });
@@ -6983,7 +7119,7 @@ impl Aggregate<'_> {
         &self,
         encoded: &EncodedCountExchange<S>,
         threads: &Lease<'_>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Chunk>> {
         let next = AtomicUsize::new(0);
         let slots: Vec<Mutex<Option<Result<Part>>>> =
             (0..RADIX_PARTITIONS).map(|_| Mutex::new(None)).collect();
@@ -7016,7 +7152,7 @@ impl Aggregate<'_> {
             held.push(charge);
         }
         drop(held);
-        self.out.fill(chunks)
+        Ok(chunks)
     }
 
     /// Every partition finished on this thread, which is what one instance means.
@@ -7642,9 +7778,9 @@ mod tests {
         Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
         Distinct, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
         FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
-        RUN_BLOCK, Share, Signed, WINDOW_RATE, WINDOW_SLACK, bigint_distinct_partition,
-        encoded_count_partition, fixed_partition, interior, slot_runs_of, spread_runs,
-        spread_slots,
+        RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
+        bigint_distinct_partition, encoded_count_partition, fixed_partition, interior,
+        slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -8355,6 +8491,7 @@ mod tests {
     #[test]
     fn a_two_key_encoded_count_record_holds_no_second_key() {
         assert_eq!(size_of::<EncodedCountRecord<()>>(), 16);
+        assert_eq!(size_of::<EncodedCountRecord<Tucked>>(), 16);
         assert_eq!(size_of::<EncodedCountRecord<i64>>(), 24);
     }
 
@@ -8376,6 +8513,7 @@ mod tests {
             &mut EncodedCountRuns { runs: vec![partition] },
             &dictionary,
             &leading,
+            u32::BITS,
             10,
             &Memory::unlimited(),
         )
@@ -8434,6 +8572,7 @@ mod tests {
             &mut EncodedCountRuns { runs: vec![early, late] },
             &dictionary,
             &[LogicalType::BigInt],
+            u32::BITS,
             3,
             &Memory::unlimited(),
         )
@@ -8483,6 +8622,7 @@ mod tests {
             &mut EncodedCountRuns { runs: vec![narrow, widest, late] },
             &dictionary,
             &leading,
+            u32::BITS,
             10,
             &Memory::unlimited(),
         )
@@ -8533,6 +8673,7 @@ mod tests {
             &mut EncodedCountRuns { runs: vec![other, folded] },
             &dictionary,
             &leading,
+            u32::BITS,
             10,
             &Memory::unlimited(),
         )
@@ -8580,6 +8721,7 @@ mod tests {
             &mut EncodedCountRuns { runs: vec![partition] },
             &dictionary,
             &leading,
+            u32::BITS,
             10,
             &Memory::unlimited(),
         )
@@ -8812,6 +8954,92 @@ mod tests {
         let mut rows = answer(&out);
         rows.sort_by_key(|row| format!("{row:?}"));
         rows
+    }
+
+    /// A three key count keeps a second key that fits above the string code in a 16 byte record
+    /// and one that does not in a 24 byte one. The same group arrives through both scatter loops,
+    /// once in a chunk with a null in it and once in one without, and has to come out as one count
+    /// however each of its rows was kept. The dictionary is two strings, so the codes take one bit
+    /// and a second key fits below two to the thirty one and at or above zero.
+    #[test]
+    fn a_three_key_count_folds_tucked_and_wide_records_into_the_same_groups() {
+        let plan = Plan::parse(concat!(
+            "Aggregate #1 groups=[#0.0::BIGINT, #0.1::BIGINT, #0.2::VARCHAR] ",
+            "aggregates=[count_star()::BIGINT]\n",
+            "  Get memory.main.t AS t #0 [x::BIGINT, m::BIGINT, y::VARCHAR]",
+        ))
+        .expect("a three-key count plan");
+        let schema = Schema::numbered(
+            vec![
+                Field::new("x", LogicalType::BigInt),
+                Field::new("m", LogicalType::BigInt),
+                Field::new("y", LogicalType::Varchar),
+            ],
+            0,
+        );
+        let rudb_plan::Node::Aggregate { groups, aggregates, .. } = *plan.node(plan.root()) else {
+            panic!("the root is an aggregate")
+        };
+        let (aggregate, out) =
+            Aggregate::new(&plan, &schema, 1, groups, aggregates, &Memory::unlimited())
+                .expect("a count aggregate");
+        let aggregate = aggregate.top_counts(10, 0);
+        let dictionary = Arc::new(
+            Vector::from_values(
+                LogicalType::Varchar,
+                &[Value::Varchar("one".into()), Value::Varchar("two".into())],
+            )
+            .expect("search phrases"),
+        );
+        let top = (1_i64 << 31) - 1;
+        let seconds =
+            [Value::BigInt(3), Value::BigInt(-1), Value::BigInt(top), Value::BigInt(top + 1)];
+        let chunk = |null: bool| {
+            let mut second = seconds.to_vec();
+            let mut first = vec![Value::BigInt(7); 4];
+            if null {
+                second.push(Value::Null);
+                first.push(Value::BigInt(7));
+            }
+            let codes = if null { vec![0, 1, 0, 1, 0] } else { vec![0, 1, 0, 1] };
+            Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &first).expect("user ids"),
+                Vector::from_values(LogicalType::BigInt, &second).expect("minutes"),
+                Vector::stable_dictionary(codes, Arc::clone(&dictionary)).expect("stable codes"),
+            ])
+            .expect("three aligned columns")
+        };
+        let mut local = aggregate.local();
+        aggregate.sink(&chunk(true), &mut local).expect("the chunk with a null");
+        aggregate.sink(&chunk(false), &mut local).expect("the chunk without one");
+        aggregate.combine(local).expect("the one instance");
+        assert!(aggregate.encoded_count.get().is_some(), "the compact path was selected");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+        let mut rows = answer(&out);
+        rows.sort_by_key(|row| format!("{row:?}"));
+        let group = |second: Value, phrase: &str, count| {
+            vec![Value::BigInt(7), second, Value::Varchar(phrase.into()), Value::BigInt(count)]
+        };
+        let mut expected = vec![
+            group(Value::BigInt(3), "one", 2),
+            group(Value::BigInt(-1), "two", 2),
+            group(Value::BigInt(top), "one", 2),
+            group(Value::BigInt(top + 1), "two", 2),
+            group(Value::Null, "one", 1),
+        ];
+        expected.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn a_tucked_second_key_comes_back_apart_from_its_code() {
+        assert_eq!(Tucked.keys(5 << 21 | 12_345, 21), (5, 12_345));
+        assert_eq!(Tucked.keys(u32::MAX, 32), (0, u32::MAX));
+        assert_eq!(Tucked.keys(9, 0), (9, 0));
+        assert_eq!(super::code_bits(2), 1);
+        assert_eq!(super::code_bits(1), 0);
+        assert_eq!(super::tuck_limit(32), 0);
+        assert_eq!(super::tuck_limit(0), 1 << 32);
     }
 
     /// The scatter has two loops that have to agree about what a group is. The first reads the words
