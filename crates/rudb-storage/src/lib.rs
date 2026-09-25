@@ -11,6 +11,7 @@
 
 pub mod count;
 pub mod deletes;
+pub mod hot;
 pub mod memory;
 pub mod sieve;
 pub mod tally;
@@ -18,6 +19,7 @@ pub mod zone;
 
 pub use count::{Counting, Counts, Partial};
 pub use deletes::{DeleteVector, Refusal};
+pub use hot::{HotStripe, Lease};
 pub use memory::MemoryTable;
 pub use sieve::{Blocked, Sieve};
 pub use tally::{TALLY_VALUES, Tally};
