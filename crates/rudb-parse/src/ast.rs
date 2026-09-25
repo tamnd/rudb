@@ -1138,6 +1138,9 @@ pub enum Expr {
     Subquery {
         /// The query.
         query: QueryRef,
+        /// Whether it was written `ARRAY(SELECT ...)`, which is every row of its one column as a
+        /// list rather than the one value of its one row.
+        array: bool,
     },
     /// `EXISTS (SELECT ...)` or its negation.
     Exists {
@@ -1397,6 +1400,9 @@ pub struct Ast {
     /// is the name. Only `unnest` takes them so far, and a side table keeps every other call as it
     /// was rather than carrying an empty list on each.
     pub named_args: Vec<(ExprRef, Slice)>,
+    /// The lists written `ARRAY[...]` rather than `[...]`. They are the same list, and only the
+    /// name of a column holding one tells them apart.
+    pub array_lists: Vec<ExprRef>,
 }
 
 impl Ast {
@@ -1499,6 +1505,11 @@ impl Ast {
             .iter()
             .find(|(held, _)| *held == call)
             .map_or(&[], |&(_, slice)| self.target_list(slice))
+    }
+
+    /// Whether a list was written `ARRAY[...]`.
+    pub fn written_as_array(&self, list: ExprRef) -> bool {
+        self.array_lists.contains(&list)
     }
 
     /// The entries of an order by list.
