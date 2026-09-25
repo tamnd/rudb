@@ -20,6 +20,10 @@
 //! literals are kept in the runtime's heap for the same reason. That is the literal table of
 //! document 07.
 //!
+//! A scalar function with no translator here is not refused. It becomes a `vcall` to a kernel that
+//! runs the first engine's own implementation of it, which the `vcall` module describes, so every
+//! function the first engine has is reachable and gives that engine's answers and errors.
+//!
 //! Every value is a pair of a value and an `i1` that says whether it is valid, and the value under
 //! an invalid one is harmless: a column read puts a zero there, and every operation on harmless
 //! inputs gives a harmless output. That is what lets a trapping add run on a null without a branch
@@ -33,7 +37,7 @@ use rudb_qc_ir::catalogue::proxy;
 use rudb_qc_ir::func::INV;
 use rudb_qc_ir::{Builder, ErrorKind, Field, Module, Op, Ty, Val, dce, verify};
 use rudb_qc_pipe::{Graph, Pipeline, Sink, Stage};
-use rudb_qc_plan::{Aggregate, Expr, Kind, Refusal, Result};
+use rudb_qc_plan::{Aggregate, Column, Expr, Kind, Refusal, Result};
 use rudb_qc_rt::abi::{COL_SIZE, COL_VALID, HEADER, MORSEL_BEGIN, MORSEL_COLS, MORSEL_END};
 use rudb_qc_rt::table::{GroupTable, KeyField, Layout};
 use rudb_qc_rt::{Rt, text};
@@ -236,6 +240,8 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
         loaded: HashMap::new(),
         row: Val::NONE,
         ptrs: Vec::new(),
+        columns: source.to_vec(),
+        next: 0,
     };
     g.b.func_mut().state.push(Field { offset: 0, size: HEADER, name: "header".into() });
 
@@ -254,6 +260,7 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
         g.cols.insert(c, (values, valid, ty));
     }
     let (out, state) = g.prepare_sink(&p.sink)?;
+    g.next = state;
     let st = g.b.st();
     match &out {
         Out::Result { columns, .. } => {
@@ -305,6 +312,7 @@ fn pipeline(stage: usize, p: &Pipeline, module: &mut Module, rt: &mut Rt) -> Res
     let ok = g.b.int(Ty::I64, 0);
     g.b.ret(ok);
 
+    let state = g.next.next_multiple_of(8);
     let mut func = g.b.finish();
     dce(&mut func);
     module.funcs.push(func);
@@ -325,6 +333,10 @@ struct Gen<'a> {
     /// The sink's buffer addresses, read once in the entry block: a result's values and validity
     /// per column, or an aggregate's one row.
     ptrs: Vec<Val>,
+    /// The source's columns, for the names an error message quotes.
+    columns: Vec<Column>,
+    /// Where the next field goes in the state, past the sink's and every `vcall` slot so far.
+    next: u32,
 }
 
 /// A value and whether it is valid.
@@ -727,19 +739,35 @@ impl Gen<'_> {
         self.b.konst(Ty::Ptr, u128::from(h))
     }
 
+    /// A scalar function: inline when there is a translator for this call and a `vcall` to the
+    /// first engine's kernel when there is not.
     fn function(&mut self, name: &str, args: &[Expr], e: &Expr) -> Result<Pair> {
+        match self.inline(name, args, e)? {
+            Some(pair) => Ok(pair),
+            None => self.vcall(name, args, e),
+        }
+    }
+
+    /// The call translated inline, or `None` when no translator takes it. Every check that can say
+    /// no is made before an argument is translated, so a call that falls through to the `vcall`
+    /// has emitted nothing here.
+    fn inline(&mut self, name: &str, args: &[Expr], e: &Expr) -> Result<Option<Pair>> {
         let ty = qir_type(&e.ty)?;
-        let refuse = || {
-            let types = args.iter().map(|a| a.ty.to_string()).collect::<Vec<_>>().join(", ");
-            Refusal::new(format!("{name}({types})"), "the function is not generated")
-        };
-        match (name, args) {
+        // The two's complement add, subtract, multiply and negate with an overflow trap are
+        // what the first engine does for a signed integer, and IEEE arithmetic is what it does for
+        // a float. A decimal and an unsigned integer are left to the kernel.
+        let signed = ty.is_int()
+            && ty != Ty::I1
+            && !unsigned(&e.ty)
+            && !matches!(e.ty, LogicalType::Decimal { .. });
+        let arithmetic = ty.is_float() || signed;
+        Ok(Some(match (name, args) {
             ("+" | "-" | "*", [l, r]) => {
+                if !arithmetic || qir_type(&l.ty)? != ty || qir_type(&r.ty)? != ty {
+                    return Ok(None);
+                }
                 let (a, va) = self.translate(l)?;
                 let (b, vb) = self.translate(r)?;
-                if qir_type(&l.ty)? != ty || qir_type(&r.ty)? != ty {
-                    return Err(refuse());
-                }
                 let valid = self.b.bin(Op::And, va, vb);
                 let v = if ty.is_float() {
                     let op = match name {
@@ -748,11 +776,7 @@ impl Gen<'_> {
                         _ => Op::Fmul,
                     };
                     self.b.bin(op, a, b)
-                } else if ty.is_int()
-                    && ty != Ty::I1
-                    && !unsigned(&e.ty)
-                    && !matches!(e.ty, LogicalType::Decimal { .. })
-                {
+                } else {
                     let (op, word) = match name {
                         "+" => (Op::SaddT, "addition"),
                         "-" => (Op::SsubT, "subtraction"),
@@ -763,69 +787,61 @@ impl Gen<'_> {
                         format!("Overflow in {word} of {}", e.ty.physical_name()),
                     );
                     self.b.checked(op, a, b, err)
-                } else {
-                    return Err(refuse());
                 };
-                Ok((v, valid))
+                (v, valid)
             }
             ("-", [x]) => {
+                if !arithmetic || qir_type(&x.ty)? != ty {
+                    return Ok(None);
+                }
                 let (a, ok) = self.translate(x)?;
                 if ty.is_float() {
-                    Ok((self.b.un(Op::Fneg, a), ok))
-                } else if ty.is_int()
-                    && ty != Ty::I1
-                    && !unsigned(&e.ty)
-                    && !matches!(e.ty, LogicalType::Decimal { .. })
-                {
+                    (self.b.un(Op::Fneg, a), ok)
+                } else {
                     let err = self.error(
                         ErrorKind::Overflow,
                         format!("Overflow in negation of {}", e.ty.physical_name()),
                     );
-                    Ok((self.b.checked_neg(a, err), ok))
-                } else {
-                    Err(refuse())
+                    (self.b.checked_neg(a, err), ok)
                 }
             }
             ("~~" | "!~~" | "~~*" | "!~~*", [s, pattern]) => {
-                let Kind::Constant(Value::Varchar(p)) = &pattern.kind else { return Err(refuse()) };
+                let Kind::Constant(Value::Varchar(p)) = &pattern.kind else { return Ok(None) };
                 let h = self.rt.add_like(p, name.contains('*'));
                 let (s, ok) = self.translate(s)?;
                 let h = self.handle(h);
                 let m = self.rt(proxy_id("str_like"), &[h, s]);
                 let m = if name.starts_with('!') { self.b.un(Op::Not, m) } else { m };
-                Ok((m, ok))
+                (m, ok)
             }
             ("strlen" | "octet_length", [s])
                 if s.ty == LogicalType::Varchar || s.ty == LogicalType::Blob =>
             {
                 let (s, ok) = self.translate(s)?;
                 let n = self.b.un(Op::StrLen, s);
-                Ok((self.b.conv(Op::Zext, n, Ty::I64), ok))
+                (self.b.conv(Op::Zext, n, Ty::I64), ok)
             }
             ("length" | "char_length", [s]) if s.ty == LogicalType::Varchar => {
                 let (s, ok) = self.translate(s)?;
-                Ok((self.rt(proxy_id("str_length"), &[s]), ok))
+                (self.rt(proxy_id("str_length"), &[s]), ok)
             }
             ("lower" | "upper", [s]) if s.ty == LogicalType::Varchar => {
                 let (s, ok) = self.translate(s)?;
                 let id = proxy_id(if name == "lower" { "str_lower" } else { "str_upper" });
-                Ok((self.rt(id, &[s]), ok))
+                (self.rt(id, &[s]), ok)
             }
             ("||", [l, r]) if l.ty == LogicalType::Varchar && r.ty == LogicalType::Varchar => {
                 let (a, va) = self.translate(l)?;
                 let (b, vb) = self.translate(r)?;
                 let valid = self.b.bin(Op::And, va, vb);
-                Ok((self.rt(proxy_id("str_concat"), &[a, b]), valid))
+                (self.rt(proxy_id("str_concat"), &[a, b]), valid)
             }
-            (
-                "regexp_replace" | "regexp_matches" | "regexp_full_match",
-                [s, pattern, rest @ ..],
-            ) => {
+            ("regexp_replace" | "regexp_matches", [s, pattern, rest @ ..]) => {
                 let text = |e: &Expr| match &e.kind {
                     Kind::Constant(Value::Varchar(p)) => Some(p.clone()),
                     _ => None,
                 };
-                let Some(pattern) = text(pattern) else { return Err(refuse()) };
+                let Some(pattern) = text(pattern) else { return Ok(None) };
                 let replace = name == "regexp_replace";
                 let (rewrite, options) = match (replace, rest) {
                     (true, [r]) => (text(r), Some(String::new())),
@@ -835,47 +851,110 @@ impl Gen<'_> {
                     _ => (None, None),
                 };
                 let (Some(rewrite), Some(options)) = (rewrite, options) else {
-                    return Err(refuse());
+                    return Ok(None);
                 };
-                if name == "regexp_full_match" {
-                    return Err(refuse());
-                }
-                let h = self
-                    .rt
-                    .add_regex(&pattern, &rewrite, &options)
-                    .map_err(|err| Refusal::new(format!("{name}({pattern:?})"), err.to_string()))?;
+                // A pattern that does not compile is the kernel's to report, with the first
+                // engine's error, on the first row that reaches it.
+                let Ok(h) = self.rt.add_regex(&pattern, &rewrite, &options) else {
+                    return Ok(None);
+                };
                 let (s, ok) = self.translate(s)?;
                 let h = self.handle(h);
                 let id = proxy_id(if replace { "str_regex_replace" } else { "str_regex" });
-                Ok((self.rt(id, &[h, s]), ok))
+                (self.rt(id, &[h, s]), ok)
             }
             ("date_part" | "datepart" | "extract", [part, x]) => {
-                let Kind::Constant(Value::Varchar(part)) = &part.kind else { return Err(refuse()) };
+                let Kind::Constant(Value::Varchar(part)) = &part.kind else { return Ok(None) };
                 let id = match (part.to_ascii_lowercase().as_str(), &x.ty) {
                     ("minute", LogicalType::Timestamp) => "date_extract_minute",
                     ("year", LogicalType::Date) => "date_extract_year",
-                    _ => return Err(refuse()),
+                    _ => return Ok(None),
                 };
                 if ty != Ty::I64 {
-                    return Err(refuse());
+                    return Ok(None);
                 }
                 let (x, ok) = self.translate(x)?;
-                Ok((self.rt(proxy_id(id), &[x]), ok))
+                (self.rt(proxy_id(id), &[x]), ok)
             }
             ("date_trunc" | "datetrunc", [part, x]) => {
-                let Kind::Constant(Value::Varchar(part)) = &part.kind else { return Err(refuse()) };
+                let Kind::Constant(Value::Varchar(part)) = &part.kind else { return Ok(None) };
                 let id = match (part.to_ascii_lowercase().as_str(), &x.ty, &e.ty) {
                     ("minute", LogicalType::Timestamp, LogicalType::Timestamp) => {
                         "date_trunc_minute"
                     }
                     ("month", LogicalType::Date, LogicalType::Date) => "date_trunc_month",
-                    _ => return Err(refuse()),
+                    _ => return Ok(None),
                 };
                 let (x, ok) = self.translate(x)?;
-                Ok((self.rt(proxy_id(id), &[x]), ok))
+                (self.rt(proxy_id(id), &[x]), ok)
             }
-            _ => Err(refuse()),
+            _ => return Ok(None),
+        }))
+    }
+
+    /// A call with no translator, run by the first engine's own kernel one row at a time.
+    ///
+    /// Each argument is stored in a slot of the state, a sixteen byte value and a validity byte,
+    /// and the kernel writes the answer into one more slot, which is read back after the call. The
+    /// kernel is made here and registered in the runtime and the module together, so the id the
+    /// code carries names the same kernel in both.
+    fn vcall(&mut self, name: &str, args: &[Expr], e: &Expr) -> Result<Pair> {
+        let refuse = |why: &str| {
+            let types = args.iter().map(|a| a.ty.to_string()).collect::<Vec<_>>().join(", ");
+            Refusal::new(format!("{name}({types})"), why)
+        };
+        // The first engine takes a row count from the arguments, and a call with none, `random()`
+        // being the one there is, gets the chunk's instead. A `TRY` is not a function at all but
+        // an expression whose errors become nulls, and a kernel cannot see the expression.
+        if args.is_empty() {
+            return Err(refuse("a function with no arguments is not generated"));
         }
+        if name == "try" {
+            return Err(refuse("TRY is not generated"));
+        }
+        let ty = qir_type(&e.ty)?;
+        for a in args {
+            qir_type(&a.ty)?;
+        }
+        let mut pairs = Vec::with_capacity(args.len());
+        for a in args {
+            pairs.push(self.translate(a)?);
+        }
+        let mut call = vcall::Call::new(name, args, &e.ty, &self.columns);
+        let id = self.rt.add_kernel(Box::new(move |n, buffers| call.run(n, buffers)));
+        if self.module.kernel(name) != id {
+            return Err(Refusal::new(
+                format!("the kernel for {name}"),
+                "the runtime and the module number their kernels differently",
+            ));
+        }
+        let st = self.b.st();
+        let mut buffers = Vec::with_capacity(2 * args.len() + 2);
+        for (k, (v, ok)) in pairs.into_iter().enumerate() {
+            let at = self.slot(&format!("k{id}.arg{k}"));
+            self.b.store(st, Val::NONE, 1, at as i32, v, 0);
+            self.b.store(st, Val::NONE, 1, at as i32 + 16, ok, 0);
+            buffers.push(self.offset(st, at));
+            buffers.push(self.offset(st, at + 16));
+        }
+        let at = self.slot(&format!("k{id}.out"));
+        buffers.push(self.offset(st, at));
+        buffers.push(self.offset(st, at + 16));
+        let one = self.b.int(Ty::I64, 1);
+        self.b.vcall(id, one, &buffers);
+        let v = self.b.load(ty, st, Val::NONE, 1, at as i32, 0);
+        let ok = self.b.load(Ty::I1, st, Val::NONE, 1, at as i32 + 16, 0);
+        Ok((v, ok))
+    }
+
+    /// A value slot of sixteen bytes and a validity byte after it, past everything in the state so
+    /// far.
+    fn slot(&mut self, name: &str) -> u32 {
+        let at = self.next.next_multiple_of(16);
+        self.field(at, 16, name);
+        self.field(at + 16, 1, &format!("{name}.valid"));
+        self.next = at + 17;
+        at
     }
 
     /// The address `base + offset`.
@@ -1111,6 +1190,8 @@ fn acc_size(acc: &Acc) -> Result<u32> {
         AccOp::Distinct(_) => 0,
     })
 }
+
+mod vcall;
 
 #[cfg(test)]
 mod tests;

@@ -151,12 +151,45 @@ fn an_ungrouped_aggregate_updates_the_one_row() {
 }
 
 #[test]
-fn a_function_it_does_not_know_is_refused_by_name() {
+fn a_function_with_no_translator_runs_the_first_engines_kernel_through_a_vcall() {
     let g = graph(concat!(
-        "Project #1 [md5(#0.0::VARCHAR)::VARCHAR AS h]\n",
+        "Project #1 [replace(#0.0::VARCHAR, 'a'::VARCHAR, 'xyz'::VARCHAR)::VARCHAR AS r]\n",
+        "  Get memory.main.a AS a #0 [s::VARCHAR]\n",
+    ));
+    let mut rt = Rt::new(Cancel::new());
+    let query = generate(&g, &mut rt).expect("generates");
+    assert_eq!(query.module.kernels.len(), 1);
+    let Some(Body { sink: Out::Result { count, columns }, state, .. }) = &query.bodies[0] else {
+        panic!("{:?}", query.bodies)
+    };
+    let long = "a string that is longer than twelve bytes";
+    let s = strings(&["a", "", "bb", long, "a", "", "bb", long]);
+    let mut out = vec![0u128; 8];
+    let mut valid = vec![0u8; 8];
+    let mut st = vec![0u8; *state as usize];
+    st[columns[0].values as usize..][..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
+    st[columns[0].valid as usize..][..8]
+        .copy_from_slice(&(valid.as_mut_ptr() as u64).to_le_bytes());
+    run(&query, 0, &mut rt, &[s], &mut st);
+    let n = u64::from_le_bytes(st[*count as usize..][..8].try_into().unwrap());
+    assert_eq!(n, 8);
+    let got: Vec<String> = out
+        .iter()
+        // SAFETY: an answer longer than twelve bytes is in the kernel's heap, which `rt` keeps.
+        .map(|h| String::from_utf8(unsafe { text::bytes(h) }.to_vec()).unwrap())
+        .collect();
+    let replaced = "xyz string thxyzt is longer thxyzn twelve bytes";
+    assert_eq!(got, ["xyz", "", "bb", replaced, "xyz", "", "bb", replaced]);
+    assert!(valid.iter().all(|v| *v == 1));
+}
+
+#[test]
+fn a_function_with_no_arguments_is_refused_by_name() {
+    let g = graph(concat!(
+        "Project #1 [random()::DOUBLE AS r]\n",
         "  Get memory.main.a AS a #0 [s::VARCHAR]\n",
     ));
     let mut rt = Rt::new(Cancel::new());
     let refusal = generate(&g, &mut rt).expect_err("refused");
-    assert_eq!(refusal.what, "md5(VARCHAR)");
+    assert_eq!(refusal.what, "random()");
 }

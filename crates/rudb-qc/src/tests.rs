@@ -2,7 +2,7 @@
 //! check of `spec/compiler/16-testing.md` at its smallest.
 
 use rudb_catalog::{Catalog, QualifiedName};
-use rudb_common::{Cancel, ErrorCode, Field, LogicalType, Memory, Session, Value};
+use rudb_common::{Cancel, Error, ErrorCode, Field, LogicalType, Memory, Session, Value};
 use rudb_pipeline::Pool;
 use rudb_plan::Plan;
 
@@ -174,10 +174,76 @@ fn an_overflow_is_the_error_the_first_engine_raises() {
     assert_eq!(error.code(), ErrorCode::OutOfRange, "{error:?}");
 }
 
+/// Asserts both engines fail on the plan with the same error.
+fn fails_the_same(text: &str) -> Error {
+    let plan = Plan::parse(text).expect("a well formed plan");
+    let first = rudb_exec::build(&plan, &catalog())
+        .expect("the first engine builds")
+        .collect(&Cancel::new(), &Pool::default())
+        .expect_err("the first engine fails");
+    let error = compiled(text).expect_err("the compiled engine fails");
+    assert_eq!(error.code(), first.code(), "{error:?} against {first:?}");
+    assert_eq!(error.to_string(), first.to_string());
+    error
+}
+
 #[test]
-fn a_function_the_generator_does_not_know_is_refused() {
-    let plan = Plan::parse(&format!("Project #1 [md5(#0.1::VARCHAR)::VARCHAR AS h]\n  {SCAN}"))
-        .expect("a well formed plan");
-    let refusal = compile(&plan, &Cancel::new()).expect_err("refused");
-    assert_eq!(refusal.what, "md5(VARCHAR)");
+fn a_function_the_first_engine_does_not_have_fails_the_same_way_on_both() {
+    // `md5` binds, since it is in the signature table, but no kernel computes it. The compiled
+    // engine used to refuse it by name. It runs it through a `vcall` now, and the kernel's error is
+    // the one the first engine raises.
+    fails_the_same(&format!("Project #1 [md5(#0.1::VARCHAR)::VARCHAR AS h]\n  {SCAN}"));
+}
+
+#[test]
+fn a_string_function_without_a_translator_matches_the_first_engine() {
+    same(
+        &format!(
+            "Project #1 [replace(#0.1::VARCHAR, 'a'::VARCHAR, 'xyz'::VARCHAR)::VARCHAR AS r, left(#0.1::VARCHAR, 3::BIGINT)::VARCHAR AS l, #0.1::VARCHAR AS s]\n  {SCAN}"
+        ),
+        true,
+    );
+    same(
+        &format!(
+            "Aggregate #1 groups=[replace(#0.1::VARCHAR, 'a'::VARCHAR, 'xyz'::VARCHAR)::VARCHAR] aggregates=[count_star()::BIGINT]\n  {SCAN}"
+        ),
+        false,
+    );
+}
+
+#[test]
+fn a_function_over_a_null_argument_matches_the_first_engine() {
+    // `concat` skips a null rather than answering null, so the kernel has to be told which
+    // arguments are null rather than being skipped for them.
+    same(
+        &format!(
+            "Project #1 [concat(#0.1::VARCHAR, '!'::VARCHAR)::VARCHAR AS c, concat(NULL::VARCHAR, #0.1::VARCHAR)::VARCHAR AS n, left(#0.1::VARCHAR, 1::BIGINT)::VARCHAR AS l]\n  {SCAN}"
+        ),
+        true,
+    );
+}
+
+#[test]
+fn a_function_over_numbers_matches_the_first_engine() {
+    same(
+        &format!(
+            "Project #1 [abs(#0.0::INTEGER)::INTEGER AS a, \"%\"(#0.0::INTEGER, 7::INTEGER)::INTEGER AS m, \"//\"(#0.0::INTEGER, 3::INTEGER)::INTEGER AS d]\n  Filter (abs(#0.0::INTEGER)::INTEGER > 10::INTEGER)::BOOLEAN\n    {SCAN}"
+        ),
+        true,
+    );
+    same(
+        &format!(
+            "Aggregate #1 groups=[\"%\"(#0.0::INTEGER, 4::INTEGER)::INTEGER] aggregates=[sum(abs(#0.0::INTEGER)::INTEGER)::HUGEINT]\n  {SCAN}"
+        ),
+        false,
+    );
+}
+
+#[test]
+fn an_error_a_function_raises_is_the_error_the_first_engine_raises() {
+    let error = fails_the_same(&format!(
+        "Project #1 [\"//\"(#0.0::INTEGER, 0::INTEGER)::INTEGER AS d]\n  {SCAN}"
+    ));
+    assert_eq!(error.code(), ErrorCode::InvalidInput, "{error:?}");
+    assert!(error.to_string().contains("(x // 0)"), "{error}");
 }
