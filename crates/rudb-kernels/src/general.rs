@@ -20,7 +20,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use crate::aggregate::Accumulator;
 use crate::compare::order_with_nulls;
 use crate::number::{approximate, fit, integral};
-use crate::quantile::{self, Holistic};
+use crate::quantile::{self, Column, Held, Holistic};
 
 /// A running aggregate that is not one of the five the aggregate module keeps inline.
 #[derive(Debug, Clone)]
@@ -53,12 +53,7 @@ pub(crate) enum General {
     Ordered { keys: Vec<(bool, bool)>, rows: Vec<Vec<Value>>, inner: Box<Accumulator> },
     /// The quantiles, `median`, `mad` and `mode`, which hold every value that is not null and the
     /// fraction the call asked for, and answer in [`crate::quantile`].
-    Holistic {
-        values: Vec<Value>,
-        fraction: Option<Value>,
-        measure: Holistic,
-        returns: LogicalType,
-    },
+    Holistic { values: Held, fraction: Option<Value>, measure: Holistic, returns: LogicalType },
 }
 
 /// Which row [`General::Pick`] keeps.
@@ -97,7 +92,7 @@ impl General {
         let moments = |measure| Self::Moments { count: 0, mean: 0.0, squared: 0.0, measure };
         if let Some(measure) = Holistic::named(name) {
             let returns = returns.clone();
-            return Some(Self::Holistic { values: Vec::new(), fraction: None, measure, returns });
+            return Some(Self::Holistic { values: Held::Empty, fraction: None, measure, returns });
         }
         Some(match name {
             "list" => {
@@ -155,7 +150,7 @@ impl General {
                 if fraction.is_none() {
                     *fraction = args.get(1).cloned();
                 }
-                values.push(value.clone());
+                values.push(value);
             }
             Self::Logic { held, all } => {
                 let Value::Boolean(flag) = *value else {
@@ -212,6 +207,31 @@ impl General {
         Ok(())
     }
 
+    /// Whether this state skips nulls and takes the rest of a column through [`Self::push_column`].
+    pub(crate) fn takes_columns(&self) -> bool {
+        matches!(self, Self::Holistic { .. })
+    }
+
+    /// Adds the row of a column a [`Column`] reads, with the fraction read off `args` the first
+    /// time. Nothing happens for a state that [`Self::takes_columns`] says no to.
+    pub(crate) fn push_column(
+        &mut self,
+        column: Column<'_>,
+        row: usize,
+        args: &[rudb_vector::Vector],
+    ) -> Result<()> {
+        let Self::Holistic { values, fraction, .. } = self else {
+            return Ok(());
+        };
+        if fraction.is_none()
+            && let Some(given) = args.get(1)
+        {
+            *fraction = Some(given.try_value_at(row)?);
+        }
+        column.push(values, row);
+        Ok(())
+    }
+
     /// Folds another state for the same call into this one, as if its rows came after these.
     pub(crate) fn combine(&mut self, other: &Self) -> Result<()> {
         match (self, other) {
@@ -225,7 +245,7 @@ impl General {
                 Self::Holistic { values, fraction, .. },
                 Self::Holistic { values: more, fraction: theirs, .. },
             ) => {
-                values.extend(more.iter().cloned());
+                values.append(more);
                 if fraction.is_none() {
                     fraction.clone_from(theirs);
                 }

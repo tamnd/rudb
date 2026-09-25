@@ -63,6 +63,7 @@ use crate::compare::order;
 use crate::fallback::{self, Kernel};
 use crate::general::General;
 use crate::number::{fit, integral, pow10, rescale};
+use crate::quantile::Column;
 use crate::shape::{identity, nulls_of};
 
 /// Where a row that belongs to no accumulator points.
@@ -594,6 +595,16 @@ impl Accumulator {
     /// The same errors [`Accumulator::update`] raises, for the same reasons.
     pub fn update_run(&mut self, args: &[Vector], rows: usize) -> Result<()> {
         if let State::General(general) = &mut self.state {
+            if general.takes_columns()
+                && let Some(input) = args.first()
+                && let Some(column) = Column::of(input, rows)
+            {
+                let valid = input.validity();
+                for row in (0..rows).filter(|&row| valid.is_valid(row)) {
+                    general.push_column(column, row, args)?;
+                }
+                return Ok(());
+            }
             let mut row_args = Vec::with_capacity(args.len());
             for row in 0..rows {
                 row_args.clear();
@@ -1372,6 +1383,22 @@ pub fn update_general(
         return Err(Error::internal(format!("an aggregate handed {rows} rows and less to fold")));
     }
     let into = Where { slots: &slots[..rows], stride, offset, tally: None };
+    let column = match (&states[offset].state, inputs.first()) {
+        (State::General(general), Some(input)) if general.takes_columns() => {
+            Column::of(input, rows).map(|column| (column, input.validity()))
+        }
+        _ => None,
+    };
+    if let Some((column, valid)) = column {
+        for row in (0..rows).filter(|&row| valid.is_valid(row)) {
+            let Some(index) = into.index(row) else { continue };
+            let Some(Accumulator { state: State::General(general) }) = states.get_mut(index) else {
+                return Err(Error::internal(format!("an aggregate state at {index} is not held")));
+            };
+            general.push_column(column, row, inputs)?;
+        }
+        return Ok(true);
+    }
     let mut args = Vec::with_capacity(inputs.len());
     for row in 0..rows {
         let Some(index) = into.index(row) else { continue };
