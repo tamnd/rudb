@@ -10863,6 +10863,83 @@ fn unnest_makes_a_row_per_element_the_way_the_pin_does() {
 }
 
 #[test]
+fn an_unnest_in_the_group_by_runs_under_the_grouping() {
+    let db = Database::new();
+    db.execute("CREATE TABLE g AS SELECT * FROM (VALUES ('a>b'), ('a>c'), ('b')) v(tags)").unwrap();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let split = "unnest(string_split(tags, '>'))";
+    assert_eq!(
+        text(&format!("SELECT {split} AS tag, count(*) FROM g GROUP BY tag ORDER BY tag")),
+        "a,2;b,2;c,1"
+    );
+    assert_eq!(
+        text(&format!("SELECT {split} AS tag, count(*) FROM g GROUP BY {split} ORDER BY tag")),
+        "a,2;b,2;c,1"
+    );
+    assert_eq!(
+        text(&format!("SELECT upper({split}) AS t, count(*) FROM g GROUP BY t ORDER BY t")),
+        "A,2;B,2;C,1"
+    );
+    assert_eq!(
+        text(
+            "SELECT unnest([1, 2]) AS a, unnest([10, 20]) AS b, count(*) FROM range(1) GROUP BY a, b ORDER BY a"
+        ),
+        "1,10,1;2,20,1"
+    );
+    assert_eq!(
+        text(
+            "SELECT unnest([1, 2]) AS g, unnest([10, 20]) AS s, count(*) FROM range(1) GROUP BY g ORDER BY g, s"
+        ),
+        "1,10,1;1,20,1;2,10,1;2,20,1"
+    );
+    assert_eq!(text("SELECT count(*) FROM range(3) GROUP BY unnest([1, 1, 2]) ORDER BY 1"), "3;6");
+    assert_eq!(
+        failure(&db, "SELECT unnest(['a']) AS tag, count(*) FROM range(1) GROUP BY ALL"),
+        "Cannot group on an UNNEST or UNLIST clause"
+    );
+    assert_eq!(
+        failure(&db, "SELECT count(*) FROM range(1) GROUP BY lower(unnest({'a': 'x'}))"),
+        "UNNEST of struct cannot be used in GROUP BY clause"
+    );
+    assert_eq!(
+        failure(&db, "SELECT count(*) FROM range(3) t(i) GROUP BY unnest([sum(i)])"),
+        "GROUP BY clause cannot contain aggregates!"
+    );
+    assert_eq!(
+        failure(&db, "SELECT 1 FROM range(3) t(i) WHERE sum(i) > 1"),
+        "WHERE clause cannot contain aggregates!"
+    );
+}
+
+#[test]
+fn a_series_or_an_unnest_can_read_a_query_in_its_arguments() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(text("SELECT * FROM range((SELECT 2), (SELECT 5))"), "2;3;4");
+    assert_eq!(text("SELECT * FROM unnest((SELECT [1, 2])) AS t(i)"), "1;2");
+    assert_eq!(
+        text("SELECT count(*) FROM unnest((SELECT list(range) FROM range(4000))) AS t(i)"),
+        "4000"
+    );
+    assert_eq!(
+        text("SELECT a.x, b.y FROM unnest((SELECT [1, 2])) a(x), range((SELECT 1)) b(y)"),
+        "1,0;2,0"
+    );
+}
+
+#[test]
 fn unnest_of_a_struct_is_a_column_per_field_the_way_the_pin_does() {
     let db = Database::new();
     db.execute(
