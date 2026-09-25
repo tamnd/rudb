@@ -138,35 +138,33 @@ fn answer(database: &Database, engine: &str, sql: &str) -> Answer {
 /// Whether two answers to a query that ends in `LIMIT` differ only in which of a run of tied rows
 /// each engine kept.
 ///
-/// The query is run again with the `LIMIT` and `OFFSET` taken off, on both engines. The two full
-/// answers have to agree, and every row either engine kept has to be one of them. That proves the
-/// rows are right and leaves only the choice among equals, which SQL does not pin down. It does
-/// not prove the compiled engine chose from the right run of ties, but its sort is the same
-/// comparison the first engine's is, and that is tested on its own in `rudb-qc`.
+/// The query is run again on the first engine with the `LIMIT` and `OFFSET` taken off, and every
+/// row either engine kept has to be one of its rows, counting repeats. That proves the rows are
+/// right and leaves only the choice among equals, which SQL does not pin down. It does not prove
+/// the compiled engine chose from the right run of ties, but its sort is the same comparison the
+/// first engine's is, and that is tested on its own in `rudb-qc`.
+///
+/// The full answer can be every group of ten million rows (q33), so it is read one row at a time
+/// and only the rows the two limited answers hold are counted, instead of keeping it all.
 fn tied(database: &Database, sql: &str, a: &[Vec<Value>], b: &[Vec<Value>]) -> bool {
     let Some(at) = sql.rfind(" LIMIT ") else { return false };
-    let whole = &sql[..at];
-    let (Ok(first), Ok(compiled)) =
-        (answer(database, "first", whole).rows, answer(database, "compiled", whole).rows)
-    else {
+    if a.len() != b.len() || database.execute("SET engine = 'first'").is_err() {
         return false;
-    };
-    agree(&first, &compiled) && within(a, &first) && within(b, &first)
-}
-
-/// Whether every row of `part` is a row of `whole`, counting repeats.
-fn within(part: &[Vec<Value>], whole: &[Vec<Value>]) -> bool {
-    let mut left: BTreeMap<String, usize> = BTreeMap::new();
-    for row in whole {
-        *left.entry(format!("{row:?}")).or_default() += 1;
     }
-    part.iter().all(|row| match left.get_mut(&format!("{row:?}")) {
-        Some(n) if *n > 0 => {
-            *n -= 1;
-            true
+    let Ok(whole) = database.query(&sql[..at]) else { return false };
+    let mut wanted: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    for row in a {
+        wanted.entry(format!("{row:?}")).or_default().0 += 1;
+    }
+    for row in b {
+        wanted.entry(format!("{row:?}")).or_default().1 += 1;
+    }
+    for row in whole.rows() {
+        if let Some(seen) = wanted.get_mut(&format!("{row:?}")) {
+            seen.2 += 1;
         }
-        _ => false,
-    })
+    }
+    wanted.values().all(|&(a, b, seen)| a <= seen && b <= seen)
 }
 
 /// Whether two answers hold the same rows, in any order.
