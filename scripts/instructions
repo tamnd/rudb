@@ -19,6 +19,29 @@ against DuckDB is the other one, and it is the same measurement with a different
 `--before-engine` and `--after-engine` pick how each side is invoked rather than there being a second
 script.
 
+One binary against itself is the third use, and it is what an ablation is. `--ablate NAME` runs the
+baseline side with that setting off and the side under test with it on, so `--after` can be left out
+and one build measured against itself. That is what `spec/stats/09-measurement.md` section 9.2 asks
+for when it says every rule is behind its own switch: a rule that cannot be turned off cannot be
+measured, and the thing that measures it is this script with two values of one switch rather than two
+different builds. A ratio under 1.000x is the rule earning something. `--before-set` and `--after-set`
+are the general form, for a switch whose two interesting values are not on and off.
+
+Both sides want the same number of settings, which is why `--ablate` gives one to each rather than
+giving the off side a switch the other side has not got. One extra `SET` on one side is worth about
+0.7 M instructions at start up, which the `SELECT 1` subtraction takes back out, and on ClickBench
+`q12` it also moved the query itself by 0.9 percent, reproducibly, with a setting at its default
+value. Two sides that differ in one value and nothing else read 1.000x on all 43 with nothing above
+1.001x. So the script says so when the two sides name different settings, rather than leaving that to
+be found in a table.
+
+`--plans` goes with an ablation. It runs `EXPLAIN` on both sides and marks the queries whose plan came
+out different, which is the queries the switch reached, and then reports the median ratio over those
+separately from the median over the rest. A rule's number on the queries it fired on is the number
+worth reading, and its number on the queries it did not reach is the check that it cost nothing to
+ask. A plan that did not change and a count that did is a rule leaking into the executor rather than
+the planner, and that is worth knowing too.
+
 The protocol is one query per process, one thread, one discarded run a side, then several rounds with
 the order of the two sides alternating and the lowest count of each side taken, and the count of
 `SELECT 1` on the same binary subtracted so what is left is the query rather than the process start
@@ -38,6 +61,7 @@ as root or setting `perf_event_paranoid` below two.
 """
 
 import argparse
+import collections
 import pathlib
 import re
 import statistics
@@ -47,12 +71,22 @@ import sys
 # The suite as the rest of the tree reads it, one query a line under a `-- qNN` comment.
 SUITE = pathlib.Path(__file__).resolve().parent.parent / 'crates' / 'rudb' / 'testdata' / 'tpch.sql'
 
+# Everything that distinguishes one side of the comparison from the other. The settings are in it
+# because an ablation is two sides that differ in nothing else, and a side that carried its binary in
+# one variable and its settings in another is a side that can be passed half of.
+Side = collections.namedtuple('Side', 'name engine binary database sets')
 
-def queries(path, only):
+
+def queries(path, only=None, without=None):
     """The named queries of a file holding one query a line under a `-- qNN` comment.
 
     A query is one line there on purpose, so this does not have to count semicolons to find where one
     ends.
+
+    `without` is how a suite keeps its answer check while one query is left out of it. The case that
+    wants it is a query whose `ORDER BY` is not a total order, where two plans agree on the rows and
+    disagree on which of two tied ones comes first, and dropping the whole check because of one of
+    those is dropping it for the forty two that would have caught something.
     """
     named = []
     name = None
@@ -64,12 +98,14 @@ def queries(path, only):
         elif line and not line.startswith('--') and name:
             named.append((name, line.rstrip(';')))
             name = None
-    if only:
-        wanted = set(only)
-        named = [pair for pair in named if pair[0] in wanted]
-        missing = wanted - {name for name, _ in named}
+    for wanted, keep in ((only, True), (without, False)):
+        if not wanted:
+            continue
+        asked = set(wanted)
+        missing = asked - {name for name, _ in named}
         if missing:
             sys.exit(f'no such query in {path}: {" ".join(sorted(missing))}')
+        named = [pair for pair in named if (pair[0] in asked) == keep]
     if not named:
         sys.exit(f'no queries found in {path}')
     return named
@@ -92,26 +128,35 @@ def instructions(stderr):
     return None
 
 
-def command(engine, binary, database, sql, threads):
+def command(side, sql, threads):
     """The command line one engine wants for one query in one process.
 
-    rudb takes the thread count as an option so that it is set before the database is opened. DuckDB
-    has no such option and takes a `SET` in front of the query instead, which is the same thing for a
-    single statement since there is nothing before it to be affected.
+    rudb takes the thread count as an option so that it is set before the database is opened, and
+    takes every other setting the same way. DuckDB has no such option and takes a `SET` in front of
+    the query instead, which is the same thing for a single statement since there is nothing before it
+    to be affected.
+
+    A setting is written `name=value` on the command line either way. The rules of
+    `crates/rudb-common/src/rules.rs` have dots in their names and DuckDB's grammar has no dot in an
+    identifier, which is why the rudb side passes them as flags and lets the binary quote them.
     """
-    if engine == 'rudb':
-        return [str(binary), '--set', f'threads={threads}', '-readonly', str(database), '-c', sql]
-    return [str(binary), '-readonly', str(database), '-c', f'SET threads={threads}; {sql}']
+    if side.engine == 'rudb':
+        sets = [part for pair in side.sets for part in ('--set', pair)]
+        return ([str(side.binary), '--set', f'threads={threads}'] + sets
+                + ['-readonly', str(side.database), '-c', sql])
+    ahead = ''.join(f"SET {name} = '{value}'; "
+                    for name, value in (pair.split('=', 1) for pair in side.sets))
+    return [str(side.binary), '-readonly', str(side.database), '-c',
+            f'SET threads={threads}; {ahead}{sql}']
 
 
-def ran(engine, binary, database, sql, threads):
+def ran(side, sql, threads):
     """One query in one new process, as a count of instructions and the answer it printed."""
     made = subprocess.run(
-        ['perf', 'stat', '-e', 'instructions:u', '-x,']
-        + command(engine, binary, database, sql, threads),
+        ['perf', 'stat', '-e', 'instructions:u', '-x,'] + command(side, sql, threads),
         capture_output=True, text=True, check=False)
     if made.returncode:
-        sys.exit(f'{binary} failed on {sql[:70]}: {made.stderr[-600:]}')
+        sys.exit(f'{side.binary} failed on {sql[:70]}: {made.stderr[-600:]}')
     counted = instructions(made.stderr)
     if counted is None:
         sys.exit(f'no count from perf, is the counter readable here: {made.stderr[-600:]}')
@@ -123,8 +168,8 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--before', required=True, type=pathlib.Path,
                         help='the baseline binary')
-    parser.add_argument('--after', required=True, type=pathlib.Path,
-                        help='the binary under test')
+    parser.add_argument('--after', type=pathlib.Path,
+                        help='the binary under test, the baseline again when left out')
     parser.add_argument('--before-engine', default='rudb', choices=('rudb', 'duckdb'),
                         help='how to invoke the baseline binary')
     parser.add_argument('--after-engine', default='rudb', choices=('rudb', 'duckdb'),
@@ -137,6 +182,8 @@ def main():
                         help='the query file, one query a line under a -- qNN comment')
     parser.add_argument('--only', nargs='+', metavar='qNN',
                         help='measure only these queries rather than all of them')
+    parser.add_argument('--except', nargs='+', metavar='qNN', dest='without',
+                        help='leave these queries out, for one whose ORDER BY is not a total order')
     parser.add_argument('--rounds', type=int, default=3,
                         help='alternating rounds a query, the lowest count of each side taken')
     parser.add_argument('--threads', type=int, default=1,
@@ -145,53 +192,79 @@ def main():
                         help='how far from 1.000x a query has to be to get marked')
     parser.add_argument('--skip-answers', action='store_true',
                         help='measure without comparing the answers first, for a known rewrite')
+    parser.add_argument('--before-set', action='append', default=[], metavar='NAME=VALUE',
+                        help='a setting the baseline side runs with, repeatable')
+    parser.add_argument('--after-set', action='append', default=[], metavar='NAME=VALUE',
+                        help='a setting the side under test runs with, repeatable')
+    parser.add_argument('--ablate', action='append', default=[], metavar='NAME',
+                        help='off on the baseline side and on the other, repeatable')
+    parser.add_argument('--plans', action='store_true',
+                        help='mark the queries whose EXPLAIN differs and report those separately')
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error('--rounds must be positive')
     if sys.platform != 'linux':
         parser.error('perf is Linux only')
+    for pair in args.before_set + args.after_set:
+        if '=' not in pair:
+            parser.error(f'a setting is written name=value, not {pair}')
+    for rule in args.ablate:
+        args.before_set.append(f'{rule}=off')
+        args.after_set.append(f'{rule}=on')
+    switches = {pair.split('=', 1)[0] for pair in args.before_set}
+    if switches != {pair.split('=', 1)[0] for pair in args.after_set}:
+        print('the two sides name different settings, so one of them runs a SET the other does not, '
+              'and the paragraph at the top of this script says what that is worth')
 
-    named = queries(args.queries, args.only)
-    after_database = args.after_database or args.database
-    sides = [('before', args.before_engine, args.before, args.database),
-             ('after', args.after_engine, args.after, after_database)]
+    named = queries(args.queries, args.only, args.without)
+    sides = [Side('before', args.before_engine, args.before, args.database, args.before_set),
+             Side('after', args.after_engine, args.after or args.before,
+                  args.after_database or args.database, args.after_set)]
 
     print(f'{len(named)} queries, {args.rounds} rounds, threads={args.threads}')
+    for side in sides:
+        if side.sets:
+            print(f'{side.name}  {" ".join(side.sets)}')
     # The start up cost is taken the same way a query is, lowest of the rounds, since it is
     # subtracted from every query and a high reading here would flatter every ratio below.
-    base = {}
-    for side, engine, binary, database in sides:
-        base[side] = min(ran(engine, binary, database, 'SELECT 1', args.threads)[0]
-                         for _ in range(args.rounds))
+    base = {side.name: min(ran(side, 'SELECT 1', args.threads)[0] for _ in range(args.rounds))
+            for side in sides}
     print(f'SELECT 1  before {base["before"] / 1e6:.1f}M  after {base["after"] / 1e6:.1f}M')
 
     if args.skip_answers:
         print('not comparing answers, --skip-answers was given')
     else:
-        changed = []
-        for name, sql in named:
-            answers = {side: ran(engine, binary, database, sql, args.threads)[1]
-                       for side, engine, binary, database in sides}
-            if answers['before'] != answers['after']:
-                changed.append(name)
+        changed = [name for name, sql in named
+                   if len({ran(side, sql, args.threads)[1] for side in sides}) > 1]
         if changed:
             sys.exit(f'answers changed on {" ".join(changed)}, not measuring')
         print(f'all {len(named)} answers unchanged')
 
+    # The plans are asked for before anything is measured, for the same reason the answers are: it is
+    # one run a side a query and it decides how the table below is read.
+    differed = set()
+    if args.plans:
+        for name, sql in named:
+            if len({ran(side, f'EXPLAIN {sql}', args.threads)[1] for side in sides}) > 1:
+                differed.add(name)
+        listed = " ".join(name for name, _ in named if name in differed)
+        print(f'{len(differed)} plans differ{":" if differed else ""} {listed}'.rstrip())
+
     print()
     total = {'before': 0.0, 'after': 0.0}
+    ratios = {True: [], False: []}
     for name, sql in named:
-        counted = {'before': [], 'after': []}
+        counted = {side.name: [] for side in sides}
         # One run a side that nothing counts, so the pages this query reads are in the page cache
         # before any number is kept. This matters much less now that the counter is user only, but a
         # first run still pays for its own lazy binding and its own heap growth, and neither of those
         # is what is being compared.
-        for side, engine, binary, database in sides:
-            ran(engine, binary, database, sql, args.threads)
+        for side in sides:
+            ran(side, sql, args.threads)
         for round_at in range(args.rounds):
             order = sides if round_at % 2 == 0 else sides[::-1]
-            for side, engine, binary, database in order:
-                counted[side].append(ran(engine, binary, database, sql, args.threads)[0])
+            for side in order:
+                counted[side.name].append(ran(side, sql, args.threads)[0])
         took = {side: min(counted[side]) - base[side] for side in counted}
         # The spread is printed because it is the only check the reader has on the run. At ring 3 on
         # a quiet corpus it comes out under a tenth of a percent, and a query showing a percent is a
@@ -201,11 +274,21 @@ def main():
         for side in total:
             total[side] += took[side]
         ratio = took['after'] / took['before'] if took['before'] else 0.0
+        ratios[name in differed].append(ratio)
         mark = '  <<<' if abs(ratio - 1.0) > args.moved else ''
+        plan = '  plan' if name in differed else ''
         print(f'{name}  {took["before"] / 1e6:9.1f}M  {took["after"] / 1e6:9.1f}M  '
-              f'{ratio:.3f}x  {spread:4.2f}%{mark}')
+              f'{ratio:.3f}x  {spread:4.2f}%{mark}{plan}')
     ratio = total['after'] / total['before'] if total['before'] else 0.0
     print(f'\nsuite  {total["before"] / 1e9:.2f}G  {total["after"] / 1e9:.2f}G  {ratio:.3f}x')
+    if args.plans:
+        # The median rather than the mean, because one query that moved by half would carry a mean
+        # over forty three of them and the question here is what the typical reached query did.
+        for reached, label in ((True, 'plan changed'), (False, 'plan the same')):
+            if ratios[reached]:
+                spanned = ratios[reached]
+                print(f'{label}  {len(spanned)} queries  median {statistics.median(spanned):.3f}x  '
+                      f'worst {max(spanned):.3f}x  best {min(spanned):.3f}x')
 
 
 if __name__ == '__main__':
