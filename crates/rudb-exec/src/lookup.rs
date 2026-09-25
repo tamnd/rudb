@@ -7,7 +7,7 @@
 //! does the hashing, the probing and the key comparison, all of it column at a time and a batch at
 //! a time, and the chain beside it turns the slot it answers with into the rows the join wanted.
 //!
-//! The chain is two arrays and no allocation per key. `head[slot]` is the first row of a key and
+//! The chain is two arrays and no allocation per key. `head[slot]` names the first row of a key and
 //! `next[row]` is the row after that one, so a key with a thousand matches costs a thousand `u32`
 //! in a run that was allocated once, rather than a `Vec` per distinct key that the allocator has to
 //! be asked for and that a probe has to chase a pointer to reach. What this replaces was a
@@ -48,6 +48,7 @@
 //! value and its nulls are stored and compared, which the table already does, because a group by
 //! puts every null in one group and that is the same question.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use rudb_common::{Cancel, Error, LogicalType, Result};
@@ -107,7 +108,12 @@ pub(crate) struct Lookup {
     parts: Vec<Part>,
     /// How many of the hash's top bits name the partition. Zero when there is only one.
     bits: u32,
-    /// The first gathered row of each distinct key, by slot, partitions laid end to end.
+    /// One more than the first gathered row of each distinct key, by slot, partitions laid end to
+    /// end, and zero for a slot with no row.
+    ///
+    /// One more so that empty is zero, which is what lets the direct form ask the system for
+    /// zeroed memory rather than fill millions of places with [`NONE`] on one thread before any
+    /// partition starts. Taking the one off again turns zero into [`NONE`] with no branch.
     head: Vec<u32>,
     /// The next gathered row with the same key, by gathered row, [`NONE`] at the end of a chain.
     ///
@@ -201,8 +207,8 @@ impl Lookup {
     /// agreeing on the low bits of its bucket, which is one bucket in `parts` used and the rest
     /// empty.
     ///
-    /// The rows are dealt into their partitions once, in two passes over the hashes, before any
-    /// partition starts. See `deal_rows` for why that is not a pass per partition.
+    /// The rows are dealt into their partitions once, a slice of the side per thread, before any
+    /// partition starts. See `deal` for why that is not a pass per partition.
     ///
     /// # Errors
     ///
@@ -216,25 +222,6 @@ impl Lookup {
         threads: &Lease<'_>,
         cancel: &Cancel,
     ) -> Result<Self> {
-        Self::build_among(keys, rows, nulls, None, threads, cancel)
-    }
-
-    /// The same, leaving out every row `allowed` says no to, as if its key held a rejected null.
-    ///
-    /// For a join that knows some of its gathered rows cannot match any driving row. See
-    /// [`Probe::narrowed_by`](crate::join::Probe::narrowed_by).
-    ///
-    /// # Errors
-    ///
-    /// The ones [`Lookup::build`] raises.
-    pub(crate) fn build_among(
-        keys: &[Vector],
-        rows: usize,
-        nulls: &[bool],
-        allowed: Option<&[bool]>,
-        threads: &Lease<'_>,
-        cancel: &Cancel,
-    ) -> Result<Self> {
         if rows >= NONE as usize {
             return Err(too_many_rows());
         }
@@ -243,11 +230,6 @@ impl Lookup {
         }
         let mut keyed = Vec::new();
         which_are_keyed(keys, rows, nulls, &mut keyed);
-        if let Some(allowed) = allowed {
-            for (keyed, &allowed) in keyed.iter_mut().zip(allowed) {
-                *keyed = *keyed && allowed;
-            }
-        }
         if let Some(direct) = Self::direct(keys, rows, nulls, &keyed, threads, cancel)? {
             return Ok(direct);
         }
@@ -258,9 +240,10 @@ impl Lookup {
         let count = 1usize << bits;
         let next: Vec<AtomicU32> = (0..rows).map(|_| AtomicU32::new(NONE)).collect();
         let types: Vec<LogicalType> = keys.iter().map(|key| key.logical_type().clone()).collect();
-        let (starts, dealt) = deal_rows(&hashes, &keyed, bits, count);
+        let dealt =
+            deal(rows, count, threads, |row| keyed[row].then(|| part_of(hashes[row], bits)))?;
         let one = |part: usize| -> Result<(Table, Vec<u32>, usize)> {
-            let mine = &dealt[starts[part]..starts[part + 1]];
+            let mine = dealt.iter().map(|slice| slice[part].as_slice());
             fill(mine, &types, keys, &hashes, &next, cancel)
         };
         let filled = in_parallel(threads, count, threads.degree(), "join table partition", one)?;
@@ -280,11 +263,15 @@ impl Lookup {
     /// The direct form, when the key is one integer column compared with `=` and its keyed values
     /// span at most [`PLACES`] places a gathered row. `None` for anything else.
     ///
-    /// One pass for the range and one to thread the chains, both in row order, so a key's rows come
-    /// out of its chain in the order the side holds them, as they do from the table. A side of
-    /// [`SPLIT`] rows or more is dealt first into partitions that each own a run of places, the
-    /// way the table deals by the top bits of the hash, so each thread fills its own part of
-    /// `head` and the only array they share is `next`, where each writes the rows it owns.
+    /// Every pass over the side is split across the lease. The range is a smallest and a largest
+    /// per slice of rows, and the rows are dealt a slice per thread into partitions that each own a
+    /// run of places, a power of two of them so that a row's partition is a shift. Each partition
+    /// then writes its own part of one `head`, which is allocated zeroed and never filled, because
+    /// an empty place is a zero there and the memory the system hands out is zeroes already. So the
+    /// pages of `head` are first touched by the thread that owns them, and there is no copy of the
+    /// partitions end to end at the finish. A partition reads its rows last to first and puts each
+    /// at the front of its chain, which leaves a key's rows in the order the side holds them with
+    /// no tail to keep.
     fn direct(
         keys: &[Vector],
         rows: usize,
@@ -301,13 +288,22 @@ impl Lookup {
         if !key.signed_block(&mut block) || block.len() < rows {
             return Ok(None);
         }
-        let (mut low, mut high) = (i64::MAX, i64::MIN);
-        for (&value, &keyed) in block[..rows].iter().zip(keyed) {
-            if keyed {
-                low = low.min(value);
-                high = high.max(value);
+        let slices = slices_of(rows, threads.degree());
+        let size = rows.div_ceil(slices);
+        let range = |slice: usize| -> Result<(i64, i64)> {
+            let (mut low, mut high) = (i64::MAX, i64::MIN);
+            let within = slice * size..((slice + 1) * size).min(rows);
+            for (&value, &keyed) in block[within.clone()].iter().zip(&keyed[within]) {
+                if keyed {
+                    low = low.min(value);
+                    high = high.max(value);
+                }
             }
-        }
+            Ok((low, high))
+        };
+        let ranges = in_parallel(threads, slices, slices, "join index range", range)?;
+        let low = ranges.iter().map(|&(low, _)| low).min().unwrap_or(i64::MAX);
+        let high = ranges.iter().map(|&(_, high)| high).max().unwrap_or(i64::MIN);
         if low > high {
             return Ok(None);
         }
@@ -329,55 +325,52 @@ impl Lookup {
             None => place_of(row),
         };
         let first_at = |place: usize| match &ranked {
-            Some(ranked) => ranked.below(place),
+            Some(ranked) if place < places => ranked.below(place),
+            Some(ranked) => ranked.keys,
             None => place.min(places),
         };
         let next: Vec<AtomicU32> = (0..rows).map(|_| AtomicU32::new(NONE)).collect();
         let count = 1usize << split_into(rows, threads.degree());
-        // A whole number of words, so that where a partition starts is a count the ranked form
-        // keeps rather than one it has to work out.
-        let run = places.div_ceil(count).next_multiple_of(64);
-        let mut starts = vec![0; count + 1];
-        for row in (0..rows).filter(|&row| keyed[row]) {
-            starts[place_of(row) / run + 1] += 1;
-        }
+        // A power of two and a whole number of words, so that a row's partition is a shift and
+        // where a partition starts is a count the ranked form keeps rather than one it works out.
+        let run = places.div_ceil(count).next_power_of_two().max(64);
+        let shift = run.trailing_zeros();
+        let count = places.div_ceil(run);
+        let dealt = deal(rows, count, threads, |row| keyed[row].then(|| place_of(row) >> shift))?;
+        let mut head = vec![0u32; first_at(places)];
+        let mut shares: Vec<Mutex<&mut [u32]>> = Vec::with_capacity(count);
+        let mut rest = head.as_mut_slice();
         for part in 0..count {
-            starts[part + 1] += starts[part];
+            let (mine, after) =
+                rest.split_at_mut(first_at((part + 1) * run) - first_at(part * run));
+            shares.push(Mutex::new(mine));
+            rest = after;
         }
-        let mut at = starts.clone();
-        let mut dealt = vec![0; starts[count]];
-        for row in (0..rows).filter(|&row| keyed[row]) {
-            let part = place_of(row) / run;
-            dealt[at[part]] = row;
-            at[part] += 1;
-        }
-        let one = |part: usize| -> Result<(Vec<u32>, usize)> {
+        let one = |part: usize| -> Result<usize> {
             let base = first_at(part * run);
-            let len = first_at((part + 1) * run) - base;
-            let mut head = vec![NONE; len];
-            let mut tail = vec![NONE; len];
+            let mut mine = shares[part].lock().map_err(|_| Error::internal("a poisoned share"))?;
+            // Written before it is read, although it is zeroes already. A page of fresh memory that
+            // is read first is mapped to the one shared page of zeroes, and the write after that
+            // is a copy of it and a flush of every processor's view of this process. On q09 that
+            // flush was four percent of the query. Written first, a page is one fault.
+            mine.fill(0);
             let mut distinct = 0;
-            for &row in &dealt[starts[part]..starts[part + 1]] {
-                let place = slot_of(row) - base;
-                let at = row as u32;
-                if tail[place] == NONE {
-                    head[place] = at;
-                    distinct += 1;
-                } else {
-                    next[tail[place] as usize].store(at, Ordering::Relaxed);
+            for slice in dealt.iter().rev() {
+                for &row in slice[part].iter().rev() {
+                    let place = slot_of(row) - base;
+                    let first = mine[place];
+                    distinct += usize::from(first == 0);
+                    next[row].store(first.wrapping_sub(1), Ordering::Relaxed);
+                    mine[place] = row as u32 + 1;
                 }
-                tail[place] = at;
             }
-            Ok((head, distinct))
+            Ok(distinct)
         };
-        let filled = in_parallel(threads, count, threads.degree(), "join index partition", one)?;
-        let mut head = Vec::with_capacity(first_at(places));
-        let mut distinct = 0;
-        for (mine, held) in filled {
-            head.extend(mine);
-            distinct += held;
-        }
-        let kept = dealt.len();
+        let distinct = in_parallel(threads, count, threads.degree(), "join index partition", one)?
+            .into_iter()
+            .sum();
+        drop(shares);
+        let kept = dealt.iter().flatten().map(Vec::len).sum();
         Ok(Some(Self {
             parts: Vec::new(),
             bits: 0,
@@ -491,7 +484,7 @@ impl Lookup {
             match ranked {
                 Some(ranked) => ranked.slot(place),
                 None => {
-                    (place < places && self.head[place as usize] != NONE).then_some(place as usize)
+                    (place < places && self.head[place as usize] != 0).then_some(place as usize)
                 }
             }
         };
@@ -569,7 +562,11 @@ impl Lookup {
     /// flight at once, where the row loop had one and waited it out before the next.
     pub(crate) fn firsts(&self, slots: &[usize], into: &mut Vec<u32>) {
         into.clear();
-        into.extend(slots.iter().map(|&slot| self.head.get(slot).copied().unwrap_or(NONE)));
+        into.extend(
+            slots
+                .iter()
+                .map(|&slot| self.head.get(slot).map_or(NONE, |&first| first.wrapping_sub(1))),
+        );
     }
 
     /// The gathered rows of the chain that starts at `first`, which [`Lookup::firsts`] handed out.
@@ -597,7 +594,7 @@ impl Lookup {
         if slot == MISS {
             return;
         }
-        let mut at = self.head[slot];
+        let mut at = self.head[slot].wrapping_sub(1);
         while at != NONE {
             into.push(at);
             at = self.next[at as usize].load(Ordering::Relaxed);
@@ -607,11 +604,12 @@ impl Lookup {
 
 /// One partition of the build: the rows whose hash names it, in the order the side holds them.
 ///
-/// Everything here belongs to this partition alone except `next`, and the entries of that it writes
-/// are the rows it owns, so nothing it touches is touched by another thread.
+/// The rows come as the runs each slice of the side dealt this partition, first slice first, which
+/// is row order. Everything here belongs to this partition alone except `next`, and the entries of
+/// that it writes are the rows it owns, so nothing it touches is touched by another thread.
 #[allow(clippy::too_many_arguments)]
-fn fill(
-    mine: &[usize],
+fn fill<'r>(
+    mine: impl Iterator<Item = &'r [usize]>,
     types: &[LogicalType],
     keys: &[Vector],
     hashes: &[u64],
@@ -624,78 +622,89 @@ fn fill(
     let mut found: Vec<usize> = Vec::new();
     let mut walk = Walk::default();
     let mut kept = 0;
-    let mut from = 0;
-    while from < mine.len() {
-        // Once per batch rather than once per row. A build over a side nobody bounded is the one
-        // part of this operator that can run long without producing anything.
-        cancel.check()?;
-        let upto = (from + BATCH).min(mine.len());
-        let batch = &mine[from..upto];
-        found.clear();
-        found.resize(batch.len(), MISS);
-        table.probe_these(hashes, keys, batch, &mut found, &mut walk);
-        // The rows the batch could not settle, in row order, which is the order they have to go in:
-        // two rows of one batch can be the first two rows of one key, and the second only finds the
-        // first if the first went in before it was asked.
-        for &place in walk.pending() {
-            let row = batch[place];
-            match table.probe(hashes[row], keys, row) {
-                Probe::Found(slot) => found[place] = slot,
-                Probe::Vacant(bucket) => {
-                    let slot = table.insert(bucket, hashes[row], keys, row)?;
-                    debug_assert_eq!(slot, head.len(), "a slot is the number of keys before it");
-                    head.push(NONE);
-                    tail.push(NONE);
-                    found[place] = slot;
+    for run in mine {
+        let mut from = 0;
+        while from < run.len() {
+            // Once per batch rather than once per row. A build over a side nobody bounded is the
+            // one part of this operator that can run long without producing anything.
+            cancel.check()?;
+            let upto = (from + BATCH).min(run.len());
+            let batch = &run[from..upto];
+            found.clear();
+            found.resize(batch.len(), MISS);
+            table.probe_these(hashes, keys, batch, &mut found, &mut walk);
+            // The rows the batch could not settle, in row order, which is the order they have to
+            // go in: two rows of one batch can be the first two rows of one key, and the second
+            // only finds the first if the first went in before it was asked.
+            for &place in walk.pending() {
+                let row = batch[place];
+                match table.probe(hashes[row], keys, row) {
+                    Probe::Found(slot) => found[place] = slot,
+                    Probe::Vacant(bucket) => {
+                        let slot = table.insert(bucket, hashes[row], keys, row)?;
+                        debug_assert_eq!(
+                            slot,
+                            head.len(),
+                            "a slot is the number of keys before it"
+                        );
+                        head.push(0);
+                        tail.push(NONE);
+                        found[place] = slot;
+                    }
                 }
             }
-        }
-        // In row order and after the whole batch has a slot, because the batched pass fills the
-        // rows that were already keys and the loop above fills the rest, and a chain that was
-        // appended to in that order would hold a key's rows in neither the order they arrived in
-        // nor any other one.
-        for (&row, &slot) in batch.iter().zip(&found) {
-            let at = u32::try_from(row).map_err(|_| too_many_rows())?;
-            if tail[slot] == NONE {
-                head[slot] = at;
-            } else {
-                next[tail[slot] as usize].store(at, Ordering::Relaxed);
+            // In row order and after the whole batch has a slot, because the batched pass fills
+            // the rows that were already keys and the loop above fills the rest, and a chain that
+            // was appended to in that order would hold a key's rows in neither the order they
+            // arrived in nor any other one.
+            for (&row, &slot) in batch.iter().zip(&found) {
+                let at = u32::try_from(row).map_err(|_| too_many_rows())?;
+                if tail[slot] == NONE {
+                    head[slot] = at + 1;
+                } else {
+                    next[tail[slot] as usize].store(at, Ordering::Relaxed);
+                }
+                tail[slot] = at;
+                kept += 1;
             }
-            tail[slot] = at;
-            kept += 1;
+            from = upto;
         }
-        from = upto;
     }
     Ok((table, head, kept))
 }
 
-/// The keyed rows of the side sorted into their partitions, in row order inside each one.
+/// The keyed rows of the side sorted into `count` partitions, a slice of the side per thread.
 ///
-/// What comes back is one run of rows and where each partition's rows start in it, with one more
-/// start at the end. Two passes over the hashes whatever the number of partitions: one counts the
-/// rows each partition gets and one puts every row where its partition starts plus the rows of it
-/// seen so far. Before this every partition read the whole run of hashes to find its own, which on
-/// sixteen threads is sixteen passes, and on q09 at SF1 that was a tenth of the query's CPU.
-fn deal_rows(hashes: &[u64], keyed: &[bool], bits: u32, count: usize) -> (Vec<usize>, Vec<usize>) {
-    let mut starts = vec![0; count + 1];
-    for (row, &hash) in hashes.iter().enumerate() {
-        if keyed[row] {
-            starts[part_of(hash, bits) + 1] += 1;
+/// `part_of` names a row's partition, or `None` for a row that goes in none. What comes back is,
+/// for each slice in order, the rows it dealt to each partition in order, so a partition that
+/// reads its run from every slice, first slice first, reads its rows in the order the side holds
+/// them. One pass over the side, split across the lease. It used to be two passes on one thread,
+/// one to count and one to place, and on q09 at SF1 dealing the million and a half rows of
+/// `orders` that way was longer than the partitions took to fill.
+fn deal(
+    rows: usize,
+    count: usize,
+    threads: &Lease<'_>,
+    part_of: impl Fn(usize) -> Option<usize> + Sync,
+) -> Result<Vec<Vec<Vec<usize>>>> {
+    let slices = if count > 1 { slices_of(rows, threads.degree()) } else { 1 };
+    let size = rows.div_ceil(slices);
+    let one = |slice: usize| -> Result<Vec<Vec<usize>>> {
+        let share = size / count + size / count / 8 + 16;
+        let mut dealt: Vec<Vec<usize>> = (0..count).map(|_| Vec::with_capacity(share)).collect();
+        for row in slice * size..((slice + 1) * size).min(rows) {
+            if let Some(part) = part_of(row) {
+                dealt[part].push(row);
+            }
         }
-    }
-    for part in 0..count {
-        starts[part + 1] += starts[part];
-    }
-    let mut at = starts.clone();
-    let mut dealt = vec![0; starts[count]];
-    for (row, &hash) in hashes.iter().enumerate() {
-        if keyed[row] {
-            let part = part_of(hash, bits);
-            dealt[at[part]] = row;
-            at[part] += 1;
-        }
-    }
-    (starts, dealt)
+        Ok(dealt)
+    };
+    in_parallel(threads, slices, slices, "join side slice", one)
+}
+
+/// How many slices a pass over `rows` rows is split into, which is one below [`SPLIT`] rows.
+fn slices_of(rows: usize, threads: usize) -> usize {
+    if rows < SPLIT { 1 } else { threads.max(1) }
 }
 
 /// How many of a hash's top bits name a partition, which is none below [`SPLIT`] rows.
@@ -795,23 +804,28 @@ mod tests {
     use rudb_common::Cancel;
     use rudb_pipeline::{Lease, Pool};
 
-    use super::{Lookup, MISS, SPLIT, Scratch, column, deal_rows, part_of, split_into};
+    use super::{Lookup, MISS, SPLIT, Scratch, column, deal, part_of, split_into};
 
     /// Every keyed row lands in the partition its hash names, once, in row order, and a row that
-    /// is not keyed lands nowhere.
+    /// is not keyed lands nowhere, whichever number of slices the side was dealt in.
     #[test]
     fn rows_are_dealt_to_the_partition_their_hash_names_in_row_order() {
+        let rows = SPLIT + 4000;
         let hashes: Vec<u64> =
-            (0..40_u64).map(|row| row.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
-        let keyed: Vec<bool> = (0..40).map(|row| row % 5 != 0).collect();
-        let (starts, dealt) = deal_rows(&hashes, &keyed, 2, 4);
-        assert_eq!(starts.len(), 5);
-        assert_eq!(dealt.len(), 32, "the eight rows that are not keyed are left out");
-        for part in 0..4 {
-            let mine = &dealt[starts[part]..starts[part + 1]];
-            let expected: Vec<usize> =
-                (0..40).filter(|&row| keyed[row] && part_of(hashes[row], 2) == part).collect();
-            assert_eq!(mine, expected);
+            (0..rows as u64).map(|row| row.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let keyed: Vec<bool> = (0..rows).map(|row| row % 5 != 0).collect();
+        let pool = Pool::new(3);
+        for threads in [Lease::alone(), pool.lease(3)] {
+            let dealt = deal(rows, 4, &threads, |row| keyed[row].then(|| part_of(hashes[row], 2)))
+                .expect("a deal");
+            for part in 0..4 {
+                let mine: Vec<usize> =
+                    dealt.iter().flat_map(|slice| slice[part].iter().copied()).collect();
+                let expected: Vec<usize> = (0..rows)
+                    .filter(|&row| keyed[row] && part_of(hashes[row], 2) == part)
+                    .collect();
+                assert_eq!(mine, expected);
+            }
         }
     }
 
