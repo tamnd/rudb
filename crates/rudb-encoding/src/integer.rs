@@ -175,7 +175,7 @@ pub fn encode_with(values: &[i64], chooser: &dyn Chooser) -> Result<Vec<u8>> {
 /// with each other.
 pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
     let mut reader = Reader::new(bytes);
-    let values = with_decoding(|scratch| decode_chunk(&mut reader, scratch))?;
+    let values = decode_chunk(&mut reader)?;
     if reader.remaining() != 0 {
         return Err(Error::internal(format!(
             "{} bytes left over after decoding a chunk",
@@ -199,7 +199,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i64>> {
 /// it was written for.
 pub fn decode_as<T: Lane>(bytes: &[u8]) -> Result<Vec<T>> {
     let mut reader = Reader::new(bytes);
-    let values = with_decoding(|scratch| decode_chunk_as(&mut reader, scratch))?;
+    let values = decode_chunk_as(&mut reader)?;
     if reader.remaining() != 0 {
         return Err(Error::internal(format!(
             "{} bytes left over after decoding a chunk",
@@ -283,9 +283,8 @@ pub fn fold(bytes: &[u8], mut emit: impl FnMut(i64, u64) -> Result<()>) -> Resul
         Kind::Sparse => {
             let dominant = reader.i64()?;
             let exception_count = reader.u32()? as usize;
-            let (positions, values) = with_decoding(|scratch| -> Result<_> {
-                Ok((decode_chunk(&mut reader, scratch)?, decode_chunk(&mut reader, scratch)?))
-            })?;
+            let positions = decode_chunk(&mut reader)?;
+            let values = decode_chunk(&mut reader)?;
             if positions.len() != exception_count || values.len() != exception_count {
                 return Err(Error::internal("a sparse chunk disagrees about its exception count"));
             }
@@ -324,9 +323,8 @@ pub fn fold(bytes: &[u8], mut emit: impl FnMut(i64, u64) -> Result<()>) -> Resul
             }
         }
         Kind::Rle => {
-            let (values, lengths) = with_decoding(|scratch| -> Result<_> {
-                Ok((decode_chunk(&mut reader, scratch)?, decode_chunk(&mut reader, scratch)?))
-            })?;
+            let values = decode_chunk(&mut reader)?;
+            let lengths = decode_chunk(&mut reader)?;
             if values.len() != lengths.len() {
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
@@ -347,7 +345,7 @@ pub fn fold(bytes: &[u8], mut emit: impl FnMut(i64, u64) -> Result<()>) -> Resul
         _ => {
             // Re-read the header through the existing decoder for the other cascade shapes.
             reader = Reader::new(bytes);
-            let values = with_decoding(|scratch| decode_chunk(&mut reader, scratch))?;
+            let values = decode_chunk(&mut reader)?;
             check_count(values.len(), count)?;
             for value in values {
                 emit(value, 1)?;
@@ -382,7 +380,7 @@ pub fn decode_selected(bytes: &[u8], positions: &[usize]) -> Result<Vec<i64>> {
         return Err(Error::internal("selected integer positions are not sorted and unique"));
     }
     let mut reader = Reader::new(bytes);
-    let values = with_decoding(|scratch| decode_selected_chunk(&mut reader, positions, scratch))?;
+    let values = decode_selected_chunk(&mut reader, positions)?;
     if reader.remaining() != 0 {
         return Err(Error::internal(format!(
             "{} bytes left over after decoding selected values",
@@ -430,7 +428,7 @@ pub fn pointed(bytes: &[u8]) -> bool {
 /// As [`decode`], except that trailing bytes are what the caller asked about rather than an error.
 pub fn decode_prefix(bytes: &[u8]) -> Result<(Vec<i64>, usize)> {
     let mut reader = Reader::new(bytes);
-    let values = with_decoding(|scratch| decode_chunk(&mut reader, scratch))?;
+    let values = decode_chunk(&mut reader)?;
     Ok((values, reader.used()))
 }
 
@@ -822,12 +820,11 @@ fn encode_as(
 /// [`bitpack::pack_tail`] instead. The transposed layout has no partial form and would charge a
 /// five entry dictionary for 1024 entries.
 fn encode_packed(values: &[i64], out: &mut Vec<u8>) -> Result<()> {
-    // The same three buffers for every unit, for the reason written on `Decoding` on the other side.
-    // The chooser encodes every candidate it is offered before it picks one, so this loop runs more
-    // often on the way in than the decoding loop does on the way out.
+    // The same three buffers for every unit, because the chooser encodes every candidate it is
+    // offered before it picks one and this loop runs once per candidate per unit.
     let mut offsets: Vec<u64> = Vec::with_capacity(VALUES);
-    // Held at the width 64 length for the reason written on `Decoding`, so a narrower unit writes
-    // the front of it and the resize per unit goes away.
+    // Held at the width 64 length, which is the largest a unit can be, so a narrower unit writes the
+    // front of it and there is no resize per unit.
     let mut packed: Vec<u64> = vec![0; bitpack::packed_len::<u64>(64)];
     let mut transposed = bitpack::Scratch::<u64>::new();
     for unit in values.chunks(VALUES) {
@@ -850,72 +847,7 @@ fn encode_packed(values: &[i64], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// The buffer a decode reuses from one unit of 1024 values to the next.
-///
-/// This used to be allocated inside the loop, and because it was allocated with a value rather than
-/// grown, the allocator zeroed it and then the decode overwrote every byte. In a ClickBench profile
-/// that zeroing was the single largest item, ahead of the unpacking it was making room for, because
-/// a scan pays it once per 1024 rows of every packed integer column it reads.
-///
-/// It is threaded through the recursion rather than made per call because a chunk is a cascade. A
-/// dictionary of deltas is three nested decodes, and each of them would otherwise make its own.
-///
-/// It starts empty and is grown on the first unit that needs it, to its largest size rather than to
-/// the size that unit wants, so that every unit after the first finds it the right length already
-/// and nothing is zeroed or resized again.
-///
-/// There used to be a second buffer here holding one unit of unpacked offsets, which the decode
-/// then walked to add the frame of reference base back on. The unpackers take the base now and
-/// write into the chunk directly, so that buffer and the pass over it are both gone.
-///
-/// It lives on the thread rather than in the caller, which is worth saying why. A chunk is a row
-/// group, and a row group in the native format is about a thousand rows, which is one unit. So there
-/// is no second unit in a chunk to reuse anything and holding this per call is strictly worse than
-/// allocating per unit was: it was tried, and it cost more in the growing than it saved in the
-/// zeroing. What there are many of is chunks, one per part per column, and the thread that reads
-/// them reads them one after another. That is the loop the reuse belongs to, and reaching it by
-/// passing a buffer down would mean a parameter through every page decoder in the storage layer for
-/// a buffer none of them has an opinion about.
-struct Decoding {
-    /// The packed words of one unit, as read off the wire. Held at the width 64 length, which is the
-    /// largest a unit can be, so a narrower unit uses the front of it.
-    packed: Vec<u64>,
-}
-
-thread_local! {
-    /// The buffers this thread decodes through. See [`Decoding`].
-    static DECODING: std::cell::RefCell<Decoding> =
-        const { std::cell::RefCell::new(Decoding::new()) };
-}
-
-/// Runs a decode over this thread's buffers.
-///
-/// Nothing inside a decode calls back into one, so the borrow is never already taken. It is asked
-/// for rather than assumed anyway, and a decode that somehow arrives while another is running gets
-/// buffers of its own rather than a panic, because the alternative is a crash in a reader on a
-/// path nobody exercised.
-fn with_decoding<T>(run: impl FnOnce(&mut Decoding) -> T) -> T {
-    DECODING.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut scratch) => run(&mut scratch),
-        Err(_) => run(&mut Decoding::new()),
-    })
-}
-
-impl Decoding {
-    /// A buffer that has not made room for anything yet.
-    const fn new() -> Self {
-        Self { packed: Vec::new() }
-    }
-
-    /// Makes room for one unit. A no op every time after the first.
-    fn ready(&mut self) {
-        if self.packed.len() != bitpack::packed_len::<u64>(64) {
-            self.packed.resize(bitpack::packed_len::<u64>(64), 0);
-        }
-    }
-}
-
-fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i64>> {
+fn decode_chunk(reader: &mut Reader<'_>) -> Result<Vec<i64>> {
     let kind = Kind::from_tag(reader.u8()?)?;
     let count = reader.u32()? as usize;
     match kind {
@@ -923,9 +855,9 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
         Kind::Packed => {
             // One buffer for the chunk, and every value written into it once. Both unpackers take
             // the frame of reference base and put the value it belongs to where it goes, so there
-            // is no unit of raw offsets in between and no second pass to fold the base back in.
+            // is no unit of raw offsets in between and no second pass to fold the base back in, and
+            // both read the packed bytes where the chunk put them rather than through a copy.
             let mut values = vec![0i64; count];
-            scratch.ready();
             let mut done = 0;
             while done < count {
                 let base = reader.i64()?;
@@ -933,9 +865,8 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
                 let wanted = (count - done).min(VALUES);
                 let into = &mut values[done..done + wanted];
                 if wanted == VALUES {
-                    let words = bitpack::packed_len::<u64>(width);
-                    reader.words(&mut scratch.packed[..words])?;
-                    bitpack::unpack_mapped(&scratch.packed[..words], width, into, |offset| {
+                    let unit = reader.bytes(bitpack::unit_len(width))?;
+                    bitpack::unpack_unit_into(unit, width, into, |offset| {
                         value_from(offset, base)
                     })?;
                 } else {
@@ -950,7 +881,7 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
         }
         Kind::Delta => {
             let first = reader.i64()?;
-            let mut values = decode_chunk(reader, scratch)?;
+            let mut values = decode_chunk(reader)?;
             check_count(values.len() + 1, count)?;
             // Each value is written over the difference that follows it, so the sums go into the
             // vector the differences came in and only the last one is pushed on the end. Pushing
@@ -965,13 +896,13 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
             Ok(values)
         }
         Kind::Rle => {
-            let run_values = decode_chunk(reader, scratch)?;
-            let run_lengths = decode_chunk(reader, scratch)?;
+            let run_values = decode_chunk(reader)?;
+            let run_lengths = decode_chunk(reader)?;
             expanded(&run_values, &run_lengths, count)
         }
         Kind::Dict => {
-            let dictionary = decode_chunk(reader, scratch)?;
-            let codes = decode_chunk(reader, scratch)?;
+            let dictionary = decode_chunk(reader)?;
+            let codes = decode_chunk(reader)?;
             let mut values = Vec::with_capacity(count);
             for code in codes {
                 let index =
@@ -986,8 +917,8 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
         Kind::Sparse => {
             let value = reader.i64()?;
             let exception_count = reader.u32()? as usize;
-            let positions = decode_chunk(reader, scratch)?;
-            let exceptions = decode_chunk(reader, scratch)?;
+            let positions = decode_chunk(reader)?;
+            let exceptions = decode_chunk(reader)?;
             if positions.len() != exception_count || exceptions.len() != exception_count {
                 return Err(Error::internal("a sparse chunk disagrees about its exception count"));
             }
@@ -1006,7 +937,7 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
         Kind::Strided => {
             let base = reader.i64()?;
             let stride = reader.u64()?;
-            let steps = decode_chunk(reader, scratch)?;
+            let steps = decode_chunk(reader)?;
             check_count(steps.len(), count)?;
             strided(steps, stride, base)
         }
@@ -1099,16 +1030,23 @@ fn expanded<T: Lane>(run_values: &[i64], run_lengths: &[i64], count: usize) -> R
 }
 
 /// [`decode_chunk`] into `T`. See [`decode_as`].
-fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<T>> {
+fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>) -> Result<Vec<T>> {
     let Some(&tag) = reader.rest().first() else {
         return Err(Error::internal("a chunk ended before its encoding tag"));
     };
     match Kind::from_tag(tag)? {
         Kind::Constant | Kind::Packed | Kind::Sparse | Kind::Rle => {}
-        // Made wide as the other kind is and narrowed after, but with the range of the chunk taken
-        // once so that a chunk whose ends fit is narrowed with no check a value.
-        Kind::Strided => {
-            let values = decode_chunk(reader, scratch)?;
+        // Every other kind is made wide as [`decode`] makes it and narrowed after, with the range of
+        // the chunk taken once so that a chunk whose ends fit is narrowed with no check a value.
+        //
+        // The check a value is worth taking out twice over. It is the check itself, and it is that a
+        // narrowing that cannot fail is a `Vec<i64>` walked into a `Vec<T>` of the same length, which
+        // the standard library does in the allocation the wide values arrived in when the two widths
+        // match. A `BIGINT` column is the case where they always match, so the whole narrowing is a
+        // walk over a vector that stays where it is, where the checked form allocated a second
+        // vector and copied every row into it.
+        _ => {
+            let values = decode_chunk(reader)?;
             let (low, high) = values.iter().fold((i64::MAX, i64::MIN), |(low, high), &value| {
                 (low.min(value), high.max(value))
             });
@@ -1117,7 +1055,6 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
             }
             return values.into_iter().map(lane).collect();
         }
-        _ => return decode_chunk(reader, scratch)?.into_iter().map(lane).collect(),
     }
     let kind = Kind::from_tag(reader.u8()?)?;
     let count = reader.u32()? as usize;
@@ -1125,7 +1062,6 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
         Kind::Constant => Ok(vec![lane(reader.i64()?)?; count]),
         Kind::Packed => {
             let mut values = vec![T::default(); count];
-            scratch.ready();
             let mut wide = [0i64; VALUES];
             let mut done = 0;
             while done < count {
@@ -1133,12 +1069,11 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
                 let width = reader.u8()? as usize;
                 let wanted = (count - done).min(VALUES);
                 let into = &mut values[done..done + wanted];
-                let bytes = if wanted == VALUES {
-                    let words = bitpack::packed_len::<u64>(width);
-                    reader.words(&mut scratch.packed[..words])?;
-                    None
+                let whole = wanted == VALUES;
+                let bytes = if whole {
+                    reader.bytes(bitpack::unit_len(width))?
                 } else {
-                    Some(reader.bytes(bitpack::tail_len(wanted, width))?)
+                    reader.bytes(bitpack::tail_len(wanted, width))?
                 };
                 // Every value of a block is between its base and the base plus the widest offset its
                 // width holds, so when both ends fit the whole block does and the unpack writes the
@@ -1148,22 +1083,18 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
                 let top = i64::try_from(i128::from(base) + i128::from(mask)).ok();
                 if T::fit(base).is_some() && top.and_then(T::fit).is_some() {
                     let map = |offset| T::wrap(value_from(offset, base));
-                    match bytes {
-                        None => {
-                            let words = bitpack::packed_len::<u64>(width);
-                            bitpack::unpack_mapped(&scratch.packed[..words], width, into, map)?;
-                        }
-                        Some(bytes) => bitpack::unpack_tail_into(bytes, width, into, map)?,
+                    if whole {
+                        bitpack::unpack_unit_into(bytes, width, into, map)?;
+                    } else {
+                        bitpack::unpack_tail_into(bytes, width, into, map)?;
                     }
                 } else {
                     let wide = &mut wide[..wanted];
                     let map = |offset| value_from(offset, base);
-                    match bytes {
-                        None => {
-                            let words = bitpack::packed_len::<u64>(width);
-                            bitpack::unpack_mapped(&scratch.packed[..words], width, wide, map)?;
-                        }
-                        Some(bytes) => bitpack::unpack_tail_into(bytes, width, wide, map)?,
+                    if whole {
+                        bitpack::unpack_unit_into(bytes, width, wide, map)?;
+                    } else {
+                        bitpack::unpack_tail_into(bytes, width, wide, map)?;
                     }
                     for (value, &held) in into.iter_mut().zip(wide.iter()) {
                         *value = lane(held)?;
@@ -1174,15 +1105,15 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
             Ok(values)
         }
         Kind::Rle => {
-            let run_values = decode_chunk(reader, scratch)?;
-            let run_lengths = decode_chunk(reader, scratch)?;
+            let run_values = decode_chunk(reader)?;
+            let run_lengths = decode_chunk(reader)?;
             expanded(&run_values, &run_lengths, count)
         }
         Kind::Sparse => {
             let value = lane::<T>(reader.i64()?)?;
             let exception_count = reader.u32()? as usize;
-            let positions = decode_chunk(reader, scratch)?;
-            let exceptions = decode_chunk(reader, scratch)?;
+            let positions = decode_chunk(reader)?;
+            let exceptions = decode_chunk(reader)?;
             if positions.len() != exception_count || exceptions.len() != exception_count {
                 return Err(Error::internal("a sparse chunk disagrees about its exception count"));
             }
@@ -1204,17 +1135,13 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
     }
 }
 
-fn decode_selected_chunk(
-    reader: &mut Reader<'_>,
-    positions: &[usize],
-    scratch: &mut Decoding,
-) -> Result<Vec<i64>> {
+fn decode_selected_chunk(reader: &mut Reader<'_>, positions: &[usize]) -> Result<Vec<i64>> {
     let Some(&tag) = reader.rest().first() else {
         return Err(Error::internal("a chunk ended before its encoding tag"));
     };
     let kind = Kind::from_tag(tag)?;
     if !matches!(kind, Kind::Constant | Kind::Packed | Kind::Rle | Kind::Strided | Kind::Dict) {
-        let values = decode_chunk(reader, scratch)?;
+        let values = decode_chunk(reader)?;
         return positions
             .iter()
             .map(|&position| {
@@ -1254,16 +1181,14 @@ fn decode_selected_chunk(
                 if wanted == VALUES && (upto - from) * SPARSE > VALUES {
                     // Enough of the unit is wanted that unpacking all of it is cheaper than
                     // finding each value on its own.
-                    let words = bitpack::packed_len::<u64>(width);
-                    scratch.ready();
-                    reader.words(&mut scratch.packed[..words])?;
+                    let bytes = reader.bytes(bitpack::unit_len(width))?;
                     let mut unit = [0_i64; VALUES];
-                    bitpack::unpack_mapped(&scratch.packed[..words], width, &mut unit, |offset| {
+                    bitpack::unpack_unit_into(bytes, width, &mut unit, |offset| {
                         value_from(offset, base)
                     })?;
                     out.extend(positions[from..upto].iter().map(|&position| unit[position - done]));
                 } else if wanted == VALUES {
-                    let bytes = reader.bytes(bitpack::packed_len::<u64>(width) * 8)?;
+                    let bytes = reader.bytes(bitpack::unit_len(width))?;
                     for &position in &positions[from..upto] {
                         let offset = bitpack::unpack_u64_at(bytes, width, position - done)?;
                         out.push(value_from(offset, base));
@@ -1286,7 +1211,7 @@ fn decode_selected_chunk(
             let run_value_count = skip_chunk(&mut run_value_reader)?;
             let run_value_len = run_value_reader.used();
             reader.skip(run_value_len)?;
-            let run_lengths = decode_chunk(reader, scratch)?;
+            let run_lengths = decode_chunk(reader)?;
             if run_value_count != run_lengths.len() {
                 return Err(Error::internal("an RLE chunk has more runs than run lengths"));
             }
@@ -1330,7 +1255,7 @@ fn decode_selected_chunk(
         Kind::Strided => {
             let base = reader.i64()?;
             let stride = reader.u64()?;
-            let steps = decode_selected_chunk(reader, positions, scratch)?;
+            let steps = decode_selected_chunk(reader, positions)?;
             steps
                 .into_iter()
                 .map(|step| {
@@ -1341,8 +1266,8 @@ fn decode_selected_chunk(
                 .collect()
         }
         Kind::Dict => {
-            let dictionary = decode_chunk(reader, scratch)?;
-            let codes = decode_selected_chunk(reader, positions, scratch)?;
+            let dictionary = decode_chunk(reader)?;
+            let codes = decode_selected_chunk(reader, positions)?;
             codes
                 .into_iter()
                 .map(|code| {
@@ -2186,11 +2111,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cascade_decodes_the_same_through_a_shared_scratch_as_through_its_own() {
-        // The scratch is threaded through the recursion, so a dictionary of deltas is three nested
-        // decodes sharing one set of buffers. Nothing in the nesting arms holds a buffer across the
-        // call it makes, and this is the test that says so: a chunk long enough to cascade and wide
-        // enough to bit pack at more than one level, decoded whole.
+    fn a_chunk_that_cascades_more_than_one_level_deep_decodes_whole() {
+        // A dictionary of deltas is three nested decodes, and each level reads the packed bytes of
+        // its own unit out of the chunk where they lie. A chunk long enough to cascade and wide
+        // enough to bit pack at more than one level is what says the levels do not read each
+        // other's bytes.
         let mut values = Vec::new();
         for index in 0..8192i64 {
             values.push(1_600_000_000 + index / 4 + (index % 7) * 1_000);

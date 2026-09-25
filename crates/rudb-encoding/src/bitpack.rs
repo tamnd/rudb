@@ -168,6 +168,15 @@ pub fn packed_len<T: Packable>(width: usize) -> usize {
     width * T::LANES
 }
 
+/// How many bytes a whole unit of `u64` words occupies on the wire at the given width.
+///
+/// The serialized form of a full unit is [`packed_len`] words written little endian, so this is what
+/// a reader takes out of a chunk before handing it to [`unpack_unit_into`].
+#[must_use]
+pub fn unit_len(width: usize) -> usize {
+    packed_len::<u64>(width) * size_of::<u64>()
+}
+
 /// The smallest bit width that can hold every value in the slice. Zero for an empty slice or a
 /// slice of zeros, which [`pack_transposed`] handles as the degenerate case that stores nothing.
 #[must_use]
@@ -441,6 +450,71 @@ pub fn unpack_mapped<T: Packable, U: Copy>(
             for lane in 0..lanes {
                 let bits = (low[lane].to_u64() >> shift) | (high[lane].to_u64() << carried);
                 into[lane] = value(bits & mask);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// As [`unpack_mapped`] for a unit that is still the bytes it was written as.
+///
+/// This is the form every scan of a packed integer column goes through, and the reason it exists
+/// rather than the caller making a `&[u64]` first is that making one is a copy of the unit. The
+/// bytes arrive inside a chunk at whatever offset the chunk put them, so they are not eight byte
+/// aligned and cannot be looked at as words in place. Copying them somewhere aligned is 8 KB moved
+/// per thousand rows, which is the same order of work as the unpacking it feeds and which bought
+/// nothing: every word here is read exactly once, and an unaligned eight byte load is the same
+/// single instruction the aligned one is on anything this runs on.
+///
+/// The body is [`unpack_mapped`] at `T = u64` with the loads spelled out, and the test below checks
+/// the two agree at every width. It is written twice rather than made generic over where a word
+/// comes from because the slice form gets its bound checked once a row and this one cannot, so a
+/// shared inner loop would be the slower of the two shapes for both callers.
+///
+/// # Errors
+///
+/// If `width` exceeds 64, the output is not [`VALUES`] long, or the input is not [`unit_len`] bytes.
+pub fn unpack_unit_into<U: Copy>(
+    input: &[u8],
+    width: usize,
+    output: &mut [U],
+    value: impl Fn(u64) -> U,
+) -> Result<()> {
+    check_width::<u64>(width)?;
+    check_vector_len(output.len(), "output")?;
+    if input.len() != unit_len(width) {
+        return Err(Error::internal(format!(
+            "a {width} bit packed vector is {} bytes, not {}",
+            unit_len(width),
+            input.len()
+        )));
+    }
+    if width == 0 {
+        output.fill(value(0));
+        return Ok(());
+    }
+
+    let mask = low_mask(width);
+    let lanes = <u64 as Packable>::LANES;
+    let stride = lanes * size_of::<u64>();
+    for row in 0..u64::BITS as usize {
+        let bit = row * width;
+        let word = bit / u64::BITS as usize;
+        let shift = bit % u64::BITS as usize;
+        let base = ((row % 8) * 8 + ORDER[row / 8]) * lanes;
+        let low = &input[word * stride..(word + 1) * stride];
+        let into = &mut output[base..base + lanes];
+        if shift + width <= u64::BITS as usize {
+            for (lane, slot) in into.iter_mut().enumerate() {
+                *slot = value((word_at(low, lane * size_of::<u64>()) >> shift) & mask);
+            }
+        } else {
+            let carried = u64::BITS as usize - shift;
+            let high = &input[(word + 1) * stride..(word + 2) * stride];
+            for (lane, slot) in into.iter_mut().enumerate() {
+                let at = lane * size_of::<u64>();
+                let bits = (word_at(low, at) >> shift) | (word_at(high, at) << carried);
+                *slot = value(bits & mask);
             }
         }
     }
@@ -874,6 +948,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_unit_unpacked_from_bytes_gives_what_one_unpacked_from_words_gives() {
+        // Two spellings of the same loop, one reading aligned words and one reading them where the
+        // chunk left them, so every width is checked against the other rather than against a table.
+        // The mapping is not the identity, because the caller this exists for is frame of reference
+        // coding and a base that lands in the answer is the way a shift applied to the wrong word
+        // would show up.
+        for width in 0..=64 {
+            let values = sample::<u64>(width);
+            let mut packed = vec![0u64; packed_len::<u64>(width)];
+            pack(&values, width, &mut packed).unwrap();
+            let bytes = packed.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            assert_eq!(bytes.len(), unit_len(width), "at {width} bits");
+            let map = |offset: u64| offset.wrapping_add(0x1234_5678) as i64;
+            let mut from_words = vec![0i64; VALUES];
+            unpack_mapped(&packed, width, &mut from_words, map).unwrap();
+            let mut from_bytes = vec![0i64; VALUES];
+            unpack_unit_into(&bytes, width, &mut from_bytes, map).unwrap();
+            assert_eq!(from_bytes, from_words, "at {width} bits");
+            // And the same again with the bytes handed over at an odd offset, which is where a chunk
+            // puts them and which is the whole reason this form reads them a word at a time.
+            let mut moved = vec![0u8; bytes.len() + 3];
+            moved[3..].copy_from_slice(&bytes);
+            let mut from_moved = vec![0i64; VALUES];
+            unpack_unit_into(&moved[3..], width, &mut from_moved, map).unwrap();
+            assert_eq!(from_moved, from_words, "at {width} bits, three bytes along");
+        }
+    }
+
+    #[test]
+    fn a_unit_of_the_wrong_length_is_refused() {
+        let mut out = vec![0i64; VALUES];
+        let bytes = vec![0u8; unit_len(9) - 1];
+        assert!(unpack_unit_into(&bytes, 9, &mut out, |bits| bits as i64).is_err());
+        let bytes = vec![0u8; unit_len(9) + 1];
+        assert!(unpack_unit_into(&bytes, 9, &mut out, |bits| bits as i64).is_err());
+        let bytes = vec![0u8; unit_len(65)];
+        assert!(unpack_unit_into(&bytes, 65, &mut out, |bits| bits as i64).is_err());
+        let bytes = vec![0u8; unit_len(9)];
+        assert!(unpack_unit_into(&bytes, 9, &mut out[..VALUES - 1], |bits| bits as i64).is_err());
     }
 
     #[test]
