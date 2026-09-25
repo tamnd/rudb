@@ -16,6 +16,7 @@ pub mod hot;
 pub mod memory;
 pub mod sieve;
 pub mod tally;
+pub mod undo;
 pub mod zone;
 
 pub use count::{Counting, Counts, Partial};
@@ -24,4 +25,5 @@ pub use hot::{HotStripe, Lease, Width};
 pub use memory::MemoryTable;
 pub use sieve::{Blocked, Sieve};
 pub use tally::{TALLY_VALUES, Tally};
+pub use undo::{UndoBuffer, UndoSpace};
 pub use zone::{Probe, Range, Zone};
