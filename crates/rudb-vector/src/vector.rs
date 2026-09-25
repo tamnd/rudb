@@ -3204,7 +3204,58 @@ impl Vector {
         if let Some(flat) = self.decoded_codes() {
             return Ok(flat);
         }
+        if let Some(flat) = self.unpacked_whole() {
+            return Ok(flat);
+        }
         self.copied((0..self.len).collect(), false)
+    }
+
+    /// A packed column with no nulls written out whole, a block of 64 codes at a time.
+    ///
+    /// The general copy builds a list of every position and then reads each code on its own, working
+    /// out its word and whether it straddles into the next every time. Every row of the column is
+    /// wanted in order, so [`Packed::unpack_mapped`] unpacks whole blocks with the width a constant
+    /// and hands each code to the value it stands for as it goes. Laying out the `orders` side of
+    /// TPC-H q9 flattens a million and a half packed dates, and the copy was a third of the layout.
+    fn unpacked_whole(&self) -> Option<Self> {
+        let Body::Packed { words, width, base, offset } = &self.body else {
+            return None;
+        };
+        if self.validity.has_nulls(self.len) {
+            return None;
+        }
+        let packed = Packed { words, width: *width, base: *base, offset: *offset };
+        let low = i64::try_from(packed.base()).ok()?;
+        i64::try_from(packed.ceiling()).ok()?;
+        // The same arithmetic as [`Self::unpacked_at`]: both ends fit, so every value does.
+        #[expect(clippy::cast_possible_wrap, reason = "a code is below the span, which fits")]
+        let value = |code: u64| low.wrapping_add(code as i64);
+        let rows = self.len;
+        #[expect(clippy::cast_possible_truncation, reason = "the layout holds every value")]
+        let data = match self.ty.physical() {
+            rudb_common::PhysicalType::Int64 => {
+                let mut out = Vec::with_capacity(rows);
+                packed.unpack_mapped(0, rows, &mut out, value);
+                Data::Int64(Buffer::from_vec(out))
+            }
+            rudb_common::PhysicalType::Int32 => {
+                let mut out = Vec::with_capacity(rows);
+                packed.unpack_mapped(0, rows, &mut out, |code| value(code) as i32);
+                Data::Int32(Buffer::from_vec(out))
+            }
+            rudb_common::PhysicalType::Int16 => {
+                let mut out = Vec::with_capacity(rows);
+                packed.unpack_mapped(0, rows, &mut out, |code| value(code) as i16);
+                Data::Int16(Buffer::from_vec(out))
+            }
+            _ => return None,
+        };
+        Some(Self {
+            ty: self.ty.clone(),
+            len: rows,
+            validity: Validity::AllValid,
+            body: Body::Flat(data),
+        })
     }
 
     /// A dictionary with no nulls over flat values with none, written out by its codes.
@@ -7195,6 +7246,39 @@ mod tests {
                 assert_eq!(block, want, "width {width} cut at {at} for {len}");
             }
         }
+    }
+
+    /// A packed column flattened whole, cut at rows that do and do not start a word, answers what
+    /// a row at a time answers, and a column with nulls in it keeps them.
+    #[test]
+    fn a_packed_column_flattened_whole_reads_what_each_row_reads() {
+        let words: Vec<u64> =
+            (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        for (ty, width) in [
+            (LogicalType::BigInt, 50),
+            (LogicalType::Integer, 13),
+            (LogicalType::SmallInt, 7),
+            (LogicalType::Date, 1),
+        ] {
+            let whole = Vector::packed(ty.clone(), words.clone(), width, -1_000, 300)
+                .expect("enough words for 300 codes");
+            for (at, len) in [(0, 300), (1, 299), (63, 130), (64, 64), (100, 5)] {
+                let cut = whole.slice(at, len).expect("a cut inside the column");
+                let flat = cut.flatten().expect("a packed column flattens");
+                assert_eq!(flat.form(), Form::Flat, "{ty:?} cut at {at}");
+                assert_eq!(
+                    flat.iter().collect::<Vec<_>>(),
+                    cut.iter().collect::<Vec<_>>(),
+                    "{ty:?} width {width} cut at {at} for {len}"
+                );
+            }
+        }
+        let nulls = Vector::packed(LogicalType::Integer, words, 13, 0, 300)
+            .expect("300 codes")
+            .with_validity(Validity::from_iter(300, |row| row % 5 != 0));
+        let flat = nulls.flatten().expect("flattens");
+        assert_eq!(flat.iter().collect::<Vec<_>>(), nulls.iter().collect::<Vec<_>>());
+        assert!(flat.is_null_at(0) && !flat.is_null_at(1));
     }
 
     #[test]
