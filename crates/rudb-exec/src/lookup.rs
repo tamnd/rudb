@@ -295,7 +295,8 @@ impl Lookup {
             deal(rows, count, threads, |row| keyed[row].then(|| part_of(hashes[row], bits)))?;
         let one = |part: usize| -> Result<(Table, Vec<u32>, usize)> {
             let mine = dealt.iter().map(|slice| slice[part].as_slice());
-            fill(mine, &types, keys, &hashes, &next, cancel)
+            let held = dealt.iter().map(|slice| slice[part].len()).sum();
+            fill(mine, held, &types, keys, &hashes, &next, cancel)
         };
         let filled = in_parallel(threads, count, threads.degree(), "join table partition", one)?;
 
@@ -748,24 +749,33 @@ impl Lookup {
 
 /// One partition of the build: the rows whose hash names it, in the order the side holds them.
 ///
+/// `held` is how many rows that is, which is as many groups as the partition can end with, so the
+/// table and the chain ends are sized for it once rather than grown to it.
+///
 /// The rows come as the runs each slice of the side dealt this partition, first slice first, which
 /// is row order. Everything here belongs to this partition alone except `next`, and the entries of
 /// that it writes are the rows it owns, so nothing it touches is touched by another thread.
 #[allow(clippy::too_many_arguments)]
 fn fill<'r>(
     mine: impl Iterator<Item = &'r [usize]>,
+    held: usize,
     types: &[LogicalType],
     keys: &[Vector],
     hashes: &[u64],
     next: &[AtomicU32],
     cancel: &Cancel,
 ) -> Result<(Table, Vec<u32>, usize)> {
-    let mut table = Table::new(types);
-    let mut head: Vec<u32> = Vec::new();
-    let mut tail: Vec<u32> = Vec::new();
+    let mut table = Table::for_rows(types, held);
+    let mut head: Vec<u32> = Vec::with_capacity(held);
+    let mut tail: Vec<u32> = Vec::with_capacity(held);
     let mut found: Vec<usize> = Vec::new();
     let mut walk = Walk::default();
     let mut kept = 0;
+    // Every place of a batch, for a batch that goes straight to the row at a time path.
+    let every: Vec<usize> = (0..BATCH).collect();
+    // Whether the last batch held no key the table had already, which starts out true because an
+    // empty table holds none.
+    let mut new = true;
     for run in mine {
         let mut from = 0;
         while from < run.len() {
@@ -776,14 +786,31 @@ fn fill<'r>(
             let batch = &run[from..upto];
             found.clear();
             found.resize(batch.len(), MISS);
-            table.probe_these(hashes, keys, batch, &mut found, &mut walk);
+            // The batched probe finds the rows whose key is in already and leaves the rest to the
+            // loop below, which probes them again one at a time and inserts them. On a side whose
+            // keys are all different, which is what a join side usually is, that is every row, so
+            // every row was probed twice to learn nothing the second probe did not. So a batch after
+            // one where no row found its key goes straight to the loop, which is exact either way:
+            // it probes before it inserts, so a key that is in already is found there. The first
+            // batch that finds one turns the batched probe back on.
+            let pending: &[usize] = if new {
+                table.warm(hashes, batch);
+                &every[..batch.len()]
+            } else {
+                table.probe_these(hashes, keys, batch, &mut found, &mut walk);
+                walk.pending()
+            };
+            let mut hits = 0;
             // The rows the batch could not settle, in row order, which is the order they have to
             // go in: two rows of one batch can be the first two rows of one key, and the second
             // only finds the first if the first went in before it was asked.
-            for &place in walk.pending() {
+            for &place in pending {
                 let row = batch[place];
                 match table.probe(hashes[row], keys, row) {
-                    Probe::Found(slot) => found[place] = slot,
+                    Probe::Found(slot) => {
+                        found[place] = slot;
+                        hits += 1;
+                    }
                     Probe::Vacant(bucket) => {
                         let slot = table.insert(bucket, hashes[row], keys, row)?;
                         debug_assert_eq!(
@@ -797,6 +824,7 @@ fn fill<'r>(
                     }
                 }
             }
+            new = hits == 0 && pending.len() == batch.len();
             // In row order and after the whole batch has a slot, because the batched pass fills
             // the rows that were already keys and the loop above fills the rest, and a chain that
             // was appended to in that order would hold a key's rows in neither the order they
@@ -1023,6 +1051,21 @@ mod tests {
     fn a_key_first_seen_twice_inside_one_batch_is_one_key() {
         let lookup = built(&[Some(4), Some(4)]);
         assert_eq!(found(&lookup, &[Some(4)]), vec![vec![0, 1]]);
+    }
+
+    /// A side whose keys are all new for several batches and then start to come back, which is where
+    /// the build stops probing each batch as a whole before it probes each row and then starts again.
+    /// The keys are spread far enough apart that the side is hashed rather than indexed by value.
+    #[test]
+    fn a_key_that_comes_back_after_batches_of_new_keys_is_the_same_key() {
+        let spread = |key: i32| Some(key * 1_000_003);
+        let values: Vec<Option<i32>> =
+            (0..600).map(|row| spread(if row < 300 { row } else { 599 - row })).collect();
+        let lookup = built(&values);
+        assert!(lookup.low.is_none(), "a key this spread out is hashed");
+        let asked: Vec<Option<i32>> = (0..300).map(spread).collect();
+        let expected: Vec<Vec<u32>> = (0..300).map(|key| vec![key, 599 - key]).collect();
+        assert_eq!(found(&lookup, &asked), expected);
     }
 
     /// Past one batch, so that the chain is appended to across several of them and the rows of a key

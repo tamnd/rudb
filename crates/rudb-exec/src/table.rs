@@ -261,6 +261,26 @@ impl Table {
         Self::sized(types, Self::buckets_for(groups))
     }
 
+    /// An empty table with room for every one of `rows` rows to be a group of its own.
+    ///
+    /// For a join side, whose rows are all in hand before the first of them goes in, so the count
+    /// is exact rather than an estimate and it bounds the groups from above. A side whose key is
+    /// unique, which is the usual side of a join, ends with a group per row, and a table that starts
+    /// at [`FIRST`] buckets gets there by doubling a dozen times and rehashing every group it held at
+    /// each one. The key columns and the hashes are reserved for the same count, so a group going in
+    /// is a write into memory that is already there. On q09 at SF1 the `partsupp` side is forty three
+    /// thousand rows with a unique pair of keys, and growing to fit them was most of what filling its
+    /// table took.
+    pub(crate) fn for_rows(types: &[rudb_common::LogicalType], rows: usize) -> Self {
+        let mut table = Self::with_groups(types, u64::try_from(rows).unwrap_or(u64::MAX));
+        let rows = rows.min(LIMIT);
+        table.hashes.reserve(rows);
+        for column in &mut table.columns {
+            column.reserve(rows);
+        }
+        table
+    }
+
     /// The bytes the bucket array of [`Table::with_groups`] takes for `groups` groups, which is
     /// what an aggregate reserves before it asks for them.
     ///
@@ -518,6 +538,24 @@ impl Table {
         // the passes above reach a vacancy in whatever order the walks happen to end. The places
         // sort into row order too, because a batch is given in row order either way it is given.
         walk.pending.sort_unstable();
+    }
+
+    /// Reads the bucket each of `rows` starts its walk at, and nothing else.
+    ///
+    /// For a caller about to probe those rows one at a time. Each load here depends on nothing but
+    /// a hash, so on a table larger than the cache the misses are all outstanding at once, and the
+    /// probes after it find their buckets waiting rather than each waiting on its own. A table
+    /// small enough to be in the cache already is left alone.
+    pub(crate) fn warm(&self, hashes: &[u64], rows: &[usize]) {
+        if self.buckets.len() <= HOT {
+            return;
+        }
+        let mask = self.buckets.len() - 1;
+        let mut seen = 0;
+        for &row in rows {
+            seen |= self.buckets[(hashes[row] as usize) & mask];
+        }
+        std::hint::black_box(seen);
     }
 
     /// The batch answered off the direct index, or `false` if it could not be.
@@ -2020,6 +2058,20 @@ impl Column {
             _ => StoredData::Other(Vec::new()),
         };
         Self { valid: Vec::new(), data }
+    }
+
+    /// Room for `rows` more values, in the runs that have a fixed width. A string column is left to
+    /// grow, because how many bytes its values take is not known from how many there are.
+    fn reserve(&mut self, rows: usize) {
+        self.valid.reserve(rows);
+        match &mut self.data {
+            StoredData::TinyInt(values) => values.reserve(rows),
+            StoredData::SmallInt(values) => values.reserve(rows),
+            StoredData::Integer(values) => values.reserve(rows),
+            StoredData::BigInt(values) => values.reserve(rows),
+            StoredData::Wide { values, .. } => values.reserve(rows),
+            StoredData::Varchar(_) | StoredData::StableText { .. } | StoredData::Other(_) => {}
+        }
     }
 
     fn push(&mut self, value: Value) -> Result<()> {
