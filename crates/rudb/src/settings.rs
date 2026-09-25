@@ -27,6 +27,7 @@
 //! `spec/stats/09-measurement.md` section 9.3 runs on every commit. `SET graph_sections = off` is
 //! the same idea for the stored graph sections. None of the eleven is a DuckDB setting either, so none
 //! of them is in the settings catalog and `duckdb_settings()` does not list them.
+//! `SET stored_answers = off` is one more of them, and it makes a whole table aggregate read its rows rather than the counts and totals the file wrote down at load time, which is what a ClickBench run needs.
 //!
 //! `cluster_by` is an exception of a third kind, and the interesting one. It is not a DuckDB
 //! setting either, but unlike the seams and the rules it keeps nothing here at all. What it writes
