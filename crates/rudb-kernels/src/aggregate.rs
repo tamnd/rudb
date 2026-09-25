@@ -3736,6 +3736,112 @@ fn real_sum<const DIRECT: bool, M: Fn(usize) -> usize>(
     Some(Contribution::Real { total, seen })
 }
 
+/// How many rows the value only loop of [`blocked`] covers before it looks for the row.
+///
+/// Small enough that searching one block for the value it just found is a small part of the pass
+/// that found it, and large enough that the outer loop's own arithmetic is noise. A run that arrives
+/// in the order the extreme wants is the case that searches every block, and at a thousand that is a
+/// sixteenth of a vector searched at a time.
+const BLOCK: usize = 1024;
+
+/// Whether a value replaces the best one so far, which is the only place the direction is read.
+///
+/// `LEAST` is a constant rather than an argument because this sits inside the loop. As an argument
+/// it is a test per row that the compiler has to hoist out; as a constant the loop that calls it is
+/// a plain minimum or a plain maximum, and the vectorizer knows both of those.
+fn beats<const LEAST: bool, T: Ord>(value: T, mark: T) -> bool {
+    if LEAST { value < mark } else { value > mark }
+}
+
+/// The row holding the smallest or largest value in a run, in two passes over one block.
+///
+/// A loop that carries the row number of the best value so far cannot go four rows at a time,
+/// because that row number is carried from one row to the next and a vector register has no lane to
+/// carry it in. A loop that carries only the value can. So this carries only the value across a
+/// block of rows and then looks for that value in the one block that produced it, which is one
+/// vectorized pass over everything and a second pass over the blocks that improved on what came
+/// before. Any row holding the value answers, because two rows with the same number in them give
+/// back the same value, and that is what makes the second pass a search rather than a record of
+/// where the first pass had got to.
+fn blocked<const LEAST: bool, T: Copy + Ord>(run: &[T]) -> Option<usize> {
+    let mut mark = *run.first()?;
+    let mut held = None;
+    for (number, block) in run.chunks(BLOCK).enumerate() {
+        let mut best = block[0];
+        for &value in &block[1..] {
+            best = if beats::<LEAST, T>(value, best) { value } else { best };
+        }
+        if held.is_none() || beats::<LEAST, T>(best, mark) {
+            // The value was read out of this block, so the search finds it and the zero is not
+            // reachable. It is a fallback rather than an unwrap because a kernel that panics on a
+            // row of data is worse than one that answers with the first row of the block.
+            let inside = block.iter().position(|value| *value == best).unwrap_or(0);
+            mark = best;
+            held = Some(number * BLOCK + inside);
+        }
+    }
+    held
+}
+
+/// Which row holds the extreme, with the column's own width and the direction both settled.
+///
+/// The best so far is held as a `T` rather than widened to an `i128`. One loop for every width was
+/// what the widening bought, and it cost a 128 bit comparison per row, which is a pair of
+/// instructions the compiler cannot put in a vector register. `T` is the width, so the loop is
+/// written once and compiled per width instead.
+fn chase<const DIRECT: bool, const LEAST: bool, T: Copy + Ord, M: Fn(usize) -> usize>(
+    values: &[T],
+    at: &M,
+    rows: usize,
+    nulls: &Validity,
+) -> Option<usize> {
+    let run = straight::<DIRECT, _>(values, rows);
+    match (nulls, run) {
+        (Validity::AllValid, Some(run)) => blocked::<LEAST, T>(run),
+        (Validity::AllValid, None) => {
+            if rows == 0 {
+                return None;
+            }
+            // The winner is a row number and a number, not an `Option` of a pair. Carrying the
+            // option into the loop puts a discriminant test on every row, and the first row is the
+            // only row that needs one, so the seed is the first row and the loop starts after it.
+            let mut mark = values[at(0)];
+            let mut held = 0;
+            for index in 1..rows {
+                let number = values[at(index)];
+                if beats::<LEAST, T>(number, mark) {
+                    mark = number;
+                    held = index;
+                }
+            }
+            Some(held)
+        }
+        (Validity::AllInvalid, _) => None,
+        (Validity::Mask(mask), run) => {
+            // A word of the mask at a time, because the rows a filter leaves behind are in no
+            // pattern a branch predictor is going to learn. The seed is an option here, because
+            // which row is the first one that is not null is not known before the mask is read.
+            let mut best: Option<(usize, T)> = None;
+            for start in (0..rows).step_by(64) {
+                let word = mask.word(start / 64);
+                for index in start..(start + 64).min(rows) {
+                    if word >> (index - start) & 1 == 0 {
+                        continue;
+                    }
+                    let number = match run {
+                        Some(run) => run[index],
+                        None => values[at(index)],
+                    };
+                    if best.is_none_or(|(_, mark)| beats::<LEAST, T>(number, mark)) {
+                        best = Some((index, number));
+                    }
+                }
+            }
+            best.map(|(index, _)| index)
+        }
+    }
+}
+
 /// Which row holds the smallest or largest number, or none if every row is null.
 fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
     data: &Data,
@@ -3747,77 +3853,22 @@ fn extreme<const DIRECT: bool, M: Fn(usize) -> usize>(
     macro_rules! best {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
-                $(Data::$variant(values) => best!(@run values),)+
+                // The direction is settled here, once for the whole vector, so that the loops it
+                // reaches have it as a constant. See [`beats`].
+                $(Data::$variant(values) => if least {
+                    chase::<DIRECT, true, $native, M>(values.as_slice(), &at, rows, nulls)
+                } else {
+                    chase::<DIRECT, false, $native, M>(values.as_slice(), &at, rows, nulls)
+                },)+
                 // A float orders NaN the way the comparison kernel says rather than the way the
                 // hardware does, and a string extreme is a comparison of bytes rather than of
                 // numbers. Both are worth a loop of their own and neither gets a wrong one here.
-                // The unsigned hugeint is out because the seed and the running best are both
-                // `i128` and it holds values that one cannot.
+                // The unsigned hugeint is not in this group, and now that the best so far is held
+                // at the column's own width there is nothing in the loop that rules it out, so it
+                // waits for a query that asks for one.
                 _ => return None,
             }
         };
-        (@run $values:expr) => {{
-            let values = $values.as_slice();
-            let run = straight::<DIRECT, _>(values, rows);
-            // The winner is a row number and a number, not an `Option` of a pair. Carrying the
-            // option into the loop puts a discriminant test on every row, and the first row is the
-            // only row that needs one, so the seed is the first row that is not null and the loop
-            // starts after it.
-            let mut held = usize::MAX;
-            let mut mark: i128 = 0;
-            match nulls {
-                Validity::AllValid => match run {
-                    Some(run) if !run.is_empty() => {
-                        mark = i128::from(run[0]);
-                        held = 0;
-                        for (index, &value) in run.iter().enumerate().skip(1) {
-                            let number = i128::from(value);
-                            let win = if least { number < mark } else { number > mark };
-                            if win {
-                                mark = number;
-                                held = index;
-                            }
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        if rows > 0 {
-                            mark = i128::from(values[at(0)]);
-                            held = 0;
-                            for index in 1..rows {
-                                let number = i128::from(values[at(index)]);
-                                let win = if least { number < mark } else { number > mark };
-                                if win {
-                                    mark = number;
-                                    held = index;
-                                }
-                            }
-                        }
-                    }
-                },
-                Validity::AllInvalid => {}
-                Validity::Mask(mask) => {
-                    for start in (0..rows).step_by(64) {
-                        let word = mask.word(start / 64);
-                        for index in start..(start + 64).min(rows) {
-                            if word >> (index - start) & 1 == 0 {
-                                continue;
-                            }
-                            let number = match run {
-                                Some(run) => i128::from(run[index]),
-                                None => i128::from(values[at(index)]),
-                            };
-                            let win = if least { number < mark } else { number > mark };
-                            if held == usize::MAX || win {
-                                mark = number;
-                                held = index;
-                            }
-                        }
-                    }
-                }
-            }
-            (held != usize::MAX).then_some(held)
-        }};
     }
     Some(rudb_vector::for_each_layout!(exact, best))
 }
@@ -3961,6 +4012,49 @@ mod tests {
             &[Value::Integer(1), Value::Integer(7), Value::Integer(3)],
         );
         assert_eq!(largest, Value::Integer(7));
+    }
+
+    /// A run of more than one block agrees with a row at a time, wherever the winner is in it.
+    ///
+    /// [`blocked`] reduces a block of rows to a value and then looks for that value in the block it
+    /// came from, so the shapes that catch a wrong block number, or a search that looked in the
+    /// wrong block, are runs longer than one block with the winner at the front, at the back, and in
+    /// the short block past the end of the whole ones. Ascending is the order that improves on every
+    /// block and descending the order that improves on none of them after the first.
+    #[test]
+    fn an_extreme_over_more_than_one_block_finds_the_winner_wherever_it_is() {
+        for order in ["ascending", "descending", "scattered", "all one value"] {
+            let number = |row: usize, rows: usize| match order {
+                "ascending" => row as i64,
+                "descending" => (rows - row) as i64,
+                "scattered" => ((row * 7919) % rows) as i64,
+                _ => 42,
+            };
+            for nulls in [0_usize, 5, 1] {
+                // Two batches, the first a block and a bit and the second most of a block, so that
+                // a winner carried from one vector to the next is read as well as one inside a
+                // vector.
+                let batches: Vec<Vector> = [BLOCK + 7, BLOCK - 3]
+                    .iter()
+                    .map(|&rows| {
+                        let values: Vec<Value> = (0..rows)
+                            .map(|row| {
+                                if nulls > 0 && row % nulls == 0 {
+                                    Value::Null
+                                } else {
+                                    Value::BigInt(number(row, rows))
+                                }
+                            })
+                            .collect();
+                        Vector::from_values(LogicalType::BigInt, &values).expect("bigints")
+                    })
+                    .collect();
+                for name in ["min", "max"] {
+                    let note = format!("{name} over a run {order}, one null in {nulls}");
+                    agrees(name, &LogicalType::BigInt, &batches, &note);
+                }
+            }
+        }
     }
 
     #[test]
