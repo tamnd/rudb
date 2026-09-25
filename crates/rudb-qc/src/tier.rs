@@ -7,10 +7,14 @@
 //! a morsel boundary: the two agree on the state and the morsel to the byte, so either one can
 //! pick up where the other stopped.
 //!
+//! [`Switch`] moves a query between the tiers at morsel boundaries, which is the tier differential
+//! of section 15 of the spec: the same query with and without the moves has to give the same bits.
+//!
 //! A function `clif` refuses, or panics on, runs on `interp` and the refusal is kept in the
 //! [`Report`]. A query never fails because the second tier could not compile it.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use rudb_qc_interp::Program;
@@ -71,11 +75,112 @@ impl fmt::Display for Tier {
     }
 }
 
+/// When a query moves between the tiers, which the tier differential forces and nothing else asks
+/// for.
+///
+/// A switch happens at a morsel boundary: the tier is picked once per morsel a pipeline is fed,
+/// and a morsel runs to the end on the tier it started on. Since the two tiers agree on the state
+/// to the byte, a query that moves between them at random morsels has to give the answer it gives
+/// on either one alone, and a difference is a bug in one of them that a whole query on one tier
+/// could hide.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Switch {
+    /// Every morsel on the query's tier.
+    #[default]
+    Off,
+    /// `n` morsels on the second tier, then `n` on `interp`, and so on.
+    Every(u64),
+    /// Each morsel on a tier drawn from this seed, so that a failure comes back with the seed.
+    Random(u64),
+}
+
+impl Switch {
+    /// The switch `SET qc_switch` names: `off`, `every:<n>` with `n` at least 1, or
+    /// `random:<seed>`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Switch> {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("off") {
+            return Some(Switch::Off);
+        }
+        let (kind, n) = name.split_once(':')?;
+        let n: u64 = n.trim().parse().ok()?;
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "every" if n > 0 => Some(Switch::Every(n)),
+            "random" => Some(Switch::Random(n)),
+            _ => None,
+        }
+    }
+
+    /// Whether morsel `n` of a query runs on the second tier.
+    fn native(self, n: u64) -> bool {
+        match self {
+            Switch::Off => true,
+            Switch::Every(k) => (n / k).is_multiple_of(2),
+            Switch::Random(seed) => mix(seed ^ mix(n)) & 1 == 0,
+        }
+    }
+}
+
+impl fmt::Display for Switch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Switch::Off => f.write_str("off"),
+            Switch::Every(n) => write!(f, "every:{n}"),
+            Switch::Random(seed) => write!(f, "random:{seed}"),
+        }
+    }
+}
+
+/// Where a pipeline's rows go, which is what says whether a switch landed inside live state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sink {
+    /// Rows out, with nothing held from one morsel to the next but the row count.
+    Result,
+    /// A hash aggregate, whose groups are live across morsels.
+    Aggregate,
+    /// A join build, whose table is live until it is finalized.
+    Build,
+}
+
+/// How many times a query moved between the tiers from one morsel of a pipeline to the next, by
+/// what the pipeline was filling at the time.
+///
+/// Section 15.3 of `spec/compiler/15-correctness.md` asks that the tier differential check it hit
+/// live state: a switch in the middle of an aggregate or a build is the one that tests something.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Switches {
+    /// In a pipeline that produces rows.
+    pub result: u64,
+    /// In a pipeline that feeds a hash aggregate.
+    pub aggregate: u64,
+    /// In a pipeline that builds a join's table.
+    pub build: u64,
+}
+
+impl Switches {
+    /// All of them.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.result + self.aggregate + self.build
+    }
+}
+
+/// splitmix64's finalizer, which is all a coin per morsel needs.
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 /// How a query is compiled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     /// The tier its pipelines run on.
     pub tier: Tier,
+    /// Whether it is made to move between the tiers as it runs.
+    pub switch: Switch,
 }
 
 /// What the second tier did with a query's module, for `EXPLAIN (CODEGEN)` and the query log.
@@ -119,6 +224,14 @@ pub(crate) struct Tiers {
     #[cfg(feature = "qc-clif")]
     native: Vec<Option<rudb_qc_rt::code::Code>>,
     report: Report,
+    switch: Switch,
+    /// How many morsels have been fed, which numbers them for [`Switch`].
+    morsels: AtomicU64,
+    /// Per function, whether its last morsel ran as machine code, 2 before its first.
+    last: Vec<AtomicU8>,
+    /// How many times a morsel ran on another tier than the morsel of the same function before
+    /// it, by [`Sink`].
+    switches: [AtomicU64; 3],
 }
 
 impl fmt::Debug for Tiers {
@@ -128,9 +241,15 @@ impl fmt::Debug for Tiers {
 }
 
 impl Tiers {
-    /// Lowers `module` for the interpreter and, when `tier` asks for it, for the machine.
-    pub(crate) fn new(module: &Module, tier: Tier) -> Tiers {
+    /// Lowers `module` for the interpreter and, when `options` asks for it, for the machine.
+    pub(crate) fn new(module: &Module, options: Options) -> Tiers {
+        let Options { tier, switch } = options;
         let program = Program::new(module);
+        let counts = (
+            AtomicU64::new(0),
+            module.funcs.iter().map(|_| AtomicU8::new(2)).collect(),
+            [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+        );
         let mut report = Report {
             tier: if tier.native() { Tier::Clif.name() } else { Tier::Interp.name() },
             functions: module.funcs.len(),
@@ -143,14 +262,16 @@ impl Tiers {
             } else {
                 module.funcs.iter().map(|_| None).collect()
             };
-            Tiers { program, native, report }
+            let (morsels, last, switches) = counts;
+            Tiers { program, native, report, switch, morsels, last, switches }
         }
         #[cfg(not(feature = "qc-clif"))]
         {
             if tier.native() {
                 report.fallbacks.push("this build has no clif tier".to_string());
             }
-            Tiers { program, report }
+            let (morsels, last, switches) = counts;
+            Tiers { program, report, switch, morsels, last, switches }
         }
     }
 
@@ -164,13 +285,55 @@ impl Tiers {
         self.program.func(name)
     }
 
-    /// Runs function `f` on a state and a morsel, as machine code when there is some, and
-    /// returns its status.
-    pub(crate) fn call(&self, f: usize, st: *mut u8, m: *const u8, rt: &mut Rt) -> u64 {
+    /// How many times a morsel ran on another tier than the morsel of its pipeline before it.
+    pub(crate) fn switches(&self) -> Switches {
+        let [result, aggregate, build] =
+            self.switches.each_ref().map(|n| n.load(Ordering::Relaxed));
+        Switches { result, aggregate, build }
+    }
+
+    /// The tier the next morsel of function `f`, which fills `sink`, runs on, as the argument
+    /// [`Tiers::call`] takes: machine code when there is some, unless [`Switch`] says otherwise for
+    /// this morsel.
+    pub(crate) fn morsel(&self, f: usize, sink: Sink) -> bool {
+        let n = self.morsels.fetch_add(1, Ordering::Relaxed);
+        let native = self.has_native(f) && self.switch.native(n);
+        let last = self.last.get(f).map_or(2, |l| l.swap(u8::from(native), Ordering::Relaxed));
+        if last != 2 && last != u8::from(native) {
+            self.switches[sink as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        native
+    }
+
+    /// Whether function `f` has machine code.
+    fn has_native(&self, f: usize) -> bool {
         #[cfg(feature = "qc-clif")]
-        if let Some(Some(code)) = self.native.get(f) {
+        {
+            matches!(self.native.get(f), Some(Some(_)))
+        }
+        #[cfg(not(feature = "qc-clif"))]
+        {
+            let _ = f;
+            false
+        }
+    }
+
+    /// Runs function `f` on a state and a morsel, as machine code when `native` is set and there
+    /// is some, and returns its status.
+    pub(crate) fn call(
+        &self,
+        native: bool,
+        f: usize,
+        st: *mut u8,
+        m: *const u8,
+        rt: &mut Rt,
+    ) -> u64 {
+        #[cfg(feature = "qc-clif")]
+        if native && let Some(Some(code)) = self.native.get(f) {
             return clif::call(code, st, m, rt);
         }
+        #[cfg(not(feature = "qc-clif"))]
+        let _ = native;
         self.program.call(f, st, m, rt)
     }
 }

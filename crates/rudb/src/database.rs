@@ -629,6 +629,9 @@ struct Inner {
     /// What the compiled engine handed back under `SET engine = 'compiled'`, one line per query
     /// and the latest [`REFUSALS_KEPT`] of them, for [`Database::refusals`].
     refusals: Mutex<Vec<String>>,
+    /// How many times the compiled engine's queries moved between its tiers, for
+    /// [`Database::tier_switches`].
+    switches: Mutex<rudb_qc::Switches>,
 }
 
 /// How many refusals the log keeps.
@@ -1239,6 +1242,7 @@ impl Database {
             settings_revision: AtomicU64::new(0),
             native_aggregate_plan: Mutex::default(),
             refusals: Mutex::default(),
+            switches: Mutex::default(),
         };
         Self { shared: Shared { inner: Arc::new(inner) } }
     }
@@ -1264,6 +1268,14 @@ impl Database {
     #[must_use]
     pub fn refusals(&self) -> Vec<String> {
         self.shared.inner.refusals.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// How many times the compiled engine's queries moved between its tiers from one morsel of a
+    /// pipeline to the next, over this database's life, which only `SET qc_switch` makes them do.
+    /// The tier differential reads it to know its switches landed inside live state.
+    #[must_use]
+    pub fn tier_switches(&self) -> rudb_qc::Switches {
+        *self.shared.inner.switches.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// One setting, by the name `SET` uses for it, in the spelling DuckDB prints.
@@ -1391,6 +1403,7 @@ impl Database {
             settings_revision: AtomicU64::new(0),
             native_aggregate_plan: Mutex::default(),
             refusals: Mutex::default(),
+            switches: Mutex::default(),
         };
         Ok(Self { shared: Shared { inner: Arc::new(inner) } })
     }
@@ -3006,10 +3019,16 @@ impl Shared {
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 if self.inner.settings.engine() == COMPILED_ENGINE {
-                    let options = rudb_qc::Options { tier: self.inner.settings.tier() };
+                    let options = rudb_qc::Options {
+                        tier: self.inner.settings.tier(),
+                        switch: self.inner.settings.switch(),
+                    };
                     match rudb_qc::compile_with(&plan, cancel, options) {
                         Ok(compiled) => {
-                            return run_compiled(sql, &plan, &catalog, cancel, compiled, under);
+                            let switches = &self.inner.switches;
+                            return run_compiled(
+                                sql, &plan, &catalog, cancel, compiled, under, switches,
+                            );
                         }
                         Err(refusal) => self.refused(sql, &refusal),
                     }
@@ -4497,6 +4516,7 @@ fn run_compiled(
     cancel: &Cancel,
     compiled: rudb_qc::Compiled,
     under: Under<'_>,
+    switches: &Mutex<rudb_qc::Switches>,
 ) -> Result<QueryResult> {
     let Under { budget: Budget { memory, pool }, seams, session, planning, .. } = under;
     memory.forget_peak();
@@ -4504,6 +4524,12 @@ fn run_compiled(
     let qc = rudb_qc::Under { catalog, cancel, memory, seams, session, pool };
     let answer = compiled.run(plan, qc)?;
     let (ran_wall, ran_cpu) = driving.stop();
+    {
+        let mut total = switches.lock().unwrap_or_else(PoisonError::into_inner);
+        total.result += answer.switches.result;
+        total.aggregate += answer.switches.aggregate;
+        total.build += answer.switches.build;
+    }
     let mut held = memory.reservation();
     let mut chunks = Vec::with_capacity(answer.chunks.len());
     for chunk in answer.chunks {

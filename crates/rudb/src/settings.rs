@@ -168,6 +168,10 @@ pub(crate) struct Settings {
     ///
     /// Not a DuckDB setting either, for the same reason.
     tier: RwLock<rudb_qc::Tier>,
+    /// Whether the compiled engine moves a query between its tiers at morsel boundaries, as
+    /// `SET qc_switch` has left it: `off`, `every:<n>` or `random:<seed>`. Only the tier
+    /// differential sets it.
+    switch: RwLock<rudb_qc::Switch>,
 }
 
 impl Settings {
@@ -206,6 +210,7 @@ impl Settings {
             sizes: RwLock::new(rudb_opt::link::Sizes::default()),
             engine: RwLock::new(FIRST_ENGINE.to_string()),
             tier: RwLock::new(rudb_qc::Tier::Auto),
+            switch: RwLock::new(rudb_qc::Switch::Off),
         }
     }
 
@@ -249,6 +254,11 @@ impl Settings {
     /// The tier `SET qc_tier` picked.
     pub(crate) fn tier(&self) -> rudb_qc::Tier {
         *self.tier.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// The switches `SET qc_switch` asked for.
+    pub(crate) fn switch(&self) -> rudb_qc::Switch {
+        *self.switch.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The configuration as the statements have left it.
@@ -334,6 +344,16 @@ impl Settings {
                 )));
             }
             *self.tier.write().unwrap_or_else(|held| held.into_inner()) = tier;
+            return Ok(());
+        }
+        if is_switch(name) {
+            let written = value.map_or_else(|| rudb_qc::Switch::Off.to_string(), text_of);
+            let switch = rudb_qc::Switch::from_name(&written).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "qc_switch is off, every:<n> or random:<seed>, not {written}"
+                ))
+            })?;
+            *self.switch.write().unwrap_or_else(|held| held.into_inner()) = switch;
             return Ok(());
         }
         if is_links(name) {
@@ -705,6 +725,9 @@ impl Settings {
         if is_tier(name) {
             return Ok(self.tier().name().to_string());
         }
+        if is_switch(name) {
+            return Ok(self.switch().to_string());
+        }
         if let Some(which) = graph_size(name) {
             let sizes = self.sizes();
             return Ok(match which {
@@ -1000,6 +1023,11 @@ fn is_engine(name: &str) -> bool {
 /// Whether this name is the compiled engine's tier setting, the same shape as [`is_engine`].
 fn is_tier(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_tier")
+}
+
+/// Whether this name is the compiled engine's switch setting, the same shape as [`is_engine`].
+fn is_switch(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("qc_switch")
 }
 
 /// Whether this name is the relationship declaration setting.

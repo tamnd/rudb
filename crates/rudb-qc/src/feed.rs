@@ -40,7 +40,7 @@ use rudb_vector::{Chunk, Data, Validity, Vector};
 
 use crate::Under;
 use crate::finish::{self, Cell, cell, vector};
-use crate::tier::Tiers;
+use crate::tier::{self, Tiers};
 
 /// One pipeline being run.
 pub(crate) struct Feed<'a> {
@@ -188,6 +188,11 @@ impl<'a> Feed<'a> {
         let mut room = rows;
         let mut buffers = Vec::new();
         let Inner { rt, state, out, done } = &mut *inner;
+        let sink = match &self.body.sink {
+            Out::Result { .. } => tier::Sink::Result,
+            Out::Aggregate(_) => tier::Sink::Aggregate,
+            Out::Build(_) => tier::Sink::Build,
+        };
         'attempt: loop {
             buffers.clear();
             if let Out::Result { count, columns, capacity } = &self.body.sink {
@@ -212,8 +217,10 @@ impl<'a> Feed<'a> {
                 }
             }
             let st = state.as_mut_ptr().cast::<u8>();
+            // The tier is picked once per morsel, so a switch only ever happens between two.
+            let native = self.tiers.morsel(self.func, sink);
             loop {
-                let status = self.tiers.call(self.func, st, (&raw const morsel).cast(), rt);
+                let status = self.tiers.call(native, self.func, st, (&raw const morsel).cast(), rt);
                 match Status(status).kind() {
                     Kind::Ok => break 'attempt,
                     // The body saved where it got to in the header's cursor and picks up there.

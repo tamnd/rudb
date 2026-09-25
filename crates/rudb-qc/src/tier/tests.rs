@@ -8,7 +8,7 @@ use rudb_common::Cancel;
 use rudb_qc_ir::{Form, Module, Op, Ty, parse, verify};
 use rudb_qc_rt::Rt;
 
-use super::{Tier, Tiers};
+use super::{Options, Sink, Switch, Switches, Tier, Tiers};
 
 const INTS: [Ty; 6] = [Ty::I1, Ty::I8, Ty::I16, Ty::I32, Ty::I64, Ty::I128];
 const ALL: [Ty; 10] =
@@ -190,15 +190,15 @@ fn run(tiers: &Tiers, a: u128, b: u128) -> (u64, u128) {
     state[4] = a;
     state[5] = b;
     let mut rt = Rt::new(Cancel::new());
-    let status = tiers.call(0, state.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
+    let status = tiers.call(true, 0, state.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
     (status, state[6])
 }
 
 /// Both tiers of one module, with the check that `clif` compiled it.
 fn both(m: &Module) -> (Tiers, Tiers) {
-    let clif = Tiers::new(m, Tier::Clif);
+    let clif = Tiers::new(m, Options { tier: Tier::Clif, ..Options::default() });
     assert_eq!(clif.report().native, m.funcs.len(), "{}", clif.report());
-    (Tiers::new(m, Tier::Interp), clif)
+    (Tiers::new(m, Options { tier: Tier::Interp, ..Options::default() }), clif)
 }
 
 #[test]
@@ -333,8 +333,8 @@ fn memory_and_control_flow_are_the_interpreters() {
         }
         let mut rt = Rt::new(Cancel::new());
         let [a, b] = &mut state;
-        let want = interp.call(0, a.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
-        let got = clif.call(0, b.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
+        let want = interp.call(false, 0, a.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
+        let got = clif.call(true, 0, b.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
         assert_eq!(want, got, "round {round}");
         // The header's `rt` word is the one thing only native code writes, and it clears it.
         assert_eq!(a[..], b[..], "round {round}");
@@ -352,7 +352,7 @@ fn a_cancelled_query_stops_at_a_poll_on_both_tiers() {
         state[4] = 100;
         state[5] = 1;
         let mut rt = Rt::new(cancel.clone());
-        let status = tiers.call(0, state.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
+        let status = tiers.call(true, 0, state.as_mut_ptr().cast(), std::ptr::null(), &mut rt);
         assert_eq!(
             rudb_qc_ir::status::kind(status),
             rudb_qc_ir::status::CANCELLED,
@@ -360,4 +360,38 @@ fn a_cancelled_query_stops_at_a_poll_on_both_tiers() {
             tiers.report()
         );
     }
+}
+
+#[test]
+fn a_switch_names_itself_the_way_set_takes_it() {
+    for (name, switch) in
+        [("off", Switch::Off), ("every:3", Switch::Every(3)), ("random:42", Switch::Random(42))]
+    {
+        assert_eq!(Switch::from_name(name), Some(switch));
+        assert_eq!(switch.to_string(), name);
+    }
+    assert_eq!(Switch::from_name(" Random: 5 "), Some(Switch::Random(5)));
+    for bad in ["every:0", "every", "sometimes:3", "random:x", ""] {
+        assert_eq!(Switch::from_name(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn switches_move_a_function_between_the_tiers_and_are_counted_where_they_land() {
+    let m = parse(FLOW).expect("the flow module parses");
+    let every = Tiers::new(&m, Options { tier: Tier::Clif, switch: Switch::Every(2) });
+    let picked: Vec<bool> = (0..8).map(|_| every.morsel(0, Sink::Aggregate)).collect();
+    assert_eq!(picked, [true, true, false, false, true, true, false, false]);
+    assert_eq!(every.switches(), Switches { aggregate: 3, ..Switches::default() });
+
+    let random = Tiers::new(&m, Options { tier: Tier::Clif, switch: Switch::Random(1) });
+    let picked: Vec<bool> = (0..64).map(|_| random.morsel(0, Sink::Build)).collect();
+    let flips = picked.windows(2).filter(|w| w[0] != w[1]).count() as u64;
+    assert!(flips > 8, "{picked:?}");
+    assert_eq!(random.switches(), Switches { build: flips, ..Switches::default() });
+
+    // On `interp` there is nothing to switch to, and nothing is counted.
+    let interp = Tiers::new(&m, Options { tier: Tier::Interp, switch: Switch::Every(1) });
+    assert!((0..8).all(|_| !interp.morsel(0, Sink::Result)));
+    assert_eq!(interp.switches().total(), 0);
 }
