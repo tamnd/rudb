@@ -355,7 +355,8 @@ pub fn picked(
     }))
 }
 
-/// The same, copying the pieces of a string column on whatever threads `spread` has.
+/// The same, copying the pieces of a string column, or of a long fixed width one, on whatever
+/// threads `spread` has.
 ///
 /// # Why this exists at all
 ///
@@ -372,9 +373,13 @@ pub fn picked(
 /// of the column rather than a copy of a view a row. Everything else goes down the same path
 /// [`concat()`] does, including the two cases that are already nearly free: pieces that share one
 /// arena, where laying is the views alone, and pieces that are adjacent windows of one page, where it
-/// is a handle. Fixed width pieces are also left serial, on the measurement above: the integer column
-/// of the same projection lays in 2 to 12 ms, so the copy is there but it is not what is worth a
-/// second code path yet.
+/// is a handle.
+///
+/// Fixed width pieces are copied on the threads too, once the column is 65,536 rows or more and the
+/// pieces are not windows of one page. On the projection above the integer column laid in 2 to 12
+/// ms and was left serial, but a join laying out its build side lays whole tables: the `orders` side
+/// of TPC-H q9 is a million and a half keys, and one thread copying them was 11 of the 12 ms the
+/// layout took on eight.
 ///
 /// The reason the string case is the expensive one is that a flat varchar piece owns its arena, so the
 /// serial walk has to be in order: each piece's views record offsets into the page being built and
@@ -396,7 +401,82 @@ pub fn concat_on<V: AsRef<Vector>>(
     if let Some(strung) = strung(ty, &pieces, spread)? {
         return Ok(Some(strung));
     }
+    if let Some(tiled) = tiled(ty, &pieces, spread)? {
+        return Ok(Some(tiled));
+    }
     laid(ty, &pieces)
+}
+
+/// How many rows a fixed width column has to have before [`tiled`] spreads its copy. Below it one
+/// thread copies the column in less time than it takes to wake the others.
+const TILED_ROWS: usize = 1 << 16;
+
+/// Fixed width pieces laid into one page with a piece per task.
+///
+/// The page is zeroed rather than grown, the way [`strung`] makes its arena, so every task has its
+/// own slice to write before any of them starts. A page this long is fresh memory from the kernel,
+/// which comes zeroed already, so the zeroing is not a pass over it. What is left is the copy, and
+/// most of what a copy into fresh memory costs is faulting the memory in, which the threads now do
+/// a slice each rather than one of them for the whole page.
+///
+/// `None` for whatever [`laid`] does as well or better: a column shorter than [`TILED_ROWS`], one
+/// piece, a piece that is not flat or holds fewer values than rows, strings, and pieces that are
+/// adjacent windows of one page, which lay as a handle.
+fn tiled(ty: &LogicalType, pieces: &[&Vector], spread: &Spread<'_>) -> Result<Option<Vector>> {
+    let rows: usize = pieces.iter().map(|piece| piece.len()).sum();
+    if pieces.len() < 2 || rows < TILED_ROWS {
+        return Ok(None);
+    }
+    let flat = pieces.iter().all(|piece| {
+        piece.form() == Form::Flat
+            && piece.logical_type() == ty
+            && !piece.is_empty()
+            && piece.data().is_some_and(|data| data.len() == piece.len())
+    });
+    if !flat || adjoined(pieces).is_some() {
+        return Ok(None);
+    }
+    macro_rules! tiles {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match pieces[0].data() {
+                $(Some(Data::$variant(_)) => {
+                    let mut page: Vec<$native> = vec![$zero; rows];
+                    // A slice of the page per piece, each taken exactly once by exactly one task,
+                    // which is the only way a shared closure can hand out a `&mut`.
+                    let mut rest: &mut [$native] = &mut page;
+                    let mut slots = Vec::with_capacity(pieces.len());
+                    for piece in pieces {
+                        let (head, tail) = rest.split_at_mut(piece.len());
+                        slots.push(Mutex::new(head));
+                        rest = tail;
+                    }
+                    let task = |at: usize| {
+                        let Some(Data::$variant(values)) = pieces[at].data() else { return };
+                        let mut slot = slots[at].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(values) = values.as_slice().get(..slot.len()) {
+                            slot.copy_from_slice(values);
+                        }
+                    };
+                    spread(pieces.len(), &task)?;
+                    drop(slots);
+                    Data::$variant(Buffer::from_vec(page))
+                })+
+                _ => return Ok(None),
+            }
+        };
+    }
+    // The first piece's layout is the page's, and a piece of any other layout is not this type.
+    if pieces.iter().any(|piece| layout_of_piece(piece) != layout_of_piece(pieces[0])) {
+        return Ok(None);
+    }
+    let data = crate::for_each_layout!(fixed, tiles);
+    let validity = run_of(pieces, rows);
+    Ok(Some(Vector::flat(ty.clone(), data)?.with_validity(validity).into_pages()))
+}
+
+/// The layout of a piece's data, for telling that every piece of a column has the same one.
+fn layout_of_piece(piece: &Vector) -> Option<std::mem::Discriminant<Data>> {
+    piece.data().map(std::mem::discriminant)
 }
 
 /// String pieces that each own an arena, laid into one page with a piece per task.
@@ -1729,6 +1809,49 @@ mod tests {
         let parallel =
             concat_on(&ty, &held, &on_a_thread_each).expect("no error").expect("flat pieces");
         assert_eq!(values(&parallel), values(&serial), "the two paths disagree");
+    }
+
+    /// Fixed width pieces long enough to be copied on the threads, some with nulls and one of a
+    /// different length, lay to the values the serial path lays, and the ones it leaves alone go
+    /// the serial way.
+    #[test]
+    fn fixed_width_pieces_laid_on_many_threads_hold_the_same_values_as_laid_on_one() {
+        for ty in [LogicalType::BigInt, LogicalType::Integer, LogicalType::Double] {
+            let pieces: Vec<Vector> = (0..9_i32)
+                .map(|piece| {
+                    let rows = if piece == 4 { 1_234 } else { TILED_ROWS / 8 + 7 };
+                    let held: Vec<Value> = (0..rows)
+                        .map(|row| {
+                            let n = piece * 100_000 + i32::try_from(row).expect("fits");
+                            if piece % 3 == 1 && n % 5 == 0 {
+                                return Value::Null;
+                            }
+                            match ty {
+                                LogicalType::BigInt => Value::BigInt(i64::from(n)),
+                                LogicalType::Integer => Value::Integer(n),
+                                _ => Value::Double(f64::from(n) / 4.0),
+                            }
+                        })
+                        .collect();
+                    Vector::from_values(ty.clone(), &held).expect("a run of values")
+                })
+                .collect();
+            let borrowed: Vec<&Vector> = pieces.iter().collect();
+            let wide = tiled(&ty, &borrowed, &on_a_thread_each).expect("no error");
+            let wide = wide.expect("long flat pieces are taken");
+            let serial = concat(&ty, &pieces).expect("no error").expect("flat pieces lay");
+            assert_eq!(values(&wide), all_of(&pieces), "{ty:?} laid end to end");
+            assert_eq!(values(&wide), values(&serial), "{ty:?} the two paths disagree");
+            let parallel = concat_on(&ty, &pieces, &on_a_thread_each).expect("no error");
+            assert_eq!(
+                values(&parallel.expect("lays")),
+                values(&serial),
+                "{ty:?} through concat_on"
+            );
+            // Too short, and a single piece, are both the serial path's.
+            assert!(tiled(&ty, &borrowed[..2], &on_a_thread_each).expect("no error").is_none());
+            assert!(tiled(&ty, &borrowed[..1], &on_a_thread_each).expect("no error").is_none());
+        }
     }
 
     /// Pieces of every form a sort hands over, read back through an order, against the same order

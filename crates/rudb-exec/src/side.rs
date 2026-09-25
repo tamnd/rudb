@@ -29,7 +29,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Spread, Value, serially};
 use rudb_pipeline::Lease;
 use rudb_vector::{Assembly, Chunk, Form, Validity, Vector};
 
@@ -145,18 +145,20 @@ impl Build {
     }
 }
 
-/// A list of chunks laid end to end, one vector per column, a column per thread.
+/// A list of chunks laid end to end, one vector per column.
 ///
 /// Both of this operator's two runs over the gathered side want it: the pairs the join answers with
 /// are gathered out of it, and the table that finds the pairs is built over the key columns in the
 /// same shape. A partition of that build reads rows from anywhere in the side, so the keys have to
 /// be one run rather than a list of chunks before it can start.
 ///
-/// A column at a time is also a thread at a time. One column's assembly reads one column of each
-/// chunk and writes one vector, and two of them share nothing, so the lease the calling pipeline
-/// already holds gets a column each. What that does not get is more threads than there are columns,
-/// which is the limit worth naming: splitting a column across threads would mean an arena per piece
-/// and then a join of the arenas, and the copy that would cost is the one #947 took out.
+/// A short side is laid a column a thread. One column's layout reads one column of each chunk and
+/// writes one vector, and two of them share nothing, so the lease the calling pipeline already holds
+/// gets a column each. A long one is laid on more threads than it has columns, because the `orders`
+/// side of TPC-H q9 is two columns and a million and a half rows. Every piece that has to be decoded
+/// is decoded first on every thread, and then each column in turn has its pieces copied into their
+/// places in one page on every thread, which is what [`rudb_vector::concat_on`] does with `spread`.
+/// See spec/perf/73-a-join-side-laid-out-on-every-thread.md.
 ///
 /// # Errors
 ///
@@ -167,11 +169,12 @@ pub(crate) fn laid_out(
     threads: &Lease<'_>,
 ) -> Result<Vec<Vector>> {
     let rows: usize = chunks.iter().map(Chunk::len).sum();
-    let one = |index: usize| -> Result<Vector> {
+    let decoded = decoded(types, chunks, threads)?;
+    let one = |index: usize, spread: &Spread<'_>| -> Result<Vector> {
         if let Some(coded) = coded(chunks, index)? {
             return Ok(coded);
         }
-        if let Some(laid) = end_to_end(&types[index], chunks, index)? {
+        if let Some(laid) = end_to_end(&types[index], chunks, index, &decoded[index], spread)? {
             return Ok(laid);
         }
         let mut assembly = Assembly::new(types[index].clone(), rows)?;
@@ -186,7 +189,75 @@ pub(crate) fn laid_out(
         }
         assembly.finish()
     };
-    in_parallel(threads, types.len(), threads.degree(), "gathered column", one)
+    if rows < SPREAD_ROWS {
+        return in_parallel(threads, types.len(), threads.degree(), "gathered column", |index| {
+            one(index, &serially)
+        });
+    }
+    // A long side lays a column at a time with each column's copy on every thread, because a side
+    // of two columns laid a column a thread used two threads of eight for the longest step.
+    let spread = |count: usize, task: &(dyn Fn(usize) + Sync)| -> Result<()> {
+        in_parallel(threads, count, threads.degree(), "laid piece", |at| {
+            task(at);
+            Ok(())
+        })
+        .map(drop)
+    };
+    (0..types.len()).map(|index| one(index, &spread)).collect()
+}
+
+/// How long a side has to be before its columns are laid one after another on every thread rather
+/// than side by side on a thread each.
+const SPREAD_ROWS: usize = 1 << 16;
+
+/// Every piece a column needs decoded before it lays end to end, decoded on every thread at once,
+/// as `[column][chunk]` with `None` where the piece lays as it is.
+///
+/// The decode is most of the work of a layout, and done inside a column's own task it ran on as
+/// many threads as the side has columns. The `orders` side of TPC-H q9 is two packed columns, so
+/// a million and a half rows were unpacked on two threads of eight and the layout was 32 of the
+/// 35 ms the side took to build. A piece is a task here, so the decode takes every thread the
+/// lease has whatever the number of columns, and the copy end to end that follows is a plain move.
+fn decoded(
+    types: &[LogicalType],
+    chunks: &[Chunk],
+    threads: &Lease<'_>,
+) -> Result<Vec<Vec<Option<Vector>>>> {
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for (index, ty) in types.iter().enumerate() {
+        if nested(ty) {
+            continue;
+        }
+        for (at, chunk) in chunks.iter().enumerate() {
+            let column = chunk.column(index)?;
+            let laid = matches!(column.form(), Form::Flat | Form::StringView);
+            // A stable dictionary is left for `coded`, which keeps it as codes when every piece
+            // shares its values.
+            if !chunk.is_empty() && !laid && column.stable_dictionary_parts().is_none() {
+                pieces.push((index, at));
+            }
+        }
+    }
+    let mut out: Vec<Vec<Option<Vector>>> =
+        types.iter().map(|_| chunks.iter().map(|_| None).collect()).collect();
+    if pieces.is_empty() {
+        return Ok(out);
+    }
+    let flat = in_parallel(threads, pieces.len(), threads.degree(), "decoded piece", |task| {
+        let (index, at) = pieces[task];
+        // flatten: a build side is probed by row, so a piece that is packed or a constant is
+        // decoded once here rather than once per probe.
+        chunks[at].column(index)?.flatten()
+    })?;
+    for ((index, at), vector) in pieces.into_iter().zip(flat) {
+        out[index][at] = Some(vector);
+    }
+    Ok(out)
+}
+
+/// Whether a type is one an assembly lays rather than a copy end to end.
+fn nested(ty: &LogicalType) -> bool {
+    matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _))
 }
 
 /// One column of the chunks laid end to end in a single copy, or `None` to leave it to an assembly.
@@ -201,15 +272,22 @@ pub(crate) fn laid_out(
 /// A piece that is not flat is flattened on its own first, which is the copy it would have had in
 /// the assembly anyway. A nested type, and a piece whose flattened run is shorter than the piece
 /// (an untyped null), go to the assembly, which is written for both.
-fn end_to_end(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option<Vector>> {
-    if matches!(ty, LogicalType::List(_) | LogicalType::Struct(_) | LogicalType::Map(_, _)) {
+fn end_to_end<'a>(
+    ty: &LogicalType,
+    chunks: &'a [Chunk],
+    index: usize,
+    decoded: &'a [Option<Vector>],
+    spread: &Spread<'_>,
+) -> Result<Option<Vector>> {
+    if nested(ty) {
         return Ok(None);
     }
-    let mut pieces: Vec<Cow<'_, Vector>> = Vec::with_capacity(chunks.len());
-    for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+    let mut pieces: Vec<Cow<'a, Vector>> = Vec::with_capacity(chunks.len());
+    for (chunk, decoded) in chunks.iter().zip(decoded).filter(|(chunk, _)| !chunk.is_empty()) {
         let column = chunk.column(index)?;
-        let piece = match column.form() {
-            Form::Flat | Form::StringView => Cow::Borrowed(column),
+        let piece = match (decoded, column.form()) {
+            (Some(decoded), _) => Cow::Borrowed(decoded),
+            (None, Form::Flat | Form::StringView) => Cow::Borrowed(column),
             // flatten: a build side is probed by row, so a piece that is a dictionary, a constant or
             // packed is decoded once here rather than once per probe, the copy the assembly made.
             _ => Cow::Owned(column.flatten()?),
@@ -220,7 +298,7 @@ fn end_to_end(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option
         pieces.push(piece);
     }
     // Views over one shared arena lay without a copy, and anything else that lays is flat.
-    if let Some(laid) = rudb_vector::concat(ty, &pieces)? {
+    if let Some(laid) = rudb_vector::concat_on(ty, &pieces, spread)? {
         return Ok(Some(laid));
     }
     for piece in &mut pieces {
@@ -233,7 +311,7 @@ fn end_to_end(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option
             }
         }
     }
-    rudb_vector::concat(ty, &pieces)
+    rudb_vector::concat_on(ty, &pieces, spread)
 }
 
 /// One column of the chunks as codes into the one dictionary every piece of it shares, or `None`
