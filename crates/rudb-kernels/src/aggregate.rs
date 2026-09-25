@@ -3979,9 +3979,9 @@ mod tests {
 
     #[test]
     fn an_aggregate_nobody_has_written_says_which_one() {
-        let error = Accumulator::new("median", &LogicalType::Double)
-            .expect_err("median is not written yet");
-        assert!(error.message().contains("the median aggregate"), "{error}");
+        let error = Accumulator::new("kurtosis", &LogicalType::Double)
+            .expect_err("kurtosis is not written yet");
+        assert!(error.message().contains("the kurtosis aggregate"), "{error}");
     }
 
     /// The row at a time path, which is the answer the one pass path has to reach.

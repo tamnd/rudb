@@ -74,6 +74,7 @@ mod nested_text;
 mod number;
 mod peel;
 pub mod prepare;
+mod quantile;
 mod random;
 mod regexp;
 pub mod scalar;

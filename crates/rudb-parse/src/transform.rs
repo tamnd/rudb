@@ -4019,11 +4019,9 @@ impl<'a> Transform<'a> {
     /// `FunctionExpression <- FunctionIdentifier FunctionExpressionArguments WithinGroupClause?
     /// FilterClause? ExportClause? OverClause?`.
     fn function(&mut self, node: u32) -> Result<ExprRef> {
-        for name in ["WithinGroupClause", "ExportClause"] {
-            let clause = self.find(node, name);
-            if clause != NONE {
-                return self.unsupported(clause);
-            }
+        let clause = self.find(node, "ExportClause");
+        if clause != NONE {
+            return self.unsupported(clause);
         }
         // `FilterClauseContents <- 'WHERE'? Expression`, so the word is optional and the predicate
         // is the last thing under it either way. Whether the call is allowed to carry one at all is
@@ -4038,7 +4036,7 @@ impl<'a> Transform<'a> {
             self.expr(predicate)?
         };
         let over = self.find(node, "OverClause");
-        let name = self.name_parts(self.first(node));
+        let mut name = self.name_parts(self.first(node));
         // `FunctionExpressionArguments <- Parens(FunctionExpressionArgumentList)` and
         // `FunctionExpressionArgumentList <- DistinctOrAll? FunctionArgumentList? OrderByClause?
         // IgnoreOrRespectNulls?`, so a call with no arguments still has both wrappers.
@@ -4048,7 +4046,7 @@ impl<'a> Transform<'a> {
         // On a call without an `OVER` it is kept beside the call, for the binder to decide whether
         // the aggregate it names cares about the order.
         let inside = self.find(list, "OrderByClause");
-        let inner = if inside == NONE {
+        let mut inner = if inside == NONE {
             Slice { start: 0, len: 0 }
         } else {
             // `ORDER BY ALL` names the call's own arguments rather than a list of keys, and what the
@@ -4103,6 +4101,16 @@ impl<'a> Transform<'a> {
         } else {
             String::new()
         };
+        let within = self.find(node, "WithinGroupClause");
+        if within != NONE {
+            if over != NONE {
+                return self.unsupported(within);
+            }
+            inner = self.within_group(within, &called, inside, args.len())?;
+            if called.starts_with("percentile_") {
+                name = self.function_name(&called.replace("percentile_", "quantile_"));
+            }
+        }
         let packs = called == "struct_pack";
         if packs && over == NONE && names.len() == args.len() {
             let names = self.part_slice(names);
@@ -4164,10 +4172,47 @@ impl<'a> Transform<'a> {
         }
         let args = self.expr_slice(args);
         let call = self.push(Expr::Function { name, args, distinct, filter });
-        if inside != NONE {
+        if inner.len > 0 {
             self.ast.aggregate_orders.push((call, inner));
         }
         Ok(call)
+    }
+
+    /// `WithinGroupClause <- 'WITHIN' 'GROUP' Parens(OrderByClause)`.
+    ///
+    /// The pin takes the clause on three names and writes it as the order of the call, so
+    /// `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` is `quantile_cont(0.5 ORDER BY x)` and the
+    /// binder reads the value from the key. The checks and their words are the pin's parser's.
+    fn within_group(
+        &mut self,
+        node: u32,
+        called: &str,
+        inside: u32,
+        written: usize,
+    ) -> Result<Slice> {
+        let wanted = match called {
+            "percentile_cont" | "percentile_disc" => 1,
+            "mode" => 0,
+            _ => return Err(Error::parser(format!("Unknown ordered aggregate \"{called}\"."))),
+        };
+        if inside != NONE {
+            return Err(Error::parser("Cannot use multiple ORDER BY statements with WITHIN GROUP"));
+        }
+        let clause = self.find(node, "OrderByClause");
+        let (items, all) = self.order_by(clause)?;
+        if all {
+            return self.unsupported(clause);
+        }
+        if items.len() != 1 {
+            return Err(Error::parser("Cannot use multiple ORDER BY clauses with WITHIN GROUP"));
+        }
+        if written != wanted {
+            return Err(Error::parser(format!(
+                "Wrong number of arguments for {}",
+                called.to_ascii_uppercase()
+            )));
+        }
+        Ok(self.order_slice(items))
     }
 
     // Windows.

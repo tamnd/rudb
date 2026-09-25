@@ -260,6 +260,19 @@ enum Shape {
     /// No arguments at all is `"NULL"[]`, which is the pin's answer for `[]` and is a list whose
     /// element type is the untyped null rather than a guess at what somebody meant to put in it.
     Listed,
+    /// `quantile_disc(x, q)`, which answers with one of its values, so in the type it was given,
+    /// and with a list of them when `q` is a list of fractions.
+    Discrete,
+    /// `quantile_cont(x, q)`, which answers between two of its values. The value is cast to the
+    /// type the answer is in before it is held, which is a DOUBLE for any integer and a TIMESTAMP
+    /// for a DATE, and a list of fractions answers a list.
+    Continuous,
+    /// `median(x)`, which is [`Shape::Continuous`] over anything that interpolates, an INTERVAL
+    /// included, and a value as given over anything else.
+    Median,
+    /// `mad(x)`, the median distance from the median, which is an INTERVAL for anything that is a
+    /// time and the continuous type for anything that is a number.
+    Deviation,
     /// No arguments at all and a fixed result. `now()` and `current_schema()`.
     ///
     /// The session context functions, which are the ones whose answer comes from the connection
@@ -993,6 +1006,11 @@ const TABLE: &[Entry] = &[
         Shape::FixedTo(Fixed::Varchar, Fixed::Varchar),
         false,
     ),
+    aggregate("quantile_cont", Arity::exactly(2), Shape::Continuous, false),
+    aggregate("quantile_disc", Arity::exactly(2), Shape::Discrete, false),
+    aggregate("median", Arity::exactly(1), Shape::Median, false),
+    aggregate("mad", Arity::exactly(1), Shape::Deviation, false),
+    aggregate("mode", Arity::exactly(1), Shape::AsGiven, false),
     // The ranking windows, which answer from where the row sits in its partition rather than from
     // anything in it. Six names and seven rows, since `rank_dense` is an alias upstream reports
     // with `dense_rank` in its `alias_of`. The three that count rows are BIGINT and the two that
@@ -1353,6 +1371,35 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                 return Err(no_match(entry.name, arguments));
             }
             (vec![common.clone(); arguments.len()], common)
+        }
+        Shape::Discrete => {
+            let (value, fraction) = (&arguments[0], &arguments[1]);
+            (vec![value.clone(), fraction.clone()], fractioned(fraction, value.clone()))
+        }
+        Shape::Continuous => {
+            let (value, fraction) = (&arguments[0], &arguments[1]);
+            let held = interpolated(value).ok_or_else(|| no_match(entry.name, arguments))?;
+            (vec![held.clone(), fraction.clone()], fractioned(fraction, held))
+        }
+        Shape::Median => {
+            let value = &arguments[0];
+            let held = match value {
+                LogicalType::Interval => Some(LogicalType::Interval),
+                _ => interpolated(value),
+            };
+            let held = held.unwrap_or_else(|| value.clone());
+            (vec![held.clone()], held)
+        }
+        Shape::Deviation => {
+            let held =
+                interpolated(&arguments[0]).ok_or_else(|| no_match(entry.name, arguments))?;
+            let returns = match held {
+                LogicalType::Timestamp | LogicalType::TimestampTz | LogicalType::Time => {
+                    LogicalType::Interval
+                }
+                ref number => number.clone(),
+            };
+            (vec![held], returns)
         }
         Shape::Listed => {
             let element = list_element(arguments)?;
@@ -1772,6 +1819,30 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
 ///
 /// The trailing newline is the reference's too. Its message ends after the last candidate with a
 /// line break, which is visible as the second blank line before the shell prints the offending SQL.
+/// The type a continuous quantile holds its values in and answers in, or `None` for a type that
+/// cannot be interpolated.
+fn interpolated(value: &LogicalType) -> Option<LogicalType> {
+    Some(match value {
+        LogicalType::Null | LogicalType::Double => LogicalType::Double,
+        LogicalType::Float => LogicalType::Float,
+        LogicalType::Decimal { .. } => value.clone(),
+        integer if integer.is_integer() => LogicalType::Double,
+        LogicalType::Date
+        | LogicalType::Timestamp
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs => LogicalType::Timestamp,
+        LogicalType::TimestampTz => LogicalType::TimestampTz,
+        LogicalType::Time => LogicalType::Time,
+        _ => return None,
+    })
+}
+
+/// A quantile's answer, which is a list of them when the fractions are a list.
+fn fractioned(fraction: &LogicalType, answer: LogicalType) -> LogicalType {
+    if matches!(fraction, LogicalType::List(_)) { LogicalType::list(answer) } else { answer }
+}
+
 fn no_match(name: &str, arguments: &[LogicalType]) -> Error {
     let types = arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
     let mut message = format!(
@@ -2787,6 +2858,10 @@ impl Shape {
             Self::Sorted => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
             Self::Graded => (leading(1, ANY_LIST, Fixed::Varchar.name()), ANY_LIST),
             Self::Ranged => (all("BIGINT"), "BIGINT[]"),
+            // The pin has a row per value type, each with a DOUBLE fraction and a DOUBLE[] twin, and
+            // one row here stands for all of them.
+            Self::Discrete | Self::Continuous => (leading(1, ANY, "DOUBLE"), ANY),
+            Self::Median | Self::Deviation => (all(ANY), ANY),
         }
     }
 }
@@ -2847,6 +2922,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("stddev", "stddev_samp"),
     ("variance", "var_samp"),
     ("group_concat", "string_agg"),
+    ("quantile", "quantile_disc"),
     ("listagg", "string_agg"),
     ("list_extract", "array_extract"),
     ("list_element", "array_extract"),
@@ -3329,6 +3405,9 @@ mod tests {
                     Shape::Flattened => arguments = vec![LogicalType::list(strings())],
                     Shape::Resized => arguments[0] = strings(),
                     Shape::Ranged => arguments = vec![LogicalType::BigInt; count],
+                    Shape::Continuous | Shape::Deviation => {
+                        arguments = vec![LogicalType::Double; count];
+                    }
                     Shape::Sorted | Shape::Graded => {
                         arguments = vec![LogicalType::Varchar; count];
                         arguments[0] = strings();
