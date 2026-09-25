@@ -37,7 +37,8 @@ use rudb_pipeline::Lease;
 use rudb_vector::{Chunk, Vector};
 
 use crate::pairs::{
-    self, Counted, Held, PARTITIONS, Repeat, Run, distinct_pairs, in_parallel, scatter_seeded,
+    self, Counted, Grouped, Held, PARTITIONS, Repeat, Run, distinct_pairs, in_parallel,
+    scatter_seeded,
 };
 use crate::rows;
 use crate::signed::SignedBlock;
@@ -686,16 +687,26 @@ impl Table {
         let timing = stage::Timing::start(Stage::Fold);
         for part in counted {
             for pair in &part.splits[split] {
-                let key = Key { group: pair.group, hash: pair.hash(), valid: pair.valid };
-                let slot = self.slot(key)?;
-                let state = &mut self.states[slot];
-                state.distinct = state
-                    .distinct
-                    .checked_add(1)
-                    .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+                self.add_distinct(*pair, 1)?;
+            }
+            // A tallied group stands for as many pairs as its partition counted.
+            for (pair, by) in &part.tallied[split] {
+                self.add_distinct(*pair, i64::from(*by))?;
             }
         }
         timing.stop(0);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn add_distinct(&mut self, pair: Grouped, by: i64) -> Result<()> {
+        let key = Key { group: pair.group, hash: pair.hash(), valid: pair.valid };
+        let slot = self.slot(key)?;
+        let state = &mut self.states[slot];
+        state.distinct = state
+            .distinct
+            .checked_add(by)
+            .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
         Ok(())
     }
 
