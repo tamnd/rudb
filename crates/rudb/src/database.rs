@@ -1507,7 +1507,35 @@ impl Database {
         let _writing = self.shared.writing();
         let mut catalog = self.shared.write();
         let resolved = catalog.resolve(&parts)?;
-        catalog.table_mut(&resolved)?.append_rows(rows)
+        let table = catalog.table_mut(&resolved)?;
+        let types: Vec<LogicalType> =
+            table.columns().iter().map(|field| field.ty.clone()).collect();
+        // Rows whose values already have their columns' types go in as they are, which is the
+        // common case, and only a batch with something to convert is copied.
+        let fits = |value: &Value, ty: &LogicalType| value.is_null() || &value.logical_type() == ty;
+        if rows
+            .iter()
+            .all(|row| row.len() == types.len() && row.iter().zip(&types).all(|(v, t)| fits(v, t)))
+        {
+            return table.append_rows(rows);
+        }
+        let mut converted = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            if row.len() != types.len() {
+                return Err(Error::invalid_input(format!(
+                    "row {index} has {} values and the table has {} columns",
+                    row.len(),
+                    types.len()
+                )));
+            }
+            let row = row
+                .iter()
+                .zip(&types)
+                .map(|(value, ty)| rudb_kernels::cast::cast_value(value, ty, false))
+                .collect::<Result<Vec<Value>>>()?;
+            converted.push(row);
+        }
+        table.append_rows(&converted)
     }
 
     /// How many rows a table holds.
