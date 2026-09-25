@@ -1055,8 +1055,8 @@ fn arithmetic_op(name: &str) -> Option<(Op, bool)> {
         "+" => (Op::Add, false),
         "-" => (Op::Subtract, false),
         "*" => (Op::Multiply, false),
-        "//" | "__rudb_checked_slash" => (Op::Divide, true),
-        "%" => (Op::Modulo, false),
+        "//" | "__rudb_checked_slash" | "__rudb_divide" => (Op::Divide, true),
+        "%" | "__rudb_mod" => (Op::Modulo, false),
         "__rudb_checked_remainder" => (Op::Modulo, true),
         _ => return None,
     })
@@ -3311,8 +3311,12 @@ pub fn call_values(
         ("+", [left, right]) => arithmetic(Op::Add, left, right, returns, written),
         ("-", [left, right]) => arithmetic(Op::Subtract, left, right, returns, written),
         ("*", [left, right]) => arithmetic(Op::Multiply, left, right, returns, written),
-        ("%", [left, right]) => arithmetic(Op::Modulo, left, right, returns, written),
-        ("//", [left, right]) => arithmetic(Op::Divide, left, right, returns, written),
+        ("%" | "__rudb_mod", [left, right]) => {
+            arithmetic(Op::Modulo, left, right, returns, written)
+        }
+        ("//" | "__rudb_divide", [left, right]) => {
+            arithmetic(Op::Divide, left, right, returns, written)
+        }
         ("__rudb_checked_slash", [left, right]) => {
             arithmetic(Op::Divide, left, right, returns, written)
         }

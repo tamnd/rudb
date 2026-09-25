@@ -135,6 +135,8 @@ fn call<W: Write>(
     let name = match name {
         "__rudb_checked_slash" => "/",
         "__rudb_checked_remainder" => "%",
+        "__rudb_divide" => "divide",
+        "__rudb_mod" => "mod",
         other => other,
     };
     let operator = !name.starts_with(|first: char| first.is_alphabetic() || first == '_');

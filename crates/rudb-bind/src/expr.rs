@@ -723,6 +723,20 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "age") && bound.len() == 1 {
             bound.insert(0, self.current_date());
         }
+        // `divide` and `mod` are `//` and `%` by another name, and the pin's division by zero message
+        // quotes them as called, `divide(7, 0)` rather than `(7 // 0)`. They are stored under a
+        // private name so the message can tell, and a zero divisor is null under the setting the
+        // same as it is for the operators.
+        for (spelled, operator, stored) in
+            [("divide", "//", "__rudb_divide"), ("mod", "%", "__rudb_mod")]
+        {
+            if rudb_catalog::same_name(&written, spelled) && bound.len() == 2 {
+                if self.semantics.null_on_division_by_zero() {
+                    bound[1] = self.zero_to_null(bound[1]);
+                }
+                return self.call_as(operator, stored, bound);
+            }
+        }
         self.call(&written, bound)
     }
 

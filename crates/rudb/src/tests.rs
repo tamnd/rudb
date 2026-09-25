@@ -2923,6 +2923,36 @@ fn ieee_floating_point_ops_are_resolved_while_the_expression_is_bound() {
     assert_eq!(error.message(), "Failed to cast value: Could not convert string 'off' to BOOL");
 }
 
+/// `divide` and `mod` are the `//` and `%` operators, and a division by zero says so in the name it
+/// was called by, the way the pin's message does.
+#[test]
+fn divide_and_mod_name_themselves_when_they_divide_by_zero() {
+    let db = database();
+    let advice = "Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.";
+    for (sql, expression) in [
+        ("SELECT divide(7, 0)", "divide(7, 0)"),
+        ("SELECT mod(7, 0)", "mod(7, 0)"),
+        ("SELECT divide(7.0, 0)", "divide(7.0, 0.0)"),
+        ("SELECT mod(7.5, 0)", "mod(7.5, 0.0)"),
+        ("SELECT 7 // 0", "(7 // 0)"),
+    ] {
+        assert_eq!(
+            failure(&db, sql),
+            format!("Division by zero in expression {expression}. {advice}"),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(&db, "SELECT divide(7, 2), mod(7, 2), TRY(divide(7, 0))"),
+        vec![vec![Value::Integer(3), Value::Integer(1), Value::Null]]
+    );
+    db.execute("SET null_on_division_by_zero = true").expect("nulling division errors");
+    assert_eq!(
+        rows(&db, "SELECT divide(7, 0), mod(7, 0), mod(7.5, 0), divide(7.0, 0)"),
+        vec![vec![Value::Null, Value::Null, Value::Null, Value::Null]]
+    );
+}
+
 #[test]
 fn timestamp_to_timestamptz_casts_can_be_disabled_while_binding() {
     let db = database();
