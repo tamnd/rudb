@@ -4350,20 +4350,27 @@ fn verify_part(bytes: &[u8], span: PartSpan) -> Result<()> {
 /// stripe after its page had been evicted read the index again with it, which on the full
 /// ClickBench file was about thirteen hundred reads out of a hundred and fourteen thousand.
 ///
-/// `seen` is which stripes have had their page read before, and `passing` is the pages read for the
-/// first time that are still held, oldest first. A page goes into the pool the second time it is
-/// read and not the first, which is the rule [`NativeText`] follows for its decoded blocks. A
-/// process that runs one statement, which is how a script or a benchmark uses the engine, reads
-/// each page once, and with no memory limit the pool kept every one of them to the end: ClickBench
-/// q33 held all of `WatchID` and `ClientIP` at its peak for a second scan that never came. The
-/// first read now keeps a page only while it is among the column's floor of newest ones, and a
-/// session that scans the table again pays one more read of each page and keeps it from then on.
+/// `touched` is which parts of each stripe have been read, a bit a part. A part is read on its own
+/// the first time and the stripe's page is read whole only when one of its parts is asked for again.
+/// That is the rule [`NativeText`] follows for its decoded blocks: a page earns its memory by being
+/// wanted a second time. A process that runs one statement, which is how a script or a benchmark
+/// uses the engine, wants each part once, and holding whole pages for it is what its peak was made
+/// of. On ClickBench 32 the pages of `WatchID` and `ClientIP`, each two megabytes a stripe, were half
+/// of the 108 MB the query peaked at, and ClickBench 41 held a stripe of every filter column to use
+/// a handful of parts out of each. Read a part at a time a scan costs more calls to read the same
+/// bytes, which on the whole suite was lost in the noise.
+///
+/// A page read whole goes into the pool when every part of its stripe had been read before, which
+/// is a second scan. When only some had, it is one scan asking for a part twice, the way a `LIKE`
+/// asks a compressed text part whether it can answer and then reads it, and `passing` holds those
+/// pages, oldest first, down to the column's floor. That is what keeps ClickBench 21 from pooling
+/// every page of `URL` for a second scan that never comes.
 #[derive(Debug, Default)]
 struct Cached {
     pages: Vec<Option<Resident>>,
     loading: Vec<usize>,
     index: Vec<Option<Arc<Vec<PartSpan>>>>,
-    seen: Vec<bool>,
+    touched: Vec<Vec<u64>>,
     passing: VecDeque<usize>,
 }
 
@@ -5804,6 +5811,20 @@ fn part_bytes(page: &[u8], span: PartSpan) -> Result<&[u8]> {
     page.get(span.start..end).ok_or_else(|| invalid("part exceeds its column page"))
 }
 
+/// Marks part `part` of a stripe of `parts` parts read, and says whether it had been read before and
+/// whether every part of the stripe had been before this one was asked for again.
+fn touch(bits: &mut Vec<u64>, part: usize, parts: usize) -> (bool, bool) {
+    if bits.is_empty() {
+        bits.resize(parts.div_ceil(64).max(1), 0);
+    }
+    let (word, bit) = (part / 64, 1_u64 << (part % 64));
+    let Some(held) = bits.get_mut(word) else { return (false, false) };
+    let again = *held & bit != 0;
+    *held |= bit;
+    let through = bits.iter().map(|word| word.count_ones() as usize).sum::<usize>() >= parts;
+    (again, again && through)
+}
+
 /// Puts one stripe of one column in the cache, and hands back the page for the pool to count when
 /// it is a page the column did not already hold.
 ///
@@ -6273,7 +6294,7 @@ impl Reader {
                 Mutex::new(Cached {
                     pages: (0..stripes).map(|_| None).collect(),
                     index: (0..stripes).map(|_| None).collect(),
-                    seen: vec![false; stripes],
+                    touched: vec![Vec::new(); stripes],
                     ..Cached::default()
                 })
             })
@@ -7117,8 +7138,10 @@ impl Reader {
 
     /// Reads only the named columns from one part.
     ///
-    /// The whole stripe page each column lives in is read and kept, because a scan asks for the
-    /// parts of a stripe one after another and this is what turns sixty four reads into one.
+    /// The whole stripe page each column lives in is read and kept once a scan has been through the
+    /// stripe before, because a session that scans a table again asks for the parts of a stripe one
+    /// after another and this is what turns sixty four reads into one. The first time through, the
+    /// part is read alone. See [`Cached`].
     ///
     /// # Errors
     ///
@@ -7259,7 +7282,7 @@ impl Reader {
             .get(stripe_index)
             .ok_or_else(|| invalid("stripe index out of range"))?;
         let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
-        let held = self.held(stripe_index, stripe, column, true)?;
+        let held = self.held(stripe_index, place.part as usize, stripe, column, true)?;
         let span = *held
             .index
             .get(place.part as usize)
@@ -7365,7 +7388,14 @@ impl Reader {
     /// milliseconds to copy even warm, and every other worker would be stopped for all of it.
     ///
     /// The file is never read under the lock.
-    fn held(&self, at: usize, stripe: &Stripe, column: usize, whole: bool) -> Result<CachedColumn> {
+    fn held(
+        &self,
+        at: usize,
+        part: usize,
+        stripe: &Stripe,
+        column: usize,
+        whole: bool,
+    ) -> Result<CachedColumn> {
         let cache =
             self.cache.columns.get(column).ok_or_else(|| invalid("column index out of range"))?;
         let mut cached = cache.lock().map_err(|_| invalid("column page cache is poisoned"))?;
@@ -7374,6 +7404,12 @@ impl Reader {
             slot.used.store(true, Atomic::Relaxed);
             Arc::clone(&slot.page)
         });
+        // Whole only for a part asked for before, see [`Cached`].
+        let (again, through) = match cached.touched.get_mut(at) {
+            Some(bits) if whole && page.is_none() => touch(bits, part, stripe.parts.len()),
+            _ => (false, false),
+        };
+        let whole = whole && again;
         if let Some(index) = known.clone() {
             if !whole || page.is_some() {
                 return Ok(CachedColumn { stripe: at, index, page });
@@ -7406,9 +7442,7 @@ impl Reader {
         }
         let held = read?;
         let taken = remember(&mut cached, &held);
-        let first = taken.is_some()
-            && cached.seen.get_mut(at).is_some_and(|seen| !std::mem::replace(seen, true));
-        if first {
+        if taken.is_some() && !through {
             let floor = self.cache.kept.load(Atomic::Relaxed).max(1);
             cached.passing.push_back(at);
             while cached.passing.len() > floor {
@@ -7486,7 +7520,7 @@ impl Reader {
                 .get(column)
                 .ok_or_else(|| invalid("column index out of range"))?;
             let page = stripe.pages.get(column).ok_or_else(|| invalid("stripe page is missing"))?;
-            let held = self.held(index, stripe, column, whole)?;
+            let held = self.held(index, place.part as usize, stripe, column, whole)?;
             let span = *held
                 .index
                 .get(place.part as usize)
@@ -14812,6 +14846,51 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
+    /// A scan that asks for each part twice reads each page whole once and keeps only the floor.
+    ///
+    /// This is ClickBench 21's shape: a `LIKE` asks a compressed text part whether it can answer and
+    /// then reads the part. Counting parts rather than asks is what stops the second ask of every
+    /// part from looking like a second scan, which would pool every page of the column.
+    #[test]
+    fn a_part_asked_for_twice_in_one_scan_keeps_its_page_only_to_the_floor() {
+        let path = path("asked-twice");
+        let parts = STRIPE_PARTS * (CACHED_STRIPES_PER_COLUMN + 2);
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        for part in 0..parts {
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Integer, &[Value::Integer(part as i32)])
+                    .expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        let stripes = a.table().stripes().len();
+        for part in 0..parts {
+            for _ in 0..2 {
+                let chunk = a.read(part, &[0]).expect("a part");
+                assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
+            }
+        }
+        assert_eq!(
+            a.pages.load(Atomic::Relaxed),
+            stripes,
+            "a page a stripe, read on the second ask"
+        );
+        assert_eq!(pool.bytes(), 0, "one scan puts nothing in the pool");
+        let column = a.cache.columns[0].lock().expect("the column");
+        assert_eq!(column.pages.iter().flatten().count(), CACHED_STRIPES_PER_COLUMN);
+        drop(column);
+        drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
     /// Eight workers over one stripe read it once between them.
     ///
     /// This is the shape a scan actually has. Parts are handed out in order, so every worker on a
@@ -14844,6 +14923,12 @@ mod tests {
 
         let reader = Reader::open(&path).expect("reopen from disk");
         assert_eq!(reader.table().stripes().len(), 1, "one stripe is the point of the test");
+        // Once through a part at a time first, since a stripe's page is only read whole the second
+        // time a scan comes to it.
+        for part in 0..STRIPE_PARTS {
+            reader.read(part, &[0]).expect("a part");
+        }
+        assert_eq!(reader.pages.load(Atomic::Relaxed), 0, "the first pass reads no page whole");
         let barrier = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             for worker in 0..8 {
@@ -14960,7 +15045,7 @@ mod tests {
         for part in 0..first.parts() {
             first.read(part, &[0]).expect("a part");
         }
-        assert!(first.reads().pages > 0, "the scan has to have read something");
+        assert!(first.reads().indexes > 0, "the scan has to have read something");
         let second = Reader::open(&path).expect("open again");
 
         assert_eq!(first.reads().opening, second.reads().opening);
@@ -15000,8 +15085,9 @@ mod tests {
         let reader = Reader::open(&path).expect("reopen from disk");
         let stripes = reader.table().stripes().len();
         assert!(stripes > CACHED_STRIPES_PER_COLUMN, "the page cache has to be too small for this");
-        // Twice over, so that the second pass finds every page evicted and every index kept.
-        for _ in 0..2 {
+        // Three times over. The first pass reads a part at a time, the second reads the pages, and
+        // the third finds every page evicted and every index kept.
+        for _ in 0..3 {
             for part in 0..parts {
                 let chunk = reader.read(part, &[0]).expect("a part");
                 assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
@@ -15057,15 +15143,15 @@ mod tests {
                 assert_eq!(chunk.value_at(0, 0), Value::Integer(part as i32));
             }
         };
-        // The first scan keeps the newest pages of the floor and no more, so the second reads the
-        // rest again and keeps them, and the third reads nothing.
+        // The first scan reads a part at a time and keeps no page, the second reads every page and
+        // keeps it, and the third reads nothing.
         scan(&a);
-        assert_eq!(pool.bytes(), 0, "a page read once is not the pool's");
+        assert_eq!(a.pages.load(Atomic::Relaxed), 0, "the first scan reads no page whole");
+        assert_eq!(pool.bytes(), 0, "a stripe read once is not the pool's");
         scan(&a);
-        let twice = stripes * 2 - CACHED_STRIPES_PER_COLUMN;
-        assert_eq!(a.pages.load(Atomic::Relaxed), twice, "the second scan reads the rest again");
+        assert_eq!(a.pages.load(Atomic::Relaxed), stripes, "the second scan reads every page");
         scan(&a);
-        assert_eq!(a.pages.load(Atomic::Relaxed), twice, "the third scan reads nothing");
+        assert_eq!(a.pages.load(Atomic::Relaxed), stripes, "the third scan reads nothing");
         let one = pool.bytes();
         assert!(one > 0, "the pool counts what the reader holds");
 
@@ -15073,15 +15159,11 @@ mod tests {
         pool.budget.store(one, Atomic::Relaxed);
         scan(&b);
         scan(&b);
-        assert_eq!(b.pages.load(Atomic::Relaxed), twice, "a page is never let go while in use");
+        assert_eq!(b.pages.load(Atomic::Relaxed), stripes, "a page is never let go while in use");
         assert_eq!(a.cache.held[0].load(Atomic::Relaxed), CACHED_STRIPES_PER_COLUMN);
         let column = a.cache.columns[0].lock().expect("the column");
         let held = column.pages.iter().flatten().count();
-        assert_eq!(
-            held,
-            CACHED_STRIPES_PER_COLUMN + column.passing.len(),
-            "the count and the slots agree"
-        );
+        assert_eq!(held, CACHED_STRIPES_PER_COLUMN, "the count and the slots agree");
         drop(column);
 
         // A reader that goes takes its pages out of the count with it.
@@ -15123,6 +15205,10 @@ mod tests {
             assert_eq!(reader.table().stripes().len(), workers, "a stripe per worker");
             if told {
                 reader.keep_stripes(workers);
+            }
+            // Through once a part at a time, so that the pass below is the one that reads pages.
+            for part in 0..reader.parts() {
+                reader.read(part, &[0]).expect("a part");
             }
             let barrier = std::sync::Barrier::new(workers);
             std::thread::scope(|scope| {
