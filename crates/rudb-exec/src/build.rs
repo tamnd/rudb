@@ -1879,7 +1879,9 @@ impl<'a> Building<'a, '_> {
         // Before the input is built, because building it is what puts it in a pipeline and a
         // pipeline that exists is a pipeline that runs. A summary that let the rows be counted
         // underneath it would answer in no time and take exactly as long as it always did.
-        if bound.max_groups.is_none() && bound.having_count.is_none() {
+        // `SET stored_answers = off` skips this and reads the rows, which is how a ClickBench run keeps what the loader added up out of its numbers.
+        let stored = self.session.rules().enabled(Rule::StoredAnswers);
+        if stored && bound.max_groups.is_none() && bound.having_count.is_none() {
             if let Some(values) =
                 stored_summary(self.plan, self.catalog, input, groups, aggregates)?
             {

@@ -20,6 +20,11 @@
 //! and a new operator are a new behaviour, and a new behaviour earns its default by measuring better
 //! rather than by being written.
 //!
+//! [`Rule::StoredAnswers`] is another switch with nothing under it.
+//! The native writer puts a row count, null counts, column bounds, stripe totals, exact distinct counts and value frequencies in the file, and a whole table `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` or `COUNT(DISTINCT)` can be read straight out of those.
+//! ClickBench does not allow that, because it is aggregation done at load time, so `stored_answers = off` makes the aggregate read the rows.
+//! Zone map pruning and the filters on the scan are indexes rather than answers and stay on either way.
+//!
 //! # Why these are not in `Settings::NAMES`
 //!
 //! The same reason the seam settings are not, which `crates/rudb/src/settings.rs` states: a name in
@@ -81,11 +86,15 @@ pub enum Rule {
     /// running the join. Not under either master, because it reads no statistic and no stored
     /// section: it is a rewrite that is right or wrong on the plan alone.
     Consistent,
+    /// Answering a whole table aggregate out of what the table wrote down when it was loaded, which is its row count, its null counts, its column bounds, its stripe totals and its exact distinct counts and value frequencies.
+    /// Off means the aggregate reads the rows.
+    /// A master of its own rather than a statistics rule, because turning it off is what a ClickBench run does and that run should not lose the statistics along with it.
+    StoredAnswers,
 }
 
 impl Rule {
     /// Every rule, in the order a report lists them.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::StatsAll,
         Self::Presize,
         Self::DirectAddressing,
@@ -99,6 +108,7 @@ impl Rule {
         Self::GraphReduction,
         Self::ClosedGroups,
         Self::Consistent,
+        Self::StoredAnswers,
     ];
 
     /// The canonical name, which is what a setting reads back as.
@@ -118,6 +128,7 @@ impl Rule {
             Self::GraphReduction => "graph.reduction",
             Self::ClosedGroups => "stats.closed_groups",
             Self::Consistent => "plan.consistent",
+            Self::StoredAnswers => "stored.answers",
         }
     }
 
@@ -128,7 +139,7 @@ impl Rule {
     #[must_use]
     pub const fn master(self) -> Option<Self> {
         match self {
-            Self::StatsAll | Self::GraphSections | Self::Consistent => None,
+            Self::StatsAll | Self::GraphSections | Self::Consistent | Self::StoredAnswers => None,
             Self::GraphReduction => Some(Self::GraphSections),
             _ => Some(Self::StatsAll),
         }
@@ -162,6 +173,7 @@ pub fn looks_like_rule(key: &str) -> bool {
     name.starts_with("stats.")
         || name.starts_with("graph.")
         || name.starts_with("plan.")
+        || name.starts_with("stored.")
         || Rule::from_name(&name).is_some()
 }
 
@@ -194,7 +206,7 @@ fn canonical(key: &str) -> String {
 
 /// Which switches are on, as the statements have left them.
 ///
-/// A bitset rather than a map, because there are eleven of them, because a session copies this once
+/// A bitset rather than a map, because there are fourteen of them, because a session copies this once
 /// per statement, and because the set is fixed at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rules(u16);
@@ -380,6 +392,23 @@ mod tests {
         for spelling in ["plan.consistent", "plan_consistent", "PLAN.CONSISTENT"] {
             assert_eq!(Rule::from_name(spelling), Some(Rule::Consistent), "{spelling}");
         }
+    }
+
+    #[test]
+    fn the_stored_answers_are_their_own_switch() {
+        for spelling in ["stored.answers", "stored_answers", "STORED_ANSWERS"] {
+            assert_eq!(Rule::from_name(spelling), Some(Rule::StoredAnswers), "{spelling}");
+        }
+        let mut rules = Rules::new();
+        assert!(rules.enabled(Rule::StoredAnswers));
+        // Turning the statistics off does not reach them, and turning them off leaves the statistics alone.
+        rules.set(Rule::StatsAll, false);
+        assert!(rules.enabled(Rule::StoredAnswers));
+        rules.set(Rule::StatsAll, true);
+        rules.set_named("stored_answers", false).expect("a rule by its underscore spelling");
+        assert!(!rules.enabled(Rule::StoredAnswers));
+        assert!(rules.enabled(Rule::Presize));
+        assert_eq!(rules.changed().collect::<Vec<_>>(), vec![("stored.answers", false)]);
     }
 
     #[test]

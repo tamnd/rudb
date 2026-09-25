@@ -615,3 +615,56 @@ fn an_integer_columns_distinct_count_is_read_out_of_the_directory() {
         assert_eq!(pair.agree(query), Value::BigInt(wanted), "{query} counted wrong");
     }
 }
+
+/// Every aggregate query the stored answers take, for the switch that turns them off.
+const STORED: [&str; 9] = [
+    "SELECT COUNT(*) FROM t",
+    "SELECT COUNT(s) FROM t",
+    "SELECT COUNT(DISTINCT s) FROM t",
+    "SELECT COUNT(DISTINCT n) FROM t",
+    "SELECT MIN(n), MAX(n) FROM t",
+    "SELECT MIN(s), MAX(s) FROM t",
+    "SELECT SUM(n), AVG(n) FROM t",
+    "SELECT COUNT(*) FROM t WHERE s = 'v0'",
+    "SELECT COUNT(*) FROM t WHERE s <> 'v0'",
+];
+
+/// Whether this query read the rows, which is a scan that produced some.
+fn scanned(db: &Database, query: &str) -> bool {
+    let result = db.query(query).expect("the query ran");
+    let metrics = result.metrics().expect("the query was measured");
+    metrics.operators.iter().any(|operator| operator.kind == "Scan" && operator.rows_out > 0)
+}
+
+/// `SET stored_answers = false` is what a ClickBench run sets, and it has to cost time rather than change an answer.
+/// Each query is asked with the switch on and off, on the file and in memory, and the rows have to be the same all four ways.
+/// With it off every one of them has to have scanned, which is what the metrics of the scan say.
+#[test]
+fn turning_the_stored_answers_off_reads_the_rows_and_answers_the_same() {
+    let pair = Pair::new(
+        "storedoff",
+        "SELECT CASE WHEN i % 11 = 0 THEN NULL ELSE i % 7 END AS n, 'v' || (i % 13) AS s \
+         FROM range(5000) r(i)",
+    );
+    let before: Vec<_> = STORED.iter().map(|query| pair.listing(query)).collect();
+    for query in STORED {
+        assert!(!scanned(&pair.file, query), "{query} scanned with the stored answers on");
+    }
+    for db in [&pair.file, &pair.memory] {
+        db.execute("SET stored_answers = false").expect("the switch is a setting");
+        assert_eq!(db.setting("stored_answers").expect("the switch reads back"), "false");
+    }
+    for (query, wanted) in STORED.iter().zip(&before) {
+        assert_eq!(&pair.listing(query), wanted, "{query} changed its answer");
+        assert!(
+            !pair.summarised(query),
+            "{query} was answered out of the file with the switch off"
+        );
+        assert!(!pair.in_memory(query), "{query} was answered out of memory with the switch off");
+        assert!(scanned(&pair.file, query), "{query} did not scan the file with the switch off");
+        assert!(scanned(&pair.memory, query), "{query} did not scan memory with the switch off");
+    }
+    // A reset puts it back on, which is where a fresh database has it.
+    pair.file.execute("RESET stored_answers").expect("the switch resets");
+    assert!(pair.summarised("SELECT COUNT(*) FROM t"), "the reset left the switch off");
+}
