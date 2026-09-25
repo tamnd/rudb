@@ -8028,9 +8028,6 @@ mod tests {
         (0..chunk.len()).map(|row| chunk.value_at(row, 0)).collect()
     }
 
-    /// Runs of kept rows moved onto all the rows come out as the runs that spreading the slots and
-    /// cutting them again finds, with dropped rows before, inside, between and after the runs.
-
     /// The starts read out of words agree with a plain walk, across word boundaries and with runs
     /// longer than a word, and a total that would overflow sixty four bits comes out whole.
     #[test]

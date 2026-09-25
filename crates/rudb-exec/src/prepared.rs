@@ -33,6 +33,7 @@
 //! `spec/engine/04-expressions.md` gives: once the tree walk is gone what is left to save is pass
 //! count, and at 1024 rows the intermediate vectors are eight kilobytes and stay in L1.
 
+use rudb_common::stage::{self, Stage};
 use rudb_common::{
     Error, ErrorCode, LogicalType, PhysicalType, Result, Session, SessionTimeZone, Span, Value,
 };
@@ -101,6 +102,11 @@ pub struct Prepared {
     /// to do, through a `HashMap` it allocated and hashed every call, and on TPC-H Q1 that map was a
     /// measurable part of the query for an answer that never changed.
     last_root: Vec<bool>,
+    /// Whether each step is string work, which is charged to [`Stage::Strings`] when it runs.
+    ///
+    /// Settled once here from the types, so the check on every chunk is an index rather than a
+    /// look at the step and its operands.
+    strings: Vec<bool>,
     /// The step already compiled for each shared plan expression.
     shared: HashMap<ExprRef, usize>,
     share: bool,
@@ -355,6 +361,7 @@ impl Prepared {
             last_use: Vec::new(),
             roots: Vec::new(),
             last_root: Vec::new(),
+            strings: Vec::new(),
             shared: HashMap::new(),
             share,
             fuse,
@@ -366,6 +373,8 @@ impl Prepared {
         }
         prepared.last_use = prepared.last_uses();
         prepared.last_root = prepared.last_roots();
+        prepared.strings =
+            (0..prepared.steps.len()).map(|step| prepared.on_strings(step)).collect();
         Ok(prepared)
     }
 
@@ -412,6 +421,23 @@ impl Prepared {
     /// than building a map. It runs once per prepared expression.
     fn last_roots(&self) -> Vec<bool> {
         (0..self.roots.len()).map(|at| !self.roots[at + 1..].contains(&self.roots[at])).collect()
+    }
+
+    /// Whether a step reads or produces strings and does work on them.
+    ///
+    /// A cast, a comparison, a function or a list test, and not a column, a constant or a
+    /// connective, which move no string data. A `CASE` or a lambda is left to the steps inside it.
+    fn on_strings(&self, index: usize) -> bool {
+        let text = |ty: &LogicalType| matches!(ty, LogicalType::Varchar | LogicalType::Blob);
+        if !matches!(
+            self.steps[index],
+            Step::Cast { .. } | Step::Compare { .. } | Step::Function { .. } | Step::InSet { .. }
+        ) {
+            return false;
+        }
+        let mut read = text(&self.types[index]);
+        self.for_each_operand(index, |operand| read |= text(&self.types[operand]));
+        read
     }
 
     /// Visits the steps one step reads, whatever shape its operands are held in.
@@ -979,6 +1005,22 @@ impl Prepared {
         for step in begin..index {
             self.run_step(step, chunk, scratch)?;
         }
+        let timing = self.strings[index].then(|| stage::Timing::start(Stage::Strings));
+        let kept = self.kept(index, chunk, scratch, live);
+        if let Some(timing) = timing {
+            timing.stop(0);
+        }
+        kept
+    }
+
+    /// The rows the last step of an operand keeps, once the steps under it have run.
+    fn kept(
+        &self,
+        index: usize,
+        chunk: &Chunk,
+        scratch: &mut Scratch,
+        live: Option<&Selection>,
+    ) -> Result<Selection> {
         // Straight to the rows it keeps, and only among the ones still in play, where the list and
         // the column allow it. See [`rudb_kernels::select_in`].
         if let Step::InSet { input, members } = &self.steps[index] {
@@ -1044,9 +1086,12 @@ impl Prepared {
 
     /// Runs one step and empties the slot of every operand this was the last step to read.
     fn run_step(&self, index: usize, chunk: &Chunk, scratch: &mut Scratch) -> Result<()> {
-        let produced = self
-            .step(index, chunk, &scratch.slots)
-            .map_err(|error| error.with_fallback_span(self.spans[index]))?;
+        let timing = self.strings[index].then(|| stage::Timing::start(Stage::Strings));
+        let produced = self.step(index, chunk, &scratch.slots);
+        if let Some(timing) = timing {
+            timing.stop(0);
+        }
+        let produced = produced.map_err(|error| error.with_fallback_span(self.spans[index]))?;
         scratch.slots[index] = produced;
         let slots = &mut scratch.slots;
         self.for_each_operand(index, |operand| {

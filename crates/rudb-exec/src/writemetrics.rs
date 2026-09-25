@@ -98,7 +98,7 @@ pub(crate) fn statement_metrics(plan: &Plan, index: u32, columns: Slice) -> Resu
         .iter()
         .map(|statement| {
             let count = |nanos: u64| Value::BigInt(signed(nanos));
-            vec![
+            let mut row = vec![
                 count(statement.id),
                 text(&statement.sql),
                 count(statement.parse_ns),
@@ -110,7 +110,9 @@ pub(crate) fn statement_metrics(plan: &Plan, index: u32, columns: Slice) -> Resu
                 count(statement.execute_ns),
                 count(statement.total_ns),
                 count(statement.cpu_ns),
-            ]
+            ];
+            row.extend(statement.split.parts().iter().map(|(_, nanos)| count(*nanos)));
+            row
         })
         .collect();
     Metadata::new("rudb_statement_metrics", &statement_metric_fields(), &rows, plan, index, columns)

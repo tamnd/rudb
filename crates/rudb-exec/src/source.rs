@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
+use rudb_common::stage::{self, Stage};
 use rudb_common::{Error, Field, LogicalType, Result, Session, Value};
 use rudb_csv::{Part, Reader as CsvReader, Split};
 use rudb_encoding::sequence::Sequence;
@@ -1139,17 +1140,22 @@ impl<'a> Scan<'a> {
         // is holding one, which is a reader that has not had a turn yet rather than an error.
         let slot = reader();
         let mut working = pushed.take(slot);
-        let mut kept = match &pushed.settles {
+        // Charged to its own stage, because otherwise a filter the scan took into itself is time
+        // the document calls reading.
+        let filtering = stage::Timing::start(Stage::Filter);
+        let kept = match &pushed.settles {
             Some(settles) => {
                 let rows = self.table.rows();
                 let settled: Vec<bool> = settles
                     .iter()
                     .map(|probes| probes.as_deref().is_some_and(|probes| rows.certain(at, probes)))
                     .collect();
-                pushed.predicate.evaluate_settled(chunk, &mut working.scratch, &settled)?
+                pushed.predicate.evaluate_settled(chunk, &mut working.scratch, &settled)
             }
-            None => pushed.predicate.evaluate_filter(chunk, &mut working.scratch)?,
+            None => pushed.predicate.evaluate_filter(chunk, &mut working.scratch),
         };
+        filtering.stop(0);
+        let mut kept = kept?;
         self.passed.saw(chunk.len(), kept.len());
         // After the filter and on its answer rather than on the chunk, so that the filter's kernels
         // read the columns flat as they came off the disk and the chunk is narrowed once. Narrowing
@@ -1345,7 +1351,11 @@ impl<'a> Scan<'a> {
         }
         let Some(column) = self.columns[stored.input] else { return Ok(false) };
         let rows = self.table.rows();
-        let Some(kept) = rows.rows_holding(at, column, &stored.sequence, stored.negated)? else {
+        // A LIKE answered on the pages is string work, and it is the whole of the filter here.
+        let searching = stage::Timing::start(Stage::Strings);
+        let holding = rows.rows_holding(at, column, &stored.sequence, stored.negated);
+        searching.stop(0);
+        let Some(kept) = holding? else {
             return Ok(false);
         };
         let len = rows.chunk_len(at)?;
@@ -1416,13 +1426,16 @@ impl<'a> Scan<'a> {
         let first = Chunk::with_rows(columns, len)?;
         let slot = reader();
         let mut working = pushed.take(slot);
+        let filtering = stage::Timing::start(Stage::Filter);
         let selected = late.predicate.evaluate_filter(
             &first,
             working
                 .late_scratch
                 .as_mut()
                 .ok_or_else(|| Error::internal("a late filter has no scratch"))?,
-        )?;
+        );
+        filtering.stop(0);
+        let selected = selected?;
         pushed.give(slot, working);
         late.saw(len, selected.len());
         if selected.len().saturating_mul(4) > len {

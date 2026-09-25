@@ -4468,6 +4468,7 @@ fn run(
     metrics.timing.rewrite_ns = planning.rewrite_ns;
     metrics.timing.physical_ns = built_wall;
     metrics.timing.execute_ns = ran_wall;
+    metrics.timing.result_ns = query.flattened_ns();
     // Every phase and not the two this function timed itself. A total that left the planner out was
     // the reason planning time could grow without anything going up, and the harness reads this
     // field as the cost of the statement.

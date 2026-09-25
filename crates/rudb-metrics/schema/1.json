@@ -32,7 +32,18 @@
     "rewrite_ns": 120000,
     "physical_ns": 44000,
     "execute_ns": 1323000000,
+    "result_ns": 2000000,
     "total_ns": 1323483000
+  },
+  "split": {
+    "scan_ns": 620000000,
+    "filter_ns": 0,
+    "build_ns": 0,
+    "probe_ns": 210000000,
+    "aggregate_ns": 360000000,
+    "strings_ns": 0,
+    "materialize_ns": 2000000,
+    "other_ns": 343000000
   },
   "resource": {
     "cpu_ns": 9880000000,

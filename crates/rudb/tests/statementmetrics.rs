@@ -46,9 +46,12 @@ fn a_query_leaves_its_four_frontend_phases() {
     let sql = "SELECT k, SUM(v) FROM phases WHERE k > 10 AND 1 = 1 GROUP BY k ORDER BY 2 LIMIT 5";
     connection.query(sql).expect("runs the query");
     let row = kept(&connection, sql);
-    for phase in ["parse_ns", "bind_ns", "rewrite_ns", "optimize_ns", "execute_ns", "cpu_ns"] {
+    // Not cpu_ns: a thread's CPU clock on Windows ticks in steps longer than this query takes, so
+    // it can read nothing there while the wall clocks below cannot.
+    for phase in ["parse_ns", "bind_ns", "rewrite_ns", "optimize_ns", "execute_ns"] {
         assert!(column(&row, phase) > 0, "{phase} was charged nothing: {row:?}");
     }
+    assert!(column(&row, "cpu_ns") >= 0, "{row:?}");
     let frontend = column(&row, "parse_ns")
         + column(&row, "bind_ns")
         + column(&row, "rewrite_ns")
