@@ -4549,14 +4549,27 @@ impl<'a> Aggregate<'a> {
     /// `None` when an argument is in a layout this does not read, before anything is built, so the
     /// caller can hand the chunk to the table instead.
     fn close_runs(&self, rows: &Rows, from: usize, to: usize) -> Result<Option<Chunk>> {
-        let mut same = Vec::new();
-        crate::table::repeats(&rows.keys, rows.rows, 0, &mut same);
-        let mut starts: Vec<u32> = Vec::new();
-        for (row, &repeat) in same.iter().enumerate().take(to).skip(from) {
-            if row == from || !repeat {
-                starts.push(u32::try_from(row).map_err(|_| Error::internal("a chunk too long"))?);
-            }
+        if u32::try_from(to).is_err() {
+            return Err(Error::internal("a chunk too long"));
         }
+        let starts = match rows.keys.as_slice() {
+            [key] => run_starts(key, from, to),
+            _ => None,
+        };
+        let starts = match starts {
+            Some(starts) => starts,
+            None => {
+                let mut same = Vec::new();
+                crate::table::repeats(&rows.keys, rows.rows, 0, &mut same);
+                let mut starts = Vec::new();
+                for (row, &repeat) in same.iter().enumerate().take(to).skip(from) {
+                    if row == from || !repeat {
+                        starts.push(row as u32);
+                    }
+                }
+                starts
+            }
+        };
         let groups = starts.len();
         let end = |group: usize| starts.get(group + 1).map_or(to, |&start| start as usize);
         let types = self.schema.types();
@@ -4597,9 +4610,7 @@ impl<'a> Aggregate<'a> {
                         (None, Some(nulls)) => {
                             (run.filter(|&row| nulls.is_valid(row)).count() as i128, true)
                         }
-                        (Some(values), None) => {
-                            (values[run].iter().map(|&v| i128::from(v)).sum(), true)
-                        }
+                        (Some(values), None) => (run_total(&values[run]), true),
                         (Some(values), Some(nulls)) => {
                             let mut total = 0_i128;
                             let mut seen = false;
@@ -5108,6 +5119,87 @@ fn integers(flat: &Vector, rows: usize) -> Option<Vec<i64>> {
     })
 }
 
+/// The first row of every run of `key` between `from` and `to`, when the key is one column in a
+/// form [`interior`] reads, which is the case that has already been found to have closed runs.
+///
+/// A run of `l_orderkey` is four rows, so a branch per row on whether a run starts there guesses
+/// wrong a quarter of the time. The rows are compared sixty four at a time into a word and the
+/// starts are read out of its set bits, which is the same answer without the branch. Asking [`crate::table::repeats`]
+/// for a flag per row and then reading the flags back was two passes for it, and on TPC-H q18 the
+/// two were half of the grouping of `lineitem` by order.
+///
+/// Nulls are not looked at, because [`interior`] refuses a key with any, and packed codes compare
+/// the way the values do because a code is the value less the frame's base.
+fn run_starts(key: &Vector, from: usize, to: usize) -> Option<Vec<u32>> {
+    /// Sixty four rows at a time: a word with a bit for each row whose key differs from the row
+    /// before it, then a push for each bit that is set.
+    fn starts(from: usize, to: usize, differs: impl Fn(usize, usize) -> u64) -> Vec<u32> {
+        let mut starts = Vec::with_capacity((to - from) / 2 + 1);
+        starts.push(from as u32);
+        let mut row = from + 1;
+        while row < to {
+            let end = (row + 64).min(to);
+            let mut mask = differs(row, end);
+            while mask != 0 {
+                starts.push((row + mask.trailing_zeros() as usize) as u32);
+                mask &= mask - 1;
+            }
+            row = end;
+        }
+        starts
+    }
+    macro_rules! flat {
+        ($values:expr) => {{
+            let values = $values.as_slice();
+            if values.len() < to {
+                return None;
+            }
+            Some(starts(from, to, |row, end| {
+                let (before, after) = (&values[row - 1..end - 1], &values[row..end]);
+                before
+                    .iter()
+                    .zip(after)
+                    .enumerate()
+                    .fold(0, |mask, (at, (a, b))| mask | u64::from(a != b) << at)
+            }))
+        }};
+    }
+    if from >= to || key.validity().has_nulls(to) {
+        return None;
+    }
+    if let Some(packed) = key.packed_parts() {
+        return Some(starts(from, to, |row, end| {
+            (row..end).fold(0, |mask, at| {
+                mask | u64::from(packed.code(at) != packed.code(at - 1)) << (at - row)
+            })
+        }));
+    }
+    match key.data()? {
+        Data::Int8(values) => flat!(values),
+        Data::Int16(values) => flat!(values),
+        Data::Int32(values) => flat!(values),
+        Data::Int64(values) => flat!(values),
+        Data::UInt8(values) => flat!(values),
+        Data::UInt16(values) => flat!(values),
+        Data::UInt32(values) => flat!(values),
+        Data::UInt64(values) => flat!(values),
+        _ => None,
+    }
+}
+
+/// The total of a run, in sixty four bits while it fits and in a hundred and twenty eight when it
+/// does not, which a run of any real width never needs.
+fn run_total(values: &[i64]) -> i128 {
+    let mut total = 0_i64;
+    for &value in values {
+        match total.checked_add(value) {
+            Some(sum) => total = sum,
+            None => return values.iter().map(|&value| i128::from(value)).sum(),
+        }
+    }
+    i128::from(total)
+}
+
 /// Where the closed groups of a chunk start and end, as the first row after the first run of the
 /// key and the first row of its last run.
 ///
@@ -5151,13 +5243,25 @@ fn interior(key: &Vector, rows: usize, grouped: bool) -> Option<(usize, usize)> 
         }
         (from > 0 && from < to).then_some((from, to))
     }
+    /// The same over a slice, in passes that do not stop early and so need no branch a row: the
+    /// order is checked over every pair at once, and the ends are found from each side, which is a
+    /// run's length of rows and not the chunk's.
+    fn sliced<T: PartialOrd>(values: &[T], grouped: bool) -> Option<(usize, usize)> {
+        let (before, after) = (&values[..values.len() - 1], &values[1..]);
+        if !grouped && !before.iter().zip(after).fold(true, |up, (a, b)| up & (a <= b)) {
+            return None;
+        }
+        let from = before.iter().zip(after).position(|(a, b)| a != b)? + 1;
+        let to = before.iter().zip(after).rposition(|(a, b)| a != b)? + 1;
+        (from < to).then_some((from, to))
+    }
     macro_rules! flat {
         ($values:expr) => {{
             let values = $values.as_slice();
             if values.len() < rows {
                 return None;
             }
-            bounds(rows, grouped, |row| values[row])
+            sliced(&values[..rows], grouped)
         }};
     }
     // A packed code is the value less the frame's base, so codes are in the order the values are.
@@ -7832,8 +7936,8 @@ mod tests {
         Distinct, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
         FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
         RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, encoded_count_partition, fixed_partition, interior,
-        slot_runs_of, spread_runs, spread_slots,
+        bigint_distinct_partition, encoded_count_partition, fixed_partition, interior, run_starts,
+        run_total, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -7858,6 +7962,24 @@ mod tests {
 
     /// Runs of kept rows moved onto all the rows come out as the runs that spreading the slots and
     /// cutting them again finds, with dropped rows before, inside, between and after the runs.
+
+    /// The starts read out of words agree with a plain walk, across word boundaries and with runs
+    /// longer than a word, and a total that would overflow sixty four bits comes out whole.
+    #[test]
+    fn run_starts_match_a_walk_and_run_totals_do_not_overflow() {
+        let keys = (0..300_i64).map(|row| row / 3 + row / 70 * 40).collect::<Vec<_>>();
+        let values = keys.iter().map(|&key| Value::BigInt(key)).collect::<Vec<_>>();
+        let vector = Vector::from_values(LogicalType::BigInt, &values).expect("keys");
+        for (from, to) in [(1, 300), (5, 64), (63, 130), (7, 8)] {
+            let walked = (from..to)
+                .filter(|&row| row == from || keys[row] != keys[row - 1])
+                .map(|row| row as u32)
+                .collect::<Vec<_>>();
+            assert_eq!(run_starts(&vector, from, to), Some(walked), "{from}..{to}");
+        }
+        assert_eq!(run_total(&[1, 2, 3]), 6);
+        assert_eq!(run_total(&[i64::MAX, i64::MAX, 1]), i128::from(i64::MAX) * 2 + 1);
+    }
     #[test]
     fn runs_of_kept_rows_spread_like_their_slots() {
         let all = 200;
