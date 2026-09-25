@@ -102,6 +102,30 @@ impl SyncCall {
         }
     }
 
+    /// The byte a kept card stores for this call.
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Fsync => 0,
+            Self::Fdatasync => 1,
+            Self::FullFsync => 2,
+            Self::BarrierFsync => 3,
+            Self::DsyncWrite => 4,
+            Self::FlushFileBuffers => 5,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self> {
+        Ok(match tag {
+            0 => Self::Fsync,
+            1 => Self::Fdatasync,
+            2 => Self::FullFsync,
+            3 => Self::BarrierFsync,
+            4 => Self::DsyncWrite,
+            5 => Self::FlushFileBuffers,
+            _ => return Err(Error::io(format!("device card: no sync call has tag {tag}"))),
+        })
+    }
+
     /// The call `commit_sync = full` uses on this platform.
     #[must_use]
     pub fn full() -> SyncCall {
@@ -129,6 +153,25 @@ impl Plp {
             Self::No => "no",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+impl Plp {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Yes => 0,
+            Self::No => 1,
+            Self::Unknown => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self> {
+        Ok(match tag {
+            0 => Self::Yes,
+            1 => Self::No,
+            2 => Self::Unknown,
+            _ => return Err(Error::io(format!("device card: no PLP answer has tag {tag}"))),
+        })
     }
 }
 
@@ -189,7 +232,137 @@ impl Card {
     pub fn plausible(&self) -> bool {
         self.full().plausible
     }
+
+    /// The card as bytes, for a database file to keep so that a later process does not measure
+    /// the device again. The path is left out, since the card is about the device and the reader
+    /// knows which directory it asked about.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![CARD_VERSION];
+        let text = |out: &mut Vec<u8>, text: &str| {
+            let bytes = &text.as_bytes()[..text.len().min(usize::from(u16::MAX))];
+            out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(bytes);
+        };
+        text(&mut out, &self.device);
+        text(&mut out, &self.filesystem);
+        out.push(u8::from(self.memory_backed));
+        out.push(u8::try_from(self.probes.len()).unwrap_or(u8::MAX));
+        for probe in self.probes.iter().take(usize::from(u8::MAX)) {
+            out.push(probe.call.tag());
+            for ns in [probe.p50_4k_ns, probe.p99_4k_ns, probe.p50_64k_ns, probe.p99_64k_ns] {
+                out.extend_from_slice(&ns.to_le_bytes());
+            }
+            out.push(u8::from(probe.plausible));
+        }
+        out.extend_from_slice(&self.write_bytes_per_s.to_le_bytes());
+        for rate in self.syncs_per_s {
+            out.extend_from_slice(&rate.to_le_bytes());
+        }
+        out.extend_from_slice(&self.scaling.to_le_bytes());
+        out.push(self.plp.tag());
+        out.extend_from_slice(&self.lanes.to_le_bytes());
+        out.extend_from_slice(&self.iterations.to_le_bytes());
+        out
+    }
+
+    /// A card [`Card::encode`] wrote, as measured for `path`.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are not a card this build wrote, which the caller treats as no card at all.
+    pub fn decode(bytes: &[u8], path: &Path) -> Result<Card> {
+        let mut read = Read(bytes);
+        if read.byte()? != CARD_VERSION {
+            return Err(Error::io("device card: the kept card is from another build"));
+        }
+        let device = read.text()?;
+        let filesystem = read.text()?;
+        let memory_backed = read.byte()? != 0;
+        let count = read.byte()?;
+        let mut probes = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let call = SyncCall::from_tag(read.byte()?)?;
+            let p50_4k_ns = read.u64()?;
+            let p99_4k_ns = read.u64()?;
+            let p50_64k_ns = read.u64()?;
+            let p99_64k_ns = read.u64()?;
+            let plausible = read.byte()? != 0;
+            probes.push(SyncProbe {
+                call,
+                p50_4k_ns,
+                p99_4k_ns,
+                p50_64k_ns,
+                p99_64k_ns,
+                plausible,
+            });
+        }
+        if probes.is_empty() {
+            return Err(Error::io("device card: the kept card has no probes"));
+        }
+        let write_bytes_per_s = read.u64()?;
+        let mut syncs_per_s = [0; 4];
+        for rate in &mut syncs_per_s {
+            *rate = read.u64()?;
+        }
+        let scaling = f64::from_bits(read.u64()?);
+        let plp = Plp::from_tag(read.byte()?)?;
+        let lanes = read.u32()?;
+        let iterations = read.u32()?;
+        if !read.0.is_empty() {
+            return Err(Error::io("device card: the kept card has bytes after its end"));
+        }
+        Ok(Card {
+            path: path.to_path_buf(),
+            device,
+            filesystem,
+            memory_backed,
+            probes,
+            write_bytes_per_s,
+            syncs_per_s,
+            scaling,
+            plp,
+            lanes,
+            iterations,
+        })
+    }
 }
+
+/// Reads an encoded card front to back.
+struct Read<'a>(&'a [u8]);
+
+impl<'a> Read<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let (head, tail) = self
+            .0
+            .split_at_checked(n)
+            .ok_or_else(|| Error::io("device card: the kept card is cut short"))?;
+        self.0 = tail;
+        Ok(head)
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
+    }
+
+    fn text(&mut self) -> Result<String> {
+        let len = u16::from_le_bytes(self.take(2)?.try_into().expect("two bytes"));
+        String::from_utf8(self.take(usize::from(len))?.to_vec())
+            .map_err(|_| Error::io("device card: the kept card has a name that is not text"))
+    }
+}
+
+/// The first byte of an encoded card, so a later build that changes what a card holds can tell an
+/// old one apart and measure again rather than misread it.
+const CARD_VERSION: u8 = 1;
 
 /// How hard to probe.
 #[derive(Debug, Clone)]
@@ -284,12 +457,10 @@ pub fn measure(dir: &Path, options: &Options) -> Result<Card> {
 ///
 /// Whatever [`measure`] says.
 pub fn card(dir: &Path, iterations: Option<u32>) -> Result<Card> {
-    static KEPT: Mutex<Vec<(String, Card)>> = Mutex::new(Vec::new());
     let key = device_key(dir)?;
     if iterations.is_none() {
-        let kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, card)) = kept.iter().find(|(have, _)| *have == key) {
-            return Ok(Card { path: dir.to_path_buf(), ..card.clone() });
+        if let Some(card) = kept(&key) {
+            return Ok(Card { path: dir.to_path_buf(), ..card });
         }
     }
     let mut options = Options::default();
@@ -303,9 +474,33 @@ pub fn card(dir: &Path, iterations: Option<u32>) -> Result<Card> {
     Ok(card)
 }
 
+/// The cards this process has, one per device.
+static KEPT: Mutex<Vec<(String, Card)>> = Mutex::new(Vec::new());
+
+/// The card this process has for the device `key` names, measured here or read out of a database
+/// file on that device.
+#[must_use]
+pub fn kept(key: &str) -> Option<Card> {
+    let kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+    kept.iter().find(|(have, _)| have == key).map(|(_, card)| card.clone())
+}
+
+/// Takes a card a database file kept for the device `key` names, unless this process already has
+/// one for it. A card measured here is newer than any a file could hold, so it stays.
+pub fn remember(key: &str, card: Card) {
+    let mut kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+    if !kept.iter().any(|(have, _)| have == key) {
+        kept.push((key.to_string(), card));
+    }
+}
+
 /// What names the device a directory is on, which on Unix is the device number and elsewhere is
 /// the directory itself.
-fn device_key(dir: &Path) -> Result<String> {
+///
+/// # Errors
+///
+/// When the directory cannot be looked at.
+pub fn device_key(dir: &Path) -> Result<String> {
     let metadata = std::fs::metadata(dir)
         .map_err(|e| Error::io(format!("device card: {}: {e}", dir.display())))?;
     #[cfg(unix)]
@@ -760,7 +955,9 @@ mod platform {
 mod tests {
     use std::time::Duration;
 
-    use super::{Options, Plp, SyncCall, lanes, measure, quantile};
+    use std::path::Path;
+
+    use super::{Card, Options, Plp, SyncCall, SyncProbe, lanes, measure, quantile};
     use crate::scratch::TempDir;
 
     #[test]
@@ -780,6 +977,37 @@ mod tests {
         assert_eq!(lanes(30_000, Plp::Unknown, 0.9, 32), 1);
         assert_eq!(lanes(30_000, Plp::Yes, 0.5, 32), 1);
         assert_eq!(lanes(3_347_000, Plp::Yes, 0.9, 32), 1);
+    }
+
+    #[test]
+    fn a_card_comes_back_from_its_bytes() {
+        let card = Card {
+            path: "/a".into(),
+            device: "/dev/nvme0n1p2".to_string(),
+            filesystem: "ext4".to_string(),
+            memory_backed: false,
+            probes: vec![SyncProbe {
+                call: SyncCall::Fdatasync,
+                p50_4k_ns: 30_000,
+                p99_4k_ns: 90_000,
+                p50_64k_ns: 60_000,
+                p99_64k_ns: 150_000,
+                plausible: true,
+            }],
+            write_bytes_per_s: 2 << 30,
+            syncs_per_s: [30_000, 55_000, 90_000, 120_000],
+            scaling: 0.5,
+            plp: Plp::Unknown,
+            lanes: 1,
+            iterations: 200,
+        };
+        let bytes = card.encode();
+        let back = Card::decode(&bytes, Path::new("/b")).expect("decodes");
+        assert_eq!(back, Card { path: "/b".into(), ..card });
+        assert!(Card::decode(&bytes[..bytes.len() - 1], Path::new("/b")).is_err());
+        let mut newer = bytes.clone();
+        newer[0] = 9;
+        assert!(Card::decode(&newer, Path::new("/b")).is_err());
     }
 
     #[test]
@@ -821,7 +1049,7 @@ mod tests {
         let info = "22 1 8:2 / / rw - ext4 /dev/sda2 rw\n\
                     40 22 0:40 / /tmp rw - tmpfs tmpfs rw\n\
                     41 22 8:3 / /home/a\\040b rw - xfs /dev/sdb1 rw\n";
-        let find = |p: &str| super::platform::best_mount(info, std::path::Path::new(p));
+        let find = |p: &str| super::platform::best_mount(info, Path::new(p));
         assert_eq!(find("/tmp/x"), ("tmpfs".into(), "tmpfs".into()));
         assert_eq!(find("/home/a b/db"), ("/dev/sdb1".into(), "xfs".into()));
         assert_eq!(find("/var/lib"), ("/dev/sda2".into(), "ext4".into()));
