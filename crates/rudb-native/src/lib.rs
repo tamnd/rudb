@@ -54,6 +54,7 @@ use rudb_vector::string::StringColumn;
 use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
+mod anchor;
 mod distinct;
 pub mod grams;
 pub mod graph;
@@ -66,6 +67,7 @@ pub mod section;
 pub mod stats;
 mod zones;
 
+pub use anchor::{LaneStart, LogAnchor};
 pub use prepare::{Building, DICTIONARY_CAP_BYTES, Merged, Merger, Paged, Prepared, Preparer};
 pub use projection::build_sorted_projection;
 pub use run_projection::{RunProjectionPart, RunProjectionScan, build_run_projection};
@@ -2017,6 +2019,9 @@ pub struct Writer {
     views: Vec<ViewEntry>,
     /// The device card the next commit writes down, which is [`card_for`] the file.
     card: Option<KeptCard>,
+    /// The log anchor the next commit writes down, carried forward by [`Writer::open`] and set by
+    /// [`Writer::with_log_anchor`].
+    anchor: Option<LogAnchor>,
     /// Where the stages this writer runs are charged, which [`Writer::with_profile`] sets.
     ///
     /// The writer runs the page builder, the dictionary blocks, the writes and the publish, and it
@@ -2219,7 +2224,7 @@ impl Writer {
         let file = fs.open(path.as_ref(), OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (mut closed, views, card) = decode_catalog(&bytes, size)?;
+        let (mut closed, views, card, anchor) = decode_catalog(&bytes, size)?;
         let card = card_for(path.as_ref(), card);
         // A table already in the file under this name is only in the way if it holds rows. One that
         // holds none has no pages for this generation to carry and no reader that could lose
@@ -2283,6 +2288,7 @@ impl Writer {
             closed,
             views,
             card,
+            anchor,
             profile: None,
         })
     }
@@ -2359,6 +2365,7 @@ impl Writer {
             closed: Vec::new(),
             views: Vec::new(),
             card: card_for(path.as_ref(), None),
+            anchor: None,
             profile: None,
         })
     }
@@ -2379,18 +2386,24 @@ impl Writer {
     ///
     /// It takes the views anyway, because a database with no table can still have views in it. A
     /// view over `range` or over another view names no table, so dropping the last table out of a
-    /// database does not have to leave the catalog with nothing worth writing down.
+    /// database does not have to leave the catalog with nothing worth writing down. The log anchor
+    /// is the same: the log a database with no table wrote is still a log the file has to account
+    /// for.
     ///
     /// # Errors
     ///
     /// If the file exists or the path cannot be written.
-    pub fn empty(path: impl AsRef<Path>, views: &[ViewEntry]) -> Result<()> {
+    pub fn empty(
+        path: impl AsRef<Path>,
+        views: &[ViewEntry],
+        anchor: Option<&LogAnchor>,
+    ) -> Result<()> {
         let file = RealFilesystem::new().open(path.as_ref(), OpenMode::CreateNew)?;
         let mut header = [0; HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
         header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
         file.write_at(0, &header)?;
-        let catalog = encode_catalog(&[], views, card_for(path.as_ref(), None).as_ref())?;
+        let catalog = encode_catalog(&[], views, card_for(path.as_ref(), None).as_ref(), anchor)?;
         file.write_at(HEADER, &catalog)?;
         // The same two syncs in the same order as [`Writer::finish`], and for the same reason. The
         // catalog is on the disk before the slot names it, so a file this is interrupted in the
@@ -2435,7 +2448,7 @@ impl Writer {
             }
             self.closed.remove(at);
         }
-        let Self { file, at, generation, mut closed, views, card, .. } = self;
+        let Self { file, at, generation, mut closed, views, card, anchor, .. } = self;
         closed.push(entry);
         Ok(Self {
             file,
@@ -2445,6 +2458,7 @@ impl Writer {
             closed,
             views,
             card,
+            anchor,
             profile: None,
             dictionaries: fields
                 .iter()
@@ -2489,6 +2503,14 @@ impl Writer {
     #[must_use]
     pub fn with_views(mut self, views: Vec<ViewEntry>) -> Self {
         self.views = views;
+        self
+    }
+
+    /// Sets the log anchor the next commit writes down, which says how much of the log the file
+    /// holds once it is published.
+    #[must_use]
+    pub fn with_log_anchor(mut self, anchor: LogAnchor) -> Self {
+        self.anchor = Some(anchor);
         self
     }
 
@@ -3876,7 +3898,8 @@ impl Writer {
         let _timing = profile.as_deref().map(|profile| profile.span(Stage::Publish));
         let mut tables = std::mem::take(&mut self.closed);
         tables.push(entry);
-        let catalog = encode_catalog(&tables, &self.views, self.card.as_ref())?;
+        let catalog =
+            encode_catalog(&tables, &self.views, self.card.as_ref(), self.anchor.as_ref())?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -3916,20 +3939,32 @@ impl Writer {
     /// entries are carried forward by directory pointer the way an append carries them, the new
     /// catalog goes on the end, and the slot write at the end is what publishes it.
     ///
+    /// The log anchor is `anchor` when there is one and the one the file holds when not.
+    ///
     /// # Errors
     ///
     /// If the file has no valid committed directory, is not this build's format, or cannot be
     /// written.
-    pub fn restate(path: impl AsRef<Path>, views: &[ViewEntry]) -> Result<()> {
+    pub fn restate(
+        path: impl AsRef<Path>,
+        views: &[ViewEntry],
+        anchor: Option<&LogAnchor>,
+    ) -> Result<()> {
         let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (closed, _, card) = decode_catalog(&bytes, size)?;
+        let (closed, _, card, held) = decode_catalog(&bytes, size)?;
+        let anchor = anchor.cloned().or(held);
         let generation = slot
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("native file generation overflow"))?;
-        let catalog = encode_catalog(&closed, views, card_for(path.as_ref(), card).as_ref())?;
+        let catalog = encode_catalog(
+            &closed,
+            views,
+            card_for(path.as_ref(), card).as_ref(),
+            anchor.as_ref(),
+        )?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -3959,11 +3994,11 @@ impl Writer {
     pub fn keep_device_card(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let (_, size, _, bytes, _) = slot_bytes(path)?;
-        let (_, views, held) = decode_catalog(&bytes, size)?;
+        let (_, views, held, _) = decode_catalog(&bytes, size)?;
         if card_for(path, held.clone()) == held {
             return Ok(());
         }
-        Self::restate(path, &views)
+        Self::restate(path, &views, None)
     }
 
     /// Adds exact count, sum, distinct, bound, and bounded frequency certificates to an older file without
@@ -3971,7 +4006,7 @@ impl Writer {
     pub fn certify_summaries(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let (_, size, slot, bytes, _) = slot_bytes(path)?;
-        let (mut entries, views, card) = decode_catalog(&bytes, size)?;
+        let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
         let native = Catalog::open(path)?;
         for entry in &mut entries {
             let reader = native.table(&entry.name)?;
@@ -3987,7 +4022,8 @@ impl Writer {
             .generation
             .checked_add(1)
             .ok_or_else(|| invalid("native file generation overflow"))?;
-        let catalog = encode_catalog(&entries, &views, card_for(path, card).as_ref())?;
+        let catalog =
+            encode_catalog(&entries, &views, card_for(path, card).as_ref(), anchor.as_ref())?;
         if catalog.len() > MAX_DIRECTORY {
             return Err(invalid("catalog exceeds the configured bound"));
         }
@@ -4112,7 +4148,7 @@ pub fn attach(
     let file = &*file;
     let size = file.len()?;
     let (slot, bytes, _) = committed_slot(file, size)?;
-    let (mut entries, views, card) = decode_catalog(&bytes, size)?;
+    let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
     let card = card_for(path.as_ref(), card);
     let at = entries
         .iter()
@@ -4159,7 +4195,7 @@ pub fn attach(
     };
     // The views the file already had, written back unchanged. Attaching a section to a table says
     // nothing about a view and must not drop one.
-    let catalog = encode_catalog(&entries, &views, card.as_ref())?;
+    let catalog = encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref())?;
     if catalog.len() > MAX_DIRECTORY {
         return Err(invalid("catalog exceeds the configured bound"));
     }
@@ -5884,6 +5920,8 @@ pub struct Catalog {
     entries: Arc<Vec<Entry>>,
     /// The views the file holds, whole, since a view has no second level to read later.
     views: Arc<Vec<ViewEntry>>,
+    /// How much of the log the file holds.
+    anchor: Option<Arc<LogAnchor>>,
     opening: Opening,
     /// Where every reader this hands out counts its pages.
     pool: PagePool,
@@ -5927,9 +5965,10 @@ impl Catalog {
     pub fn open_in(path: impl AsRef<Path>, pool: &PagePool) -> Result<Self> {
         let path = path.as_ref();
         let (file, size, _, bytes, opening) = slot_bytes(path)?;
-        let (entries, views, card) = decode_catalog(&bytes, size)?;
+        let (entries, views, card, anchor) = decode_catalog(&bytes, size)?;
         remember_card(path, card.as_ref());
         Ok(Self {
+            anchor: anchor.map(Arc::new),
             file: Arc::new(file),
             size,
             entries: Arc::new(entries),
@@ -5961,6 +6000,12 @@ impl Catalog {
     /// nothing left to go and fetch and no reason to make the caller ask twice.
     pub fn views(&self) -> impl ExactSizeIterator<Item = &ViewEntry> {
         self.views.iter()
+    }
+
+    /// How much of the log the file holds, or `None` for a file no log was ever anchored in.
+    #[must_use]
+    pub fn log_anchor(&self) -> Option<&LogAnchor> {
+        self.anchor.as_deref()
     }
 
     /// How many tables the file holds.
@@ -8782,6 +8827,7 @@ fn encode_catalog(
     entries: &[Entry],
     views: &[ViewEntry],
     card: Option<&KeptCard>,
+    anchor: Option<&LogAnchor>,
 ) -> Result<Vec<u8>> {
     let mut out = CATALOG.to_vec();
     put_u32(&mut out, u32::try_from(entries.len()).map_err(|_| invalid("too many tables"))?);
@@ -8956,6 +9002,9 @@ fn encode_catalog(
         out.extend_from_slice(device);
         put_u32(&mut out, u32::try_from(card.bytes.len()).map_err(|_| invalid("card too long"))?);
         out.extend_from_slice(&card.bytes);
+    }
+    if let Some(anchor) = anchor {
+        anchor.encode(&mut out)?;
     }
     Ok(out)
 }
@@ -9211,25 +9260,29 @@ fn decode_catalog(bytes: &[u8], size: u64) -> Result<Decoded> {
         }
     }
     let mut card = None;
-    if !cur.done() {
-        if cur.take(8)? != DEVICE_CARD {
-            return Err(invalid("device card catalog extension magic differs"));
+    let mut anchor = None;
+    // The extensions in the order they are written, each at most once. An older build stops at the
+    // first magic it does not know, which is how a file it cannot read whole says so.
+    while !cur.done() {
+        let tag = cur.take(8)?;
+        if tag == DEVICE_CARD && card.is_none() && anchor.is_none() {
+            let device = cur.text()?;
+            let len = cur.u32()? as usize;
+            if len > MAX_CARD {
+                return Err(invalid("device card is longer than any card"));
+            }
+            card = Some(KeptCard { device, bytes: cur.take(len)?.to_vec() });
+        } else if tag == anchor::LOG_ANCHOR && anchor.is_none() {
+            anchor = Some(LogAnchor::decode(&mut cur)?);
+        } else {
+            return Err(invalid("catalog extension magic differs or repeats"));
         }
-        let device = cur.text()?;
-        let len = cur.u32()? as usize;
-        if len > MAX_CARD {
-            return Err(invalid("device card is longer than any card"));
-        }
-        card = Some(KeptCard { device, bytes: cur.take(len)?.to_vec() });
     }
-    if !cur.done() {
-        return Err(invalid("catalog has trailing bytes"));
-    }
-    Ok((entries, views, card))
+    Ok((entries, views, card, anchor))
 }
 
-/// What [`decode_catalog`] reads: the tables, the views and the device card.
-type Decoded = (Vec<Entry>, Vec<ViewEntry>, Option<KeptCard>);
+/// What [`decode_catalog`] reads: the tables, the views, the device card and the log anchor.
+type Decoded = (Vec<Entry>, Vec<ViewEntry>, Option<KeptCard>, Option<LogAnchor>);
 
 /// The most a kept device card can take, which is many times what one holds.
 const MAX_CARD: usize = 64 << 10;
@@ -14112,7 +14165,7 @@ mod tests {
     #[test]
     fn a_file_holding_no_table_commits_and_opens_and_a_table_can_be_added_to_it() {
         let path = path("empty");
-        Writer::empty(&path, &[]).expect("a file with nothing in it");
+        Writer::empty(&path, &[], None).expect("a file with nothing in it");
         let catalog = Catalog::open(&path).expect("the empty file opens");
         assert_eq!(catalog.len(), 0);
         assert!(catalog.is_empty());
@@ -14163,6 +14216,67 @@ mod tests {
     }
 
     #[test]
+    fn a_log_anchor_rides_the_catalog_after_the_card_and_goes_forward_with_every_commit() {
+        let entry = || Entry {
+            name: "items".to_string(),
+            fields: vec![Field::required("id", LogicalType::Integer)],
+            rows: 1,
+            directory: Page { offset: HEADER, length: 8, hash: 0 },
+            nonzero: vec![None],
+            aggregates: vec![None],
+            distincts: vec![None],
+            extremes: vec![None],
+            frequencies: vec![None],
+        };
+        let anchor = LogAnchor {
+            database: 0xfeed,
+            durable: 41,
+            lanes: vec![LaneStart { sequence: 3, offset: 4096 }],
+            voids: vec![43, 47],
+        };
+        assert!(!anchor.replays(41) && anchor.replays(42) && !anchor.replays(43));
+        let card = KeptCard { device: "dev:42".to_string(), bytes: vec![1, 2, 3] };
+        for card in [None, Some(&card)] {
+            let bytes = encode_catalog(&[entry()], &[], card, Some(&anchor)).expect("encodes");
+            let (_, _, kept, held) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
+            assert_eq!((kept.as_ref(), held.as_ref()), (card, Some(&anchor)));
+        }
+        let mut twice = encode_catalog(&[entry()], &[], None, Some(&anchor)).expect("encodes");
+        anchor.encode(&mut twice).expect("encodes");
+        assert!(decode_catalog(&twice, HEADER + 8).is_err(), "a second anchor");
+        let mut after = encode_catalog(&[entry()], &[], None, Some(&anchor)).expect("encodes");
+        after.extend_from_slice(DEVICE_CARD);
+        assert!(decode_catalog(&after, HEADER + 8).is_err(), "a card after the anchor");
+        let under = LogAnchor { voids: vec![40], ..anchor.clone() };
+        let bytes = encode_catalog(&[entry()], &[], None, Some(&under)).expect("encodes");
+        assert!(decode_catalog(&bytes, HEADER + 8).is_err(), "a void under the cut");
+
+        let path = path("anchored");
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        writer.append(&sample_ids()).expect("rows");
+        writer.with_log_anchor(anchor.clone()).finish().expect("commit");
+        assert_eq!(Catalog::open(&path).expect("reopen").log_anchor(), Some(&anchor));
+        Writer::restate(&path, &[sample_view("v")], None).expect("a view");
+        assert_eq!(Catalog::open(&path).expect("reopen").log_anchor(), Some(&anchor));
+        let mut writer =
+            Writer::open(&path, "other", vec![Field::required("id", LogicalType::Integer)])
+                .expect("a second table");
+        writer.append(&sample_ids()).expect("rows");
+        writer.finish().expect("commit");
+        assert_eq!(Catalog::open(&path).expect("reopen").log_anchor(), Some(&anchor));
+        let next = LogAnchor { durable: 90, voids: Vec::new(), ..anchor };
+        Writer::restate(&path, &[], Some(&next)).expect("a new cut");
+        assert_eq!(Catalog::open(&path).expect("reopen").log_anchor(), Some(&next));
+        fs::remove_file(&path).expect("clean up");
+        let empty = self::path("anchoredempty");
+        Writer::empty(&empty, &[], Some(&next)).expect("an empty file");
+        assert_eq!(Catalog::open(&empty).expect("reopen").log_anchor(), Some(&next));
+        fs::remove_file(&empty).expect("clean up");
+    }
+
+    #[test]
     fn a_device_card_rides_the_catalog_and_an_older_catalog_has_none() {
         let entry = || Entry {
             name: "items".to_string(),
@@ -14176,11 +14290,11 @@ mod tests {
             frequencies: vec![None],
         };
         let card = KeptCard { device: "dev:42".to_string(), bytes: vec![1, 2, 3] };
-        let bytes = encode_catalog(&[entry()], &[], Some(&card)).expect("encodes");
-        let (entries, views, kept) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
+        let bytes = encode_catalog(&[entry()], &[], Some(&card), None).expect("encodes");
+        let (entries, views, kept, _) = decode_catalog(&bytes, HEADER + 8).expect("decodes");
         assert_eq!((entries.len(), views.len()), (1, 0));
         assert_eq!(kept, Some(card));
-        let bytes = encode_catalog(&[entry()], &[], None).expect("encodes");
+        let bytes = encode_catalog(&[entry()], &[], None, None).expect("encodes");
         assert_eq!(decode_catalog(&bytes, HEADER + 8).expect("decodes").2, None);
     }
 
@@ -14241,7 +14355,7 @@ mod tests {
         writer.append(&sample_ids()).expect("rows");
         writer.finish().expect("commit");
         let before = fs::metadata(&path).expect("the file is there").len();
-        Writer::restate(&path, &[sample_view("v"), sample_view("w")]).expect("two views");
+        Writer::restate(&path, &[sample_view("v"), sample_view("w")], None).expect("two views");
         let catalog = Catalog::open(&path).expect("reopen");
         assert_eq!(catalog.views().count(), 2);
         assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["items"]);
@@ -14256,7 +14370,7 @@ mod tests {
         assert_eq!(reader.table().rows, 3);
         // And a restate over a restate keeps working, because each one reads the slot that
         // checksummed rather than the highest number in the header.
-        Writer::restate(&path, &[]).expect("no views at all");
+        Writer::restate(&path, &[], None).expect("no views at all");
         assert_eq!(Catalog::open(&path).expect("reopen").views().count(), 0);
         fs::remove_file(&path).expect("clean up");
     }
@@ -14277,6 +14391,7 @@ mod tests {
                 frequencies: vec![None],
             }],
             &[sample_view("items")],
+            None,
             None,
         )
         .expect("it encodes, because encoding does not look");

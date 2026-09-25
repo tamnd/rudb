@@ -1704,13 +1704,13 @@ fn persist(
     // rewrite below it, written as an empty file and renamed over whatever was there.
     if names.is_empty() {
         let temporary = scratch(path)?;
-        rudb_native::Writer::empty(&temporary, &views)?;
+        rudb_native::Writer::empty(&temporary, &views, None)?;
         return rename(&temporary, path);
     }
     // Only the views moved, so nothing has to be written again. Everything the file holds is still
     // the right bytes in the right place and the commit is a new catalog naming the same pages.
     if clean && held.is_some_and(|held| held.tables == wanted(&names)) {
-        rudb_native::Writer::restate(path, &views)?;
+        rudb_native::Writer::restate(path, &views, None)?;
         return rebind(path, catalog, &names, pages);
     }
     if appended(path, catalog, &names, &views)? {
@@ -1990,7 +1990,7 @@ fn attach_database(
         }
         // Made before the name goes in, so a path that cannot be written is refused with nothing
         // left attached.
-        rudb_native::Writer::empty(&path, &[])?;
+        rudb_native::Writer::empty(&path, &[], None)?;
     }
     let native = rudb_native::Catalog::open_in(&path, pages)?;
     catalog.attach_file(&name, Some(attach.path.clone()), read_only)?;
