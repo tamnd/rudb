@@ -38,6 +38,8 @@ The deliverable of every milestone in document 10 is a table with one row per ru
 
 A rule whose "everything else" column is negative is a rule that made the engine slower where it did not help, which happens, filter reordering on a query with two cheap conjuncts costs the reordering and buys nothing, and the response is a threshold, not a shrug.
 
+The first of these tables is [`../perf/72-every-rule-off-one-at-a-time.md`](../perf/72-every-rule-off-one-at-a-time.md), which is ClickBench at a million rows for G4 in tamnd/rudb#764. It is also where the apparatus is written down, because `--ablate` in `scripts/instructions` is what turns one switch into a measurement, and where the protocol that table needs is argued out: one query per process charges a once per table cost to every query in the suite, and the number a session run gives is the different and also true one.
+
 ## 9.5 Estimate quality, reported as a distribution
 
 q-error, the maximum of estimate over actual and actual over estimate, as a distribution over a benchmark and never as a mean, because the tail is the thing that causes the catastrophe. `../planner/06-cardinality-and-cost.md` section 06.5 already requires this on CEB; this directory is what supplies the numbers that move it.
