@@ -92,6 +92,15 @@ pub struct Prepared {
     last_use: Vec<usize>,
     /// The step index each expression this was built from ends at.
     roots: Vec<usize>,
+    /// Whether each entry of [`roots`](Self::roots) is the last one naming its step.
+    ///
+    /// Two expressions of one projection can end at the same step, because a shared subexpression is
+    /// compiled once, and then the first of them has to copy the answer and the last of them can
+    /// take it. Which is which is a property of `roots` alone, so it is settled here rather than
+    /// counted again on every chunk. Counting it per chunk is what [`evaluate`](Self::evaluate) used
+    /// to do, through a `HashMap` it allocated and hashed every call, and on TPC-H Q1 that map was a
+    /// measurable part of the query for an answer that never changed.
+    last_root: Vec<bool>,
     /// The step already compiled for each shared plan expression.
     shared: HashMap<ExprRef, usize>,
     share: bool,
@@ -345,6 +354,7 @@ impl Prepared {
             operands: Vec::new(),
             last_use: Vec::new(),
             roots: Vec::new(),
+            last_root: Vec::new(),
             shared: HashMap::new(),
             share,
             fuse,
@@ -355,6 +365,7 @@ impl Prepared {
             prepared.roots.push(root);
         }
         prepared.last_use = prepared.last_uses();
+        prepared.last_root = prepared.last_roots();
         Ok(prepared)
     }
 
@@ -392,6 +403,15 @@ impl Prepared {
             last[root] = usize::MAX;
         }
         last
+    }
+
+    /// Which entries of [`roots`](Self::roots) are the last to name their step. See
+    /// [`last_root`](Self::last_root).
+    ///
+    /// A projection has a handful of roots, so this compares each against the ones after it rather
+    /// than building a map. It runs once per prepared expression.
+    fn last_roots(&self) -> Vec<bool> {
+        (0..self.roots.len()).map(|at| !self.roots[at + 1..].contains(&self.roots[at])).collect()
     }
 
     /// Visits the steps one step reads, whatever shape its operands are held in.
@@ -516,28 +536,17 @@ impl Prepared {
         out: &mut Vec<Vector>,
     ) -> Result<()> {
         self.run(chunk, scratch)?;
-        let mut remaining: HashMap<usize, usize> = HashMap::new();
-        for &root in &self.roots {
-            *remaining.entry(root).or_default() += 1;
-        }
-        for &root in &self.roots {
+        for (at, &root) in self.roots.iter().enumerate() {
             // The one place a column is copied, and it is copied because the caller is taking
             // ownership of a vector that has to outlive the chunk it came from. `SELECT a` is that
             // shape and a projection of a bare column is the only expression where it happens.
             match self.steps[root] {
                 Step::Column(position) => out.push(chunk.column(position)?.clone()),
+                _ if self.last_root[at] => {
+                    out.push(scratch.slots[root].take().ok_or_else(|| missing(root))?);
+                }
                 _ => {
-                    let Some(left) = remaining.get_mut(&root) else {
-                        return Err(Error::internal("a prepared root was not counted"));
-                    };
-                    *left -= 1;
-                    if *left == 0 {
-                        out.push(scratch.slots[root].take().ok_or_else(|| missing(root))?);
-                    } else {
-                        out.push(
-                            scratch.slots[root].as_ref().ok_or_else(|| missing(root))?.clone(),
-                        );
-                    }
+                    out.push(scratch.slots[root].as_ref().ok_or_else(|| missing(root))?.clone());
                 }
             }
         }
@@ -564,14 +573,14 @@ impl Prepared {
         let width = chunk.width();
         let mut columns: Vec<Option<Vector>> = chunk.into_columns().into_iter().map(Some).collect();
         let mut uses = vec![0usize; width];
-        let mut remaining: HashMap<usize, usize> = HashMap::new();
         for &root in &self.roots {
-            match self.steps[root] {
-                Step::Column(position) if position < width => uses[position] += 1,
-                _ => *remaining.entry(root).or_default() += 1,
+            if let Step::Column(position) = self.steps[root] {
+                if position < width {
+                    uses[position] += 1;
+                }
             }
         }
-        for &root in &self.roots {
+        for (at, &root) in self.roots.iter().enumerate() {
             if let Step::Column(position) = self.steps[root] {
                 let missing = || {
                     Error::internal(format!(
@@ -585,11 +594,7 @@ impl Prepared {
                 out.push(column.ok_or_else(missing)?);
                 continue;
             }
-            let Some(left) = remaining.get_mut(&root) else {
-                return Err(Error::internal("a prepared root was not counted"));
-            };
-            *left -= 1;
-            if *left == 0 {
+            if self.last_root[at] {
                 out.push(scratch.slots[root].take().ok_or_else(|| missing(root))?);
             } else {
                 out.push(scratch.slots[root].as_ref().ok_or_else(|| missing(root))?.clone());
