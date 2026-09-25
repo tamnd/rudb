@@ -3541,6 +3541,18 @@ impl<'a> Transform<'a> {
                 // of more than one is a row.
                 "ParensExpression" if count == 1 => node = self.first(node),
                 "BoundedListExpression" => return self.list(node),
+                "ArrayParensSelect" => {
+                    let query = self.query(self.descendant(node, "SelectStatementInternal"))?;
+                    return Ok(self.push(Expr::Subquery { query, array: true }));
+                }
+                "ArrayBoundedListExpression" => {
+                    let inner = self.find(node, "BoundedListExpression");
+                    let list = self.list(inner)?;
+                    if self.text(node).len() != self.text(inner).len() {
+                        self.ast.array_lists.push(list);
+                    }
+                    return Ok(list);
+                }
                 "StructExpression" => return self.structure(node),
                 "MapExpression" => return self.map(node),
                 "QuestionMarkNumberedParameter"
@@ -4887,7 +4899,7 @@ impl<'a> Transform<'a> {
         } else if negated {
             return self.unsupported(node);
         } else {
-            self.push(Expr::Subquery { query })
+            self.push(Expr::Subquery { query, array: false })
         })
     }
 
@@ -5391,7 +5403,8 @@ mod tests {
                     .collect();
                 format!("{{{}}}", fields.join(", "))
             }
-            Expr::Subquery { query } => format!("({})", show_query(ast, query)),
+            Expr::Subquery { query, array: false } => format!("({})", show_query(ast, query)),
+            Expr::Subquery { query, array: true } => format!("ARRAY({})", show_query(ast, query)),
             Expr::Exists { query, negated } => {
                 let exists = format!("EXISTS ({})", show_query(ast, query));
                 if negated { format!("NOT {exists}") } else { exists }

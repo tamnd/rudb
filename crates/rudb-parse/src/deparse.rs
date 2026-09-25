@@ -402,7 +402,8 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             let params: Vec<String> = ast.name(params).map(quoted).collect();
             format!("(lambda {}: {})", params.join(", "), expr(ast, body))
         }
-        Expr::Subquery { query: inner } => format!("({})", query(ast, inner)),
+        Expr::Subquery { query: inner, array: false } => format!("({})", query(ast, inner)),
+        Expr::Subquery { query: inner, array: true } => format!("ARRAY({})", query(ast, inner)),
         Expr::Exists { query: inner, negated } => {
             let exists = format!("EXISTS({})", query(ast, inner));
             if negated { format!("(NOT {exists})") } else { exists }

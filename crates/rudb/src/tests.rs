@@ -10940,6 +10940,42 @@ fn a_series_or_an_unnest_can_read_a_query_in_its_arguments() {
 }
 
 #[test]
+fn an_array_is_a_list_written_with_the_keyword_or_a_query_gathered_into_one() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let names = |sql: &str| db.query(sql).unwrap().names().to_vec();
+    assert_eq!(
+        text("SELECT ARRAY[1, 2, 3], ARRAY[[1, 2], [3]], ARRAY[]"),
+        "[1, 2, 3],[[1, 2], [3]],[]"
+    );
+    assert_eq!(
+        names("SELECT ARRAY[1, 2, 3], ARRAY[[1, 2], [3]], [4]"),
+        ["(ARRAY[1, 2, 3])", "(ARRAY[list_value(1, 2), list_value(3)])", "list_value(4)"]
+    );
+    assert_eq!(text("SELECT typeof(ARRAY[1, 2])"), "INTEGER[]");
+    assert_eq!(text("SELECT ARRAY(SELECT i FROM range(3) t(i))"), "[0, 1, 2]");
+    assert_eq!(text("SELECT ARRAY(SELECT i FROM range(0) t(i))"), "[]");
+    assert_eq!(
+        text("SELECT ARRAY(SELECT i FROM range(5) t(i) ORDER BY i DESC)"),
+        "[4, 3, 2, 1, 0]"
+    );
+    assert_eq!(
+        text("SELECT i, ARRAY(SELECT j FROM range(i) u(j)) FROM range(3) t(i) ORDER BY i"),
+        "0,[];1,[0];2,[0, 1]"
+    );
+    assert!(
+        failure(&db, "SELECT ARRAY(SELECT i, i FROM range(2) t(i))")
+            .contains("Subquery returns 2 columns - expected 1")
+    );
+}
+
+#[test]
 fn unnest_of_a_struct_is_a_column_per_field_the_way_the_pin_does() {
     let db = Database::new();
     db.execute(

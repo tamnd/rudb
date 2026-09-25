@@ -177,7 +177,9 @@ impl Binder<'_> {
             // `DEFAULT` that reaches this is one written anywhere else.
             ast::Expr::Default if self.default_as_null => Ok(self.add_constant(Value::Null)),
             ast::Expr::Default => Err(Error::binder("DEFAULT is not allowed here!")),
-            ast::Expr::Subquery { query } => self.bind_scalar_subquery(ast, query, scope),
+            ast::Expr::Subquery { query, array } => {
+                self.bind_scalar_subquery(ast, query, array, scope)
+            }
             ast::Expr::Exists { query, negated } => {
                 self.bind_exists_subquery(ast, query, negated, scope)
             }
@@ -185,29 +187,68 @@ impl Binder<'_> {
     }
 
     /// Binds an uncorrelated scalar query and returns its one output as a column expression.
+    ///
+    /// `ARRAY(SELECT ...)` is the same subquery with its column gathered into one list, which is
+    /// empty rather than null when the query has no rows. The pin writes it as `array_agg` ordered
+    /// by the query's own `ORDER BY`. The aggregate here has no ordering of its own and takes the
+    /// rows in the order the query gives them, which keeps that order while the query fits in one
+    /// chunk but not over several chunks read in parallel, the same as `list` over an ordered
+    /// subquery.
     fn bind_scalar_subquery(
         &mut self,
         ast: &Ast,
         query: ast::QueryRef,
+        array: bool,
         outer: &Scope,
     ) -> Result<ExprRef> {
-        let (node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
+        let (mut node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
         let [column] = scope.columns.as_slice() else {
             return Err(Error::binder(format!(
                 "Subquery returns {} columns - expected 1",
                 scope.len()
             )));
         };
-        let expr = self.add_expr(Expr::Column(column.binding), column.ty.clone());
+        let mut binding = column.binding;
+        let mut ty = column.ty.clone();
+        if array {
+            let element = self.add_expr(Expr::Column(binding), ty.clone());
+            let resolved = resolve("array_agg", std::slice::from_ref(&ty))?;
+            let args = self.plan_mut().add_expr_list(&[element]);
+            let name = self.plan_mut().intern(resolved.name);
+            ty = resolved.returns;
+            let gathered = self.add_expr(
+                Expr::Aggregate { name, args, distinct: false, filter: None },
+                ty.clone(),
+            );
+            let aggregates = self.plan_mut().add_expr_list(&[gathered]);
+            let groups = self.plan_mut().add_expr_list(&[]);
+            let index = self.fresh_index();
+            node = self.add_node(rudb_plan::Node::Aggregate {
+                input: node,
+                index,
+                groups,
+                aggregates,
+            });
+            binding = rudb_plan::ColumnBinding::new(index, 0);
+        }
+        let expr = self.add_expr(Expr::Column(binding), ty.clone());
         self.scalar_subqueries.push(PendingSubquery {
             node,
             kind: rudb_plan::JoinKind::Single,
             conditions: Vec::new(),
             dependent: !correlations.is_empty(),
             reads: correlations,
-            index: column.binding.table,
+            index: binding.table,
             inside_aggregate: self.in_aggregate,
         });
+        if array {
+            let LogicalType::List(element) = &ty else {
+                return Err(Error::internal(format!("array_agg returning {ty}")));
+            };
+            let empty = Value::List { element: (**element).clone(), values: Vec::new() };
+            let empty = self.add_constant(empty);
+            return self.call("coalesce", vec![expr, empty]);
+        }
         Ok(expr)
     }
 
@@ -1872,7 +1913,13 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         ast::Expr::List { items } => {
             let items: Vec<String> =
                 ast.expr_list(items).iter().map(|&item| describe(ast, item, semantics)).collect();
-            format!("list_value({})", items.join(", "))
+            // `ARRAY[1, 2]` keeps the spelling it was written with, in brackets, and what is inside
+            // it is named the usual way, so `ARRAY[[1]]` is `(ARRAY[list_value(1)])`.
+            if ast.written_as_array(expr) {
+                format!("(ARRAY[{}])", items.join(", "))
+            } else {
+                format!("list_value({})", items.join(", "))
+            }
         }
         // And a braced struct after `struct_pack`, with every field passed by name.
         ast::Expr::Struct { names, values } => {
@@ -1889,7 +1936,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         // the value turns out to be.
         ast::Expr::Parameter { name } => format!("${}", ast.string(name)),
         ast::Expr::Default => "DEFAULT".to_string(),
-        ast::Expr::Subquery { .. } => "subquery".to_string(),
+        ast::Expr::Subquery { array: false, .. } => "subquery".to_string(),
+        ast::Expr::Subquery { query, array: true } => {
+            format!("ARRAY({})", rudb_parse::deparse::query(ast, query))
+        }
         ast::Expr::Exists { query, negated } => {
             let exists = format!("EXISTS({})", rudb_parse::deparse::query(ast, query));
             if negated { format!("(NOT {exists})") } else { exists }
