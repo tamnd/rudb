@@ -86,8 +86,8 @@ mod subscript;
 mod text;
 
 pub use aggregate::{
-    Accumulator, NOWHERE, finish_run, group_tally, settle_extremes, update_general, update_runs,
-    update_scattered, update_shared_runs, update_tallied, whole_answers,
+    Accumulator, NOWHERE, finish_run, group_tally, ordered_name, settle_extremes, update_general,
+    update_runs, update_scattered, update_shared_runs, update_tallied, whole_answers,
 };
 pub use cast::{cast, cast_in_time_zone, cast_value, percentage, row_count};
 pub use compare::{

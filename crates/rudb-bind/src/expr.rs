@@ -108,7 +108,8 @@ impl Binder<'_> {
                 self.bind_unnest(ast, expr, &args, scope)
             }
             ast::Expr::Function { name, args, distinct, filter } => {
-                self.bind_call(ast, name, args, distinct, filter, scope)
+                let sorted = ast.aggregate_order(expr);
+                self.bind_call(ast, name, args, distinct, filter, sorted, scope)
             }
             ast::Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec } => {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
@@ -646,6 +647,7 @@ impl Binder<'_> {
         args: ast::Slice,
         distinct: bool,
         filter: ast::ExprRef,
+        sorted: &[ast::OrderItem],
         scope: &Scope,
     ) -> Result<ExprRef> {
         let written = ast.name(name).last().unwrap_or_default().to_string();
@@ -663,13 +665,13 @@ impl Binder<'_> {
             if !rudb_catalog::same_name(&written, "count") || arguments.len() != 1 {
                 return Err(Error::binder(format!("* is not allowed in {written}()")));
             }
-            return self.bind_aggregate(ast, "count_star", &[], false, filter, scope);
+            return self.bind_aggregate(ast, "count_star", &[], false, filter, &[], scope);
         }
         // `count()` with nothing in it is upstream's other spelling of `count(*)`. It counts rows
         // the same way and it is not an arity mistake, which is what the signature table would
         // otherwise say about a `count` given no arguments.
         if rudb_catalog::same_name(&written, "count") && arguments.is_empty() {
-            return self.bind_aggregate(ast, "count_star", &[], false, filter, scope);
+            return self.bind_aggregate(ast, "count_star", &[], false, filter, &[], scope);
         }
         // `TRY(1, 2)` is not the grammar's `TryExpression`, so it arrives as a call, and the pin's
         // parser is what refuses it there.
@@ -683,7 +685,7 @@ impl Binder<'_> {
             return Ok(expanded);
         }
         if kind_of(&written) == Some(FunctionKind::Aggregate) {
-            return self.bind_aggregate(ast, &written, &arguments, distinct, filter, scope);
+            return self.bind_aggregate(ast, &written, &arguments, distinct, filter, sorted, scope);
         }
         // A ranking window with no `OVER` after it. Upstream says this and not that the name is
         // missing, because the name is there and it is the place it was written that is wrong:
@@ -694,7 +696,8 @@ impl Binder<'_> {
         // Upstream's sentence, which names all three modifiers whichever one was written, and which
         // it reaches only once the name has resolved: `nosuch(DISTINCT x)` is a catalog error there
         // and not this, so a name this does not know falls through and gets the catalog's answer.
-        if (distinct || filter != NONE) && kind_of(&written) == Some(FunctionKind::Scalar) {
+        let modified = distinct || filter != NONE || !sorted.is_empty();
+        if modified && kind_of(&written) == Some(FunctionKind::Scalar) {
             return Err(Error::invalid_input(format!(
                 "Function \"{written}\" is a Scalar Function. \"DISTINCT\", \"FILTER\", and \
                  \"ORDER BY\" are only applicable to window and aggregate functions."
@@ -1810,8 +1813,33 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 let value = describe(ast, target.expr, semantics);
                 arguments.push(format!("{} := {value}", quoted(ast.string(target.alias))));
             }
+            // An `ORDER BY` inside the call is part of the name whether or not the aggregate reads
+            // it, so `sum(x ORDER BY y)` keeps it too.
+            let sorted: Vec<String> = ast
+                .aggregate_order(expr)
+                .iter()
+                .map(|item| {
+                    let mut key = describe(ast, item.expr, semantics);
+                    key += match item.order {
+                        ast::Order::Unstated => "",
+                        ast::Order::Ascending => " ASC",
+                        ast::Order::Descending => " DESC",
+                    };
+                    key += match item.nulls {
+                        ast::Nulls::Unstated => "",
+                        ast::Nulls::First => " NULLS FIRST",
+                        ast::Nulls::Last => " NULLS LAST",
+                    };
+                    key
+                })
+                .collect();
+            let sorted = if sorted.is_empty() {
+                String::new()
+            } else {
+                format!(" ORDER BY {}", sorted.join(", "))
+            };
             format!(
-                "{name}({word}{}){}",
+                "{name}({word}{}{sorted}){}",
                 arguments.join(", "),
                 named_filter(ast, filter, semantics)
             )

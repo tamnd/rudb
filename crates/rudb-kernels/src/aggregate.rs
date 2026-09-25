@@ -73,6 +73,44 @@ use crate::shape::{identity, nulls_of};
 /// compare against a constant.
 pub const NOWHERE: usize = usize::MAX;
 
+/// The name an aggregate goes by when its call says which order to read its rows in, which is the
+/// plain name followed by one pair of letters per sort key.
+///
+/// `list(x ORDER BY y DESC, z)` is `list ORDER BY dl,al`, where the first letter is the direction
+/// and the second is where nulls go. The keys are the last arguments of the call, after the ones
+/// the aggregate itself reads. Carrying the order in the name keeps it out of every rule that looks
+/// at an aggregate by name, none of which knows what to do with an order, and every rule that walks
+/// arguments sees the keys as arguments and keeps them.
+#[must_use]
+pub fn ordered_name(inner: &str, keys: &[(bool, bool)]) -> String {
+    let keys: Vec<&str> = keys
+        .iter()
+        .map(|&(descending, nulls_first)| match (descending, nulls_first) {
+            (false, false) => "al",
+            (false, true) => "af",
+            (true, false) => "dl",
+            (true, true) => "df",
+        })
+        .collect();
+    format!("{inner} ORDER BY {}", keys.join(","))
+}
+
+/// The plain name and the sort keys of a name [`ordered_name`] made, or `None` for any other name.
+fn split_ordered(name: &str) -> Option<(&str, Vec<(bool, bool)>)> {
+    let (inner, keys) = name.split_once(" ORDER BY ")?;
+    let keys = keys
+        .split(',')
+        .map(|key| match key {
+            "al" => Some((false, false)),
+            "af" => Some((false, true)),
+            "dl" => Some((true, false)),
+            "df" => Some((true, true)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((inner, keys))
+}
+
 /// A running aggregate.
 #[derive(Debug, Clone)]
 pub struct Accumulator {
@@ -407,6 +445,11 @@ impl Accumulator {
     ///
     /// If the name is not an aggregate this crate implements.
     pub fn new(name: &str, returns: &LogicalType) -> Result<Self> {
+        if let Some((inner, keys)) = split_ordered(name) {
+            let inner = Box::new(Self::new(inner, returns)?);
+            let general = General::Ordered { keys, rows: Vec::new(), inner };
+            return Ok(Self { state: State::General(Box::new(general)) });
+        }
         if let Some(general) = General::new(name, returns) {
             return Ok(Self { state: State::General(Box::new(general)) });
         }

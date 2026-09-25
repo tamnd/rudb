@@ -10940,6 +10940,67 @@ fn a_series_or_an_unnest_can_read_a_query_in_its_arguments() {
 }
 
 #[test]
+fn an_order_by_inside_an_aggregate_is_the_order_it_reads_its_rows_in() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(text("SELECT list(i ORDER BY i DESC) FROM range(5) t(i)"), "[4, 3, 2, 1, 0]");
+    assert_eq!(
+        text(
+            "SELECT i % 2 AS k, list(i ORDER BY i DESC), string_agg(i::VARCHAR, ',' ORDER BY i \
+             DESC) FROM range(6) t(i) GROUP BY k ORDER BY k"
+        ),
+        "0,[4, 2, 0],4,2,0;1,[5, 3, 1],5,3,1"
+    );
+    assert_eq!(
+        text("SELECT list(i ORDER BY i % 3, i DESC) FROM range(7) t(i)"),
+        "[6, 3, 0, 4, 1, 5, 2]"
+    );
+    assert_eq!(
+        text(
+            "SELECT list(v ORDER BY v DESC NULLS LAST), list(v ORDER BY v NULLS FIRST) FROM (VALUES (3), (NULL), (5)) t(v)"
+        ),
+        "[5, 3, NULL],[NULL, 3, 5]"
+    );
+    assert_eq!(
+        text(
+            "SELECT first(v ORDER BY w), last(v ORDER BY w) FROM (VALUES ('a', 3), ('b', 1), ('c', 2)) t(v, w)"
+        ),
+        "b,a"
+    );
+    // Across chunks read in parallel, and in every group of a large grouping.
+    assert_eq!(
+        text("SELECT list(i ORDER BY i DESC)[1:3] FROM range(300000) t(i)"),
+        "[299999, 299998, 299997]"
+    );
+    assert_eq!(
+        text(
+            "SELECT count(*) FROM (SELECT i % 1000 AS k, list(i ORDER BY i DESC) AS l FROM \
+             range(200000) t(i) GROUP BY k) WHERE l[1] <> 199000 + k"
+        ),
+        "0"
+    );
+    assert_eq!(
+        text("SELECT sum(i ORDER BY i DESC), list(i ORDER BY 1) FROM range(3) t(i)"),
+        "3,[0, 1, 2]"
+    );
+    let names = db
+        .query("SELECT list(i ORDER BY i % 3, i DESC), sum(i ORDER BY i) FROM range(3) t(i)")
+        .unwrap();
+    assert_eq!(names.names(), ["list(i ORDER BY (i % 3), i DESC)", "sum(i ORDER BY i)"]);
+    assert!(
+        failure(&db, "SELECT list(DISTINCT i % 3 ORDER BY i) FROM range(6) t(i)")
+            .contains("ORDER BY expressions must appear in the argument list")
+    );
+    assert!(failure(&db, "SELECT upper('a' ORDER BY 1)").contains("is a Scalar Function"));
+}
+
+#[test]
 fn an_array_is_a_list_written_with_the_keyword_or_a_query_gathered_into_one() {
     let db = Database::new();
     let text = |sql: &str| {

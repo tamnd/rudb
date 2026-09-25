@@ -4045,12 +4045,9 @@ impl<'a> Transform<'a> {
         let list = self.first(self.nth(node, 1));
         // An `ORDER BY` written inside the brackets is the order the call reads its rows in, which
         // is a different thing from the `ORDER BY` in an `OVER` and is written in a different place.
-        // A call without an `OVER` is an aggregate and this is the ordered aggregate form, which is
-        // still a gap, so the clause is only kept for a window call and the rest say so. Per #1203.
+        // On a call without an `OVER` it is kept beside the call, for the binder to decide whether
+        // the aggregate it names cares about the order.
         let inside = self.find(list, "OrderByClause");
-        if inside != NONE && over == NONE {
-            return self.unsupported(inside);
-        }
         let inner = if inside == NONE {
             Slice { start: 0, len: 0 }
         } else {
@@ -4113,6 +4110,10 @@ impl<'a> Transform<'a> {
             return Ok(self.push(Expr::Struct { names, values }));
         }
         let merges = matches!(called.as_str(), "struct_insert" | "struct_update");
+        let rewritten = packs || merges || called == "unnest" || called == "ifnull";
+        if inside != NONE && over == NONE && rewritten {
+            return self.unsupported(inside);
+        }
         if merges && over == NONE && !names.is_empty() && names.len() + 1 == args.len() {
             let names = self.part_slice(names);
             let values = self.expr_slice(args.split_off(1));
@@ -4162,7 +4163,11 @@ impl<'a> Transform<'a> {
             return Ok(self.push(Expr::Function { name, args, distinct, filter }));
         }
         let args = self.expr_slice(args);
-        Ok(self.push(Expr::Function { name, args, distinct, filter }))
+        let call = self.push(Expr::Function { name, args, distinct, filter });
+        if inside != NONE {
+            self.ast.aggregate_orders.push((call, inner));
+        }
+        Ok(call)
     }
 
     // Windows.
