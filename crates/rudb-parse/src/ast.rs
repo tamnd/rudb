@@ -144,7 +144,10 @@ pub enum Statement {
     /// `spec/stats/05-every-query.md` section 5.1.1 asks `EXPLAIN` to print. It is a flag for the
     /// same reason `ANALYZE` is: it changes what goes on the end of the output and nothing before
     /// it.
-    Explain { query: QueryRef, analyze: bool, statistics: bool },
+    ///
+    /// `CODEGEN` asks for what the compiled engine would run instead of the plan: its stages and
+    /// the QIR it generated for them, or the reason it refuses the query.
+    Explain { query: QueryRef, analyze: bool, statistics: bool, codegen: bool },
 }
 
 /// `SET name = value` and `RESET name`.

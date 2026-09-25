@@ -2939,8 +2939,11 @@ impl Shared {
                 }
                 run(sql, &plan, &catalog, cancel, under)
             }
-            Bound::Explain { mut plan, analyze, statistics } => {
+            Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                if codegen {
+                    return explained_codegen(&plan, cancel);
+                }
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
                     &plan,
@@ -3381,8 +3384,11 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
-            Bound::Explain { mut plan, analyze, statistics } => {
+            Bound::Explain { mut plan, analyze, statistics, codegen } => {
                 let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                if codegen {
+                    return explained_codegen(&plan, cancel);
+                }
                 let seams = rudb_opt::explain::Seams::new(&seams, rudb_exec::registries());
                 explaining(
                     &plan,
@@ -4432,6 +4438,18 @@ fn explaining(
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, context, seams, measured, statistics);
     explained("analyzed_plan", &text)
+}
+
+/// What the compiled engine makes of a plan, for `EXPLAIN (CODEGEN)`: its stages and the QIR of
+/// every pipeline, or the refusal it would log.
+///
+/// A refusal is an answer here and not an error, because the question was what the compiled engine
+/// does with the query and refusing it is what it does.
+fn explained_codegen(plan: &Plan, cancel: &Cancel) -> Result<QueryResult> {
+    match rudb_qc::compile(plan, cancel) {
+        Ok(compiled) => explained("codegen", &compiled.explain()),
+        Err(refusal) => explained("codegen", &format!("refused: {refusal}")),
+    }
 }
 
 /// The two flags an `EXPLAIN` can carry, which are the whole of what the options change.
