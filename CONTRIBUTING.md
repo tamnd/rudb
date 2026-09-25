@@ -39,7 +39,7 @@ cargo test --workspace --all-features
 
 `cargo xtask bench <suite>` is that one. It builds rudb, builds the harness out of a `rudb-bench` checkout beside this repository or wherever `RUDB_BENCH_REPO` points, and runs the suite against every engine the machine has installed. It is one command because `spec/engine/13-measurement.md` section 13.8 asks for one command, on the grounds that a result which needs a sequence of steps is a result that gets reproduced once. It is not in the gate either, because it takes minutes and needs data and rival engines that a laptop does not have.
 
-The minimum supported Rust version check needs that toolchain installed, which is `rustup toolchain install 1.85.0 --profile minimal`. If it is not installed the task says so and continues rather than failing, because CI runs it either way and the point is to find out sooner, not to make a fresh clone unbuildable. It catches one thing that nothing else catches: a language feature newer than the floor, which does not announce itself, it just compiles on whatever toolchain is in front of you.
+The minimum supported Rust version check needs that toolchain installed, which is `rustup toolchain install 1.88.0 --profile minimal`. If it is not installed the task says so and continues rather than failing, because CI runs it either way and the point is to find out sooner, not to make a fresh clone unbuildable. It catches one thing that nothing else catches: a language feature newer than the floor, which does not announce itself, it just compiles on whatever toolchain is in front of you.
 
 ## What a change has to come with
 
