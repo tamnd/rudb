@@ -340,11 +340,11 @@ impl Shell {
     /// caret under the offending token.
     fn report(&mut self, problem: &Error, sql: &str) {
         let _ = writeln!(self.err, "{problem}");
-        if let Some(span) = problem.span() {
-            if let Some(text) = pointer(sql, span) {
-                let _ = writeln!(self.err);
-                let _ = write!(self.err, "{text}");
-            }
+        if let Some(span) = problem.span()
+            && let Some(text) = pointer(sql, span)
+        {
+            let _ = writeln!(self.err);
+            let _ = write!(self.err, "{text}");
         }
         let _ = self.err.flush();
     }

@@ -123,10 +123,10 @@ pub(crate) fn inner_joins(plan: &mut Plan, context: &Context) {
         let Some(keys) = equated_pair(plan, conditions) else {
             continue;
         };
-        if verified(plan, left, right, keys, context) {
-            if let Node::Join { kind, .. } = plan.node_mut(at) {
-                *kind = JoinKind::Inner;
-            }
+        if verified(plan, left, right, keys, context)
+            && let Node::Join { kind, .. } = plan.node_mut(at)
+        {
+            *kind = JoinKind::Inner;
         }
     }
 }

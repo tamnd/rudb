@@ -1397,10 +1397,11 @@ impl<'a> Binder<'a> {
                 // A column found by its second name is headed by that name, so `t.range` over
                 // `range(2) t` is a column called `range` on the pin while `SELECT *` calls it `t`.
                 let written = parts.last().copied().unwrap_or_default();
-                if let Some(also) = &found.also {
-                    if !same_name(&found.name, written) && same_name(also, written) {
-                        return also.clone();
-                    }
+                if let Some(also) = &found.also
+                    && !same_name(&found.name, written)
+                    && same_name(also, written)
+                {
+                    return also.clone();
                 }
                 return found.name.clone();
             }
@@ -1884,10 +1885,10 @@ impl<'a> Binder<'a> {
         for binding in read {
             if left.columns.iter().any(|column| column.binding == binding) {
                 here.push(binding);
-            } else if let Some(enclosing) = self.correlations.last_mut() {
-                if !enclosing.contains(&binding) {
-                    enclosing.push(binding);
-                }
+            } else if let Some(enclosing) = self.correlations.last_mut()
+                && !enclosing.contains(&binding)
+            {
+                enclosing.push(binding);
             }
         }
         // A table function is allowed to read the left the same as anything else here. There is
@@ -2186,13 +2187,14 @@ impl<'a> Binder<'a> {
         // built-in lives in. Anything else is a name that has to fail rather than fall through to
         // the unqualified lookup and be found somewhere it was not asked for.
         let function_name = *parts.last().unwrap_or(&"");
-        if let Some(schema) = parts.iter().rev().nth(1) {
-            if !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("system") {
-                return Err(Error::catalog(format!(
-                    "Table Function with name {} does not exist!",
-                    parts.join(".")
-                )));
-            }
+        if let Some(schema) = parts.iter().rev().nth(1)
+            && !schema.eq_ignore_ascii_case("main")
+            && !schema.eq_ignore_ascii_case("system")
+        {
+            return Err(Error::catalog(format!(
+                "Table Function with name {} does not exist!",
+                parts.join(".")
+            )));
         }
         // The name is looked up before the arguments are bound so that a call of something that is
         // not a table function says that, rather than reporting whatever is wrong with the
@@ -2273,21 +2275,21 @@ impl<'a> Binder<'a> {
                 // running it, which is the same reason the schema is settled here.
                 let paths = self.file_paths(cast[0], resolved.function.name())?;
                 let mut mirrorable = None;
-                if resolved.function == TableFunction::ReadParquet && !options.file_row_number {
-                    if let Some((path, stamp)) = mirror_target(&paths) {
-                        if let Some(name) =
-                            self.catalog.mirror(&path, options.binary_as_string, stamp)
-                        {
-                            let name = name.clone();
-                            let label = if alias == NONE {
-                                resolved.function.name().to_string()
-                            } else {
-                                ast.string(alias).to_string()
-                            };
-                            return self.bind_catalog_table(ast, &name, label, renamed);
-                        }
-                        mirrorable = Some(path);
+                if resolved.function == TableFunction::ReadParquet
+                    && !options.file_row_number
+                    && let Some((path, stamp)) = mirror_target(&paths)
+                {
+                    if let Some(name) = self.catalog.mirror(&path, options.binary_as_string, stamp)
+                    {
+                        let name = name.clone();
+                        let label = if alias == NONE {
+                            resolved.function.name().to_string()
+                        } else {
+                            ast.string(alias).to_string()
+                        };
+                        return self.bind_catalog_table(ast, &name, label, renamed);
                     }
+                    mirrorable = Some(path);
                 }
                 let copy_into = match columns {
                     Columns::Csv => self.copy_into.take(),
@@ -2715,14 +2717,14 @@ impl<'a> Binder<'a> {
             ast.string(alias).to_string()
         };
         let mut mirrorable = None;
-        if function == TableFunction::ReadParquet {
-            if let Some((canonical, stamp)) = mirror_target(&paths) {
-                if let Some(name) = self.catalog.mirror(&canonical, false, stamp) {
-                    let name = name.clone();
-                    return self.bind_catalog_table(ast, &name, label, columns);
-                }
-                mirrorable = Some(canonical);
+        if function == TableFunction::ReadParquet
+            && let Some((canonical, stamp)) = mirror_target(&paths)
+        {
+            if let Some(name) = self.catalog.mirror(&canonical, false, stamp) {
+                let name = name.clone();
+                return self.bind_catalog_table(ast, &name, label, columns);
             }
+            mirrorable = Some(canonical);
         }
         let read = match function {
             TableFunction::ReadParquet => {
@@ -3252,6 +3254,7 @@ impl<'a> Binder<'a> {
     ///
     /// An aggregate inside a lambda's body is computed over the rows and not over the elements,
     /// so its arguments cannot see the lambda's parameters. See `crate::lambda`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_aggregate(
         &mut self,
         ast: &Ast,

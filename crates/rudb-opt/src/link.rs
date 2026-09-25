@@ -714,10 +714,10 @@ fn worth_it(plan: &Plan, parent: NodeRef, kind: JoinKind, found: &Match, context
     // A parent nobody has counted is planned as one that does not fit, which is the answer that
     // stays right as a table grows: a hash join over a parent this pass declined is the plan that
     // ran before there were links at all.
-    if let Some(rows) = estimate::rows(plan, parent, context.facts()) {
-        if bytes(rows) <= sizes.cache_bytes {
-            return Why::Fits { rows, bytes: bytes(rows) };
-        }
+    if let Some(rows) = estimate::rows(plan, parent, context.facts())
+        && bytes(rows) <= sizes.cache_bytes
+    {
+        return Why::Fits { rows, bytes: bytes(rows) };
     }
     // The second bullet of section 6.4, which is the one this pass cannot ask yet: whether the
     // child is stored in the parent's row id order is a property of how the file was written and

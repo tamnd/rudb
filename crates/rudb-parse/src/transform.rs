@@ -4668,13 +4668,12 @@ impl<'a> Transform<'a> {
             return Ok(Target { expr, alias });
         }
         let expr = self.expr(self.first(inner))?;
-        if let Expr::Binary { op: BinaryOp::Eq, left, right } = self.ast.expr(expr) {
-            if let Expr::Column { name } = self.ast.expr(left) {
-                if name.len == 1 {
-                    let alias = self.ast.parts[name.start as usize];
-                    return Ok(Target { expr: right, alias });
-                }
-            }
+        if let Expr::Binary { op: BinaryOp::Eq, left, right } = self.ast.expr(expr)
+            && let Expr::Column { name } = self.ast.expr(left)
+            && name.len == 1
+        {
+            let alias = self.ast.parts[name.start as usize];
+            return Ok(Target { expr: right, alias });
         }
         Ok(Target { expr, alias: NONE })
     }
@@ -4951,12 +4950,12 @@ impl<'a> Transform<'a> {
             [prefix, b'\'', ..] => *prefix,
             _ => 0,
         };
-        if matches!(prefix, b'X' | b'x') {
-            if let Some(body) = token.get(1..).and_then(quoted_body) {
-                let text = blob_text(body.as_bytes())?;
-                let text = self.intern(&text);
-                return Ok(self.push(Expr::Literal { kind: LiteralKind::Blob, text }));
-            }
+        if matches!(prefix, b'X' | b'x')
+            && let Some(body) = token.get(1..).and_then(quoted_body)
+        {
+            let text = blob_text(body.as_bytes())?;
+            let text = self.intern(&text);
+            return Ok(self.push(Expr::Literal { kind: LiteralKind::Blob, text }));
         }
         let value = self.string_value(node)?;
         let text = self.intern(&value);
@@ -5120,7 +5119,7 @@ fn string_token(text: &str) -> Result<String> {
 /// one step later. Doing the same thing gives both messages in the same words. The pairs are bytes
 /// and not characters: `x'éé'` is four bytes and so two pairs, which is how upstream counts them.
 fn blob_text(body: &[u8]) -> Result<String> {
-    if body.len() % 2 != 0 {
+    if !body.len().is_multiple_of(2) {
         return Err(Error::parser("Hex string literal must have an even number of hex digits"));
     }
     let digit = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);

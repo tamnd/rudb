@@ -186,11 +186,11 @@ fn intersection(left: Vec<Vec<Value>>, right: &RowMap<usize>) -> Vec<Vec<Value>>
     let mut budget = right.clone();
     let mut out = Vec::new();
     for row in left {
-        if let Some(remaining) = budget.get_mut(&Key(row.clone())) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                out.push(row);
-            }
+        if let Some(remaining) = budget.get_mut(&Key(row.clone()))
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            out.push(row);
         }
     }
     out

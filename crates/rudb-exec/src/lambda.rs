@@ -392,12 +392,11 @@ impl Lambda {
 /// accumulator type. The reads say which, and a parameter nobody reads keeps the default it came in
 /// with, since then its type is never looked at.
 fn read_types(plan: &Plan, expr: ExprRef, table: u32, types: &mut [LogicalType]) {
-    if let Expr::LambdaParam(binding) = *plan.expr(expr) {
-        if binding.table == table {
-            if let Some(slot) = types.get_mut(binding.column as usize) {
-                *slot = plan.expr_type(expr).clone();
-            }
-        }
+    if let Expr::LambdaParam(binding) = *plan.expr(expr)
+        && binding.table == table
+        && let Some(slot) = types.get_mut(binding.column as usize)
+    {
+        *slot = plan.expr_type(expr).clone();
     }
     plan.for_each_operand(expr, &mut |operand| read_types(plan, operand, table, types));
 }

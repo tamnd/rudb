@@ -313,11 +313,9 @@ impl Shape {
                 self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline });
                 if let Some(&(_, filled)) =
                     self.holding.iter().rev().find(|&&(held, _)| held == cte)
-                {
-                    if !self.waits[pipeline as usize].contains(&filled) {
+                    && !self.waits[pipeline as usize].contains(&filled) {
                         self.waits_on(pipeline, filled);
                     }
-                }
             }
             // Every relation is a pipeline of its own ending in the node, which is the sink of all
             // of them and then the source of the one row it answers with. A relation's pipeline

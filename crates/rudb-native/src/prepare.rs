@@ -1473,12 +1473,13 @@ mod tests {
     /// `city` repeats a handful of values and has a null every so often, which keeps its dictionary.
     /// `note` is different on every row but its nulls, which loses it on the first stripe.
     fn row(id: usize) -> [Value; 3] {
-        let city = if id % 11 == 0 {
+        let city = if id.is_multiple_of(11) {
             Value::Null
         } else {
             Value::Varchar(format!("city {}", (id / 7) % 13))
         };
-        let note = if id % 17 == 0 { Value::Null } else { Value::Varchar(format!("note {id}")) };
+        let note =
+            if id.is_multiple_of(17) { Value::Null } else { Value::Varchar(format!("note {id}")) };
         [Value::BigInt(id as i64), city, note]
     }
 
@@ -1811,7 +1812,7 @@ mod tests {
     /// throughout.
     fn turning(id: usize) -> [Value; 3] {
         let url = match id {
-            _ if id % 13 == 0 => Value::Null,
+            _ if id.is_multiple_of(13) => Value::Null,
             _ if id < 5 * PART => Value::Varchar(format!("https://example.com/{}", id % 20)),
             _ => Value::Varchar(format!("https://example.com/page/{id}")),
         };

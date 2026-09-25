@@ -342,16 +342,16 @@ fn crossings(name: &str, text: &str, methods: &[String]) -> (Vec<String>, usize)
             || declares(&lines, at, MARKER);
         let crossed = crosses(&body, methods);
         let looped = body.lines().any(is_row_loop);
-        if let Some(crossed) = crossed {
-            if looped {
-                if marked {
-                    declared += 1;
-                } else {
-                    problems.push(format!(
-                        "{name}:{}: this function loops over rows and crosses a seam at {crossed}",
-                        at + 1
-                    ));
-                }
+        if let Some(crossed) = crossed
+            && looped
+        {
+            if marked {
+                declared += 1;
+            } else {
+                problems.push(format!(
+                    "{name}:{}: this function loops over rows and crosses a seam at {crossed}",
+                    at + 1
+                ));
             }
         }
         at = ends;

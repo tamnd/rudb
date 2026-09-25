@@ -1147,18 +1147,18 @@ fn create_index(
     for &expr in ast.expr_list(written.elements) {
         if let ast::Expr::Column { name: column } = ast.exprs[expr as usize] {
             let column: Vec<&str> = ast.name(column).collect();
-            if let [only] = column[..] {
-                if !fields.iter().any(|field| same_name(&field.name, only)) {
-                    let names: Vec<String> =
-                        fields.iter().map(|field| format!("\"{}\"", field.name)).collect();
-                    // The stray colon is the pin's.
-                    return Err(Error::binder(format!(
-                        "Table \"{}\" does not have a column named \"{only}\"\n\nCandidate bindings: \
+            if let [only] = column[..]
+                && !fields.iter().any(|field| same_name(&field.name, only))
+            {
+                let names: Vec<String> =
+                    fields.iter().map(|field| format!("\"{}\"", field.name)).collect();
+                // The stray colon is the pin's.
+                return Err(Error::binder(format!(
+                    "Table \"{}\" does not have a column named \"{only}\"\n\nCandidate bindings: \
                          : {}",
-                        name.table,
-                        names.join(", ")
-                    )));
-                }
+                    name.table,
+                    names.join(", ")
+                )));
             }
         }
         if crate::expr::has_aggregate(ast, expr) {
@@ -1309,10 +1309,10 @@ fn columns_in(text: &str) -> Result<Vec<String>> {
     let (ast, _) = check_ast(text)?;
     let mut out = Vec::new();
     for expr in &ast.exprs {
-        if let ast::Expr::Column { name } = *expr {
-            if let Some(last) = ast.name(name).last() {
-                out.push(last.to_string());
-            }
+        if let ast::Expr::Column { name } = *expr
+            && let Some(last) = ast.name(name).last()
+        {
+            out.push(last.to_string());
         }
     }
     Ok(out)

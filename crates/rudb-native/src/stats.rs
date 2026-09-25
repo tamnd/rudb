@@ -871,15 +871,15 @@ impl Pass {
         self.bounded &= later.bounded;
         self.bytes = self.bytes.saturating_add(later.bytes);
         self.widest = self.widest.max(later.widest);
-        if let Some(low) = later.low {
-            if takes(&self.low, &low, Ordering::Less) {
-                self.low = Some(low);
-            }
+        if let Some(low) = later.low
+            && takes(&self.low, &low, Ordering::Less)
+        {
+            self.low = Some(low);
         }
-        if let Some(high) = later.high {
-            if takes(&self.high, &high, Ordering::Greater) {
-                self.high = Some(high);
-            }
+        if let Some(high) = later.high
+            && takes(&self.high, &high, Ordering::Greater)
+        {
+            self.high = Some(high);
         }
         self.stripes.extend(later.stripes);
         self.pieces.extend(later.pieces);

@@ -519,7 +519,7 @@ fn walk_checksummed(
     window: usize,
     mut each: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<u64> {
-    debug_assert!(window % 32 == 0 && window > 0, "a window is whole blocks of the hash");
+    debug_assert!(window.is_multiple_of(32) && window > 0, "a window is whole blocks of the hash");
     if length < 32 {
         let mut bytes = vec![0; length];
         read_at(file, offset, &mut bytes)?;
@@ -1635,12 +1635,11 @@ impl GlobalDictionary {
             if self.checks.get(code as usize) == Some(&check) {
                 return Ok(code);
             }
-            if let Some(codes) = self.collisions.get(&hash) {
-                if let Some(code) =
+            if let Some(codes) = self.collisions.get(&hash)
+                && let Some(code) =
                     codes.iter().copied().find(|&code| self.checks[code as usize] == check)
-                {
-                    return Ok(code);
-                }
+            {
+                return Ok(code);
             }
             let code = self.insert(text, check)?;
             self.collisions.entry(hash).or_default().push(code);
@@ -1664,7 +1663,7 @@ impl GlobalDictionary {
         );
         self.checks.push(check);
         self.counts.push(0);
-        if self.ends.len() % TEXT_PAYLOAD_VALUES == 0 {
+        if self.ends.len().is_multiple_of(TEXT_PAYLOAD_VALUES) {
             self.seal();
         }
         Ok(code)
@@ -1678,7 +1677,7 @@ impl GlobalDictionary {
     fn seal(&mut self) {
         let at = self.ends.len().div_ceil(TEXT_PAYLOAD_VALUES) - 1;
         let bytes = std::mem::take(&mut self.filling);
-        if at % self.stride == 0 {
+        if at.is_multiple_of(self.stride) {
             self.sample.push((at, bytes.clone()));
             if self.sample.len() > PAYLOAD_SAMPLE_BLOCKS {
                 self.stride *= 2;
@@ -1785,7 +1784,7 @@ impl GlobalDictionary {
         // Asked of the values rather than of the bytes, because a block of empty strings has values
         // in it and no bytes, and a column of nulls is exactly that. A demoted dictionary sealed its
         // part block when it was demoted and has taken nothing since.
-        if !self.demoted && self.ends.len() % TEXT_PAYLOAD_VALUES != 0 {
+        if !self.demoted && !self.ends.len().is_multiple_of(TEXT_PAYLOAD_VALUES) {
             self.seal();
         }
     }
@@ -1921,7 +1920,8 @@ impl GlobalDictionary {
         let Some(&base) = bases.get(code / TEXT_PAYLOAD_VALUES) else { return (0, 0) };
         let Some(&end) = ends.get(code) else { return (0, 0) };
         let base = base as usize;
-        let from = if code % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[code - 1] as usize };
+        let from =
+            if code.is_multiple_of(TEXT_PAYLOAD_VALUES) { 0 } else { ends[code - 1] as usize };
         (base + from, base + end as usize)
     }
 
@@ -4517,10 +4517,10 @@ impl PagePool {
         }
         for (shelf, entry) in gone {
             let Ok(mut cached) = shelf.columns[entry.column].lock() else { continue };
-            if let Some(slot) = cached.pages.get_mut(entry.stripe) {
-                if slot.as_ref().is_some_and(|slot| Arc::ptr_eq(&slot.used, &entry.used)) {
-                    *slot = None;
-                }
+            if let Some(slot) = cached.pages.get_mut(entry.stripe)
+                && slot.as_ref().is_some_and(|slot| Arc::ptr_eq(&slot.used, &entry.used))
+            {
+                *slot = None;
             }
         }
     }
@@ -5213,7 +5213,7 @@ impl NativeText {
     /// Where the value at `index` starts inside its payload block, which is where the value before
     /// it ended unless it is the first of the block.
     fn start_within(&self, index: usize) -> Result<u32> {
-        if index % TEXT_PAYLOAD_VALUES == 0 { Ok(0) } else { self.end_within(index - 1) }
+        if index.is_multiple_of(TEXT_PAYLOAD_VALUES) { Ok(0) } else { self.end_within(index - 1) }
     }
 
     /// Where the value at `index` starts and ends inside its payload block.
@@ -5229,7 +5229,7 @@ impl NativeText {
                 *ends.get(index).ok_or_else(|| invalid("global dictionary offsets are short"))?;
             // The value before it in the same block, and zero where there is no value before it.
             // `index` is inside the table, so the one under it is too.
-            let start = if index % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[index - 1] };
+            let start = if index.is_multiple_of(TEXT_PAYLOAD_VALUES) { 0 } else { ends[index - 1] };
             if start > end {
                 return Err(invalid("global dictionary value ends before it starts"));
             }
@@ -5451,7 +5451,7 @@ impl TextSource for NativeText {
                 into.push(0);
                 continue;
             };
-            let start = if index % TEXT_PAYLOAD_VALUES == 0 { 0 } else { ends[index - 1] };
+            let start = if index.is_multiple_of(TEXT_PAYLOAD_VALUES) { 0 } else { ends[index - 1] };
             if start > end {
                 return Err(invalid("global dictionary value ends before it starts"));
             }
@@ -5847,10 +5847,10 @@ fn touch(bits: &mut Vec<u64>, part: usize, parts: usize) -> (bool, bool) {
 /// The index goes in its own slot and stays. Only the page is under the budget, and the pool is
 /// what enforces it, once the caller has let go of the column's lock.
 fn remember(cached: &mut Cached, held: &CachedColumn) -> Option<(usize, Arc<AtomicBool>)> {
-    if let Some(slot) = cached.index.get_mut(held.stripe) {
-        if slot.is_none() {
-            *slot = Some(Arc::clone(&held.index));
-        }
+    if let Some(slot) = cached.index.get_mut(held.stripe)
+        && slot.is_none()
+    {
+        *slot = Some(Arc::clone(&held.index));
     }
     let page = held.page.clone()?;
     let slot = cached.pages.get_mut(held.stripe)?;
@@ -7169,7 +7169,7 @@ impl Reader {
     /// The whole stripe page each column lives in is read and kept once a scan has been through the
     /// stripe before, because a session that scans a table again asks for the parts of a stripe one
     /// after another and this is what turns sixty four reads into one. The first time through, the
-    /// part is read alone. See [`Cached`].
+    /// part is read alone. See `Cached`.
     ///
     /// # Errors
     ///
@@ -7463,10 +7463,10 @@ impl Reader {
             _ => (false, false),
         };
         let whole = whole && again;
-        if let Some(index) = known.clone() {
-            if !whole || page.is_some() {
-                return Ok(CachedColumn { stripe: at, index, page });
-            }
+        if let Some(index) = known.clone()
+            && (!whole || page.is_some())
+        {
+            return Ok(CachedColumn { stripe: at, index, page });
         }
         if cached.loading.contains(&at) {
             drop(cached);

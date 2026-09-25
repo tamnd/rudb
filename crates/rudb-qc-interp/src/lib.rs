@@ -247,7 +247,7 @@ fn lower(f: &Func) -> Code {
                     let n = o[2] as usize;
                     let dm = moves(&mut code, o[1], &o[3..3 + n]);
                     let cstart = code.cases.len() as u32;
-                    for pair in o[3 + n..].chunks_exact(2) {
+                    for pair in o[3 + n..].as_chunks::<2>().0 {
                         code.cases.push((u128::from(pair[0]), pair[1]));
                     }
                     let cases = Span { start: cstart, len: code.cases.len() as u32 - cstart };

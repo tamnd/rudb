@@ -830,10 +830,10 @@ fn one_link(
 /// Kept, it would be refused by the budget and take the link down with it. Built here, it costs one
 /// read of two parent columns per checkpoint, which is less than the child scan beside it.
 fn parent_map(parent: &Reader, edge: &Edge) -> std::result::Result<KeyMap, String> {
-    if columns_of(edge.parent_column).len() == 1 {
-        if let Some(stored) = key_map(parent, edge.parent_column) {
-            return Ok(stored);
-        }
+    if columns_of(edge.parent_column).len() == 1
+        && let Some(stored) = key_map(parent, edge.parent_column)
+    {
+        return Ok(stored);
     }
     KeyColumn::new(parent, edge.parent_column)
         .and_then(|keys| KeyMap::build_from(&keys))

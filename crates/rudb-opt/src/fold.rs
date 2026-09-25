@@ -298,10 +298,10 @@ fn simplify(plan: &mut Plan, expr: ExprRef) -> ExprRef {
     if matches!(*plan.expr(expr), Expr::Constant(_)) {
         return expr;
     }
-    if let Some(value) = fold(plan, expr) {
-        if let Some(folded) = constant_of(plan, expr, value) {
-            return folded;
-        }
+    if let Some(value) = fold(plan, expr)
+        && let Some(folded) = constant_of(plan, expr, value)
+    {
+        return folded;
     }
     if let Some(widened) = widened_negation(plan, expr) {
         return widened;

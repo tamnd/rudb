@@ -47,20 +47,20 @@ impl Pattern {
         if plain(spelling) {
             return Pattern::Exact(spelling.as_bytes().to_vec());
         }
-        if let Some(inner) = spelling.strip_prefix('%').and_then(|rest| rest.strip_suffix('%')) {
-            if plain(inner) {
-                return Pattern::Contains(Box::new(memmem::Finder::new(inner).into_owned()));
-            }
+        if let Some(inner) = spelling.strip_prefix('%').and_then(|rest| rest.strip_suffix('%'))
+            && plain(inner)
+        {
+            return Pattern::Contains(Box::new(memmem::Finder::new(inner).into_owned()));
         }
-        if let Some(rest) = spelling.strip_prefix('%') {
-            if plain(rest) {
-                return Pattern::Suffix(rest.as_bytes().to_vec());
-            }
+        if let Some(rest) = spelling.strip_prefix('%')
+            && plain(rest)
+        {
+            return Pattern::Suffix(rest.as_bytes().to_vec());
         }
-        if let Some(head) = spelling.strip_suffix('%') {
-            if plain(head) {
-                return Pattern::Prefix(head.as_bytes().to_vec());
-            }
+        if let Some(head) = spelling.strip_suffix('%')
+            && plain(head)
+        {
+            return Pattern::Prefix(head.as_bytes().to_vec());
         }
         if !spelling.contains('_') {
             let mut pieces: Vec<&str> = spelling.split('%').collect();

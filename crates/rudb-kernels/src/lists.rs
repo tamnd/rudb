@@ -170,7 +170,8 @@ fn series_length(start: i64, stop: i64, step: i64, inclusive: bool) -> Result<us
     let apart = stop.abs_diff(start);
     let by = step.unsigned_abs();
     // A step of one is nearly every series written, and it needs no division at all.
-    let (whole, over) = if by == 1 { (apart, false) } else { (apart / by, apart % by != 0) };
+    let (whole, over) =
+        if by == 1 { (apart, false) } else { (apart / by, !apart.is_multiple_of(by)) };
     let count = u128::from(whole) + u128::from(inclusive || over);
     usize::try_from(count).ok().filter(|&count| count <= MAX_SERIES).ok_or_else(too_long)
 }
@@ -662,10 +663,10 @@ fn series<V: AsRef<Vector>>(
     returns: &LogicalType,
     rows: usize,
 ) -> Result<Option<Vector>> {
-    if let [start, stop, step] = args {
-        if step.as_ref().logical_type() == &LogicalType::Interval {
-            return timed(inclusive, [start.as_ref(), stop.as_ref(), step.as_ref()], returns, rows);
-        }
+    if let [start, stop, step] = args
+        && step.as_ref().logical_type() == &LogicalType::Interval
+    {
+        return timed(inclusive, [start.as_ref(), stop.as_ref(), step.as_ref()], returns, rows);
     }
     if args.iter().any(|arg| arg.as_ref().logical_type() != &LogicalType::BigInt) {
         return Ok(None);

@@ -461,10 +461,10 @@ impl Table {
             return;
         }
         if self.buckets.len() <= HOT {
-            if let [column] = keys {
-                if self.hot_one(hashes, column, rows, slots, walk) {
-                    return;
-                }
+            if let [column] = keys
+                && self.hot_one(hashes, column, rows, slots, walk)
+            {
+                return;
             }
             for (out, found) in slots.iter_mut().enumerate().take(rows.len()) {
                 let row = rows.at(out);
@@ -1862,23 +1862,22 @@ fn places_of(key: &Vector, rows: usize, room: usize) -> Option<(Places<'_>, usiz
     // every chunk, because each filtered chunk points at a payload of its own and a map held by the
     // payload's identity cannot outlive it. Read this way the span is the width's, which is
     // sixteen, and the map's identity is the page's, so the chunk after this one reuses it.
-    if let Some((at, values)) = key.dictionary_parts() {
-        if let Some(packed) = values.packed_parts() {
-            // No code here needs checking against the payload. A dictionary vector is range checked
-            // when it is built and nothing changes its codes after, so the check that used to sit
-            // here was a second pass over every row of a chunk to learn what was already known.
-            let at = at.get(..rows)?;
-            let span = 1_usize.checked_shl(packed.width())?.checked_add(1)?;
-            if span > room {
-                return None;
-            }
-            // A packed run keeps its nulls in the vector's own validity, and a row here reads that
-            // vector at the code rather than at the row, so the question is whether the page has a
-            // null anywhere in it rather than whether this chunk does.
-            let nullable =
-                key.validity().has_nulls(rows) || values.validity().has_nulls(values.len());
-            return Some((Places::CodedBits { at, packed }, span, nullable));
+    if let Some((at, values)) = key.dictionary_parts()
+        && let Some(packed) = values.packed_parts()
+    {
+        // No code here needs checking against the payload. A dictionary vector is range checked
+        // when it is built and nothing changes its codes after, so the check that used to sit
+        // here was a second pass over every row of a chunk to learn what was already known.
+        let at = at.get(..rows)?;
+        let span = 1_usize.checked_shl(packed.width())?.checked_add(1)?;
+        if span > room {
+            return None;
         }
+        // A packed run keeps its nulls in the vector's own validity, and a row here reads that
+        // vector at the code rather than at the row, so the question is whether the page has a
+        // null anywhere in it rather than whether this chunk does.
+        let nullable = key.validity().has_nulls(rows) || values.validity().has_nulls(values.len());
+        return Some((Places::CodedBits { at, packed }, span, nullable));
     }
     if let Some((codes, values)) = key.shared_dictionary_parts() {
         let codes = codes.get(..rows)?;
@@ -2100,18 +2099,16 @@ impl Column {
     /// check and a push and a `VARCHAR` key costs a copy of its bytes. Everything else builds a
     /// value, which is what all of this used to do.
     fn push_from(&mut self, column: &Vector, row: usize) -> Result<u64> {
-        if matches!(&self.data, StoredData::Varchar(values) if values.ends.is_empty()) {
-            if let Some((codes, dictionary)) = column.stable_dictionary_parts() {
-                let code = *codes
-                    .get(row)
-                    .ok_or_else(|| Error::internal("a stable dictionary row is missing"))?;
-                self.data = StoredData::StableText {
-                    dictionary: Arc::clone(dictionary),
-                    codes: vec![code],
-                };
-                self.valid.push(!column.is_null_at(row));
-                return Ok(0);
-            }
+        if matches!(&self.data, StoredData::Varchar(values) if values.ends.is_empty())
+            && let Some((codes, dictionary)) = column.stable_dictionary_parts()
+        {
+            let code = *codes
+                .get(row)
+                .ok_or_else(|| Error::internal("a stable dictionary row is missing"))?;
+            self.data =
+                StoredData::StableText { dictionary: Arc::clone(dictionary), codes: vec![code] };
+            self.valid.push(!column.is_null_at(row));
+            return Ok(0);
         }
         if column.is_null_at(row) {
             // A null does not end a run. Both sides keep their nulls in the validity beside the
@@ -2120,17 +2117,16 @@ impl Column {
             // because everything that reads a slot asks the validity first, but it still has to be
             // a code the dictionary has, since the vector handed back at the end is built from the
             // whole run at once and a code past the end of a dictionary is refused there.
-            if let StoredData::StableText { dictionary, codes } = &mut self.data {
-                if let Some((incoming, values)) = column.stable_dictionary_parts() {
-                    if Arc::ptr_eq(dictionary, values) {
-                        let code = *incoming
-                            .get(row)
-                            .ok_or_else(|| Error::internal("a stable dictionary row is missing"))?;
-                        codes.push(code);
-                        self.valid.push(false);
-                        return Ok(0);
-                    }
-                }
+            if let StoredData::StableText { dictionary, codes } = &mut self.data
+                && let Some((incoming, values)) = column.stable_dictionary_parts()
+                && Arc::ptr_eq(dictionary, values)
+            {
+                let code = *incoming
+                    .get(row)
+                    .ok_or_else(|| Error::internal("a stable dictionary row is missing"))?;
+                codes.push(code);
+                self.valid.push(false);
+                return Ok(0);
             }
             return self.push(Value::Null).map(|()| 0);
         }
@@ -2275,25 +2271,22 @@ impl Column {
     /// falls through to `holds` a row at a time, exactly as it did before.
     fn holds_run(&self, here: &[Step], seen: &[u64], column: &Vector, same: &mut [bool]) {
         let validity = column.validity();
-        if let StoredData::StableText { dictionary, codes: stored } = &self.data {
-            if let Some((values, incoming)) = column.stable_dictionary_parts() {
-                if Arc::ptr_eq(dictionary, incoming) {
-                    for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
-                        if !*flag {
-                            continue;
-                        }
-                        let slot = slot_of(bucket) as usize;
-                        *flag = match values.get(step.row) {
-                            _ if !self.valid[slot] => !validity.is_valid(step.row),
-                            Some(code) => {
-                                validity.is_valid(step.row) && Some(code) == stored.get(slot)
-                            }
-                            None => false,
-                        };
-                    }
-                    return;
+        if let StoredData::StableText { dictionary, codes: stored } = &self.data
+            && let Some((values, incoming)) = column.stable_dictionary_parts()
+            && Arc::ptr_eq(dictionary, incoming)
+        {
+            for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
+                if !*flag {
+                    continue;
                 }
+                let slot = slot_of(bucket) as usize;
+                *flag = match values.get(step.row) {
+                    _ if !self.valid[slot] => !validity.is_valid(step.row),
+                    Some(code) => validity.is_valid(step.row) && Some(code) == stored.get(slot),
+                    None => false,
+                };
             }
+            return;
         }
         // A packed run, either the column's own or one a dictionary points into. Neither has `Data`
         // for the match below to index, so before this both of them went to [`Self::holds`] a row at
@@ -2331,8 +2324,8 @@ impl Column {
                 }
             }
         }
-        if let Some(data) = column.data() {
-            if self.flat_run(
+        if let Some(data) = column.data()
+            && self.flat_run(
                 here,
                 seen,
                 same,
@@ -2340,9 +2333,9 @@ impl Column {
                 data,
                 |row| !validity.is_valid(row),
                 |row| row,
-            ) {
-                return;
-            }
+            )
+        {
+            return;
         }
         for ((step, &bucket), flag) in here.iter().zip(seen).zip(same.iter_mut()) {
             if *flag {
@@ -2830,23 +2823,23 @@ pub(crate) enum Across {
 pub(crate) fn hash(keys: &[Vector], rows: usize, hashes: &mut Vec<u64>, across: Across) {
     hashes.clear();
     hashes.resize(rows, 0);
-    if let ([column], Across::OneInput) = (keys, across) {
-        if let Some((codes, _)) = column.stable_dictionary_parts() {
-            let validity = column.validity();
-            // Two runs side by side when the column has no null in it, which is most columns, so
-            // the row is a load, a mix and a spread and not a validity read and a branch as well.
-            if let (false, Some(codes)) = (validity.has_nulls(rows), codes.get(..rows)) {
-                for (state, &code) in hashes.iter_mut().zip(codes) {
-                    *state = spread(mix(0, u64::from(code)));
-                }
-                return;
-            }
-            for (row, state) in hashes.iter_mut().enumerate() {
-                let word = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
-                *state = spread(mix(0, word));
+    if let ([column], Across::OneInput) = (keys, across)
+        && let Some((codes, _)) = column.stable_dictionary_parts()
+    {
+        let validity = column.validity();
+        // Two runs side by side when the column has no null in it, which is most columns, so
+        // the row is a load, a mix and a spread and not a validity read and a branch as well.
+        if let (false, Some(codes)) = (validity.has_nulls(rows), codes.get(..rows)) {
+            for (state, &code) in hashes.iter_mut().zip(codes) {
+                *state = spread(mix(0, u64::from(code)));
             }
             return;
         }
+        for (row, state) in hashes.iter_mut().enumerate() {
+            let word = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
+            *state = spread(mix(0, word));
+        }
+        return;
     }
     // The spread is folded into the last column's pass rather than made into a pass of its own.
     // It used to be a second walk of the whole run, which is a load, five operations and a store a
@@ -2994,23 +2987,23 @@ fn narrow(same: &mut [bool], validity: &rudb_vector::Validity, equal: impl Fn(us
 /// up to, which is what makes a day and twenty four hours one group.
 fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish: bool) {
     let validity = column.validity();
-    if across == Across::OneInput {
-        if let Some((codes, _)) = column.stable_dictionary_parts() {
-            // The same two runs side by side as in [`hash`], for the same reason.
-            if let (false, Some(codes), Some(hashes)) =
-                (validity.has_nulls(rows), codes.get(..rows), hashes.get_mut(..rows))
-            {
-                for (state, &code) in hashes.iter_mut().zip(codes) {
-                    *state = end(mix(*state, u64::from(code)), finish);
-                }
-                return;
-            }
-            for (row, state) in hashes.iter_mut().enumerate().take(rows) {
-                let one = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
-                *state = end(mix(*state, one), finish);
+    if across == Across::OneInput
+        && let Some((codes, _)) = column.stable_dictionary_parts()
+    {
+        // The same two runs side by side as in [`hash`], for the same reason.
+        if let (false, Some(codes), Some(hashes)) =
+            (validity.has_nulls(rows), codes.get(..rows), hashes.get_mut(..rows))
+        {
+            for (state, &code) in hashes.iter_mut().zip(codes) {
+                *state = end(mix(*state, u64::from(code)), finish);
             }
             return;
         }
+        for (row, state) in hashes.iter_mut().enumerate().take(rows) {
+            let one = if validity.is_valid(row) { u64::from(codes[row]) } else { NOTHING };
+            *state = end(mix(*state, one), finish);
+        }
+        return;
     }
     // What the unpacked integer is read as, decided once for the column rather than once for every
     // row of it. The match was inside the loop, which made a pass over a packed column a logical
@@ -3039,12 +3032,12 @@ fn fold(column: &Vector, rows: usize, hashes: &mut [u64], across: Across, finish
         });
         return;
     }
-    if let Some(data) = column.data() {
-        if fold_data(data, rows, hashes, straight.then_some(Reads::Own), finish, |row| {
+    if let Some(data) = column.data()
+        && fold_data(data, rows, hashes, straight.then_some(Reads::Own), finish, |row| {
             validity.is_valid(row).then_some(row)
-        }) {
-            return;
-        }
+        })
+    {
+        return;
     }
     // The same pass with one indirection in it, for a dictionary or a run length column. Without it
     // a dictionary of `BIGINT`, which is what the Parquet reader hands back for a join key the

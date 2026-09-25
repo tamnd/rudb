@@ -40,10 +40,16 @@ fn fields() -> Vec<Field> {
 
 /// The value of every column of row `row`, which is what the load writes and the check expects.
 fn row(row: usize) -> [Value; 3] {
-    let name =
-        if row % 11 == 0 { Value::Null } else { Value::Varchar(format!("name {}", row % 37)) };
-    let score =
-        if row % 13 == 0 { Value::Null } else { Value::Integer((row as i32 * 7) % 1000 - 500) };
+    let name = if row.is_multiple_of(11) {
+        Value::Null
+    } else {
+        Value::Varchar(format!("name {}", row % 37))
+    };
+    let score = if row.is_multiple_of(13) {
+        Value::Null
+    } else {
+        Value::Integer((row as i32 * 7) % 1000 - 500)
+    };
     [Value::BigInt(row as i64), name, score]
 }
 

@@ -2251,10 +2251,9 @@ fn numeric_order(left: &Value, right: &Value) -> Result<Ordering> {
         Value::Decimal { unscaled: a, scale: sa, .. },
         Value::Decimal { unscaled: b, scale: sb, .. },
     ) = (left, right)
+        && sa == sb
     {
-        if sa == sb {
-            return Ok(a.cmp(b));
-        }
+        return Ok(a.cmp(b));
     }
     match (approximate(left), approximate(right)) {
         (Some(a), Some(b)) => Ok(float_order(a, b)),

@@ -2852,10 +2852,8 @@ impl Shared {
                 rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented
             )
         });
-        if aborts {
-            if let Some(open) = self.open().as_mut() {
-                open.aborted = true;
-            }
+        if aborts && let Some(open) = self.open().as_mut() {
+            open.aborted = true;
         }
         result
     }
@@ -3418,14 +3416,14 @@ impl Shared {
                 | Bound::Index(_)
                 | Bound::Insert(_)
         );
-        if let Some((kind, database)) = written_database(&bound) {
-            if let Some(held) = catalog.attached(database).filter(|held| held.read_only()) {
-                return Err(Error::invalid_input(format!(
-                    "Cannot execute statement of type \"{kind}\" on database \"{}\" which is \
+        if let Some((kind, database)) = written_database(&bound)
+            && let Some(held) = catalog.attached(database).filter(|held| held.read_only())
+        {
+            return Err(Error::invalid_input(format!(
+                "Cannot execute statement of type \"{kind}\" on database \"{}\" which is \
                      attached in read-only mode!",
-                    held.name()
-                )));
-            }
+                held.name()
+            )));
         }
         if writes && self.open().as_ref().is_some_and(|open| open.read_only) {
             return Err(Error::transaction(format!(

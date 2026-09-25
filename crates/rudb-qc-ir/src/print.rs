@@ -164,8 +164,12 @@ impl Printer<'_> {
             }
             Form::Switch => {
                 let n = o[2] as usize;
-                let cases: Vec<String> =
-                    o[3 + n..].chunks_exact(2).map(|c| format!("{}: b{}", c[0], c[1])).collect();
+                let cases: Vec<String> = o[3 + n..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| format!("{}: b{}", c[0], c[1]))
+                    .collect();
                 format!(
                     "{op} {ty} {}, {}, [{}]",
                     self.val(Val(o[0])),

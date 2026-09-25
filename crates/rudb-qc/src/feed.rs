@@ -101,16 +101,16 @@ impl<'a> Feed<'a> {
         let header = StateHeader::new(state.as_ptr().cast());
         // SAFETY: the first line of the state is 64 bytes aligned to 64, which is the header.
         unsafe { state.as_mut_ptr().cast::<StateHeader>().write(header) };
-        if let Out::Aggregate(g) = &body.sink {
-            if let Some(at) = g.row {
-                // The one group of an aggregate with no groups was made with the table, and rows
-                // never move, so its address is written once.
-                let table = rt.table(g.table).ok_or_else(|| {
-                    Error::internal("the aggregate's table is not in the runtime")
-                })?;
-                let row = table.address(0) as u64;
-                bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
-            }
+        if let Out::Aggregate(g) = &body.sink
+            && let Some(at) = g.row
+        {
+            // The one group of an aggregate with no groups was made with the table, and rows
+            // never move, so its address is written once.
+            let table = rt
+                .table(g.table)
+                .ok_or_else(|| Error::internal("the aggregate's table is not in the runtime"))?;
+            let row = table.address(0) as u64;
+            bytes(&mut state)[at as usize..at as usize + 8].copy_from_slice(&row.to_le_bytes());
         }
         for probe in &body.probes {
             // The build ran and was finalized before this pipeline started, and its table does

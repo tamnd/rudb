@@ -63,7 +63,7 @@ fn answer(regex: bool, args: &[Value]) -> Result<Value> {
 
 /// The pieces of `text`, where `find` gives the start and end of the first separator in what it is
 /// handed, or `None` when there is none left.
-fn cut<'t>(text: &'t str, mut find: impl FnMut(&str) -> Option<(usize, usize)>) -> Vec<&'t str> {
+fn cut(text: &str, mut find: impl FnMut(&str) -> Option<(usize, usize)>) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {

@@ -538,11 +538,12 @@ impl Parser {
                 break;
             }
             first = false;
-            if ch == '[' && self.ahead(1) == Some(':') {
-                if let Some(ranges) = self.posix()? {
-                    class.ranges.extend(ranges);
-                    continue;
-                }
+            if ch == '['
+                && self.ahead(1) == Some(':')
+                && let Some(ranges) = self.posix()?
+            {
+                class.ranges.extend(ranges);
+                continue;
             }
             match self.class_item(from)? {
                 Item::Set(ranges) => class.ranges.extend(ranges),
@@ -670,10 +671,10 @@ fn complement(ranges: &[(char, char)]) -> Vec<(char, char)> {
     let mut next = 0u32;
     for (low, high) in sorted {
         let low = low as u32;
-        if low > next {
-            if let (Some(from), Some(to)) = (char::from_u32(next), char::from_u32(low - 1)) {
-                out.push((from, to));
-            }
+        if low > next
+            && let (Some(from), Some(to)) = (char::from_u32(next), char::from_u32(low - 1))
+        {
+            out.push((from, to));
         }
         next = next.max(high as u32 + 1);
         // The gap between the two halves of the code point space holds nothing, so stepping over it

@@ -118,10 +118,10 @@ impl Cutoff {
         let Some(&(_, op)) = self.about.get() else { return };
         // Read first so that a query whose cutoff has settled, which is almost the whole of one,
         // takes the shared lock and not the exclusive one.
-        if let Ok(held) = self.worst.read() {
-            if held.as_ref().is_some_and(|held| !improves(op, held, &bound)) {
-                return;
-            }
+        if let Ok(held) = self.worst.read()
+            && held.as_ref().is_some_and(|held| !improves(op, held, &bound))
+        {
+            return;
         }
         let Ok(mut held) = self.worst.write() else { return };
         *held = Some(match held.take() {

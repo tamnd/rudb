@@ -170,7 +170,7 @@ impl Inst<'_> {
             Form::Switch => {
                 let n = o[2] as usize;
                 f(Block(o[1]), &o[3..3 + n]);
-                for pair in o[3 + n..].chunks_exact(2) {
+                for pair in o[3 + n..].as_chunks::<2>().0 {
                     f(Block(pair[1]), &[]);
                 }
             }

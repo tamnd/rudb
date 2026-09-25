@@ -324,7 +324,7 @@ fn format_size(bytes: u64) -> String {
     for power in (1..=4).rev() {
         for (scale, unit) in [(1024u64, "iB"), (1000u64, "B")] {
             let Some(scale) = scale.checked_pow(power) else { continue };
-            if bytes >= scale && bytes % scale == 0 {
+            if bytes >= scale && bytes.is_multiple_of(scale) {
                 let prefix = ["K", "M", "G", "T"][power as usize - 1];
                 return format!("{}{prefix}{unit}", bytes / scale);
             }

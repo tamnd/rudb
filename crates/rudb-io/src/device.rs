@@ -458,10 +458,10 @@ pub fn measure(dir: &Path, options: &Options) -> Result<Card> {
 /// Whatever [`measure`] says.
 pub fn card(dir: &Path, iterations: Option<u32>) -> Result<Card> {
     let key = device_key(dir)?;
-    if iterations.is_none() {
-        if let Some(card) = kept(&key) {
-            return Ok(Card { path: dir.to_path_buf(), ..card });
-        }
+    if iterations.is_none()
+        && let Some(card) = kept(&key)
+    {
+        return Ok(Card { path: dir.to_path_buf(), ..card });
     }
     let mut options = Options::default();
     if let Some(iterations) = iterations {

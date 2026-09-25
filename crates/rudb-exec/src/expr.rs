@@ -167,15 +167,14 @@ pub(crate) fn evaluate_in_time_zone(
                 }
                 pending = still;
             }
-            if let Some(otherwise) = otherwise {
-                if !pending.is_empty() {
-                    let narrowed = narrow(chunk, &pending)?;
-                    let results =
-                        evaluate_in_time_zone(plan, otherwise, schema, &narrowed, time_zone)?;
-                    // row at a time: the scatter this wants is 2c (#57), same as the two above.
-                    for (slot, &row) in pending.iter().enumerate() {
-                        answers[row] = results.try_value_at(slot)?;
-                    }
+            if let Some(otherwise) = otherwise
+                && !pending.is_empty()
+            {
+                let narrowed = narrow(chunk, &pending)?;
+                let results = evaluate_in_time_zone(plan, otherwise, schema, &narrowed, time_zone)?;
+                // row at a time: the scatter this wants is 2c (#57), same as the two above.
+                for (slot, &row) in pending.iter().enumerate() {
+                    answers[row] = results.try_value_at(slot)?;
                 }
             }
             Vector::from_values(ty, &answers)

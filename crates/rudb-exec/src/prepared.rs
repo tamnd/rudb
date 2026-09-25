@@ -574,10 +574,10 @@ impl Prepared {
         let mut columns: Vec<Option<Vector>> = chunk.into_columns().into_iter().map(Some).collect();
         let mut uses = vec![0usize; width];
         for &root in &self.roots {
-            if let Step::Column(position) = self.steps[root] {
-                if position < width {
-                    uses[position] += 1;
-                }
+            if let Step::Column(position) = self.steps[root]
+                && position < width
+            {
+                uses[position] += 1;
             }
         }
         for (at, &root) in self.roots.iter().enumerate() {
@@ -1004,27 +1004,25 @@ impl Prepared {
         // path remains cheaper when most rows are still live.
         if let (Some(live), Step::Function { recipe, written, start, len }) =
             (live, &self.steps[index])
+            && matches!(recipe.name(), "~~" | "!~~" | "~~*" | "!~~*")
+            && live.len().saturating_mul(4) <= chunk.len()
         {
-            if matches!(recipe.name(), "~~" | "!~~" | "~~*" | "!~~*")
-                && live.len().saturating_mul(4) <= chunk.len()
-            {
-                let flags = self
-                    .with_operands(*start, *len, chunk, &scratch.slots, |args| {
-                        let gathered = args
-                            .iter()
-                            .map(|arg| arg.gather(live.indices()))
-                            .collect::<Result<Vec<_>>>()?;
-                        let narrowed = gathered.iter().collect::<Vec<_>>();
-                        rudb_kernels::call_prepared(
-                            recipe,
-                            &narrowed,
-                            &self.types[index],
-                            Some(&|| written.clone()),
-                        )
-                    })
-                    .map_err(|error| error.with_fallback_span(self.spans[index]))?;
-                return Ok(selection(&flags, live.len()).compose(live));
-            }
+            let flags = self
+                .with_operands(*start, *len, chunk, &scratch.slots, |args| {
+                    let gathered = args
+                        .iter()
+                        .map(|arg| arg.gather(live.indices()))
+                        .collect::<Result<Vec<_>>>()?;
+                    let narrowed = gathered.iter().collect::<Vec<_>>();
+                    rudb_kernels::call_prepared(
+                        recipe,
+                        &narrowed,
+                        &self.types[index],
+                        Some(&|| written.clone()),
+                    )
+                })
+                .map_err(|error| error.with_fallback_span(self.spans[index]))?;
+            return Ok(selection(&flags, live.len()).compose(live));
         }
         self.run_step(index, chunk, scratch)?;
         let flags = self.operand(index, chunk, &scratch.slots)?;
@@ -1215,10 +1213,10 @@ impl Prepared {
         ty: &LogicalType,
     ) -> Result<Vector> {
         let claimed = self.claims(chunk, arms)?;
-        if let Some(blend) = blend {
-            if let Some(blended) = blended(chunk, &claimed, blend)? {
-                return Ok(blended);
-            }
+        if let Some(blend) = blend
+            && let Some(blended) = blended(chunk, &claimed, blend)?
+        {
+            return Ok(blended);
         }
         let mut built = Assembly::new(ty.clone(), chunk.len())?;
         let branches = arms.iter().map(|arm| &arm.then).map(Some).chain([otherwise]);
@@ -1290,18 +1288,18 @@ impl Prepared {
 
     /// Flattens one expression, appending its steps and returning the index of its last one.
     fn push(&mut self, plan: &Plan, expr: ExprRef, schema: &Schema) -> Result<usize> {
-        if self.share {
-            if let Some(&step) = self.shared.get(&expr) {
-                return Ok(step);
-            }
+        if self.share
+            && let Some(&step) = self.shared.get(&expr)
+        {
+            return Ok(step);
         }
         let ty = plan.expr_type(expr).clone();
-        if self.fuse {
-            if let Some(fused) = Fused::compile(plan, expr, schema) {
-                let fallback = Self::built(plan, &[expr], schema, false, false)?;
-                let step = Step::Fused { fused: Box::new(fused), fallback: Box::new(fallback) };
-                return Ok(self.place(plan, expr, step, ty));
-            }
+        if self.fuse
+            && let Some(fused) = Fused::compile(plan, expr, schema)
+        {
+            let fallback = Self::built(plan, &[expr], schema, false, false)?;
+            let step = Step::Fused { fused: Box::new(fused), fallback: Box::new(fallback) };
+            return Ok(self.place(plan, expr, step, ty));
         }
         if let Some((stamp, count)) = stamped_seconds(plan, expr) {
             let (start, len) = self.push_list(plan, &[stamp, count], schema)?;

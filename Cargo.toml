@@ -103,6 +103,11 @@ undocumented_unsafe_blocks = "warn"
 doc_markdown = "allow"
 missing_panics_doc = "warn"
 todo = "warn"
+# Rust 1.98 asks for `as_chunks` wherever `chunks_exact` has a constant size. The rewrite hands the
+# loop `&[T; N]` rather than `&[T]`, and most of these loops are decode kernels that convert the
+# chunk with `try_into` or index it, so the suggestion does not compile as written and moving each
+# one is a kernel change that wants its own measurement rather than a lint pass.
+chunks_exact_to_as_chunks = "allow"
 
 [profile.release]
 lto = "thin"

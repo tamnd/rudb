@@ -624,12 +624,12 @@ fn write_rows(
     dots: Option<(usize, usize)>,
 ) {
     for (at, values) in cells.iter().enumerate() {
-        if let Some((head, tail)) = dots {
-            if at == head {
-                let parts = dot_row(cells, sizes, right, head, tail);
-                for _ in 0..ELIDED {
-                    let _ = writeln!(out, "{}", row(&parts, vertical));
-                }
+        if let Some((head, tail)) = dots
+            && at == head
+        {
+            let parts = dot_row(cells, sizes, right, head, tail);
+            for _ in 0..ELIDED {
+                let _ = writeln!(out, "{}", row(&parts, vertical));
             }
         }
         let parts: Vec<String> = values

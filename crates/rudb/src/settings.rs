@@ -1099,10 +1099,10 @@ fn graph_size(name: &str) -> Option<Size> {
 ///
 /// For text that is neither, and for a negative number.
 fn size_of(value: &Value, name: &str) -> Result<u64> {
-    if let Value::Varchar(text) = value {
-        if text.contains(|character: char| character.is_ascii_alphabetic()) {
-            return parse_size(text.trim());
-        }
+    if let Value::Varchar(text) = value
+        && text.contains(|character: char| character.is_ascii_alphabetic())
+    {
+        return parse_size(text.trim());
     }
     let count = integer_of(value, "UBIGINT")?;
     u64::try_from(count)

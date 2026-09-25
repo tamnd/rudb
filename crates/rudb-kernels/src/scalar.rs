@@ -554,24 +554,25 @@ fn cut_each<A: Fn(usize) -> usize>(
     rows: usize,
 ) -> Result<Option<Vector>> {
     // Nested rather than a let chain, because the minimum supported Rust version is 1.85.
-    if let Some(length) = length {
-        if start >= 1 && length >= 0 {
-            let skip = usize::try_from(start - 1).unwrap_or(usize::MAX);
-            let take = usize::try_from(length).unwrap_or(usize::MAX);
-            if let Text::Read(vector) = text {
-                let visited = visited_bytes(vector, &base, rows, |value, into| {
-                    into.extend_from_slice(text::cut_forward(value, skip, take));
-                })?;
-                if let Some(out) = visited {
-                    return finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows));
-                }
-            }
-            let out = try_each_string(rows, &base, |index, into| {
-                into.push_bytes(text::cut_forward(text.bytes(index)?, skip, take));
-                Ok(())
+    if let Some(length) = length
+        && start >= 1
+        && length >= 0
+    {
+        let skip = usize::try_from(start - 1).unwrap_or(usize::MAX);
+        let take = usize::try_from(length).unwrap_or(usize::MAX);
+        if let Text::Read(vector) = text {
+            let visited = visited_bytes(vector, &base, rows, |value, into| {
+                into.extend_from_slice(text::cut_forward(value, skip, take));
             })?;
-            return finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows));
+            if let Some(out) = visited {
+                return finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows));
+            }
         }
+        let out = try_each_string(rows, &base, |index, into| {
+            into.push_bytes(text::cut_forward(text.bytes(index)?, skip, take));
+            Ok(())
+        })?;
+        return finish(&LogicalType::Varchar, Data::Varlen(out), base.normalize(rows));
     }
     if let Text::Read(vector) = text {
         let visited = visited_strings(vector, &base, rows, |value, into| {
@@ -2391,27 +2392,24 @@ impl StableLike {
     fn decide_group(&self, code: usize, like: &Like, characters: &mut Vec<char>) -> Result<()> {
         let first = code / LIKE_GROUP * LIKE_GROUP;
         let last = (first + LIKE_GROUP).min(self.dictionary.len());
-        if !like.fold_case {
-            if let Pattern::Contains(finder) = &like.compiled {
-                if finder.needle().len() >= 4
-                    && !self.dictionary.text_block_might_contain(first, finder.needle())?
-                {
-                    // A stored signature can only prove absence. Mark the whole group as decided,
-                    // with the negated answer when this is NOT LIKE, without decoding its payload.
-                    let word = if like.negated { u64::MAX } else { 0x5555_5555_5555_5555 };
-                    for step in 0..(last - first).div_ceil(MEMO_VALUES) {
-                        let remaining = (last - first - step * MEMO_VALUES).min(MEMO_VALUES);
-                        let mask = if remaining == MEMO_VALUES {
-                            u64::MAX
-                        } else {
-                            (1_u64 << (remaining * 2)) - 1
-                        };
-                        self.word(first / MEMO_VALUES + step)?
-                            .fetch_or(word & mask, Ordering::Release);
-                    }
-                    return Ok(());
-                }
+        if !like.fold_case
+            && let Pattern::Contains(finder) = &like.compiled
+            && finder.needle().len() >= 4
+            && !self.dictionary.text_block_might_contain(first, finder.needle())?
+        {
+            // A stored signature can only prove absence. Mark the whole group as decided,
+            // with the negated answer when this is NOT LIKE, without decoding its payload.
+            let word = if like.negated { u64::MAX } else { 0x5555_5555_5555_5555 };
+            for step in 0..(last - first).div_ceil(MEMO_VALUES) {
+                let remaining = (last - first - step * MEMO_VALUES).min(MEMO_VALUES);
+                let mask = if remaining == MEMO_VALUES {
+                    u64::MAX
+                } else {
+                    (1_u64 << (remaining * 2)) - 1
+                };
+                self.word(first / MEMO_VALUES + step)?.fetch_or(word & mask, Ordering::Release);
             }
+            return Ok(());
         }
         let mut bits = [0_u64; LIKE_GROUP / MEMO_VALUES];
         let mut at = first;
@@ -2724,20 +2722,20 @@ impl Pattern {
         if plain(spelling) {
             return Self::Exact(spelling.to_owned());
         }
-        if let Some(inner) = spelling.strip_prefix('%').and_then(|rest| rest.strip_suffix('%')) {
-            if plain(inner) {
-                return Self::Contains(Box::new(memmem::Finder::new(inner).into_owned()));
-            }
+        if let Some(inner) = spelling.strip_prefix('%').and_then(|rest| rest.strip_suffix('%'))
+            && plain(inner)
+        {
+            return Self::Contains(Box::new(memmem::Finder::new(inner).into_owned()));
         }
-        if let Some(rest) = spelling.strip_prefix('%') {
-            if plain(rest) {
-                return Self::Suffix(rest.to_owned());
-            }
+        if let Some(rest) = spelling.strip_prefix('%')
+            && plain(rest)
+        {
+            return Self::Suffix(rest.to_owned());
         }
-        if let Some(head) = spelling.strip_suffix('%') {
-            if plain(head) {
-                return Self::Prefix(head.to_owned());
-            }
+        if let Some(head) = spelling.strip_suffix('%')
+            && plain(head)
+        {
+            return Self::Prefix(head.to_owned());
         }
         // Everything left that has no `_` in it is literal text with `%` between the pieces, since
         // the four shapes above are the cases of that with one piece or two. A spelling with no `%`

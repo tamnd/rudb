@@ -530,10 +530,10 @@ impl Lookup {
         let word = load(input, at);
         // Written as a nested `if` rather than as a chained `if let` because the minimum supported
         // Rust version is 1.85 and let chains landed in 1.88.
-        if remaining >= 3 {
-            if let Some(found) = self.long_at(word, remaining) {
-                return found;
-            }
+        if remaining >= 3
+            && let Some(found) = self.long_at(word, remaining)
+        {
+            return found;
         }
         if remaining >= 2 {
             let entry = self.short[(word & 0xffff) as usize];

@@ -172,13 +172,12 @@ enum Cell {
 impl Cell {
     /// The cell for one row of one column, keeping the code where the column has one.
     fn of(column: &Vector, row: usize) -> Result<Self> {
-        if let Some((codes, dictionary)) = column.shared_dictionary_parts() {
-            if column.validity().is_valid(row) {
-                if let Some(code) = codes.get(row) {
-                    let dictionary = Arc::clone(dictionary);
-                    return Ok(Self::Coded { dictionary, code: *code, rank: None });
-                }
-            }
+        if let Some((codes, dictionary)) = column.shared_dictionary_parts()
+            && column.validity().is_valid(row)
+            && let Some(code) = codes.get(row)
+        {
+            let dictionary = Arc::clone(dictionary);
+            return Ok(Self::Coded { dictionary, code: *code, rank: None });
         }
         Ok(Self::Ready(column.try_value_at(row)?))
     }
@@ -826,11 +825,11 @@ fn at_row(column: &Vector, row: usize, held: &Cell, key: SortKey) -> Result<Orde
         Cell::Ready(there) => return rank(&column.try_value_at(row)?, there, key),
         Cell::Coded { dictionary, code, rank } => (dictionary, code, rank),
     };
-    if let Some(there) = place {
-        if let Some(here) = rank_within(column, row, dictionary) {
-            let ordering = here.cmp(there);
-            return Ok(if key.descending { ordering.reverse() } else { ordering });
-        }
+    if let Some(there) = place
+        && let Some(here) = rank_within(column, row, dictionary)
+    {
+        let ordering = here.cmp(there);
+        return Ok(if key.descending { ordering.reverse() } else { ordering });
     }
     let (here, there) = (column.try_value_at(row)?, dictionary.try_value_at(*code as usize)?);
     rank(&here, &there, key)

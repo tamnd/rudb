@@ -1432,10 +1432,11 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             ) {
                 return Err(no_match(entry.name, arguments));
             }
-            if let Some(dimension) = arguments.get(1) {
-                if !dimension.is_integer() && *dimension != LogicalType::Null {
-                    return Err(no_match(entry.name, arguments));
-                }
+            if let Some(dimension) = arguments.get(1)
+                && !dimension.is_integer()
+                && *dimension != LogicalType::Null
+            {
+                return Err(no_match(entry.name, arguments));
             }
             let mut cast_to = vec![LogicalType::BigInt; arguments.len()];
             cast_to[0] = target.clone();
@@ -1462,10 +1463,11 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             // A step is declared BIGINT and so it is not cast to one either, while the two bounds
             // are declared ANY and are: `array_slice([1, 2, 3], 1.5, 2)` is `[2]` upstream, rounded,
             // and `array_slice([1, 2, 3], 1, 2, 1.5)` is a binder error.
-            if let Some(step) = arguments.get(3) {
-                if !step.is_integer() && *step != LogicalType::Null {
-                    return Err(no_match(entry.name, arguments));
-                }
+            if let Some(step) = arguments.get(3)
+                && !step.is_integer()
+                && *step != LogicalType::Null
+            {
+                return Err(no_match(entry.name, arguments));
             }
             let mut cast_to = vec![LogicalType::BigInt; arguments.len()];
             cast_to[0] = target.clone();

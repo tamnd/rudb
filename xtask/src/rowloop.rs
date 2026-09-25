@@ -107,15 +107,15 @@ fn check_one(name: &str, text: &str) -> (Vec<String>, usize) {
             }
             open.push(Open { line: index + 1, outer: depth, declared: marked });
         }
-        if let Some(what) = builds_a_value(&code) {
-            if let Some(loop_at) = open.iter().find(|entry| !entry.declared) {
-                problems.push(format!(
-                    "{name}:{}: a loop over rows, and {} on line {}",
-                    loop_at.line,
-                    what,
-                    index + 1
-                ));
-            }
+        if let Some(what) = builds_a_value(&code)
+            && let Some(loop_at) = open.iter().find(|entry| !entry.declared)
+        {
+            problems.push(format!(
+                "{name}:{}: a loop over rows, and {} on line {}",
+                loop_at.line,
+                what,
+                index + 1
+            ));
         }
         depth += braces(&code);
         open.retain(|entry| depth > entry.outer);

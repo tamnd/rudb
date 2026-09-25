@@ -269,12 +269,13 @@ fn unescape(raw: &[u8], dialect: Dialect) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut at = 0;
     while let Some(&byte) = raw.get(at) {
-        if byte == escape && escape != quote {
-            if let Some(&next) = raw.get(at + 1) {
-                out.push(next);
-                at += 2;
-                continue;
-            }
+        if byte == escape
+            && escape != quote
+            && let Some(&next) = raw.get(at + 1)
+        {
+            out.push(next);
+            at += 2;
+            continue;
         }
         if byte == escape && raw.get(at + 1) == Some(&quote) {
             out.push(quote);

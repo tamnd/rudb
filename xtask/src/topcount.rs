@@ -175,11 +175,11 @@ fn scan(path: &str, column: usize, mut body: impl FnMut(&[u8])) -> Result<u64, S
         // row at a time: the whole measurement is what one row costs to remember, and a column at a
         // time version of this harness would be measuring a kernel that the operator does not have.
         for row in 0..chunk.len() {
-            if let Some(bytes) = vector.bytes_at(row) {
-                if !bytes.is_empty() {
-                    body(bytes);
-                    rows += 1;
-                }
+            if let Some(bytes) = vector.bytes_at(row)
+                && !bytes.is_empty()
+            {
+                body(bytes);
+                rows += 1;
             }
         }
     }
