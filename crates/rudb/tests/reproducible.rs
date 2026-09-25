@@ -89,8 +89,13 @@ fn opening_a_database_and_planning_a_query_reads_no_rows() {
 
     // And running a query does read, which is what makes the two assertions above mean anything
     // rather than being true of a file nobody could read at all.
+    // A first scan reads a stripe a part at a time since #1892, so it counts indexes and not pages.
     database.query(QUERIES[0]).expect("the query runs");
-    assert!(reads(&database).pages > 0, "the query read no pages, so this file is not being read");
+    let ran = reads(&database);
+    assert!(
+        ran.pages > 0 || ran.indexes > 0,
+        "the query read nothing, so this file is not being read"
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -154,5 +159,22 @@ fn a_setting_is_allowed_to_move_a_plan_and_running_the_query_is_not() {
     // the setting rather than the order things happened in.
     database.execute("SET disabled_optimizers = ''").expect("the switch goes back");
     assert_eq!(optimized, plans(&database), "the plans did not come back when the setting did");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_count_through_a_view_of_a_file_plans_the_same_twice() {
+    // The file counts its nulls exactly, so `count(a)` is `count(*)`. Through a view the column is
+    // passed on by a projection first, and a rewrite that only saw through it once the projection
+    // had been folded away made a plan the second run of the passes changed.
+    let path = written("view");
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let database = Database::open(name).expect("the written file opens");
+    database.execute("CREATE VIEW v AS SELECT * FROM t").expect("the view is created");
+    for sql in ["SELECT count(a) FROM v", "SELECT sum(a), sum(a + 1) FROM v"] {
+        let plan = database.plan(sql).unwrap_or_else(|error| panic!("{sql} did not plan: {error}"));
+        assert!(plan.contains("count_star()"), "{sql} still counts the column:\n{plan}");
+        database.query(sql).unwrap_or_else(|error| panic!("{sql} did not run: {error}"));
+    }
     let _ = std::fs::remove_file(path);
 }

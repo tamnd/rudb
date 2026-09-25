@@ -1052,12 +1052,45 @@ pub(crate) const NO_NULLS: Use = Use::Enable;
 /// holds no nulls in the file holds one in every row the join had no match for. That is what makes
 /// `LEFT JOIN ... WHERE parent.x IS NULL` the way to write an anti join, and settling that predicate
 /// on the file's count would answer the opposite of the question.
+///
+/// A projection that only passes the column on is walked through as well, since a view is one of
+/// those over its table. Stopping there would leave the question unanswered on this run of the
+/// passes and answered on the next, once the projection has been folded away, and the sequence has
+/// to give the same plan the second time it runs.
 pub(crate) fn never_null(plan: &Plan, input: NodeRef, binding: ColumnBinding) -> bool {
+    let (input, binding) = passed_on(plan, input, binding);
     let Some(at) = walk::scan_of(plan, input, binding.table) else {
         return false;
     };
     let Some(stat) = nulls_at(plan, at, binding.column as usize) else { return false };
     stat.read(NO_NULLS) == Some(&0)
+}
+
+/// Where a column comes from once every projection that only renames it is walked through.
+///
+/// The walk goes through the operators [`walk::scan_of`] goes through and stops at the first
+/// projection that computes the column rather than passing it on.
+fn passed_on(plan: &Plan, input: NodeRef, binding: ColumnBinding) -> (NodeRef, ColumnBinding) {
+    fn project(plan: &Plan, at: NodeRef, table: u32) -> Option<NodeRef> {
+        match *plan.node(at) {
+            Node::Project { index, .. } if index == table => Some(at),
+            Node::Filter { input, .. } => project(plan, input, table),
+            Node::Join { left, right, kind: JoinKind::Inner, .. }
+            | Node::LinkJoin { child: left, parent: right, kind: JoinKind::Inner, .. }
+            | Node::CrossProduct { left, right } => {
+                project(plan, left, table).or_else(|| project(plan, right, table))
+            }
+            _ => None,
+        }
+    }
+    let (mut input, mut binding) = (input, binding);
+    while let Some(at) = project(plan, input, binding.table) {
+        let Node::Project { input: below, exprs, .. } = *plan.node(at) else { break };
+        let Some(&expr) = plan.expr_list(exprs).get(binding.column as usize) else { break };
+        let Expr::Column(inner) = *plan.expr(expr) else { break };
+        (input, binding) = (below, inner);
+    }
+    (input, binding)
 }
 
 /// One equality or inequality between a column of the scan numbered `index` and a constant.
