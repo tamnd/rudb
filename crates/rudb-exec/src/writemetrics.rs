@@ -10,11 +10,14 @@
 //!
 //! `rudb_codec_metrics()` is here too, since it is the page builder's row of the same profile split
 //! by codec. The counting is in `rudb_encoding::tally`.
+//!
+//! So is `rudb_statement_metrics()`, the phases of the recent statements, which is the same kind of
+//! table over a ring `rudb_metrics` keeps. The counting is on the statement path in `rudb`.
 
 use rudb_common::{Result, Value};
 use rudb_encoding::tally;
-use rudb_functions::{codec_metric_fields, write_metric_fields};
-use rudb_metrics::{LoadProfile, Stage, StageTotals, recent_loads};
+use rudb_functions::{codec_metric_fields, statement_metric_fields, write_metric_fields};
+use rudb_metrics::{LoadProfile, Stage, StageTotals, recent_loads, recent_statements};
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -83,6 +86,34 @@ pub(crate) fn codec_metrics(plan: &Plan, index: u32, columns: Slice) -> Result<M
         })
         .collect();
     Metadata::new("rudb_codec_metrics", &codec_metric_fields(), &rows, plan, index, columns)
+}
+
+/// Every kept statement with what each of its phases cost.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn statement_metrics(plan: &Plan, index: u32, columns: Slice) -> Result<Metadata> {
+    let rows: Vec<Vec<Value>> = recent_statements()
+        .iter()
+        .map(|statement| {
+            let count = |nanos: u64| Value::BigInt(signed(nanos));
+            vec![
+                count(statement.id),
+                text(&statement.sql),
+                count(statement.parse_ns),
+                count(statement.bind_ns),
+                count(statement.rewrite_ns),
+                count(statement.optimize_ns),
+                count(statement.frontend_ns()),
+                count(statement.physical_ns),
+                count(statement.execute_ns),
+                count(statement.total_ns),
+                count(statement.cpu_ns),
+            ]
+        })
+        .collect();
+    Metadata::new("rudb_statement_metrics", &statement_metric_fields(), &rows, plan, index, columns)
 }
 
 #[expect(clippy::cast_precision_loss, reason = "a share does not need 53 bits")]

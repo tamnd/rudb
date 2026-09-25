@@ -69,6 +69,11 @@
 //! `rudb_write_metrics()` reads it. The `load` module says what each stage covers and why it is
 //! charged once per stripe and once per worker rather than once per chunk.
 //!
+//! [`Statement`] is the smallest of these. Every statement that finishes leaves one in a ring of
+//! the last few, with what its parse, bind, rewrites, optimizer, build and run cost, and
+//! `rudb_statement_metrics()` reads the ring. The `statements` module says what that costs a
+//! statement nobody asks about.
+//!
 //! [`Report`] is the other end of all those counters. Whoever builds an execution registers each
 //! operator with one as it is made and says which pipeline depends on which, and at the end
 //! [`Report::fill`] puts the rows into the document. That is the piece that makes the ids and the
@@ -91,6 +96,7 @@ mod json;
 mod load;
 mod qerror;
 mod report;
+mod statements;
 mod warn;
 
 pub use clock::{Span, thread_cpu_ns};
@@ -104,6 +110,10 @@ pub use histogram::{HIGHEST, Histogram};
 pub use load::{Holding, KEPT_LOADS, LoadProfile, Stage, StageSpan, StageTotals, recent_loads};
 pub use qerror::{QErrors, Spread, q_error, tenths, word};
 pub use report::Report;
+pub use statements::{
+    KEPT_STATEMENTS, KEPT_TEXT, Statement, recent_statements, remember, remember_unplanned,
+    remembered_here,
+};
 
 /// The version of the document this crate writes.
 ///

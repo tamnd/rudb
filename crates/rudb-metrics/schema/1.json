@@ -29,6 +29,7 @@
     "parse_ns": 41000,
     "bind_ns": 88000,
     "optimize_ns": 310000,
+    "rewrite_ns": 120000,
     "physical_ns": 44000,
     "execute_ns": 1323000000,
     "total_ns": 1323483000

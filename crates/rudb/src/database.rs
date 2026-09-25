@@ -2825,7 +2825,7 @@ impl Shared {
             if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
                 return Ok(answer);
             }
-            self.query_mirrored(sql, cancel, true)
+            kept(sql, 0, |noted| self.query_mirrored(sql, cancel, true, noted))
         })
     }
 
@@ -2952,7 +2952,13 @@ impl Shared {
     /// A statement that wanted one is bound again once the mirrors are in, and not a third time,
     /// so a mirror that cannot be had costs one extra bind and leaves the statement reading the
     /// file.
-    fn query_mirrored(&self, sql: &str, cancel: &Cancel, mirror: bool) -> Result<QueryResult> {
+    fn query_mirrored(
+        &self,
+        sql: &str,
+        cancel: &Cancel,
+        mirror: bool,
+        noted: &mut Noted,
+    ) -> Result<QueryResult> {
         let catalog = self.read();
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
@@ -2967,6 +2973,7 @@ impl Shared {
                 rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session)
             }
         })?;
+        *noted = Noted { parse_ns, bind_ns };
         if mirror {
             let wanted = self.wanted_mirrors(&bound);
             // An outlined plan that asked for a mirror is bound again whether or not it gets one,
@@ -2977,16 +2984,16 @@ impl Shared {
                 drop(bound);
                 drop(catalog);
                 self.mirror(&wanted);
-                return self.query_mirrored(sql, cancel, false);
+                return self.query_mirrored(sql, cancel, false, noted);
             }
         }
         match bound {
             Bound::Query(mut plan) => {
-                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 self.remember_native_aggregate(sql, &ast, &plan, &catalog);
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
-                    .after(Planning { parse_ns, bind_ns, optimize_ns });
+                    .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 if self.inner.settings.engine() == COMPILED_ENGINE {
                     match rudb_qc::compile(&plan, cancel) {
                         Ok(compiled) => {
@@ -2998,7 +3005,7 @@ impl Shared {
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
-                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
                     return explained_codegen(&plan, cancel);
                 }
@@ -3013,7 +3020,7 @@ impl Shared {
                     &session,
                     Asked { analyze, statistics },
                     sql,
-                    Planning { parse_ns, bind_ns, optimize_ns },
+                    Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
             }
             _ => Err(Error::not_implemented("a statement that is not a query, on the query path")),
@@ -3369,10 +3376,13 @@ impl Shared {
         parse_ns: u64,
     ) -> Result<QueryResult> {
         let _writing = self.writing();
-        self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true)
+        kept(sql, parse_ns, |noted| {
+            self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
+        })
     }
 
     /// [`Shared::execute_ast`], asking for mirrors the way [`Shared::query_mirrored`] does.
+    #[allow(clippy::too_many_arguments)]
     fn execute_mirrored(
         &self,
         ast: &Ast,
@@ -3381,6 +3391,7 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
         mirror: bool,
+        noted: &mut Noted,
     ) -> Result<QueryResult> {
         let seams = self.seams(sql)?;
         let mut catalog = self.write();
@@ -3394,6 +3405,7 @@ impl Shared {
                 rudb_bind::bind_statement_with(ast, &catalog, parameters, &session)
             }
         })?;
+        noted.bind_ns = bind_ns;
         if mirror {
             let wanted = self.wanted_mirrors(&bound);
             if !wanted.is_empty() || (outlined && asked_for_mirrors(&bound)) {
@@ -3401,7 +3413,7 @@ impl Shared {
                 drop(bound);
                 drop(catalog);
                 self.mirror(&wanted);
-                return self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, false);
+                return self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, false, noted);
             }
         }
         let writes = matches!(
@@ -3433,17 +3445,17 @@ impl Shared {
         }
         match bound {
             Bound::Query(mut plan) => {
-                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if parameters.is_empty() {
                     self.remember_native_aggregate(sql, ast, &plan, &catalog);
                 }
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
-                    .after(Planning { parse_ns, bind_ns, optimize_ns });
+                    .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 run(sql, &plan, &catalog, cancel, under)
             }
             Bound::Explain { mut plan, analyze, statistics, codegen } => {
-                let ((), optimize_ns) = timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
                     return explained_codegen(&plan, cancel);
                 }
@@ -3458,7 +3470,7 @@ impl Shared {
                     &session,
                     Asked { analyze, statistics },
                     sql,
-                    Planning { parse_ns, bind_ns, optimize_ns },
+                    Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
             }
             Bound::Setting(setting)
@@ -3696,12 +3708,11 @@ impl Shared {
                 };
                 let rows = match alter.rewrite {
                     Some(mut plan) => {
-                        let ((), optimize_ns) =
-                            timed(|| rudb_opt::optimize_with(&mut plan, &context))?;
+                        let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                         let facts = context.facts();
                         let under =
                             Under::new(self.budget(), facts, &seams, &session, Rows::ForATable)
-                                .after(Planning { parse_ns, bind_ns, optimize_ns });
+                                .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                         Some(run(sql, &plan, &catalog, cancel, under)?.into_chunks())
                     }
                     None => None,
@@ -3728,8 +3739,7 @@ impl Shared {
                 // implementation detail. `INSERT INTO t SELECT * FROM t` reads the table it writes,
                 // and a version of this that appended chunk by chunk would either read its own
                 // output forever or depend on how the scan holds its chunks.
-                let ((), optimize_ns) =
-                    timed(|| rudb_opt::optimize_with(&mut insert.source, &context))?;
+                let (optimize_ns, rewrite_ns) = optimized(&mut insert.source, &context)?;
                 // Same as the create above: rows going into a temporary table are rows the file
                 // never sees, and a read only database writes no file at all.
                 let writable = self.inner.writable
@@ -3795,7 +3805,7 @@ impl Shared {
                 }
                 let facts = context.facts();
                 let under = Under::new(self.budget(), facts, &seams, &session, Rows::ForATable)
-                    .after(Planning { parse_ns, bind_ns, optimize_ns });
+                    .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let workers = self.inner.pool.threads();
                 let chunks = result.into_chunks();
@@ -4161,9 +4171,15 @@ enum Rows {
 /// Wall clock and not CPU. All three phases are single threaded, so the two are the same number up
 /// to scheduling noise, and the wall clock is the one a caller waited.
 #[derive(Clone, Copy, Default, Debug)]
+///
+/// `rewrite_ns` is the part of `optimize_ns` that went on the rewrites, the passes in front of join
+/// ordering, which is where milestone C0 draws the line between the rewrite phase and the optimizer.
+/// It is a part and not a fourth number to add, for the reason the document's field of the same
+/// name gives.
 struct Planning {
     parse_ns: u64,
     bind_ns: u64,
+    rewrite_ns: u64,
     optimize_ns: u64,
 }
 
@@ -4180,13 +4196,57 @@ fn asked_for_mirrors(bound: &Bound) -> bool {
     matches!(bound, Bound::Query(plan) if !plan.wanted_mirrors().is_empty())
 }
 
+/// The two phases a statement path got through before it knew whether it would run a plan.
+///
+/// A statement that runs one leaves its phases in the ring through the metrics document. One that
+/// does not, `CREATE TABLE`, `SET`, a plain `EXPLAIN`, still parsed and bound, and this is where
+/// the statement path writes those two down for [`kept`] to keep.
+#[derive(Clone, Copy, Default)]
+struct Noted {
+    parse_ns: u64,
+    bind_ns: u64,
+}
+
+/// Run a statement and make sure it left a row for `rudb_statement_metrics()`.
+///
+/// A statement that ran a plan already did, from the document `run` made. One that did not is kept
+/// here with the phases it noted and the wall time of the whole of it, which is `parse_ns` taken
+/// before this was called and the rest taken here. A statement that fails is not kept.
+fn kept(
+    sql: &str,
+    parse_ns: u64,
+    statement: impl FnOnce(&mut Noted) -> Result<QueryResult>,
+) -> Result<QueryResult> {
+    let before = rudb_metrics::remembered_here();
+    let started = Instant::now();
+    let mut noted = Noted { parse_ns, bind_ns: 0 };
+    let answer = statement(&mut noted)?;
+    if rudb_metrics::remembered_here() == before {
+        let rest = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let total_ns = parse_ns.saturating_add(rest);
+        rudb_metrics::remember_unplanned(sql, noted.parse_ns, noted.bind_ns, total_ns);
+    }
+    Ok(answer)
+}
+
+/// Optimize a plan and say how long it took and how much of that was the rewrites, in that order.
+fn optimized(plan: &mut Plan, context: &rudb_opt::pass::Context) -> Result<(u64, u64)> {
+    let (rewrite_ns, optimize_ns) = timed(|| rudb_opt::optimize_timed(plan, context))?;
+    Ok((optimize_ns, rewrite_ns))
+}
+
 /// Run something and say how long it took, in wall nanoseconds.
 ///
 /// Here so that the three phases are timed the same way rather than three ways, and so that adding
 /// a span around a call that already existed does not also re-indent it. A failure is not timed,
 /// because there is no document to put the number in and a partial phase is not a phase.
+///
+/// The wall clock alone. This used to start a span on both clocks and keep only the wall reading,
+/// which was two reads of the thread CPU clock per phase and six per statement, and on Linux every
+/// one of those is a system call where the wall clock is a read out of the vDSO. The phases are
+/// single threaded, so the CPU reading said nothing the wall one did not.
 fn timed<T>(what: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
-    let span = Span::start();
+    let span = Span::wall();
     let out = what()?;
     Ok((out, span.stop().0))
 }
@@ -4394,6 +4454,7 @@ fn run(
     metrics.timing.parse_ns = planning.parse_ns;
     metrics.timing.bind_ns = planning.bind_ns;
     metrics.timing.optimize_ns = planning.optimize_ns;
+    metrics.timing.rewrite_ns = planning.rewrite_ns;
     metrics.timing.physical_ns = built_wall;
     metrics.timing.execute_ns = ran_wall;
     // Every phase and not the two this function timed itself. A total that left the planner out was
@@ -4410,6 +4471,7 @@ fn run(
     metrics.resource.peak_bytes = memory.peak();
     report.fill(&mut metrics);
     rudb_opt::explain::record_estimates(plan, facts, &mut metrics);
+    rudb_metrics::remember(&metrics);
     Ok(QueryResult::new(names, types, chunks, held).in_session(session.clone()).measured(metrics))
 }
 
@@ -4442,10 +4504,12 @@ fn run_compiled(
     metrics.timing.parse_ns = planning.parse_ns;
     metrics.timing.bind_ns = planning.bind_ns;
     metrics.timing.optimize_ns = planning.optimize_ns;
+    metrics.timing.rewrite_ns = planning.rewrite_ns;
     metrics.timing.execute_ns = ran_wall;
     metrics.timing.total_ns = planning.total_ns().saturating_add(ran_wall);
     metrics.resource.cpu_ns = ran_cpu;
     metrics.resource.peak_bytes = memory.peak();
+    rudb_metrics::remember(&metrics);
     Ok(QueryResult::new(answer.names, answer.types, chunks, held)
         .in_session(session.clone())
         .measured(metrics))

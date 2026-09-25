@@ -102,6 +102,8 @@ pub enum TableFunction {
     RudbWriteMetrics,
     /// `rudb_codec_metrics()`, what each codec cost the process and how often it was kept.
     RudbCodecMetrics,
+    /// `rudb_statement_metrics()`, what each phase of the recent statements cost.
+    RudbStatementMetrics,
     /// `duckdb_keywords()`, every word the grammar knows and which class each one is in.
     DuckdbKeywords,
     /// `duckdb_types()`, every type name the engine knows and what each one stands for.
@@ -179,6 +181,7 @@ impl TableFunction {
             Self::RudbDeviceCard => "rudb_device_card",
             Self::RudbWriteMetrics => "rudb_write_metrics",
             Self::RudbCodecMetrics => "rudb_codec_metrics",
+            Self::RudbStatementMetrics => "rudb_statement_metrics",
             Self::DuckdbKeywords => "duckdb_keywords",
             Self::DuckdbTypes => "duckdb_types",
             Self::DuckdbFunctions => "duckdb_functions",
@@ -336,6 +339,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("rudb_codec_metrics") {
             return Some(Self::RudbCodecMetrics);
+        }
+        if name.eq_ignore_ascii_case("rudb_statement_metrics") {
+            return Some(Self::RudbStatementMetrics);
         }
         if name.eq_ignore_ascii_case("duckdb_keywords") {
             return Some(Self::DuckdbKeywords);
@@ -685,6 +691,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::RudbDeviceCard
         | TableFunction::RudbWriteMetrics
         | TableFunction::RudbCodecMetrics
+        | TableFunction::RudbStatementMetrics
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions
@@ -722,6 +729,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::RudbLinks => Some(link_fields()),
         TableFunction::RudbWriteMetrics => Some(write_metric_fields()),
         TableFunction::RudbCodecMetrics => Some(codec_metric_fields()),
+        TableFunction::RudbStatementMetrics => Some(statement_metric_fields()),
         TableFunction::DuckdbKeywords => Some(keyword_fields()),
         TableFunction::DuckdbTypes => Some(type_fields()),
         TableFunction::DuckdbFunctions => Some(function_fields()),
@@ -975,6 +983,35 @@ pub fn strategy_fields() -> Vec<Field> {
         Field::new("determinism", LogicalType::Varchar),
         Field::new("is_reference", LogicalType::Boolean),
         Field::new("is_default", LogicalType::Boolean),
+    ]
+}
+
+/// The columns `rudb_statement_metrics()` produces.
+///
+/// One row per statement the process kept, oldest first, which is the last sixty four to finish.
+/// `id` is the number the process gave the statement as it finished and `sql` is its text, cut at
+/// four kilobytes. Every other column is wall nanoseconds.
+///
+/// The four frontend phases are milestone C0's: `parse_ns`, `bind_ns`, `rewrite_ns`, which is the
+/// optimizer passes in front of join ordering, and `optimize_ns`, which is the rest of the
+/// optimizer. They do not overlap and `frontend_ns` is the four added up. `physical_ns` is building
+/// the operator tree and `execute_ns` is running it, and `total_ns` is the whole statement. A
+/// statement that did not run a plan, `CREATE TABLE` or `SET`, has its parse, bind and total and
+/// zero for the rest. `cpu_ns` is the CPU time of every thread the plan ran on.
+#[must_use]
+pub fn statement_metric_fields() -> Vec<Field> {
+    vec![
+        Field::new("id", LogicalType::BigInt),
+        Field::new("sql", LogicalType::Varchar),
+        Field::new("parse_ns", LogicalType::BigInt),
+        Field::new("bind_ns", LogicalType::BigInt),
+        Field::new("rewrite_ns", LogicalType::BigInt),
+        Field::new("optimize_ns", LogicalType::BigInt),
+        Field::new("frontend_ns", LogicalType::BigInt),
+        Field::new("physical_ns", LogicalType::BigInt),
+        Field::new("execute_ns", LogicalType::BigInt),
+        Field::new("total_ns", LogicalType::BigInt),
+        Field::new("cpu_ns", LogicalType::BigInt),
     ]
 }
 
@@ -1499,6 +1536,14 @@ mod tests {
         assert_eq!(resolved.function, TableFunction::RudbCodecMetrics);
         assert_eq!(resolved.columns, Columns::Fixed(codec_metric_fields()));
         assert!(resolve_table("rudb_codec_metrics", &[LogicalType::BigInt]).is_err());
+    }
+
+    #[test]
+    fn rudb_statement_metrics_takes_no_arguments() {
+        let resolved = resolve_table("rudb_statement_metrics", &[]).unwrap();
+        assert_eq!(resolved.function, TableFunction::RudbStatementMetrics);
+        assert_eq!(resolved.columns, Columns::Fixed(statement_metric_fields()));
+        assert!(resolve_table("rudb_statement_metrics", &[LogicalType::BigInt]).is_err());
     }
 
     #[test]
