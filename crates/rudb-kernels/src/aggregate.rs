@@ -1880,6 +1880,12 @@ fn many_runs<T: Copy + TryInto<i64>>(
 /// total loaded and stored back. Named at compile time the columns are registers held across the whole
 /// walk, the totals are registers held across the run, and the loop over the calls is not a loop.
 ///
+/// The row loop is outside the call loop rather than inside it, which is what makes the second of those
+/// true. Per call per run there is a loop to set up, a counter to step and a bound to test, and at 2.81
+/// rows a run that is three instructions of loop for every useful add. The other way round the counter
+/// is stepped once for all `W` calls and the adds between two steps of it are straight line code, so
+/// q01's five totals cost thirteen instructions a row where they cost twenty five.
+///
 /// `false` with `folded` left however far it got, which the caller only reads on `true`, for the misses
 /// [`many_runs`] documents: a value that does not fit an `i64`, a total that leaves one, and a slot or a
 /// run past what the caller said there would be.
@@ -1900,16 +1906,32 @@ fn walk_runs<const W: usize, T: Copy + TryInto<i64>>(
         if slot == NOWHERE {
             continue;
         }
+        // Ends that walk backwards are the caller's bug, and taken here rather than left to the
+        // subtraction below so that the row loop's bound and every slice it reads are the one length.
+        let Some(length) = end.checked_sub(from) else { return false };
         // A slot past the groups is a bug elsewhere, and nothing has been folded yet, so the caller's
         // loop gets to say so.
         let Some(cells) = folded.get_mut(slot * span..).and_then(|rest| rest.get_mut(..span))
         else {
             return false;
         };
+        // The one bounds check a call pays per run, so that the row loop reads a slice it already knows
+        // the length of. `from_fn` cannot fail, so a column too short for this run is carried out.
+        let mut short = false;
+        let run: [&[T]; W] = array::from_fn(|call| match columns[call].get(from..end) {
+            Some(run) => run,
+            None => {
+                short = true;
+                &[]
+            }
+        });
+        if short {
+            return false;
+        }
         let mut sums: [i64; W] = array::from_fn(|call| cells[call]);
-        for (sum, values) in sums.iter_mut().zip(columns) {
-            let Some(run) = values.get(from..end) else { return false };
-            for &value in run {
+        for at in 0..length {
+            for (sum, values) in sums.iter_mut().zip(run) {
+                let Some(&value) = values.get(at) else { return false };
                 let Ok(value) = value.try_into() else { return false };
                 let Some(next) = sum.checked_add(value) else { return false };
                 *sum = next;
@@ -1918,7 +1940,7 @@ fn walk_runs<const W: usize, T: Copy + TryInto<i64>>(
         for (cell, &sum) in cells.iter_mut().zip(&sums) {
             *cell = sum;
         }
-        cells[W] += (end - from) as i64;
+        cells[W] += length as i64;
     }
     true
 }
