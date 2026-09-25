@@ -111,6 +111,9 @@ pub struct Parent {
     spent_parts: AtomicUsize,
     /// The parts, by column and then by part, that a chunk has read a few rows of already.
     visited: Mutex<HashSet<(usize, usize)>>,
+    /// Set once a column read whole for a scattered chunk went past the budget, so that later
+    /// chunks go by part without trying again.
+    refused: AtomicBool,
 }
 
 /// Where the parent rows one chunk asked for are, worked out once and used for every column.
@@ -130,6 +133,9 @@ enum Shape {
     /// and for each row which of those parts and which of its offsets, with [`NO_ROW`] as the part
     /// of a row that has no parent.
     Many(Vec<(usize, Vec<u32>)>, Vec<(u32, u32)>),
+    /// More than half the parts, kept as the row ids themselves and gathered out of the column read
+    /// whole, with the number of parts reached.
+    Whole(usize, Vec<u32>),
 }
 
 impl Placement {
@@ -140,6 +146,7 @@ impl Placement {
             Shape::Nowhere => 0,
             Shape::One(..) => 1,
             Shape::Many(parts, _) => parts.len(),
+            Shape::Whole(parts, _) => *parts,
         }
     }
 }
@@ -156,10 +163,18 @@ impl Parent {
             parts: Mutex::new(HashMap::new()),
             spent_parts: AtomicUsize::new(0),
             visited: Mutex::new(HashSet::new()),
+            refused: AtomicBool::new(false),
         }
     }
 
     /// Where the parent rows `rids` name are, with [`NO_ROW`] for a row that has no parent.
+    ///
+    /// A chunk that reaches more than half the parts of a parent of several is placed whole: the
+    /// gather reads the column once, end to end, and indexes it by row id. That is a child stored
+    /// in another order than its parent's, `lineitem` against `partsupp` on TPC-H q09, where every
+    /// chunk reached every part and paid for each row a search for its part, a lookup of that part
+    /// in a map, a gather per part and a pick to put the rows back in order. The parts it would have
+    /// read are the same ones.
     ///
     /// # Errors
     ///
@@ -167,14 +182,19 @@ impl Parent {
     pub fn place(&self, rids: &[u32]) -> Result<Placement> {
         let starts = self.starts()?;
         let total = starts.last().copied().unwrap_or(0);
-        let mut found = Vec::with_capacity(rids.len());
+        let parts = starts.len().saturating_sub(1);
+        // Each row's part and offset in it, with [`NO_ROW`] as the part of a row with no parent.
+        let mut found: Vec<(u32, u32)> = Vec::with_capacity(rids.len());
+        // For each part, its place among the parts this chunk reached, in the order reached.
+        let mut numbered = vec![NO_ROW; parts];
+        let mut reached: Vec<usize> = Vec::new();
         // The part of the row before, tried first, because a child stored in its parent's order asks
         // for the same part a couple of thousand times in a row and a search per row would be most
         // of the cost of this.
         let mut last = 0;
         for &rid in rids {
             if rid == NO_ROW {
-                found.push(None);
+                found.push((NO_ROW, 0));
                 continue;
             }
             let at = u64::from(rid);
@@ -186,39 +206,46 @@ impl Parent {
             if !(starts[last] <= at && at < starts[last + 1]) {
                 last = starts.partition_point(|&start| start <= at) - 1;
             }
+            if numbered[last] == NO_ROW {
+                // Under the part count, which is far under a `u32`.
+                numbered[last] = reached.len() as u32;
+                reached.push(last);
+            }
             // In a part, so under its row count, which is a `usize` the part was read into.
-            found.push(Some((last, (at - starts[last]) as u32)));
+            found.push((numbered[last], (at - starts[last]) as u32));
         }
-        let mut touched = found.iter().flatten().map(|&(part, _)| part);
-        let shape = match touched.next() {
-            None => Shape::Nowhere,
-            Some(first) if touched.all(|part| part == first) => Shape::One(
-                first,
-                Arc::new(found.iter().map(|hit| hit.map_or(NO_ROW, |(_, row)| row)).collect()),
+        let shape = match reached.as_slice() {
+            [] => Shape::Nowhere,
+            &[only] => Shape::One(
+                only,
+                Arc::new(
+                    found
+                        .iter()
+                        .map(|&(part, row)| if part == NO_ROW { NO_ROW } else { row })
+                        .collect(),
+                ),
             ),
-            Some(_) => {
+            _ if reached.len() * 2 > parts && !self.refused.load(Ordering::Relaxed) => {
+                Shape::Whole(reached.len(), rids.to_vec())
+            }
+            _ => {
                 // Numbered in the order they are first reached. A child walking its parent forwards
                 // reaches them in part order, and nothing below depends on it either way.
-                let mut parts: Vec<(usize, Vec<u32>)> = Vec::new();
-                let mut numbered: HashMap<usize, u32> = HashMap::new();
+                let mut offsets: Vec<(usize, Vec<u32>)> =
+                    reached.iter().map(|&part| (part, Vec::new())).collect();
                 let picks = found
                     .iter()
-                    .map(|hit| match *hit {
-                        None => (NO_ROW, 0),
-                        Some((part, row)) => {
-                            let at = *numbered.entry(part).or_insert_with(|| {
-                                parts.push((part, Vec::new()));
-                                // Under the chunk's length, which is a `u32` because a row id is.
-                                (parts.len() - 1) as u32
-                            });
-                            let offsets = &mut parts[at as usize].1;
-                            offsets.push(row);
-                            // The same bound, since a part gets no more rows than the chunk has.
-                            (at, (offsets.len() - 1) as u32)
+                    .map(|&(at, row)| {
+                        if at == NO_ROW {
+                            return (NO_ROW, 0);
                         }
+                        let held = &mut offsets[at as usize].1;
+                        held.push(row);
+                        // Under the chunk's length, since a part gets no more rows than it has.
+                        (at, (held.len() - 1) as u32)
                     })
                     .collect();
-                Shape::Many(parts, picks)
+                Shape::Many(offsets, picks)
             }
         };
         Ok(Placement { rows: rids.len(), shape })
@@ -240,6 +267,14 @@ impl Parent {
         match &placement.shape {
             Shape::Nowhere => Ok(Some(Vector::constant(ty.clone(), Value::Null, placement.rows))),
             Shape::One(part, offsets) => self.rows_in(column, *part, offsets),
+            Shape::Whole(_, rids) => {
+                if let Some(whole) = self.column(column, ty)? {
+                    return whole.gather(rids).map(Some);
+                }
+                // Past the budget, so this chunk and every one after it go by part.
+                self.refused.store(true, Ordering::Relaxed);
+                self.gather(column, ty, &self.place(rids)?)
+            }
             Shape::Many(parts, picks) => {
                 // Each part's own rows first, which is where the part's form is dealt with: a
                 // packed part unpacks the rows asked for and no others, and a dictionary keeps its
@@ -853,6 +888,57 @@ mod tests {
             let want = if id == NO_ROW { Value::Null } else { Value::Integer(id as i32) };
             assert_eq!(column.value_at(row), want, "row {row}");
         }
+    }
+
+    /// A chunk that reaches more than half the parts is gathered out of the column read whole, and
+    /// comes back the same as one gathered by part would.
+    #[test]
+    fn a_chunk_over_most_of_the_parts_is_gathered_out_of_the_whole_column() {
+        let values: Vec<i32> = (0..1024).collect();
+        let parent = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        let ids = [1000, 3, NO_ROW, 300, 700, 129, 900, 500, 3];
+        let placed = parent.place(&ids).expect("placed");
+        assert_eq!(placed.parts(), 6);
+        let column = parent.gather(0, &LogicalType::Integer, &placed).expect("read").expect("fits");
+        for (row, &id) in ids.iter().enumerate() {
+            let want = if id == NO_ROW { Value::Null } else { Value::Integer(id as i32) };
+            assert_eq!(column.value_at(row), want, "row {row}");
+        }
+        let whole = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        whole.column(0, &LogicalType::Integer).expect("read").expect("fits");
+        assert_eq!(parent.footprint(), whole.footprint(), "the column is held once, end to end");
+
+        let held: Vec<&str> = (0..500).map(|row| ["a", "bb", "ccc"][row % 3]).collect();
+        let parent = Parent::new(strings(&held, 64), 64 * 1024 * 1024);
+        let ids = [499, 3, 64, 200, 130, 260, 330, 400];
+        let placed = parent.place(&ids).expect("placed");
+        let column = parent.gather(0, &LogicalType::Varchar, &placed).expect("read").expect("fits");
+        for (row, &id) in ids.iter().enumerate() {
+            assert_eq!(column.value_at(row), Value::Varchar(held[id as usize].into()), "row {row}");
+        }
+    }
+
+    /// A column the budget will not hold whole is gathered by part instead, for that chunk and for
+    /// the ones after it.
+    #[test]
+    fn a_chunk_over_most_of_the_parts_goes_by_part_when_the_column_does_not_fit() {
+        let values: Vec<i32> = (0..1024).collect();
+        let whole = Parent::new(table(&values, 128), 64 * 1024 * 1024);
+        whole.column(0, &LogicalType::Integer).expect("read").expect("fits");
+        let parent = Parent::new(table(&values, 128), whole.footprint() - 1);
+        let ids: Vec<u32> = (0..8).map(|part| part * 128 + 5).rev().collect();
+        for _ in 0..2 {
+            let placed = parent.place(&ids).expect("placed");
+            let column =
+                parent.gather(0, &LogicalType::Integer, &placed).expect("read").expect("fits");
+            for (row, &id) in ids.iter().enumerate() {
+                assert_eq!(column.value_at(row), Value::Integer(id as i32), "row {row}");
+            }
+        }
+        assert!(
+            parent.refused.load(std::sync::atomic::Ordering::Relaxed),
+            "the whole read is not tried again"
+        );
     }
 
     /// A chunk that takes a few rows of a part leaves nothing held, and one that takes a share of
