@@ -1697,13 +1697,20 @@ impl<'a> Aggregate<'a> {
     /// closed group would never reach their answer. A `DISTINCT` call keeps a set per group and a
     /// pushed down limit agrees on groups between instances, and neither is worth teaching about a
     /// group that skipped the table.
+    ///
+    /// A count and nothing else closes only where its runs are answered where they lie, since the
+    /// table it keeps has no accumulators to close a group into. The dense count is not tried for
+    /// one that closes, so the two never split a query's groups between them.
     fn closes(&self) -> bool {
         self.clustered
             && !self.alone
             && !self.sets
             && self.keys.len() == 1
             && self.max_groups.is_none()
-            && !self.count_only
+            && (!self.count_only
+                || (!self.compact_numeric
+                    && self.having_count.is_none()
+                    && self.top_counts.is_none()))
             && !self.radix_distinct_count
             && !self.fixed_top_count()
             && !self.encoded_top_count()
@@ -1715,8 +1722,9 @@ impl<'a> Aggregate<'a> {
     /// Whether the groups a sorted chunk closes can be answered straight from their runs, with no
     /// table and no accumulators. See [`Aggregate::close_runs`].
     ///
-    /// Every call has to be a count or a total whose answer is the sum of the raw integers, which is
-    /// a total over an integer column or over a decimal at the scale the total is declared at. A
+    /// Every call has to be a count, a total whose answer is the sum of the raw integers, which is
+    /// a total over an integer column or over a decimal at the scale the total is declared at, or
+    /// the least or greatest of a column whose raw integers order the way its values do. A
     /// `FILTER` clause, a call finished from another call's state and the selections made from the
     /// counts afterwards all live in the accumulators, so any of them leaves the chunk to the table.
     fn closes_by_run(&self) -> bool {
@@ -1733,6 +1741,9 @@ impl<'a> Aggregate<'a> {
                         ("count_star", []) | ("count", [_]) => true,
                         ("sum", [argument]) => {
                             whole_total(self.plan.expr_type(*argument), &call.returns)
+                        }
+                        ("min" | "max", [argument]) => {
+                            whole_extreme(self.plan.expr_type(*argument), &call.returns)
                         }
                         _ => false,
                     }
@@ -1909,11 +1920,19 @@ impl<'a> Aggregate<'a> {
         // for the direct map, and its probe read the three keys that way for all six hundred
         // thousand rows. One key is left alone, since the map is wide enough for most of those and
         // reads a packed page by its codes.
-        if keys.len() > 1 {
+        //
+        // One key is opened too when the aggregate closes groups out of sorted runs, unless it is
+        // packed. [`interior`] finds the runs by comparing what the rows hold, and a key a filter
+        // left as a dictionary over its page is not a form it reads, so every filtered chunk went
+        // to the table instead. `GROUP BY l_orderkey` under a filter on lineitem was ten times the
+        // instructions of the same grouping without one.
+        let closing = self.closes();
+        if keys.len() > 1 || closing {
             for key in &mut keys {
                 if key.logical_type().is_integer()
                     && key.data().is_none()
                     && key.constant_value().is_none()
+                    && !(closing && key.packed_parts().is_some())
                 {
                     *key = key.opened()?;
                 }
@@ -4596,6 +4615,11 @@ impl<'a> Aggregate<'a> {
                 let argument = rows.arguments[at][0].clone().into_flat()?;
                 let nulls = argument.validity().has_nulls(rows.rows).then(|| argument.validity());
                 let counting = self.calls[at].name == "count";
+                let least = match self.calls[at].name.as_str() {
+                    "min" => Some(true),
+                    "max" => Some(false),
+                    _ => None,
+                };
                 let values = match counting {
                     true => None,
                     false => match integers(&argument, rows.rows) {
@@ -4603,6 +4627,15 @@ impl<'a> Aggregate<'a> {
                         None => return Ok(None),
                     },
                 };
+                // Its own loop, so the loop a total takes is the same code it was before extremes
+                // came through here.
+                if let (Some(values), None, Some(least)) = (&values, nulls, least) {
+                    for (group, &start) in starts.iter().enumerate() {
+                        answers[group] = run_extreme(&values[start as usize..end(group)], least);
+                    }
+                    columns.push(whole_answers(&answers, &valid, ty)?);
+                    continue;
+                }
                 for (group, &start) in starts.iter().enumerate() {
                     let run = start as usize..end(group);
                     let (total, seen) = match (&values, nulls) {
@@ -4616,7 +4649,13 @@ impl<'a> Aggregate<'a> {
                             let mut seen = false;
                             for row in run {
                                 if nulls.is_valid(row) {
-                                    total += i128::from(values[row]);
+                                    let value = i128::from(values[row]);
+                                    total = match least {
+                                        None => total + value,
+                                        Some(_) if !seen => value,
+                                        Some(true) => total.min(value),
+                                        Some(false) => total.max(value),
+                                    };
                                     seen = true;
                                 }
                             }
@@ -5095,6 +5134,34 @@ fn whole_total(argument: &LogicalType, returns: &LogicalType) -> bool {
         ) => true,
         _ => false,
     }
+}
+
+/// Whether the least or greatest of `argument` is its least or greatest raw integer, written back
+/// as `returns` unchanged.
+///
+/// Every type [`integers`] reads, a date and a decimal that fits in 64 bits, since a date is a day
+/// number and one decimal column has one scale, so the integers order the way the values do.
+fn whole_extreme(argument: &LogicalType, returns: &LogicalType) -> bool {
+    use LogicalType as T;
+    argument == returns
+        && match argument {
+            T::Decimal { width, .. } => *width <= 18,
+            T::TinyInt
+            | T::SmallInt
+            | T::Integer
+            | T::BigInt
+            | T::UTinyInt
+            | T::USmallInt
+            | T::UInteger
+            | T::Date => true,
+            _ => false,
+        }
+}
+
+/// The least or greatest of a run that is not empty.
+fn run_extreme(values: &[i64], least: bool) -> i128 {
+    let best = if least { values.iter().min() } else { values.iter().max() };
+    i128::from(best.copied().unwrap_or_default())
 }
 
 /// A flat column of whole numbers read as `i64`, the raw integers of a decimal included.
@@ -6026,6 +6093,7 @@ impl Sink for Aggregate<'_> {
         }
         if self.count_only
             && self.keys.len() == 1
+            && !self.closes()
             && let [key] = rows.keys.as_slice()
             && let Some((codes, dictionary)) = key.stable_dictionary_parts()
         {
@@ -7929,7 +7997,7 @@ mod tests {
     use rudb_kernels::NOWHERE;
     use rudb_pipeline::Sink;
     use rudb_plan::{Plan, Slice};
-    use rudb_vector::{Chunk, Data, Vector};
+    use rudb_vector::{Chunk, Data, Selection, Vector};
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
@@ -9603,6 +9671,37 @@ mod tests {
         assert!(Share::Passing.before_the_split());
         assert!(!Share::Partition.before_the_split());
         assert!(!Share::Local.before_the_split());
+    }
+
+    /// A sorted key under a filter arrives as a dictionary over its page. It is opened for an
+    /// aggregate that closes runs, so the runs are still found, and the least and greatest of each
+    /// run inside the chunk are answered off the run where it lies.
+    #[test]
+    fn a_filtered_sorted_key_closes_its_runs_with_their_extremes() {
+        let plan = parsed(
+            "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[min(#0.0::INTEGER)::INTEGER, \
+             max(#0.0::INTEGER)::INTEGER, count_star()::BIGINT]",
+        );
+        let (aggregate, _out) = aggregate(&plan);
+        let aggregate = aggregate.clustered();
+        assert!(aggregate.closes_by_run());
+        let values = [1, 1, 2, 2, 2, 3, 3, 4, 5, 5, 6];
+        let kept = Selection::from_indices(vec![0, 1, 2, 4, 5, 6, 7, 9, 10]);
+        let marked = chunk(&values).marked(kept);
+        let mut local = aggregate.local();
+        let rows = aggregate.read(&marked, &mut local.expressions).expect("a chunk");
+        assert!(rows.keys[0].data().is_some(), "the key is read flat");
+        let (from, to) = interior(&rows.keys[0], rows.rows, false).expect("sorted runs");
+        assert_eq!((from, to), (2, 8));
+        let answered = &aggregate.close_runs(&rows, from, to).expect("closed").expect("answered");
+        let column = |at: usize| (0..answered.len()).map(move |row| answered.value_at(row, at));
+        let ints =
+            |values: &[i32]| -> Vec<Value> { values.iter().map(|&v| Value::Integer(v)).collect() };
+        assert_eq!(column(0).collect::<Vec<_>>(), ints(&[2, 3, 4, 5]));
+        assert_eq!(column(1).collect::<Vec<_>>(), ints(&[2, 3, 4, 5]));
+        assert_eq!(column(2).collect::<Vec<_>>(), ints(&[2, 3, 4, 5]));
+        let counts = column(3).collect::<Vec<_>>();
+        assert_eq!(counts, [2, 2, 1, 1].map(Value::BigInt).to_vec());
     }
 
     #[test]
