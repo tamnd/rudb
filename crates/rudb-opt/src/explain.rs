@@ -703,6 +703,16 @@ fn write_totals(measured: &Document, out: &mut String) {
         duration(timing.execute_ns),
         duration(timing.total_ns)
     );
+    // The same planning, phase by phase, which are the four phases `rudb_statement_metrics()` has a
+    // column each for. The optimizer here is what is left of it after the rewrites.
+    let _ = writeln!(
+        out,
+        "  {} parsing, {} binding, {} rewriting, {} optimizing",
+        duration(timing.parse_ns),
+        duration(timing.bind_ns),
+        duration(timing.rewrite_ns),
+        duration(timing.optimize_ns.saturating_sub(timing.rewrite_ns))
+    );
     let _ = writeln!(
         out,
         "  {} of cpu, {} held at the peak",

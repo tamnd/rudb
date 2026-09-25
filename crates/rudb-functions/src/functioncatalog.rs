@@ -217,6 +217,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::RudbDeviceCard,
     TableFunction::RudbWriteMetrics,
     TableFunction::RudbCodecMetrics,
+    TableFunction::RudbStatementMetrics,
     TableFunction::DuckdbKeywords,
     TableFunction::DuckdbTypes,
     TableFunction::DuckdbFunctions,
@@ -261,6 +262,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::RudbLinks
         | TableFunction::RudbWriteMetrics
         | TableFunction::RudbCodecMetrics
+        | TableFunction::RudbStatementMetrics
         | TableFunction::DuckdbKeywords
         | TableFunction::DuckdbTypes
         | TableFunction::DuckdbFunctions

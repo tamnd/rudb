@@ -47,8 +47,8 @@ pub use table::{
     Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, codec_metric_fields,
     database_size_fields, device_card_fields, dialect_fields, extension_fields,
     grammar_extension_fields, keyword_categories, keyword_fields, link_fields, optimizer_fields,
-    platform_fields, resolve_pragma, resolve_table, series, series_length, strategy_fields,
-    user_agent_fields, version_fields, write_metric_fields,
+    platform_fields, resolve_pragma, resolve_table, series, series_length, statement_metric_fields,
+    strategy_fields, user_agent_fields, version_fields, write_metric_fields,
 };
 pub use typecatalog::{
     Signature, TYPE_NAMES, TypeEntry, representative, sort_key, type_category, type_fields,

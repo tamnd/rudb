@@ -51,6 +51,8 @@ mod walk;
 
 pub use walk::volatile;
 
+use std::time::Instant;
+
 use rudb_common::rules::Rule;
 use rudb_common::{Error, Result};
 use rudb_plan::{JoinKind, Node, NodeRef, Plan};
@@ -327,6 +329,34 @@ pub fn optimize(plan: &mut Plan) -> Result<()> {
 /// Whatever a pass reported, and then, in a debug build, if a pass left the plan malformed, narrowed
 /// what it returns or did not settle, all three of which are a bug in the pass and not in the query.
 pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
+    optimize_timed(plan, context).map(|_| ())
+}
+
+/// How many of [`PASSES`] are rewrites, which is every pass in front of join ordering.
+///
+/// The frontend has four phases a statement is timed in: parse, bind, rewrite and optimize. The
+/// line between the last two is drawn here rather than by a flag on each pass because the sequence
+/// already draws it. Everything in front of join ordering turns the bound plan into a better
+/// written version of itself, a constant folded, a distinct aggregate rewritten, a filter moved to
+/// where it lands, and none of it asks what anything costs. Join ordering is the first pass that
+/// searches, and everything after it is choosing how the plan runs, which is what somebody means by
+/// the optimizer. A test holds the index to the pass, so a pass added in front of join ordering
+/// moves the line with it or fails.
+pub const REWRITES: usize = 9;
+
+/// [`optimize_with`], saying how many wall nanoseconds of it were the rewrites.
+///
+/// The rewrites are the lowering of dependent joins and the passes in front of [`REWRITES`]. The
+/// rest of the time is the caller's to take from its own span, which is what keeps this at one
+/// clock read. A debug build runs the sequence a second time to check it settled, and that second
+/// run is not a rewrite or an optimization of anything, so the number is taken from the first run
+/// only and a debug build's caller sees the check in its optimize time.
+///
+/// # Errors
+///
+/// The same as [`optimize_with`].
+pub fn optimize_timed(plan: &mut Plan, context: &Context) -> Result<u64> {
+    let started = Instant::now();
     // The master ablation, and the whole of it. Every rule with a switch of its own also has
     // `Rule::StatsAll` as its master and so is already off by the time a pass asks, but the passes
     // are not the only readers: a cardinality the join order chose on, a bound a filter was ordered
@@ -337,13 +367,15 @@ pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
         plan.forget_statistics();
     }
     unnest::lower(plan)?;
-    run(plan, context, &PASSES)
+    let rewritten = run(plan, context, &PASSES)?;
+    Ok(u64::try_from(rewritten.saturating_duration_since(started).as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// The sequence, over a list of passes the tests can choose.
-fn run(plan: &mut Plan, context: &Context, passes: &[&(dyn Pass + Sync)]) -> Result<()> {
+/// The sequence, over a list of passes the tests can choose, saying when the first run of it got
+/// past the rewrites.
+fn run(plan: &mut Plan, context: &Context, passes: &[&(dyn Pass + Sync)]) -> Result<Instant> {
     let before = output_columns(plan, plan.root());
-    once(plan, context, passes)?;
+    let rewritten = once(plan, context, passes)?;
     if cfg!(debug_assertions) {
         plan.validate()?;
         let after = output_columns(plan, plan.root());
@@ -361,18 +393,28 @@ fn run(plan: &mut Plan, context: &Context, passes: &[&(dyn Pass + Sync)]) -> Res
             )));
         }
     }
-    Ok(())
+    Ok(rewritten)
 }
 
-/// One run of every pass that is turned on.
-fn once(plan: &mut Plan, context: &Context, passes: &[&(dyn Pass + Sync)]) -> Result<()> {
-    for pass in passes {
+/// One run of every pass that is turned on, saying when it got to the pass at [`REWRITES`].
+///
+/// A list shorter than that is all rewrites, so the time comes back as the end of the list.
+fn once(plan: &mut Plan, context: &Context, passes: &[&(dyn Pass + Sync)]) -> Result<Instant> {
+    let (rewrites, rest) = passes.split_at(REWRITES.min(passes.len()));
+    for pass in rewrites {
         if context.is_disabled(pass.name()) {
             continue;
         }
         pass.run(plan, context)?;
     }
-    Ok(())
+    let rewritten = Instant::now();
+    for pass in rest {
+        if context.is_disabled(pass.name()) {
+            continue;
+        }
+        pass.run(plan, context)?;
+    }
+    Ok(rewritten)
 }
 
 /// How many columns a node produces, which no pass is allowed to change at the root.
@@ -451,6 +493,21 @@ mod tests {
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         optimize(&mut plan).unwrap_or_else(|error| panic!("{text} did not optimize: {error}"));
         plan.to_string()
+    }
+
+    #[test]
+    fn the_rewrites_end_where_join_ordering_begins() {
+        assert_eq!(PASSES[REWRITES].name(), "join_order");
+    }
+
+    #[test]
+    fn the_rewrites_are_part_of_the_optimizer_time() {
+        let sql = "SELECT x FROM (VALUES (1), (2)) t(x) WHERE x > 1 AND 1 = 1";
+        let mut plan = rudb_bind::bind_sql(sql, &Catalog::new()).expect("the query binds");
+        let started = Instant::now();
+        let rewrite_ns = optimize_timed(&mut plan, &Context::new()).expect("it optimizes");
+        let whole = u64::try_from(started.elapsed().as_nanos()).expect("a short run");
+        assert!(rewrite_ns > 0 && rewrite_ns <= whole, "{rewrite_ns} of {whole}");
     }
 
     #[test]

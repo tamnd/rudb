@@ -125,6 +125,7 @@ impl Document {
             out.count("parse_ns", self.timing.parse_ns);
             out.count("bind_ns", self.timing.bind_ns);
             out.count("optimize_ns", self.timing.optimize_ns);
+            out.count("rewrite_ns", self.timing.rewrite_ns);
             out.count("physical_ns", self.timing.physical_ns);
             out.count("execute_ns", self.timing.execute_ns);
             out.count("total_ns", self.timing.total_ns);
@@ -450,6 +451,14 @@ pub struct Timing {
     pub bind_ns: u64,
     /// The optimizer passes.
     pub optimize_ns: u64,
+    /// The part of `optimize_ns` that went on the rewrites, which is every pass in front of join
+    /// ordering and the lowering of dependent joins before them.
+    ///
+    /// A part of `optimize_ns` rather than a phase of its own next to it, because a reader of an
+    /// older document takes `optimize_ns` to be the whole optimizer and changing that would be a
+    /// schema change. The optimizer proper is `optimize_ns` minus this, and `rudb_statement_metrics()`
+    /// prints the two apart.
+    pub rewrite_ns: u64,
     /// The physical plan and the operator tree.
     pub physical_ns: u64,
     /// Running it.
@@ -936,6 +945,7 @@ mod tests {
         metrics.timing.parse_ns = 41_000;
         metrics.timing.bind_ns = 88_000;
         metrics.timing.optimize_ns = 310_000;
+        metrics.timing.rewrite_ns = 120_000;
         metrics.timing.physical_ns = 44_000;
         metrics.timing.execute_ns = 1_323_000_000;
         metrics.timing.total_ns = 1_323_483_000;
