@@ -4,7 +4,7 @@
 
 q06 filters `lineitem` on `l_shipdate >= date '1994-01-01' and l_shipdate < date '1995-01-01'` and on `l_discount between 0.05 and 0.07`, which the plan hands the scan as five conjuncts. The filter runs them one at a time, each over the rows the ones before it kept, and learns which order rejects the most for the least. That works well when one conjunct is selective. Here none is. Each end of the date range keeps between 45 and 70 percent of the rows it is given, and it is only the two together that keep 15 percent. So the first conjunct walks the whole chunk and builds a selection of more than half of it, and the second walks that selection again to throw most of it away. At SF1 on one thread q06 retired 431 M instructions against 319 M for DuckDB.
 
-The same shape, a low and a high bound on one column, is in q04, q05, q10, q12 and q14 on a date and in q15 on `l_shipdate`, so this is not a q06 problem alone.
+The same shape, a low and a high bound on one column, is in q04, q05, q10, q12, q14 and q15, each on a date, so this is not a q06 problem alone.
 
 ## The change
 
