@@ -444,7 +444,7 @@ fn bits(at: usize) -> u64 {
 /// The obvious loop, clearing the lowest set bit `nth` times. `pdep` does this in one instruction
 /// on x86 and there is no portable way to say so yet, so this is the version that is correct
 /// everywhere and the place to put the intrinsic when a measurement asks for it.
-fn nth_set(mut word: u64, nth: u32) -> u32 {
+pub(crate) fn nth_set(mut word: u64, nth: u32) -> u32 {
     for _ in 0..nth {
         word &= word - 1;
     }

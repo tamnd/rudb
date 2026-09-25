@@ -327,6 +327,57 @@ impl Link {
         Ok(())
     }
 
+    /// The parent of each child in a list, with [`NO_PARENT`] for a child that has none or is past
+    /// the end.
+    ///
+    /// This is [`Link::forward`] over the rows a filter or a reduction left, and it is for the
+    /// monotone form again. A child there is a `select1` and a `rank0`, about three hundred
+    /// instructions between them, and on q09 those were a tenth of the query for 319,404 children.
+    /// The children a scan hands up are ascending, so the next one is usually a few words further
+    /// along the bitmap than the last, and walking those words is a count of ones per word. A
+    /// child further away than [`Link::WALK`] children, or one before the last, is searched for
+    /// again, so the answer is the same in any order and only the cost depends on it.
+    pub fn forward_each(&self, children: &[Rid], out: &mut Vec<Rid>) {
+        out.clear();
+        out.reserve(children.len());
+        let Body::Monotone { vector } = &self.body else {
+            out.extend(children.iter().map(|&child| self.forward(child).unwrap_or(NO_PARENT)));
+            return;
+        };
+        let words = vector.words();
+        // The last child answered, the position of its bit and its parent.
+        let mut last: Option<(Rid, usize, Rid)> = None;
+        for &child in children {
+            if child >= self.children {
+                out.push(NO_PARENT);
+                continue;
+            }
+            let near = last.filter(|&(from, ..)| child >= from && child - from <= Self::WALK);
+            let (at, parent) = match near {
+                Some((from, at, parent)) => {
+                    walk_ones(words, at, parent, child - from).unwrap_or((usize::MAX, NO_PARENT))
+                }
+                None => match vector.select1(child) {
+                    Some(at) => (at, vector.rank0(at)),
+                    None => (usize::MAX, NO_PARENT),
+                },
+            };
+            if parent == NO_PARENT {
+                last = None;
+            } else {
+                last = Some((child, at, parent));
+            }
+            out.push(parent);
+        }
+    }
+
+    /// How many children [`Link::forward_each`] walks the bitmap across before it searches instead.
+    ///
+    /// A word walked is about five instructions and holds a few dozen children on a table with a
+    /// few children per parent, and a search is about three hundred, so the break even is some
+    /// thousands of children and this stays well under it.
+    const WALK: Rid = 1024;
+
     /// The children of a parent row, as a half open range of child `rid`s.
     ///
     /// `None` for the packed form, which does not answer this direction, and for a parent past the
@@ -556,6 +607,39 @@ fn reserved(width: usize) -> u64 {
 }
 
 /// A row count as a `u64`, which is what every count in a header is.
+/// The position and parent of the one bit `skip` ones after the one at `at`, whose parent is
+/// `parent`, or `None` if the bitmap runs out first.
+///
+/// Each zero crossed is a parent boundary. A word at a time: shift out the bits at or before the
+/// current one, and either the ones left in the word are too few, so count them and its zeros and
+/// move on, or the one wanted is in it.
+fn walk_ones(words: &[u64], at: usize, mut parent: Rid, skip: Rid) -> Option<(usize, Rid)> {
+    if skip == 0 {
+        return Some((at, parent));
+    }
+    let mut left = skip - 1;
+    let mut from = at + 1;
+    loop {
+        let index = from / 64;
+        let offset = from % 64;
+        let word = *words.get(index)? >> offset;
+        let span = 64 - offset;
+        let ones = u64::from(word.count_ones());
+        if ones > left {
+            #[expect(clippy::cast_possible_truncation, reason = "under the ones in one word")]
+            let within = crate::bits::nth_set(word, left as u32) as usize;
+            // The zeros between `from` and the one found are the parents crossed.
+            parent += count(within) - left;
+            return Some((from + within, parent));
+        }
+        // The caller checked the child against the count of children, so the one wanted is in
+        // the words and the tail past the length is never reached.
+        parent += count(span) - ones;
+        left -= ones;
+        from += span;
+    }
+}
+
 fn count(rows: usize) -> u64 {
     u64::try_from(rows).unwrap_or(u64::MAX)
 }
@@ -812,6 +896,48 @@ mod tests {
             }
             let mut out = vec![0; 2];
             assert!(link.forward_run(children - 1, &mut out).is_err(), "past the last child");
+        }
+    }
+
+    /// A list of children decodes to what the per child lookup says, whether the list goes up in
+    /// small steps, in steps past the walk, backwards, or past the last child.
+    #[test]
+    fn a_list_agrees_with_the_per_child_lookup_in_both_forms() {
+        let mut clustered = Vec::new();
+        for parent in 0..3000_u64 {
+            let children = if parent % 50 < 45 { parent % 3 } else { parent % 7 + 1 };
+            clustered.extend(std::iter::repeat_n(parent, children as usize));
+        }
+        let scattered: Vec<Rid> = (0..3000_u64)
+            .map(|child| if child % 13 == 0 { NO_PARENT } else { (child * 37) % 500 })
+            .collect();
+        for (parents_of, parents) in [(clustered, 3000), (scattered, 500)] {
+            let link = Link::build(&parents_of, parents).expect("build");
+            let children = link.children();
+            let mut lists: Vec<Vec<Rid>> = vec![
+                Vec::new(),
+                (0..children).collect(),
+                (0..children).step_by(7).collect(),
+                (0..children).step_by(1500).collect(),
+                (0..children).rev().step_by(11).collect(),
+                vec![5, 5, 4, children - 1, children, children + 9, 0, 63, 64, 65],
+            ];
+            let mut state = 7_u64;
+            let mut sparse = Vec::new();
+            for child in 0..children {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                if state >> 60 == 0 {
+                    sparse.push(child);
+                }
+            }
+            lists.push(sparse);
+            let mut out = Vec::new();
+            for list in &lists {
+                link.forward_each(list, &mut out);
+                let want: Vec<Rid> =
+                    list.iter().map(|&child| link.forward(child).unwrap_or(NO_PARENT)).collect();
+                assert_eq!(out, want, "{:?} over {} children", link.form(), list.len());
+            }
         }
     }
 }

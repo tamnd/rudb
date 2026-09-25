@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Parent;
 use rudb_common::{Cancel, Error, LogicalType, Memory, Reservation, Result, Session};
-use rudb_graph::Link;
+use rudb_graph::{Link, NO_PARENT, Rid};
 use rudb_pipeline::{Compaction, Gauge, Lease, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, JoinKind, Plan};
 use rudb_seam::{Context, SeamId, Settings};
@@ -99,6 +99,9 @@ pub(crate) struct Linking {
     /// One buffer per instance, reused per chunk, and handed to every projected parent column of
     /// that chunk at once. Eight gathered columns off one chunk are eight pointers and one buffer.
     rids: Vec<u32>,
+    /// The chunk's child row ids and the parents the link answered for them, reused per chunk.
+    children: Vec<Rid>,
+    parents: Vec<Rid>,
     gauge: Gauge,
 }
 
@@ -201,23 +204,29 @@ impl LinkJoin {
         let held = held.get(..rows).ok_or_else(|| {
             Error::internal("a link join was handed fewer row ids than the chunk has rows")
         })?;
+        local.children.clear();
+        for &id in held {
+            local.children.push(
+                u64::try_from(id).map_err(|_| {
+                    Error::internal("a link join was handed a negative child row id")
+                })?,
+            );
+        }
+        // A child past the end of the link comes back with no parent, the same answer as one with
+        // no parent, and for the same reason: section 3.1 says the answer to a section that does
+        // not cover a row is no section, and no section says nothing about that row. A child past
+        // the end can only be a row appended since the link was built, and `Rows::stored` already
+        // refused a table that has any.
+        self.link.forward_each(&local.children, &mut local.parents);
         local.rids.clear();
         local.rids.reserve(rows);
-        for &id in held {
-            let child = u64::try_from(id)
-                .map_err(|_| Error::internal("a link join was handed a negative child row id"))?;
-            // `forward` answers `None` for a child past the end of the link as well as for one with
-            // no parent, which is the same answer for the same reason: section 3.1 says the answer
-            // to a section that does not cover a row is no section, and no section says nothing
-            // about that row. A child past the end can only be a row appended since the link was
-            // built, and `Rows::stored` already refused a table that has any.
-            local.rids.push(match self.link.forward(child) {
-                Some(parent) => {
-                    u32::try_from(parent).ok().filter(|&rid| rid != NO_ROW).ok_or_else(|| {
-                        Error::internal("a link answered a parent row id a gather cannot hold")
-                    })?
-                }
-                None => NO_ROW,
+        for &parent in &local.parents {
+            local.rids.push(if parent == NO_PARENT {
+                NO_ROW
+            } else {
+                u32::try_from(parent).ok().filter(|&rid| rid != NO_ROW).ok_or_else(|| {
+                    Error::internal("a link answered a parent row id a gather cannot hold")
+                })?
             });
         }
         Ok(())
@@ -282,7 +291,13 @@ impl Stream for LinkJoin {
     type Local = Linking;
 
     fn local(&self) -> Linking {
-        Linking { scratch: self.rid.scratch(), rids: Vec::new(), gauge: Gauge::new(1) }
+        Linking {
+            scratch: self.rid.scratch(),
+            rids: Vec::new(),
+            children: Vec::new(),
+            parents: Vec::new(),
+            gauge: Gauge::new(1),
+        }
     }
 
     fn prepare(&self, _threads: &Lease<'_>) -> Result<()> {
