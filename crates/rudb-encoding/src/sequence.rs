@@ -12,6 +12,13 @@
 //! code takes each state can be worked out once per chunk and then looked up. A string is then one
 //! lookup per code rather than a decompression, a copy and a search over the bytes, and the lookups
 //! are filled in only for the states a string actually reached. See `spec/perf/44-like-on-codes.md`.
+//!
+//! Walking is still a step per code for every string, and a filter that keeps nearly every row
+//! walks nearly every string to the end. [`grams`] is the sketch that saves the walk: a bit for
+//! each run of three bytes a string holds, hashed into sixty four. A string that holds a piece
+//! holds every run of three in it, so a string whose sketch lacks one of the piece's bits cannot
+//! hold the piece, and only the strings whose sketch has all of them are walked. The writer keeps
+//! one sketch per row of a long text column, see `spec/graph/12-the-order-the-suite-asks-for.md`.
 
 use rudb_common::{Error, Result};
 
@@ -29,6 +36,24 @@ pub struct Sequence {
     next: Vec<u8>,
     /// That last state.
     done: u8,
+    /// The [`grams`] bits every string that holds the pieces has.
+    needs: u64,
+}
+
+/// The bit a run of three bytes sets in a sketch.
+#[inline]
+fn gram(a: u8, b: u8, c: u8) -> u64 {
+    let run = u32::from(a) << 16 | u32::from(b) << 8 | u32::from(c);
+    1 << (run.wrapping_mul(0x9E37_79B1) >> 26)
+}
+
+/// The sketch of `text`: a bit for every run of three bytes in it, hashed into sixty four.
+///
+/// Stored by the writer, one per row, and read against [`Sequence::needs`]. The hash is part of the
+/// file format, since a sketch written by one build is read by the next.
+#[must_use]
+pub fn grams(text: &[u8]) -> u64 {
+    text.windows(3).fold(0, |bits, run| bits | gram(run[0], run[1], run[2]))
 }
 
 impl Sequence {
@@ -69,7 +94,17 @@ impl Sequence {
         for byte in 0..256 {
             next[total * 256 + byte] = total as u8;
         }
-        Some(Self { next, done: total as u8 })
+        let needs = pieces.iter().fold(0, |bits, piece| bits | grams(piece));
+        Some(Self { next, done: total as u8, needs })
+    }
+
+    /// The sketch bits a string has to have to hold the pieces. A string whose [`grams`] lack any
+    /// of them does not hold the pieces, and one that has them all may.
+    ///
+    /// Zero when no piece is three bytes long, which every string passes.
+    #[must_use]
+    pub fn needs(&self) -> u64 {
+        self.needs
     }
 
     fn states(&self) -> usize {
@@ -170,6 +205,29 @@ mod tests {
             }
         }
         true
+    }
+
+    /// A string that holds the pieces always has the bits they need, so the sketch never turns
+    /// away a string the walk would have kept.
+    #[test]
+    fn a_string_that_holds_the_pieces_has_every_bit_they_need() {
+        let cases: [&[&[u8]]; 4] =
+            [&[b"special", b"requests"], &[b"furiously"], &[b"ab"], &[b"aab", b"sts", b"\xc3\xa9"]];
+        for pieces in cases {
+            let sequence = Sequence::new(pieces).expect("an automaton");
+            let mut kept = 0;
+            for text in texts() {
+                let has = grams(&text) & sequence.needs() == sequence.needs();
+                if searched(&text, pieces) {
+                    assert!(has, "{:?} holds {pieces:?} and its sketch says not", text);
+                    kept += 1;
+                }
+            }
+            assert!(kept > 0, "{pieces:?} is held somewhere, so the test tests something");
+        }
+        assert_eq!(Sequence::new(&[b"ab"]).expect("an automaton").needs(), 0);
+        assert_eq!(grams(b"ab"), 0, "no run of three");
+        assert_ne!(grams(b"special") & grams(b"requests"), grams(b"special"));
     }
 
     fn texts() -> Vec<Vec<u8>> {

@@ -2160,6 +2160,38 @@ fn index(
     rebind(path, catalog, &names, pages)
 }
 
+/// Sketches the long text columns of every table in the file that has no current sketch.
+///
+/// Apart from [`index`] because nothing has to be declared for it: a text sketch answers a `LIKE`
+/// on the column it was built from and on nothing else, so the file is all it needs. A table whose
+/// sketches are current is passed over, which is what keeps a checkpoint that changed one table
+/// from reading the text of all of them. See `rudb_native::grams`.
+fn sketch(path: &Path, catalog: &mut Catalog, pages: &rudb_native::PagePool) -> Result<()> {
+    let native = rudb_native::Catalog::open_in(path, pages)?;
+    let mut stale = Vec::new();
+    for name in native.names() {
+        if !rudb_native::grams::current(&native.table(name)?) {
+            stale.push(name.to_string());
+        }
+    }
+    drop(native);
+    let mut names = Vec::new();
+    for table in &stale {
+        rudb_native::grams::build_text_grams(path, table)?;
+        if let Some(name) = catalog
+            .tables()
+            .find(|held| held.name().table == *table)
+            .map(|held| held.name().clone())
+        {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    rebind(path, catalog, &names, pages)
+}
+
 /// The declared relationships whose four names all resolve, as the link builder wants them.
 ///
 /// A declaration that names a table or a column that is not there is dropped rather than reported.
@@ -3475,6 +3507,7 @@ impl Shared {
                 if let Some(path) = self.inner.path.as_ref().filter(|_| self.inner.writable) {
                     persist(path, &mut catalog, &self.inner.pages, DEFAULT_CATALOG)?;
                     index(path, &mut catalog, &self.inner.settings.links(), &self.inner.pages)?;
+                    sketch(path, &mut catalog, &self.inner.pages)?;
                 }
                 Ok(QueryResult::empty())
             }

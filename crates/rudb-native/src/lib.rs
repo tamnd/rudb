@@ -55,6 +55,7 @@ use rudb_vector::validity::Validity;
 use rudb_vector::{Buffer, Chunk, Data, Packed, TextSource, Vector, search_below};
 
 mod distinct;
+pub mod grams;
 pub mod graph;
 pub mod host;
 mod prepare;
@@ -4233,6 +4234,11 @@ pub struct Reader {
     /// reads hashed the whole part again: on TPC-H q21, which reads `lineitem` three times, that was
     /// 4 percent of the query.
     verified: Arc<Vec<AtomicU64>>,
+    /// Each text column's [`grams`] sketch in row id order, read the first time a `LIKE` asks
+    /// about the column, and `None` when the table carries none for it.
+    text_grams: Arc<Vec<OnceLock<Option<Vec<u64>>>>>,
+    /// The row id of every part's first row, by table wide part number.
+    firsts: Arc<Vec<usize>>,
     /// The file's size when it was opened, for [`Reader::layout`].
     size: u64,
     /// The committed directory's size, for [`Reader::layout`].
@@ -6321,6 +6327,14 @@ impl Reader {
             .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
             .collect();
         let verified = (places.len() * table_fields).div_ceil(64);
+        let firsts = places
+            .iter()
+            .scan(0, |first, place| {
+                let at = *first;
+                *first += place.rows as usize;
+                Some(at)
+            })
+            .collect();
         Ok(Self {
             file,
             table: Arc::new(table),
@@ -6338,6 +6352,8 @@ impl Reader {
             pages: Arc::new(AtomicUsize::new(0)),
             indexes: Arc::new(AtomicUsize::new(0)),
             verified: Arc::new((0..verified).map(|_| AtomicU64::new(0)).collect()),
+            text_grams: Arc::new((0..table_fields).map(|_| OnceLock::new()).collect()),
+            firsts: Arc::new(firsts),
             size,
             directory,
             opening,
@@ -7263,7 +7279,17 @@ impl Reader {
                 }
                 _ => return Err(invalid("page validity tag differs")),
             };
-            let Some(held) = string::holds_in(&bytes[cur.at..], sequence)? else {
+            // A row whose sketch lacks a bit the pieces need cannot hold them, so only the rest
+            // are walked. See `grams`.
+            let needs = sequence.needs();
+            let first = self.firsts.get(part).copied().unwrap_or_default();
+            let sketch = self
+                .text_grams
+                .get(column)
+                .and_then(|slot| slot.get_or_init(|| grams::text_grams(self, column)).as_deref())
+                .and_then(|words| words.get(first..first + rows));
+            let maybe = |row: usize| sketch.is_none_or(|words| words[row] & needs == needs);
+            let Some(held) = string::holds_in_where(&bytes[cur.at..], sequence, maybe)? else {
                 return Ok(None);
             };
             if held.len() != rows {
