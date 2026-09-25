@@ -162,6 +162,11 @@ pub(crate) fn cell(b: &[u8]) -> [u8; 16] {
 }
 
 /// The rows of `chunks` in the order of `keys`, then `offset` of them skipped and `count` kept.
+///
+/// Only the key columns are copied out, and what is sorted is row positions, so a top ten over ten
+/// million groups (ClickBench q33) holds one value per group and not a whole row. With a `count`
+/// the positions past it are cut with a selection before the sort. Equal keys keep the order they
+/// came in, which is what the stable sort this replaced gave, so the answer did not change.
 pub(crate) fn sort(
     chunks: Vec<Chunk>,
     keys: &[Key],
@@ -171,12 +176,6 @@ pub(crate) fn sort(
     let Some(types) = chunks.first().map(Chunk::types) else {
         return Ok(Vec::new());
     };
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    for chunk in &chunks {
-        for i in 0..chunk.len() {
-            rows.push(chunk.row(i).collect());
-        }
-    }
     let keys: Vec<(usize, bool, bool)> = keys
         .iter()
         .map(|k| match k.expr.kind {
@@ -184,10 +183,21 @@ pub(crate) fn sort(
             _ => Err(Error::internal("a sort key the check let through")),
         })
         .collect::<Result<_>>()?;
+    let mut place: Vec<(u32, u32)> = Vec::new();
+    let mut columns: Vec<Vec<Value>> = vec![Vec::new(); keys.len()];
+    for (at, chunk) in chunks.iter().enumerate() {
+        for (column, &(c, _, _)) in columns.iter_mut().zip(&keys) {
+            let vector = chunk.column(c)?;
+            column.extend((0..chunk.len()).map(|i| vector.value_at(i)));
+        }
+        place.extend((0..chunk.len()).map(|i| (at as u32, i as u32)));
+    }
     let mut failed = None;
-    rows.sort_by(|l, r| {
-        for &(c, descending, nulls_first) in &keys {
-            let o = match (l[c].is_null(), r[c].is_null()) {
+    let mut compare = |l: &u32, r: &u32| {
+        let (l, r) = (*l as usize, *r as usize);
+        for (column, &(_, descending, nulls_first)) in columns.iter().zip(&keys) {
+            let (a, b) = (&column[l], &column[r]);
+            let o = match (a.is_null(), b.is_null()) {
                 (true, true) => Ordering::Equal,
                 (true, false) => {
                     if nulls_first {
@@ -203,7 +213,7 @@ pub(crate) fn sort(
                         Ordering::Less
                     }
                 }
-                (false, false) => match order(&l[c], &r[c]) {
+                (false, false) => match order(a, b) {
                     Ok(o) if descending => o.reverse(),
                     Ok(o) => o,
                     Err(e) => {
@@ -216,14 +226,30 @@ pub(crate) fn sort(
                 return o;
             }
         }
-        Ordering::Equal
-    });
+        l.cmp(&r)
+    };
+    let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+    let take = count.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let wanted = skip.saturating_add(take);
+    let mut kept: Vec<u32> = (0..place.len() as u32).collect();
+    if wanted == 0 {
+        kept.clear();
+    } else if wanted < kept.len() {
+        kept.select_nth_unstable_by(wanted - 1, &mut compare);
+        kept.truncate(wanted);
+    }
+    kept.sort_unstable_by(&mut compare);
     if let Some(e) = failed {
         return Err(e);
     }
-    let skip = usize::try_from(offset).unwrap_or(usize::MAX);
-    let take = count.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
-    let rows: Vec<Vec<Value>> = rows.into_iter().skip(skip).take(take).collect();
+    let rows: Vec<Vec<Value>> = kept
+        .iter()
+        .skip(skip)
+        .map(|&n| {
+            let (at, i) = place[n as usize];
+            chunks[at as usize].row(i as usize).collect()
+        })
+        .collect();
     let mut out = Vec::new();
     for part in rows.chunks(VECTOR_SIZE) {
         let mut vectors = Vec::with_capacity(types.len());
