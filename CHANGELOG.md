@@ -18,6 +18,8 @@ The 0.4.33 to 0.4.36 release runs all stopped in the tag check before they publi
 
 #1935 takes a struct apart into columns in a root unnest, and #1938 runs an unnest in a `GROUP BY` key under the grouping and lets a series read a query in its arguments.
 
+#1941 reads `ARRAY[...]` and `ARRAY(SELECT ...)` the way the pin does, #1944 reads an `ORDER BY` inside an aggregate call and #1945 orders an `ARRAY` subquery by it. #1943 keeps a sketch of long text columns so a `LIKE` only walks the rows that might match. #1946 lays out a join side on every thread. #1942 measures one planner rule at a time and reports what the statistics are worth on ClickBench. #1947 makes CI green again on Rust 1.98, where clippy has new lints and `cargo doc` refused three links to private items, which is what stopped the first 0.5.0 tag.
+
 ## 0.4.36
 
 A patch release of seven commits, mostly on the graph layer's link joins, with the fused hash join in the compiled engine and two families of list functions. The native directory format number stays at 30 and the storage format version at 9.
