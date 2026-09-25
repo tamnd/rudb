@@ -2394,6 +2394,8 @@ struct NativePlace {
     /// The stripe `held` goes into once there are [`FEED_PARTS`] of them, and how many parts it
     /// has been handed so far.
     building: Option<rudb_native::Building>,
+    /// What `building` was last charged to the load profile, given back once it is written.
+    built: u64,
     fed: usize,
     started: Option<Span>,
     inside_wall: u64,
@@ -2581,8 +2583,16 @@ impl NativeSink {
         let inside = Span::start();
         let building = place.building.get_or_insert_with(|| self.preparer.start());
         let fed = self.preparer.feed(building, parts);
-        // The rows are charged until they are encoded, which is when they are let go. What the
-        // stripe has built from them so far is pages, a small fraction of the rows.
+        // The rows are charged until they are encoded, which is when they are let go, and what
+        // the stripe built from them is charged from here until it is written. The stripe is
+        // charged first so the two never both look let go at once.
+        let now = building.held();
+        if now >= place.built {
+            self.profile.hold(now - place.built);
+        } else {
+            self.profile.release(place.built - now);
+        }
+        place.built = now;
         self.profile.release(holding);
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
@@ -2613,6 +2623,7 @@ impl NativeSink {
         let (wall, cpu) = inside.stop();
         place.inside_wall = place.inside_wall.saturating_add(wall);
         place.inside_cpu = place.inside_cpu.saturating_add(cpu);
+        self.profile.release(std::mem::take(&mut place.built));
         // The stripe's rows, its pages and whatever the encode built along the way were all just
         // let go, which is the moment the allocator has the most to hand back.
         rudb_common::heap::release();

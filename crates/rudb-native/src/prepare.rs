@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 use rudb_common::{Error, LogicalType, Result};
 use rudb_metrics::{LoadProfile, Stage};
 use rudb_storage::Range;
+use rudb_storage::sieve::Sieve;
 use rudb_vector::{Bitmap, Chunk, Data, StringColumn, Validity, Vector};
 
 use super::{
@@ -280,6 +281,24 @@ struct LocalPart {
 }
 
 impl Local {
+    /// The bytes the dictionary and the codes of the parts so far take up.
+    fn held(&self) -> usize {
+        // A hash table slot is its key, its value and one control byte.
+        self.first.capacity() * (size_of::<u64>() + size_of::<u32>() + 1)
+            + spilled(&self.next)
+            + spilled(&self.hashes)
+            + spilled(&self.checks)
+            + spilled(&self.bytes)
+            + spilled(&self.ends)
+            + spilled(&self.counts)
+            + spilled(&self.parts)
+            + self
+                .parts
+                .iter()
+                .map(|part| spilled(&part.codes) + spilled(&part.validity))
+                .sum::<usize>()
+    }
+
     /// One column of a stripe, coded in one go.
     #[cfg(test)]
     fn code_column(index: usize, held: &[PendingChunk]) -> Result<Self> {
@@ -799,6 +818,46 @@ impl Building {
     pub fn parts(&self) -> usize {
         self.parts.len()
     }
+
+    /// The bytes the stripe holds so far: every column's codes, stripe dictionary and pages.
+    ///
+    /// The rows a load hands in are charged until they are encoded, and this is what they turn
+    /// into. It is not the small fraction of them it sounds like. A text column coded against its
+    /// stripe dictionary keeps four bytes of code a row and every distinct value with its hashes,
+    /// and each worker of a load has a stripe of its own going.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        let bytes: usize = self
+            .columns
+            .iter()
+            .map(|growing| {
+                growing.lock().map_or(0, |growing| match &growing.body {
+                    Body::Pages(stripe, _) => stripe_bytes(stripe),
+                    Body::Coded(local, mapped) => {
+                        local.held() + mapped.as_ref().map_or(0, |(_, codes)| spilled(codes))
+                    }
+                })
+            })
+            .sum();
+        bytes as u64
+    }
+}
+
+/// The bytes a column's finished pages and what goes beside them take up.
+fn stripe_bytes(stripe: &ColumnStripe) -> usize {
+    stripe.pages.iter().map(Vec::capacity).sum::<usize>()
+        + spilled(&stripe.pages)
+        + spilled(&stripe.sums)
+        + stripe.codes.iter().flatten().map(spilled).sum::<usize>()
+        + spilled(&stripe.codes)
+        + stripe.sieves.iter().flatten().map(Sieve::len).sum::<usize>()
+        + spilled(&stripe.sieves)
+        + spilled(&stripe.ranges)
+}
+
+/// The bytes a vector's buffer takes up, whatever is in it.
+fn spilled<T>(values: &Vec<T>) -> usize {
+    values.capacity() * size_of::<T>()
 }
 
 /// One column of a stripe that is being built.
