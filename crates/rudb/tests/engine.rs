@@ -31,6 +31,7 @@ fn the_compiled_engine_answers_what_the_first_engine_answers() {
         "SELECT s, count(*), avg(x) FROM t GROUP BY s ORDER BY s NULLS FIRST",
         "SELECT x + 1, s FROM t WHERE x > 30 ORDER BY 1, 2 LIMIT 7 OFFSET 3",
         "SELECT x, count(DISTINCT s) AS c FROM t GROUP BY x ORDER BY c DESC, x LIMIT 5",
+        "SELECT replace(s, 'w', 'a longer string '), abs(x) % 7, concat(s, '!') FROM t ORDER BY 1, 2, 3 LIMIT 20",
     ];
     for sql in queries {
         database.execute("SET engine = 'first'").expect("the first engine");

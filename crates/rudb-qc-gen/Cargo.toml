@@ -14,11 +14,15 @@ readme.workspace = true
 
 [dependencies]
 rudb-common.workspace = true
+# For the scalar functions with no translator, which a `vcall` runs with the first engine's own
+# kernels over one row vectors, so their answers and errors are that engine's.
+rudb-kernels.workspace = true
 rudb-plan.workspace = true
 rudb-qc-ir.workspace = true
 rudb-qc-pipe.workspace = true
 rudb-qc-plan.workspace = true
 rudb-qc-rt.workspace = true
+rudb-vector.workspace = true
 
 [dev-dependencies]
 rudb-qc-interp.workspace = true
