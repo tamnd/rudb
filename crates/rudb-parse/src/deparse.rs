@@ -349,7 +349,9 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Literal { kind, text } => literal(ast, kind, text),
         Expr::Unary { op, operand } => unary(ast, op, operand),
         Expr::Binary { op, left, right } => binary(ast, op, left, right),
-        Expr::Function { name, args, distinct, filter } => call(ast, name, args, distinct, filter),
+        Expr::Function { name, args, distinct, filter } => {
+            call(ast, name, args, distinct, filter, ast.named_args(index))
+        }
         held @ Expr::Window { .. } => window(ast, held),
         Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
@@ -645,7 +647,14 @@ fn binary(ast: &Ast, op: BinaryOp, left: ExprRef, right: ExprRef) -> String {
 }
 
 /// A function call.
-fn call(ast: &Ast, name: Slice, args: Slice, distinct: bool, filter: ExprRef) -> String {
+fn call(
+    ast: &Ast,
+    name: Slice,
+    args: Slice,
+    distinct: bool,
+    filter: ExprRef,
+    named: &[Target],
+) -> String {
     let written = parts(ast, name);
     let list = ast.expr_list(args);
     // `count(*)` is a different function from `count`, and the star is how it is spelled rather than
@@ -660,12 +669,19 @@ fn call(ast: &Ast, name: Slice, args: Slice, distinct: bool, filter: ExprRef) ->
         }
     }
     let word = if distinct { "DISTINCT " } else { "" };
-    format!(
-        "{}({word}{}){}",
-        operator(ast, name, &written),
-        exprs(ast, args),
-        filtered(ast, filter)
-    )
+    // Named arguments come after the positional ones, the way they had to be written.
+    let mut listed = exprs(ast, args);
+    for target in named {
+        if !listed.is_empty() {
+            listed.push_str(", ");
+        }
+        listed.push_str(&format!(
+            "{} := {}",
+            quoted(ast.string(target.alias)),
+            expr(ast, target.expr)
+        ));
+    }
+    format!("{}({word}{listed}){}", operator(ast, name, &written), filtered(ast, filter))
 }
 
 /// The `FILTER` a call was written with, or nothing at all when it was written without one.

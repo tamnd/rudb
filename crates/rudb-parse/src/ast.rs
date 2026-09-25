@@ -1393,6 +1393,10 @@ pub struct Ast {
     pub ctes: Vec<Cte>,
     /// Backing store for every [`Slice`] of materialised `WITH` indexes.
     pub cte_lists: Vec<u32>,
+    /// The named arguments of the calls that take any, each call with a run of targets whose alias
+    /// is the name. Only `unnest` takes them so far, and a side table keeps every other call as it
+    /// was rather than carrying an empty list on each.
+    pub named_args: Vec<(ExprRef, Slice)>,
 }
 
 impl Ast {
@@ -1486,6 +1490,15 @@ impl Ast {
     /// The entries of a target list.
     pub fn target_list(&self, slice: Slice) -> &[Target] {
         &self.targets[slice.range()]
+    }
+
+    /// The named arguments of a call, in the order they were written, each as a target whose alias
+    /// is the name. Empty for a call that has none.
+    pub fn named_args(&self, call: ExprRef) -> &[Target] {
+        self.named_args
+            .iter()
+            .find(|(held, _)| *held == call)
+            .map_or(&[], |&(_, slice)| self.target_list(slice))
     }
 
     /// The entries of an order by list.

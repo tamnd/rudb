@@ -94,6 +94,19 @@ impl Binder<'_> {
             ast::Expr::Literal { kind, text } => self.bind_literal(ast, kind, text),
             ast::Expr::Unary { op, operand } => self.bind_unary(ast, op, operand, scope),
             ast::Expr::Binary { op, left, right } => self.bind_binary(ast, op, left, right, scope),
+            ast::Expr::Function { name, args, distinct, filter }
+                if name.len == 1
+                    && rudb_catalog::same_name(
+                        ast.name(name).last().unwrap_or_default(),
+                        "unnest",
+                    ) =>
+            {
+                if distinct || filter != NONE {
+                    return Err(Error::binder("UNNEST not supported here"));
+                }
+                let args = ast.expr_list(args).to_vec();
+                self.bind_unnest(ast, expr, &args, scope)
+            }
             ast::Expr::Function { name, args, distinct, filter } => {
                 self.bind_call(ast, name, args, distinct, filter, scope)
             }
@@ -1744,8 +1757,12 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             // `count(UserID)` and `count(DISTINCT UserID)` are two different answers and a result
             // that called them both the first one would be reporting the wrong one.
             let word = if distinct { "DISTINCT " } else { "" };
-            let arguments: Vec<String> =
+            let mut arguments: Vec<String> =
                 ast.expr_list(args).iter().map(|&arg| describe(ast, arg, semantics)).collect();
+            for target in ast.named_args(expr) {
+                let value = describe(ast, target.expr, semantics);
+                arguments.push(format!("{} := {value}", quoted(ast.string(target.alias))));
+            }
             format!(
                 "{name}({word}{}){}",
                 arguments.join(", "),

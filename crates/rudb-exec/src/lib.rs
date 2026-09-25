@@ -134,6 +134,7 @@ mod stream;
 mod table;
 mod topn;
 mod typenames;
+mod unnest;
 mod window;
 mod writemetrics;
 mod written;

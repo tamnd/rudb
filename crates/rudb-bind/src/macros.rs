@@ -10,9 +10,8 @@
 //! The macros that already have a function or an expansion of their own here are not in the table.
 //! The `list_` aggregates are `crate::listaggr`, `list_append` and its five relatives are in
 //! `crate::expr`, and `if` and `nullif` bind as the CASE they stand for. The json macros wait for a
-//! JSON type, `md5_number_lower` and `md5_number_upper` wait for BIT, `days_in_month` waits for
-//! `last_day`, and `generate_subscripts` and `regexp_split_to_table` wait for `unnest` in an
-//! expression.
+//! JSON type, `md5_number_lower` and `md5_number_upper` wait for BIT, and `days_in_month` waits for
+//! `last_day`.
 
 use rudb_common::{Error, Result};
 use rudb_parse::{Ast, Kind, ast, deparse, parse_ast_with_case, tokenize};
@@ -69,7 +68,17 @@ const MACROS: &[Macro] = &[
     define("fdiv", &["x", "y"], "floor((x / y))"),
     define("fmod", &["x", "y"], "(x - (y * floor((x / y))))"),
     define("geomean", &["x"], "exp(avg(ln(x)))"),
+    define(
+        "generate_subscripts",
+        &["arr", "dim"],
+        "unnest(generate_series(1, array_length(arr, dim)))",
+    ),
     define("geometric_mean", &["x"], "geomean(x)"),
+    define(
+        "regexp_split_to_table",
+        &["text", "pattern"],
+        "unnest(string_split_regex(\"text\", pattern))",
+    ),
     define(
         "split_part",
         &["string", "delimiter", "position"],

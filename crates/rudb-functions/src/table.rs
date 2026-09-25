@@ -86,6 +86,8 @@ pub enum TableFunction {
     Range,
     /// The same three, stopping on the end.
     GenerateSeries,
+    /// `unnest(list)`, one row per element of a list or an array.
+    Unnest,
     /// `read_parquet(path)`, the rows of a Parquet file.
     ReadParquet,
     /// `read_csv(path)`, the rows of a CSV file, with everything about how it is written sniffed.
@@ -169,6 +171,7 @@ impl TableFunction {
         match self {
             Self::Range => "range",
             Self::GenerateSeries => "generate_series",
+            Self::Unnest => "unnest",
             Self::ReadParquet => "read_parquet",
             Self::ReadCsv => "read_csv",
             Self::RudbStrategies => "rudb_strategies",
@@ -306,6 +309,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("generate_series") {
             return Some(Self::GenerateSeries);
+        }
+        if name.eq_ignore_ascii_case("unnest") {
+            return Some(Self::Unnest);
         }
         if name.eq_ignore_ascii_case("read_parquet") || name.eq_ignore_ascii_case("parquet_scan") {
             return Some(Self::ReadParquet);
@@ -522,6 +528,9 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
     if function == TableFunction::RudbDeviceCard {
         return device_card(arguments);
     }
+    if function == TableFunction::Unnest {
+        return unnest(arguments);
+    }
     let arity = arguments.len();
     // The metadata tables take nothing and their columns are fixed, which makes them the simplest
     // case here. They are one arm rather than one each because the only thing that differs is the
@@ -579,6 +588,32 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
         function,
         arguments: vec![LogicalType::BigInt; arity],
         columns: Columns::Fixed(vec![Field::new(function.name(), LogicalType::BigInt)]),
+    })
+}
+
+/// `unnest(list)` where a table goes, which is one column of the list's elements.
+///
+/// The pin has one overload taking anything, so a second argument is a missing overload and a
+/// single one that is not a list is the sentence below, a null and a struct included, which the
+/// select list form would take.
+fn unnest(arguments: &[LogicalType]) -> Result<ResolvedTable> {
+    let function = TableFunction::Unnest;
+    let [argument] = arguments else {
+        let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
+        return Err(Error::binder(format!(
+            "No function matches the given name and argument types 'unnest({})'. You might need \
+             to add explicit type casts.\n\tCandidate functions:\n\t\"unnest\"(ANY)\n",
+            written.join(", ")
+        )));
+    };
+    let element = match argument {
+        LogicalType::List(element) | LogicalType::Array(element, _) => (**element).clone(),
+        _ => return Err(Error::binder("UNNEST requires a single list or array as input")),
+    };
+    Ok(ResolvedTable {
+        function,
+        arguments: vec![argument.clone()],
+        columns: Columns::Fixed(vec![Field::new("unnest", element)]),
     })
 }
 
@@ -644,6 +679,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         TableFunction::ReadCsv => Some(Columns::Csv),
         TableFunction::Range
         | TableFunction::GenerateSeries
+        | TableFunction::Unnest
         | TableFunction::RudbStrategies
         | TableFunction::RudbLinks
         | TableFunction::RudbDeviceCard
@@ -711,6 +747,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::PragmaShowTablesExpanded => Some(show_expanded_fields()),
         TableFunction::Range
         | TableFunction::GenerateSeries
+        | TableFunction::Unnest
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::RudbDeviceCard

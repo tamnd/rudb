@@ -1025,7 +1025,7 @@ fn the_regular_expression_functions_answer_the_way_duckdb_does() {
 #[test]
 fn a_function_that_is_not_implemented_does_not_answer_its_own_argument() {
     let db = database();
-    let message = failure(&db, "SELECT unnest([1], recursive := true)");
+    let message = failure(&db, "SELECT list_value(1, recursive := true)");
     assert!(message.contains("not supported yet"), "{message}");
     assert!(message.starts_with("recursive := true is not supported yet"), "{message}");
 }
@@ -10791,5 +10791,71 @@ fn dropping_the_schema_the_session_is_in_goes_back_to_main_of_the_same_database(
     assert_eq!(
         rows(&db, "SELECT current_setting('search_path')"),
         vec![vec![Value::Varchar("nd.a,nd.b".into())]]
+    );
+}
+
+/// `unnest` in a select list and in a `FROM`, with every answer read off the pinned binary.
+///
+/// The ones worth pointing at are the zip, where a shorter list is null for the rest of the longer
+/// one and a row whose lists are all null or empty makes no rows, and the levels of a recursive
+/// call, which line up at the deepest level so that 3 goes with 10 and nothing goes with 20.
+#[test]
+fn unnest_makes_a_row_per_element_the_way_the_pin_does() {
+    let db = Database::new();
+    db.execute("CREATE TABLE u AS SELECT * FROM (VALUES (1, [1, 2]), (2, NULL), (3, []), (4, [5])) v(k, l)")
+        .unwrap();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(text("SELECT unnest([1, 2, 3])"), "1;2;3");
+    assert_eq!(text("SELECT unnest([1, 2]) AS a, unnest([10, 20, 30]) AS b"), "1,10;2,20;NULL,30");
+    assert_eq!(text("SELECT 1 AS k, unnest(NULL::INT[])"), "");
+    assert_eq!(text("SELECT unnest([]::INT[]), unnest([1])"), "NULL,1");
+    assert_eq!(text("SELECT k, unnest(l) FROM u ORDER BY k"), "1,1;1,2;4,5");
+    assert_eq!(text("SELECT unnest(list(k)) FROM u ORDER BY 1"), "1;2;3;4");
+    assert_eq!(text("SELECT unnest([1, 2]) AS a, count(*) OVER () AS c"), "1,1;2,1");
+    assert_eq!(
+        text("SELECT unnest([[1, 2], [3]], recursive := true) AS a, unnest([10, 20]) AS b"),
+        "1,10;2,20;3,10;NULL,20"
+    );
+    assert_eq!(text("SELECT unnest([[[1, 2]], [[3]]], max_depth := 2)"), "[1, 2];[3]");
+    assert_eq!(text("SELECT k, x FROM u, unnest(u.l) AS v(x) ORDER BY k, x"), "1,1;1,2;4,5");
+    assert_eq!(text("SELECT * FROM unnest([1, 2]) AS v"), "1;2");
+    assert_eq!(text("SELECT generate_subscripts([4, 5, 6], 1)"), "1;2;3");
+    assert_eq!(text("SELECT regexp_split_to_table('a b', ' ')"), "a;b");
+    assert_eq!(
+        text("SELECT count(*), sum(x) FROM (SELECT unnest(range(5000)) AS x)"),
+        "5000,12497500"
+    );
+    let names = |sql: &str| db.query(sql).unwrap().names().to_vec();
+    assert_eq!(names("SELECT unnest([1])"), ["unnest(list_value(1))"]);
+    assert_eq!(
+        names("SELECT unnest([[1]], recursive := true)"),
+        ["unnest(list_value(list_value(1)), \"recursive\" := true)"]
+    );
+    assert_eq!(names("SELECT * FROM unnest([1]) AS v"), ["v"]);
+    let error = |sql: &str| failure(&db, sql);
+    assert!(
+        error("SELECT unnest(unnest([[1]]))").starts_with("Nested UNNEST calls are not supported")
+    );
+    assert_eq!(error("SELECT * FROM u WHERE unnest(l) > 1"), "UNNEST not supported here");
+    assert_eq!(error("SELECT sum(unnest([1]))"), "UNNEST not supported here");
+    assert_eq!(
+        error("SELECT unnest(1)"),
+        "UNNEST() can only be applied to lists, structs and NULL, not INTEGER"
+    );
+    assert_eq!(error("SELECT unnest()"), "UNNEST() requires at least one argument");
+    assert_eq!(error("SELECT unnest([1], foo := 1)"), "Unsupported parameter \"foo\" for unnest");
+    assert_eq!(
+        error("SELECT unnest([[1]], max_depth := 0)"),
+        "UNNEST cannot have a max depth of 0"
+    );
+    assert_eq!(
+        error("SELECT * FROM unnest(NULL)"),
+        "UNNEST requires a single list or array as input"
     );
 }

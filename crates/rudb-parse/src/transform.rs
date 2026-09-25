@@ -4105,6 +4105,17 @@ impl<'a> Transform<'a> {
             let names = self.part_slice(names);
             let values = self.expr_slice(args.split_off(1));
             args.push(self.push(Expr::Struct { names, values }));
+        } else if called == "unnest" && over == NONE && !names.is_empty() {
+            // `unnest(l, recursive := true)` keeps its options beside the call, where the binder
+            // looks for them, and the call itself is the positional arguments alone.
+            let values = args.split_off(args.len() - names.len());
+            let named: Vec<Target> =
+                names.into_iter().zip(values).map(|(alias, expr)| Target { expr, alias }).collect();
+            let named = self.target_slice(named);
+            let args = self.expr_slice(args);
+            let call = self.push(Expr::Function { name, args, distinct, filter });
+            self.ast.named_args.push((call, named));
+            return Ok(call);
         } else if !names.is_empty() && (!packs || names.len() == args.len()) {
             return self.unsupported(first_named);
         }
