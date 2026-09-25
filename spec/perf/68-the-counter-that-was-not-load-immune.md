@@ -12,7 +12,7 @@ The test is to compare a binary against itself. Same file on both sides, so the 
 | --- | --- | --- |
 | `-e instructions`, before first every round | 0.982x | q03 0.862x |
 | `-e instructions`, order alternated | 1.011x | q08 1.106x |
-| `-e instructions:u`, order alternated | 1.000x | none, all 22 read 1.000x |
+| `-e instructions:u`, order alternated | 1.000x | q12 1.001x, every other query 1.000x |
 
 The first row is the harness as it stood. A binary beat itself by 1.8 percent over the suite and by 13.8 percent on q03, which is larger than most of what this directory has ever reported.
 
@@ -30,7 +30,11 @@ Note 13's claim was never wrong about the machine. It was measuring the right th
 
 `-e instructions:u`, which is the whole of the first fault. The order of the two sides alternates round by round, and one run a side is thrown away before any round is counted. The last two matter much less once the counter is user only, but a first run still pays for its own lazy symbol binding and its own heap growth, and neither is what is being compared.
 
-One more thing worth putting back. Note 13 says best of three and the harness had drifted to the median of three. When interference is additive and the floor is hard, the minimum is the estimator that wants finding, and the median of three throws away the one run in three most likely to be clean.
+One more thing worth putting back. Note 13 says best of three and the harness had drifted to the median of three. When interference is additive and the floor is hard, the minimum is the estimator that wants finding, and the median of three throws away the one run in three most likely to be clean. So it takes the lowest of the rounds now, on the start up baseline as well as on the queries, since that baseline is subtracted from every query and reading it high would flatter every ratio under it.
+
+It also prints the spread of each query's rounds beside the ratio, as the larger of the two sides' coefficient of variation. That is the only check the reader has that the run was clean, and it wants reading before the third decimal place of a ratio is quoted anywhere. Over the 22 it comes out at 0.00 or 0.01 percent on eighteen of them and never above 0.08 percent.
+
+And the harness is in the tree, at [`scripts/instructions`](../../scripts/instructions), rather than in a home directory on the box it was last used on. That is the part of this that took longest to notice. The measurement every note in this directory rests on lived in one `/tmp`, so nothing could review it, nothing pinned it to a version of the engine it had measured, and the fix above could have been lost to a reboot. Run against one binary on both sides it reads 1.000x on 21 of the 22 and 1.001x on q12, whose spread is 0.02 percent, over a suite of 12.42 G either way. That is the test any change to it has to keep passing.
 
 ## Why this note exists rather than a one line fix
 
