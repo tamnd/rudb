@@ -754,13 +754,15 @@ impl Prepared {
             .take()
             .unwrap_or_else(|| Ordering::new(op, self.weights(operands, begin)));
         let mut carried: Option<Selection> = live.cloned();
+        // The operands already answered as the other end of a range, see [`Self::range`].
+        let mut ranged: u128 = 0;
         for slot in 0..len {
             if carried.as_ref().is_some_and(Selection::is_empty) {
                 break;
             }
             let which = order.at(slot);
             // Known to keep every row, so running it would hand back the rows it was given.
-            if settled.get(which) == Some(&true) {
+            if settled.get(which) == Some(&true) || (which < 128 && (ranged >> which) & 1 == 1) {
                 continue;
             }
             let operand = operands[which];
@@ -770,7 +772,20 @@ impl Prepared {
             // where each one starts.
             let from = if which == 0 { begin } else { operands[which - 1] + 1 };
             let given = carried.as_ref().map_or(rows, Selection::len);
-            let answered = self.thread(operand, from, chunk, scratch, carried.as_ref())?;
+            let fused = match op {
+                Connective::And => {
+                    self.range(operands, which, settled, ranged, chunk, scratch, carried.as_ref())?
+                }
+                Connective::Or => None,
+            };
+            let answered = match fused {
+                Some((other, answered)) => {
+                    ranged |= 1 << other;
+                    order.observed(other, given, answered.len());
+                    answered
+                }
+                None => self.thread(operand, from, chunk, scratch, carried.as_ref())?,
+            };
             order.observed(which, given, answered.len());
             carried = Some(match (op, carried) {
                 (Connective::And, _) => answered,
@@ -798,6 +813,78 @@ impl Prepared {
                 Some(live) => live.without(&missed),
             },
         })
+    }
+
+    /// Operand `which` of an `AND` and another operand of it answered together, when the two are a
+    /// low and a high bound on the same column, as the other operand and the rows the two keep.
+    ///
+    /// `l_shipdate >= date '1994-01-01' and l_shipdate < date '1995-01-01'` is two comparisons that
+    /// each keep most of a chunk and together keep a seventh of it, so running one and then the
+    /// other walks most of the chunk twice and builds a selection of most of it in between. Here it
+    /// is one pass with one test a row, see [`rudb_kernels::select_range`]. The plan does not change
+    /// and neither does the order the operands learn, since both of them are told what the pair
+    /// kept. `None` when there is no such pair, when the column has a form the range has no loop
+    /// for, and for steps built to be shared, whose slots a later operand may read.
+    #[expect(clippy::too_many_arguments, reason = "the walk's state, handed over as it stands")]
+    fn range(
+        &self,
+        operands: &[usize],
+        which: usize,
+        settled: &[bool],
+        ranged: u128,
+        chunk: &Chunk,
+        scratch: &Scratch,
+        live: Option<&Selection>,
+    ) -> Result<Option<(usize, Selection)>> {
+        if self.share {
+            return Ok(None);
+        }
+        let Some((column, low)) = self.bound(operands[which]) else { return Ok(None) };
+        let Some(other) = (0..operands.len().min(128)).find(|&other| {
+            other != which
+                && settled.get(other) != Some(&true)
+                && (ranged >> other) & 1 == 0
+                && self.bound(operands[other]) == Some((column, !low))
+        }) else {
+            return Ok(None);
+        };
+        let (lower, upper) = if low {
+            (operands[which], operands[other])
+        } else {
+            (operands[other], operands[which])
+        };
+        let (Some((left, lower)), Some((_, upper))) = (self.end(lower), self.end(upper)) else {
+            return Ok(None);
+        };
+        let values = self.operand(left, chunk, &scratch.slots)?;
+        let live = live.map(Selection::indices);
+        Ok(rudb_kernels::select_range(values, lower, upper, live).map(|kept| (other, kept)))
+    }
+
+    /// The column a comparison of a column with a literal reads, and whether the literal is where
+    /// the column's values start (`>`, `>=`) or where they end (`<`, `<=`).
+    fn bound(&self, operand: usize) -> Option<(usize, bool)> {
+        let Step::Compare { op, left, right, .. } = &self.steps[operand] else { return None };
+        let (Step::Column(column), Step::Constant(value)) =
+            (&self.steps[*left], &self.steps[*right])
+        else {
+            return None;
+        };
+        if value.is_null() || self.types[*left] != self.types[*right] {
+            return None;
+        }
+        match op {
+            Comparison::Greater | Comparison::GreaterOrEqual => Some((*column, true)),
+            Comparison::Less | Comparison::LessOrEqual => Some((*column, false)),
+            _ => None,
+        }
+    }
+
+    /// The column step of a comparison [`Self::bound`] accepted, and its end of the range.
+    fn end(&self, operand: usize) -> Option<(usize, rudb_kernels::Bound<'_>)> {
+        let Step::Compare { op, left, right, held } = &self.steps[operand] else { return None };
+        let Step::Constant(value) = &self.steps[*right] else { return None };
+        Some((*left, rudb_kernels::Bound { op: *op, value, held: held.as_ref() }))
     }
 
     /// What each operand of a connective costs to run over a chunk, for the ordering to divide by.
@@ -2071,6 +2158,76 @@ mod tests {
         // this once a chunk and a slot left behind by the conjunct before would show up here.
         let again = prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs again");
         assert_eq!(again, expected, "`{predicate}` a second time");
+    }
+
+    /// Two bounds on one column are answered as one range, and the rows have to be the ones the
+    /// tree walk keeps, on a column with no nulls both flat and bit packed, with the bounds either
+    /// way round, strict or not, beside another conjunct, and meeting nowhere.
+    #[test]
+    fn two_bounds_on_one_column_keep_the_rows_the_tree_walk_keeps() {
+        let schema = Schema::numbered(
+            vec![Field::new("x", LogicalType::Integer), Field::new("s", LogicalType::Varchar)],
+            0,
+        );
+        let values: Vec<i32> = (0..1000).map(|row| 700 + (row * 37) % 600).collect();
+        let flat = Vector::flat(LogicalType::Integer, rudb_vector::Data::Int32(values.into()))
+            .expect("integers are an i32 layout");
+        let packed = flat.bit_packed().expect("a six hundred wide range packs");
+        let words = Vector::from_values(
+            LogicalType::Varchar,
+            &(0..1000).map(|row| Value::Varchar(["a", "b"][row % 2].into())).collect::<Vec<_>>(),
+        )
+        .expect("strings");
+        let predicates = [
+            "((#0.0::INTEGER >= 800::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 900::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER <= 900::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 800::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER >= 0::INTEGER)::BOOLEAN AND (#0.0::INTEGER <= 5000::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER > 900::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 800::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER >= 1299::INTEGER)::BOOLEAN AND (#0.0::INTEGER <= 1299::INTEGER)::BOOLEAN)",
+            "((#0.1::VARCHAR = 'a'::VARCHAR)::BOOLEAN AND (#0.0::INTEGER >= 750::INTEGER)::BOOLEAN AND \
+             (#0.0::INTEGER < 1000::INTEGER)::BOOLEAN)",
+            "((#0.0::INTEGER >= 750::INTEGER)::BOOLEAN AND (#0.0::INTEGER >= 760::INTEGER)::BOOLEAN AND \
+             (#0.0::INTEGER < 1000::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 990::INTEGER)::BOOLEAN)",
+        ];
+        for column in [flat, packed] {
+            let chunk = Chunk::new(vec![column, words.clone()]).expect("two columns");
+            // One end settled by the scan leaves the other to run alone, with nothing to pair.
+            let alone = |predicate: &str, settled: Option<[bool; 2]>| {
+                let (plan, list) = projection(&format!("{predicate}::BOOLEAN AS p"));
+                let prepared =
+                    Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+                let mut scratch = prepared.scratch();
+                match settled {
+                    Some(settled) => prepared.evaluate_settled(&chunk, &mut scratch, &settled),
+                    None => prepared.evaluate_filter(&chunk, &mut scratch),
+                }
+                .expect("the filter runs")
+            };
+            assert_eq!(
+                alone(predicates[0], Some([true, false])),
+                alone("(#0.0::INTEGER < 900::INTEGER)", None)
+            );
+            assert_eq!(
+                alone(predicates[0], Some([false, true])),
+                alone("(#0.0::INTEGER >= 800::INTEGER)", None)
+            );
+            for predicate in predicates {
+                let (plan, list) = projection(&format!("{predicate}::BOOLEAN AS p"));
+                let prepared =
+                    Prepared::new(&plan, &list, &schema).expect("the predicate resolves");
+                let mut scratch = prepared.scratch();
+                let flags = evaluate(&plan, list[0], &schema, &chunk).expect("the tree walk runs");
+                let expected =
+                    Selection::from_predicate(chunk.len(), |row| is_true(&flags.value_at(row)));
+                // Enough chunks for the order to learn and move, which puts a different operand of
+                // the pair in front.
+                for _ in 0..40 {
+                    let threaded =
+                        prepared.evaluate_filter(&chunk, &mut scratch).expect("the filter runs");
+                    assert_eq!(threaded, expected, "`{predicate}`");
+                }
+            }
+        }
     }
 
     /// A predicate with no `AND` in it is not threaded and has to keep saying the same thing.

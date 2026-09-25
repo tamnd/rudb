@@ -511,6 +511,186 @@ fn packed_kept(
     Some(kept)
 }
 
+/// One end of a range a filter asks for: the comparison that sets it, the literal it compares
+/// against, and the column that literal was built into early, if one was.
+#[derive(Clone, Copy, Debug)]
+pub struct Bound<'a> {
+    /// `>` or `>=` for the low end, `<` or `<=` for the high one.
+    pub op: Comparison,
+    /// The literal, in the column's own type.
+    pub value: &'a Value,
+    /// What the step that holds the literal built for it, see [`Held`].
+    pub held: Option<&'a Held>,
+}
+
+/// The rows of `column` that lie between `low` and `high`, out of `live` when there are some, in one
+/// pass over the column.
+///
+/// `l_shipdate >= date '1994-01-01' and l_shipdate < date '1995-01-01'` is two conjuncts, and each
+/// of them on its own keeps most of the rows it is given, so running them one after the other pays
+/// for a selection of half the chunk that the second one then walks again. Together they keep a
+/// seventh of it. A value is in the range when its distance above the low end, read unsigned, is at
+/// most the width of the range, which is one subtraction and one compare a row and a loop the
+/// compiler does in vector registers. TPC-H q6 asks this twice and q4, q5, q10, q12, q14 and q15
+/// ask it once. See `spec/perf/65-one-range-one-pass.md`.
+///
+/// `None` for anything this has no loop for, a column with nulls, a form other than flat or bit
+/// packed, a type wider than 64 bits, a literal that is null or of another type, so that the caller
+/// runs the two comparisons the way it would have.
+#[must_use]
+pub fn select_range(
+    column: &Vector,
+    low: Bound<'_>,
+    high: Bound<'_>,
+    live: Option<&[u32]>,
+) -> Option<Selection> {
+    let len = column.len();
+    if len == 0 || u32::try_from(len).is_err() || nulls_of(column) != Validity::AllValid {
+        return None;
+    }
+    // Asked before the literals are built, since building one is an allocation.
+    let integral = column.packed_parts().is_some()
+        || matches!(
+            column.data(),
+            Some(
+                Data::Int8(_)
+                    | Data::Int16(_)
+                    | Data::Int32(_)
+                    | Data::Int64(_)
+                    | Data::UInt8(_)
+                    | Data::UInt16(_)
+                    | Data::UInt32(_)
+                    | Data::UInt64(_)
+            )
+        );
+    if !integral {
+        return None;
+    }
+    let ty = column.logical_type();
+    let literal = |bound: Bound<'_>| -> Option<i128> {
+        if bound.value.is_null() {
+            return None;
+        }
+        let single = readied(bound.held, ty, bound.value)?;
+        if single.logical_type() != ty {
+            return None;
+        }
+        Some(match single.data()? {
+            Data::Int8(values) => i128::from(*values.first()?),
+            Data::Int16(values) => i128::from(*values.first()?),
+            Data::Int32(values) => i128::from(*values.first()?),
+            Data::Int64(values) => i128::from(*values.first()?),
+            Data::UInt8(values) => i128::from(*values.first()?),
+            Data::UInt16(values) => i128::from(*values.first()?),
+            Data::UInt32(values) => i128::from(*values.first()?),
+            Data::UInt64(values) => i128::from(*values.first()?),
+            _ => return None,
+        })
+    };
+    // Both ends inclusive from here on.
+    let low = match low.op {
+        Comparison::GreaterOrEqual => literal(low)?,
+        Comparison::Greater => literal(low)? + 1,
+        _ => return None,
+    };
+    let high = match high.op {
+        Comparison::LessOrEqual => literal(high)?,
+        Comparison::Less => literal(high)? - 1,
+        _ => return None,
+    };
+    if let Some(packed) = column.packed_parts() {
+        return packed_range(&packed, len, low, high, live);
+    }
+    macro_rules! flat {
+        ($($variant:ident: $signed:ty => $unsigned:ty),+ $(,)?) => {
+            match column.data()? {
+                $(
+                    Data::$variant(values) => {
+                        let values = values.get(..len)?;
+                        let low = low.max(i128::from(<$signed>::MIN));
+                        let high = high.min(i128::from(<$signed>::MAX));
+                        if low > high {
+                            return Some(Selection::empty());
+                        }
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "both ends were clamped to the type, and the distance is read \
+                                      unsigned on purpose"
+                        )]
+                        let (low, span) = (low as $signed, (high - low) as $unsigned);
+                        // Allowed rather than expected, since an unsigned type has no sign to lose.
+                        #[allow(clippy::cast_sign_loss, reason = "the distance is read unsigned")]
+                        let within = |value: $signed| value.wrapping_sub(low) as $unsigned <= span;
+                        Some(match live {
+                            Some(rows) => kept_where(Some(rows), len, |row| within(values[row])),
+                            None => kept_in_blocks(
+                                len,
+                                |base, flags| {
+                                    for (flag, &value) in
+                                        flags.iter_mut().zip(&values[base..base + 64])
+                                    {
+                                        *flag = u8::from(within(value));
+                                    }
+                                },
+                                |row| within(values[row]),
+                            ),
+                        })
+                    }
+                )+
+                _ => None,
+            }
+        };
+    }
+    flat!(
+        Int8: i8 => u8,
+        Int16: i16 => u16,
+        Int32: i32 => u32,
+        Int64: i64 => u64,
+        UInt8: u8 => u8,
+        UInt16: u16 => u16,
+        UInt32: u32 => u32,
+        UInt64: u64 => u64,
+    )
+}
+
+/// [`select_range`] on a bit packed column, in code space, where the range moves down by the base
+/// and is cut to the codes the width can hold, or `None` for a width and base whose top code does
+/// not fit an `i128`.
+fn packed_range(
+    packed: &Packed<'_>,
+    len: usize,
+    low: i128,
+    high: i128,
+    live: Option<&[u32]>,
+) -> Option<Selection> {
+    let (low, high) = (low.max(packed.base()), high.min(ceiling_of(packed)?));
+    if low > high {
+        return Some(Selection::empty());
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "both ends are inside the codes the width holds, so both differences fit a u64"
+    )]
+    let (from, span) = ((low - packed.base()) as u64, (high - low) as u64);
+    let within = |code: u64| code.wrapping_sub(from) <= span;
+    Some(match live {
+        Some(rows) => kept_where(Some(rows), len, |row| within(packed.code(row))),
+        None => kept_in_blocks(
+            len,
+            |base, flags| {
+                let mut codes = [0_u64; 64];
+                packed.unpack(base, &mut codes);
+                for (flag, &code) in flags.iter_mut().zip(&codes) {
+                    *flag = u8::from(within(code));
+                }
+            },
+            |row| within(packed.code(row)),
+        ),
+    })
+}
+
 /// The rows where `a` stands in `op` to `b`, row by row, or none for the two operators that are
 /// about nulls, which two flat runs of codes know nothing of.
 fn flat_by<T: Copy + PartialOrd>(
@@ -2915,6 +3095,91 @@ mod tests {
         let answer = compare_prepared(Comparison::Equal, &column, &constant, Some(&other))
             .expect("compares");
         assert_eq!(answer, compare(Comparison::Equal, &column, &constant).expect("compares"));
+    }
+
+    /// A range answered in one pass keeps the rows the two comparisons keep one after the other,
+    /// flat and bit packed, strict and not, from every row and from some, and for ends that cut
+    /// past the column's values or meet nowhere.
+    #[test]
+    fn a_range_keeps_the_rows_its_two_comparisons_keep() {
+        let values: Vec<i32> = (0..1000).map(|row| 700 + (row * 37) % 600).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into()))
+            .expect("integers are an i32 layout");
+        let packed = flat.bit_packed().expect("packs");
+        let some = Selection::from_predicate(1000, |row| row % 3 != 1);
+        let ends = [i32::MIN, -5, 699, 700, 701, 900, 1299, 1300, 5000, i32::MAX];
+        for column in [&flat, &packed] {
+            for low in ends {
+                for high in ends {
+                    for (lower, upper) in [
+                        (Comparison::GreaterOrEqual, Comparison::LessOrEqual),
+                        (Comparison::Greater, Comparison::Less),
+                    ] {
+                        let (low, high) = (Value::Integer(low), Value::Integer(high));
+                        let at = |value: &Value| {
+                            Vector::constant(LogicalType::Integer, value.clone(), 1000)
+                        };
+                        let (one, other) = (at(&low), at(&high));
+                        let bounds = (
+                            Bound { op: lower, value: &low, held: None },
+                            Bound { op: upper, value: &high, held: None },
+                        );
+                        let first = select_prepared(lower, column, &one, None).expect("compares");
+                        let both = refine(upper, column, &other, &first).expect("refines");
+                        let ranged = select_range(column, bounds.0, bounds.1, None)
+                            .expect("a column with no nulls has a range");
+                        assert_eq!(
+                            ranged.indices(),
+                            both.indices(),
+                            "{low} {lower:?}, {high} {upper:?}"
+                        );
+                        let first = refine(lower, column, &one, &some).expect("refines");
+                        let both = refine(upper, column, &other, &first).expect("refines");
+                        let ranged = select_range(column, bounds.0, bounds.1, Some(some.indices()))
+                            .expect("a column with no nulls has a range");
+                        assert_eq!(
+                            ranged.indices(),
+                            both.indices(),
+                            "{low} {lower:?}, {high} {upper:?} of some"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nulls, a literal of another type and a string column are left to the two comparisons.
+    #[test]
+    fn a_range_it_has_no_loop_for_is_none() {
+        let low = Value::Integer(1);
+        let high = Value::Integer(5);
+        fn bound(op: Comparison, value: &Value) -> Bound<'_> {
+            Bound { op, value, held: None }
+        }
+        let nulls = Vector::from_values(LogicalType::Integer, &[Value::Integer(2), Value::Null])
+            .expect("integers");
+        let range = |column: &Vector, low: &Value, high: &Value| {
+            select_range(
+                column,
+                bound(Comparison::GreaterOrEqual, low),
+                bound(Comparison::Less, high),
+                None,
+            )
+        };
+        assert!(range(&nulls, &low, &high).is_none());
+        let plain =
+            Vector::from_values(LogicalType::Integer, &[Value::Integer(2), Value::Integer(9)])
+                .expect("integers");
+        assert_eq!(range(&plain, &low, &high).expect("a range").indices(), &[0]);
+        assert!(range(&plain, &Value::Null, &high).is_none());
+        assert!(range(&words(), &low, &high).is_none());
+        let wrong = select_range(
+            &plain,
+            bound(Comparison::Less, &low),
+            bound(Comparison::Less, &high),
+            None,
+        );
+        assert!(wrong.is_none(), "a low end has to be > or >=");
     }
 
     /// A bit packed column against a literal is compared in code space, which has to reach the
