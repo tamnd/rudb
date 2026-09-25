@@ -209,6 +209,7 @@ fn tables() -> Vec<FunctionEntry> {
 const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::Range,
     TableFunction::GenerateSeries,
+    TableFunction::Unnest,
     TableFunction::ReadParquet,
     TableFunction::ReadCsv,
     TableFunction::RudbStrategies,
@@ -250,7 +251,8 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
     match function {
         TableFunction::Range | TableFunction::GenerateSeries => vec![1, 2, 3],
         TableFunction::RudbDeviceCard => vec![1, 2],
-        TableFunction::ReadParquet
+        TableFunction::Unnest
+        | TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
@@ -289,6 +291,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
 const fn positional_type(function: TableFunction, at: usize) -> &'static str {
     match function {
         TableFunction::RudbDeviceCard if at == 0 => "VARCHAR",
+        TableFunction::Unnest => "ANY",
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::PragmaTableInfo

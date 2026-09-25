@@ -30,6 +30,7 @@ mod parameters;
 mod scope;
 mod statement;
 mod structs;
+mod unnest;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
 pub use parameters::Parameters;

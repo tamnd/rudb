@@ -278,6 +278,15 @@ pub(crate) struct Binder<'a> {
     pub(crate) in_filter: bool,
     /// The window runs this select block has collected, in the order they were first written.
     pub(crate) windows: Vec<WindowRun>,
+    /// The `unnest` calls this select block has written, in the order they were written.
+    pub(crate) unnests: Vec<crate::unnest::UnnestCall>,
+    /// The table index the block's `unnest` calls produce their columns under, once there is one.
+    pub(crate) unnest_index: Option<u32>,
+    /// Whether an `unnest` may be written where the binder is, which is the select list and the
+    /// `ORDER BY` of a select block.
+    pub(crate) unnest_here: bool,
+    /// Set while an `unnest` call's own argument is being bound, so nesting is caught.
+    pub(crate) in_unnest: bool,
     /// The sequences a `nextval`, `currval` or `setval` named, which a table's default depends on.
     pub(crate) sequences: Vec<QualifiedName>,
     /// Set while a window call's own arguments and keys are being bound, so nesting is caught.
@@ -352,6 +361,10 @@ impl<'a> Binder<'a> {
             in_aggregate: false,
             in_filter: false,
             windows: Vec::new(),
+            unnests: Vec::new(),
+            unnest_index: None,
+            unnest_here: false,
+            in_unnest: false,
             sequences: Vec::new(),
             in_window: false,
             scalar_subqueries: Vec::new(),
@@ -966,6 +979,11 @@ impl<'a> Binder<'a> {
         // without a subquery in between, so the outer block's runs are put aside for the duration
         // rather than left where a nested block would append to them.
         let outer_windows = std::mem::take(&mut self.windows);
+        // The same for the unnests, which also run over this block's rows and nobody else's.
+        let outer_unnests = std::mem::take(&mut self.unnests);
+        let outer_unnest_index = self.unnest_index.take();
+        let outer_unnest_here = std::mem::replace(&mut self.unnest_here, false);
+        let outer_in_unnest = std::mem::replace(&mut self.in_unnest, false);
         // Same argument for the queries lifted over this block's grouping. They are recorded while
         // the select list is being bound and read until the sort keys are done, and a block bound
         // inside that stretch has its own set, so the outer block's is put aside rather than left
@@ -1010,7 +1028,9 @@ impl<'a> Binder<'a> {
         let mut above = Vec::new();
 
         self.clause = "SELECT clause";
+        self.unnest_here = true;
         let (mut exprs, mut names) = self.bind_targets(ast, &targets, &input, &mut above)?;
+        self.unnest_here = false;
         let visible = exprs.len();
 
         let mut having = None;
@@ -1043,9 +1063,12 @@ impl<'a> Binder<'a> {
 
         self.clause = "ORDER BY clause";
         let mut extra = Vec::new();
+        self.unnest_here = true;
         let keys = self.select_sort_keys(
             ast, query, &input, &output, project, &mut exprs, &mut names, &mut extra, &mut above,
         )?;
+        self.unnest_here = outer_unnest_here;
+        self.in_unnest = outer_in_unnest;
         self.joined_above = outer_joined_above;
         if !extra.is_empty() && written.distinct != Distinct::No {
             return Err(Error::binder(
@@ -1086,6 +1109,12 @@ impl<'a> Binder<'a> {
                 frame: run.frame,
                 expressions,
             });
+        }
+        // After the windows, which is also the pin's order: `SELECT unnest([1, 2]), count(*) OVER
+        // ()` counts one row and then makes two of it.
+        let unnests = std::mem::replace(&mut self.unnests, outer_unnests);
+        if let Some(index) = std::mem::replace(&mut self.unnest_index, outer_unnest_index) {
+            node = self.plan_unnests(node, index, &unnests)?;
         }
 
         let interned: Vec<u32> = names.iter().map(|name| self.plan.intern(name)).collect();
@@ -2495,6 +2524,14 @@ impl<'a> Binder<'a> {
                 .iter()
                 .map(|(parameter, ty)| format!("    {parameter} {ty}"))
                 .collect();
+            // A function with no named parameters at all says so rather than listing none.
+            if candidates.is_empty() {
+                return Err(Error::binder(format!(
+                    "Invalid named parameter \"{name}\" for function {}\nFunction does not \
+                     accept any named parameters.",
+                    function.name()
+                )));
+            }
             return Err(Error::binder(format!(
                 "Invalid named parameter \"{name}\" for function {}\nCandidates:\n{}\n",
                 function.name(),
@@ -2710,8 +2747,11 @@ impl<'a> Binder<'a> {
         }
         if !names.is_empty() {
             scope.rename(names, label)?;
-        } else if matches!(function, TableFunction::Range | TableFunction::GenerateSeries) {
-            // The PostgreSQL naming, which the pin follows for these two and for no reader: the
+        } else if matches!(
+            function,
+            TableFunction::Range | TableFunction::GenerateSeries | TableFunction::Unnest
+        ) {
+            // The PostgreSQL naming, which the pin follows for these three and for no reader: the
             // alias names the one column, and the column keeps answering to its own name too.
             for column in &mut scope.columns {
                 column.also = Some(std::mem::replace(&mut column.name, label.to_string()));
@@ -3568,6 +3608,9 @@ impl<'a> Binder<'a> {
             // `SELECT sum(count(i)) OVER () FROM t GROUP BY j` binds and `sum(i) OVER ()` over the
             // same block does not.
             Expr::Column(binding) if self.is_window_output(binding) => Ok(expr),
+            // An unnest runs over the grouping too, and what it takes apart was checked against the
+            // groups when it was bound.
+            Expr::Column(binding) if self.is_unnest_output(binding) => Ok(expr),
             // The same argument for a query joined in above the grouping. `HAVING sum(x) > (SELECT
             // ...)` reads one row out of a query that has nothing to do with the groups, and the
             // join that produces it sits on top of the `Aggregate`, so what it produces is not one
