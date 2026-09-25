@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+## 0.4.34
+
+A patch release of sixteen commits, led by the backward adjacency on the graph layer, with COPY FROM for CSV, the math and bitwise functions, the device card in the database file, and the compiled engine driver. The native directory format number goes from 29 to 30 with #1889, which keeps the device card at the end of the catalog, and format 29 files still open. The storage format version stays at 9.
+
+On the graph layer, #1903 stores the backward adjacency of spec 3.5 beside every packed link, out of its own 25 percent share of the table. A build side holding few parents reads their children from it rather than testing every child row, and the native scan decodes only those rows. With all ten TPC-H relationships declared on SF1, q17 goes from 0.544 to 0.245 billion instructions on the clustered file and from 0.467 to 0.201 on the base one, and the suite from 12.34 to 11.52 and from 14.68 to 13.82. #1898 answers MIN and MAX over an acyclic join by a full semijoin reduction.
+
+On scans and aggregation, #1887 stops compacting a pair run whose pairs do not repeat, #1899 counts a pair partition's groups as it finds them while they repeat, #1897 tucks a narrow second group key above the string code in encoded counts, #1891 answers two bounds on one column as one range, and #1892 reads a stripe's part on its own until the part is asked for again. #1901 compiles the x86-64 targets for x86-64-v3.
+
+#1896 adds COPY FROM for CSV files and #1895 converts appended values to their column types as the appender does. #1888 adds the math family with the pin's types for floor, round and trunc, and #1894 adds the bitwise operators, xor, bit_count and binom. #1889 keeps the device card in the database file and adds `PRAGMA device_card_refresh`.
+
+For the query compiler, #1890 adds the compiled engine driver and routes queries to it with `SET engine`, #1893 adds `EXPLAIN (CODEGEN)`, and #1900 adds `cargo xtask compiled`, the ClickBench differential for the compiled engine.
+
 ## 0.4.33
 
 A patch release of twenty two commits, mostly on the graph layer under G10 and on aggregation, with ATTACH and DETACH, scripts of several statements, and the first pieces of the query compiler. The native directory format number stays at 29 and the storage format version at 9. A file can now hold a key map in the permuted form of #1872, and 0.4.32 skips a key map in a form it does not know and plans without it, so such a file still opens there.
