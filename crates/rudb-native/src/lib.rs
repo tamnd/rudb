@@ -39,7 +39,7 @@ use std::fs::File;
 use std::mem::{size_of, size_of_val};
 use std::path::Path;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as Atomic};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 
 use rudb_common::bounds::{self, Bound, Op, scaled_as};
@@ -4223,6 +4223,16 @@ pub struct Reader {
     /// How many index sections have been read. A scan of a column should read each of its stripes
     /// once here too, and the test that says so is the only thing keeping it that way.
     indexes: Arc<AtomicUsize>,
+    /// Which parts of which columns have matched their checksums, a bit per part of the table for
+    /// each column in turn.
+    ///
+    /// A part is written once and a later generation writes its parts somewhere else, so bytes
+    /// that matched once match for as long as this reader is open. The page cache keeps the same
+    /// promise for as long as it holds a page, and this one outlives the page. A scan the graph
+    /// layer reduces reads a part at the rows it keeps and not the stripe's page, and each of those
+    /// reads hashed the whole part again: on TPC-H q21, which reads `lineitem` three times, that was
+    /// 4 percent of the query.
+    verified: Arc<Vec<AtomicU64>>,
     /// The file's size when it was opened, for [`Reader::layout`].
     size: u64,
     /// The committed directory's size, for [`Reader::layout`].
@@ -6310,6 +6320,7 @@ impl Reader {
         let part_ranges: Vec<Vec<RangeSlot>> = (0..table.fields.len())
             .map(|_| table.stripes.iter().map(|_| OnceLock::new()).collect())
             .collect();
+        let verified = (places.len() * table_fields).div_ceil(64);
         Ok(Self {
             file,
             table: Arc::new(table),
@@ -6326,6 +6337,7 @@ impl Reader {
             pool,
             pages: Arc::new(AtomicUsize::new(0)),
             indexes: Arc::new(AtomicUsize::new(0)),
+            verified: Arc::new((0..verified).map(|_| AtomicU64::new(0)).collect()),
             size,
             directory,
             opening,
@@ -7267,6 +7279,21 @@ impl Reader {
         })
     }
 
+    /// Whether part and column `bit`, numbered as [`Reader::verified`] numbers them, has matched its
+    /// checksum since this reader was opened.
+    fn is_verified(&self, bit: usize) -> bool {
+        self.verified
+            .get(bit / 64)
+            .is_some_and(|word| word.load(Atomic::Relaxed) >> (bit % 64) & 1 == 1)
+    }
+
+    /// Remembers that part and column `bit` matched its checksum.
+    fn set_verified(&self, bit: usize) {
+        if let Some(word) = self.verified.get(bit / 64) {
+            word.fetch_or(1 << (bit % 64), Atomic::Relaxed);
+        }
+    }
+
     /// Runs `read` over the stored bytes of one column of one part, out of the stripe's page when
     /// it is held and read off the file on their own when it is not.
     fn with_part<T>(
@@ -7526,8 +7553,12 @@ impl Reader {
                 .get(place.part as usize)
                 .ok_or_else(|| invalid("part index out of range"))?;
             let owned;
+            let bit = at * self.table.fields.len() + column;
             let bytes = match &held.page {
-                Some(held) => held.part(place.part as usize, span),
+                Some(held) if self.is_verified(bit) => part_bytes(&held.bytes, span),
+                Some(held) => {
+                    held.part(place.part as usize, span).inspect(|_| self.set_verified(bit))
+                }
                 None => {
                     let offset = page
                         .offset
@@ -7536,7 +7567,14 @@ impl Reader {
                     let mut bytes = vec![0; span.length];
                     read_at(&self.file, offset, &mut bytes)?;
                     owned = bytes;
-                    verify_part(&owned, span).map(|()| owned.as_slice())
+                    if self.is_verified(bit) {
+                        Ok(owned.as_slice())
+                    } else {
+                        verify_part(&owned, span).map(|()| {
+                            self.set_verified(bit);
+                            owned.as_slice()
+                        })
+                    }
                 }
             }
             .map_err(|error| {
@@ -17343,6 +17381,40 @@ mod tests {
             .map(|code| generous.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a starved sweep answers what a point read answers");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A part is hashed the first time a reader reads it and not after, and a reader opened after
+    /// the part was damaged still refuses it.
+    #[test]
+    fn a_part_is_checked_once_per_open_reader() {
+        let path = path("checked-once");
+        let mut writer = Writer::create(
+            &path,
+            "items",
+            vec![
+                Field::required("id", LogicalType::Integer),
+                Field::new("text", LogicalType::Varchar),
+            ],
+        )
+        .expect("new file");
+        writer.append(&sample()).expect("stripe written");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let first = reader.read_rows(0, &[0], &[0, 1], false).expect("checked and read");
+        assert!(reader.is_verified(0), "the part is remembered as checked");
+        let page = reader.table.stripes[0].pages[0];
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open column page");
+        file.seek(SeekFrom::Start(page.offset + u64::from(page.length) - 1)).expect("page end");
+        file.write_all(&[0xa5]).expect("damage page");
+        if let Err(error) = reader.read_rows(0, &[0], &[0, 1], false) {
+            assert!(!error.message().contains("checksum differs"), "not hashed again: {error}");
+        }
+        let fresh = Reader::open(&path).expect("valid directory");
+        let error = fresh.read_rows(0, &[0], &[0, 1], false).expect_err("a new reader checks");
+        assert!(error.message().contains("column page checksum differs"), "{error}");
+        assert_eq!(first.len(), 2);
         fs::remove_file(path).expect("remove scratch file");
     }
 
