@@ -65,6 +65,7 @@ mod node;
 mod parse;
 mod plan;
 mod print;
+mod reducer;
 mod rid;
 mod seams;
 mod shape;
@@ -76,6 +77,7 @@ pub use node::{
     WindowUnit,
 };
 pub use plan::Plan;
+pub use reducer::{Edge, Extreme, Key, Leaf, Reducer};
 pub use rid::{Carried, rids_of};
 pub use seams::seams_of;
 pub use shape::{ROOT, Shape};

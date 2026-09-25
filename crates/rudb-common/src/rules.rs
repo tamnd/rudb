@@ -76,11 +76,16 @@ pub enum Rule {
     /// Closing a group of an aggregate as soon as its key moves past it, when the key is a column the
     /// table is stored in ascending order of.
     ClosedGroups,
+    /// Answering a MIN or MAX over an acyclic chain of inner equi-joins by reducing each relation to
+    /// the rows that take part in some joined row and reading the extremes off those, without ever
+    /// running the join. Not under either master, because it reads no statistic and no stored
+    /// section: it is a rewrite that is right or wrong on the plan alone.
+    Consistent,
 }
 
 impl Rule {
     /// Every rule, in the order a report lists them.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::StatsAll,
         Self::Presize,
         Self::DirectAddressing,
@@ -93,6 +98,7 @@ impl Rule {
         Self::GraphSections,
         Self::GraphReduction,
         Self::ClosedGroups,
+        Self::Consistent,
     ];
 
     /// The canonical name, which is what a setting reads back as.
@@ -111,6 +117,7 @@ impl Rule {
             Self::GraphSections => "graph.sections",
             Self::GraphReduction => "graph.reduction",
             Self::ClosedGroups => "stats.closed_groups",
+            Self::Consistent => "plan.consistent",
         }
     }
 
@@ -121,7 +128,7 @@ impl Rule {
     #[must_use]
     pub const fn master(self) -> Option<Self> {
         match self {
-            Self::StatsAll | Self::GraphSections => None,
+            Self::StatsAll | Self::GraphSections | Self::Consistent => None,
             Self::GraphReduction => Some(Self::GraphSections),
             _ => Some(Self::StatsAll),
         }
@@ -152,7 +159,10 @@ impl Rule {
 #[must_use]
 pub fn looks_like_rule(key: &str) -> bool {
     let name = canonical(key);
-    name.starts_with("stats.") || name.starts_with("graph.") || Rule::from_name(&name).is_some()
+    name.starts_with("stats.")
+        || name.starts_with("graph.")
+        || name.starts_with("plan.")
+        || Rule::from_name(&name).is_some()
 }
 
 /// Every rule name, for the sentence that says what the list is.
@@ -336,6 +346,8 @@ mod tests {
         rules.set(Rule::StatsAll, false);
         assert!(!rules.enabled(Rule::Presize));
         assert!(!rules.enabled(Rule::NarrowArithmetic));
+        // A rewrite that reads no statistic stays where it was.
+        assert!(rules.enabled(Rule::Consistent));
         // The graph sections are their own layer and their own ablation, so the statistics master
         // does not reach them either way.
         rules.set(Rule::GraphSections, true);
@@ -364,6 +376,9 @@ mod tests {
         }
         for spelling in ["stats.top_n_seed", "stats_top_n_seed"] {
             assert_eq!(Rule::from_name(spelling), Some(Rule::TopNSeed), "{spelling}");
+        }
+        for spelling in ["plan.consistent", "plan_consistent", "PLAN.CONSISTENT"] {
+            assert_eq!(Rule::from_name(spelling), Some(Rule::Consistent), "{spelling}");
         }
     }
 

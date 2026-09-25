@@ -547,6 +547,30 @@ pub enum Node {
         /// The produced columns with their types, into the field pool.
         columns: Slice,
     },
+    /// A MIN or MAX over an acyclic chain of inner equi-joins, answered without running the join.
+    ///
+    /// What it replaces is an ungrouped aggregate whose every call is a MIN or a MAX of one
+    /// relation's column. Neither answer changes when a row is repeated, so the extreme over the
+    /// joined rows is the extreme over the rows of that one relation that take part in at least one
+    /// joined row, and on an acyclic join those rows are found with two sweeps of semijoins over a
+    /// join tree and no join at all. That is Yannakakis's full reducer, and the relations, the
+    /// classes of columns the equalities made equal and the tree are all in the
+    /// [`Reducer`](crate::Reducer) this points at.
+    ///
+    /// A leaf here, and the relations it reads are not its children. A node has two input slots and
+    /// a join of seventeen relations has seventeen inputs, and the passes that run after this one
+    /// have nothing to do inside it anyway: each relation is a scan with its own filter, already as
+    /// narrow as it is going to get. The two walks that do have to reach them, the pipeline shape
+    /// and the printer, read the reducer.
+    Consistent {
+        /// The table index the produced columns bind against, which is the index of the aggregate
+        /// this replaced, so nothing above it had to be rebound.
+        index: u32,
+        /// The produced columns with their types, into the field pool, one per extreme.
+        columns: Slice,
+        /// Which reducer in the plan's pool describes the relations and the tree.
+        reducer: u32,
+    },
     /// `UNION`, `EXCEPT` or `INTERSECT`.
     SetOp {
         /// The left input.
@@ -590,6 +614,7 @@ impl Node {
             Self::CrossProduct { .. } => "CrossProduct",
             Self::MaterializedCte { .. } => "MaterializedCte",
             Self::CteScan { .. } => "CteScan",
+            Self::Consistent { .. } => "Consistent",
             Self::SetOp { .. } => "SetOp",
         }
     }
@@ -606,7 +631,8 @@ impl Node {
             | Self::Dummy
             | Self::Values { .. }
             | Self::TableFunction { .. }
-            | Self::CteScan { .. } => [None, None],
+            | Self::CteScan { .. }
+            | Self::Consistent { .. } => [None, None],
             Self::Filter { input, .. }
             | Self::Project { input, .. }
             | Self::Aggregate { input, .. }
@@ -648,6 +674,7 @@ impl Node {
             | Self::Aggregate { index, .. }
             | Self::Window { index, .. }
             | Self::CteScan { index, .. }
+            | Self::Consistent { index, .. }
             | Self::SetOp { index, .. } => Some(index),
             _ => None,
         }
@@ -850,6 +877,7 @@ mod tests {
             },
             Node::CrossProduct { left: 0, right: 1 },
             Node::SetOp { left: 0, right: 1, kind: SetOpKind::Union, all: true, index: 0 },
+            Node::Consistent { index: 0, columns: Slice::EMPTY, reducer: 0 },
         ]
     }
 
@@ -896,6 +924,7 @@ mod tests {
                     | Node::Project { .. }
                     | Node::Aggregate { .. }
                     | Node::SetOp { .. }
+                    | Node::Consistent { .. }
             );
             assert_eq!(
                 node.table_index().is_some(),

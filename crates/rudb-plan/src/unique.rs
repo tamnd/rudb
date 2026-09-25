@@ -416,6 +416,7 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Keys]) -> Keys {
         | Node::Fetch { .. }
         | Node::TableFetch { .. }
         | Node::CteScan { .. }
+        | Node::Consistent { .. }
         | Node::DependentJoin { .. } => Keys::unknown(),
     }
 }

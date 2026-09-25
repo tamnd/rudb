@@ -57,6 +57,7 @@ pub fn seams_of(node: &Node) -> &'static [SeamId] {
         | Node::CrossProduct { .. }
         | Node::MaterializedCte { .. }
         | Node::CteScan { .. }
+        | Node::Consistent { .. }
         | Node::DependentJoin { .. } => &[],
     }
 }

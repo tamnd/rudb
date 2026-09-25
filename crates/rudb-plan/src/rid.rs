@@ -153,13 +153,15 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Carried]) -> Carried {
         // An aggregate's rows are groups. A group is not a row of anything.
         Node::Aggregate { .. } => Carried::none(),
 
-        // Rows that were written down, rows a function made up, and rows read back out of a
-        // materialisation, none of which are rows of a base table.
+        // Rows that were written down, rows a function made up, rows read back out of a
+        // materialisation and the one row of extremes a consistent node reads off its relations,
+        // none of which are rows of a base table.
         Node::Dummy
         | Node::Values { .. }
         | Node::TableFunction { .. }
         | Node::LateralFunction { .. }
-        | Node::CteScan { .. } => Carried::none(),
+        | Node::CteScan { .. }
+        | Node::Consistent { .. } => Carried::none(),
 
         // Set operations renumber everything. Even a `UNION ALL`, which emits the rows of both
         // sides untouched, emits them with two different tables' rows interleaved under one output
@@ -416,6 +418,35 @@ mod tests {
         let node = plan.add_node(Node::CteScan { index: 0, cte: 0, name, columns });
         plan.set_root(node);
         assert!(root(&plan).is_empty(), "what it reads was computed rather than stored");
+    }
+
+    #[test]
+    fn a_consistent_node_produces_one_row_of_extremes_and_no_rid() {
+        // It reads two scans that both carry a rid, and hands up neither, because its one row is
+        // the least of one column and the most of another and is no row of either table.
+        let mut plan = Plan::new();
+        let first = scan(&mut plan, 0);
+        let second = scan(&mut plan, 1);
+        let reducer = plan.add_reducer(crate::Reducer {
+            leaves: vec![
+                crate::Leaf {
+                    input: first,
+                    keys: vec![crate::Key { class: 0, column: 0 }],
+                    parent: Some(crate::Edge { leaf: 1, class: 0 }),
+                },
+                crate::Leaf {
+                    input: second,
+                    keys: vec![crate::Key { class: 0, column: 0 }],
+                    parent: None,
+                },
+            ],
+            classes: 1,
+            extremes: vec![crate::Extreme { leaf: 0, column: 1, max: false }],
+        });
+        let columns = plan.add_fields(&[Field::new("b", LogicalType::Integer)]);
+        let node = plan.add_node(Node::Consistent { index: 2, columns, reducer });
+        plan.set_root(node);
+        assert!(root(&plan).is_empty(), "an extreme is computed rather than stored");
     }
 
     #[test]

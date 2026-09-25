@@ -319,6 +319,25 @@ impl Shape {
                     }
                 }
             }
+            // Every relation is a pipeline of its own ending in the node, which is the sink of all
+            // of them and then the source of the one row it answers with. A relation's pipeline
+            // waits for its children's, because its rows are checked against the keys they kept as
+            // they arrive, and the node waits for every one of them.
+            Node::Consistent { reducer, .. } => {
+                self.of[node as usize] = Some(Placed { operator, gathered: None, pipeline });
+                let tree = plan.reducer(reducer);
+                let mut filling: Vec<PipelineRef> = Vec::with_capacity(tree.leaves.len());
+                for (at, leaf) in tree.leaves.iter().enumerate() {
+                    let own = self.fresh();
+                    let at = u32::try_from(at).unwrap_or(u32::MAX);
+                    for (child, _) in tree.children(at) {
+                        self.waits_on(own, filling[child as usize]);
+                    }
+                    self.waits_on(pipeline, own);
+                    self.walk(plan, leaf.input, own, Some(operator));
+                    filling.push(own);
+                }
+            }
             Node::CrossProduct { left, right } => {
                 let gathered = self.number(Some(operator));
                 let aside = self.fresh();

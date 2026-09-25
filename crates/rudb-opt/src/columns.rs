@@ -344,7 +344,8 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
         | Node::SetOp { .. }
         | Node::CrossProduct { .. }
         | Node::MaterializedCte { .. }
-        | Node::CteScan { .. } => {}
+        | Node::CteScan { .. }
+        | Node::Consistent { .. } => {}
         Node::Values { rows, .. } => {
             for &row in plan.row_list(rows) {
                 list(plan, row, found);
