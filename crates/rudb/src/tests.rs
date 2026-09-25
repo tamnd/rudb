@@ -294,6 +294,38 @@ fn order_by_and_limit_and_offset_compose() {
     );
 }
 
+/// `append` converts a value to its column's type the way the pin's appender does, so a `BIGINT`
+/// lands in a `DOUBLE` column and a string that is a number lands in an `INTEGER` one. It used to
+/// hand the value to the column as it came and fail with an internal error for any type but the
+/// column's own.
+#[test]
+fn append_converts_each_value_to_its_column() {
+    let db = Database::new();
+    db.create_table(
+        "t",
+        vec![Field::new("id", LogicalType::Integer), Field::new("score", LogicalType::Double)],
+    )
+    .unwrap();
+    db.append(
+        "t",
+        &[
+            vec![Value::BigInt(1), Value::BigInt(2)],
+            vec![Value::Varchar("5".to_string()), Value::Double(0.25)],
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, score FROM t ORDER BY id"),
+        vec![
+            vec![Value::Integer(1), Value::Double(2.0)],
+            vec![Value::Integer(5), Value::Double(0.25)],
+        ]
+    );
+    assert!(db.append("t", &[vec![Value::Varchar("nope".to_string()), Value::Null]]).is_err());
+    assert!(db.append("t", &[vec![Value::Integer(9)]]).is_err());
+    assert_eq!(db.table_len("t").unwrap(), 2);
+}
+
 /// An order by with a limit runs as a top N, which holds the rows that could still come out rather
 /// than the whole input. What it has to produce is what the sort produced, over enough rows that it
 /// trims several times and over more than one chunk of input.
