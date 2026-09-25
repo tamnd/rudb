@@ -1883,14 +1883,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         }
         ast::Expr::Cast { operand, ty, try_cast } => {
             let word = if try_cast { "TRY_CAST" } else { "CAST" };
-            // An inline enum is named with its labels spaced out the way the pin prints them, and
-            // every other type keeps the spelling it was written with.
-            let written = ast.string(ty);
-            let ty = if written.get(..4).is_some_and(|head| head.eq_ignore_ascii_case("enum")) {
-                rudb_parse::deparse::typename(written)
-            } else {
-                written.to_string()
-            };
+            // The type is named the way the grammar leaves it: a keyword type such as `int` or
+            // `numeric(4,1)` comes back under its one name, `INTEGER` and `DECIMAL(4, 1)`, and a
+            // name the grammar has no rule for, `tinyint` or `double`, keeps its spelling.
+            let ty = rudb_parse::deparse::typename(ast.string(ty));
             format!("{word}({} AS {ty})", describe(ast, operand, semantics))
         }
         // A CASE is named as the searched form it becomes, whichever form was written, with every

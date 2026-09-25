@@ -59,6 +59,7 @@ use std::sync::Arc;
 use rudb_common::{Error, LogicalType, PhysicalType, Result, Value};
 use rudb_vector::{Data, Form, Live, Validity, Vector};
 
+use crate::arg_extreme::Key;
 use crate::compare::order;
 use crate::fallback::{self, Kernel};
 use crate::general::General;
@@ -605,8 +606,15 @@ impl Accumulator {
                 }
                 return Ok(());
             }
+            let keys = if general.keyed() { by_column(args, rows) } else { None };
             let mut row_args = Vec::with_capacity(args.len());
             for row in 0..rows {
+                if let Some((column, valid)) = keys
+                    && valid.is_valid(row)
+                    && general.cannot_take(Key::at(column, row), args.len())
+                {
+                    continue;
+                }
                 row_args.clear();
                 for arg in args {
                     row_args.push(arg.try_value_at(row)?);
@@ -1399,9 +1407,20 @@ pub fn update_general(
         }
         return Ok(true);
     }
+    let keys = match &states[offset].state {
+        State::General(general) if general.keyed() => by_column(inputs, rows),
+        _ => None,
+    };
     let mut args = Vec::with_capacity(inputs.len());
     for row in 0..rows {
         let Some(index) = into.index(row) else { continue };
+        if let Some((column, valid)) = keys
+            && valid.is_valid(row)
+            && let Some(Accumulator { state: State::General(general) }) = states.get(index)
+            && general.cannot_take(Key::at(column, row), inputs.len())
+        {
+            continue;
+        }
         args.clear();
         for input in inputs {
             args.push(input.try_value_at(row)?);
@@ -1412,6 +1431,13 @@ pub fn update_general(
         state.update(&args)?;
     }
     Ok(true)
+}
+
+/// The second argument of an `arg_min` or `arg_max` call read as a typed column, with its validity,
+/// or `None` when it is not one a [`Column`] reads.
+fn by_column(args: &[Vector], rows: usize) -> Option<(Column<'_>, &Validity)> {
+    let by = args.get(1)?;
+    Column::of(by, rows).map(|column| (column, by.validity()))
 }
 
 /// Folds one vector into many accumulators a run of rows at a time, where every row of a run
