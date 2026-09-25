@@ -162,8 +162,9 @@ fn a_reduction_that_removes_nothing_early_stops_and_says_so() {
 }
 
 /// A filter that drops only the last customer leaves nearly every parent key in the build side, so
-/// no stretch of `orders` could be skipped and the push is not tried at all. The keys the join holds
-/// answer the scan instead.
+/// no stretch of `orders` could be skipped. Since #1929 the push is tried anyway, because it costs
+/// only the parents it holds, and the scan stops it once a third of the rows removed nothing. Either
+/// way nothing is kept off the link, and the keys the join holds answer the scan instead.
 #[test]
 fn a_side_that_holds_nearly_every_parent_does_not_push() {
     let (database, path) = database("dense");
@@ -172,7 +173,7 @@ fn a_side_that_holds_nearly_every_parent_does_not_push() {
     let reduced = rows(&database, sql);
     assert_eq!(reduced[0][0], Value::BigInt(299_990));
     let line = orders_scan(&database, sql);
-    assert!(!line.contains("link kept") && !line.contains("link reduction stopped"), "{line}");
+    assert!(!line.contains("link kept"), "{line}");
 
     database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
     assert_eq!(rows(&database, sql), reduced, "the layer changed an answer");
