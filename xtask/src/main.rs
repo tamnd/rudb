@@ -499,7 +499,7 @@ fn msrv_scoped(scope: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // Through `rustup run` rather than `cargo +1.85.0`, because `cargo xtask` sets `CARGO` to a
+    // Through `rustup run` rather than `cargo +1.88.0`, because `cargo xtask` sets `CARGO` to a
     // real binary and the `+toolchain` syntax is a rustup shim thing that a real binary rejects.
     // `--config` for the deny rather than `RUSTFLAGS`, for the reason `cargo` below gives: the
     // variable would drop the workspace's `-C target-cpu` and check a different engine.

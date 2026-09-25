@@ -2,13 +2,23 @@
 resolver = "3"
 members = ["crates/*", "xtask"]
 # The fuzz crate is its own workspace and stays out of this one. It needs nightly for the sanitizer
-# and it pulls in libfuzzer, and neither of those belongs in the build that has to work on 1.85.0.
+# and it pulls in libfuzzer, and neither of those belongs in the build that has to work on 1.88.0.
 exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.4.34"
 edition = "2024"
-rust-version = "1.85.0"
+# The floor was 1.85.0, which is only where edition 2024 starts, so it was never a support
+# commitment anybody made on purpose. 1.88.0 is the oldest toolchain that has the two things the
+# performance work needs. `#[target_feature(enable = ...)]` on a safe function landed in 1.86, and
+# without it the AVX-512 and `VBMI2` dispatch that spec/07-execution.md section 7.3 still wants
+# cannot be written in rudb-kernels at all, because that crate is `#![forbid(unsafe_code)]` and
+# before 1.86 the attribute only went on an `unsafe fn`. `core::hint::select_unpredictable` landed
+# in 1.88, and spec/perf/57 is the note about a branch mispredict that cost 6 percent of q01's
+# cycles while retiring no extra instructions, which is exactly what that hint is for. Both checked
+# by compiling them rather than read off a release note. Raising this is cheap next to the hardware
+# floor in `.cargo/config.toml`, which asks for a CPU from 2013.
+rust-version = "1.88.0"
 license = "Apache-2.0"
 repository = "https://github.com/tamnd/rudb"
 homepage = "https://github.com/tamnd/rudb"
