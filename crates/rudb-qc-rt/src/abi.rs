@@ -55,6 +55,57 @@ pub const COL_SIZE: i32 = 16;
 /// The byte offset of [`Col::valid`].
 pub const COL_VALID: i32 = 8;
 
+/// The first cache line of every pipeline's state, before the local slots.
+///
+/// The body reads its fields at the offsets below. `rt` and `profile` are opaque here: the
+/// interpreter tier passes the runtime to a step as an argument and keeps no counters yet, so
+/// both stay null until a tier that needs them fills them in.
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug)]
+pub struct StateHeader {
+    /// The shared state of the pipeline. With one worker the local state is the shared state.
+    pub shared: *const u8,
+    /// The runtime ABI.
+    pub rt: *const u8,
+    /// The worker's profiling counters.
+    pub profile: *mut u8,
+    /// Where a body that returned `Yield` or `NeedMemory` picks up again.
+    pub cursor: u64,
+    /// The deferred error word.
+    pub error: u32,
+    /// The guard site of the last deopt.
+    pub deopt_site: u32,
+    /// Which worker owns this state.
+    pub worker: u16,
+    /// Which body variant is live.
+    pub variant: u16,
+    /// The countdown for `poll`.
+    pub poll_left: u32,
+    /// The parameter block, null when the query has no parameters.
+    pub params: *const u8,
+    _pad: [u8; 8],
+}
+
+impl StateHeader {
+    /// A header for a state block at `state` run by one worker, which is its own shared state.
+    #[must_use]
+    pub fn new(state: *const u8) -> StateHeader {
+        StateHeader {
+            shared: state,
+            rt: std::ptr::null(),
+            profile: std::ptr::null_mut(),
+            cursor: 0,
+            error: 0,
+            deopt_site: 0,
+            worker: 0,
+            variant: 0,
+            poll_left: 0,
+            params: std::ptr::null(),
+            _pad: [0; 8],
+        }
+    }
+}
+
 /// The size of the state header. Local slots start here.
 pub const HEADER: u32 = 64;
 /// The header's `cursor` word, where a body that yields records how far it got.
@@ -76,5 +127,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Morsel, cols), MORSEL_COLS as usize);
         assert_eq!(size_of::<Col>(), COL_SIZE as usize);
         assert_eq!(std::mem::offset_of!(Col, valid), COL_VALID as usize);
+        assert_eq!(size_of::<StateHeader>(), HEADER as usize);
+        assert_eq!(align_of::<StateHeader>(), 64);
+        assert_eq!(std::mem::offset_of!(StateHeader, cursor), CURSOR as usize);
+        assert_eq!(std::mem::offset_of!(StateHeader, error), ERROR as usize);
+        assert_eq!(std::mem::offset_of!(StateHeader, poll_left), POLL_LEFT as usize);
     }
 }

@@ -26,9 +26,9 @@ mod finish;
 
 use rudb_catalog::Catalog;
 use rudb_common::{Cancel, LogicalType, Memory, Result, Session};
-use rudb_pipeline::Pool;
+use rudb_pipeline::{Pool, Progress};
 use rudb_plan::Plan;
-use rudb_qc_gen::{Out, Query};
+use rudb_qc_gen::Query;
 use rudb_qc_interp::Program;
 use rudb_qc_pipe::{Graph, Source, Stage};
 use rudb_qc_plan::Kind;
@@ -136,6 +136,7 @@ impl Compiled {
                     let feed = Feed::new(
                         &self.query.module,
                         &self.program,
+                        p,
                         body,
                         &mut self.rt,
                         under.cancel,
@@ -151,15 +152,13 @@ impl Compiled {
                         }
                         Source::Stage { stage, .. } => {
                             for chunk in take(&mut outputs, *stage)? {
-                                feed.push(&chunk)?;
+                                if feed.push(&chunk)? == Progress::Done {
+                                    break;
+                                }
                             }
                         }
                     }
-                    let out = feed.finish()?;
-                    match &body.sink {
-                        Out::Result { .. } => out,
-                        Out::Aggregate(g) => finish::groups(&self.rt, g, stage.columns())?,
-                    }
+                    feed.finish()?
                 }
                 Stage::Sort { input, keys, .. } => {
                     finish::sort(take(&mut outputs, *input)?, keys, None, 0)?
