@@ -88,6 +88,7 @@ rudb-exec = 12
 rudb-qc-plan = 12
 rudb-qc-pipe = 13
 rudb-qc-gen = 14
+rudb-qc = 15
 
 # The surfaces people actually touch. `rudb` is 16 and not 13 so that the compiled engine fits
 # under it, per spec/compiler/19-crate-layout.md.

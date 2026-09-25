@@ -21,7 +21,7 @@ use crate::text::{self, Heap};
 pub const RUNTIME_ERROR: u64 = 0xff_ffff;
 
 /// A first engine kernel over `n` rows of the buffers a `vcall` passes.
-pub type Kernel = Box<dyn FnMut(u64, &[u128]) -> Result<(), Error>>;
+pub type Kernel = Box<dyn FnMut(u64, &[u128]) -> Result<(), Error> + Send>;
 
 /// Something a handle names.
 enum Object {
