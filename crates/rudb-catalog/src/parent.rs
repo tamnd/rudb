@@ -103,8 +103,9 @@ pub struct Parent {
     held: Mutex<HashMap<usize, Option<Arc<Vector>>>>,
     /// What every column held here may cost together, in bytes.
     budget: usize,
-    /// The first row of each part and then the row count, worked out on first use.
-    starts: OnceLock<Vec<u64>>,
+    /// The first row of each part and then the row count, with the part of every stretch of row
+    /// ids, worked out on first use.
+    starts: OnceLock<Directory>,
     /// The parts read so far for [`Self::gather`], by column and then by part, in stored form.
     parts: Mutex<HashMap<usize, Slots>>,
     /// What the parts held in `parts` cost between them.
@@ -151,6 +152,60 @@ impl Placement {
     }
 }
 
+/// Which part a row id is in, answered with a load rather than a search.
+///
+/// The row ids are cut into stretches of `1 << shift`, no longer than the shortest part but the
+/// last, so a stretch starts in some part and ends in that one or the next. `first` holds the part
+/// each stretch starts in, and a row id is its stretch's part or a step or two past it. The search
+/// this replaces was most of what placing a chunk cost when its rows jump between parts, which is
+/// a child stored in another order than its parent's.
+#[derive(Debug)]
+struct Directory {
+    /// The first row of each part and then the row count.
+    starts: Vec<u64>,
+    shift: u32,
+    first: Vec<u32>,
+}
+
+/// The most stretches a directory holds, so that a table of many short parts costs a search's
+/// worth of steps rather than a directory as long as the table.
+const STRETCHES: u64 = 1 << 16;
+
+impl Directory {
+    fn new(starts: Vec<u64>) -> Self {
+        let total = starts.last().copied().unwrap_or(0);
+        let parts = starts.len().saturating_sub(1);
+        let shortest = starts
+            .windows(2)
+            .take(parts.saturating_sub(1))
+            .map(|pair| pair[1] - pair[0])
+            .filter(|&len| len > 0)
+            .min()
+            .unwrap_or(total.max(1));
+        let mut shift = 63 - shortest.max(1).leading_zeros();
+        while (total >> shift) >= STRETCHES {
+            shift += 1;
+        }
+        let first = (0..=(total >> shift))
+            .map(|stretch| {
+                // Under the part count, which is far under a `u32`.
+                (starts.partition_point(|&start| start <= stretch << shift).saturating_sub(1))
+                    .min(parts.saturating_sub(1)) as u32
+            })
+            .collect();
+        Self { starts, shift, first }
+    }
+
+    /// The part row `at` is in. `at` has to be under the row count.
+    fn part_of(&self, at: u64) -> usize {
+        let mut part = self.first[(at >> self.shift) as usize] as usize;
+        while at >= self.starts[part + 1] {
+            part += 1;
+        }
+        part
+    }
+}
+
 impl Parent {
     /// A parent whose columns may cost `budget` bytes between them.
     #[must_use]
@@ -180,21 +235,20 @@ impl Parent {
     ///
     /// If a part cannot say how many rows it has, or if a row id is past the end of the table.
     pub fn place(&self, rids: &[u32]) -> Result<Placement> {
-        let starts = self.starts()?;
+        let directory = self.starts()?;
+        let starts = directory.starts.as_slice();
         let total = starts.last().copied().unwrap_or(0);
         let parts = starts.len().saturating_sub(1);
-        // Each row's part and offset in it, with [`NO_ROW`] as the part of a row with no parent.
-        let mut found: Vec<(u32, u32)> = Vec::with_capacity(rids.len());
         // For each part, its place among the parts this chunk reached, in the order reached.
         let mut numbered = vec![NO_ROW; parts];
         let mut reached: Vec<usize> = Vec::new();
-        // The part of the row before, tried first, because a child stored in its parent's order asks
-        // for the same part a couple of thousand times in a row and a search per row would be most
-        // of the cost of this.
+        // The parts first and nothing else, because a chunk placed whole needs only how many it
+        // reached, and on TPC-H q09 every chunk against `partsupp` is placed whole. The part of the
+        // row before is tried first, because a child stored in its parent's order asks for the same
+        // part a couple of thousand times in a row.
         let mut last = 0;
         for &rid in rids {
             if rid == NO_ROW {
-                found.push((NO_ROW, 0));
                 continue;
             }
             let at = u64::from(rid);
@@ -204,12 +258,31 @@ impl Parent {
                 )));
             }
             if !(starts[last] <= at && at < starts[last + 1]) {
-                last = starts.partition_point(|&start| start <= at) - 1;
+                last = directory.part_of(at);
             }
             if numbered[last] == NO_ROW {
                 // Under the part count, which is far under a `u32`.
                 numbered[last] = reached.len() as u32;
                 reached.push(last);
+            }
+        }
+        if reached.len() > 1 && reached.len() * 2 > parts && !self.refused.load(Ordering::Relaxed) {
+            return Ok(Placement {
+                rows: rids.len(),
+                shape: Shape::Whole(reached.len(), rids.to_vec()),
+            });
+        }
+        // Each row's part and offset in it, with [`NO_ROW`] as the part of a row with no parent.
+        let mut found: Vec<(u32, u32)> = Vec::with_capacity(rids.len());
+        let mut last = 0;
+        for &rid in rids {
+            if rid == NO_ROW {
+                found.push((NO_ROW, 0));
+                continue;
+            }
+            let at = u64::from(rid);
+            if !(starts[last] <= at && at < starts[last + 1]) {
+                last = directory.part_of(at);
             }
             // In a part, so under its row count, which is a `usize` the part was read into.
             found.push((numbered[last], (at - starts[last]) as u32));
@@ -225,9 +298,6 @@ impl Parent {
                         .collect(),
                 ),
             ),
-            _ if reached.len() * 2 > parts && !self.refused.load(Ordering::Relaxed) => {
-                Shape::Whole(reached.len(), rids.to_vec())
-            }
             _ => {
                 // Numbered in the order they are first reached. A child walking its parent forwards
                 // reaches them in part order, and nothing below depends on it either way.
@@ -305,9 +375,9 @@ impl Parent {
     }
 
     /// The first row of each part, and the row count after the last.
-    fn starts(&self) -> Result<&[u64]> {
-        if let Some(starts) = self.starts.get() {
-            return Ok(starts);
+    fn starts(&self) -> Result<&Directory> {
+        if let Some(directory) = self.starts.get() {
+            return Ok(directory);
         }
         let parts = self.rows.chunk_count();
         let mut starts = Vec::with_capacity(parts + 1);
@@ -317,7 +387,7 @@ impl Parent {
             at += self.rows.chunk_len(part)? as u64;
             starts.push(at);
         }
-        Ok(self.starts.get_or_init(|| starts))
+        Ok(self.starts.get_or_init(|| Directory::new(starts)))
     }
 
     /// The rows of one part at `offsets`, with [`NO_ROW`] as a null, or `None` past the budget.
@@ -640,8 +710,33 @@ mod tests {
     use rudb_storage::MemoryTable;
     use rudb_vector::{Chunk, NO_ROW, Validity, Vector};
 
-    use super::Parent;
+    use super::{Directory, Parent};
     use crate::table::Rows;
+
+    /// The directory names the same part a search over the starts does, for every row id, over
+    /// parts of uneven length, empty ones among them, and a short last one.
+    #[test]
+    fn the_directory_finds_the_part_a_search_finds() {
+        let layouts: [&[u64]; 5] = [
+            &[10],
+            &[4, 4, 4, 1],
+            &[7, 0, 3, 9, 0, 0, 2],
+            &[65_536, 65_536, 65_536, 12],
+            &[1, 100, 1, 100, 5],
+        ];
+        for lengths in layouts {
+            let mut starts = vec![0u64];
+            for &len in lengths {
+                starts.push(starts.last().copied().unwrap_or(0) + len);
+            }
+            let total = *starts.last().expect("a row count");
+            let directory = Directory::new(starts.clone());
+            for at in 0..total {
+                let searched = starts.partition_point(|&start| start <= at) - 1;
+                assert_eq!(directory.part_of(at), searched, "{lengths:?} at {at}");
+            }
+        }
+    }
 
     /// A table of one integer column, written `per` rows to a chunk, so that a column of it is
     /// genuinely several parts rather than one.
