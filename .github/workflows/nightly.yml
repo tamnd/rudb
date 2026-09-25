@@ -48,7 +48,11 @@ jobs:
       # and the parallel operators share those pages across threads.
       - name: cargo test under -Zsanitizer=${{ matrix.san }}
         env:
-          RUSTFLAGS: -Zsanitizer=${{ matrix.san }}
+          # The target CPU is repeated here because a `RUSTFLAGS` replaces the rustflags in
+          # `.cargo/config.toml`, and the point of this job is to look for undefined behaviour in
+          # the code that ships rather than in a baseline build of it. This one pins the x86-64
+          # target below, so the flag is unconditional.
+          RUSTFLAGS: -Zsanitizer=${{ matrix.san }} -C target-cpu=x86-64-v3
           RUSTDOCFLAGS: -Zsanitizer=${{ matrix.san }}
         run: |
           cargo +nightly test --workspace --all-features \

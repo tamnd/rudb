@@ -2,6 +2,25 @@
 [alias]
 xtask = "run --quiet --package xtask --"
 
+# The engine is compiled for x86-64-v3, which is AVX2, BMI2 and FMA, so the floor under an x86 host
+# is Haswell on Intel and Zen on AMD, hardware from 2013 and 2017. Baseline x86-64 is SSE2 and
+# nothing after it, which costs 12.8 percent of the instructions TPC-H at SF1 retires and 25.2
+# percent of q01's, because a chunk of `i64` moves four at a time instead of two and an `i64`
+# multiply is one instruction rather than a sequence of 32 bit partial products.
+# spec/perf/66-the-registers-we-already-have.md has the per query table and
+# spec/07-execution.md section 7.3 has why this rather than runtime dispatch.
+#
+# The `cfg` form rather than three triples, so an x86-64 target nobody has added yet is covered and
+# the two arm targets in the release matrix are not, since `-C target-cpu=x86-64-v3` is not a thing
+# rustc will accept for them.
+#
+# Worth knowing before editing anything that sets `RUSTFLAGS`: a `RUSTFLAGS` in the environment
+# replaces the rustflags from this file rather than adding to them, so a build that sets one and
+# forgets this flag is a baseline build that looks fine. Everything in this workspace that sets
+# `RUSTFLAGS` either repeats the flag or passes its own through `--config` so that the two join.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
 # spec/05-storage-format.md asks that the same input produce the same bytes, and CI checks the
 # weaker version of it that is available today by building the shell twice and comparing the two
 # binaries. mimalloc is C, its options.c puts `__DATE__` and `__TIME__` into the binary, and a clock
