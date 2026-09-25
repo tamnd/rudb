@@ -1317,21 +1317,7 @@ impl<'a> Probe<'a> {
         let filters: Vec<(usize, &Domain)> = self
             .narrowing
             .iter()
-            .filter_map(|(at, sideways)| {
-                let domain = sideways.kept()?;
-                let Expr::Column(binding) = *keying.plan.expr(*keying.exprs.get(*at)?) else {
-                    return None;
-                };
-                let column = keying.schema.position_of(binding)?;
-                let integer = matches!(
-                    self.right_types.get(column)?,
-                    LogicalType::TinyInt
-                        | LogicalType::SmallInt
-                        | LogicalType::Integer
-                        | LogicalType::BigInt
-                );
-                integer.then_some((column, domain))
-            })
+            .filter_map(|(at, sideways)| Some((self.integer_key(keying, *at)?, sideways.kept()?)))
             .collect();
         if filters.is_empty() {
             return Ok(chunks);
@@ -1356,6 +1342,81 @@ impl<'a> Probe<'a> {
         };
         let narrowed = in_parallel(threads, held.len(), threads.degree(), "narrowed chunk", one)?;
         Ok(narrowed.into_iter().flatten().collect())
+    }
+
+    /// The column of this side key `at` is, when it is a column and an integer one.
+    fn integer_key(&self, keying: Keying<'_>, at: usize) -> Option<usize> {
+        let Expr::Column(binding) = *keying.plan.expr(*keying.exprs.get(at)?) else {
+            return None;
+        };
+        let column = keying.schema.position_of(binding)?;
+        let integer = matches!(
+            self.right_types.get(column)?,
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::BigInt
+        );
+        integer.then_some(column)
+    }
+
+    /// The gathered chunks sorted by their first key, when that puts every key of the side in
+    /// ascending order with none twice, and as they came otherwise.
+    ///
+    /// A table read in the order of its primary key hands over its chunks in that order on one
+    /// thread, and on several in whatever order the threads finished them. The table over a side in
+    /// key order is a bit a place and no chain (see `Lookup::ordered`), so putting the chunks back
+    /// in order is what lets the parallel scan have it too. On q09 that was 1.5 million rows of
+    /// `orders` in 184 chunks. The chunks are moved and not copied.
+    ///
+    /// This only ever reorders a side whose keys are distinct, which is proven here a chunk at a time
+    /// before anything moves, so every key is one row and no chain can come out in another order.
+    fn in_key_order(
+        &self,
+        keying: Keying<'_>,
+        mut chunks: Vec<Chunk>,
+        threads: &Lease<'_>,
+    ) -> Result<Vec<Chunk>> {
+        let ([_], [false]) = (keying.exprs, keying.nulls) else { return Ok(chunks) };
+        let Some(column) = self.integer_key(keying, 0) else { return Ok(chunks) };
+        if chunks.len() < 2 {
+            return Ok(chunks);
+        }
+        // The first and last key of each chunk, which is enough to say whether the chunks are in
+        // order already, as they are on one thread, and then nothing else is read. The direct form
+        // asks whether the keys ascend in the same pass it takes their range in.
+        let mut ends = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let key = chunk.column(column)?;
+            let at = |row: usize| key.signed_at(row).and_then(|value| i64::try_from(value).ok());
+            let (Some(first), Some(last)) = (at(0), at(chunk.len().saturating_sub(1))) else {
+                return Ok(chunks);
+            };
+            ends.push((first, last));
+        }
+        let mut order: Vec<usize> = (0..chunks.len()).collect();
+        order.sort_unstable_by_key(|&index| ends[index].0);
+        let apart = order.windows(2).all(|pair| ends[pair[0]].1 < ends[pair[1]].0);
+        if !apart || order.iter().enumerate().all(|(at, &index)| at == index) {
+            return Ok(chunks);
+        }
+        // Moving chunks is only safe for keys that are distinct, so every chunk is read whole to
+        // prove its keys ascend with no null among them before any of them moves.
+        let ascends = |index: usize| -> Result<bool> {
+            let chunk = &chunks[index];
+            let key = chunk.column(column)?;
+            let mut block = Vec::new();
+            Ok(!key.validity().has_nulls(chunk.len())
+                && key.signed_block(&mut block)
+                && block.len() >= chunk.len()
+                && block[..chunk.len()].windows(2).all(|pair| pair[0] < pair[1]))
+        };
+        let proven = in_parallel(threads, chunks.len(), threads.degree(), "key order", ascends)?;
+        if !proven.into_iter().all(|ascends| ascends) {
+            return Ok(chunks);
+        }
+        let mut held: Vec<Option<Chunk>> = chunks.drain(..).map(Some).collect();
+        Ok(order.into_iter().filter_map(|index| held[index].take()).collect())
     }
 
     /// Applies the session semantics to the key expressions.
@@ -1530,6 +1591,7 @@ impl<'a> Probe<'a> {
                 // cannot match costs its copy into every column and its hash and its deal as well,
                 // and on q09 that is nineteen rows of `partsupp` in every twenty.
                 let chunks = self.narrowed(keying, chunks, threads)?;
+                let chunks = self.in_key_order(keying, chunks, threads)?;
                 let rows = Build::new(&self.right_types, &chunks, threads)?;
                 charged.grow(rows.footprint())?;
                 // Laid before the table rather than after it, because a key that is a column of
@@ -3907,6 +3969,51 @@ mod tests {
             probed(&probe, &chunk(&[1, 2, 3]), 2),
             [vec![Value::Integer(2), Value::BigInt(2)], vec![Value::Integer(3), Value::BigInt(3)]]
         );
+    }
+
+    /// A gathered side whose chunks came out of key order, the way a scan on several threads hands
+    /// them over, is put back in order when its keys are distinct and left as it came when one key
+    /// is in two chunks. Either way every driving row finds the rows it should.
+    #[test]
+    fn a_side_gathered_out_of_key_order_answers_the_same() {
+        let apart: &[&[i64]] = &[&[7, 8, 9], &[1, 2, 3], &[4, 5, 6]];
+        let shared: &[&[i64]] = &[&[4, 5], &[1, 4]];
+        let found = |key: i64| vec![Value::Integer(key as i32), Value::BigInt(key)];
+        for (gathered, ordered, wanted) in [
+            (apart, true, vec![found(9), found(1), found(4)]),
+            (shared, false, vec![found(1), found(4), found(4)]),
+        ] {
+            let mut plan = Plan::new();
+            let (left, right) = sides();
+            let narrow = column(&mut plan, 0, LogicalType::Integer);
+            let widened =
+                plan.add_expr(Expr::Cast { input: narrow, try_cast: false }, LogicalType::BigInt);
+            let other = column(&mut plan, 1, LogicalType::BigInt);
+            let condition = equal(&mut plan, widened, other);
+            let conditions = plan.add_expr_list(&[condition]);
+
+            let memory = Memory::unlimited();
+            let (keep, rows) = Keep::new(&memory);
+            let mut local = keep.local();
+            for values in gathered {
+                keep.sink(&wide_chunk(values), &mut local).expect("the gathered rows");
+            }
+            keep.combine(local).expect("the one instance");
+            keep.finalize(&rudb_pipeline::Lease::alone()).expect("the chunks");
+            let probe = Probe::new(
+                &plan,
+                &left,
+                &Gathered { schema: &right, chunks: rows, marker: None, swapped: false },
+                JoinKind::Inner,
+                conditions,
+                &Cancel::new(),
+                &memory,
+            )
+            .expect("a lookup answers an inner join on one equality");
+            let built = probe.built_with(&rudb_pipeline::Lease::alone()).expect("the table");
+            assert_eq!(built.index.is_ordered(), ordered, "{gathered:?}");
+            assert_eq!(probed(&probe, &chunk(&[9, 1, 4, 10]), 2), wanted, "{gathered:?}");
+        }
     }
 
     /// The subject side of a turned around join, gathered the way the pipeline before it would.
