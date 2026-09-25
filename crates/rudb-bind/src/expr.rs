@@ -191,10 +191,11 @@ impl Binder<'_> {
     ///
     /// `ARRAY(SELECT ...)` is the same subquery with its column gathered into one list, which is
     /// empty rather than null when the query has no rows. The pin writes it as `array_agg` ordered
-    /// by the query's own `ORDER BY`. The aggregate here has no ordering of its own and takes the
-    /// rows in the order the query gives them, which keeps that order while the query fits in one
-    /// chunk but not over several chunks read in parallel, the same as `list` over an ordered
-    /// subquery.
+    /// by the query's own `ORDER BY`, and so does this: a sort at the top of the query, with or
+    /// without the projection that drops keys it did not select, becomes the order of the
+    /// aggregate, because the rows reach an aggregate in no particular order once there are
+    /// several chunks of them. A sort under a limit stays where it is, since it decides which rows
+    /// there are.
     fn bind_scalar_subquery(
         &mut self,
         ast: &Ast,
@@ -212,10 +213,22 @@ impl Binder<'_> {
         let mut binding = column.binding;
         let mut ty = column.ty.clone();
         if array {
-            let element = self.add_expr(Expr::Column(binding), ty.clone());
+            let mut element = self.add_expr(Expr::Column(binding), ty.clone());
             let resolved = resolve("array_agg", std::slice::from_ref(&ty))?;
-            let args = self.plan_mut().add_expr_list(&[element]);
-            let name = self.plan_mut().intern(resolved.name);
+            let mut args = vec![element];
+            let mut name = resolved.name.to_string();
+            if let Some((input, first, keys)) = self.sorted_top(node) {
+                node = input;
+                element = first.unwrap_or(element);
+                let keys = self.plan().sort_key_list(keys).to_vec();
+                args = vec![element];
+                args.extend(keys.iter().map(|key| key.expr));
+                let flags: Vec<(bool, bool)> =
+                    keys.iter().map(|key| (key.descending, key.nulls_first)).collect();
+                name = rudb_kernels::ordered_name(&name, &flags);
+            }
+            let args = self.plan_mut().add_expr_list(&args);
+            let name = self.plan_mut().intern(&name);
             ty = resolved.returns;
             let gathered = self.add_expr(
                 Expr::Aggregate { name, args, distinct: false, filter: None },
@@ -251,6 +264,27 @@ impl Binder<'_> {
             return self.call("coalesce", vec![expr, empty]);
         }
         Ok(expr)
+    }
+
+    /// The input of the sort at the top of a query, the expression the query's one column is over
+    /// that input when a projection sits on the sort, and the sort's keys.
+    fn sorted_top(
+        &self,
+        node: rudb_plan::NodeRef,
+    ) -> Option<(rudb_plan::NodeRef, Option<ExprRef>, rudb_plan::Slice)> {
+        match *self.plan().node(node) {
+            rudb_plan::Node::Sort { input, keys } => Some((input, None, keys)),
+            rudb_plan::Node::Project { input, exprs, .. } => {
+                let rudb_plan::Node::Sort { input, keys } = *self.plan().node(input) else {
+                    return None;
+                };
+                let &[first] = self.plan().expr_list(exprs) else {
+                    return None;
+                };
+                Some((input, Some(first), keys))
+            }
+            _ => None,
+        }
     }
 
     /// Binds an uncorrelated existence test as a nullable marker joined once into the outer rows.
