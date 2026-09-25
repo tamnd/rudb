@@ -4823,6 +4823,72 @@ mod tests {
         assert_eq!(took, 0b11, "two columns that fit did not share a walk");
     }
 
+    /// A column at the widest its type holds totals through the shared pass the way the scatter does.
+    ///
+    /// The walk keeps its totals in an `i64` per call per group, so the row counts and the widths that
+    /// interest it are the ones near where that stops being enough room. Every row of the chunk the
+    /// largest value its type has and every row in the one group is the most such a chunk can come to,
+    /// and the four here are the types whose widest value a few hundred rows of leaves room for.
+    ///
+    /// A `BIGINT` of `i64::MAX` is the other side of the same line and is why the second half is here.
+    /// The case above it reaches the handback with a value too large to become an `i64` at all, which is
+    /// one of the two misses [`many_runs`] documents. This one reaches it with values that each fit and
+    /// a total that does not, which is the other, and nothing else covered it.
+    #[test]
+    fn a_column_at_the_widest_its_type_holds_totals_the_way_the_scatter_does() {
+        let rows = 300;
+        let stride = 2;
+        let money = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let brim = Value::Decimal { unscaled: -999_999_999_999_999, width: 15, scale: 2 };
+        let widest = [
+            (&LogicalType::TinyInt, Value::TinyInt(i8::MIN)),
+            (&LogicalType::Integer, Value::Integer(i32::MIN)),
+            (&LogicalType::UInteger, Value::UInteger(u32::MAX)),
+            (&money, brim),
+        ];
+        let slots = vec![0_usize; rows];
+        let runs = [(0_usize, rows)];
+        for (ty, value) in widest {
+            let column = Vector::from_values(ty.clone(), &vec![value; rows])
+                .expect("one value over and over");
+            let inputs = [Some(&column), Some(&column)];
+            let fresh = || {
+                let returns = returns_of("sum", ty);
+                (0..stride)
+                    .map(|_| Accumulator::new("sum", &returns).expect("known"))
+                    .collect::<Vec<_>>()
+            };
+            let mut alone = fresh();
+            for at in 0..stride {
+                update_scattered(&mut alone, &slots, stride, at, Some(&column), rows)
+                    .expect("folds them in");
+            }
+            let mut together = fresh();
+            let took = update_shared_runs(&mut together, &runs, stride, &inputs, 0b11, rows)
+                .expect("folds them in");
+            assert_eq!(took, 0b11, "two columns of {ty} did not share a walk");
+            for at in 0..stride {
+                assert_eq!(
+                    together[at].finish().expect("finishes"),
+                    alone[at].finish().expect("finishes"),
+                    "the call at {at} over {ty}"
+                );
+            }
+        }
+        let past = Vector::from_values(LogicalType::BigInt, &vec![Value::BigInt(i64::MAX); rows])
+            .expect("big integers");
+        let inputs = [Some(&past), Some(&past)];
+        let returns = returns_of("sum", &LogicalType::BigInt);
+        let mut states: Vec<Accumulator> =
+            (0..stride).map(|_| Accumulator::new("sum", &returns).expect("known")).collect();
+        let took = update_shared_runs(&mut states, &runs, stride, &inputs, 0b11, rows)
+            .expect("gives up rather than failing");
+        assert_eq!(took, 0, "a total that left an i64 was folded in anyway");
+        for (at, state) in states.iter().enumerate() {
+            assert_eq!(state.finish().expect("finishes"), Value::Null, "the state at {at} was fed");
+        }
+    }
+
     /// A sum read out of a mean's state over the same column is the sum a call of its own reaches,
     /// over every type a mean keeps an exact total for, with nulls among the rows and without, and
     /// with rows in no group. Where the mean has no exact total to give, the sum of its own had
