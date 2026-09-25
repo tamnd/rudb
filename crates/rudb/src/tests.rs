@@ -11221,6 +11221,58 @@ fn the_regression_family_and_the_moments_answer_the_way_the_pin_does() {
     assert!(error.contains("No function matches"), "{error}");
 }
 
+/// `count_if`, `entropy` and the Kahan pair, every digit probed on the pinned binary.
+#[test]
+fn count_if_entropy_and_the_kahan_sums_answer_the_way_the_pin_does() {
+    let db = Database::new();
+    let text = |sql: &str| {
+        rows(&db, sql)
+            .iter()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    assert_eq!(
+        text(
+            "SELECT count_if(x > 1), countif(x > 1), typeof(count_if(x > 1)), count_if(NULL::BOOLEAN) FROM (VALUES (1), (2), (3), (NULL)) t(x)"
+        ),
+        "2,2,HUGEINT,NULL"
+    );
+    assert_eq!(
+        text("SELECT entropy(x), typeof(entropy(x)) FROM (VALUES (1), (2), (2), (3), (NULL)) t(x)"),
+        "1.5,DOUBLE"
+    );
+    assert_eq!(
+        text("SELECT entropy(x) FROM (VALUES ('a'), ('b'), ('a')) t(x)"),
+        "0.9182958340544894"
+    );
+    assert_eq!(text("SELECT entropy(x) FROM (VALUES (NULL::INT)) t(x)"), "0.0");
+    assert_eq!(
+        text(
+            "SELECT fsum(x), kahan_sum(x), sumkahan(x), favg(x) FROM (VALUES (0.1), (0.2), (0.3), (1e16), (-1e16)) t(x)"
+        ),
+        "0.0,0.0,0.0,0.0"
+    );
+    assert_eq!(text("SELECT fsum(x), favg(x) FROM (VALUES (NULL::DOUBLE)) t(x)"), "NULL,NULL");
+    // The pin combines an ungrouped state into an empty one before finishing it, which moves the
+    // last digit of this average, and finishes a grouped state as it stands.
+    assert_eq!(
+        text(
+            "SELECT fsum(x), favg(x) FROM (SELECT i * 0.37 + 1e15 * (i % 3) AS x FROM range(5000) r(i))"
+        ),
+        "4.999000000004624e+18,999800000000924.8"
+    );
+    assert_eq!(
+        text(
+            "SELECT g, count_if(x > 1), entropy(x), fsum(x) FROM (VALUES (1, 1), (1, 2), (2, 3)) t(g, x) GROUP BY g ORDER BY g"
+        ),
+        "1,1,1.0,3.0;2,1,0.0,3.0"
+    );
+    let error =
+        db.execute("SELECT count_if(x) FROM (VALUES (1), (0)) t(x)").unwrap_err().to_string();
+    assert!(error.contains("No function matches"), "{error}");
+}
+
 #[test]
 fn arg_min_and_arg_max_answer_the_way_the_pin_does() {
     let db = Database::new();

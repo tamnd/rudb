@@ -118,7 +118,7 @@ impl Whole {
         clippy::cast_sign_loss,
         reason = "every number was widened from this type, so it narrows back without loss"
     )]
-    fn value(self, n: i64) -> Value {
+    pub(crate) fn value(self, n: i64) -> Value {
         match self {
             Self::TinyInt => Value::TinyInt(n as i8),
             Self::SmallInt => Value::SmallInt(n as i16),
@@ -230,6 +230,7 @@ impl Held {
 pub(crate) enum Column<'a> {
     Wholes(Whole, Numbers<'a>),
     Reals(&'a [f64]),
+    Flags(&'a [bool]),
 }
 
 /// The numbers of a [`Column::Wholes`], in whatever width the vector stores them.
@@ -271,6 +272,9 @@ impl<'a> Column<'a> {
         if let (LogicalType::Double, Data::Float64(reals)) = (ty, data) {
             return reals.get(..rows).map(Self::Reals);
         }
+        if let (LogicalType::Boolean, Data::Bool(flags)) = (ty, data) {
+            return flags.get(..rows).map(Self::Flags);
+        }
         let whole = match *ty {
             LogicalType::TinyInt => Whole::TinyInt,
             LogicalType::SmallInt => Whole::SmallInt,
@@ -299,6 +303,15 @@ impl<'a> Column<'a> {
         Some(Self::Wholes(whole, numbers))
     }
 
+    /// The value at `row`.
+    pub(crate) fn value(self, row: usize) -> Value {
+        match self {
+            Self::Wholes(whole, numbers) => whole.value(numbers.at(row)),
+            Self::Reals(reals) => Value::Double(reals[row]),
+            Self::Flags(flags) => Value::Boolean(flags[row]),
+        }
+    }
+
     /// Adds the value at `row` to `held`.
     pub(crate) fn push(self, held: &mut Held, row: usize) {
         match self {
@@ -306,6 +319,7 @@ impl<'a> Column<'a> {
             Self::Wholes(whole, numbers) => {
                 held.push_whole(whole, numbers.at(row));
             }
+            Self::Flags(flags) => held.push(&Value::Boolean(flags[row])),
         }
     }
 }

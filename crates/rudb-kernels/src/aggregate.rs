@@ -895,6 +895,20 @@ impl Accumulator {
         Ok(())
     }
 
+    /// The answer of an aggregate with no `GROUP BY`, which is [`Accumulator::finish`] except for
+    /// `fsum` and `favg`. The pin combines an ungrouped state into an empty one before finishing
+    /// it, and for those two that step changes the last digits.
+    ///
+    /// # Errors
+    ///
+    /// If the running total does not fit the declared return type.
+    pub fn finish_ungrouped(&self) -> Result<Value> {
+        if let State::General(general) = &self.state {
+            return general.finish_ungrouped();
+        }
+        self.finish()
+    }
+
     /// The aggregate's answer.
     ///
     /// # Errors
@@ -1437,7 +1451,9 @@ pub fn update_general(
 /// or `None` when it is not one a [`Column`] reads.
 fn by_column(args: &[Vector], rows: usize) -> Option<(Column<'_>, &Validity)> {
     let by = args.get(1)?;
-    Column::of(by, rows).map(|column| (column, by.validity()))
+    Column::of(by, rows)
+        .filter(|column| !matches!(column, Column::Flags(_)))
+        .map(|column| (column, by.validity()))
 }
 
 /// Folds one vector into many accumulators a run of rows at a time, where every row of a run
@@ -4126,9 +4142,9 @@ mod tests {
 
     #[test]
     fn an_aggregate_nobody_has_written_says_which_one() {
-        let error = Accumulator::new("entropy", &LogicalType::Double)
-            .expect_err("entropy is not written yet");
-        assert!(error.message().contains("the entropy aggregate"), "{error}");
+        let error = Accumulator::new("histogram", &LogicalType::Double)
+            .expect_err("histogram is not written yet");
+        assert!(error.message().contains("the histogram aggregate"), "{error}");
     }
 
     /// The row at a time path, which is the answer the one pass path has to reach.

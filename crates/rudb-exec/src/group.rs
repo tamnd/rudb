@@ -3433,6 +3433,9 @@ impl<'a> Aggregate<'a> {
                             ),
                             // `held` is this call's own state, and the earlier call's where this one
                             // repeats it.
+                            (None, None) if self.groups.is_empty() => {
+                                states[slot * calls + held].finish_ungrouped()
+                            }
                             (None, None) => states[slot * calls + held].finish(),
                         }
                     }?;
