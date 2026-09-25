@@ -276,6 +276,48 @@ fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
     clear
 }
 
+/// Whether nothing above `join` reads a column its input `side` produces, and nothing above it
+/// reads its columns by position.
+///
+/// The executor asks this about a join whose driving scan it may reduce to exactly the rows that
+/// match, where the join then has nothing to add but the gathered side's columns. It is
+/// [`unread`] and [`absorbed`] together, the same two questions elimination asks, for a join no
+/// certificate lets the plan delete because its parent side is filtered.
+///
+/// Unlike [`unread`] it looks only at the nodes the root reaches, because the plan it is asked
+/// about is the one that runs, and a node a pass left behind is a node nothing runs.
+pub fn unread_side(plan: &Plan, join: NodeRef, side: NodeRef) -> bool {
+    let mut produced = Vec::new();
+    indices(plan, side, &mut produced);
+    let mut running = vec![false; plan.node_count()];
+    mark(plan, plan.root(), &mut running);
+    let mut inside = vec![false; plan.node_count()];
+    mark(plan, side, &mut inside);
+    let mut clear = true;
+    for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        let at = node as usize;
+        if node == join || !running.get(at).copied().unwrap_or(false) || inside[at] {
+            continue;
+        }
+        walk::node_columns(plan, node, &mut |_, binding| {
+            clear &= !produced.contains(&binding.table);
+        });
+    }
+    // The consumers of the running nodes only, for the same reason.
+    let mut above = vec![None; plan.node_count()];
+    for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        if !running.get(node as usize).copied().unwrap_or(false) {
+            continue;
+        }
+        for child in plan.node(node).children().into_iter().flatten() {
+            if let Some(slot) = above.get_mut(child as usize) {
+                *slot = Some(node);
+            }
+        }
+    }
+    clear && absorbed(plan, &above, join)
+}
+
 /// The operator numbers a subtree's nodes bind their output columns to.
 fn indices(plan: &Plan, at: NodeRef, found: &mut Vec<u32>) {
     if let Some(outputs) = walk::outputs(plan, at) {

@@ -1926,6 +1926,15 @@ impl<'a> Building<'a, '_> {
                 })
                 .collect();
             let probe = probe.narrowed_by(narrowing);
+            // A join nothing above reads the gathered side of, whose driving scan is reduced to
+            // exactly the rows that match, is a join that only has to hand its rows on. The plan
+            // cannot tell which joins those are, because the reduction is decided once the build
+            // side has finished, so the probe asks then. See `crate::join::Probe::settled_by`.
+            let probe = if rudb_opt::eliminate::unread_side(plan, reference, parent) {
+                probe.settled_by(Arc::clone(&sideways))
+            } else {
+                probe
+            };
             let schema = probe.schema().clone();
             let counters = self.watch(reference, id, pipeline, "Probe", None);
             let probe = probe.watched(Arc::clone(&counters));
@@ -2280,6 +2289,9 @@ impl<'a> Building<'a, '_> {
                 );
                 for aside in &self.above {
                     aside.set_aside();
+                }
+                if let Some(own) = self.sideways.as_ref() {
+                    own.own();
                 }
                 let filters = Filters {
                     pruning: std::mem::take(&mut self.pruning),

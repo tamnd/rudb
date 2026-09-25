@@ -958,6 +958,12 @@ pub(crate) struct Probe<'a> {
     ///
     /// See [`Probe::narrowed_by`].
     narrowing: Vec<(usize, Arc<Sideways<'a>>)>,
+    /// This join's own runtime filter, when nothing above the join reads the gathered side.
+    ///
+    /// See [`Probe::settled_by`].
+    settling: Option<Arc<Sideways<'a>>>,
+    /// Whether the driving rows are known to match, decided once the table is built.
+    settled: OnceLock<bool>,
 }
 
 /// The gathered side and the table that finds rows in it.
@@ -1256,6 +1262,36 @@ impl<'a> Probe<'a> {
             time_zone: SessionTimeZone::default(),
             counters: None,
             narrowing: Vec::new(),
+            settling: None,
+            settled: OnceLock::new(),
+        })
+    }
+
+    /// Lets the join hand its driving rows on without a lookup, when `sideways` says they match.
+    ///
+    /// The builder calls this only for a join where nothing above reads a column of the gathered
+    /// side. Such a join still has to drop the driving rows that match nothing and repeat the ones
+    /// that match twice, and that is all it does. When `sideways` reduced the driving scan to
+    /// exactly the rows whose key the gathered side holds, and the gathered side holds each key
+    /// once, there is nothing to drop and nothing to repeat, so a driving chunk goes up as it came
+    /// with a constant standing in for each gathered column. TPC-H q09 is the case: the scan of
+    /// `lineitem` reads the rows of green parts through the adjacency, and the join to `part` then
+    /// hashed and looked up all 319 thousand of them to find each one a part nothing above reads.
+    #[must_use]
+    pub(crate) fn settled_by(mut self, sideways: Arc<Sideways<'a>>) -> Self {
+        self.settling = Some(sideways);
+        self
+    }
+
+    /// Whether every driving row matches exactly one gathered row, asked once the table is built.
+    fn settled(&self, built: &Built) -> bool {
+        *self.settled.get_or_init(|| {
+            self.kind == JoinKind::Inner
+                && self.equalities.left.len() == 1
+                && self.equalities.residual.is_empty()
+                && !self.equalities.null_is_a_value.iter().any(|&null| null)
+                && built.index.single()
+                && self.settling.as_ref().is_some_and(|sideways| sideways.settles())
         })
     }
 
@@ -1679,6 +1715,18 @@ impl Stream for Probe<'_> {
 
     fn push(&self, chunk: &mut Chunk, local: &mut Probing) -> Result<Progress> {
         let built = self.built()?;
+        if self.settled(&built) {
+            let rows = chunk.len();
+            let mut columns = std::mem::replace(chunk, Chunk::empty(&[])).into_columns();
+            columns.extend(
+                self.right_types.iter().map(|ty| Vector::constant(ty.clone(), Value::Null, rows)),
+            );
+            if self.swapped {
+                columns.rotate_left(self.left_width);
+            }
+            *chunk = Chunk::with_rows(columns, rows)?;
+            return Ok(Progress::More);
+        }
         let left = match local.left.take() {
             // Being asked again, so the chunk holds whatever was downstream of it and the driving
             // rows are the ones this instance kept. Their keys are kept beside them, because
