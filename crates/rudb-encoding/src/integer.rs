@@ -934,9 +934,7 @@ fn decode_chunk(reader: &mut Reader<'_>, scratch: &mut Decoding) -> Result<Vec<i
                 let into = &mut values[done..done + wanted];
                 if wanted == VALUES {
                     let words = bitpack::packed_len::<u64>(width);
-                    for word in &mut scratch.packed[..words] {
-                        *word = reader.u64()?;
-                    }
+                    reader.words(&mut scratch.packed[..words])?;
                     bitpack::unpack_mapped(&scratch.packed[..words], width, into, |offset| {
                         value_from(offset, base)
                     })?;
@@ -1137,9 +1135,7 @@ fn decode_chunk_as<T: Lane>(reader: &mut Reader<'_>, scratch: &mut Decoding) -> 
                 let into = &mut values[done..done + wanted];
                 let bytes = if wanted == VALUES {
                     let words = bitpack::packed_len::<u64>(width);
-                    for word in &mut scratch.packed[..words] {
-                        *word = reader.u64()?;
-                    }
+                    reader.words(&mut scratch.packed[..words])?;
                     None
                 } else {
                     Some(reader.bytes(bitpack::tail_len(wanted, width))?)
@@ -1260,9 +1256,7 @@ fn decode_selected_chunk(
                     // finding each value on its own.
                     let words = bitpack::packed_len::<u64>(width);
                     scratch.ready();
-                    for word in &mut scratch.packed[..words] {
-                        *word = reader.u64()?;
-                    }
+                    reader.words(&mut scratch.packed[..words])?;
                     let mut unit = [0_i64; VALUES];
                     bitpack::unpack_mapped(&scratch.packed[..words], width, &mut unit, |offset| {
                         value_from(offset, base)

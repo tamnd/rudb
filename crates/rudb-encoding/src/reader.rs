@@ -56,6 +56,24 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    /// A run of little endian `u64` words, taken as one range and converted in place.
+    ///
+    /// The packed unit of a bit packed chunk is up to a thousand words, and reading it a word at a
+    /// time is a bounds check, an eight byte copy and a `Result` to test for each of them. On a
+    /// `BIGINT` column packed at 62 bits that is about one word a row of the column, and it cost as
+    /// much as the unpacking it was feeding. Taken this way it is one bounds check for the whole
+    /// unit and a loop of eight byte copies, which on a little endian machine is a copy of the
+    /// range and nothing else.
+    pub(crate) fn words(&mut self, into: &mut [u64]) -> Result<()> {
+        let bytes = self.bytes(size_of_val(into))?;
+        for (word, from) in into.iter_mut().zip(bytes.chunks_exact(size_of::<u64>())) {
+            let mut eight = [0u8; size_of::<u64>()];
+            eight.copy_from_slice(from);
+            *word = u64::from_le_bytes(eight);
+        }
+        Ok(())
+    }
+
     pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.take::<1>()?[0])
     }
