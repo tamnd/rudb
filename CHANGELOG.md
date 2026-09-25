@@ -6,6 +6,18 @@ The version number says how far through the plan we are. **The minor version is 
 
 The count does not restart at a handover, because a version number cannot go backwards, and there have now been two of them. 0.0.y through 0.2.y were the M series, where 0.1.0 closed M0 and 0.2.0 closed M1. 0.3.0 closed F0 and 0.3.y was work against the F series. The G series is the graph engine plan and it took the number over at 0.4.0, with G0 and G1 both landing inside 0.3.y, so 0.4.0 is the first release the G series names rather than the fourth milestone the project has closed. Each plan runs beside the ones before it rather than replacing them, per `notes/Spec/2140/engine-v2/00-README.md`, and two plans cannot both own one version number, so one of them has it and the others do not. Work that lands against an M or an F milestone still ships in whatever release it lands in.
 
+There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
+
+## 0.5.0
+
+The release where C1 closed. The compiled engine now has everything C1 asks for: QIR and its verifier, the interpreter, the physical plan with the fused hash join, the pipeline graph and its steps, translators with a vcall into every scalar function of the first engine, the router with its refusal log, `EXPLAIN (CODEGEN)` and the differential harness. It answers all 43 ClickBench queries the same as the first engine at ten million rows, single threaded on the interpreter. It is still much slower than the first engine, which is expected until C2 gives it a real backend. On the refusal count from `cargo xtask refusals`, TPC-H has 1 of 22 queries accepted and JOB has 0 of 113, all of JOB refused first at the Consistent node, and those numbers are what C2 starts from. The native directory format number stays at 30 and the storage format version at 9.
+
+The 0.4.33 to 0.4.36 release runs all stopped in the tag check before they published anything, so this is the first release with binaries since 0.4.32. #1934 fixes the four tests that stopped them. Two were tests that expected what the engine did before #1872 and #1892. The other two were real planner bugs where running the passes a second time gave a different plan. A LEFT join that a certificate makes inner was only reduced to a Consistent node on the second run, and `count(x)` through a view over a table with exact null counts only became `count(*)` on the second run, which made any such query fail with an internal error.
+
+#1933 checks a part's checksum once per open reader rather than on every read, which is how a scan reduced by the graph layer reads, and q21 reads `lineitem` three times that way. #1937 builds a join side whose keys arrive in order and once each as one bit a place with no chain, which is the `orders` build in q09. #1936 records why the overflow check in the shared aggregate walk has to stay and tests a total that leaves an i64. #1939 updates a graph layer test for the push #1929 now always tries.
+
+#1935 takes a struct apart into columns in a root unnest, and #1938 runs an unnest in a `GROUP BY` key under the grouping and lets a series read a query in its arguments.
+
 ## 0.4.36
 
 A patch release of seven commits, mostly on the graph layer's link joins, with the fused hash join in the compiled engine and two families of list functions. The native directory format number stays at 30 and the storage format version at 9.
@@ -24,7 +36,7 @@ For the query compiler, #1911 reads wide rows back after a top N, which was the 
 
 On joins and the graph layer, #1912 builds a join table on every thread and narrows its side before the layout, #1913 answers a chunk's children off a monotone link by walking the bitmap, and #1917 gives key maps a budget share of their own, so the map over `o_orderkey` is kept on the clustered SF1 file. On aggregation, #1908 counts a run of one key in the encoded count scatter as one weighted record, which helps ClickBench 17.
 
-#1907 adds `SET stored_answers = false`, which stops the engine answering from numbers the native writer stored at load time, for benchmark runs that must not pre-aggregate. #1910 adds random, setseed, TRY and the if macro, and #1920 expands the pin's built-in macros and adds error(). #1905 raises the MSRV to 1.88.0. #1918 corrects the note on which instructions counter is immune to load, and #1906 is changelog only. #1924 fixes the release gate, which stopped the 0.4.33 and 0.4.34 release runs before they published anything, so this is the first release with binaries since 0.4.32.
+#1907 adds `SET stored_answers = false`, which stops the engine answering from numbers the native writer stored at load time, for benchmark runs that must not pre-aggregate. #1910 adds random, setseed, TRY and the if macro, and #1920 expands the pin's built-in macros and adds error(). #1905 raises the MSRV to 1.88.0. #1918 corrects the note on which instructions counter is immune to load, and #1906 is changelog only. #1924 fixes the release gate, which stopped the 0.4.33 and 0.4.34 release runs before they published anything. The 0.4.35 run then stopped on two tests, so it has no binaries either, and neither does 0.4.36. 0.5.0 is the first release after 0.4.32 with binaries.
 
 ## 0.4.34
 
